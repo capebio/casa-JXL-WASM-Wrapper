@@ -186,6 +186,169 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
     })
 }
 
+/// Preview-path metadata (no raw). Mirrors the fields `decode_bytes_inner` derives.
+pub struct DngMeta {
+    pub width: usize,
+    pub height: usize,
+    pub cfa: Cfa,
+    pub black: u16,
+    pub white: u16,
+    pub wb_r: f32,
+    pub wb_b: f32,
+    pub color_matrix: Option<[[f32; 3]; 3]>,
+    pub iso: Option<u32>,
+    pub orientation: u16,
+    pub make: String,
+    pub model: String,
+}
+
+/// Build `DngMeta` from a parsed IFD + walk state. The expressions match
+/// `decode_bytes_inner` exactly (kept in sync by construction; not shared to avoid
+/// perturbing the proven full-decode path).
+fn dng_meta(state: &WalkState, raw: &RawIfd, width: usize, height: usize, cfa: Cfa) -> DngMeta {
+    let wb_g_neutral = state.as_shot_neutral.map(|n| n[1]).unwrap_or(1.0);
+    let wb_r_neutral = state.as_shot_neutral.map(|n| n[0]).unwrap_or(1.0);
+    let wb_b_neutral = state.as_shot_neutral.map(|n| n[2]).unwrap_or(1.0);
+    DngMeta {
+        width,
+        height,
+        cfa,
+        black: raw.black_level.unwrap_or(0),
+        white: raw.white_level.unwrap_or(16383),
+        wb_r: wb_g_neutral / wb_r_neutral.max(1e-6),
+        wb_b: wb_g_neutral / wb_b_neutral.max(1e-6),
+        color_matrix: choose_camera_to_srgb_matrix(
+            state.forward_matrix_1,
+            state.forward_matrix_2,
+            state.color_matrix_1,
+            state.color_matrix_2,
+        ),
+        iso: state.iso,
+        orientation: state.orientation.unwrap_or(1),
+        make: state.make.clone(),
+        model: state.model.clone(),
+    }
+}
+
+/// Streaming DNG raw-row source. comp=7 (LJPEG tiles) decodes one row-tile band at a
+/// time into a reused buffer; comp=1 (uncompressed) decodes the whole raw once and doles
+/// rows. Yields rows byte-identical to `decode_bytes().raw`, top-to-bottom, without the
+/// full-res demosaiced RGB. Feeds the generic `stream_preview::build_previews_streaming`.
+pub struct DngRowSource<'a> {
+    data: &'a [u8],
+    raw: RawIfd,
+    meta: DngMeta,
+    row: usize,
+    // comp=7 tile-band streaming
+    tiled: bool,
+    tw: usize,
+    tl: usize,
+    coltiles: usize,
+    band_buf: Vec<u16>,
+    band_first: usize,
+    band_rows: usize,
+    // comp=1 fallback: whole raw decoded up front
+    full: Vec<u16>,
+}
+
+impl<'a> DngRowSource<'a> {
+    /// Parse a DNG for streaming. `Err` if unsupported (caller falls back to the full
+    /// path): compression not in {1,7}, cps != 1, unsupported CFA, or implausible dims.
+    pub fn new(data: &'a [u8]) -> Result<Self, String> {
+        let (state, raw, le) = load_dng(data).map_err(|e| format!("DNG parse: {e}"))?;
+        let width = raw.width as usize;
+        let height = raw.height as usize;
+        if width == 0 || height == 0 {
+            return Err("DNG: zero dimension".into());
+        }
+        if (width as u64).saturating_mul(height as u64) > 200_000_000 {
+            return Err(format!("DNG: implausible dimensions {width}×{height}"));
+        }
+        let cps = raw.samples_per_pixel.max(1) as usize;
+        if cps != 1 {
+            return Err(format!("DNG: streaming needs single-sample Bayer (cps={cps})"));
+        }
+        let cfa = match raw.cfa_pattern {
+            Some([0, 1, 1, 2]) => Cfa::Rggb,
+            Some([1, 2, 0, 1]) => Cfa::Gbrg,
+            Some([1, 0, 2, 1]) => Cfa::Grbg,
+            Some([2, 1, 1, 0]) => Cfa::Bggr,
+            Some(p) => return Err(format!("DNG: unsupported CFA {p:?}")),
+            None => Cfa::Rggb,
+        };
+        let meta = dng_meta(&state, &raw, width, height, cfa);
+
+        match raw.compression {
+            7 => {
+                let tw = raw.tile_width.ok_or("DNG: missing TileWidth")? as usize;
+                let tl = raw.tile_length.ok_or("DNG: missing TileLength")? as usize;
+                if tw == 0 || tl == 0 {
+                    return Err("DNG: zero TileWidth/TileLength".into());
+                }
+                let coltiles = width.div_ceil(tw);
+                let rowtiles = height.div_ceil(tl);
+                let expected = coltiles.checked_mul(rowtiles).ok_or("DNG: tile grid overflow")?;
+                if raw.tile_offsets.len() != expected || raw.tile_byte_counts.len() != expected {
+                    return Err("DNG: tile count mismatch".into());
+                }
+                Ok(Self {
+                    data, raw, meta, row: 0, tiled: true, tw, tl, coltiles,
+                    band_buf: Vec::new(), band_first: 0, band_rows: 0, full: Vec::new(),
+                })
+            }
+            1 => {
+                // Uncompressed: decode the whole raw once (cheap, no entropy) and dole
+                // rows. Reuses the crate's endianness/strip/tile-aware unpack. Avoids the
+                // full-res RGB (the dominant DNG buffer); keeps the raw (~3.5× peak).
+                let mut full = vec![0u16; width * height];
+                decode_uncompressed(data, &raw, width, height, le, &mut full)
+                    .map_err(|e| format!("DNG uncompressed: {e}"))?;
+                Ok(Self {
+                    data, raw, meta, row: 0, tiled: false, tw: 0, tl: 0, coltiles: 0,
+                    band_buf: Vec::new(), band_first: 0, band_rows: 0, full,
+                })
+            }
+            c => Err(format!("DNG: compression {c} not streamable")),
+        }
+    }
+
+    pub fn phase(&self) -> (u8, u8) { cfa_phase(self.meta.cfa) }
+    pub fn meta(&self) -> &DngMeta { &self.meta }
+}
+
+impl crate::decompress::RawRowSource for DngRowSource<'_> {
+    fn width(&self) -> usize { self.meta.width }
+    fn height(&self) -> usize { self.meta.height }
+
+    fn next_row_into(&mut self, dst: &mut [u16]) -> Result<bool, String> {
+        let (w, h) = (self.meta.width, self.meta.height);
+        if self.row >= h {
+            return Ok(false);
+        }
+        let r = self.row;
+        if self.tiled {
+            if self.band_rows == 0 || r >= self.band_first + self.band_rows {
+                let tr = r / self.tl;
+                let row_start = tr * self.tl;
+                let active_h = ((tr + 1) * self.tl).min(h) - row_start;
+                self.band_buf.resize(active_h * w, 0);
+                decode_band_into(
+                    self.data, &self.raw, w, h, self.tw, self.tl, self.coltiles, tr, &mut self.band_buf,
+                )
+                .map_err(|e| format!("DNG band {tr}: {e}"))?;
+                self.band_first = row_start;
+                self.band_rows = active_h;
+            }
+            let local = r - self.band_first;
+            dst[..w].copy_from_slice(&self.band_buf[local * w..local * w + w]);
+        } else {
+            dst[..w].copy_from_slice(&self.full[r * w..r * w + w]);
+        }
+        self.row += 1;
+        Ok(true)
+    }
+}
+
 /// Decode one row-tile band `tr` (comp=7 LJPEG tiles) into `band` (len == active_h*width,
 /// rows [tr*tl, min((tr+1)*tl, height))). Shared by `decode_tiles` (parallel full-frame
 /// blit) and the streaming `DngRowSource`. Byte-identical to the previous inline closure.
@@ -611,7 +774,7 @@ pub fn align_to_rggb(
     (Cow::Owned(out), new_w, new_h)
 }
 
-fn cfa_phase(cfa: Cfa) -> (u8, u8) {
+pub fn cfa_phase(cfa: Cfa) -> (u8, u8) {
     match cfa {
         Cfa::Rggb => (0, 0),
         Cfa::Grbg => (0, 1),

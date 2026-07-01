@@ -1,7 +1,7 @@
 //! Streaming, bounded-memory ORF preview build: decode → half-demosaic →
 //! box-downscale, one strip at a time. Byte-identical to the full-frame path.
 
-use crate::decompress::{for_each_strip, OrfRowDecoder, RawRowSource};
+use crate::decompress::{for_each_strip, RawRowSource};
 use crate::demosaic::demosaic_half_band;
 
 /// Even strip height. Larger = fewer rayon dispatches + coarser demosaic grain
@@ -192,6 +192,7 @@ pub fn build_previews_streaming<S: RawRowSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decompress::OrfRowDecoder;
 
     // Verbatim reference of src/lib.rs::downscale_rgb16_impl (int + float paths),
     // kept as the byte-exact oracle. If the production downscaler changes, update both.
