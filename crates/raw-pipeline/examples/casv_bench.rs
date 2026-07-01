@@ -44,7 +44,7 @@ fn main() {
     let mp = (w as f64 * h as f64) / 1e6;
 
     println!(
-        "CasaVideo encoder comparison: {n} frames @ {w}x{h} ({mp:.2} MP), single-thread, lossless e3"
+        "CasaVideo encoder comparison: {n} frames @ {w}x{h} ({mp:.2} MP), parallel encode / sequential decode, lossless e3"
     );
     println!("(decode = sequential playback via decode_casv_all_rgb8; 24fps budget 41.7 ms/frame)\n");
     println!(

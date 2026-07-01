@@ -26,6 +26,7 @@
 
 use crate::jxl_casaencoder::{encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame};
 use crate::jxl_casadecoder::decode_interleaved;
+use rayon::prelude::*;
 
 pub const CASV_MAGIC: u32 = 0x5641_5343; // 'CASV' little-endian
 pub const CASV_VERSION: u32 = 1;
@@ -116,13 +117,17 @@ pub fn encode_casv_rgb8(
     let expected = (width as usize) * (height as usize) * 3;
 
     // Encode every frame first so we know each codestream length for the index.
-    let mut streams: Vec<Vec<u8>> = Vec::with_capacity(frames.len());
-    for (idx, px) in frames.iter().enumerate() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
-        }
-        streams.push(encode_rgb8(px, width, height, opts.clone())?);
-    }
+    // Frames are independent → encode in parallel (order preserved by collect).
+    let streams: Vec<Vec<u8>> = frames
+        .par_iter()
+        .enumerate()
+        .map(|(idx, px)| {
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            Ok(encode_rgb8(px, width, height, opts.clone())?)
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
 
     let header = CasvHeader {
         width,
@@ -193,20 +198,23 @@ pub fn encode_casv_delta_rgb8(
     let expected = (width as usize) * (height as usize) * 3;
     let gop = gop_len.max(1) as usize;
 
-    // (is_p, jxl_bytes) per frame.
-    let mut streams: Vec<(bool, Vec<u8>)> = Vec::with_capacity(frames.len());
-    for (idx, px) in frames.iter().enumerate() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
-        }
-        let is_p = idx % gop != 0;
-        let jxl = if is_p {
-            encode_residual16(px, frames[idx - 1], width, height, &opts)?
-        } else {
-            encode_rgb8(px, width, height, opts.clone())?
-        };
-        streams.push((is_p, jxl));
-    }
+    // (is_p, jxl_bytes) per frame — encoded in parallel (each frame independent).
+    let streams: Vec<(bool, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            let is_p = idx % gop != 0;
+            let jxl = if is_p {
+                encode_residual16(px, frames[idx - 1], width, height, &opts)?
+            } else {
+                encode_rgb8(px, width, height, opts.clone())?
+            };
+            Ok((is_p, jxl))
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
 
     let header = CasvHeader {
         width,
@@ -401,53 +409,55 @@ pub fn encode_casv_delta_tiled_rgb8(
     let (txn, _tyn) = tile_grid(width, height, t);
     let (w, ts) = (width as usize, t as usize);
 
-    let mut streams: Vec<(bool, Vec<u8>)> = Vec::with_capacity(frames.len());
-    for (idx, px) in frames.iter().enumerate() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
-        }
-        if idx % gop == 0 {
-            streams.push((false, encode_rgb8(px, width, height, opts.clone())?));
-            continue;
-        }
-        let prev = frames[idx - 1];
-        let map = changed_tile_map(px, prev, width, height, t);
-        let changed: Vec<usize> =
-            map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+    let streams: Vec<(bool, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            if idx % gop == 0 {
+                return Ok((false, encode_rgb8(px, width, height, opts.clone())?));
+            }
+            let prev = frames[idx - 1];
+            let map = changed_tile_map(px, prev, width, height, t);
+            let changed: Vec<usize> =
+                map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
 
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(t as u16).to_le_bytes());
-        let bitmap_len = map.len().div_ceil(8);
-        let mut bitmap = vec![0u8; bitmap_len];
-        for &i in &changed {
-            bitmap[i / 8] |= 1 << (i % 8);
-        }
-        payload.extend_from_slice(&bitmap);
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(t as u16).to_le_bytes());
+            let bitmap_len = map.len().div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_len];
+            for &i in &changed {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+            payload.extend_from_slice(&bitmap);
 
-        if !changed.is_empty() {
-            // 16-bit-offset atlas; padding stays at 32768 (== zero diff).
-            let mut atlas = vec![32768u16; ts * ts * 3 * changed.len()];
-            for (slot, &i) in changed.iter().enumerate() {
-                let tx = (i as u32 % txn) as usize;
-                let ty = (i as u32 / txn) as usize;
-                let bw = ts.min(w - tx * ts);
-                let bh = ts.min(height as usize - ty * ts);
-                for row in 0..bh {
-                    for col in 0..bw {
-                        let src = ((ty * ts + row) * w + tx * ts + col) * 3;
-                        let dst = ((slot * ts + row) * ts + col) * 3;
-                        for c in 0..3 {
-                            atlas[dst + c] = ((px[src + c] as i32 - prev[src + c] as i32) + 32768) as u16;
+            if !changed.is_empty() {
+                // 16-bit-offset atlas; padding stays at 32768 (== zero diff).
+                let mut atlas = vec![32768u16; ts * ts * 3 * changed.len()];
+                for (slot, &i) in changed.iter().enumerate() {
+                    let tx = (i as u32 % txn) as usize;
+                    let ty = (i as u32 / txn) as usize;
+                    let bw = ts.min(w - tx * ts);
+                    let bh = ts.min(height as usize - ty * ts);
+                    for row in 0..bh {
+                        for col in 0..bw {
+                            let src = ((ty * ts + row) * w + tx * ts + col) * 3;
+                            let dst = ((slot * ts + row) * ts + col) * 3;
+                            for c in 0..3 {
+                                atlas[dst + c] = ((px[src + c] as i32 - prev[src + c] as i32) + 32768) as u16;
+                            }
                         }
                     }
                 }
+                let jxl = Encoder::new(opts.clone())?
+                    .encode(&Frame::rgb(atlas.as_slice(), t, t * changed.len() as u32))?;
+                payload.extend_from_slice(&jxl);
             }
-            let jxl = Encoder::new(opts.clone())?
-                .encode(&Frame::rgb(atlas.as_slice(), t, t * changed.len() as u32))?;
-            payload.extend_from_slice(&jxl);
-        }
-        streams.push((true, payload));
-    }
+            Ok((true, payload))
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
 
     let header = CasvHeader {
         width, height, frame_count: frames.len() as u32, fps_num, fps_den, flags: 0,
@@ -494,36 +504,38 @@ pub fn encode_casv_delta_bbox_rgb8(
     let expected = (width as usize) * (height as usize) * 3;
     let gop = gop_len.max(1) as usize;
 
-    let mut streams: Vec<(bool, bool, Vec<u8>)> = Vec::with_capacity(frames.len());
-    for (idx, px) in frames.iter().enumerate() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
-        }
-        if idx % gop == 0 {
-            streams.push((false, false, encode_rgb8(px, width, height, opts.clone())?));
-            continue;
-        }
-        let prev = frames[idx - 1];
-        let mut payload = Vec::new();
-        match changed_bbox(px, prev, width, height) {
-            None => {
-                for _ in 0..4 {
-                    payload.extend_from_slice(&0u16.to_le_bytes());
+    let streams: Vec<(bool, bool, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            if idx % gop == 0 {
+                return Ok((false, false, encode_rgb8(px, width, height, opts.clone())?));
+            }
+            let prev = frames[idx - 1];
+            let mut payload = Vec::new();
+            match changed_bbox(px, prev, width, height) {
+                None => {
+                    for _ in 0..4 {
+                        payload.extend_from_slice(&0u16.to_le_bytes());
+                    }
+                }
+                Some((x, y, bw, bh)) => {
+                    let cur_crop = crop_rgb(px, width, x, y, bw, bh);
+                    let prev_crop = crop_rgb(prev, width, x, y, bw, bh);
+                    let jxl = encode_residual16(&cur_crop, &prev_crop, bw, bh, &opts)?;
+                    payload.extend_from_slice(&(x as u16).to_le_bytes());
+                    payload.extend_from_slice(&(y as u16).to_le_bytes());
+                    payload.extend_from_slice(&(bw as u16).to_le_bytes());
+                    payload.extend_from_slice(&(bh as u16).to_le_bytes());
+                    payload.extend_from_slice(&jxl);
                 }
             }
-            Some((x, y, bw, bh)) => {
-                let cur_crop = crop_rgb(px, width, x, y, bw, bh);
-                let prev_crop = crop_rgb(prev, width, x, y, bw, bh);
-                let jxl = encode_residual16(&cur_crop, &prev_crop, bw, bh, &opts)?;
-                payload.extend_from_slice(&(x as u16).to_le_bytes());
-                payload.extend_from_slice(&(y as u16).to_le_bytes());
-                payload.extend_from_slice(&(bw as u16).to_le_bytes());
-                payload.extend_from_slice(&(bh as u16).to_le_bytes());
-                payload.extend_from_slice(&jxl);
-            }
-        }
-        streams.push((true, true, payload));
-    }
+            Ok((true, true, payload))
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
 
     let header = CasvHeader {
         width, height, frame_count: frames.len() as u32, fps_num, fps_den, flags: 0,

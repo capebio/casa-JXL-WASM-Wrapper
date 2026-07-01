@@ -399,6 +399,11 @@ Findings:
   compound with the ~5× cheaper lossy tier.)
 - With 16-bit residuals unchanged regions are ~free, so **tile-vs-bbox is now a decode-compute distinction**
   (tile decodes fewer pixels), not a byte one.
+- **Frame-parallel encode (rayon) — landed.** Frames encode independently (lossless residuals need only the
+  previous *source*), so encode is embarrassingly parallel: **~3.5–4.4× faster** on 6 cores (720p lossless
+  intra 182 → 41 ms/f ≈ **24fps encode single-machine**, near-real-time capture), byte-identical output.
+  Decode is still sequential per GOP — **GOP-parallel decode** (independent GOPs across cores) is the
+  follow-on for multi-GOP streams.
 
 ---
 
