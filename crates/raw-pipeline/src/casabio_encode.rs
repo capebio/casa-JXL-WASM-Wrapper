@@ -535,6 +535,99 @@ fn box_downscale_rgba8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh
     true
 }
 
+/// 3-channel twin of [`box_downscale_rgba8`] for the opaque (RGB) cascade.
+///
+/// Box averaging is per-channel independent, so the r/g/b outputs are **byte-identical**
+/// to `box_downscale_rgba8` followed by `strip_rgba_to_rgb` — dropping the alpha channel
+/// from the accumulation cannot perturb the colour math. Operating natively in RGB removes
+/// the alpha plane's averaging+store (≈25% of the inner-loop traffic) and, paired with the
+/// pyramid's RGB-native path, the per-level strip allocation. Proven equal across sizes in
+/// `examples/box_downscale_rgb_parity_flip.rs`.
+fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) -> bool {
+    if dw == 0 || dh == 0 {
+        return false;
+    }
+    // Checked multiply: on 32-bit/WASM targets the product can overflow usize and
+    // wrap to a small value that spuriously passes the length guard.
+    let src_len = (sw as usize).checked_mul(sh as usize).and_then(|n| n.checked_mul(3));
+    let dst_len = (dw as usize).checked_mul(dh as usize).and_then(|n| n.checked_mul(3));
+    let (src_len, dst_len) = match (src_len, dst_len) {
+        (Some(s), Some(d)) => (s, d),
+        _ => return false,
+    };
+    if src.len() < src_len || dst.len() < dst_len {
+        return false;
+    }
+
+    // exact integer fast path (loop-invariant count, mirrors the RGBA variant)
+    if (sw % dw == 0) && (sh % dh == 0) {
+        let xstep = sw / dw;
+        let ystep = sh / dh;
+        let count = xstep * ystep;
+        for dy in 0..dh {
+            for dx in 0..dw {
+                let mut r = 0u32;
+                let mut g = 0u32;
+                let mut b = 0u32;
+                for yy in 0..ystep {
+                    let y = dy * ystep + yy;
+                    let row = &src[(y as usize * sw as usize * 3)..];
+                    for xx in 0..xstep {
+                        let x = dx * xstep + xx;
+                        let px = &row[(x as usize * 3)..];
+                        r += px[0] as u32;
+                        g += px[1] as u32;
+                        b += px[2] as u32;
+                    }
+                }
+                let out = &mut dst[(dy as usize * dw as usize + dx as usize) * 3..];
+                out[0] = (r / count) as u8;
+                out[1] = (g / count) as u8;
+                out[2] = (b / count) as u8;
+            }
+        }
+        return true;
+    }
+
+    // general coverage (ceiling for end) — x ranges hoisted, count hoisted.
+    let x_ranges: Vec<(u32, u32)> = (0..dw)
+        .map(|dx| {
+            let x0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
+            let x1 = (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64)
+                .min(sw as u64) as u32;
+            (x0, x1)
+        })
+        .collect();
+    for dy in 0..dh {
+        let y0 = ((dy as u64 * sh as u64) / dh as u64) as u32;
+        let y1 = (((dy as u64 + 1) * sh as u64 + dh as u64 - 1) / dh as u64).min(sh as u64) as u32;
+        for dx in 0..dw {
+            let (x0, x1) = x_ranges[dx as usize];
+            let count = (x1 - x0) * (y1 - y0);
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            for sy in y0..y1 {
+                let row = &src[(sy as usize * sw as usize * 3)..];
+                for sx in x0..x1 {
+                    let px = &row[(sx as usize * 3)..];
+                    r += px[0] as u32;
+                    g += px[1] as u32;
+                    b += px[2] as u32;
+                }
+            }
+            if count == 0 {
+                continue;
+            }
+            let out = &mut dst[(dy as usize * dw as usize + dx as usize) * 3..];
+            out[0] = (r / count) as u8;
+            out[1] = (g / count) as u8;
+            out[2] = (b / count) as u8;
+        }
+    }
+    true
+}
+
 /// Encode one pyramid level (by butteraugli distance) reusing a held [`Encoder`].
 fn encode_distance_into(
     enc: &mut Encoder,
@@ -558,6 +651,22 @@ fn encode_distance_into(
     Ok(bytes)
 }
 
+/// Encode one pyramid level from an **already-RGB** (3ch) buffer, reusing a held
+/// [`Encoder`]. The RGB-native opaque path carries no alpha plane, so there is no strip:
+/// `pixels` is handed straight to `Frame::rgb`. Output is byte-identical to
+/// `encode_distance_into(.., has_alpha=false)` fed the matching RGBA buffer.
+fn encode_distance_rgb_into(
+    enc: &mut Encoder,
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    distance: f32,
+    effort: u8,
+) -> Result<Vec<u8>, EncodeError> {
+    enc.set_options(EncodeOptions::distance(distance).with_effort(effort));
+    Ok(enc.encode(&Frame::rgb(rgb, w, h))?)
+}
+
 /// Thread count for a single **serial** encode of a `px`-pixel image.
 ///
 /// Returns 1 (→ `Encoder::with_threads` allocates no runner) below ~0.25 MP, where
@@ -574,6 +683,136 @@ fn serial_encode_threads(px: usize) -> usize {
         return 1;
     }
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+/// One sidecar level target: dimensions + butteraugli distance. Channel-agnostic —
+/// shared by the RGBA and RGB-native cascades.
+#[derive(Clone, Copy)]
+struct Sc {
+    tw: u32,
+    th: u32,
+    dist: f32,
+}
+
+/// Build the sidecar level list (sizes→dims, skip no-ops/upscales) and sort it
+/// largest→smallest by long edge. Validates that sizes and distances pair up. Channel-
+/// and pixel-agnostic, so both pyramid entry points share one source of truth for the
+/// cascade shape.
+fn build_sorted_scs(
+    width: u32,
+    height: u32,
+    sidecar_sizes: &[u32],
+    sidecar_distances: &[f32],
+) -> Result<Vec<Sc>, EncodeError> {
+    if sidecar_sizes.len() != sidecar_distances.len() {
+        return Err(EncodeError::Jxl(
+            "sidecar_sizes and sidecar_distances length mismatch".into(),
+        ));
+    }
+    let longer = width.max(height);
+    let mut scs: Vec<Sc> = Vec::new();
+    for (i, &max_dim) in sidecar_sizes.iter().enumerate() {
+        if max_dim == 0 || max_dim >= longer {
+            continue;
+        }
+        let (tw, th) = if width >= height {
+            let tw = max_dim;
+            let th = std::cmp::max(1u32, (((max_dim as u64 * height as u64) + (width as u64 / 2)) / (width as u64)) as u32);
+            (tw, th)
+        } else {
+            let th = max_dim;
+            let tw = std::cmp::max(1u32, (((max_dim as u64 * width as u64) + (height as u64 / 2)) / (height as u64)) as u32);
+            (tw, th)
+        };
+        scs.push(Sc { tw, th, dist: sidecar_distances[i] });
+    }
+
+    // Sort descending by the actual LONG edge so the cascade (largest → smallest)
+    // always downscales, regardless of the order sidecar_sizes was passed in.
+    // Keying on `tw` alone breaks for ultra-narrow portraits (tw saturates to 1 across
+    // levels while th still distinguishes them); max(tw,th) — the long edge, i.e. the
+    // original max_dim — is byte-identical for the monotone cases and restores a strict
+    // downscale for the degenerate ones. Tie-break tw then th for a total order.
+    scs.sort_unstable_by(|a, b| {
+        b.tw.max(b.th)
+            .cmp(&a.tw.max(a.th))
+            .then_with(|| b.tw.cmp(&a.tw))
+            .then_with(|| b.th.cmp(&a.th))
+    });
+    Ok(scs)
+}
+
+/// RGB-native sidecar pyramid: cascade and encode entirely in 3-channel space.
+///
+/// `rgb` is the full-resolution RGB8 master (`width*height*3`). Used by the opaque path
+/// of [`encode_rgba8_pyramid`] (after a single full-frame strip) and directly by
+/// [`encode_rgba8_pyramid_from_rgb16`] (RGB straight out of `process_rgb`, zero strips).
+/// Output is byte-identical to the RGBA cascade + per-level strip it replaces.
+fn pyramid_encode_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    full_distance: f32,
+    scs: &[Sc],
+    effort: u8,
+) -> Result<Vec<PyramidLevel>, EncodeError> {
+    // Phase 1: cascade in RGB (3ch); each level reads the previous level's buffer.
+    let mut scaled_bufs: Vec<(Vec<u8>, u32, u32, f32)> = Vec::with_capacity(scs.len());
+    {
+        let mut cw = width;
+        let mut ch = height;
+        for sc in scs.iter() {
+            let mut buf = vec![0u8; sc.tw as usize * sc.th as usize * 3];
+            let src: &[u8] = if scaled_bufs.is_empty() { rgb } else { &scaled_bufs.last().unwrap().0 };
+            if !box_downscale_rgb8(src, cw, ch, &mut buf, sc.tw, sc.th) {
+                return Err(EncodeError::Resize);
+            }
+            cw = sc.tw;
+            ch = sc.th;
+            scaled_bufs.push((buf, sc.tw, sc.th, sc.dist));
+        }
+    }
+
+    // Phase 2: encode sidecars via Frame::rgb — no per-level strip.
+    #[cfg(feature = "parallel")]
+    let mut sides: Vec<PyramidLevel> = {
+        use rayon::prelude::*;
+        let results: Vec<Result<PyramidLevel, EncodeError>> = scaled_bufs
+            .into_par_iter()
+            .map_init(
+                || Encoder::new(EncodeOptions::default()),
+                |enc_slot, (buf, tw, th, dist)| {
+                    let enc = enc_slot.as_mut().map_err(|_| EncodeError::Jxl("encoder init".into()))?;
+                    let data = encode_distance_rgb_into(enc, &buf, tw, th, dist, effort)?;
+                    Ok(PyramidLevel { data, width: tw, height: th, bits_per_sample: 8 })
+                },
+            )
+            .collect();
+        results.into_iter().collect::<Result<Vec<_>, _>>()?
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let mut sides: Vec<PyramidLevel> = {
+        let mut enc = Encoder::new(EncodeOptions::default())?;
+        let mut v = Vec::with_capacity(scaled_bufs.len());
+        for (buf, tw, th, dist) in scaled_bufs {
+            let data = encode_distance_rgb_into(&mut enc, &buf, tw, th, dist, effort)?;
+            v.push(PyramidLevel { data, width: tw, height: th, bits_per_sample: 8 });
+        }
+        v
+    };
+
+    // Sidecars built largest→smallest; reverse to smallest→largest for consumers.
+    sides.reverse();
+
+    // Full-resolution encode (serial, post-barrier → libjxl gets its own thread runner).
+    let full = {
+        let threads = serial_encode_threads(width as usize * height as usize);
+        let mut enc = Encoder::with_threads(EncodeOptions::default(), threads)?;
+        encode_distance_rgb_into(&mut enc, rgb, width, height, full_distance, effort)?
+    };
+    sides.push(PyramidLevel { data: full, width, height, bits_per_sample: 8 });
+    Ok(sides)
 }
 
 pub fn encode_rgba8_pyramid(
@@ -603,58 +842,22 @@ pub fn encode_rgba8_pyramid(
             got: rgba.len(),
         });
     }
-    if sidecar_sizes.len() != sidecar_distances.len() {
-        return Err(EncodeError::Jxl("sidecar_sizes and sidecar_distances length mismatch".into()));
-    }
     let effort = effort.clamp(1, 10) as u8;
-    let longer = width.max(height);
-
-    #[derive(Clone, Copy)]
-    struct Sc {
-        tw: u32,
-        th: u32,
-        dist: f32,
-    }
-    let mut scs: Vec<Sc> = Vec::new();
-    for (i, &max_dim) in sidecar_sizes.iter().enumerate() {
-        if max_dim == 0 || max_dim >= longer {
-            continue;
-        }
-        let (tw, th) = if width >= height {
-            let tw = max_dim;
-            let th = std::cmp::max(1u32, (((max_dim as u64 * height as u64) + (width as u64 / 2)) / (width as u64)) as u32);
-            (tw, th)
-        } else {
-            let th = max_dim;
-            let tw = std::cmp::max(1u32, (((max_dim as u64 * width as u64) + (height as u64 / 2)) / (height as u64)) as u32);
-            (tw, th)
-        };
-        scs.push(Sc { tw, th, dist: sidecar_distances[i] });
-    }
-
-    // Sort descending by the actual LONG edge so the cascade (largest → smallest)
-    // always downscales, regardless of the order sidecar_sizes was passed in.
-    // Without this, an unsorted input reverses the cascade direction and produces
-    // blurry/tiled artefacts from upscaling smaller intermediate buffers.
-    //
-    // Keying on `tw` alone is correct for landscape and for typical portrait inputs
-    // (there tw is monotone in max_dim), but it breaks for ultra-narrow portraits:
-    // when width≪height, tw saturates to 1 across several levels while th still
-    // distinguishes them. Width-only ordering then leaves an ascending th run, so the
-    // cascade upscales a 1×128 buffer up to 1×512. Ordering by max(tw,th) — the long
-    // edge, i.e. the original max_dim — is byte-identical for the monotone cases and
-    // restores a strict downscale for the degenerate ones. Tie-break tw then th for a
-    // total, deterministic order.
-    scs.sort_unstable_by(|a, b| {
-        b.tw.max(b.th)
-            .cmp(&a.tw.max(a.th))
-            .then_with(|| b.tw.cmp(&a.tw))
-            .then_with(|| b.th.cmp(&a.th))
-    });
+    let scs = build_sorted_scs(width, height, sidecar_sizes, sidecar_distances)?;
 
     // CRAWL F1: only has_alpha is needed here (the strip was discarded); use the
     // zero-allocation scan instead of alpha_strip's full-frame n*3 strip build.
     let has_alpha = has_meaningful_alpha(rgba);
+
+    // Meta-seam cut: on the dominant opaque (RAW) path the alpha plane is pure
+    // ballast — manufactured upstream, averaged at every cascade level, then discarded
+    // by the FFI. Strip the full frame ONCE and run the entire cascade in RGB:
+    // box_downscale_rgb8 is byte-identical to rgba8+strip, and each level encodes via
+    // Frame::rgb with no per-level strip allocation. Alpha images keep the RGBA path.
+    if !has_alpha {
+        let rgb_full = strip_rgba_to_rgb(rgba);
+        return pyramid_encode_rgb(&rgb_full, width, height, full_distance, &scs, effort);
+    }
 
     // Phase 1: cascade all scales sequentially (each level reads from previous).
     // Produces (pixels, w, h, distance) tuples for parallel encoding.
@@ -747,8 +950,26 @@ pub fn encode_rgba8_pyramid_from_rgb16(
     sidecar_distances: &[f32],
     effort: u32,
 ) -> Result<Vec<PyramidLevel>, EncodeError> {
-    let rgba = crate::pipeline::process_rgba(rgb16, params);
-    encode_rgba8_pyramid(&rgba, width, height, full_distance, sidecar_sizes, sidecar_distances, effort)
+    if rgb16.is_empty() || width == 0 || height == 0 {
+        return Err(EncodeError::Jxl("empty or zero-dim input".into()));
+    }
+    // RGB16 shape contract before the pipeline allocates/tone-maps.
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3));
+    if expected != Some(rgb16.len()) {
+        return Err(EncodeError::Size {
+            expected: expected.unwrap_or(usize::MAX),
+            got: rgb16.len(),
+        });
+    }
+    let effort = effort.clamp(1, 10) as u8;
+    let scs = build_sorted_scs(width, height, sidecar_sizes, sidecar_distances)?;
+    // RAW source → always opaque. Tone-map straight to RGB (process_rgb is the byte-exact
+    // 3-channel twin of process_rgba — α was a hardcoded 255 it never needed) so the alpha
+    // plane is never created and the meta-seam never forms. No strip anywhere in this path.
+    let rgb = crate::pipeline::process_rgb(rgb16, params);
+    pyramid_encode_rgb(&rgb, width, height, full_distance, &scs, effort)
 }
 
 #[cfg(test)]
@@ -942,5 +1163,56 @@ mod tests {
         // smallest→largest for consumers; final entry is the full image.
         let dims: Vec<(u32, u32)> = levels.iter().map(|l| (l.width, l.height)).collect();
         assert_eq!(dims, vec![(1, 128), (1, 256), (1, 512), (1, 1000)], "cascade not strictly ascending by long edge");
+    }
+
+    // Deterministic pseudo-random RGBA source (LCG), α set to a constant 255.
+    fn rand_rgba(sw: u32, sh: u32) -> Vec<u8> {
+        let n = (sw * sh) as usize;
+        let mut v = vec![0u8; n * 4];
+        let mut s: u32 = 0x9e37_79b9u32.wrapping_mul(sw).wrapping_add(sh).wrapping_add(1);
+        for px in v.chunks_exact_mut(4) {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            px[0] = (s >> 24) as u8;
+            px[1] = (s >> 16) as u8;
+            px[2] = (s >> 8) as u8;
+            px[3] = 255;
+        }
+        v
+    }
+
+    /// The meta-seam invariant: box averaging is per-channel independent, so the RGB-native
+    /// downscale must be byte-identical to the 4-channel downscale followed by an alpha strip,
+    /// for both the exact-ratio and general-coverage branches.
+    #[test]
+    fn box_downscale_rgb8_matches_rgba8_then_strip() {
+        // (sw, sh, dw, dh): first two exact ratios, last two general (non-divisor).
+        let cases = [(8, 8, 4, 4), (12, 9, 4, 3), (7, 5, 3, 2), (13, 11, 5, 4)];
+        for (sw, sh, dw, dh) in cases {
+            let rgba = rand_rgba(sw, sh);
+            let rgb = strip_rgba_to_rgb(&rgba);
+
+            let mut dst_rgba = vec![0u8; (dw * dh * 4) as usize];
+            let mut dst_rgb = vec![0u8; (dw * dh * 3) as usize];
+            assert!(box_downscale_rgba8(&rgba, sw, sh, &mut dst_rgba, dw, dh));
+            assert!(box_downscale_rgb8(&rgb, sw, sh, &mut dst_rgb, dw, dh));
+
+            let stripped = strip_rgba_to_rgb(&dst_rgba);
+            assert_eq!(
+                stripped, dst_rgb,
+                "rgb8 downscale != rgba8+strip at {sw}x{sh}->{dw}x{dh}"
+            );
+        }
+    }
+
+    /// `process_rgb` must be the byte-exact 3ch twin of `process_rgba` (α was a constant 255
+    /// the opaque path strips anyway). Guards the meta-seam's upstream half.
+    #[test]
+    fn process_rgb_matches_process_rgba_stripped() {
+        let params = crate::pipeline::PipelineParams::default_olympus();
+        // A spread of 16-bit values across the LUT domain.
+        let rgb16: Vec<u16> = (0..(13 * 7 * 3)).map(|i| ((i * 911) % 65536) as u16).collect();
+        let rgba = crate::pipeline::process_rgba(&rgb16, &params);
+        let rgb = crate::pipeline::process_rgb(&rgb16, &params);
+        assert_eq!(rgb, strip_rgba_to_rgb(&rgba), "process_rgb != strip(process_rgba)");
     }
 }

@@ -2004,6 +2004,73 @@ pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     out
 }
 
+/// Byte-exact 3-channel twin of [`process_rgba`]: tone-maps RGB16 → RGB8 with **no alpha
+/// plane**. `process_rgba` writes a hardcoded `α = 255` the opaque (RAW) encode path strips
+/// straight back off; emitting RGB directly removes that per-pixel write, a 25%-smaller
+/// output buffer, and the downstream strip. The r/g/b bytes are identical to
+/// `process_rgba` — same pre/post LUTs, same tone math, same clamp — so
+/// `process_rgb(x) == strip_rgba_to_rgb(process_rgba(x))` for all inputs.
+pub fn process_rgb(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
+    debug_assert_eq!(rgb16.len() % 3, 0);
+    let ti = derive_tone_inputs(params);
+    let fallback = CAM_TO_SRGB;
+    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let n = rgb16.len() / 3;
+    let mut out = vec![0u8; n * 3];
+
+    #[cfg(not(feature = "parallel"))]
+    {
+        LUT_CACHE.with(|cache_cell| {
+            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
+            let cache = cache_cell.borrow();
+            let c = cache.as_ref().unwrap();
+            let pre_lut_mask = c.pre_lut_len - 1;
+            let pre_lut_shift = c.pre_lut_shift;
+            // unsafe: src advances rgb16.len(); dst advances n*3 == out.len(). In-bounds.
+            unsafe {
+                let nbytes = rgb16.len();
+                let mut src = rgb16.as_ptr();
+                let mut dst = out.as_mut_ptr();
+                let src_end = src.add(nbytes);
+                let pre_r = c.pre_r.as_ptr();
+                let pre_g = c.pre_g.as_ptr();
+                let pre_b = c.pre_b.as_ptr();
+                let post = c.post.as_ptr();
+                while src < src_end {
+                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
+                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
+                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
+                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
+                    *dst = *post.add(r2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                    *dst = *post.add(g2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                    *dst = *post.add(b2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "parallel")]
+    {
+        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) = LUT_CACHE.with(|cache_cell| {
+            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
+            let c = cache_cell.borrow();
+            let cr = c.as_ref().unwrap();
+            (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post.clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
+        });
+        out.par_chunks_mut(3).zip(rgb16.par_chunks(3)).with_min_len(4096).for_each(|(out_px, in_px)| {
+            let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+            let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+            let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+            let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
+            out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
+            out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
+            out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
+        });
+    }
+
+    out
+}
+
 /// Gray-world auto-WB from raw Bayer (RGGB) pixels.  Returns (r_gain,
 /// b_gain) normalised so G_gain = 1.0.  Samples every 8×8 block to keep it
 /// cheap (strides by 8).  Assumes an RGGB CFA at (0,0). Clamps the result to a sane range so a colour-cast scene (e.g.

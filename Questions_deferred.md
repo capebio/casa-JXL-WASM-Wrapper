@@ -979,6 +979,15 @@ data shape, a schedule, or a public contract and needs its own parity + ratio/th
 benchmark. Logged largest-lever first.
 
 **D1 — RGB-native downscale + encode for opaque (RAW/RGB16) inputs.** *Biggest lever.*
+**✅ LANDED (pyramid half) — branch `perf/casabio-rgb-native-jun30-d1x9` @cbcb5d73, stacked
+on the sweep branch.** `pipeline::process_rgb` (byte-exact 3ch twin of `process_rgba`) +
+`box_downscale_rgb8` (byte-exact: per-channel box averaging) + RGB-native `pyramid_encode_rgb`.
+`encode_rgba8_pyramid` opaque path strips once up front then cascades in RGB; `_from_rgb16`
+tone-maps straight to RGB (zero strips). Parity byte-identical (2 unit tests + flipflop
+`box_downscale_rgb_parity_flip` all sizes); per-level downscale+strip +13.8..28.4%; 14/14
+MSVC tests pass. **Still deferred: the variant-path half** (`encode_variants*`) — that path
+resizes via the `image` crate (Lanczos/Triangle) in 4ch then strips; an RGB-native variant
+needs an `image` RGB resize + parity check and is a separate pass. Original analysis below.
 The dominant RAW path is `has_alpha == false`, yet the whole pipeline carries 4 channels:
 `box_downscale_rgba8` averages and stores the alpha plane at every cascade level, then
 `strip_rgba_to_rgb` discards it immediately before each `Frame::rgb` encode. For a 24 MP
