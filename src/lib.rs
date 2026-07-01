@@ -712,7 +712,9 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
         if should_stream_previews(need_previews, need_full_rgb, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
             let t = now_ms();
             let previews = raw_pipeline::stream_preview::build_previews_streaming(
-                strip, w, h, &[(lb_w, lb_h), (thumb_w, thumb_h)],
+                raw_pipeline::decompress::OrfRowDecoder::new(strip, w, h)
+                    .map_err(|e| JsError::new(&e))?,
+                w, h, (0, 0), &[(lb_w, lb_h), (thumb_w, thumb_h)],
             ).map_err(|e| JsError::new(&e))?;
             let stream_ms = now_ms() - t;
             let mut it = previews.into_iter();

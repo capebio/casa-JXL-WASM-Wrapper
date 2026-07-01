@@ -692,18 +692,28 @@ pub fn demosaic_rggb_shuffle_simd(raw: &[u16], width: usize, height: usize) -> R
 /// ML thumbnail inference. ~¼ the output work of full demosaic + downscale.
 /// Demosaic `k_rows` raw rows (k_rows even, starting at an even raw row) into
 /// half-resolution interleaved RGB16. `out_half` len must be (k_rows/2)*(width/2)*3.
-/// Byte-identical to the matching chunk of `demosaic_rggb_half`.
-pub fn demosaic_half_band(raw_strip: &[u16], width: usize, k_rows: usize, out_half: &mut [u16]) {
+/// `phase` = position of R in the 2x2 tile (RGGB=(0,0), Grbg=(0,1), Gbrg=(1,0),
+/// Bggr=(1,1)): R at `phase`, B at the diagonal-opposite cell, G = mean of the
+/// other two. RGGB reduces to the original expression (byte-identical).
+pub fn demosaic_half_band(
+    raw_strip: &[u16], width: usize, k_rows: usize, phase: (u8, u8), out_half: &mut [u16],
+) {
     let hw = width / 2;
+    let (pr, pc) = (phase.0 as usize, phase.1 as usize);
     let do_row = |qr: usize, out_row: &mut [u16]| {
-        let top = &raw_strip[(2 * qr) * width..(2 * qr) * width + width];
-        let bot = &raw_strip[(2 * qr + 1) * width..(2 * qr + 1) * width + width];
+        let r0 = &raw_strip[(2 * qr) * width..(2 * qr) * width + width];
+        let r1 = &raw_strip[(2 * qr + 1) * width..(2 * qr + 1) * width + width];
+        let rows = [r0, r1];
         for qc in 0..hw {
             let c0 = 2 * qc;
+            let at = |dr: usize, dc: usize| rows[dr][c0 + dc] as u32;
+            let r = at(pr, pc);
+            let b = at(1 - pr, 1 - pc);
+            let g = (at(pr, 1 - pc) + at(1 - pr, pc)) >> 1;
             let o = qc * 3;
-            out_row[o]     = top[c0];
-            out_row[o + 1] = ((top[c0 + 1] as u32 + bot[c0] as u32) >> 1) as u16;
-            out_row[o + 2] = bot[c0 + 1];
+            out_row[o] = r as u16;
+            out_row[o + 1] = g as u16;
+            out_row[o + 2] = b as u16;
         }
     };
     #[cfg(feature = "parallel")]
@@ -723,8 +733,8 @@ pub fn demosaic_rggb_half(raw: &[u16], width: usize, height: usize) -> Result<Ve
         .and_then(|n| n.checked_mul(3))
         .ok_or_else(|| format!("demosaic: half {}×{}×3 overflows usize", hw, hh))?;
     let mut rgb = vec![0u16; n3];
-    // Delegate to the banded kernel over the whole frame (first 2*hh rows).
-    demosaic_half_band(&raw[..(2 * hh) * width], width, 2 * hh, &mut rgb);
+    // Delegate to the banded kernel over the whole frame (first 2*hh rows). RGGB phase.
+    demosaic_half_band(&raw[..(2 * hh) * width], width, 2 * hh, (0, 0), &mut rgb);
     Ok(rgb)
 }
 
@@ -1619,6 +1629,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn half_band_phase_matches_reference() {
+        fn ref_half(raw: &[u16], w: usize, h: usize, phase: (u8, u8)) -> Vec<u16> {
+            let (hw, hh) = (w / 2, h / 2);
+            let (pr, pc) = (phase.0 as usize, phase.1 as usize);
+            let mut out = vec![0u16; hw * hh * 3];
+            for qr in 0..hh {
+                for qc in 0..hw {
+                    let at = |dr: usize, dc: usize| raw[(2 * qr + dr) * w + (2 * qc + dc)] as u32;
+                    let r = at(pr, pc);
+                    let b = at(1 - pr, 1 - pc);
+                    let g = (at(pr, 1 - pc) + at(1 - pr, pc)) >> 1;
+                    let o = (qr * hw + qc) * 3;
+                    out[o] = r as u16; out[o + 1] = g as u16; out[o + 2] = b as u16;
+                }
+            }
+            out
+        }
+        let (w, h) = (8usize, 6usize);
+        let raw: Vec<u16> = (0..(w * h)).map(|i| ((i * 53 + 11) & 0x0fff) as u16).collect();
+        for phase in [(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
+            let want = ref_half(&raw, w, h, phase);
+            let mut got = vec![0u16; (w / 2) * (h / 2) * 3];
+            demosaic_half_band(&raw, w, h, phase, &mut got);
+            assert_eq!(got, want, "phase {:?}", phase);
+        }
+    }
+
+    #[test]
     fn half_band_matches_full() {
         let (w, h) = (16usize, 12usize);
         let raw: Vec<u16> = (0..(w * h)).map(|i| ((i * 37 + 5) & 0x0fff) as u16).collect();
@@ -1634,7 +1672,7 @@ mod tests {
             while r + band_rows <= h {
                 let strip = &raw[r * w..(r + band_rows) * w];
                 let mut out = vec![0u16; (band_rows / 2) * hw * 3];
-                demosaic_half_band(strip, w, band_rows, &mut out);
+                demosaic_half_band(strip, w, band_rows, (0, 0), &mut out);
                 got.extend_from_slice(&out);
                 r += band_rows;
             }

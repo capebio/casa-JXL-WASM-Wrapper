@@ -1,7 +1,7 @@
 //! Streaming, bounded-memory ORF preview build: decode → half-demosaic →
 //! box-downscale, one strip at a time. Byte-identical to the full-frame path.
 
-use crate::decompress::{for_each_strip, OrfRowDecoder};
+use crate::decompress::{for_each_strip, OrfRowDecoder, RawRowSource};
 use crate::demosaic::demosaic_half_band;
 
 /// Even strip height. Larger = fewer rayon dispatches + coarser demosaic grain
@@ -143,28 +143,31 @@ impl StreamingBoxDownscale {
     }
 }
 
-/// Fully streaming ORF preview build. Decodes `compressed` in even strips, half-
-/// demosaics each strip, and box-downscales into one packed LE u16 buffer per target
-/// (width,height). Never materializes the full raw or the full half-res image. Byte-
-/// identical to `decompress -> demosaic_rggb_half -> downscale_rgb16_impl`.
-pub fn build_previews_streaming(
-    compressed: &[u8],
+/// Fully streaming preview build over any [`RawRowSource`]. Decodes in even strips,
+/// half-demosaics each strip with `phase`, and box-downscales into one packed LE u16
+/// buffer per target (width,height). Never materializes the full raw or the full
+/// half-res image. `w`/`h` are the full mosaic dims of `source`. For ORF (RGGB,
+/// phase (0,0)) this is byte-identical to `decompress -> demosaic_rggb_half -> downscale`.
+pub fn build_previews_streaming<S: RawRowSource>(
+    mut source: S,
     w: usize,
     h: usize,
+    phase: (u8, u8),
     targets: &[(usize, usize)],
 ) -> Result<Vec<Vec<u8>>, String> {
     let (hw, hh) = (w / 2, h / 2);
     if hw == 0 || hh == 0 {
         return Err(format!("stream_preview: {}×{} too small for half-res", w, h));
     }
-    let mut dec = OrfRowDecoder::new(compressed, w, h)?;
+    debug_assert_eq!(source.width(), w);
+    debug_assert_eq!(source.height(), h);
     let mut downs: Vec<StreamingBoxDownscale> =
         targets.iter().map(|&(dw, dh)| StreamingBoxDownscale::new(hw, hh, dw, dh)).collect();
 
     let mut scratch: Vec<u16> = Vec::new();
     let mut half_strip = vec![0u16; (STRIP_ROWS / 2) * hw * 3];
 
-    for_each_strip(&mut dec, STRIP_ROWS, &mut scratch, |_first_row, k, raw_strip| {
+    for_each_strip(&mut source, STRIP_ROWS, &mut scratch, |_first_row, k, raw_strip| {
         // Only whole 2-row pairs demosaic; a trailing odd row (only possible on the
         // final strip when h is odd) is dropped, matching hh = h/2.
         let keven = k & !1;
@@ -173,7 +176,7 @@ pub fn build_previews_streaming(
         }
         let half_rows = keven / 2;
         let hs = &mut half_strip[..half_rows * hw * 3];
-        demosaic_half_band(&raw_strip[..keven * w], w, keven, hs);
+        demosaic_half_band(&raw_strip[..keven * w], w, keven, phase, hs);
         for hr in 0..half_rows {
             let row = &hs[hr * hw * 3..(hr + 1) * hw * 3];
             for d in downs.iter_mut() {
@@ -294,7 +297,9 @@ mod tests {
         let th = reference_downscale(&half, hw, hh, 8, 6);   // integer dims
 
         // streaming
-        let got = build_previews_streaming(&payload, w, h, &[(20, 15), (8, 6)]).unwrap();
+        let got = build_previews_streaming(
+            OrfRowDecoder::new(&payload, w, h).unwrap(), w, h, (0, 0), &[(20, 15), (8, 6)],
+        ).unwrap();
         assert_eq!(got[0], lb, "lightbox differs");
         assert_eq!(got[1], th, "thumb differs");
     }
@@ -317,7 +322,11 @@ mod tests {
             let _a = reference_downscale(&half, hw, hh, targets[0].0, targets[0].1);
             let _b = reference_downscale(&half, hw, hh, targets[1].0, targets[1].1);
         };
-        let stream = || { let _ = build_previews_streaming(&payload, w, h, &targets).unwrap(); };
+        let stream = || {
+            let _ = build_previews_streaming(
+                OrfRowDecoder::new(&payload, w, h).unwrap(), w, h, (0, 0), &targets,
+            ).unwrap();
+        };
 
         let iters = 30u32;
         let (mut tf, mut ts) = (0u128, 0u128);
