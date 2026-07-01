@@ -1003,3 +1003,26 @@ untouched and want their own flip/parity before any change:
   Out of avx2.rs's seam scope (separate kernels), but the higher-ROI target if ref-build
   latency matters. Output shift from the SIMD-ref change measured 0.00e0 (f32 metric
   resolution), so it is purely a latency question.
+  **UPDATE (landed):** the SIMD `box_blur` shipped — `simd::avx2::box_blur_avx2`
+  (8-wide vertical pass), dispatched via `blur_mask`. Bit-exact; flip +13.7/11.3/30.1%
+  at 1/6/24 MP; aggregate ref-build now +27/20/26% (from +4–10%). Remaining ref-build
+  follow-ups below.
+
+- **`ref_moments` → reuse `ssim_moments_avx2_cal(b, b, np)`.** ref_moments (per-channel
+  Σy, Σy² over ref RGBA) is exactly the (sa, saa) the channel-as-lane SSIM kernel already
+  computes; `sab = Σy·y = Σy²` so `(sa, saa) == (sb, sbb)`, integer-exact. Dispatch it at
+  mod.rs (like `blur_mask`) for Avx2/Avx512 backends. Low ROI (one bandwidth-bound integer
+  pass, ~1.4× → ~10 ms @24MP) but near-zero code — reuses a flip-proven kernel. Not done to
+  keep the box_blur change focused.
+
+- **`box_blur` allocates+zeroes `tmp`+`dst` (2× n f32 = 192 MB @24MP) that are then fully
+  overwritten** — the `vec![0f32; n]` memset is wasted work. `box_blur_avx2` writes every
+  element of both before any read (H fills tmp, V+remainder fill dst), so uninit alloc
+  (`Box<[MaybeUninit<f32>]>` / `Vec::with_capacity`+`set_len`) is sound there and saves the
+  192 MB zeroing. Adds `unsafe`; measure separately (the flip zeroes both arms so it is
+  apples-to-apples today). Applies to scalar `box_blur` too.
+
+- **Parallelise / widen box_blur.** (a) The H rows and V column-tiles are independent →
+  rayon over `y` (H) and over the `x` tile stride (V), gated on `parallel`. (b) AVX-512 /
+  wasm-SIMD `box_blur` for those backends (currently fall back to scalar V). (c) Fold the
+  3-level mask blur into the pyramid walk to avoid re-blurring re-read planes.
