@@ -54,6 +54,9 @@ pub struct RawStreamExporter {
     // mutated or moved after construction, so the 'static borrow inside `src` stays valid for the
     // struct's whole life — a sound self-reference.
     src: BandSrc,
+    // Never read directly — it owns the heap bytes that `src` borrows (see note above), so it must
+    // outlive `src`. rustc can't see the unsafe 'static borrow, hence the allow.
+    #[allow(dead_code)]
     bytes: Box<[u8]>,
     w: usize,
     h: usize,
