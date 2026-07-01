@@ -186,6 +186,31 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
     })
 }
 
+/// Decode one row-tile band `tr` (comp=7 LJPEG tiles) into `band` (len == active_h*width,
+/// rows [tr*tl, min((tr+1)*tl, height))). Shared by `decode_tiles` (parallel full-frame
+/// blit) and the streaming `DngRowSource`. Byte-identical to the previous inline closure.
+fn decode_band_into(
+    data: &[u8], raw: &RawIfd, width: usize, height: usize,
+    tw: usize, tl: usize, coltiles: usize, tr: usize, band: &mut [u16],
+) -> Result<()> {
+    let row_start = tr * tl;
+    let row_end = ((tr + 1) * tl).min(height);
+    let active_h = row_end - row_start;
+    for tc in 0..coltiles {
+        let idx = tr * coltiles + tc;
+        let off = raw.tile_offsets[idx] as usize;
+        let bc = raw.tile_byte_counts[idx] as usize;
+        let end = off.checked_add(bc).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let src = data.get(off..end).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let col_start = tc * tw;
+        let col_end = ((tc + 1) * tw).min(width);
+        let active_w = col_end - col_start;
+        ljpeg::decode_tile(src, band, col_start, width, active_w, active_h)
+            .with_context(|| format!("tile r={tr} c={tc}"))?;
+    }
+    Ok(())
+}
+
 /// Decode LJPEG tiles (compression=7) directly into the strided output mosaic,
 /// parallelised over **row-tile bands**.
 ///
@@ -236,29 +261,7 @@ fn decode_tiles(
     // [tr*tl, row_end) at full `width` stride, so a tile at column tc writes its active
     // sub-rect at base = col_start (row 0 of the band), stride = width.
     let decode_band = |tr: usize, band: &mut [u16]| -> Result<()> {
-        let row_start = tr * tl;
-        let row_end = ((tr + 1) * tl).min(height);
-        let active_h = row_end - row_start; // == band.len() / width
-        for tc in 0..coltiles {
-            let idx = tr * coltiles + tc;
-            let off = raw.tile_offsets[idx] as usize;
-            let bc = raw.tile_byte_counts[idx] as usize;
-            // checked_add (000-security-11): off+bc can wrap usize on wasm32.
-            let end = off.checked_add(bc).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
-            let src = data
-                .get(off..end)
-                .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
-            let col_start = tc * tw;
-            let col_end = ((tc + 1) * tw).min(width);
-            let active_w = col_end - col_start;
-            // Decode the active sub-rect straight into the band. decode_tile clamps its
-            // writes to active_w×active_h (active ≤ the tile's SOF dims for valid DNGs:
-            // interior tiles are exactly tw×tl, edge tiles are smaller) and bounds-checks
-            // its destination — same contract the fused band path relies on.
-            ljpeg::decode_tile(src, band, col_start, width, active_w, active_h)
-                .with_context(|| format!("tile r={tr} c={tc}"))?;
-        }
-        Ok(())
+        decode_band_into(data, raw, width, height, tw, tl, coltiles, tr, band)
     };
 
     // par_chunks_mut(tl*width) yields exactly `rowtiles` disjoint bands (the last shorter
