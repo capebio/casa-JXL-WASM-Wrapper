@@ -9,6 +9,10 @@
 //! let casv = encode_casv_rgb8(&[&frame0, &frame1], w, h, 24, 1, EncodeOptions::lossless())?;
 //! let (px, w, h) = decode_casv_frame_rgb8(&casv, 1).unwrap(); // O(1) random access
 //! ```
+//!
+//! GOP delta (P2): `encode_casv_delta_rgb8(frames, w, h, fps_num, fps_den, gop_len, opts)`
+//! codes frame `i%gop_len==0` as an I-frame and the rest as wrapping-residual
+//! P-frames vs the previous frame (single-reference, lossless ⇒ drift-free).
 
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
@@ -19,6 +23,9 @@ pub const CASV_MAGIC: u32 = 0x5641_5343; // 'CASV' little-endian
 pub const CASV_VERSION: u32 = 1;
 pub const CASV_HEADER_BYTES: usize = 32;
 pub const CASV_INDEX_ENTRY_BYTES: usize = 8;
+/// Top bit of an index `len` field flags a P-frame (delta vs previous frame).
+/// All-intra files leave it 0, so they remain valid.
+pub const CASV_PFRAME_FLAG: u32 = 0x8000_0000;
 
 #[derive(thiserror::Error, Debug)]
 pub enum VideoError {
@@ -134,10 +141,88 @@ pub fn encode_casv_rgb8(
     Ok(out)
 }
 
+/// Per-byte wrapping residual `cur - prev`. Reconstructs exactly via
+/// `prev.wrapping_add(residual)`.
+fn wrapping_residual(cur: &[u8], prev: &[u8]) -> Vec<u8> {
+    cur.iter().zip(prev).map(|(&c, &p)| c.wrapping_sub(p)).collect()
+}
+
+/// Encode RGB8 frames with a GOP: frame `i` is an I-frame when `i % gop_len == 0`,
+/// otherwise a P-frame carrying the wrapping residual vs the previous frame.
+/// `gop_len == 1` ⇒ all-intra (identical bytes to `encode_casv_rgb8`).
+///
+/// Coded lossless ⇒ drift-free (reconstruction equals source), so no in-loop
+/// decode is needed. `opts` should be `EncodeOptions::lossless()` for v0.
+pub fn encode_casv_delta_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    gop_len: u32,
+    opts: EncodeOptions,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+    let gop = gop_len.max(1) as usize;
+
+    // (is_p, jxl_bytes) per frame.
+    let mut streams: Vec<(bool, Vec<u8>)> = Vec::with_capacity(frames.len());
+    for (idx, px) in frames.iter().enumerate() {
+        if px.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+        }
+        let is_p = idx % gop != 0;
+        let payload = if is_p {
+            wrapping_residual(px, frames[idx - 1])
+        } else {
+            px.to_vec()
+        };
+        streams.push((is_p, encode_rgb8(&payload, width, height, opts.clone())?));
+    }
+
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: frames.len() as u32,
+        fps_num,
+        fps_den,
+        flags: 0,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+
+    let mut offset = data_start;
+    for (is_p, s) in &streams {
+        let mut len_field = s.len() as u32;
+        if *is_p {
+            len_field |= CASV_PFRAME_FLAG;
+        }
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&len_field.to_le_bytes());
+        offset += s.len();
+    }
+    for (_, s) in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
 /// Borrow the JXL codestream bytes for frame `index`, validated against the
 /// index table and file bounds. `None` if `index` is out of range or the index
 /// entry points outside the file.
 pub fn casv_frame_slice(data: &[u8], index: usize) -> Option<&[u8]> {
+    casv_frame_info(data, index).map(|(_, slice)| slice)
+}
+
+/// Like `casv_frame_slice` but also reports whether the frame is a P-frame
+/// (delta) vs an I-frame (keyframe).
+pub fn casv_frame_info(data: &[u8], index: usize) -> Option<(bool, &[u8])> {
     let hdr = parse_casv_header(data)?;
     if index >= hdr.frame_count as usize {
         return None;
@@ -147,26 +232,70 @@ pub fn casv_frame_slice(data: &[u8], index: usize) -> Option<&[u8]> {
         return None;
     }
     let offset = u32::from_le_bytes(data[entry..entry + 4].try_into().ok()?) as usize;
-    let len = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?) as usize;
+    let len_field = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?);
+    let is_p = (len_field & CASV_PFRAME_FLAG) != 0;
+    let len = (len_field & !CASV_PFRAME_FLAG) as usize;
     let end = offset.checked_add(len)?;
     if offset < CASV_HEADER_BYTES || end > data.len() {
         return None;
     }
-    Some(&data[offset..end])
+    Some((is_p, &data[offset..end]))
 }
 
-/// Decode a single frame to interleaved RGB8 `(pixels, width, height)`.
+/// In-place `base[i] = base[i].wrapping_add(residual[i])`.
+fn wrapping_add_into(base: &mut [u8], residual: &[u8]) {
+    for (b, &r) in base.iter_mut().zip(residual) {
+        *b = b.wrapping_add(r);
+    }
+}
+
+/// Index of the I-frame at or before `index` (the GOP start needed to decode it).
+fn preceding_iframe(data: &[u8], index: usize) -> Option<usize> {
+    (0..=index)
+        .rev()
+        .find(|&j| casv_frame_info(data, j).map(|(is_p, _)| !is_p).unwrap_or(false))
+}
+
+/// Decode a single frame to interleaved RGB8 `(pixels, width, height)`. For a
+/// P-frame this decodes forward from the preceding I-frame (O(GOP)),
+/// reconstructing each residual.
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
-    let stream = casv_frame_slice(data, index)?;
-    decode_interleaved::<u8>(stream, 3)
+    let start = preceding_iframe(data, index)?;
+    let mut recon: Option<(Vec<u8>, u32, u32)> = None;
+    for i in start..=index {
+        let (is_p, slice) = casv_frame_info(data, i)?;
+        let (payload, w, h) = decode_interleaved::<u8>(slice, 3)?;
+        recon = Some(if is_p {
+            let (mut prev, _, _) = recon.take()?;
+            wrapping_add_into(&mut prev, &payload);
+            (prev, w, h)
+        } else {
+            (payload, w, h)
+        });
+    }
+    recon
 }
 
-/// Decode every frame in order. `None` if any frame fails to decode.
+/// Decode every frame in order, reconstructing P-frames against the running
+/// previous frame. `None` if any frame fails to decode.
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
-    (0..hdr.frame_count as usize)
-        .map(|i| decode_casv_frame_rgb8(data, i))
-        .collect()
+    let mut out = Vec::with_capacity(hdr.frame_count as usize);
+    let mut prev: Option<Vec<u8>> = None;
+    for i in 0..hdr.frame_count as usize {
+        let (is_p, slice) = casv_frame_info(data, i)?;
+        let (payload, w, h) = decode_interleaved::<u8>(slice, 3)?;
+        let recon = if is_p {
+            let mut base = prev.take()?;
+            wrapping_add_into(&mut base, &payload);
+            base
+        } else {
+            payload
+        };
+        prev = Some(recon.clone());
+        out.push((recon, w, h));
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -269,5 +398,104 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 5];
         let last = parse_casv_header(&bytes).unwrap().frame_count as usize - 1;
         assert!(casv_frame_slice(truncated, last).is_none());
+    }
+
+    #[test]
+    fn frame_flag_encodes_in_len_top_bit() {
+        let (w, h) = (12u32, 8u32);
+        let src: Vec<Vec<u8>> = (0..3).map(|s| gradient(w, h, (s * 20) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::lossless()).unwrap();
+        for i in 0..3 {
+            let (is_p, slice) = casv_frame_info(&bytes, i).expect("info");
+            assert!(!is_p, "all-intra frame {i} must be I");
+            assert_eq!(slice, casv_frame_slice(&bytes, i).unwrap());
+        }
+        assert!(casv_frame_info(&bytes, 3).is_none()); // out of range
+    }
+
+    #[test]
+    fn delta_encode_sets_gop_frame_types() {
+        let (w, h) = (16u32, 16u32);
+        let src: Vec<Vec<u8>> = (0..8).map(|s| gradient(w, h, (s * 8) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_delta_rgb8(&refs, w, h, 24, 1, 4, EncodeOptions::lossless()).unwrap();
+
+        let expect_i = [true, false, false, false, true, false, false, false];
+        for i in 0..8 {
+            let (is_p, _) = casv_frame_info(&bytes, i).unwrap();
+            assert_eq!(is_p, !expect_i[i], "frame {i} type");
+        }
+        let all_i = encode_casv_delta_rgb8(&refs, w, h, 24, 1, 1, EncodeOptions::lossless()).unwrap();
+        for i in 0..8 {
+            assert!(!casv_frame_info(&all_i, i).unwrap().0, "gop=1 frame {i} must be I");
+        }
+    }
+
+    #[test]
+    fn delta_roundtrip_is_byte_exact() {
+        let (w, h) = (32u32, 24u32);
+        let src: Vec<Vec<u8>> = (0..8).map(|s| gradient(w, h, (s * 11) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_delta_rgb8(&refs, w, h, 24, 1, 4, EncodeOptions::lossless()).unwrap();
+
+        let all = decode_casv_all_rgb8(&bytes).expect("decode all");
+        assert_eq!(all.len(), 8);
+        for (i, (px, dw, dh)) in all.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
+            assert_eq!(px, &src[i], "frame {i} must reconstruct byte-exact through P-frames");
+        }
+    }
+
+    // A near-static sequence: fixed background + a small moving square.
+    fn low_motion(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
+        let base = gradient(w, h, 7);
+        (0..n)
+            .map(|f| {
+                let mut v = base.clone();
+                let cx = (2 + f as u32) % (w - 4);
+                for yy in (h / 2)..(h / 2 + 3) {
+                    for xx in cx..cx + 3 {
+                        let o = ((yy * w + xx) * 3) as usize;
+                        v[o] = 255;
+                        v[o + 1] = 0;
+                        v[o + 2] = 0;
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn delta_beats_intra_on_low_motion() {
+        let (w, h) = (64u32, 64u32);
+        let src = low_motion(w, h, 8);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::lossless()).unwrap();
+        let delta = encode_casv_delta_rgb8(&refs, w, h, 24, 1, 8, EncodeOptions::lossless()).unwrap();
+        assert!(
+            (delta.len() as f64) < 0.6 * (intra.len() as f64),
+            "delta ({}) should be well under 60% of intra ({}) on low-motion",
+            delta.len(),
+            intra.len()
+        );
+        let out = decode_casv_all_rgb8(&delta).unwrap();
+        for (i, (px, _, _)) in out.iter().enumerate() {
+            assert_eq!(px, &src[i], "low-motion frame {i} exact");
+        }
+    }
+
+    #[test]
+    fn random_access_to_pframe_reconstructs() {
+        let (w, h) = (24u32, 20u32);
+        let src: Vec<Vec<u8>> = (0..8).map(|s| gradient(w, h, (s * 9) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_delta_rgb8(&refs, w, h, 24, 1, 4, EncodeOptions::lossless()).unwrap();
+
+        let (px6, _, _) = decode_casv_frame_rgb8(&bytes, 6).expect("frame 6");
+        assert_eq!(px6, src[6]);
+        let (px4, _, _) = decode_casv_frame_rgb8(&bytes, 4).expect("frame 4");
+        assert_eq!(px4, src[4]);
     }
 }
