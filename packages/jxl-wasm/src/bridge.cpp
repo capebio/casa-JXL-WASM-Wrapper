@@ -835,9 +835,16 @@ void ChunkedOutFinal(void* op, uint64_t finalized_position) {
 
 }  // namespace
 
-static JxlWasmBuffer* EncodeRgbChunked(
-    const uint8_t* pixels, uint32_t width, uint32_t height, float distance, uint32_t effort) {
-  if (pixels == nullptr || width == 0 || height == 0) return MakeError(20);
+// Shared chunked-encode core: basic info (3ch 8-bit sRGB), frame settings (effort + buffering=2,
+// lossless when distance<=0), the growable output processor, and drive the whole encode via
+// AddChunkedFrame(is_last=TRUE) over the given input `source`. Used by BOTH the whole-buffer
+// chunked encode (EncodeRgbChunked) and the JS-pull streaming encode (EncodeRgbStream), so all of
+// {whole-frame, chunked, streamed} stay byte-identical. `source` (and whatever its opaque points
+// to) must stay alive across this call — AddChunkedFrame invokes the callbacks synchronously.
+static JxlWasmBuffer* EncodeViaChunkedSource(
+    uint32_t width, uint32_t height, float distance, uint32_t effort,
+    JxlChunkedFrameInputSource source) {
+  if (width == 0 || height == 0) return MakeError(20);
 
   JxlEncoder* enc = JxlEncoderCreate(nullptr);
   if (enc == nullptr) return MakeError(21);
@@ -861,10 +868,10 @@ static JxlWasmBuffer* EncodeRgbChunked(
 
   JxlEncoderFrameSettings* frame = JxlEncoderFrameSettingsCreate(enc, nullptr);
   JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT, static_cast<int64_t>(effort));
-  // Streaming input buffering (present since libjxl 0.10; the shipped bridge builds 0.11.2 —
-  // build-manifest.json). OUTPUT_MODE / USE_FULL_IMAGE_HEURISTICS (0.12) are deliberately NOT set
-  // here: they are absent in 0.11.2 and the native proof showed they don't change output bytes
-  // (chunked == whole). Add them in P2b when the bridge moves to the libjxl-012 source.
+  // buffering=2 is present since libjxl 0.10. OUTPUT_MODE / USE_FULL_IMAGE_HEURISTICS (0.12-only,
+  // and byte-neutral per the native proof) are deliberately NOT set, so this compiles against both
+  // the 0.11.2 comparison clone and the 012 production fork. When the bridge is 012-only they can
+  // be added (USE_FULL_IMAGE_HEURISTICS=0 tightens the encoder's own peak for true streaming).
   JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_BUFFERING, 2);
   if (lossless) JxlEncoderSetFrameLossless(frame, JXL_TRUE);
   else JxlEncoderSetFrameDistance(frame, distance);
@@ -882,18 +889,8 @@ static JxlWasmBuffer* EncodeRgbChunked(
     free(ostate.buf); JxlEncoderDestroy(enc); return MakeError(240);
   }
 
-  ChunkedRgbSrc srcstate;
-  srcstate.data = pixels; srcstate.width = width; srcstate.num_channels = 3;
-  JxlChunkedFrameInputSource source;
-  source.opaque = &srcstate;
-  source.get_color_channels_pixel_format = ChunkedColorPf;
-  source.get_color_channel_data_at = ChunkedColorAt;
-  source.get_extra_channel_pixel_format = nullptr;
-  source.get_extra_channel_data_at = nullptr;
-  source.release_buffer = ChunkedSrcRelease;
-
   // Output processor + is_last=TRUE: AddChunkedFrame drives the whole encode and emits via the
-  // processor (no CloseInput/ProcessOutput). ostate/srcstate stay alive across this call.
+  // processor (no CloseInput/ProcessOutput). ostate stays alive across this call.
   const JxlEncoderStatus st = JxlEncoderAddChunkedFrame(frame, JXL_TRUE, source);
   JxlEncoderDestroy(enc);
   if (ostate.oom) { free(ostate.buf); return MakeError(241); }
@@ -909,6 +906,72 @@ static JxlWasmBuffer* EncodeRgbChunked(
   result->bits_per_sample = 8;
   result->has_alpha = 0;
   return result;
+}
+
+static JxlWasmBuffer* EncodeRgbChunked(
+    const uint8_t* pixels, uint32_t width, uint32_t height, float distance, uint32_t effort) {
+  if (pixels == nullptr) return MakeError(20);
+  ChunkedRgbSrc srcstate;
+  srcstate.data = pixels; srcstate.width = width; srcstate.num_channels = 3;
+  JxlChunkedFrameInputSource source;
+  source.opaque = &srcstate;
+  source.get_color_channels_pixel_format = ChunkedColorPf;
+  source.get_color_channel_data_at = ChunkedColorAt;
+  source.get_extra_channel_pixel_format = nullptr;
+  source.get_extra_channel_data_at = nullptr;
+  source.release_buffer = ChunkedSrcRelease;
+  return EncodeViaChunkedSource(width, height, distance, effort, source);  // srcstate lives across the call
+}
+
+// --- P2c (Approach A): streaming encode that pulls each band from the RAW-pipeline wasm module ---
+// libjxl's chunked input source reenters JS synchronously (EM_JS) to fetch each requested band.
+// The JS orchestration registers globalThis.__jxlP2cPull / __jxlP2cRelease, which pull one RGB8
+// band out of the RAW module and copy it into THIS module's heap (returning ptr + row stride).
+// Only one band is materialized at a time on each side ⇒ full-res / gigapixel export at
+// O(super-tile band) memory. Byte-identical to the whole-buffer path (same EncodeViaChunkedSource).
+// Bracket-notation global lookups so `--closure 1` does not rename the registered callbacks.
+EM_JS(uint8_t*, jxl_p2c_pull_band,
+      (uint32_t xpos, uint32_t ypos, uint32_t xsize, uint32_t ysize, uint32_t* stride_out), {
+  const f = globalThis['__jxlP2cPull'];
+  if (!f) return 0;
+  const r = f(xpos >>> 0, ypos >>> 0, xsize >>> 0, ysize >>> 0);  // { ptr, stride } in this heap
+  if (!r || !r['ptr']) return 0;
+  HEAPU32[stride_out >>> 2] = r['stride'] >>> 0;
+  return r['ptr'] >>> 0;
+});
+EM_JS(void, jxl_p2c_release_band, (uint8_t* buf), {
+  const f = globalThis['__jxlP2cRelease'];
+  if (f) f(buf >>> 0);
+});
+
+namespace {
+void StreamColorPf(void* /*op*/, JxlPixelFormat* pf) {
+  pf->num_channels = 3;
+  pf->data_type = JXL_TYPE_UINT8;
+  pf->endianness = JXL_NATIVE_ENDIAN;
+  pf->align = 0;
+}
+const void* StreamColorAt(void* /*op*/, size_t xpos, size_t ypos, size_t xsize, size_t ysize, size_t* row_offset) {
+  uint32_t stride = 0;
+  uint8_t* p = jxl_p2c_pull_band(static_cast<uint32_t>(xpos), static_cast<uint32_t>(ypos),
+                                 static_cast<uint32_t>(xsize), static_cast<uint32_t>(ysize), &stride);
+  *row_offset = stride;
+  return p;
+}
+void StreamRelease(void* /*op*/, const void* buf) {
+  jxl_p2c_release_band(static_cast<uint8_t*>(const_cast<void*>(buf)));
+}
+}  // namespace
+
+static JxlWasmBuffer* EncodeRgbStream(uint32_t width, uint32_t height, float distance, uint32_t effort) {
+  JxlChunkedFrameInputSource source;
+  source.opaque = nullptr;  // state lives in JS (globalThis.__jxlP2cPull)
+  source.get_color_channels_pixel_format = StreamColorPf;
+  source.get_color_channel_data_at = StreamColorAt;
+  source.get_extra_channel_pixel_format = nullptr;
+  source.get_extra_channel_data_at = nullptr;
+  source.release_buffer = StreamRelease;
+  return EncodeViaChunkedSource(width, height, distance, effort, source);
 }
 
 static JxlWasmBuffer* EncodeRgbaWithGainMap(
@@ -2658,6 +2721,12 @@ JxlWasmBuffer* jxl_wasm_encode_rgba8(const uint8_t* pixels, uint32_t width, uint
 JxlWasmBuffer* jxl_wasm_encode_rgb8_chunked(const uint8_t* pixels, uint32_t width, uint32_t height,
     float distance, uint32_t effort) {
   return EncodeRgbChunked(pixels, width, height, distance, effort);
+}
+// P2c (Approach A): streaming RGB8 encode with NO input buffer — the encoder pulls each band from
+// JS (globalThis.__jxlP2cPull, set by the orchestration) which feeds the RAW-pipeline wasm module.
+// Byte-identical to the whole-frame / chunked encoders. distance <= 0 => lossless.
+JxlWasmBuffer* jxl_wasm_encode_rgb8_stream(uint32_t width, uint32_t height, float distance, uint32_t effort) {
+  return EncodeRgbStream(width, height, distance, effort);
 }
 JxlWasmBuffer* jxl_wasm_encode_rgba16(const uint8_t* pixels, uint32_t width, uint32_t height, float distance, uint32_t effort, uint32_t has_alpha,
     uint32_t progressive_dc, uint32_t progressive_ac, uint32_t qprogressive_ac, uint32_t buffering, uint32_t group_order, uint32_t resampling) {

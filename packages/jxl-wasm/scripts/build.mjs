@@ -45,9 +45,11 @@ const config = {
       "simd": 1_363_149
     },
     enc: {
-      "relaxed-simd-mt": 3_350_000,
-      "simd-mt": 3_250_000,
-      "simd": 3_050_000
+      // +~2.7 KB for the P2c streaming encode (EncodeViaChunkedSource + JS-pull EncodeRgbStream +
+      // EM_JS glue); headroom restored to ~the prior ~6%.
+      "relaxed-simd-mt": 3_400_000,
+      "simd-mt": 3_300_000,
+      "simd": 3_100_000
     }
   },
   // Phase 1 module split: dec for viewer (decode-only, smaller), enc for ingest (lazy loaded).
