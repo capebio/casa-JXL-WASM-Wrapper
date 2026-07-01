@@ -187,4 +187,26 @@ mod tests {
             assert_eq!(got, want, "{}x{}", w, h);
         }
     }
+
+    #[test]
+    fn streaming_export_bytes_equal_whole() {
+        use crate::jxl_casaencoder::encode_chunked_rgb8;
+        for (w, h) in [(64usize, 96usize), (300, 520)] {
+            let strip = decompress::tests_synth_payload(w, h, 0x7A5);
+            let params = pipeline::PipelineParams::default_olympus();
+
+            // whole-frame reference: decode -> demosaic -> tone -> encode_chunked
+            let raw = decompress::decompress(&strip, w, h).unwrap();
+            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let mut rgb8 = vec![0u8; w * h * 3];
+            pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
+            let whole = encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();
+
+            // streamed
+            let mut streamed = Vec::new();
+            export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 1.0, 3, &mut streamed).unwrap();
+
+            assert_eq!(streamed, whole, "export bytes differ {}x{}", w, h);
+        }
+    }
 }
