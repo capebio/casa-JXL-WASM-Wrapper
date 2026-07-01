@@ -1629,6 +1629,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bayer_mhc_phase00_equals_rggb() {
+        // If the general phased MHC at phase (0,0) equals the RGGB fast path, the streaming
+        // export can use one phase-aware band kernel for both ORF (0,0) and DNG.
+        for (w, h) in [(16usize, 12usize), (34, 20), (5, 9)] {
+            let raw: Vec<u16> = (0..(w * h)).map(|i| ((i * 41 + 3) & 0x0fff) as u16).collect();
+            let rggb = demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let bayer = demosaic_bayer_mhc(&raw, w, h, (0, 0)).unwrap();
+            assert_eq!(rggb, bayer, "rggb vs bayer(0,0) differ {}x{}", w, h);
+        }
+    }
+
+    #[test]
     fn half_band_phase_matches_reference() {
         fn ref_half(raw: &[u16], w: usize, h: usize, phase: (u8, u8)) -> Vec<u16> {
             let (hw, hh) = (w / 2, h / 2);

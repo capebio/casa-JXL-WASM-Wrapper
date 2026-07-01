@@ -39,6 +39,36 @@ fn find_dng() -> Option<Vec<u8>> {
     None
 }
 
+/// DNG streaming full-res export == whole-frame (decode→bayer_mhc(phase)→tone→encode).
+/// Fixture-gated (real comp=7 DNG); exercises the phase-aware band demosaic end-to-end.
+#[test]
+fn dng_export_bytes_equal_whole() {
+    use raw_pipeline::{demosaic, jxl_casaencoder, pipeline, stream_export};
+    let Some(data) = find_dng() else {
+        eprintln!("skip: no DNG fixture");
+        return;
+    };
+    let img = dng::decode_bytes(&data).expect("decode");
+    let (w, h) = (img.width, img.height);
+    let phase = dng::cfa_phase(img.cfa);
+    let rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase).expect("demosaic");
+    let mut params = pipeline::PipelineParams::default_olympus();
+    params.black = img.black;
+    params.white = img.white;
+    params.wb_r = img.wb_r;
+    params.wb_b = img.wb_b;
+    params.color_matrix = img.color_matrix;
+    let mut rgb8 = vec![0u8; w * h * 3];
+    pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
+    let whole = jxl_casaencoder::encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();
+
+    let mut streamed = Vec::new();
+    stream_export::export_dng_jxl_streaming(&data, 1.0, 3, &mut streamed).unwrap();
+
+    assert_eq!(streamed.len(), whole.len(), "DNG export size differs");
+    assert!(streamed == whole, "DNG export bytes differ");
+}
+
 #[test]
 fn dng_rowsource_rows_equal_full_decode() {
     let Some(data) = find_dng() else {
