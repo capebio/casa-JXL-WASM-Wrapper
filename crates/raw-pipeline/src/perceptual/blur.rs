@@ -1,18 +1,11 @@
 //! Separable O(n) box blur, clamp-to-edge. Port of the JS `boxBlur`.
 
-/// Box blur of `src` (w×h) with radius `r` into a fresh Vec.
-pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
-    let n = w * h;
-    // Zero-extent plane is a no-op: with w==0 (or h==0) the passes would index
-    // an empty buffer (src[0]) and underflow `w - 1`/`h - 1` to usize::MAX.
-    if n == 0 {
-        return Vec::new();
-    }
-    let mut tmp = vec![0f32; n];
-    let mut dst = vec![0f32; n];
-    let inv = 1.0 / (2 * r + 1) as f32;
-
-    // Horizontal
+/// Horizontal box-blur pass: `src` (w×h) → `tmp`, sliding window radius `r`,
+/// clamp-to-edge, scaled by `inv = 1/(2r+1)`. Extracted so the AVX2 vertical
+/// kernel (`simd::avx2::box_blur_avx2`) can share the identical horizontal pass
+/// — the H pass is a per-row scalar recurrence (sequential `sum += add - sub`),
+/// so it stays scalar in every backend; only the column-parallel V pass vectorises.
+pub(crate) fn box_blur_h(src: &[f32], tmp: &mut [f32], w: usize, h: usize, r: usize, inv: f32) {
     let w_max = w - 1;
     for y in 0..h {
         let base = y * w;
@@ -27,6 +20,22 @@ pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
             sum += add - sub;
         }
     }
+}
+
+/// Box blur of `src` (w×h) with radius `r` into a fresh Vec. Scalar path +
+/// parity oracle for `box_blur_avx2`.
+pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let n = w * h;
+    // Zero-extent plane is a no-op: with w==0 (or h==0) the passes would index
+    // an empty buffer (src[0]) and underflow `w - 1`/`h - 1` to usize::MAX.
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut tmp = vec![0f32; n];
+    let mut dst = vec![0f32; n];
+    let inv = 1.0 / (2 * r + 1) as f32;
+
+    box_blur_h(src, &mut tmp, w, h, r, inv);
 
     // Vertical: process TILE columns at a time to improve cache locality.
     // The naive column-by-column loop accesses memory at stride w (up to 16 KB
