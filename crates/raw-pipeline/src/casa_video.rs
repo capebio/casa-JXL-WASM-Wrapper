@@ -5,9 +5,13 @@
 //! independent JXL codestream (Architecture A); a 32-byte header + an
 //! `(offset,len)` index give O(1) random access. Native + `jxl-codec` only.
 //!
+//! Ergonomic entry — [`encode_casv_video`] + [`CasaVideoOptions`] presets pick the
+//! tier and skip mode; the individual `encode_casv_*` functions remain for direct
+//! use.
 //! ```ignore
-//! let casv = encode_casv_rgb8(&[&frame0, &frame1], w, h, 24, 1, EncodeOptions::lossless())?;
-//! let (px, w, h) = decode_casv_frame_rgb8(&casv, 1).unwrap(); // O(1) random access
+//! let casv = encode_casv_video(&frames, w, h, 24, 1, &CasaVideoOptions::streaming(1.0))?;
+//! let out  = decode_casv_all_rgb8(&casv).unwrap();
+//! // byte-exact archival instead: CasaVideoOptions::lossless_archive()
 //! ```
 //!
 //! GOP delta (P2): `encode_casv_delta_rgb8(frames, w, h, fps_num, fps_den, gop_len, opts)`
@@ -22,10 +26,11 @@
 //! only changed tiles (`CASV_TILE_FLAG`, atlas of residual tiles), for scattered
 //! multi-region motion. Byte-exact.
 //!
-//! Lossy tier: `encode_casv_delta_lossy_bbox_rgb8(..., gop_len, distance)` codes
-//! changed rectangles as *fresh lossy pixels* and REPLACEs them (`CASV_REPLACE_FLAG`),
-//! copying unchanged regions from the reference — the working lossy inter-frame
-//! path (residual-through-VarDCT and `BLEND_ADD` do not work; see the code comment).
+//! Lossy tier: `encode_casv_delta_lossy_bbox_rgb8` / `..._lossy_tiled_rgb8` code
+//! changed regions (bounding box / tiles, above a `thresh`) as *fresh lossy pixels*
+//! and REPLACE them (`CASV_REPLACE_FLAG`), copying unchanged regions — the working
+//! lossy inter-frame path (residual-through-VarDCT and `BLEND_ADD` do not work; see
+//! the code comment).
 
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
@@ -107,6 +112,106 @@ pub fn parse_casv_header(data: &[u8]) -> Option<CasvHeader> {
         return None;
     }
     Some(h)
+}
+
+// ── Ergonomic top-level API ────────────────────────────────────────────────────
+
+/// Heuristic default change-detection threshold for a lossy `distance` (tolerate
+/// near-static change roughly below the lossy quant error). Clamped to `[0, 16]`.
+pub fn default_thresh_for_distance(distance: f32) -> u8 {
+    (distance * 4.0).round().clamp(0.0, 16.0) as u8
+}
+
+/// How P-frames reduce redundancy vs the reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkipMode {
+    /// Whole-frame residual (lossless) — no spatial skipping.
+    None,
+    /// Skip to the changed bounding rectangle (localized motion).
+    Bbox,
+    /// Skip to changed tiles (scattered / multi-region motion).
+    Tile,
+}
+
+/// Quality tier.
+#[derive(Clone, Copy, Debug)]
+pub enum VideoRate {
+    /// Byte-exact (archival / science tier).
+    Lossless,
+    /// Lossy at the given JXL butteraugli distance (streaming tier).
+    Lossy(f32),
+}
+
+/// One coherent knob-set for [`encode_casv_video`].
+#[derive(Clone, Copy, Debug)]
+pub struct CasaVideoOptions {
+    pub rate: VideoRate,
+    /// I-frame period; `1` = all-intra.
+    pub gop_len: u32,
+    pub skip: SkipMode,
+    /// Tile size for [`SkipMode::Tile`].
+    pub tile: u32,
+    /// libjxl effort for the lossless / all-intra paths (lossy skip tiers use the
+    /// production default effort 3).
+    pub effort: u8,
+    /// Change-detection threshold; `None` = auto from the lossy distance
+    /// ([`default_thresh_for_distance`]). Lossless skipping is always exact.
+    pub thresh: Option<u8>,
+}
+
+impl Default for CasaVideoOptions {
+    fn default() -> Self {
+        Self::streaming(1.0)
+    }
+}
+
+impl CasaVideoOptions {
+    /// Byte-exact archival: lossless, bbox skip, GOP 24.
+    pub fn lossless_archive() -> Self {
+        CasaVideoOptions { rate: VideoRate::Lossless, gop_len: 24, skip: SkipMode::Bbox, tile: 32, effort: 3, thresh: Some(0) }
+    }
+    /// Streaming: lossy at `distance`, tile replace-skip, GOP 24, auto threshold.
+    pub fn streaming(distance: f32) -> Self {
+        CasaVideoOptions { rate: VideoRate::Lossy(distance), gop_len: 24, skip: SkipMode::Tile, tile: 32, effort: 3, thresh: None }
+    }
+}
+
+/// One ergonomic entry that dispatches to the right encoder for `opts`:
+/// - Lossless + None → whole-frame residual delta (all-intra if `gop_len==1`)
+/// - Lossless + Bbox/Tile → residual skip (bounding-box / tiles), byte-exact
+/// - Lossy + Bbox/Tile → fresh-pixel **replace** skip (the working lossy tier)
+/// - Lossy + None → all-intra lossy (each frame independent)
+///
+/// (Lossy *additive-residual* delta does not work in JXL — see the code comment;
+/// the lossy tiers code fresh pixels and replace regions instead.)
+pub fn encode_casv_video(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    opts: &CasaVideoOptions,
+) -> Result<Vec<u8>, VideoError> {
+    match opts.rate {
+        VideoRate::Lossless => {
+            let enc = EncodeOptions::lossless().with_effort(opts.effort);
+            match opts.skip {
+                SkipMode::None => encode_casv_delta_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, enc),
+                SkipMode::Bbox => encode_casv_delta_bbox_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, enc),
+                SkipMode::Tile => encode_casv_delta_tiled_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, opts.tile, enc),
+            }
+        }
+        VideoRate::Lossy(distance) => {
+            let thresh = opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance));
+            match opts.skip {
+                SkipMode::None => {
+                    encode_casv_rgb8(frames, width, height, fps_num, fps_den, EncodeOptions::distance(distance).with_effort(opts.effort))
+                }
+                SkipMode::Bbox => encode_casv_delta_lossy_bbox_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, distance, thresh),
+                SkipMode::Tile => encode_casv_delta_lossy_tiled_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, opts.tile, distance, thresh),
+            }
+        }
+    }
 }
 
 /// Encode a sequence of interleaved RGB8 frames into a `.casv` byte vector.
@@ -362,6 +467,110 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
     Ok(out)
 }
 
+/// Lossy streaming tier, tile granularity: like `encode_casv_delta_lossy_bbox_rgb8`
+/// but codes each *changed tile*'s fresh pixels into an atlas and REPLACEs those
+/// tiles on decode — for scattered / multi-region motion. Emits
+/// `PFRAME|TILE|REPLACE` frames. Changed tiles detected vs the previous source.
+pub fn encode_casv_delta_lossy_tiled_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    gop_len: u32,
+    tile: u32,
+    distance: f32,
+    thresh: u8,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+    let gop = gop_len.max(1) as usize;
+    let t = tile.max(1);
+    let (txn, _tyn) = tile_grid(width, height, t);
+    let (w, ts) = (width as usize, t as usize);
+    let opts = EncodeOptions::distance(distance);
+
+    let mut streams: Vec<(u32, Vec<u8>)> = Vec::with_capacity(frames.len());
+    let mut recon: Vec<u8> = Vec::new();
+    for (idx, px) in frames.iter().enumerate() {
+        if px.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+        }
+        if idx % gop == 0 {
+            let jxl = encode_rgb8(px, width, height, opts.clone())?;
+            let (r, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+            recon = r;
+            streams.push((0, jxl));
+            continue;
+        }
+        let map = changed_tile_map_thresh(px, frames[idx - 1], width, height, t, thresh);
+        let changed: Vec<usize> =
+            map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(t as u16).to_le_bytes());
+        let bitmap_len = map.len().div_ceil(8);
+        let mut bitmap = vec![0u8; bitmap_len];
+        for &i in &changed {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+        payload.extend_from_slice(&bitmap);
+
+        if !changed.is_empty() {
+            // atlas of FRESH pixels (not residuals), zero-padded edge tiles.
+            let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+            for (slot, &i) in changed.iter().enumerate() {
+                let tx = (i as u32 % txn) as usize;
+                let ty = (i as u32 / txn) as usize;
+                let bw = ts.min(w - tx * ts);
+                let bh = ts.min(height as usize - ty * ts);
+                for row in 0..bh {
+                    let src = ((ty * ts + row) * w + tx * ts) * 3;
+                    let dst = ((slot * ts + row) * ts) * 3;
+                    atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
+                }
+            }
+            let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone())?;
+            // in-loop reconstruct: decode the atlas, replace each tile in recon.
+            let (datlas, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+            for (slot, &i) in changed.iter().enumerate() {
+                let tx = (i as u32 % txn) as usize;
+                let ty = (i as u32 / txn) as usize;
+                let bw = ts.min(w - tx * ts);
+                let bh = ts.min(height as usize - ty * ts);
+                for row in 0..bh {
+                    let d = ((ty * ts + row) * w + tx * ts) * 3;
+                    let s = ((slot * ts + row) * ts) * 3;
+                    recon[d..d + bw * 3].copy_from_slice(&datlas[s..s + bw * 3]);
+                }
+            }
+            payload.extend_from_slice(&jxl);
+        }
+        streams.push((CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG, payload));
+    }
+
+    let header = CasvHeader {
+        width, height, frame_count: frames.len() as u32, fps_num, fps_den, flags: 0,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for (flags, s) in &streams {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
+        offset += s.len();
+    }
+    for (_, s) in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
 /// Borrow the JXL codestream bytes for frame `index`, validated against the
 /// index table and file bounds. `None` if `index` is out of range or the index
 /// entry points outside the file.
@@ -503,10 +712,12 @@ fn tile_grid(width: u32, height: u32, tile: u32) -> (u32, u32) {
 }
 
 /// Per-tile changed flags (row-major, index = ty*tiles_x + tx): a tile is
-/// changed if any pixel in it differs between `cur` and `prev`.
-fn changed_tile_map(cur: &[u8], prev: &[u8], width: u32, height: u32, tile: u32) -> Vec<bool> {
+/// changed if any channel of any pixel differs by more than `thresh`. `thresh=0`
+/// means any difference (exact).
+fn changed_tile_map_thresh(cur: &[u8], prev: &[u8], width: u32, height: u32, tile: u32, thresh: u8) -> Vec<bool> {
     let (txn, tyn) = tile_grid(width, height, tile);
     let (w, t) = (width as usize, tile as usize);
+    let th = thresh as i32;
     let mut map = vec![false; (txn * tyn) as usize];
     for ty in 0..tyn as usize {
         for tx in 0..txn as usize {
@@ -518,7 +729,7 @@ fn changed_tile_map(cur: &[u8], prev: &[u8], width: u32, height: u32, tile: u32)
             'tile: for row in 0..bh {
                 let base = ((y0 + row) * w + x0) * 3;
                 for c in 0..bw * 3 {
-                    if cur[base + c] != prev[base + c] {
+                    if (cur[base + c] as i32 - prev[base + c] as i32).abs() > th {
                         changed = true;
                         break 'tile;
                     }
@@ -528,6 +739,11 @@ fn changed_tile_map(cur: &[u8], prev: &[u8], width: u32, height: u32, tile: u32)
         }
     }
     map
+}
+
+/// Per-tile changed flags with exact detection (`thresh=0`).
+fn changed_tile_map(cur: &[u8], prev: &[u8], width: u32, height: u32, tile: u32) -> Vec<bool> {
+    changed_tile_map_thresh(cur, prev, width, height, tile, 0)
 }
 
 /// Encode RGB8 frames with GOP + **tile-grid** P-frames. Each P-frame payload is
@@ -738,11 +954,30 @@ fn apply_pframe(
         if changed.is_empty() {
             return Some(());
         }
+        let (w, ts) = (width as usize, t as usize);
+        if is_replace {
+            // lossy tier: atlas holds fresh pixels — replace each tile.
+            let (atlas, aw, ah) = decode_interleaved::<u8>(&slice[2 + bitmap_len..], 3)?;
+            if aw != t || ah != t * changed.len() as u32 {
+                return None;
+            }
+            for (slot, &i) in changed.iter().enumerate() {
+                let tx = (i as u32 % txn) as usize;
+                let ty = (i as u32 / txn) as usize;
+                let bw = ts.min(w - tx * ts);
+                let bh = ts.min(height as usize - ty * ts);
+                for row in 0..bh {
+                    let d = ((ty * ts + row) * w + tx * ts) * 3;
+                    let s = ((slot * ts + row) * ts) * 3;
+                    prev[d..d + bw * 3].copy_from_slice(&atlas[s..s + bw * 3]);
+                }
+            }
+            return Some(());
+        }
         let (atlas, aw, ah) = decode_interleaved::<u16>(&slice[2 + bitmap_len..], 3)?;
         if aw != t || ah != t * changed.len() as u32 {
             return None;
         }
-        let (w, ts) = (width as usize, t as usize);
         for (slot, &i) in changed.iter().enumerate() {
             let tx = (i as u32 % txn) as usize;
             let ty = (i as u32 / txn) as usize;
@@ -1300,5 +1535,68 @@ mod tests {
             exact.len()
         );
         assert!(decode_casv_all_rgb8(&thr).is_some());
+    }
+
+    #[test]
+    fn lossy_tile_replace_smaller_and_stable() {
+        let (w, h) = (64u32, 64u32);
+        let src = two_region_motion(w, h, 8);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let d = 1.0f32;
+        let skip = encode_casv_delta_lossy_tiled_rgb8(&refs, w, h, 24, 1, 8, 16, d, 0).unwrap();
+        let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(d)).unwrap();
+        assert!(
+            skip.len() < intra.len(),
+            "lossy tile skip ({}) should beat lossy all-intra ({})",
+            skip.len(),
+            intra.len()
+        );
+        for i in 1..8 {
+            assert!(casv_frame_is_tile(&skip, i).unwrap(), "frame {i} is tile");
+            assert!(casv_frame_is_replace(&skip, i).unwrap(), "frame {i} is replace");
+        }
+        let out = decode_casv_all_rgb8(&skip).unwrap();
+        assert_eq!(out.len(), 8);
+        for (i, (px, _, _)) in out.iter().enumerate() {
+            let me = px.iter().zip(&src[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
+            assert!(me < 8.0, "frame {i} mean err {} (should be ~visually-lossless)", me);
+        }
+        let out2 = decode_casv_all_rgb8(&skip).unwrap();
+        for i in 0..8 {
+            assert_eq!(out[i].0, out2[i].0, "deterministic decode (frame {i})");
+        }
+    }
+
+    #[test]
+    fn unified_api_dispatches_and_roundtrips() {
+        let (w, h) = (32u32, 24u32);
+        let src: Vec<Vec<u8>> = (0..6).map(|s| gradient(w, h, (s * 20) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+
+        // Lossless archive preset → byte-exact.
+        let arch = encode_casv_video(&refs, w, h, 24, 1, &CasaVideoOptions::lossless_archive()).unwrap();
+        for (i, (px, _, _)) in decode_casv_all_rgb8(&arch).unwrap().iter().enumerate() {
+            assert_eq!(px, &src[i], "lossless-archive frame {i} byte-exact");
+        }
+
+        // Streaming preset → decodes (lossy, not byte-exact) with right dims.
+        let stream = encode_casv_video(&refs, w, h, 24, 1, &CasaVideoOptions::streaming(1.0)).unwrap();
+        let s = decode_casv_all_rgb8(&stream).unwrap();
+        assert_eq!(s.len(), 6);
+        assert_eq!((s[0].1, s[0].2), (w, h));
+
+        // Custom lossless tile config also byte-exact.
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: 3,
+            skip: SkipMode::Tile,
+            tile: 16,
+            effort: 3,
+            thresh: Some(0),
+        };
+        let tv = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();
+        for (i, (px, _, _)) in decode_casv_all_rgb8(&tv).unwrap().iter().enumerate() {
+            assert_eq!(px, &src[i], "custom lossless-tile frame {i} byte-exact");
+        }
     }
 }
