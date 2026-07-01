@@ -371,7 +371,14 @@ Reproduce: `node probe.mjs {gen,measure,video,videoblock,diag,diag2}`.
 5. **P4 — Streaming hardening.** Mux/seek/error-resilience/audio; WebCodecs-style player integration.
 6. **Parallel track — diagnostic-driven codec levers ("improve the codec" wins).** Independent of phase order
    and of any codec race, land the bit-sink levers the diagnostic ranked (§7): **(a) temporal noise/grain
-   model** (~18–48% of delta bits on real footage; near-lossless/distribution tier only), **(b) static
+   model** (~18–48% of delta bits; distribution tier only) — **~80% already built**: JXL's noise-synthesis
+   feature (`noise.h` `NoiseParams` 8-pt LUT; `enc_frame.cc:700` estimate/`--photon_noise_iso`/manual →
+   `kNoise` flag; `dec_cache.cc:220` `GetAddNoiseStage` synthesises; verified live via `cjxl
+   --photon_noise_iso`; the `dec_noise.h:9` "disabled" comment is stale). Video work = **predict/delta in the
+   *denoised* domain** (reuse RAW-pipeline `nr_ms`) + carry one ISO-based model per clip (camera-aware — ideal
+   for known citizen-science capture) + decoder re-grains per frame. Auto-estimate only ramps in at distance
+   ≥1 (`enc_frame.cc:716`), so *lossless/near-lossless keeps real noise* (science tier); synthesis is
+   plausible-not-original (distribution tier). **(b) static
    block-skip flag** (~14%; all tiers), **(c) temporal chroma coding** (22% chroma share), **(d) ROI /
    region-adaptive quant** (localized-motion content packs 43–63% of residual energy into 10% of tiles). The
    deepened diagnostic also *simplifies* the design: **single-reference (previous frame) is sufficient — skip
