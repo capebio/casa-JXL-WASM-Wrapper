@@ -67,7 +67,9 @@ fn peak_mem_stream_vs_full() {
     let base_stream = CUR.load(Ordering::Relaxed);
     PEAK.store(base_stream, Ordering::Relaxed);
     {
-        let previews = stream_preview::build_previews_streaming(&payload, w, h, &[(300, 300)]).unwrap();
+        let previews = stream_preview::build_previews_streaming(
+            decompress::OrfRowDecoder::new(&payload, w, h).unwrap(), w, h, (0, 0), &[(300, 300)],
+        ).unwrap();
         std::hint::black_box(&previews);
     }
     let stream_peak = PEAK.load(Ordering::Relaxed) - base_stream;

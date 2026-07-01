@@ -1119,3 +1119,17 @@ the lightbox deliverable dominates); preview-build flipflop -1.5%/-0.7% (neutral
 
 Remaining FUTURE (new specs, not deferred-from-this-pass): WB-stats fold-in (so no-camera-WB
 also streams), progressive-paint JS wiring, ROI/window public API, DNG/CR2 RawRowSource impl.
+
+## DNG streaming — IMPLEMENTED 2026-07-01 (branch perf/dng-stream-preview-jul01-m2r7)
+
+Extended the streaming preview pipeline to DNG (spec+plan+6-task TDD, off q8z). Approach A
+(generic RawRowSource). Superpixel previews (phase-aware; NOT byte-exact to old full-MHC
+DNG previews — accepted quality delta), full-res MHC path unchanged. comp=7 tile-band
+streaming (~19× measured), comp=1 decode-then-dole (~3.5×). Verified: DngRowSource rows ==
+decode_bytes().raw byte-exact (real comp=7 fixture); phase superpixel == reference (4
+phases); ORF previews unchanged; peak-mem working-set ratio 0.052 (~19×); MSVC --lib 216
+pass; wasm32 clean. Gate: preview-only && Bayer(cps=1) && comp∈{7,1}; else full path.
+
+REMAINING DEFERRED: CR2 streaming — vertical-slice layout means every slice spans all rows,
+so row-streaming requires decoding the whole frame first (no peak win for the raw). Only the
+post-decode demosaic+downscale could stream (~43%). Do only if the half-RGB buffer matters.

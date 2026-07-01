@@ -1,7 +1,31 @@
-//! DNG streaming decode: DngRowSource rows must equal the full decode_bytes().raw.
+//! DNG streaming decode: DngRowSource rows must equal the full decode_bytes().raw,
+//! and the streaming preview build must use far less peak memory than the full path.
 //! Fixture-gated (comp=7 real DNG); skips gracefully in CI without the asset.
 use raw_pipeline::decompress::RawRowSource;
 use raw_pipeline::dng;
+
+// Counting allocator (this test binary only) for the peak-mem probe.
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+struct Counting;
+static CUR: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = System.alloc(l);
+        if !p.is_null() {
+            let c = CUR.fetch_add(l.size(), Ordering::Relaxed) + l.size();
+            PEAK.fetch_max(c, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        CUR.fetch_sub(l.size(), Ordering::Relaxed);
+        System.dealloc(p, l);
+    }
+}
+#[global_allocator]
+static A: Counting = Counting;
 
 fn find_dng() -> Option<Vec<u8>> {
     for p in [
@@ -33,4 +57,41 @@ fn dng_rowsource_rows_equal_full_decode() {
     }
     assert_eq!(streamed.len(), full.raw.len());
     assert!(streamed == full.raw, "streamed rows != full decode raw");
+}
+
+#[test]
+fn dng_peak_mem_stream_vs_full() {
+    let Some(data) = find_dng() else {
+        eprintln!("skip: no DNG fixture");
+        return;
+    };
+    // Full path working set (above shared input): full raw + full-res MHC RGB.
+    let base_full = CUR.load(Ordering::Relaxed);
+    PEAK.store(base_full, Ordering::Relaxed);
+    {
+        let img = dng::decode_bytes(&data).unwrap();
+        let rgb = raw_pipeline::demosaic::demosaic_bayer_mhc(
+            &img.raw, img.width, img.height, dng::cfa_phase(img.cfa),
+        ).unwrap();
+        std::hint::black_box((&img.raw, &rgb));
+    }
+    let full_peak = PEAK.load(Ordering::Relaxed) - base_full;
+
+    // Streaming path working set: one tile-band + tiny half-strip + preview outputs.
+    let base_s = CUR.load(Ordering::Relaxed);
+    PEAK.store(base_s, Ordering::Relaxed);
+    {
+        let src = dng::DngRowSource::new(&data).unwrap();
+        let (w, h, phase) = (src.meta().width, src.meta().height, src.phase());
+        let prev = raw_pipeline::stream_preview::build_previews_streaming(
+            src, w, h, phase, &[(300, 300), (120, 120)],
+        ).unwrap();
+        std::hint::black_box(&prev);
+    }
+    let stream_peak = PEAK.load(Ordering::Relaxed) - base_s;
+
+    println!("DNG working-set peak: full={} stream={} ratio={:.3}",
+        full_peak, stream_peak, stream_peak as f64 / full_peak as f64);
+    // comp=7 target ~1/14; assert a robust < 1/2 (also covers a comp=1 ~1/3.5 fixture).
+    assert!(stream_peak * 2 < full_peak, "stream peak {} not < full/2 {}", stream_peak, full_peak);
 }
