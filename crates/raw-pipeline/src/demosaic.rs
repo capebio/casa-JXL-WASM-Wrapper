@@ -690,6 +690,29 @@ pub fn demosaic_rggb_shuffle_simd(raw: &[u16], width: usize, height: usize) -> R
 ///
 /// Zero-interpolation collapse. Artefact-free for pyramid/LOD ≤ ½, AR preview,
 /// ML thumbnail inference. ~¼ the output work of full demosaic + downscale.
+/// Demosaic `k_rows` raw rows (k_rows even, starting at an even raw row) into
+/// half-resolution interleaved RGB16. `out_half` len must be (k_rows/2)*(width/2)*3.
+/// Byte-identical to the matching chunk of `demosaic_rggb_half`.
+pub fn demosaic_half_band(raw_strip: &[u16], width: usize, k_rows: usize, out_half: &mut [u16]) {
+    let hw = width / 2;
+    let do_row = |qr: usize, out_row: &mut [u16]| {
+        let top = &raw_strip[(2 * qr) * width..(2 * qr) * width + width];
+        let bot = &raw_strip[(2 * qr + 1) * width..(2 * qr + 1) * width + width];
+        for qc in 0..hw {
+            let c0 = 2 * qc;
+            let o = qc * 3;
+            out_row[o]     = top[c0];
+            out_row[o + 1] = ((top[c0 + 1] as u32 + bot[c0] as u32) >> 1) as u16;
+            out_row[o + 2] = bot[c0 + 1];
+        }
+    };
+    #[cfg(feature = "parallel")]
+    out_half.par_chunks_mut(hw * 3).enumerate().for_each(|(qr, out_row)| do_row(qr, out_row));
+    #[cfg(not(feature = "parallel"))]
+    out_half.chunks_mut(hw * 3).enumerate().for_each(|(qr, out_row)| do_row(qr, out_row));
+    let _ = k_rows; // length is carried by out_half; k_rows documents the caller contract
+}
+
 pub fn demosaic_rggb_half(raw: &[u16], width: usize, height: usize) -> Result<Vec<u16>, String> {
     validate(raw, width, height)?;
     let (hw, hh) = (width / 2, height / 2);
@@ -700,21 +723,8 @@ pub fn demosaic_rggb_half(raw: &[u16], width: usize, height: usize) -> Result<Ve
         .and_then(|n| n.checked_mul(3))
         .ok_or_else(|| format!("demosaic: half {}×{}×3 overflows usize", hw, hh))?;
     let mut rgb = vec![0u16; n3];
-    let do_row = |qr: usize, out_row: &mut [u16]| {
-        let top = &raw[(2 * qr) * width..(2 * qr) * width + width];
-        let bot = &raw[(2 * qr + 1) * width..(2 * qr + 1) * width + width];
-        for qc in 0..hw {
-            let c0 = 2 * qc;
-            let o = qc * 3;
-            out_row[o]     = top[c0];
-            out_row[o + 1] = ((top[c0 + 1] as u32 + bot[c0] as u32) >> 1) as u16;
-            out_row[o + 2] = bot[c0 + 1];
-        }
-    };
-    #[cfg(feature = "parallel")]
-    rgb.par_chunks_mut(hw * 3).enumerate().for_each(|(qr, out_row)| do_row(qr, out_row));
-    #[cfg(not(feature = "parallel"))]
-    rgb.chunks_mut(hw * 3).enumerate().for_each(|(qr, out_row)| do_row(qr, out_row));
+    // Delegate to the banded kernel over the whole frame (first 2*hh rows).
+    demosaic_half_band(&raw[..(2 * hh) * width], width, 2 * hh, &mut rgb);
     Ok(rgb)
 }
 
@@ -1607,6 +1617,30 @@ pub fn demosaic_rggb_mhc_matrix(raw: &[u16], width: usize, height: usize, m: &[i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_band_matches_full() {
+        let (w, h) = (16usize, 12usize);
+        let raw: Vec<u16> = (0..(w * h)).map(|i| ((i * 37 + 5) & 0x0fff) as u16).collect();
+        let full = demosaic_rggb_half(&raw, w, h).unwrap();
+        let hw = w / 2;
+        let hh = h / 2;
+        assert_eq!(full.len(), hh * hw * 3);
+
+        // Decode in bands of 2 raw rows (1 half-row) and 4 raw rows (2 half-rows).
+        for band_rows in [2usize, 4] {
+            let mut got = Vec::new();
+            let mut r = 0;
+            while r + band_rows <= h {
+                let strip = &raw[r * w..(r + band_rows) * w];
+                let mut out = vec![0u16; (band_rows / 2) * hw * 3];
+                demosaic_half_band(strip, w, band_rows, &mut out);
+                got.extend_from_slice(&out);
+                r += band_rows;
+            }
+            assert_eq!(got, full, "band_rows={}", band_rows);
+        }
+    }
 
     #[test]
     fn bayer_mhc_interior_split_matches_clamped_reference() {

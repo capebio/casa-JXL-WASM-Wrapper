@@ -659,6 +659,26 @@ struct OrfDecoded {
     fast_preview: bool,  // fast planar path used for previews
 }
 
+/// Gate for the streaming preview-only fast path: previews requested, full-res output
+/// NOT requested (so the raw is needed for nothing else), camera WB tags present (so no
+/// full-raw auto-WB scan is needed), and the frame is halve-able (¼-res superpixel path).
+fn should_stream_previews(need_previews: bool, need_full_rgb: bool, wb_from_camera: bool, can_halve: bool) -> bool {
+    need_previews && !need_full_rgb && wb_from_camera && can_halve
+}
+
+#[cfg(test)]
+mod stream_gate_tests {
+    use super::should_stream_previews;
+    #[test]
+    fn gate_truth_table() {
+        assert!(should_stream_previews(true, false, true, true));
+        assert!(!should_stream_previews(true, true, true, true));   // full-res wanted
+        assert!(!should_stream_previews(true, false, false, true)); // no camera WB
+        assert!(!should_stream_previews(false, false, true, true)); // no previews
+        assert!(!should_stream_previews(true, false, true, false)); // not halve-able
+    }
+}
+
 /// Shared ORF decode path: parse → validate → decompress → demosaic → NR → WB/matrix setup.
 /// Returns pre-tonemapped RGB16 and all metadata.  Called by process_orf_impl.
 fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError> {
@@ -678,6 +698,55 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
     // strip bounds already validated by validate_orf_structure above
     let strip_end = info.strip_offset as usize + info.strip_byte_count as usize;
     let strip = &data[info.strip_offset as usize..strip_end];
+
+    // Streaming preview-only fast path (see docs/superpowers/specs/2026-07-01-...).
+    // When previews are wanted, full-res output is not, the frame is halve-able, and
+    // camera WB tags are present, build previews without ever materializing the full
+    // raw (~6× lower peak). Byte-identical to the full path (stream_preview tests).
+    {
+        let (lb_w, lb_h) = target_dims(w, h, 1800);
+        let (thumb_w, thumb_h) = target_dims(w, h, 360);
+        let need_previews = output_flags & (OUT_LIGHTBOX | OUT_THUMB) != 0;
+        let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16) != 0;
+        let wb_from_camera = info.wb_r.is_some() && info.wb_b.is_some();
+        if should_stream_previews(need_previews, need_full_rgb, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
+            let t = now_ms();
+            let previews = raw_pipeline::stream_preview::build_previews_streaming(
+                strip, w, h, &[(lb_w, lb_h), (thumb_w, thumb_h)],
+            ).map_err(|e| JsError::new(&e))?;
+            let stream_ms = now_ms() - t;
+            let mut it = previews.into_iter();
+            let lb_packed = it.next().unwrap_or_default();
+            let thumb_packed = it.next().unwrap_or_default();
+
+            let mut params = pipeline::PipelineParams::default_olympus();
+            params.black = OLYMPUS_BLACK_LEVEL;
+            if let Some(r) = info.wb_r { params.wb_r = r; }
+            if let Some(b) = info.wb_b { params.wb_b = b; }
+            if let Some(m) = info.color_matrix { params.color_matrix = Some(m); }
+            let color_matrix_from_mn = info.color_matrix.is_some();
+            let color_matrix_flat: [f32; 9] = {
+                let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+                [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
+            };
+
+            return Ok(OrfDecoded {
+                rgb16: Vec::new(),
+                w, h, info,
+                decompress_ms: stream_ms,
+                demosaic_ms: 0.0,
+                wb_from_camera,
+                params,
+                color_matrix_from_mn,
+                color_matrix_flat,
+                lb_packed, lb_w, lb_h,
+                thumb_packed, thumb_w, thumb_h,
+                preview_demosaic_ms: 0.0,
+                preview_downscale_ms: 0.0,
+                fast_preview: true,
+            });
+        }
+    }
 
     let t = now_ms();
     let raw = decompress::decompress(strip, w, h).map_err(|e| JsError::new(&e))?;

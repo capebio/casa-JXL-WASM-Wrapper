@@ -1424,3 +1424,40 @@ zero-copy byte view, not an intermediate `Vec<u8>`).
   single-threaded (its `&& threads > 1` gate). To preserve `new()`'s exact behaviour the
   honest-thread-count path was added as a *separate* additive `with_threads(opts, n)`
   constructor instead; `new()` is untouched.
+## DECOMPRESS-D9 — fold 4 per-pixel truncation checks into 1 — REJECTED (flip, +13%)
+
+Branch `perf/decompress-trunc-fold-jul01-q8z`, `crates/raw-pipeline/src/decompress.rs`.
+ChatGPT "basket lens" headline: the inner pixel loop checks `br.truncated` four times
+per pixel (after read_bits(3), read_huff, the escape read_bits, and the literal
+read_bits). Since every read is bounded (<=16 bits) and pad-safe (read_bits/read_huff
+never panic/OOB on a truncated stream — they zero-pad and latch `truncated`), it is
+byte-exact to run all four reads and reject ONCE before mutating carry state / emitting
+the pixel. Confirmed byte-exact (golden + `decompress_old_vs_new_byteexact` on
+128x96/255x64/64x255/3x257 + truncation parity).
+
+But the 5-way `dec_variant<FOLD,HOIST>` bisect (decompress_ab_timing, 1024x1024 synthetic
+xorshift stream, MSVC release, i7-10850H, rotated-start interleave, 120 iters x3) is
+unambiguous and sign-stable:
+
+  base (4 checks)          : baseline
+  FOLD only (1 check)      : +11.4 .. +12.6 %  <-- REGRESSION
+  HOIST only (D10)         : -1.6 .. -2.2 %
+  FOLD+HOIST (the ChatGPT both-change combo): +5.4 .. +6.7 %
+
+The four checks are LOAD-BEARING, not redundant overhead. Each `if br.truncated`
+immediately after a read breaks the serial BitReader state-dependency chain
+(`buf`/`nbits`/`real_in_buf`, each read consumes the previous read's `nbits -= n`),
+letting the truncation bookkeeping resolve off the inter-pixel critical path. Folding
+serializes all four reads back-to-back before any branch, lengthening the binding chain
+on this latency-bound loop. Do not re-fold. (The pad-safety analysis is correct and is
+why the fold is *byte-exact* — it is just *slower*.) Kept production at 4 checks, now
+routed through the `#[cold] bitstream_exhausted()` helper (the cold attribute's
+branch-layout hint is itself worth ~-2.5%, so PROD = HOIST + cold = -4.5% vs base).
+
+Also evaluated and NOT taken from the same analysis:
+- "Replace `unsafe *cur_row_ptr.add(col)` with safe `cur_row[col]`": reverting the
+  existing Lens-23 raw-ptr store risks a bounds-check regression for zero upside; the
+  raw-ptr write is also WHY D10's north hoist pays (it defeats CSE of north_row[col]).
+- Parity / carry-state-local unroll: already rejected in-file (`parity_unroll_reject`,
+  sign-unstable noise; OoO hides the [parity] spill). The D9 bisect reconfirms the loop
+  is latency-bound, not branch/spill-bound.

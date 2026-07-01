@@ -1290,3 +1290,75 @@ Remaining deferred (with honest blockers):
 - **Wall-clock pan bench** — decode-COUNT reduction is proven by metrics; a wall-clock
   number is noise-dominated at test-tile scale and needs real-size fixtures + a native
   pan-loop (Tauri) to be meaningful.
+## decompress.rs (branch perf/decompress-trunc-fold-jul01-q8z) — deferred
+
+Landed this pass (byte-exact, +4.5% vs base on synthetic): D10 north-load hoist,
+`#[cold]` error helper, dead `padded` field removal. Rejected: D9 truncation fold
+(+13%, see rejected-optimizations). Deferred (not implemented):
+
+- **Native u64 wide refill in `BitReader::fill`.** The refill is a byte-at-a-time loop
+  (`buf = (buf<<8)|data[pos+i]`). A native unaligned u64 load + bswap could cut refill
+  work, BUT fill already batches to 56 bits so it is called rarely (amortized near-free,
+  cf. rejected D3 one-fill), and WASM lacks a cheap byteswap so it may regress the
+  browser target. Needs a per-target flip (native AND wasm) before adopting.
+- **Min-payload pre-alloc rejection in `decompress_rows`.** The convenience wrapper
+  `vec![0u16; n]` (zero-fills the whole frame) before `decompress_rows_into` discovers a
+  too-short payload — a malformed tiny input with huge claimed WxH causes a large zeroed
+  alloc then immediate Err. A cheap lower-bound (>=6 bits/px + warmup) check could reject
+  first. Hardening only (real callers pass genuine header dims); not a valid-image perf
+  win. `decompress_rows_into` is already the zero-realloc path for hot callers.
+- **`width == 0` degenerate guard.** With width 0 the row loop spins `nrows` times doing
+  no reads/writes; a vast claimed height makes it a no-op DoS. Real ORF is never
+  zero-width. One-line early return; cosmetic robustness.
+- **Streaming two-row / window decode API.** The predictor needs only row, row-2, and
+  two delay values, so a streaming form could hold ~2 rows instead of the full frame for
+  preview/thumbnail/downstream-transform pipelines (mem WxH -> Wx3). New public API; the
+  current full-frame `decompress_rows_into` (output-buffer-as-history) stays optimal for
+  callers that need the whole image. Design task, not a micro-op.
+
+## decompress.rs — UPDATE 2026-07-01: 3 of 4 deferred items ENACTED
+
+Same branch perf/decompress-trunc-fold-jul01-q8z (2nd commit). After re-review at max
+effort, three of the four deferred items were implementable + verifiable here:
+
+- **[ENACTED] native u64 wide refill** — biggest win of the pass. `BitReader` is now
+  `BitReader<const WIDE: bool>`; native uses a single unaligned `from_be_bytes` u64 load
+  (keeping the top `in_bounds` bytes = byte-exact MSB-first packing) instead of up to 7
+  dependent `(buf<<8)|byte` shifts on the inter-pixel critical path, with a byte-loop
+  fallback in the last <8 bytes. Measured via the 6-way bisect (hst+wide vs hoist):
+  ~-7% isolated; PROD -6.0..-8.9% vs original base, sign-stable x3. Byte-exact (the
+  differential oracle uses `BitReader<false>` vs production `BitReader<WIDE_FILL=true>`).
+  wasm keeps the byte loop (`WIDE_FILL=false` via cfg) — the deferral's byteswap concern
+  is sidestepped, not risked; `cargo check --target wasm32` clean.
+- **[ENACTED] min-payload pre-alloc rejection** — `decompress_rows` now rejects payloads
+  below the 6-bits/pixel floor before the zero-fill alloc (identical Err text; safe lower
+  bound, never false-rejects). Test `decompress_rows_rejects_giant_dims_without_alloc`
+  (100000x100000 would need ~20 GB; passes = guard fired pre-alloc).
+- **[ENACTED] width==0 guard** — early `Ok(nrows)` after the short-input check (preserves
+  the sub-HEADER_SKIP "input too short" Err; kills the adversarial-height no-op spin).
+  Test `decompress_zero_width_is_noop`.
+
+- **[STILL DEFERRED] streaming two-row / window decode API** — unchanged. New public API
+  + caller migration + design buy-in; not a verifiable micro-change. Needs brainstorming,
+  not enactment.
+
+## decompress.rs streaming — UPDATE 2026-07-01: IMPLEMENTED (last deferred item done)
+
+The streaming two-row/window API (last remaining deferred item) is now IMPLEMENTED on
+branch perf/decompress-trunc-fold-jul01-q8z, per spec
+docs/superpowers/specs/2026-07-01-streaming-orf-preview-decode-design.md and plan
+docs/superpowers/plans/2026-07-01-streaming-orf-preview-decode.md. Shipped:
+- decompress.rs: decode_row_into shared helper (perf-neutral, bisect PROD -10%),
+  RawRowSource trait, OrfRowDecoder (3-row ring), for_each_strip.
+- demosaic.rs: demosaic_half_band (demosaic_rggb_half delegates).
+- stream_preview.rs (new): StreamingBoxDownscale + build_previews_streaming (STRIP_ROWS=128).
+- src/lib.rs: decode_orf_raw streaming fork (gate: previews && !full_rgb && wb_from_camera
+  && preview_can_halve); rare no-camera-WB bails to the full path.
+
+Verified: byte-exact at every layer (streamed rows==full decode; half-band==full; streaming
+downscale==reference; fused previews==manual composition); MSVC lib suite 215 passed;
+wasm32 check clean; peak-mem working-set ratio 0.269 (~3.7x, scales to ~6x at 24MP where
+the lightbox deliverable dominates); preview-build flipflop -1.5%/-0.7% (neutral, no regression).
+
+Remaining FUTURE (new specs, not deferred-from-this-pass): WB-stats fold-in (so no-camera-WB
+also streams), progressive-paint JS wiring, ROI/window public API, DNG/CR2 RawRowSource impl.
