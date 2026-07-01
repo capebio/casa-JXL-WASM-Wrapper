@@ -102,9 +102,8 @@ Not mutually exclusive — Route A for the deliverable JXL, Route B where ROI ma
    full encode continues.
 
 ## 6. Risks / honest costs
-- Route A: measurable compression-density loss (approximated global heuristics); gated to
-  fast tiers, higher distance, VarDCT, > 2048 px. **Benchmark the density delta** before
-  committing — it may be unacceptable for archival/lossless.
+- Route A density cost: **MEASURED = ZERO** (see §8) — the feared loss did not materialize
+  at any tested setting. (Still gated to fast/VarDCT/>2048 px; lossless/modular untested.)
 - Route B: non-standard container, seam artifacts, per-tile overhead; only wins where ROI
   or extreme size matters.
 - Small images (≤ 8 groups) don't benefit and don't need to.
@@ -121,3 +120,33 @@ Not mutually exclusive — Route A for the deliverable JXL, Route B where ROI ma
 3. Route B (JXTC streaming + ROI) as a separate follow-on where ROI/gigapixel is the goal.
 4. Feed the finding into the video-codec branch (streaming encode = its bounded-memory
    per-frame path).
+
+## 8. Gate result — MEASURED 2026-07-01 (Route A is GREEN)
+
+Implemented a native chunked-frame streaming encoder (`jxl_casaencoder::encode_chunked_rgb8`
+— `JxlEncoderAddChunkedFrame` + output processor + pull input source, mirroring libjxl's
+own `encode_test.cc` streaming path) and benchmarked it whole-frame vs streaming on a real
+20.5 MP photo (`examples/jxl_stream_encode_density.rs`), sweeping effort {1,3,5,7} × distance
+{0.5,1.0,2.0}:
+
+| d | e | density Δ | whole peak | stream peak | Δpeak | speed |
+|---|---|---|---|---|---|---|
+| 1.0 | 1 | **0.00% (byte-identical)** | 214 MB | 154 MB | −60 MB | faster |
+| 1.0 | 3 | **0.00%** | 215 | 155 | −60 | −16% |
+| 1.0 | 5 | **0.00%** | 246 | 187 | −59 | ≈ |
+| 1.0 | 7 | **0.00%** | 291 | 231 | −60 | −10% |
+| 0.5 | 3 | **0.00%** | 213 | 154 | −59 | faster |
+| 2.0 | 3 | **0.00%** | 215 | 154 | −61 | faster |
+
+**Streaming output is byte-identical to whole-frame at every setting** (identical PSNR,
+valid decode), while cutting encoder peak a steady ~60 MB (the whole-frame float working
+copy) and running neutral-to-faster. The distinct peak RSS + timing confirm it is genuinely
+the streaming path. This isolates the *encoder* (source still in RAM both arms); the full
+decode→demosaic-band→encode fusion eliminates the upstream raw+rgb16+rgb8 (~250 MB @ 24 MP)
+on top, reaching the O(band) peak.
+
+**Verdict:** the one catch (density cost) is empirically zero at the app's plausible export
+settings → **Route A is viable at no quality/size penalty.** Next: brainstorm the streaming
+export (fused decode→demosaic-band→tone-band→`encode_chunked` pipeline) + a WASM-bridge
+parity path. Not yet tested: lossless/modular density under streaming, and content beyond
+this photo.
