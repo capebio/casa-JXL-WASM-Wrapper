@@ -1381,3 +1381,85 @@ also streams), progressive-paint JS wiring, ROI/window public API, DNG/CR2 RawRo
   Out of avx2.rs's seam scope (separate kernels), but the higher-ROI target if ref-build
   latency matters. Output shift from the SIMD-ref change measured 0.00e0 (f32 metric
   resolution), so it is purely a latency question.
+## dec_group decode subsystem (2026-07-01, branch perf/dec-group-border-atomic-jul01-b3k9)
+
+Reviewed `dec_group.cc/.h` + `dec_group_border.cc/.h` for video-throughput wins.
+The files are already 5/5 (the 2026-06-29 work-elimination plan is fully landed:
+component-aware qblock clear, per-channel dc_only + CfL gate, DequantSingleBlock,
+JpegGroupParams hoist, ac_occupancy pre-size, no-draw split). LANDED: border
+atomic coalescing (see rejected/notes). The following remain **deferred** because
+each needs a full decode A/B (native `djxl` SHA and/or WASM flipflop) that this
+agent could not run, or is conditional on data this agent could not measure.
+
+- **No-CfL `DequantLane` variant (dec_group.cc).** When `no_cfl`
+  (`x_cc_mul==0 && b_cc_mul==0`, already computed per color-tile at the block loop),
+  the two `MulAdd(x_cc_mul, dequant_y, dequant_x_cc)` / `MulAdd(b_cc_mul, …)` reduce to
+  `dequant_x_cc` / `dequant_b_cc`. **Byte-exact** by IEEE-754: `fma(0,y,x)==x` for finite
+  x,y (dequant values are always finite; `dequant_x_cc` from a zero coeff is `+0.0`, never
+  `-0.0`, so no sign-of-zero divergence). Implementation = template `DequantLane`/
+  `DequantSingleBlock`/`DequantBlock` on `bool kNoCfl`, select the function pointer per
+  color-tile (where `no_cfl` is already known). Saves 2 FMA/lane on no-CfL blocks.
+  **Deferred, not landed**, because: (1) the win is *conditional* on no-CfL block
+  frequency, which is content-dependent and unmeasured (CfL is signalled only when it
+  helps, so photographic content is often CfL-active); (2) doubling the dequant template
+  surface grows the i-cache footprint, a plausible regression on CfL-heavy content — so
+  this is **not** an unambiguous "no-regression" change (rule 10 does not cleanly apply);
+  (3) the routing change touches the hottest 5/5 decode file and the *control-flow*
+  correctness (not just the FP identity) needs a full-decode SHA to confirm. Gate before
+  landing: standalone HWY `dequant_lane_ab.cc` proving `DequantLane<...,true>` with
+  `x_cc_mul=0` ≡ `DequantLane<...,false>` byte-for-byte, **plus** an interleaved decode
+  flipflop on both CfL-heavy and no-CfL content to confirm net non-regression.
+
+- **`ac_occupancy` sizing was a latent data race (dec_group.cc ~L1249) — NOW LANDED.**
+  `DecodeGroup` runs per-group across the worker pool (`RunOnPool` over `ps_ac_runnable_`
+  in `dec_frame.cc`), yet it lazily sized the frame-scoped sidecar with
+  `if (ac_occupancy.size() < needed) ac_occupancy.assign(needed, 0);`. On the first
+  accumulate-mode group of a frame, two worker threads can both see `size() < needed` and
+  race on `assign()` (concurrent reallocation) while others `|=` into it → UB. Only fires
+  in progressive/multi-pass decode (`!coefficients->IsEmpty()`). **Fixed** on branch
+  `perf/dec-group-ac-occupancy-frame-owned-jul01-c5m2` (capebio): allocation moved to
+  AC-global frame setup in `dec_frame.cc` (single-threaded, beside the retained coefficient
+  store, before `decoded_ac_global_` / any AC group dispatch); `DecodeGroup` no longer
+  touches the sidecar size; population keeps its `block_idx < size()` guard. Byte-exact by
+  construction (write-only sidecar has no consumer → output independent of allocation site).
+  Integrator build = compile gate.
+
+- **Consume `ac_occupancy` to skip the redraw coefficient scan (the file's own TODO at
+  `DecodeGroupFromStoredCoefficients`).** In stored-coefficient redraws the dc_only
+  detection re-scans `qblock[c][1..64)` per channel; the pre-populated sidecar mask
+  (bit c = channel c has nonzero AC) is exactly `!scan_ac_zero(c)` for `covered_blocks==1`,
+  so it could replace the scan. **Deferred, and currently unsafe to land** — see the
+  rejected log: `DecodeGroupNoDraw` populates coefficients but does **not** populate the
+  sidecar, so a redraw after hidden passes would read a stale/empty mask and wrongly
+  DC-fill blocks that actually have AC. Landing the consumer requires *also* populating the
+  mask in `DecodeGroupNoDraw` (adds a scan to the hidden-pass path) and a progressive
+  multi-pass corpus to verify byte-exact redraw output.
+
+- **Avoid `GetInputBuffers` on no-draw AC passes (analysis item 2) — investigated, NOT a
+  clean win.** `FrameDecoder::ProcessACGroup` (dec_frame.cc:498) calls
+  `render_pipeline->GetInputBuffers(ac_group_id, thread)` unconditionally, then `DecodeGroup`
+  decides draw/no-draw internally — so the analysis is right that render-buffer acquisition
+  happens even on no-draw VarDCT passes. **But** the same `render_pipeline_input` is also
+  consumed by the *modular* decode on every pass (dec_frame.cc:535 and :541), which runs
+  regardless of the VarDCT draw decision. So the buffers can't simply be skipped when VarDCT
+  is no-draw; making this safe means proving the modular path for that pass also needs no
+  input, which is content/mode dependent. **Deferred**: real coupling, not surgical; needs
+  the modular-decode buffer contract nailed down first.
+
+- **Border geometry precompute + counter-layout experiments (dec_group_border.cc).**
+  `GroupDone` recomputes `block_rect` / `is_last_group_*` / `xpos[4]` / `ypos[4]` per call;
+  for constant-resolution video these are frame-invariant per group and could be cached in
+  `Init` — but only amortizes if the assigner instance is reused across frames without
+  re-`Init` (a lifecycle change). Also: replacing the `available_parts_mask[3][3]` bool
+  grid with three 3-bit row masks + LUT (micro), and testing counter-array padding vs the
+  packed layout for false-sharing at high core counts. All low-value until the *atomic*
+  cost (now coalesced) is profiled as still-dominant. **Deferred**: need multi-frame /
+  many-core decode profiling to justify; the analysis itself ranks these below the atomic
+  coalescing that was landed.
+
+- **Larger analysis restructures (frame-plan object, sparse/low-frequency-only dequant
+  kernels, block-execution descriptors, supergroup/clustered scheduling, bounded
+  multi-frame pipelining).** These are architecture-level throughput ideas for a JXL video
+  profile, not surgical byte-exact edits. Each needs a design pass, a build, and a
+  multi-frame benchmark harness. **Deferred** wholesale as out-of-scope for a byte-exact
+  optimization branch; recorded so the video-codec effort can pick them up with evidence.
