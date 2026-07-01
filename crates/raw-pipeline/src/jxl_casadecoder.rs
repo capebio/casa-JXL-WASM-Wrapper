@@ -260,6 +260,23 @@ pub struct Decoder {
 // libjxl context is looked up per-use, not stored → Send, not Sync.
 unsafe impl Send for Decoder {}
 
+/// Resets the libjxl handle on drop, so a reusable [`Decoder`] returns to a clean
+/// state on **every** exit from a decode that runs a user callback — success,
+/// error, *and* a panic-unwind through the callback (`decode_view`'s `f`,
+/// `decode_progressive`'s `on_event`). The non-callback decodes reset inline
+/// (no Rust code between the C decode and the reset can unwind), so they don't
+/// need this; the callback paths do, or a panicking callback would skip the reset
+/// and poison the next decode on the same handle.
+struct ResetGuard {
+    handle: *mut ffi::JxlDecoder,
+}
+
+impl Drop for ResetGuard {
+    fn drop(&mut self) {
+        unsafe { ffi::JxlDecoderReset(self.handle) };
+    }
+}
+
 impl Decoder {
     /// Construct a decoder. `JxlDecoderCreate` is a cheap malloc; the (costly)
     /// thread runner is created once here and held across decodes when
@@ -281,6 +298,33 @@ impl Decoder {
             // Reconcile opts.parallel with the actual runner state: if runner
             // creation failed (null), opts.parallel must reflect single-threaded
             // reality so attach_runner and callers are not misled.
+            let mut opts = opts;
+            opts.parallel = !runner.is_null();
+            Some(Decoder {
+                handle,
+                runner,
+                opts,
+            })
+        }
+    }
+
+    /// Like [`Decoder::new`] but pins the thread runner to an **explicit**
+    /// `num_threads` instead of `available_parallelism()`. `num_threads <= 1`
+    /// means single-threaded (no runner). This is the honest path for benchmark
+    /// callers that request a specific thread width (`decode_full_threaded`);
+    /// `new()` deliberately keeps its auto-width behaviour. `opts.parallel` is
+    /// reconciled to the actual runner state, exactly as in `new()`.
+    pub fn with_threads(opts: DecodeOptions, num_threads: usize) -> Option<Self> {
+        unsafe {
+            let handle = ffi::JxlDecoderCreate(std::ptr::null());
+            if handle.is_null() {
+                return None;
+            }
+            let runner = if num_threads > 1 {
+                ffi::JxlThreadParallelRunnerCreate(std::ptr::null(), num_threads)
+            } else {
+                std::ptr::null_mut()
+            };
             let mut opts = opts;
             opts.parallel = !runner.is_null();
             Some(Decoder {
@@ -375,9 +419,13 @@ impl Decoder {
         ch: Channels,
         f: impl FnOnce(ImageView<S>) -> R,
     ) -> Result<R, DecodeError> {
+        // RAII reset: fires on the normal return *and* if `f` panics — without it
+        // a panicking analysis closure would leave the handle un-reset and poison
+        // the next decode (the Decoder is built to be reused).
+        let _reset = ResetGuard { handle: self.handle };
         let mut data: Vec<S> = Vec::new();
         let r = unsafe { self.run_full_into::<S>(jxl, ch.count(), &mut data, true) };
-        let out = match r {
+        match r {
             Ok((w, h, meta, extra)) => {
                 let view = ImageView {
                     width: w,
@@ -390,9 +438,7 @@ impl Decoder {
                 Ok(f(view))
             }
             Err(e) => Err(e),
-        };
-        unsafe { ffi::JxlDecoderReset(self.handle) };
-        out
+        }
     }
 
     /// Region decode (AR / digital-twin / tile seam) of a **monolithic** codestream.
@@ -428,6 +474,13 @@ impl Decoder {
                 extra: Vec::new(),
                 meta: full.meta,
             });
+        }
+        // Whole-image fast path: a viewport that (after clamping) equals the full
+        // frame needs no crop — hand back the decoded image directly instead of
+        // re-allocating and row-copying colour + every extra plane into an
+        // identical-size buffer. Byte-identical result; saves one full-frame copy.
+        if x == 0 && y == 0 && w == full.width && h == full.height {
+            return Ok(full);
         }
         let row = w as usize * cc;
         let mut data: Vec<S> = Vec::with_capacity(h as usize * row);
@@ -469,9 +522,10 @@ impl Decoder {
         ch: Channels,
         mut on_event: impl FnMut(DecodeEvent<S>) -> ProgressControl,
     ) -> Result<Image<S>, DecodeError> {
-        let r = unsafe { self.run_progressive_into::<S>(jxl, ch.count(), &mut on_event) };
-        unsafe { ffi::JxlDecoderReset(self.handle) };
-        r
+        // RAII reset: fires on success/error *and* on a panic-unwind through
+        // `on_event`, keeping the reused handle clean. (See `ResetGuard`.)
+        let _reset = ResetGuard { handle: self.handle };
+        unsafe { self.run_progressive_into::<S>(jxl, ch.count(), &mut on_event) }
     }
 
     /// Timing-only full decode at a fixed **RGBA8** output (measurement path;
@@ -908,10 +962,12 @@ pub fn decode_full(jxl_bytes: &[u8]) -> Option<Duration> {
 /// setup is excluded from timing, as before). Mirrors the prior `jpegxl-sys`
 /// `ThreadsRunner` decode.
 pub fn decode_full_threaded(jxl_bytes: &[u8], num_threads: usize) -> Option<Duration> {
-    let mut dec = Decoder::new(DecodeOptions {
-        parallel: num_threads > 1,
-        ..Default::default()
-    })?;
+    // Honour the requested width: `with_threads` pins the runner to exactly
+    // `num_threads`. The prior `parallel: num_threads > 1` only toggled a bool,
+    // then `new()` sized the runner to `available_parallelism()` — so a caller
+    // asking for 2 threads silently got the whole machine, poisoning constrained
+    // benchmark numbers.
+    let mut dec = Decoder::with_threads(DecodeOptions::default(), num_threads)?;
     dec.time_full_decode(jxl_bytes)
         .ok()
         .map(|m| Duration::from_secs_f64(m.decode_ms / 1000.0))
@@ -1107,9 +1163,13 @@ where
     })
 }
 
-/// Timing-only wrapper around [`decode_progressive_frames`].
+/// Timing-only wrapper. Uses the **borrowed** progressive path so the measurement
+/// reflects decoder work, not the legacy per-pass frame clone: the retaining
+/// `decode_progressive_frames` `to_vec()`s every flush, but this helper discards
+/// each frame, so cloning would only pollute the timing (and allocate
+/// passes × w × h × 4 bytes for nothing).
 pub fn decode_progressive_first_total(jxl_bytes: &[u8]) -> Option<(f64, f64)> {
-    decode_progressive_frames(jxl_bytes, |_| {})
+    decode_progressive_frames_borrowed(jxl_bytes, |_| {})
 }
 
 pub use decode_full as bench_jxl_decode_lowlevel_full;
@@ -1272,22 +1332,631 @@ impl TilePixels {
             },
         }
     }
+
+    /// Byte footprint (also the cache-accounting size for one tile).
+    #[inline]
+    fn byte_len(&self) -> usize {
+        match self {
+            TilePixels::U8(v) => v.len(),
+            TilePixels::U16(v) => v.len() * std::mem::size_of::<u16>(),
+        }
+    }
 }
 
-/// Decode a rectangular viewport from a JXTC tile container. Each rayon worker
-/// holds **one** [`Decoder`] reused across the tiles it handles (`map_init`) —
-/// no per-tile create/destroy on the fan-out (spec §8 criterion 4).
+// ── JxtcRegionDecoder: stateful viewport decoder with a tile cache ────────────
+// A persistent session over ONE immutable JXTC container. Header + index are
+// validated once; decoded tiles are retained (byte-bounded LRU) across decode()
+// calls, so an interactive pan/zoom re-decodes only the newly-exposed tiles.
+// Outer parallelism (rayon) fans out cache MISSES; inner libjxl stays
+// single-threaded per tile, so there is no nested oversubscription. The serial
+// row compositor and every container/trust-boundary check are the same ones the
+// free fn used; the free fn now delegates here with the cache disabled, so its
+// regression tests exercise this code too.
+
+/// Whether the session emits an alpha channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmitAlpha {
+    /// Always emit RGBA (4 bpp / 8 bpp@16-bit). On a no-alpha container libjxl
+    /// fills opaque alpha. This is the legacy free-fn contract — the default.
+    Always,
+    /// Emit RGB (3 bpp / 6 bpp@16-bit) when the container header says no alpha,
+    /// RGBA otherwise. Saves ~25% output + the alpha-synthesis work for opaque
+    /// imagery.
+    FromHeader,
+}
+
+impl Default for EmitAlpha {
+    fn default() -> Self {
+        EmitAlpha::Always
+    }
+}
+
+/// What a per-tile failure does to the whole viewport result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JxtcFailurePolicy {
+    /// Any failed/forbidden overlapping tile fails the entire `decode`.
+    Strict,
+    /// Failed tiles become zeroed holes, reported in `missing_tiles` (this is the
+    /// legacy free-fn behaviour).
+    Preview,
+}
+
+impl Default for JxtcFailurePolicy {
+    fn default() -> Self {
+        JxtcFailurePolicy::Strict
+    }
+}
+
+/// Session configuration.
+#[derive(Clone, Debug)]
+pub struct JxtcRegionOptions {
+    /// Max decoded-tile bytes retained across `decode` calls. `0` disables the
+    /// cache entirely (every call re-decodes — the stateless free-fn behaviour).
+    pub cache_bytes: usize,
+    pub failure_policy: JxtcFailurePolicy,
+    /// Alpha emission policy (see [`EmitAlpha`]). Default `Always` keeps the
+    /// historical RGBA output; `FromHeader` lets opaque containers decode as RGB.
+    pub emit_alpha: EmitAlpha,
+    /// Inherited by every tile decoder (`cancel` / `limits` / `keep_orientation`).
+    /// `parallel` and `allow_partial` are forced off for tiles regardless (rayon
+    /// owns tile parallelism; a tile is always a whole cache unit).
+    pub decode: DecodeOptions,
+}
+
+impl Default for JxtcRegionOptions {
+    fn default() -> Self {
+        JxtcRegionOptions {
+            cache_bytes: 128 * 1024 * 1024,
+            failure_policy: JxtcFailurePolicy::Strict,
+            emit_alpha: EmitAlpha::Always,
+            decode: DecodeOptions::default(),
+        }
+    }
+}
+
+/// Per-call observability (for interactive-profiling: how much the cache saved).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JxtcRegionMetrics {
+    pub cache_hits: u32,
+    pub decoded_tiles: u32,
+    pub missing_tiles: u32,
+    pub cache_tiles: u32,
+    pub cache_bytes: usize,
+}
+
+/// A decoded viewport: native-endian interleaved RGBA bytes (4 bpp at 8-bit,
+/// 8 bpp at 16-bit), what (if anything) was missing, and the call metrics.
+#[derive(Debug)]
+pub struct JxtcRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_pixel: usize,
+    pub pixels: Vec<u8>,
+    /// Empty on a clean Strict decode; the zeroed-hole tiles under Preview.
+    pub missing_tiles: Vec<(u32, u32)>,
+    pub metrics: JxtcRegionMetrics,
+}
+
+/// Stage-located session error. Strict mode surfaces per-tile errors; Preview
+/// folds them into `missing_tiles` instead.
+#[derive(thiserror::Error, Debug)]
+pub enum JxtcRegionError {
+    #[error("invalid JXTC header or index table")]
+    InvalidContainer,
+    #[error("JXTC region exceeds limits: {pixels} px / {bytes} bytes")]
+    LimitExceeded { pixels: u64, bytes: u64 },
+    #[error("JXTC region output allocation failed")]
+    OutputAlloc,
+    #[error("could not create a JXTC tile decoder")]
+    DecoderCreate,
+    #[error("JXTC decode cancelled")]
+    Cancelled,
+    #[error("invalid JXTC index entry for tile ({x}, {y})")]
+    InvalidIndex { x: u32, y: u32 },
+    #[error("JXTC tile ({x}, {y}) has unexpected dimensions")]
+    InvalidTileDimensions { x: u32, y: u32 },
+    #[error("JXTC tile ({x}, {y}) decode failed")]
+    Tile { x: u32, y: u32 },
+}
+
+struct CachedTile {
+    pixels: TilePixels,
+    width: u32,
+    height: u32,
+    bytes: usize,
+}
+
+/// Byte-bounded LRU. `n` (live tile count) is viewport-scale, so the O(n)
+/// least-recently-used scan on eviction is a cheap cold path — an intrusive
+/// linked LRU would complicate every lookup for no real-world gain.
+struct TileCache {
+    entries: std::collections::HashMap<(u32, u32), (CachedTile, u64)>,
+    max_bytes: usize,
+    bytes: usize,
+    clock: u64,
+}
+
+impl TileCache {
+    fn new(max_bytes: usize) -> Self {
+        TileCache {
+            entries: std::collections::HashMap::new(),
+            max_bytes,
+            bytes: 0,
+            clock: 0,
+        }
+    }
+
+    #[inline]
+    fn tick(&mut self) -> u64 {
+        self.clock = self.clock.wrapping_add(1);
+        self.clock
+    }
+
+    fn get(&mut self, key: (u32, u32)) -> Option<&CachedTile> {
+        let stamp = self.tick();
+        let slot = self.entries.get_mut(&key)?;
+        slot.1 = stamp;
+        Some(&slot.0)
+    }
+
+    fn remove(&mut self, key: (u32, u32)) -> Option<CachedTile> {
+        let (tile, _) = self.entries.remove(&key)?;
+        self.bytes = self.bytes.saturating_sub(tile.bytes);
+        Some(tile)
+    }
+
+    fn insert(&mut self, key: (u32, u32), tile: CachedTile) {
+        // Caching disabled, or one tile can't even fit → don't retain it.
+        if self.max_bytes == 0 || tile.bytes > self.max_bytes {
+            return;
+        }
+        if let Some((old, _)) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.bytes);
+        }
+        let bytes = tile.bytes;
+        let stamp = self.tick();
+        self.entries.insert(key, (tile, stamp));
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.evict_to_budget();
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.bytes > self.max_bytes {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, stamp))| *stamp)
+                .map(|(k, _)| *k);
+            match victim {
+                Some(k) => {
+                    self.remove(k);
+                }
+                None => break,
+            }
+        }
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes;
+        self.evict_to_budget();
+    }
+}
+
+/// Persistent viewport decoder over one borrowed JXTC container. Construct once,
+/// call [`JxtcRegionDecoder::decode`] per viewport; decoded tiles are reused
+/// across calls. See the module note above for the parallelism/memory shape.
+pub struct JxtcRegionDecoder<'a> {
+    container: &'a [u8],
+    header: JxtcHeader,
+    index_start: usize,
+    index_end: usize,
+    /// Interleaved channels requested per tile (3 = RGB, 4 = RGBA), fixed by
+    /// `emit_alpha` + the header's alpha flag at construction.
+    channels: u32,
+    bytes_per_pixel: usize,
+    options: JxtcRegionOptions,
+    cache: TileCache,
+    /// Reused across `decode` calls for the single-miss (1-tile interactive pan)
+    /// path — the genuine cross-call decoder-handle reuse. Multi-miss batches use
+    /// rayon `map_init` decoders instead.
+    serial_decoder: Option<Decoder>,
+}
+
+impl<'a> JxtcRegionDecoder<'a> {
+    /// Validate the container header + index table once. The container is borrowed
+    /// for the session; nothing is copied.
+    pub fn new(container: &'a [u8], options: JxtcRegionOptions) -> Result<Self, JxtcRegionError> {
+        let header = parse_jxtc_header(container).ok_or(JxtcRegionError::InvalidContainer)?;
+        // Checked, mirroring the free fn (tile counts are attacker-controlled).
+        let num_tiles = (header.tiles_x as usize)
+            .checked_mul(header.tiles_y as usize)
+            .ok_or(JxtcRegionError::InvalidContainer)?;
+        let index_start = JXTC_HEADER_BYTES;
+        let index_end = num_tiles
+            .checked_mul(JXTC_INDEX_ENTRY_BYTES)
+            .and_then(|table| index_start.checked_add(table))
+            .ok_or(JxtcRegionError::InvalidContainer)?;
+        if container.len() < index_end {
+            return Err(JxtcRegionError::InvalidContainer);
+        }
+        // Channel count is fixed for the session: RGBA unless the caller opted into
+        // header-driven alpha AND the container is alpha-free.
+        let emit_alpha = match options.emit_alpha {
+            EmitAlpha::Always => true,
+            EmitAlpha::FromHeader => header.has_alpha,
+        };
+        let channels: u32 = if emit_alpha { 4 } else { 3 };
+        let sample = if header.bits_per_sample == 16 { 2 } else { 1 };
+        let bytes_per_pixel = channels as usize * sample;
+        let cache_bytes = options.cache_bytes;
+        Ok(JxtcRegionDecoder {
+            container,
+            header,
+            index_start,
+            index_end,
+            channels,
+            bytes_per_pixel,
+            options,
+            cache: TileCache::new(cache_bytes),
+            serial_decoder: None,
+        })
+    }
+
+    #[inline]
+    pub fn header(&self) -> JxtcHeader {
+        self.header
+    }
+    /// Bytes currently held in the decoded-tile cache.
+    #[inline]
+    pub fn cache_bytes(&self) -> usize {
+        self.cache.bytes
+    }
+    /// Number of tiles currently held in the cache.
+    #[inline]
+    pub fn cache_tiles(&self) -> usize {
+        self.cache.entries.len()
+    }
+    /// Drop all cached tiles (e.g. on a zoom level change).
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+    /// Re-budget the cache, evicting down to the new ceiling immediately.
+    pub fn set_cache_bytes(&mut self, max_bytes: usize) {
+        self.options.cache_bytes = max_bytes;
+        self.cache.set_max_bytes(max_bytes);
+    }
+
+    #[inline]
+    fn check_cancel(&self) -> Result<(), JxtcRegionError> {
+        if self
+            .options
+            .decode
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Acquire))
+        {
+            Err(JxtcRegionError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn clamp_region(&self, r: ImageRegion) -> (u32, u32, u32, u32) {
+        let x = r.x.min(self.header.image_w);
+        let y = r.y.min(self.header.image_h);
+        let w = r.w.min(self.header.image_w.saturating_sub(x));
+        let h = r.h.min(self.header.image_h.saturating_sub(y));
+        (x, y, w, h)
+    }
+
+    fn checked_output_len(&self, w: u32, h: u32) -> Result<usize, JxtcRegionError> {
+        let pixels = (w as u64)
+            .checked_mul(h as u64)
+            .ok_or(JxtcRegionError::LimitExceeded { pixels: u64::MAX, bytes: u64::MAX })?;
+        let bytes = pixels
+            .checked_mul(self.bytes_per_pixel as u64)
+            .ok_or(JxtcRegionError::LimitExceeded { pixels, bytes: u64::MAX })?;
+        if pixels > self.options.decode.limits.max_pixels
+            || bytes > self.options.decode.limits.max_output_bytes
+        {
+            return Err(JxtcRegionError::LimitExceeded { pixels, bytes });
+        }
+        usize::try_from(bytes).map_err(|_| JxtcRegionError::LimitExceeded { pixels, bytes })
+    }
+
+    fn tile_decode_options(&self) -> DecodeOptions {
+        let mut o = self.options.decode.clone();
+        o.parallel = false; // rayon owns tile parallelism; no nested libjxl runner
+        o.allow_partial = false; // a tile is a whole cache unit, never partial
+        o
+    }
+
+    fn serial_decoder(&mut self) -> Result<&mut Decoder, JxtcRegionError> {
+        if self.serial_decoder.is_none() {
+            let opts = self.tile_decode_options();
+            self.serial_decoder = Decoder::new(opts);
+        }
+        self.serial_decoder.as_mut().ok_or(JxtcRegionError::DecoderCreate)
+    }
+
+    /// Decode one viewport. Cache hits are composited immediately; misses are
+    /// decoded (the held serial decoder for one, a rayon fan-out for many), then
+    /// composited and inserted into the cache.
+    pub fn decode(&mut self, request: ImageRegion) -> Result<JxtcRegion, JxtcRegionError> {
+        self.check_cancel()?;
+        let (rx, ry, rw, rh) = self.clamp_region(request);
+        let out_len = self.checked_output_len(rw, rh)?;
+
+        let mut pixels: Vec<u8> = Vec::new();
+        pixels
+            .try_reserve_exact(out_len)
+            .map_err(|_| JxtcRegionError::OutputAlloc)?;
+        pixels.resize(out_len, 0);
+
+        let header = self.header;
+        let bpp = self.bytes_per_pixel;
+        let mut metrics = JxtcRegionMetrics::default();
+        let mut missing_tiles: Vec<(u32, u32)> = Vec::new();
+
+        if rw != 0 && rh != 0 {
+            let overlapping =
+                overlapping_tile_indices(&header, ImageRegion { x: rx, y: ry, w: rw, h: rh });
+
+            // Phase 1: composite cache hits; collect the misses.
+            let mut misses: Vec<(u32, u32)> = Vec::with_capacity(overlapping.len());
+            for key in overlapping {
+                if let Some(tile) = self.cache.get(key) {
+                    blit_jxtc_tile(&header, bpp, rx, ry, rw, rh, &mut pixels, key, tile)?;
+                    metrics.cache_hits += 1;
+                } else {
+                    misses.push(key);
+                }
+            }
+
+            // Phase 2: decode the misses, composite, and cache them.
+            for (key, decoded) in self.decode_misses(&misses)? {
+                match decoded {
+                    Ok(tile) => {
+                        blit_jxtc_tile(&header, bpp, rx, ry, rw, rh, &mut pixels, key, &tile)?;
+                        self.cache.insert(key, tile);
+                        metrics.decoded_tiles += 1;
+                    }
+                    Err(JxtcRegionError::Cancelled) => return Err(JxtcRegionError::Cancelled),
+                    Err(e) => match self.options.failure_policy {
+                        JxtcFailurePolicy::Strict => return Err(e),
+                        JxtcFailurePolicy::Preview => {
+                            missing_tiles.push(key);
+                            metrics.missing_tiles += 1;
+                        }
+                    },
+                }
+            }
+        }
+
+        metrics.cache_tiles = self.cache.entries.len().min(u32::MAX as usize) as u32;
+        metrics.cache_bytes = self.cache.bytes;
+
+        Ok(JxtcRegion {
+            x: rx,
+            y: ry,
+            width: rw,
+            height: rh,
+            bytes_per_pixel: bpp,
+            pixels,
+            missing_tiles,
+            metrics,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn decode_misses(
+        &mut self,
+        misses: &[(u32, u32)],
+    ) -> Result<Vec<((u32, u32), Result<CachedTile, JxtcRegionError>)>, JxtcRegionError> {
+        if misses.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.check_cancel()?;
+
+        // Copy the borrow-free pieces out so the rayon closures / serial path
+        // don't capture `self` (the `&'a` container ref is Copy, lifetime-independent
+        // of the `&mut self` borrow `serial_decoder()` needs).
+        let container = self.container;
+        let header = self.header;
+        let index_start = self.index_start;
+        let index_end = self.index_end;
+        let channels = self.channels;
+
+        // One miss → reuse the held serial decoder (the 1-tile interactive pan).
+        if misses.len() == 1 {
+            let key = misses[0];
+            let dec = self.serial_decoder()?;
+            let res =
+                decode_one_jxtc_tile(container, header, index_start, index_end, channels, dec, key);
+            return Ok(vec![(key, res)]);
+        }
+
+        // Many misses → rayon fan-out, one fresh single-threaded decoder per job.
+        let opts = self.tile_decode_options();
+        let results: Vec<((u32, u32), Result<CachedTile, JxtcRegionError>)> = misses
+            .par_iter()
+            .map_init(
+                move || Decoder::new(opts.clone()),
+                |slot, &key| {
+                    let res = match slot.as_mut() {
+                        Some(dec) => decode_one_jxtc_tile(
+                            container,
+                            header,
+                            index_start,
+                            index_end,
+                            channels,
+                            dec,
+                            key,
+                        ),
+                        None => Err(JxtcRegionError::DecoderCreate),
+                    };
+                    (key, res)
+                },
+            )
+            .collect();
+        Ok(results)
+    }
+}
+
+/// Borrow one tile's codestream from the validated index table — all the
+/// overflow + trust-boundary checks the free fn did inline live here.
+fn jxtc_tile_stream(
+    container: &[u8],
+    header: JxtcHeader,
+    index_start: usize,
+    index_end: usize,
+    key: (u32, u32),
+) -> Result<&[u8], JxtcRegionError> {
+    let (x, y) = key;
+    if x >= header.tiles_x || y >= header.tiles_y {
+        return Err(JxtcRegionError::InvalidIndex { x, y });
+    }
+    let idx = (y as usize)
+        .checked_mul(header.tiles_x as usize)
+        .and_then(|row| row.checked_add(x as usize))
+        .ok_or(JxtcRegionError::InvalidIndex { x, y })?;
+    let base = idx
+        .checked_mul(JXTC_INDEX_ENTRY_BYTES)
+        .and_then(|off| index_start.checked_add(off))
+        .ok_or(JxtcRegionError::InvalidIndex { x, y })?;
+    let entry_end = base
+        .checked_add(JXTC_INDEX_ENTRY_BYTES)
+        .ok_or(JxtcRegionError::InvalidIndex { x, y })?;
+    if entry_end > index_end {
+        return Err(JxtcRegionError::InvalidIndex { x, y });
+    }
+    let entry = container
+        .get(base..entry_end)
+        .ok_or(JxtcRegionError::InvalidIndex { x, y })?;
+    let off = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
+    let len = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) as usize;
+    let end = off.checked_add(len).ok_or(JxtcRegionError::InvalidIndex { x, y })?;
+    // Trust boundary: a tile must live past the index table and within bounds, or
+    // a crafted container could feed index bytes to the JXL decoder.
+    if off < index_end || end > container.len() {
+        return Err(JxtcRegionError::InvalidIndex { x, y });
+    }
+    container.get(off..end).ok_or(JxtcRegionError::InvalidIndex { x, y })
+}
+
+/// Expected (partial-edge-aware) pixel dims of a tile.
+fn jxtc_expected_tile_dims(
+    header: JxtcHeader,
+    key: (u32, u32),
+) -> Result<(u32, u32), JxtcRegionError> {
+    let (x, y) = key;
+    let x0 = x
+        .checked_mul(header.tile_size)
+        .ok_or(JxtcRegionError::InvalidTileDimensions { x, y })?;
+    let y0 = y
+        .checked_mul(header.tile_size)
+        .ok_or(JxtcRegionError::InvalidTileDimensions { x, y })?;
+    let w = header.tile_size.min(header.image_w.saturating_sub(x0));
+    let h = header.tile_size.min(header.image_h.saturating_sub(y0));
+    if w == 0 || h == 0 {
+        return Err(JxtcRegionError::InvalidTileDimensions { x, y });
+    }
+    Ok((w, h))
+}
+
+/// Decode + validate one tile into a `CachedTile`. Uses `run_raw` (colour-only):
+/// JXTC composites interleaved RGBA bytes, so extra planes are never read back.
+fn decode_one_jxtc_tile(
+    container: &[u8],
+    header: JxtcHeader,
+    index_start: usize,
+    index_end: usize,
+    channels: u32,
+    dec: &mut Decoder,
+    key: (u32, u32),
+) -> Result<CachedTile, JxtcRegionError> {
+    let (x, y) = key;
+    let stream = jxtc_tile_stream(container, header, index_start, index_end, key)?;
+    let (pixels, tw, th) = if header.bits_per_sample == 16 {
+        match dec.run_raw::<u16>(stream, channels) {
+            Ok((w, h, _, data)) => (TilePixels::U16(data), w, h),
+            Err(DecodeError::Cancelled) => return Err(JxtcRegionError::Cancelled),
+            Err(_) => return Err(JxtcRegionError::Tile { x, y }),
+        }
+    } else {
+        match dec.run_raw::<u8>(stream, channels) {
+            Ok((w, h, _, data)) => (TilePixels::U8(data), w, h),
+            Err(DecodeError::Cancelled) => return Err(JxtcRegionError::Cancelled),
+            Err(_) => return Err(JxtcRegionError::Tile { x, y }),
+        }
+    };
+    let (ew, eh) = jxtc_expected_tile_dims(header, key)?;
+    if tw != ew || th != eh {
+        return Err(JxtcRegionError::InvalidTileDimensions { x, y });
+    }
+    let sample = if header.bits_per_sample == 16 { 2usize } else { 1usize };
+    let bpp = channels as usize * sample;
+    let expected = (tw as usize)
+        .checked_mul(th as usize)
+        .and_then(|px| px.checked_mul(bpp))
+        .ok_or(JxtcRegionError::InvalidTileDimensions { x, y })?;
+    if pixels.byte_len() != expected {
+        return Err(JxtcRegionError::Tile { x, y });
+    }
+    Ok(CachedTile { bytes: pixels.byte_len(), pixels, width: tw, height: th })
+}
+
+/// Composite one tile's overlap into `dest` — safe strided row copies, byte-for-byte
+/// identical to the free-fn loop (just fallible instead of panicking on a bad rect).
+#[allow(clippy::too_many_arguments)]
+fn blit_jxtc_tile(
+    header: &JxtcHeader,
+    bpp: usize,
+    rx: u32,
+    ry: u32,
+    rw: u32,
+    rh: u32,
+    dest: &mut [u8],
+    key: (u32, u32),
+    tile: &CachedTile,
+) -> Result<(), JxtcRegionError> {
+    let (tx, ty) = key;
+    let src = tile.pixels.as_bytes();
+    if let Some((src_x, src_y, dst_x, dst_y, ow, oh)) =
+        compute_tile_copy_rects(header, tx, ty, rx, ry, rw, rh, tile.width, tile.height)
+    {
+        for row in 0..oh {
+            let src_off = ((src_y + row) as usize * tile.width as usize + src_x as usize) * bpp;
+            let dst_off = ((dst_y + row) as usize * rw as usize + dst_x as usize) * bpp;
+            let n = ow as usize * bpp;
+            let s = src
+                .get(src_off..src_off + n)
+                .ok_or(JxtcRegionError::Tile { x: tx, y: ty })?;
+            let d = dest
+                .get_mut(dst_off..dst_off + n)
+                .ok_or(JxtcRegionError::Tile { x: tx, y: ty })?;
+            d.copy_from_slice(s);
+        }
+    }
+    Ok(())
+}
+
+/// Decode a rectangular viewport from a JXTC tile container (legacy free-fn API).
 ///
-/// Tiles are decoded in parallel, then composited serially into `dest`. The
-/// composite is **not** parallelised on purpose: it is row `memcpy` into disjoint
-/// destination rectangles — bandwidth-bound, not CPU-bound, so adding threads
-/// would contend on the same memory bus for no gain. The transient `decoded_tiles`
-/// vector only holds the *overlapping* tiles (a handful for a normal viewport);
-/// its peak is meaningful only when the viewport approaches the whole image, which
-/// is the anti-pattern this region API exists to avoid. Decoding straight into
-/// `dest` would drop that transient but requires unsafe disjoint-sub-rectangle
-/// writes (tile rects are strided, not contiguous slices) — not justified for the
-/// small-viewport norm.
+/// Thin wrapper over [`JxtcRegionDecoder`] with the cache **disabled** and the
+/// **Preview** failure policy, preserving the historical behaviour exactly:
+/// failed/forbidden tiles become zeroed holes, and `None` is returned only for a
+/// bad container (or an output that overflows / exceeds limits). New callers that
+/// decode many viewports from one container (pan/zoom) should hold a
+/// [`JxtcRegionDecoder`] instead, to reuse decoded tiles across calls.
 pub fn decode_jxtc_region(
     container: &[u8],
     region_x: u32,
@@ -1295,135 +1964,20 @@ pub fn decode_jxtc_region(
     region_w: u32,
     region_h: u32,
 ) -> Option<Vec<u8>> {
-    let header = parse_jxtc_header(container)?;
-
-    let rx = region_x.min(header.image_w);
-    let ry = region_y.min(header.image_h);
-    let rw = region_w.min(header.image_w.saturating_sub(rx));
-    let rh = region_h.min(header.image_h.saturating_sub(ry));
-
-    if rw == 0 || rh == 0 {
-        return Some(Vec::new());
-    }
-
-    let bpp = if header.bits_per_sample == 16 { 8usize } else { 4usize };
-
-    // Checked arithmetic: tiles_x/tiles_y are attacker-controlled u32 header
-    // fields. On 32-bit `tiles_x*tiles_y` and the index-table extent can
-    // overflow `usize` and wrap below `container.len()`, passing the bounds test
-    // and slicing arbitrary bytes. Reject any product/extent that overflows.
-    let num_tiles = (header.tiles_x as usize).checked_mul(header.tiles_y as usize)?;
-    let index_start = JXTC_HEADER_BYTES;
-    let index_end = num_tiles
-        .checked_mul(JXTC_INDEX_ENTRY_BYTES)
-        .and_then(|table_bytes| index_start.checked_add(table_bytes))?;
-    if container.len() < index_end {
-        return None;
-    }
-
-    // The index table is validated present (container.len() >= index_end above);
-    // each overlapping tile's 8-byte entry is read directly inside the fan-out
-    // rather than materializing a Vec<(off,len)> for *all* num_tiles up front
-    // (most are never touched for a small viewport).
-    let overlapping = overlapping_tile_indices(&header, ImageRegion { x: rx, y: ry, w: rw, h: rh });
-
-    let is16 = header.bits_per_sample == 16;
-    let decoded_tiles: Vec<((u32, u32), TilePixels, u32, u32)> = overlapping
-        .par_iter()
-        .map_init(
-            || Decoder::new(DecodeOptions::default()),
-            |dec_slot, &(tx, ty)| {
-                let dec = dec_slot.as_mut()?;
-                // Cast to usize before multiplying to avoid u32 wrap (matches the
-                // dest-copy convention below): ty*tiles_x is bounded by num_tiles,
-                // which is a usize-checked product — the intermediate must widen too.
-                let idx = ty as usize * header.tiles_x as usize + tx as usize;
-                // Read this tile's index entry directly from the validated table.
-                // overlapping_tile_indices guarantees tx<tiles_x && ty<tiles_y, so
-                // idx<num_tiles ⇒ base+8 <= index_end <= container.len(); the
-                // explicit guard keeps the None-on-OOB contract (no panic) regardless.
-                let base = index_start + idx * JXTC_INDEX_ENTRY_BYTES;
-                if base + JXTC_INDEX_ENTRY_BYTES > index_end {
-                    return None;
-                }
-                let off = u32::from_le_bytes(container[base..base + 4].try_into().ok()?);
-                let len = u32::from_le_bytes(container[base + 4..base + 8].try_into().ok()?);
-                let start = off as usize;
-                // Checked add: on 32-bit `start + len` can wrap below
-                // container.len() and slip past the bounds test.
-                let end = start.checked_add(len as usize)?;
-                if end > container.len() {
-                    return None;
-                }
-                // Trust-boundary: tiles must not overlap the header or index table.
-                // A crafted container with off < index_end would feed index bytes to
-                // the JXL decoder, potentially bypassing format validation.
-                if start < index_end {
-                    return None;
-                }
-                let tile_jxl = &container[start..end];
-
-                // Keep tiles in their native sample width — the 16-bit branch no
-                // longer copies into an intermediate Vec<u8>; the compositor takes a
-                // byte view (TilePixels::as_bytes) at copy time instead.
-                let (pixels, tw, th) = if is16 {
-                    let img = dec.decode::<u16>(tile_jxl, Channels::Rgba).ok()?;
-                    (TilePixels::U16(img.data), img.width, img.height)
-                } else {
-                    let img = dec.decode::<u8>(tile_jxl, Channels::Rgba).ok()?;
-                    (TilePixels::U8(img.data), img.width, img.height)
-                };
-
-                // saturating_sub: malformed headers can have tiles_x > ceil(image_w/tile_size);
-                // without saturation the subtraction wraps on u32 targets (see also parse validation).
-                let exp_w = header.tile_size.min(header.image_w.saturating_sub(tx * header.tile_size));
-                let exp_h = header.tile_size.min(header.image_h.saturating_sub(ty * header.tile_size));
-                if tw != exp_w || th != exp_h {
-                    return None;
-                }
-                Some(((tx, ty), pixels, tw, th))
-            },
-        )
-        .collect::<Vec<Option<_>>>()
-        .into_iter()
-        .flatten()
-        .collect();
-
-    // Checked multiply: rw*rh*bpp can overflow on 32-bit/WASM targets.
-    let dest_len = (rw as usize)
-        .checked_mul(rh as usize)
-        .and_then(|n| n.checked_mul(bpp))?;
-    let mut dest = vec![0u8; dest_len];
-
-    for ((tx, ty), tile_pixels, tw, th) in decoded_tiles {
-        // Byte view of the native-width tile (zero-copy for both 8- and 16-bit).
-        let tile_pixels = tile_pixels.as_bytes();
-        // Trust-boundary guard: `tw`/`th` are decoder-reported dims; verify the
-        // buffer actually holds tw*th*bpp bytes so a mismatch skips the tile
-        // instead of OOB-panicking copy_from_slice.
-        let needed = (tw as usize)
-            .checked_mul(th as usize)
-            .and_then(|px| px.checked_mul(bpp));
-        match needed {
-            Some(n) if tile_pixels.len() >= n => {}
-            _ => continue,
-        }
-        if let Some((src_x, src_y, dst_x, dst_y, ow, oh)) =
-            compute_tile_copy_rects(&header, tx, ty, rx, ry, rw, rh, tw, th)
-        {
-            for row in 0..oh {
-                // Cast to usize before multiplying to avoid u32 wrap on 32-bit (WASM).
-                let src_row_off = ((src_y + row) as usize * tw as usize + src_x as usize) * bpp;
-                let dst_row_off = ((dst_y + row) as usize * rw as usize + dst_x as usize) * bpp;
-                let row_bytes = (ow as usize) * bpp;
-
-                dest[dst_row_off..dst_row_off + row_bytes]
-                    .copy_from_slice(&tile_pixels[src_row_off..src_row_off + row_bytes]);
-            }
-        }
-    }
-
-    Some(dest)
+    let mut session = JxtcRegionDecoder::new(
+        container,
+        JxtcRegionOptions {
+            cache_bytes: 0,
+            failure_policy: JxtcFailurePolicy::Preview,
+            emit_alpha: EmitAlpha::Always, // legacy callers expect RGBA always
+            decode: DecodeOptions::default(),
+        },
+    )
+    .ok()?;
+    session
+        .decode(ImageRegion { x: region_x, y: region_y, w: region_w, h: region_h })
+        .ok()
+        .map(|region| region.pixels)
 }
 
 pub use overlapping_tile_indices as jxtc_overlapping_tile_indices;
@@ -1549,6 +2103,30 @@ mod tests {
         let img = dec.decode::<u8>(&jxl, Channels::Rgba).unwrap();
         let sum_owned: u64 = img.data.iter().map(|&b| b as u64).sum();
         assert_eq!(sum_view, sum_owned);
+    }
+
+    #[test]
+    fn panicking_view_callback_leaves_decoder_reusable() {
+        // The ResetGuard must reset the handle even when the analysis closure
+        // unwinds, or the next decode on the reused Decoder would be poisoned.
+        let (w, h) = (32u32, 32u32);
+        let rgba = gradient_rgba8(w, h);
+        let jxl = enc_lossless(&Frame::rgba8(&rgba, w, h));
+        let mut dec = Decoder::new(DecodeOptions::default()).unwrap();
+
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = dec.decode_view::<u8, ()>(&jxl, Channels::Rgba, |_| panic!("boom"));
+        }));
+        std::panic::set_hook(prev);
+        assert!(caught.is_err(), "callback panic must propagate");
+
+        // Same decoder, after the panic-unwind → still decodes correctly.
+        let img = dec
+            .decode::<u8>(&jxl, Channels::Rgba)
+            .expect("decoder reusable after a panicking view callback");
+        assert_eq!((img.width, img.height), (w, h));
     }
 
     #[test]
@@ -1992,5 +2570,311 @@ mod tests {
         let out = decode_jxtc_region(&c, 0, 0, ts, ts).expect("graceful skip, not None/panic");
         assert_eq!(out.len(), (ts * ts * 4) as usize);
         assert!(out.iter().all(|&b| b == 0), "rejected tile yields a zeroed hole");
+    }
+
+    // ── JxtcRegionDecoder session (stateful, byte-bounded tile cache) ─────────
+    // The session parses header+index once and caches decoded tiles across
+    // decode() calls, so an interactive pan re-decodes only newly-exposed tiles.
+    // These tests pin: parity with the proven free fn, cross-call reuse (vs a
+    // cache-disabled control), bounded eviction, strict/preview failure, cancel.
+
+    fn assert_rgba_region(out: &[u8], reference: &[u8], img_w: u32, rx: u32, ry: u32, rw: u32, rh: u32) {
+        for dy in 0..rh {
+            for dx in 0..rw {
+                let s = (((ry + dy) * img_w + (rx + dx)) * 4) as usize;
+                let d = ((dy * rw + dx) * 4) as usize;
+                assert_eq!(&out[d..d + 4], &reference[s..s + 4], "roi px ({dx},{dy})");
+            }
+        }
+    }
+
+    #[test]
+    fn jxtc_session_roi_matches_free_fn() {
+        let (w, h, ts) = (100u32, 70u32, 32u32);
+        let reference = gradient_rgba8(w, h);
+        let container = build_jxtc_rgba8(&reference, w, h, ts);
+        let (rx, ry, rw, rh) = (40u32, 30u32, 58u32, 38u32);
+
+        let mut s = JxtcRegionDecoder::new(&container, JxtcRegionOptions::default()).unwrap();
+        let region = s.decode(ImageRegion { x: rx, y: ry, w: rw, h: rh }).unwrap();
+        let free = decode_jxtc_region(&container, rx, ry, rw, rh).unwrap();
+        assert_eq!(region.pixels, free, "session must match the proven free fn byte-for-byte");
+        assert_rgba_region(&region.pixels, &reference, w, rx, ry, rw, rh);
+    }
+
+    #[test]
+    fn jxtc_session_reuses_overlap_between_adjacent_viewports() {
+        // 96x64 @ tile 32 → 3x2 grid. A horizontal pan shares the middle column.
+        let (w, h, ts) = (96u32, 64u32, 32u32);
+        let reference = gradient_rgba8(w, h);
+        let container = build_jxtc_rgba8(&reference, w, h, ts);
+
+        let mut s = JxtcRegionDecoder::new(
+            &container,
+            JxtcRegionOptions { cache_bytes: 16 * 1024 * 1024, ..Default::default() },
+        )
+        .unwrap();
+
+        let f1 = s.decode(ImageRegion { x: 0, y: 0, w: 64, h: 64 }).unwrap();
+        assert_eq!(
+            (f1.metrics.cache_hits, f1.metrics.decoded_tiles),
+            (0, 4),
+            "cold frame decodes all 4 overlapping tiles"
+        );
+        assert_rgba_region(&f1.pixels, &reference, w, 0, 0, 64, 64);
+
+        let f2 = s.decode(ImageRegion { x: 32, y: 0, w: 64, h: 64 }).unwrap();
+        eprintln!(
+            "JXTC pan reuse: hits={} decoded={} (stateless re-decode would be {})",
+            f2.metrics.cache_hits,
+            f2.metrics.decoded_tiles,
+            f2.metrics.cache_hits + f2.metrics.decoded_tiles
+        );
+        assert_eq!(
+            (f2.metrics.cache_hits, f2.metrics.decoded_tiles),
+            (2, 2),
+            "pan reuses the 2 shared tiles, decodes only the 2 newly-exposed"
+        );
+        assert_eq!(f2.metrics.missing_tiles, 0);
+        assert_rgba_region(&f2.pixels, &reference, w, 32, 0, 64, 64);
+    }
+
+    #[test]
+    fn jxtc_session_disabled_cache_decodes_every_frame() {
+        // Control for the reuse test: cache_bytes = 0 ⇒ no reuse, full re-decode.
+        // If the reuse counts above came from anything but the cache, this fails.
+        let (w, h, ts) = (96u32, 64u32, 32u32);
+        let reference = gradient_rgba8(w, h);
+        let container = build_jxtc_rgba8(&reference, w, h, ts);
+
+        let mut s = JxtcRegionDecoder::new(
+            &container,
+            JxtcRegionOptions { cache_bytes: 0, ..Default::default() },
+        )
+        .unwrap();
+        let _ = s.decode(ImageRegion { x: 0, y: 0, w: 64, h: 64 }).unwrap();
+        let f2 = s.decode(ImageRegion { x: 32, y: 0, w: 64, h: 64 }).unwrap();
+        assert_eq!(
+            (f2.metrics.cache_hits, f2.metrics.decoded_tiles),
+            (0, 4),
+            "no cache ⇒ no reuse ⇒ every overlapping tile re-decoded"
+        );
+        assert_rgba_region(&f2.pixels, &reference, w, 32, 0, 64, 64);
+    }
+
+    #[test]
+    fn jxtc_session_eviction_keeps_correctness_and_budget() {
+        let (w, h, ts) = (64u32, 64u32, 32u32); // 2x2 grid; each tile = 32*32*4 = 4096 B
+        let reference = gradient_rgba8(w, h);
+        let container = build_jxtc_rgba8(&reference, w, h, ts);
+
+        let budget = 5000usize; // holds exactly one 4096-byte tile
+        let mut s = JxtcRegionDecoder::new(
+            &container,
+            JxtcRegionOptions { cache_bytes: budget, ..Default::default() },
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let f = s.decode(ImageRegion { x: 0, y: 0, w: 64, h: 64 }).unwrap();
+            assert_rgba_region(&f.pixels, &reference, w, 0, 0, 64, 64);
+            assert!(s.cache_bytes() <= budget, "cache stays within byte budget");
+        }
+        assert!(s.cache_tiles() <= 1, "tiny budget retains at most one tile");
+    }
+
+    #[test]
+    fn jxtc_session_strict_errors_on_corrupt_tile() {
+        let (w, h, ts) = (64u32, 32u32, 32u32);
+        let mut c = build_jxtc_rgba8(&gradient_rgba8(w, h), w, h, ts);
+        // Rewrite tile (0,0)'s offset to point back into the index region.
+        c[JXTC_HEADER_BYTES..JXTC_HEADER_BYTES + 4].copy_from_slice(&0u32.to_le_bytes());
+
+        let mut s = JxtcRegionDecoder::new(
+            &c,
+            JxtcRegionOptions { failure_policy: JxtcFailurePolicy::Strict, ..Default::default() },
+        )
+        .unwrap();
+        assert!(
+            s.decode(ImageRegion { x: 0, y: 0, w: ts, h: ts }).is_err(),
+            "strict mode rejects the viewport when an overlapping tile is corrupt"
+        );
+    }
+
+    #[test]
+    fn jxtc_session_preview_reports_missing_and_zeros_hole() {
+        let (w, h, ts) = (64u32, 32u32, 32u32); // 2x1 grid
+        let mut c = build_jxtc_rgba8(&gradient_rgba8(w, h), w, h, ts);
+        c[JXTC_HEADER_BYTES..JXTC_HEADER_BYTES + 4].copy_from_slice(&0u32.to_le_bytes());
+
+        let mut s = JxtcRegionDecoder::new(
+            &c,
+            JxtcRegionOptions { failure_policy: JxtcFailurePolicy::Preview, ..Default::default() },
+        )
+        .unwrap();
+        let f = s.decode(ImageRegion { x: 0, y: 0, w: ts, h: ts }).unwrap(); // only tile (0,0)
+        assert_eq!(f.missing_tiles, vec![(0, 0)]);
+        assert_eq!(f.metrics.missing_tiles, 1);
+        assert!(f.pixels.iter().all(|&b| b == 0), "missing tile leaves a zeroed hole");
+    }
+
+    #[test]
+    fn jxtc_session_cancel_propagates() {
+        let (w, h, ts) = (64u32, 64u32, 32u32);
+        let container = build_jxtc_rgba8(&gradient_rgba8(w, h), w, h, ts);
+        let flag = Arc::new(AtomicBool::new(true));
+        let mut s = JxtcRegionDecoder::new(
+            &container,
+            JxtcRegionOptions {
+                decode: DecodeOptions { cancel: Some(flag.clone()), ..Default::default() },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            s.decode(ImageRegion { x: 0, y: 0, w: 64, h: 64 }),
+            Err(JxtcRegionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn jxtc_session_16bit_matches_free_fn() {
+        let tile = 16u32;
+        let (txn, tyn) = (2u32, 2u32);
+        let (iw, ih) = (tile * txn, tile * tyn);
+        let mut full: Vec<u16> = vec![0; (iw * ih * 4) as usize];
+        for y in 0..ih {
+            for x in 0..iw {
+                let i = ((y * iw + x) * 4) as usize;
+                full[i] = (x as u16).wrapping_mul(257);
+                full[i + 1] = (y as u16).wrapping_mul(257);
+                full[i + 2] = ((x + y) as u16).wrapping_mul(131);
+                full[i + 3] = 65535;
+            }
+        }
+        let mut tiles = Vec::new();
+        for ty in 0..tyn {
+            for tx in 0..txn {
+                let mut t: Vec<u16> = vec![0; (tile * tile * 4) as usize];
+                for ly in 0..tile {
+                    for lx in 0..tile {
+                        let (gx, gy) = (tx * tile + lx, ty * tile + ly);
+                        let s = ((gy * iw + gx) * 4) as usize;
+                        let d = ((ly * tile + lx) * 4) as usize;
+                        t[d..d + 4].copy_from_slice(&full[s..s + 4]);
+                    }
+                }
+                tiles.push(enc_lossless(&Frame::rgba(&t, tile, tile)));
+            }
+        }
+        let container = build_jxtc(&tiles, txn, tyn, tile, iw, ih, true);
+
+        let mut s = JxtcRegionDecoder::new(&container, JxtcRegionOptions::default()).unwrap();
+        let region = s.decode(ImageRegion { x: 0, y: 0, w: iw, h: ih }).unwrap();
+        assert_eq!(region.bytes_per_pixel, 8);
+        let free = decode_jxtc_region(&container, 0, 0, iw, ih).unwrap();
+        assert_eq!(region.pixels, free, "16-bit session matches the free fn");
+        assert_eq!(region.pixels, u16_samples_to_ne_bytes(&full));
+    }
+
+    fn gradient_rgb8(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                v[i] = (x % 256) as u8;
+                v[i + 1] = (y % 256) as u8;
+                v[i + 2] = ((x + y) % 256) as u8;
+            }
+        }
+        v
+    }
+
+    /// Build an **alpha-free** 8-bit JXTC container: RGB (3-channel) tiles, header
+    /// flags = 0 (no alpha, 8-bit).
+    fn build_jxtc_rgb8(ref_rgb: &[u8], w: u32, h: u32, tile_size: u32) -> Vec<u8> {
+        let tiles_x = w.div_ceil(tile_size);
+        let tiles_y = h.div_ceil(tile_size);
+        let num_tiles = (tiles_x * tiles_y) as usize;
+        let mut streams: Vec<Vec<u8>> = Vec::with_capacity(num_tiles);
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let (tx0, ty0) = (tx * tile_size, ty * tile_size);
+                let tw = tile_size.min(w - tx0);
+                let th = tile_size.min(h - ty0);
+                let mut tile = vec![0u8; (tw * th * 3) as usize];
+                for ry in 0..th {
+                    for rx in 0..tw {
+                        let s = (((ty0 + ry) * w + (tx0 + rx)) * 3) as usize;
+                        let d = ((ry * tw + rx) * 3) as usize;
+                        tile[d..d + 3].copy_from_slice(&ref_rgb[s..s + 3]);
+                    }
+                }
+                streams.push(enc_lossless(&Frame::rgb(&tile, tw, th)));
+            }
+        }
+        let index_bytes = num_tiles * JXTC_INDEX_ENTRY_BYTES;
+        let mut c: Vec<u8> = Vec::new();
+        c.extend_from_slice(&JXTC_MAGIC.to_le_bytes());
+        c.extend_from_slice(&JXTC_VERSION.to_le_bytes());
+        c.extend_from_slice(&w.to_le_bytes());
+        c.extend_from_slice(&h.to_le_bytes());
+        c.extend_from_slice(&tile_size.to_le_bytes());
+        c.extend_from_slice(&tiles_x.to_le_bytes());
+        c.extend_from_slice(&tiles_y.to_le_bytes());
+        c.extend_from_slice(&0u32.to_le_bytes()); // flags: no alpha, 8-bit
+        let mut cursor = JXTC_HEADER_BYTES + index_bytes;
+        for s in &streams {
+            c.extend_from_slice(&(cursor as u32).to_le_bytes());
+            c.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            cursor += s.len();
+        }
+        for s in &streams {
+            c.extend_from_slice(s);
+        }
+        c
+    }
+
+    fn assert_region_ch(out: &[u8], reference: &[u8], img_w: u32, rx: u32, ry: u32, rw: u32, rh: u32, ch: usize) {
+        for dy in 0..rh {
+            for dx in 0..rw {
+                let s = (((ry + dy) * img_w + (rx + dx)) as usize) * ch;
+                let d = ((dy * rw + dx) as usize) * ch;
+                assert_eq!(&out[d..d + ch], &reference[s..s + ch], "px ({dx},{dy})");
+            }
+        }
+    }
+
+    #[test]
+    fn jxtc_session_alpha_free_emits_rgb_in_fromheader_mode() {
+        let (w, h, ts) = (64u32, 48u32, 32u32);
+        let rgb = gradient_rgb8(w, h);
+        let container = build_jxtc_rgb8(&rgb, w, h, ts);
+
+        // FromHeader on a no-alpha container → RGB (3 bpp): 25% smaller output and
+        // no alpha-synthesis work.
+        let mut s = JxtcRegionDecoder::new(
+            &container,
+            JxtcRegionOptions { emit_alpha: EmitAlpha::FromHeader, ..Default::default() },
+        )
+        .unwrap();
+        let r = s.decode(ImageRegion { x: 0, y: 0, w, h }).unwrap();
+        assert_eq!(r.bytes_per_pixel, 3, "alpha-free FromHeader emits RGB");
+        assert_eq!(r.pixels.len(), (w * h * 3) as usize);
+        assert_region_ch(&r.pixels, &rgb, w, 0, 0, w, h, 3);
+
+        // Always (default) → RGBA (4 bpp), libjxl fills opaque alpha. Preserves the
+        // legacy contract even on a no-alpha container.
+        let mut s2 = JxtcRegionDecoder::new(&container, JxtcRegionOptions::default()).unwrap();
+        let r2 = s2.decode(ImageRegion { x: 0, y: 0, w, h }).unwrap();
+        assert_eq!(r2.bytes_per_pixel, 4);
+        for i in 0..(w * h) as usize {
+            assert_eq!(&r2.pixels[i * 4..i * 4 + 3], &rgb[i * 3..i * 3 + 3], "rgb px {i}");
+            assert_eq!(r2.pixels[i * 4 + 3], 255, "opaque alpha px {i}");
+        }
+
+        // Free fn is unchanged: always RGBA.
+        let free = decode_jxtc_region(&container, 0, 0, w, h).unwrap();
+        assert_eq!(free.len(), (w * h * 4) as usize, "free fn keeps the RGBA contract");
     }
 }

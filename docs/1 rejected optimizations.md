@@ -1391,3 +1391,36 @@ flags). enc_cluster.cc and ans_common.cc from the same ChatGPT analysis were alr
 implemented byte-exact on parked branches perf/enc-cluster-fuse-reindex-jun30-v8n3 and
 perf/ans-common-allocfree-jun30-z7k (scratch merge-cost, no-copy/move reindex, union-find,
 const-ref distribution, stack scratch, `range` not `ANS_TAB_SIZE`) — not redone.
+## jxl_casadecoder.rs final-audit rejections — 2026-07-01 (branch perf/casadecoder-jxtc-runraw-jul01-d4k8)
+
+Rejected during the "last lens" pass on `jxl_casadecoder.rs` (ChatGPT analysis was
+against a STALE upload — several of its headline findings were already fixed in tree:
+`Decoder::new` already reconciles `opts.parallel` with runner state; the output buffer
+already skips the zero-fill on the non-partial path; the 16-bit JXTC path already uses a
+zero-copy byte view, not an intermediate `Vec<u8>`).
+
+- **Rayon `with_min_len` job-grain cap on the JXTC fan-out.** Proposed to bound
+  `map_init` decoder construction to ~`current_num_threads()`. This adds a granularity
+  *tunable* with no benchmark backing it; the repo rule is "no tunables without evidence",
+  and the default work-splitting already reuses one `Decoder` per rayon job. The genuine
+  win in that block (skip dead extra-plane decode) was captured by switching `decode` →
+  `run_raw`; the `Vec<Option<_>>` intermediate was removed via `flatten()`. Not adding
+  the grain knob.
+
+- **`MaybeUninit` destination to skip the JXTC `vec![0; n]` zero-fill in strict mode.**
+  Only valid if every destination byte is provably overwritten (all overlapping tiles
+  succeed and the grid covers the viewport exactly once). It buys one memset on a
+  bandwidth path, but needs unsafe + a coverage proof + strict-mode plumbing that doesn't
+  exist. Cost/risk not justified; the current preview-shaped `vec![0; n]` is correct and
+  clear.
+
+- **Sealing the `Sample` trait.** Suggested for raw-output soundness. `Sample` is defined
+  in `jxl_casaencoder.rs` (a different file, shared per spec §6), so this is a cross-file
+  API change out of scope for a `jxl_casadecoder.rs` pass and is not a performance change.
+  No action.
+
+- **`Decoder::new` exact-thread refactor that changes `new()` semantics.** ChatGPT's
+  `new_with_thread_count` would have made `new(parallel:true)` on a 1-core host go
+  single-threaded (its `&& threads > 1` gate). To preserve `new()`'s exact behaviour the
+  honest-thread-count path was added as a *separate* additive `with_threads(opts, n)`
+  constructor instead; `new()` is untouched.

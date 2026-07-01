@@ -1186,3 +1186,107 @@ Byte-exact-or-plausible but need a WASM/decode benchmark the integrator runs on 
 5. **Branchless-vs-branchy ANS renorm + alias prefetch policy** — currently branchless
    unconditionally (comment cites Skylake-X parity only). Add a per-arch (Zen3 / WASM) decode
    benchmark toggle; do not flip globally without data.
+## jxl_casadecoder.rs final-audit deferrals — 2026-07-01 (branch perf/casadecoder-jxtc-runraw-jul01-d4k8)
+
+Landed this pass (byte-exact, 23/23 MSVC tests green): A progressive-timing borrowed
+path (drop per-pass clone), B JXTC tiles `run_raw` not `decode` (skip dead extra-plane
+decode) + `flatten()` collapse, C `decode_region` whole-image fast path, D
+`decode_full_threaded` honours `num_threads` via new `Decoder::with_threads`, E
+`ResetGuard` RAII reset on the two callback paths (`decode_view`/`decode_progressive`)
++ panic-reuse regression test. Deferred below:
+
+- **JxtcRegionDecoder persistent session + byte-bounded tile cache.** A stateful
+  viewport decoder that parses header/index once, caches decoded tiles across calls,
+  and decodes only newly-exposed tiles on a pan. Potentially the largest interactive
+  win, but: (1) `decode_jxtc_region` has **no in-crate caller** (only Tauri/WASM), so a
+  cache benefits an interactive pan/zoom loop that isn't exercised here; (2) the LRU is
+  a heuristic — repo rule requires benchmark evidence before adding tunables; (3) ~400
+  lines of new public API + its own test suite. Needs a real interactive bench (hit/miss,
+  decoded-tile, resident-byte metrics) before landing. Strip-staged compositing (decode
+  one tile-row, composite, release) folds in here to cap peak transient memory.
+
+- **Output-buffer `set_len`-before-fill restructure.** `run_full_into` does
+  `reserve+set_len(elems)` *before* libjxl writes, so a decode that errors after the
+  buffer is bound leaves the caller's reused `Vec` with `len==elems` over uninit bytes.
+  Benign today (all `Sample` types are POD with no invalid bit-patterns, and the error
+  is propagated so well-behaved callers don't read), but not strictly sound. Cleaner
+  shape: bind the spare allocation at `len==0`, `set_len` only after the loop succeeds.
+  Touches the hottest decode loop (the `!buf.is_empty()`/`buf.is_empty()` guards key off
+  length) — defer until it can carry its own soundness test; no perf delta either way.
+
+- **JXTC tile decoders inherit DecodeOptions.** Tile decode hard-codes
+  `DecodeOptions::default()`, so a caller's `cancel`/`limits`/`keep_orientation` don't
+  reach the fan-out (a region decode can't be cancelled). Wire an options param through
+  `decode_jxtc_region` (or the session object above). Behavioural, needs API decision.
+
+- **Strict vs preview JXTC failure policy + completeness reporting.** Failed/forbidden
+  tiles currently become silent zeroed holes (`flatten()` drops the `None`); `DecodeError::Tile`
+  exists but is unused on this path. A strict variant returning `Result` + a preview
+  variant returning `missing_tiles` would make corruption visible. Behavioural split.
+
+- **Extra-channel completeness contract.** `run_full_into` `continue`s on a failed
+  extra-channel size/bind, so `decode` can return fewer planes than `meta.num_extra_channels`
+  with no signal. Decide strict-fail vs declared-partial; matters for scientific planes.
+
+- **Alpha-free JXTC native RGB path.** `JxtcHeader.has_alpha` is informational; tile
+  decode always requests RGBA (4/8 bpp). An RGB-native layout would save ~25% output
+  memory for alpha-free containers. New API; all current JXTC fixtures set has_alpha.
+
+- **B runtime benchmark.** The `run_raw` swap is byte-exact and strictly-less-work, kept
+  per the "not-a-regression + theoretically better" rule, but its saving only materialises
+  for JXTC tiles that carry planar extras — not present in the test corpus. Quantify with
+  an extra-channel JXTC fixture + flipflop before claiming a number.
+
+### UPDATE 2026-07-01 — JxtcRegionDecoder LANDED (same branch, max-effort follow-up)
+
+The "JxtcRegionDecoder persistent session + byte-bounded tile cache" item above is
+now **implemented** in `jxl_casadecoder.rs` (user explicitly requested the build).
+Shipped: `JxtcRegionDecoder<'a>` (borrows one container, parses header/index once),
+`TileCache` (byte-bounded LRU), `JxtcRegionOptions`/`JxtcRegion`/`JxtcRegionMetrics`/
+`JxtcRegionError`, strict-vs-preview failure policy, option inheritance into tile
+decoders (cancel/limits/keep_orientation), cross-call serial-decoder reuse for the
+1-tile pan + rayon fan-out for multi-miss. The free fn `decode_jxtc_region` now
+delegates here (cache off, Preview) so its 5 tests cover the session path; 8 new
+session tests added. Demonstrated: a 4-tile→pan→4-tile viewport sequence sharing one
+tile column decodes **2 tiles instead of 4** (metrics `hits=2 decoded=2`), with a
+cache-disabled control proving the reuse comes from the cache. 216/216 crate tests
+green (MSVC). So these previously-deferred items are now DONE: option inheritance,
+strict/preview split + missing-tile reporting.
+
+Still deferred (now refinements on the landed session, not the session itself):
+- **Strip-staged compositing** for the whole-image anti-pattern: decode one tile-row,
+  composite, release, to cap peak transient memory below dest+all-misses. Current
+  impl decodes all misses in one batch (better parallelism + simpler; peak ≈ dest for
+  a normal viewport). Only matters when a viewport approaches the whole image — the
+  case JXTC exists to avoid. Needs a peak-RSS bench to justify the added complexity.
+- **Alpha-free native RGB tiles** (`has_alpha=false` → 3/6 bpp): the session still
+  requests RGBA like the free fn. ~25% output saving for alpha-free containers; new
+  result layout, all current fixtures set has_alpha.
+- **Extra-channel completeness contract** on the monolithic `decode` path (unchanged).
+- **Animation / multi-frame** explicit policy (decoder still returns first frame only).
+- **Interactive wall-clock bench**: decode-COUNT reduction is proven by metrics; a
+  real pan-loop timing (native Tauri or a bench harness) would quantify ms saved.
+
+### UPDATE 2026-07-01b — alpha-free native RGB LANDED (same branch)
+
+The "alpha-free native RGB tiles" refinement is now implemented. Added
+`EmitAlpha { Always, FromHeader }` to `JxtcRegionOptions` (default `Always`).
+`FromHeader` on a no-alpha container (`has_alpha=false`) decodes tiles as RGB
+(3 bpp / 6 bpp@16-bit) instead of RGBA — ~25% less output and no alpha-synthesis.
+The session fixes channel count + bytes_per_pixel once in `new()`; tile decode and
+the compositor were already bpp-generic. `decode_jxtc_region` stays `EmitAlpha::Always`
+(RGBA contract preserved; libjxl fills opaque alpha on no-alpha streams — verified).
+New test `jxtc_session_alpha_free_emits_rgb_in_fromheader_mode` (RGB output + opaque-
+alpha RGBA control + free-fn-unchanged guard). 217/217 crate tests green (MSVC).
+
+Remaining deferred (with honest blockers):
+- **Strip-staged compositing** — needs per-allocation peak-RSS measurement to justify;
+  no clean way to measure that in a Win unit test, and it only helps the whole-image
+  anti-pattern. Not tackled.
+- **Extra-channel completeness contract** (monolithic `decode` path) — an API-semantics
+  decision that ripples the `Image` type. Out of scope for the JXTC session.
+- **Animation / multi-frame policy** — cheap doc clarification only (decoder returns
+  first frame); real frame selection needs a new iterator API.
+- **Wall-clock pan bench** — decode-COUNT reduction is proven by metrics; a wall-clock
+  number is noise-dominated at test-tile scale and needs real-size fixtures + a native
+  pan-loop (Tauri) to be meaningful.
