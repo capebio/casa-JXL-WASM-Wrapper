@@ -327,6 +327,43 @@ impl ProcessResult {
     pub fn color_matrix_used(&self) -> Vec<f32> {
         self.color_matrix_flat.to_vec()
     }
+
+    /// S1 seam: build the lightbox `LookRenderer` directly from the internal packed
+    /// preview buffer, without round-tripping the bytes out to JS and back into
+    /// `LookRenderer.new_with_options`. Moves `rgb16_lb` out (empties it, exactly like
+    /// `take_rgb16_lb`), so the two wasm-bindgen boundary memcpys and the transient JS
+    /// `Uint8Array` (per decode) are eliminated — the packed bytes never leave wasm linear
+    /// memory. `apply_rotation=false` matches `makeLiveState`'s Phase-2 wiring;
+    /// `orientation`/`color_matrix_flat`/`black_used` are read from the same fields the JS
+    /// path passed back in, so the renderer — and every `render()` output — is byte-identical
+    /// to the take-then-construct path. Returns an empty-buffer renderer on a second call
+    /// (ownership transferred, same as `take_rgb16_lb`).
+    pub fn take_lightbox_renderer(&mut self) -> LookRenderer {
+        LookRenderer::from_packed_le(
+            std::mem::take(&mut self.rgb16_lb),
+            self.lb_w,
+            self.lb_h,
+            self.orientation,
+            &self.color_matrix_flat,
+            false,
+            self.black_used,
+        )
+    }
+
+    /// S1 seam twin of [`take_lightbox_renderer`] for the 360 px thumbnail preview.
+    /// Moves `rgb16_thumb` out; independent of the lightbox buffer, so the two may be
+    /// called in either order.
+    pub fn take_thumb_renderer(&mut self) -> LookRenderer {
+        LookRenderer::from_packed_le(
+            std::mem::take(&mut self.rgb16_thumb),
+            self.thumb_w,
+            self.thumb_h,
+            self.orientation,
+            &self.color_matrix_flat,
+            false,
+            self.black_used,
+        )
+    }
 }
 
 fn now_ms() -> f64 {
@@ -1827,6 +1864,53 @@ pub struct LookRenderer {
     // every render() so live slider edits subtract the same black as the initial
     // decode — otherwise edits revert to the black=0 magenta cast.
     black: u16,
+}
+
+impl LookRenderer {
+    /// Seam-direct constructor (S1): build from an OWNED packed-LE byte buffer that is
+    /// already resident in wasm linear memory, *moved* in rather than marshalled across
+    /// the wasm-bindgen boundary. Byte-identical to `new_with_options` for the same bytes,
+    /// dims, matrix, orientation, `apply_rotation` and black — same `unpack_rgb16_le`, same
+    /// row-major matrix decode, same field assignment — so every `render()` output is
+    /// bit-exact vs the take-bytes-then-`new_with_options` path. The internal preview
+    /// buffers are correctly sized by construction (downscale emits exactly `w*h*6` bytes),
+    /// so the length guard `new_with_options` runs against JS-supplied bytes is unnecessary
+    /// here; kept as a debug assertion for parity. `new_with_options` only falls back to
+    /// `CAM_TO_SRGB` when the JS matrix slice length != 9 — the app path always passes 9
+    /// (`color_matrix_used()`), which is exactly `color_matrix_flat`, so the direct decode
+    /// matches.
+    fn from_packed_le(
+        packed: Vec<u8>,
+        width: u32,
+        height: u32,
+        orientation: u16,
+        color_matrix_flat: &[f32; 9],
+        apply_rotation: bool,
+        black: u16,
+    ) -> LookRenderer {
+        let w = width as usize;
+        let h = height as usize;
+        debug_assert_eq!(
+            packed.len(),
+            w.saturating_mul(h).saturating_mul(6),
+            "from_packed_le: internal preview buffer must be w*h*6 bytes"
+        );
+        let cm = color_matrix_flat;
+        let color_matrix = [
+            [cm[0], cm[1], cm[2]],
+            [cm[3], cm[4], cm[5]],
+            [cm[6], cm[7], cm[8]],
+        ];
+        LookRenderer {
+            rgb16: unpack_rgb16_le(&packed),
+            width: w,
+            height: h,
+            orientation,
+            apply_rotation,
+            color_matrix,
+            black,
+        }
+    }
 }
 
 #[wasm_bindgen]
