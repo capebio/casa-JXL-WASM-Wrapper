@@ -715,6 +715,154 @@ impl Encoder {
     }
 }
 
+/// Streaming (chunked-frame) RGB8 encode: libjxl pulls 256x256 groups (+border) via a
+/// pull `JxlChunkedFrameInputSource` and writes compressed output through a
+/// `JxlEncoderOutputProcessor`, so peak encoder memory is O(group), not O(frame) — no
+/// whole-image float working copy. Same sRGB / lossy VarDCT settings as the whole-frame
+/// path. `rgb` is the full image in RAM (the source returns pointers into it, no copy),
+/// which isolates the ENCODER's memory behaviour for the streaming-encode benchmark;
+/// upstream band-fusion (never holding the source) is a separate future win.
+///
+/// Streaming only actually engages when libjxl's `CanDoStreamingEncoding` permits it
+/// (fast effort, ≥8 groups / >2048 px, VarDCT, buffering>0); otherwise libjxl silently
+/// falls back to whole-image internally but still produces valid output — so this is a
+/// faithful measurement, not a guarantee of low memory.
+pub fn encode_chunked_rgb8(
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    distance: f32,
+    effort: i64,
+) -> Result<Vec<u8>, EncodeError> {
+    assert_eq!(rgb.len(), w as usize * h as usize * 3, "rgb must be w*h*3");
+
+    struct Src {
+        data: *const u8,
+        stride: usize,
+    }
+    struct Out {
+        buf: Vec<u8>,
+        pos: usize,
+        high: usize,
+        final_pos: Option<usize>,
+    }
+
+    unsafe extern "C" fn color_pf(_op: *mut c_void, pf: *mut ffi::JxlPixelFormat) {
+        (*pf).num_channels = 3;
+        (*pf).data_type = ffi::JxlDataType::JXL_TYPE_UINT8;
+        (*pf).endianness = ffi::JxlEndianness::JXL_NATIVE_ENDIAN;
+        (*pf).align = 0;
+    }
+    unsafe extern "C" fn color_at(
+        op: *mut c_void, xpos: usize, ypos: usize, _xs: usize, _ys: usize, row_offset: *mut usize,
+    ) -> *const c_void {
+        let s = &*(op as *const Src);
+        *row_offset = s.stride; // bytes between rows in the returned (whole-image) buffer
+        s.data.add(ypos * s.stride + xpos * 3) as *const c_void
+    }
+    unsafe extern "C" fn out_get(op: *mut c_void, size: *mut usize) -> *mut c_void {
+        let o = &mut *(op as *mut Out);
+        let want = (*size).max(1 << 16);
+        if o.buf.len() < o.pos + want {
+            o.buf.resize(o.pos + want, 0);
+        }
+        *size = o.buf.len() - o.pos;
+        o.buf.as_mut_ptr().add(o.pos) as *mut c_void
+    }
+    unsafe extern "C" fn out_release(op: *mut c_void, written: usize) {
+        let o = &mut *(op as *mut Out);
+        o.pos += written;
+        if o.pos > o.high {
+            o.high = o.pos;
+        }
+    }
+    unsafe extern "C" fn out_seek(op: *mut c_void, position: u64) {
+        (*(op as *mut Out)).pos = position as usize;
+    }
+    unsafe extern "C" fn out_final(op: *mut c_void, position: u64) {
+        (*(op as *mut Out)).final_pos = Some(position as usize);
+    }
+    // libjxl calls this per pulled input buffer; must be non-null (our source returns
+    // pointers into the persistent image, so releasing is a no-op).
+    unsafe extern "C" fn src_release(_op: *mut c_void, _buf: *const c_void) {}
+
+    unsafe {
+        let enc = ffi::JxlEncoderCreate(ptr::null());
+        if enc.is_null() {
+            return Err(EncodeError::Create);
+        }
+        let mut info = std::mem::MaybeUninit::<ffi::JxlBasicInfo>::uninit();
+        ffi::JxlEncoderInitBasicInfo(info.as_mut_ptr());
+        let mut info = info.assume_init();
+        info.xsize = w;
+        info.ysize = h;
+        info.bits_per_sample = 8;
+        info.exponent_bits_per_sample = 0;
+        info.num_color_channels = 3;
+        info.num_extra_channels = 0;
+        info.uses_original_profile = JXL_FALSE; // XYB lossy
+        if ffi::JxlEncoderSetBasicInfo(enc, &info) != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
+            ffi::JxlEncoderDestroy(enc);
+            return Err(EncodeError::Jxl("SetBasicInfo".into()));
+        }
+        let mut ce = std::mem::MaybeUninit::<ffi::JxlColorEncoding>::uninit();
+        ffi::JxlColorEncodingSetToSRGB(ce.as_mut_ptr(), JXL_FALSE);
+        let ce = ce.assume_init();
+        ffi::JxlEncoderSetColorEncoding(enc, &ce);
+
+        let fs = ffi::JxlEncoderFrameSettingsCreate(enc, ptr::null());
+        if fs.is_null() {
+            ffi::JxlEncoderDestroy(enc);
+            return Err(EncodeError::Jxl("FrameSettingsCreate".into()));
+        }
+        use ffi::JxlEncoderFrameSettingId as FS;
+        ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_EFFORT, effort);
+        // Streaming knobs, mirroring libjxl's own encode_test.cc streaming path:
+        // buffering=2, buffer-output mode (no seek), and full-image-heuristics OFF (the
+        // switch that both *enables* streaming and is the source of any density delta).
+        ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_BUFFERING, 2);
+        ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_OUTPUT_MODE, 0);
+        ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS, 0);
+        ffi::JxlEncoderSetFrameDistance(fs, distance);
+
+        let mut out = Out { buf: Vec::new(), pos: 0, high: 0, final_pos: None };
+        let op = ffi::JxlEncoderOutputProcessor {
+            opaque: &mut out as *mut _ as *mut c_void,
+            get_buffer: Some(out_get),
+            release_buffer: Some(out_release),
+            seek: Some(out_seek),
+            set_finalized_position: Some(out_final),
+        };
+        if ffi::JxlEncoderSetOutputProcessor(enc, op) != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
+            ffi::JxlEncoderDestroy(enc);
+            return Err(EncodeError::Jxl("SetOutputProcessor".into()));
+        }
+
+        let src = Src { data: rgb.as_ptr(), stride: w as usize * 3 };
+        let source = ffi::JxlChunkedFrameInputSource {
+            opaque: &src as *const _ as *mut c_void,
+            get_color_channels_pixel_format: Some(color_pf),
+            get_color_channel_data_at: Some(color_at),
+            get_extra_channel_pixel_format: None,
+            get_extra_channel_data_at: None,
+            release_buffer: Some(src_release),
+        };
+        // With the output processor set + is_last=TRUE, AddChunkedFrame drives the whole
+        // encode and emits the codestream through the processor (no CloseInput/
+        // ProcessOutput needed — matches encode_test.cc's streaming path). `src`/`out`
+        // stay alive across this call (the callbacks fire during it).
+        let st = ffi::JxlEncoderAddChunkedFrame(fs, JXL_TRUE, source);
+        let code = encoder_error_code(enc);
+        ffi::JxlEncoderDestroy(enc);
+        if st != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
+            return Err(EncodeError::Jxl(format!("AddChunkedFrame (code {code})")));
+        }
+        let end = out.final_pos.unwrap_or(out.high.max(out.pos));
+        out.buf.truncate(end);
+        Ok(out.buf)
+    }
+}
+
 impl Drop for Encoder {
     fn drop(&mut self) {
         unsafe {
