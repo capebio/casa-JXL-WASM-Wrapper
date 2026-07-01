@@ -295,6 +295,7 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
     fps_den: u32,
     gop_len: u32,
     distance: f32,
+    thresh: u8,
 ) -> Result<Vec<u8>, VideoError> {
     if frames.is_empty() {
         return Err(VideoError::Empty);
@@ -319,7 +320,8 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
         let mut payload = Vec::new();
         // Detect genuinely-changed regions vs the previous SOURCE frame (comparing
         // against the lossy `recon` would flag the whole frame via quant noise).
-        match changed_bbox(px, frames[idx - 1], width, height) {
+        // `thresh` skips near-static regions — essential on noisy real content.
+        match changed_bbox_thresh(px, frames[idx - 1], width, height, thresh) {
             None => {
                 for _ in 0..4 {
                     payload.extend_from_slice(&0u16.to_le_bytes());
@@ -405,16 +407,23 @@ fn preceding_iframe(data: &[u8], index: usize) -> Option<usize> {
         .find(|&j| casv_frame_info(data, j).map(|(is_p, _)| !is_p).unwrap_or(false))
 }
 
-/// Tight bounding box `(x, y, w, h)` of pixels that differ between `cur` and
-/// `prev` (interleaved RGB8). `None` if the frames are identical.
-fn changed_bbox(cur: &[u8], prev: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+/// Tight bounding box `(x, y, w, h)` of pixels whose max channel difference
+/// between `cur` and `prev` exceeds `thresh`. `None` if none exceed it. `thresh=0`
+/// means any difference (exact). A larger `thresh` skips *near*-static regions,
+/// which is what makes the lossy tier work on mildly-noisy real content.
+fn changed_bbox_thresh(cur: &[u8], prev: &[u8], width: u32, height: u32, thresh: u8) -> Option<(u32, u32, u32, u32)> {
     let w = width as usize;
     let (mut minx, mut miny, mut maxx, mut maxy) = (usize::MAX, usize::MAX, 0usize, 0usize);
     let mut any = false;
+    let t = thresh as i32;
     for y in 0..height as usize {
         for x in 0..w {
             let o = (y * w + x) * 3;
-            if cur[o] != prev[o] || cur[o + 1] != prev[o + 1] || cur[o + 2] != prev[o + 2] {
+            let d = (cur[o] as i32 - prev[o] as i32)
+                .abs()
+                .max((cur[o + 1] as i32 - prev[o + 1] as i32).abs())
+                .max((cur[o + 2] as i32 - prev[o + 2] as i32).abs());
+            if d > t {
                 any = true;
                 if x < minx { minx = x; }
                 if x > maxx { maxx = x; }
@@ -427,6 +436,11 @@ fn changed_bbox(cur: &[u8], prev: &[u8], width: u32, height: u32) -> Option<(u32
         return None;
     }
     Some((minx as u32, miny as u32, (maxx - minx + 1) as u32, (maxy - miny + 1) as u32))
+}
+
+/// Tight bounding box of pixels that differ at all (exact). `None` if identical.
+fn changed_bbox(cur: &[u8], prev: &[u8], width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
+    changed_bbox_thresh(cur, prev, width, height, 0)
 }
 
 /// Copy a `bw×bh` RGB8 sub-rectangle at `(x,y)` out of a `width`-wide image.
@@ -1202,7 +1216,7 @@ mod tests {
         let src = low_motion(w, h, 8);
         let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
         let d = 1.0f32;
-        let skip = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, d).unwrap();
+        let skip = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, d, 0).unwrap();
         let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(d)).unwrap();
         assert!(
             skip.len() < intra.len(),
@@ -1242,5 +1256,49 @@ mod tests {
         for i in 0..8 {
             assert_eq!(out[i].0, out2[i].0, "deterministic decode (frame {i})");
         }
+    }
+
+    #[test]
+    fn threshold_gates_and_skips_more() {
+        // Unit: a 2-unit change is caught at thresh 1, skipped at thresh 3.
+        let (w, h) = (16u32, 16u32);
+        let a = vec![100u8; (w * h * 3) as usize];
+        let mut b = a.clone();
+        b[((5 * w + 5) * 3) as usize] = 102;
+        assert!(changed_bbox_thresh(&b, &a, w, h, 1).is_some());
+        assert!(changed_bbox_thresh(&b, &a, w, h, 3).is_none());
+
+        // Integration: on noisy content a higher threshold skips the noise and
+        // yields a smaller lossy stream than exact change detection.
+        let (w, h) = (64u32, 64u32);
+        let base = gradient(w, h, 7);
+        let src: Vec<Vec<u8>> = (0..6)
+            .map(|f| {
+                let mut v = base.clone();
+                for i in (0..v.len()).step_by(37) {
+                    v[i] = v[i].saturating_add(((f + i) % 3) as u8); // faint +/- noise
+                }
+                let cx = (2 + f as u32) % (w - 4);
+                for yy in (h / 2)..(h / 2 + 3) {
+                    for xx in cx..cx + 3 {
+                        let o = ((yy * w + xx) * 3) as usize;
+                        v[o] = 255;
+                        v[o + 1] = 0;
+                        v[o + 2] = 0;
+                    }
+                }
+                v
+            })
+            .collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let exact = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 6, 1.0, 0).unwrap();
+        let thr = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 6, 1.0, 4).unwrap();
+        assert!(
+            thr.len() < exact.len(),
+            "threshold ({}) should skip noise vs exact ({})",
+            thr.len(),
+            exact.len()
+        );
+        assert!(decode_casv_all_rgb8(&thr).is_some());
     }
 }

@@ -468,10 +468,26 @@ Two approaches that **do not work**, then the one that does:
    regions are detected vs the previous *source* frame (comparing to the lossy reference would flag everything
    via quant noise). Beats lossy all-intra by skipping unchanged regions; on noisy content it degrades to
    all-intra (no skip), never worse. This is the streaming tier — lossy decode is ~5× cheaper than lossless
-   (~22 ms/f @720p, under the 24fps budget).
+   (~22 ms/f @720p, under the 24fps budget). A **threshold** on change detection skips *near*-static regions
+   (tolerate ≤`thresh` difference), which is the enabler on content with any small global flicker/noise.
 
-Remaining: threshold-based near-static skip (tolerate small change → skip more on mildly-noisy content); a
-real-content bench of the lossy tier; and the tile-grid form of replace-skip for scattered change.
+**Measured (`casv_bench`, distance 1.0, GOP=24, vs lossy all-intra):**
+
+| content | encoder | size | vs lossy-intra | dec ms/f | dec fps |
+|---|---|---:|---:|---:|---:|
+| low-motion (static seahorse) | lossy-intra | 6.34 MB | — | 20.5 | 48.9 |
+| low-motion | replace t0 | 6.20 MB | −2.2% | 15.7 | 63.7 |
+| **low-motion** | **replace t6** | **0.38 MB** | **−94.1%** | **1.9** | **533** |
+| noisy (dashcam) | replace t6 | 7.07 MB | −1.0% | 20.9 | 47.9 |
+
+**On target (low-motion) content the lossy tier is −94% size AND ~27× faster decode (533 fps).** The
+threshold is decisive: exact detection (t0) flags a small global flicker as "all changed" (−2%), while t6
+skips it and codes only the moving subject. On noisy content it degrades to ~all-intra (−1%) but still
+decodes at 46 fps — never worse. Threshold near-static skip and the real-content lossy bench are **done**.
+
+Remaining: tile-grid form of replace-skip (scattered multi-region change); auto-tuning `thresh` from
+`distance`/content; the C++ **native reference-frame** path only matters if true motion-compensated residual
+coding is ever needed (JXL has none — §8 findings above).
 
 ### Open questions
 - Real target resolutions/fps per ShareNat device tier? (sets the WASM feasibility line)

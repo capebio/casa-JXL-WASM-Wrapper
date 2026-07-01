@@ -13,8 +13,8 @@
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn main() {
     use raw_pipeline::casa_video::{
-        decode_casv_all_rgb8, encode_casv_delta_bbox_rgb8, encode_casv_delta_rgb8,
-        encode_casv_delta_tiled_rgb8, encode_casv_rgb8,
+        decode_casv_all_rgb8, encode_casv_delta_bbox_rgb8, encode_casv_delta_lossy_bbox_rgb8,
+        encode_casv_delta_rgb8, encode_casv_delta_tiled_rgb8, encode_casv_rgb8,
     };
     use raw_pipeline::jxl_casaencoder::EncodeOptions;
     use std::time::Instant;
@@ -91,6 +91,36 @@ fn main() {
     show(format!("delta g{gop}"), &delta, e_delta);
     show(format!("bbox g{gop}"), &bbox, e_bbox);
     show(format!("tile g{gop} t{tile}"), &tiled, e_tile);
+
+    // --- lossy tier (distance 1.0): all-intra vs fresh-pixel replace-skip ---
+    println!("\nlossy tier (distance 1.0), decode = playback:");
+    println!(
+        "{:<16} {:>9} {:>11} {:>10} {:>9}  {}",
+        "encoder", "size MB", "vs l-intra", "dec ms/f", "dec fps", "24fps?"
+    );
+    let dist = 1.0f32;
+    let li = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(dist)).expect("lossy intra");
+    let lr0 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, dist, 0).expect("replace t0");
+    let lr6 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, dist, 6).expect("replace t6");
+    let li_sz = li.len() as f64;
+    let showl = |label: String, casv: &[u8]| {
+        let t = Instant::now();
+        let frames = decode_casv_all_rgb8(casv).expect("decode");
+        let dec = ms(t);
+        assert_eq!(frames.len(), n);
+        println!(
+            "{:<16} {:>9.2} {:>+10.1}% {:>10.1} {:>9.1}  {}",
+            label,
+            casv.len() as f64 / 1048576.0,
+            (casv.len() as f64 / li_sz - 1.0) * 100.0,
+            dec,
+            1000.0 / dec,
+            if dec <= 41.7 { "OK" } else { "OVER" }
+        );
+    };
+    showl("lossy-intra".into(), &li);
+    showl(format!("replace t0 g{gop}"), &lr0);
+    showl(format!("replace t6 g{gop}"), &lr6);
 }
 
 #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]
