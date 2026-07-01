@@ -1,3 +1,4 @@
-Module enc tier simd is within the size budget.
+Module enc tier simd exceeded the size budget.
 Budget: 3050000 bytes
-Actual: 2875969 bytes
+Actual: 3050024 bytes
+Re-run node scripts/build.mjs --host-toolchain --size-report to emit an Emscripten symbol map (C:\Foo\rcw-p2-wasm\packages\jxl-wasm\dist\jxl-core.enc.simd.js.symbols).
