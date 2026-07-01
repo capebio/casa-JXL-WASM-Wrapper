@@ -1078,17 +1078,19 @@ agent could not run, or is conditional on data this agent could not measure.
   `x_cc_mul=0` ≡ `DequantLane<...,false>` byte-for-byte, **plus** an interleaved decode
   flipflop on both CfL-heavy and no-CfL content to confirm net non-regression.
 
-- **`ac_occupancy` sizing is a latent data race (dec_group.cc ~L1249).** `DecodeGroup`
-  runs per-group and takes a `thread` index (parallel-for over groups), yet it lazily
-  sizes the frame-scoped sidecar with
+- **`ac_occupancy` sizing was a latent data race (dec_group.cc ~L1249) — NOW LANDED.**
+  `DecodeGroup` runs per-group across the worker pool (`RunOnPool` over `ps_ac_runnable_`
+  in `dec_frame.cc`), yet it lazily sized the frame-scoped sidecar with
   `if (ac_occupancy.size() < needed) ac_occupancy.assign(needed, 0);`. On the first
   accumulate-mode group of a frame, two worker threads can both see `size() < needed` and
   race on `assign()` (concurrent reallocation) while others `|=` into it → UB. Only fires
-  in progressive/multi-pass decode (`!coefficients->IsEmpty()`); single-pass video never
-  hits it. Correct fix = allocate + zero once at frame setup (single-threaded), before
-  group tasks are dispatched — that site is in the frame decoder (`dec_frame.cc`), outside
-  these four files. **Deferred**: correctness fix, needs a build to verify and lives in a
-  fifth file; flagged here so it is not lost.
+  in progressive/multi-pass decode (`!coefficients->IsEmpty()`). **Fixed** on branch
+  `perf/dec-group-ac-occupancy-frame-owned-jul01-c5m2` (capebio): allocation moved to
+  AC-global frame setup in `dec_frame.cc` (single-threaded, beside the retained coefficient
+  store, before `decoded_ac_global_` / any AC group dispatch); `DecodeGroup` no longer
+  touches the sidecar size; population keeps its `block_idx < size()` guard. Byte-exact by
+  construction (write-only sidecar has no consumer → output independent of allocation site).
+  Integrator build = compile gate.
 
 - **Consume `ac_occupancy` to skip the redraw coefficient scan (the file's own TODO at
   `DecodeGroupFromStoredCoefficients`).** In stored-coefficient redraws the dc_only
@@ -1100,6 +1102,17 @@ agent could not run, or is conditional on data this agent could not measure.
   DC-fill blocks that actually have AC. Landing the consumer requires *also* populating the
   mask in `DecodeGroupNoDraw` (adds a scan to the hidden-pass path) and a progressive
   multi-pass corpus to verify byte-exact redraw output.
+
+- **Avoid `GetInputBuffers` on no-draw AC passes (analysis item 2) — investigated, NOT a
+  clean win.** `FrameDecoder::ProcessACGroup` (dec_frame.cc:498) calls
+  `render_pipeline->GetInputBuffers(ac_group_id, thread)` unconditionally, then `DecodeGroup`
+  decides draw/no-draw internally — so the analysis is right that render-buffer acquisition
+  happens even on no-draw VarDCT passes. **But** the same `render_pipeline_input` is also
+  consumed by the *modular* decode on every pass (dec_frame.cc:535 and :541), which runs
+  regardless of the VarDCT draw decision. So the buffers can't simply be skipped when VarDCT
+  is no-draw; making this safe means proving the modular path for that pass also needs no
+  input, which is content/mode dependent. **Deferred**: real coupling, not surgical; needs
+  the modular-decode buffer contract nailed down first.
 
 - **Border geometry precompute + counter-layout experiments (dec_group_border.cc).**
   `GroupDone` recomputes `block_rect` / `is_last_group_*` / `xpos[4]` / `ypos[4]` per call;
