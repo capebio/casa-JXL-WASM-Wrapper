@@ -575,8 +575,79 @@ async function cmdVideoBlock() {
   writeFileSync(join(__dir, 'results-videoblock.json'), JSON.stringify({ intra, deltaNone: prev.deltaNone, deltaGmc: prev.deltaGmc, deltaBlock, mvBytes: mvTotal }, null, 2));
 }
 
+// ---- diagnostic bit-sink analysis (where do the bits go? -> codec levers) ------
+// BT.709 full-range luma/chroma
+function planeY(buf) { const y = new Uint8Array(W * H); for (let i = 0, p = 0; i < W * H; i++, p += 3) y[i] = clamp8(0.2126 * buf[p] + 0.7152 * buf[p + 1] + 0.0722 * buf[p + 2]); return y; }
+function planeCb(buf) { const c = new Uint8Array(W * H); for (let i = 0, p = 0; i < W * H; i++, p += 3) { const yy = 0.2126 * buf[p] + 0.7152 * buf[p + 1] + 0.0722 * buf[p + 2]; c[i] = clamp8((buf[p + 2] - yy) / 1.8556 + 128); } return c; }
+function planeCr(buf) { const c = new Uint8Array(W * H); for (let i = 0, p = 0; i < W * H; i++, p += 3) { const yy = 0.2126 * buf[p] + 0.7152 * buf[p + 1] + 0.0722 * buf[p + 2]; c[i] = clamp8((buf[p] - yy) / 1.5748 + 128); } return c; }
+function pgm8(plane) { return Buffer.concat([Buffer.from(`P5\n${W} ${H}\n255\n`, 'ascii'), Buffer.from(plane)]); }
+function pgm16Res(a, b) { const hdr = Buffer.from(`P5\n${W} ${H}\n65535\n`, 'ascii'); const body = Buffer.allocUnsafe(W * H * 2); for (let i = 0; i < W * H; i++) body.writeUInt16BE((a[i] - b[i] + 32768) | 0, i * 2); return Buffer.concat([hdr, body]); }
+// RGB residual PPM16 with |Δ|<=k deadzoned to 0; returns {buf, zeroed}
+function resDeadzone(cur, prev, k) {
+  const px = W * H, hdr = Buffer.from(`P6\n${W} ${H}\n65535\n`, 'ascii'), body = Buffer.allocUnsafe(px * 6);
+  let zeroed = 0;
+  for (let i = 0; i < px * 3; i++) { let d = cur[i] - prev[i]; if (d <= k && d >= -k) { d = 0; zeroed++; } body.writeUInt16BE(d + 32768, i * 2); }
+  return { buf: body.length ? Buffer.concat([hdr, body]) : hdr, zeroed: zeroed / (px * 3) };
+}
+// RGB residual with near-static blocks (max|Δ|<=T over bs×bs) zeroed; returns {buf, staticFrac}
+function resBlockSkip(cur, prev, bs, T) {
+  const px = W * H, hdr = Buffer.from(`P6\n${W} ${H}\n65535\n`, 'ascii'), body = Buffer.allocUnsafe(px * 6);
+  let staticBlocks = 0, totalBlocks = 0;
+  for (let by = 0; by < H; by += bs) for (let bx = 0; bx < W; bx += bs) {
+    totalBlocks++;
+    let mx = 0;
+    for (let y = by; y < Math.min(by + bs, H); y++) for (let x = bx; x < Math.min(bx + bs, W); x++) {
+      const o = (y * W + x) * 3;
+      for (let c = 0; c < 3; c++) { const d = Math.abs(cur[o + c] - prev[o + c]); if (d > mx) mx = d; }
+    }
+    const skip = mx <= T; if (skip) staticBlocks++;
+    for (let y = by; y < Math.min(by + bs, H); y++) for (let x = bx; x < Math.min(bx + bs, W); x++) {
+      const o = (y * W + x) * 3;
+      for (let c = 0; c < 3; c++) { const d = skip ? 0 : cur[o + c] - prev[o + c]; body.writeUInt16BE(d + 32768, (o + c) * 2); }
+    }
+  }
+  return { buf: Buffer.concat([hdr, body]), staticFrac: staticBlocks / totalBlocks };
+}
+async function cmdDiag() {
+  mkdirSync(WORK, { recursive: true });
+  const dir = join(OUT_ROOT, 'real_video_ghana');
+  const require = createRequire('C:/Foo/raw-converter-wasm/package.json');
+  const sharp = require('sharp');
+  const frames = [];
+  for (let i = 1; i <= N; i++) frames.push(await sharp(join(dir, `rv_${String(i).padStart(3, '0')}.png`)).removeAlpha().raw().toBuffer());
+  const SAMPLE = [1, 6, 11, 16, 21, 26, 31, 36, 41, 46];
+  const enc = (buf, tag) => encode(buf, tag).bytes;
+  const acc = { lY: 0, lCb: 0, lCr: 0, dY: 0, dCb: 0, dCr: 0, full: 0, dz: [0, 0, 0], zf: [0, 0, 0], skip: 0, sf: 0 };
+  console.log('[diag] bit-sink analysis on real frames…');
+  for (const i of SAMPLE) {
+    const cur = frames[i], prev = frames[i - 1];
+    // A. luma/chroma share (intra + delta), via separate grayscale encodes
+    const Yc = planeY(cur), Cbc = planeCb(cur), Crc = planeCr(cur), Yp = planeY(prev), Cbp = planeCb(prev), Crp = planeCr(prev);
+    acc.lY += enc(pgm8(Yc), `d_ly_${i}`); acc.lCb += enc(pgm8(Cbc), `d_lcb_${i}`); acc.lCr += enc(pgm8(Crc), `d_lcr_${i}`);
+    acc.dY += enc(pgm16Res(Yc, Yp), `d_dy_${i}`); acc.dCb += enc(pgm16Res(Cbc, Cbp), `d_dcb_${i}`); acc.dCr += enc(pgm16Res(Crc, Crp), `d_dcr_${i}`);
+    // B. noise-floor tax: full residual vs |Δ|<=k deadzoned
+    const f = resDeadzone(cur, prev, 0); acc.full += enc(f.buf, `d_f_${i}`);
+    [1, 2, 3].forEach((k, j) => { const r = resDeadzone(cur, prev, k); acc.dz[j] += enc(r.buf, `d_dz${k}_${i}`); acc.zf[j] += r.zeroed; });
+    // C. static-region tax: zero near-static 16px blocks (max|Δ|<=3)
+    const s = resBlockSkip(cur, prev, 16, 3); acc.skip += enc(s.buf, `d_sk_${i}`); acc.sf += s.staticFrac;
+  }
+  const n = SAMPLE.length, pct = (a, b) => ((1 - a / b) * 100).toFixed(1) + '%';
+  const lTot = acc.lY + acc.lCb + acc.lCr, dTot = acc.dY + acc.dCb + acc.dCr;
+  console.log('\n================ BIT-SINK DIAGNOSTIC (real video, lossless, sampled) ================');
+  console.log('\n[A] luma vs chroma share (separate-plane encode)');
+  console.log(`  INTRA : Y ${(100 * acc.lY / lTot).toFixed(0)}%  Cb ${(100 * acc.lCb / lTot).toFixed(0)}%  Cr ${(100 * acc.lCr / lTot).toFixed(0)}%`);
+  console.log(`  DELTA : Y ${(100 * acc.dY / dTot).toFixed(0)}%  Cb ${(100 * acc.dCb / dTot).toFixed(0)}%  Cr ${(100 * acc.dCr / dTot).toFixed(0)}%   -> chroma temporal coding lever = ${(100 * (acc.dCb + acc.dCr) / dTot).toFixed(0)}% of delta bits`);
+  console.log('\n[B] noise-floor tax (delta residual, deadzone |Δ|<=k -> 0)');
+  [1, 2, 3].forEach((k, j) => console.log(`  k=${k}: ${pct(acc.dz[j], acc.full)} smaller, zeroes ${(100 * acc.zf[j] / n).toFixed(1)}% of samples  -> grain/noise-model lever`));
+  console.log('\n[C] static-region tax (zero near-static 16px blocks, max|Δ|<=3)');
+  console.log(`  ${(100 * acc.sf / n).toFixed(1)}% of blocks near-static; forcing skip -> ${pct(acc.skip, acc.full)} smaller  -> block-skip flag lever`);
+  writeFileSync(join(__dir, 'results-diag.json'), JSON.stringify(acc, null, 2));
+  console.log('\n[diag] wrote results-diag.json');
+}
+
 const cmd = process.argv[2] || 'all';
 if (cmd === 'gen' || cmd === 'all') await cmdGen();
 if (cmd === 'measure' || cmd === 'all') cmdMeasure();
 if (cmd === 'video') await cmdVideo();
 if (cmd === 'videoblock') await cmdVideoBlock();
+if (cmd === 'diag') await cmdDiag();

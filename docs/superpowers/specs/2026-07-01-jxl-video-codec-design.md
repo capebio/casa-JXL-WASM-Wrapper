@@ -271,38 +271,53 @@ timestamp overlay — mixed motion, real sensor noise, and source compression ar
 | DELTA_GMC (global MV, estimated) | 14 355 | −34.3% *(MV estimated to 0)* |
 | DELTA_BLOCK (per-32px-block MC, ±12) | 14 608 | −33.1% *(worse — MV overhead + block-edge residual)* |
 
-**Sobering, decisive findings:**
+**What the real clip actually shows (and what it does NOT):**
 - **Temporal delta on real noisy footage yields ~34%, not 88–95%.** Sensor noise, real motion, and source
-  artifacts don't delta cleanly. Synthetic = ceiling; real handheld/vehicle content ≈ floor.
-- **Motion compensation does not pay on real footage.** The global MV estimated to zero (static interior +
-  overlay dominate the frame), and *per-block* MC came out **slightly worse** than plain delta — MV
-  signalling + block-edge residual discontinuities cost more than the motion saved, because JXL's own
-  spatial context modelling already captures most residual redundancy. **Direct evidence that building a
-  motion engine (Architecture C) is not justified for this content class** — it only helps *clean,
-  structured* motion (the synthetic parallax, where layered shift won 95%).
-- **JXL-video does not beat HEVC on bitrate for general content.** All-intra Motion-JXL at streaming
-  distances measured 15 600–32 700 kb/s; even projected arch-B (intra × the 0.66 delta ratio) is
-  ~10 300 kb/s at −d3 vs HEVC's ~3 700 kb/s (720p-equivalent). HEVC's joint rate-distortion motion+transform
-  loop wins on pure bitrate. *(Caveat: doubly unfair to JXL — re-encoding already-lossy HEVC output + a
-  downscaled bitrate estimate — but the direction is unambiguous.)*
-- **Decode is marginal, not free.** Spawn-corrected native decode of the lossless 720p streams was
-  **63 ms/frame (intra) / 46 ms/frame (delta)** — *over* the 41.7 ms 24fps budget. Lossy streams decode
-  faster, but 24fps at 720p in WASM/mobile needs lossy + threading + resolution scaling; the "delta frames
-  are cheap" reading alone is too optimistic.
+  artifacts don't delta cleanly. Synthetic = clean-content ceiling; noisy handheld/vehicle content ≈ floor.
+- **Motion compensation didn't pay *on this clip*.** Global MV estimated to zero (static interior + overlay
+  dominate) and per-block MC was *slightly worse* than plain delta. **But this is a narrow result** —
+  lossless residual coding, small inter-frame motion, and (see diagnostic) a *noise-dominated residual that
+  no motion model can predict*. It is **not** proof that motion comp never pays; on clean structured motion
+  (synthetic parallax) layered shift won 95%. Downgrade Architecture C from "dead" to **"unproven here."**
+- **The HEVC bitrate comparison was not apples-to-apples — retracted as a verdict.** It measured JXL at its
+  *weakest* point (low-bitrate, losslessly re-encoding already-lossy 4:2:0 HEVC output, a downscaled
+  estimate) and HEVC at its *strongest* (its distribution sweet spot). At the regime scientific use requires
+  — **near-lossless / lossless / 4:4:4 / >8-bit** — HEVC/AV1 are inefficient by design and JXL is
+  state-of-the-art; a fair *matched-fidelity* comparison (not yet run — needs a real x265/AV1 build) is the
+  only meaningful head-to-head. **Honest statement:** JXL won't win *low-bitrate distribution* (HEVC's turf);
+  at *high-fidelity scientific quality* the comparison favours JXL, and the maturity gap (3 weeks of tuning
+  vs decades) means today's pipeline is a *rising floor, not a ceiling*.
+- **Decode is marginal, not free.** Spawn-corrected native decode of the lossless 720p streams was **63
+  ms/frame (intra) / 46 ms/frame (delta)** — over the 41.7 ms 24fps budget. Lossless is the heaviest path;
+  lossy + threads + resolution scaling is the real 24fps route, and it is improvable with the ongoing
+  pipeline work (not a fixed ceiling).
 
-**Honest recalibration of the design:**
-1. The value proposition **cannot** be "smaller than HEVC on arbitrary video." It must rest on **(a)** the
-   favorable content classes — clean low-motion nature, and high-shutter *structured* train parallax where
-   temporal/layered prediction genuinely wins — and **(b)** the fidelity/feature differentiators (§6:
-   lossless/near-lossless, HDR, ROI, progressive, provenance, parallax-depth metadata, per-device).
-2. **Keep the predictor simple.** Zero-motion delta (model 1) captures the achievable real-content gain; the
-   layered-shift model (model 2) is worth it only where content is clean and structured (train). **General
-   block ME/MC (Architecture C) is now further deprioritized — it empirically did not help real footage.**
+### Bit-sink diagnostic — where the real-video bits actually go (the improvement compass)
+
+The higher-value use of the footage: not a pass/fail benchmark but a **map of where JXL leaves bits on the
+table**, so pipeline work can target it. On sampled real frames (lossless), residual cost decomposed
+(`node probe.mjs diag`, `results-diag.json`):
+
+| bit sink | measurement | codec-improvement lever | recoverable |
+|---|---|---|---|
+| **noise floor** | 80% of residual samples are \|Δ\|≤1; deadzoning = −18.5%. \|Δ\|≤2 → −35.8%; \|Δ\|≤3 → −47.9% | **temporal grain/noise model or residual deadzone** (AV1 has film-grain synthesis; JXL lacks a temporal one) | **~18–48%** of delta bits |
+| **static regions** | 51.6% of 16px blocks near-static (max\|Δ\|≤3); forcing skip = −14.4% | **block-skip flag** (HEVC "skip" mode) | **~14%** |
+| **chroma** | Cb+Cr = 22% of delta bits (Y 78%) | **temporal chroma-from-luma / chroma-sub-in-time** | portion of 22% |
+
+**This explains the earlier floor and points the way:** ~half the temporal residual on real footage is
+*noise* and ~half the frame is *static* — exactly why plain delta only reached 34% and motion comp couldn't
+help (you cannot motion-predict noise). The concrete, evidence-backed levers are **(1) a temporal
+noise/grain model, (2) a static block-skip flag, (3) temporal chroma coding** — each a *targeted addition*
+to the existing pipeline, not a rebuild, and each measurable with this harness. **Nuance for science:** at
+true *lossless* the noise is signal and must be kept (the grain lever applies to the near-lossless/
+distribution tier); block-skip and chroma levers apply at every tier. This "use the video to improve the
+codec" win stands **independent of any codec race**.
 
 **Probe caveats:** lossless residuals isolate information content but a shipping codec would use lossy
-residuals + in-loop reconstruct (§3.2); byte-offset residual images are a faithful compressibility proxy,
-not the final residual transform; the lossy-vs-HEVC comparison re-encodes already-lossy HEVC output at a
-downscaled bitrate estimate (indicative, not a fair head-to-head). Reproduce: `node probe.mjs {gen,measure,video,videoblock}`.
+residuals + in-loop reconstruct (§3.2); byte-offset residual images are a compressibility proxy, not the
+final residual transform; the HEVC bitrate figures are a *wrong-regime* comparison (see above), retained
+only to illustrate JXL's *distribution* weakness — not as a verdict. Reproduce:
+`node probe.mjs {gen,measure,video,videoblock,diag}`.
 
 ---
 
@@ -329,12 +344,19 @@ downscaled bitrate estimate (indicative, not a fair head-to-head). Reproduce: `n
 4. **P3 — Prediction model 2 (layered horizontal shift).** 1-D per-band motion estimate + patch copy +
    disocclusion-intra + parallax-depth sidecar. Target: train survey. *Months.*
 5. **P4 — Streaming hardening.** Mux/seek/error-resilience/audio; WebCodecs-style player integration.
-6. **(Deferred — now evidence-against) C.** General block ME/MC. The real-clip probe tested per-block MC and
-   it was *worse* than plain delta (§7); build only if a clean, structured, high-motion use-case appears
-   where the synthetic-parallax dynamics (not the dashcam dynamics) dominate.
+6. **Parallel track — diagnostic-driven codec levers ("improve the codec" wins).** Independent of phase order
+   and of any codec race, land the bit-sink levers the diagnostic ranked (§7): **(a) temporal noise/grain
+   model** (~18–48% of delta bits on real footage; near-lossless/distribution tier only), **(b) static
+   block-skip flag** (~14%; all tiers), **(c) temporal chroma coding** (targets the 22% chroma share). Each
+   is a targeted pipeline addition, flipflop/A-B measurable with this harness.
+7. **(Deferred — unproven here) C.** General block ME/MC. Per-block MC was *worse* than plain delta on the
+   real clip (§7), but that was a noise-dominated, small-motion, *lossless* case — build only if a clean,
+   structured, high-motion use-case appears (synthetic-parallax dynamics, not dashcam).
 
 ### Open questions
 - Real target resolutions/fps per ShareNat device tier? (sets the WASM feasibility line)
 - Live vs on-demand: is any *encode* real-time, or always offline? (affects latency/GOP design)
 - Audio required in v1, or video-only first?
 - Interop: is a bespoke container acceptable, or must it wrap in standard MP4/WebM for existing players?
+- **Fair benchmark:** fetch a real x265/SVT-AV1 build to run the matched-fidelity (near-lossless, 4:4:4)
+  comparison — the only meaningful head-to-head — instead of the wrong-regime figures in §7?
