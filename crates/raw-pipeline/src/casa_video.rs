@@ -24,7 +24,7 @@
 
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
-use crate::jxl_casaencoder::{encode_rgb8, EncodeOptions};
+use crate::jxl_casaencoder::{encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame};
 use crate::jxl_casadecoder::decode_interleaved;
 
 pub const CASV_MAGIC: u32 = 0x5641_5343; // 'CASV' little-endian
@@ -153,10 +153,23 @@ pub fn encode_casv_rgb8(
     Ok(out)
 }
 
-/// Per-byte wrapping residual `cur - prev`. Reconstructs exactly via
-/// `prev.wrapping_add(residual)`.
-fn wrapping_residual(cur: &[u8], prev: &[u8]) -> Vec<u8> {
-    cur.iter().zip(prev).map(|(&c, &p)| c.wrapping_sub(p)).collect()
+/// Encode a **16-bit-offset** residual (`cur - prev + 32768`) of a `w×h` RGB8
+/// region as a lossless JXL. The tight unimodal distribution around 32768
+/// compresses far better than an 8-bit wrapping residual (which maps −1→255, a
+/// high-entropy bimodal signal that inflates on noisy content).
+fn encode_residual16(
+    cur: &[u8],
+    prev: &[u8],
+    w: u32,
+    h: u32,
+    opts: &EncodeOptions,
+) -> Result<Vec<u8>, EncodeError> {
+    let resid: Vec<u16> = cur
+        .iter()
+        .zip(prev)
+        .map(|(&c, &p)| ((c as i32 - p as i32) + 32768) as u16)
+        .collect();
+    Encoder::new(opts.clone())?.encode(&Frame::rgb(resid.as_slice(), w, h))
 }
 
 /// Encode RGB8 frames with a GOP: frame `i` is an I-frame when `i % gop_len == 0`,
@@ -187,12 +200,12 @@ pub fn encode_casv_delta_rgb8(
             return Err(VideoError::FrameSize { idx, expected, got: px.len() });
         }
         let is_p = idx % gop != 0;
-        let payload = if is_p {
-            wrapping_residual(px, frames[idx - 1])
+        let jxl = if is_p {
+            encode_residual16(px, frames[idx - 1], width, height, &opts)?
         } else {
-            px.to_vec()
+            encode_rgb8(px, width, height, opts.clone())?
         };
-        streams.push((is_p, encode_rgb8(&payload, width, height, opts.clone())?));
+        streams.push((is_p, jxl));
     }
 
     let header = CasvHeader {
@@ -254,10 +267,10 @@ pub fn casv_frame_info(data: &[u8], index: usize) -> Option<(bool, &[u8])> {
     Some((is_p, &data[offset..end]))
 }
 
-/// In-place `base[i] = base[i].wrapping_add(residual[i])`.
-fn wrapping_add_into(base: &mut [u8], residual: &[u8]) {
-    for (b, &r) in base.iter_mut().zip(residual) {
-        *b = b.wrapping_add(r);
+/// In-place `base[i] += residual16[i] - 32768` (exact for in-range u8).
+fn add_residual16_into(base: &mut [u8], resid: &[u16]) {
+    for (b, &r) in base.iter_mut().zip(resid) {
+        *b = (*b as i32 + r as i32 - 32768) as u8;
     }
 }
 
@@ -412,7 +425,8 @@ pub fn encode_casv_delta_tiled_rgb8(
         payload.extend_from_slice(&bitmap);
 
         if !changed.is_empty() {
-            let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+            // 16-bit-offset atlas; padding stays at 32768 (== zero diff).
+            let mut atlas = vec![32768u16; ts * ts * 3 * changed.len()];
             for (slot, &i) in changed.iter().enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
@@ -423,12 +437,13 @@ pub fn encode_casv_delta_tiled_rgb8(
                         let src = ((ty * ts + row) * w + tx * ts + col) * 3;
                         let dst = ((slot * ts + row) * ts + col) * 3;
                         for c in 0..3 {
-                            atlas[dst + c] = px[src + c].wrapping_sub(prev[src + c]);
+                            atlas[dst + c] = ((px[src + c] as i32 - prev[src + c] as i32) + 32768) as u16;
                         }
                     }
                 }
             }
-            let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone())?;
+            let jxl = Encoder::new(opts.clone())?
+                .encode(&Frame::rgb(atlas.as_slice(), t, t * changed.len() as u32))?;
             payload.extend_from_slice(&jxl);
         }
         streams.push((true, payload));
@@ -499,8 +514,7 @@ pub fn encode_casv_delta_bbox_rgb8(
             Some((x, y, bw, bh)) => {
                 let cur_crop = crop_rgb(px, width, x, y, bw, bh);
                 let prev_crop = crop_rgb(prev, width, x, y, bw, bh);
-                let resid = wrapping_residual(&cur_crop, &prev_crop);
-                let jxl = encode_rgb8(&resid, bw, bh, opts.clone())?;
+                let jxl = encode_residual16(&cur_crop, &prev_crop, bw, bh, &opts)?;
                 payload.extend_from_slice(&(x as u16).to_le_bytes());
                 payload.extend_from_slice(&(y as u16).to_le_bytes());
                 payload.extend_from_slice(&(bw as u16).to_le_bytes());
@@ -566,7 +580,7 @@ fn apply_pframe(
         if changed.is_empty() {
             return Some(());
         }
-        let (atlas, aw, ah) = decode_interleaved::<u8>(&slice[2 + bitmap_len..], 3)?;
+        let (atlas, aw, ah) = decode_interleaved::<u16>(&slice[2 + bitmap_len..], 3)?;
         if aw != t || ah != t * changed.len() as u32 {
             return None;
         }
@@ -581,7 +595,7 @@ fn apply_pframe(
                     let asrc = ((slot * ts + row) * ts + col) * 3;
                     let fdst = ((ty * ts + row) * w + tx * ts + col) * 3;
                     for c in 0..3 {
-                        prev[fdst + c] = prev[fdst + c].wrapping_add(atlas[asrc + c]);
+                        prev[fdst + c] = (prev[fdst + c] as i32 + atlas[asrc + c] as i32 - 32768) as u8;
                     }
                 }
             }
@@ -589,11 +603,11 @@ fn apply_pframe(
         return Some(());
     }
     if !is_bbox {
-        let (resid, _, _) = decode_interleaved::<u8>(slice, 3)?;
+        let (resid, _, _) = decode_interleaved::<u16>(slice, 3)?;
         if resid.len() != prev.len() {
             return None;
         }
-        wrapping_add_into(prev, &resid);
+        add_residual16_into(prev, &resid);
         return Some(());
     }
     if slice.len() < 8 {
@@ -604,7 +618,7 @@ fn apply_pframe(
     if bw == 0 || bh == 0 {
         return Some(());
     }
-    let (resid, dw, dh) = decode_interleaved::<u8>(&slice[8..], 3)?;
+    let (resid, dw, dh) = decode_interleaved::<u16>(&slice[8..], 3)?;
     if dw != bw || dh != bh || resid.len() != (bw * bh * 3) as usize {
         return None;
     }
@@ -613,7 +627,7 @@ fn apply_pframe(
         let dst = ((y as usize + row) * w + x as usize) * 3;
         let srow = row * bw as usize * 3;
         for c in 0..(bw as usize * 3) {
-            prev[dst + c] = prev[dst + c].wrapping_add(resid[srow + c]);
+            prev[dst + c] = (prev[dst + c] as i32 + resid[srow + c] as i32 - 32768) as u8;
         }
     }
     Some(())
@@ -987,7 +1001,7 @@ mod tests {
     }
 
     #[test]
-    fn tile_encoder_marks_and_beats_bbox_on_scatter() {
+    fn tile_encoder_marks_and_beats_intra_on_scatter() {
         let (w, h) = (64u32, 64u32);
         let src = two_region_motion(w, h, 8);
         let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
@@ -997,12 +1011,15 @@ mod tests {
         for i in 1..8 {
             assert!(casv_frame_is_tile(&tiled, i).unwrap(), "frame {i} is tile");
         }
-        let bbox = encode_casv_delta_bbox_rgb8(&refs, w, h, 24, 1, 8, EncodeOptions::lossless()).unwrap();
+        // With 16-bit residuals unchanged regions are ~free, so tile-vs-bbox is now
+        // a decode-compute distinction (tile decodes fewer pixels), not a byte one.
+        // The robust byte claim: skipping unchanged tiles beats coding full frames.
+        let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::lossless()).unwrap();
         assert!(
-            (tiled.len() as f64) < (bbox.len() as f64),
-            "tiled ({}) should beat bbox ({}) on scattered change",
+            (tiled.len() as f64) < 0.75 * (intra.len() as f64),
+            "tiled ({}) should be well under intra ({}) by skipping unchanged tiles",
             tiled.len(),
-            bbox.len()
+            intra.len()
         );
     }
 
