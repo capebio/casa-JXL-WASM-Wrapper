@@ -109,9 +109,18 @@ impl Comparer {
             .and_then(|n| n.checked_mul(4).map(|_| n))
             .expect("width*height*4 overflows usize");
         assert_eq!(ref_rgba.len(), n * 4, "ref must be RGBA");
+        // Resolve the backend up front so the reference pyramid is built with the
+        // SAME dispatched kernels as the per-compare test pyramid (convert_xyb /
+        // downsample_one). The backend depends only on opts + CPU detect, not on
+        // any XYB result, so it is safe to compute before the conversion. This
+        // makes the reference side use AVX2/AVX-512/wasm-SIMD instead of the scalar
+        // fallback, and — by using the same fmadd kernel as the test side — makes
+        // ref/test conversion bit-consistent (the difference `rx - tx` no longer
+        // carries a scalar-vs-fmadd rounding asymmetry).
+        let backend = resolve_backend(&opts);
         // Build reference XYB pyramid + masks (3 scales, blur radius ~w/64 clamped 1..8).
         let (mut rx, mut ry, mut rb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-        xyb::pixels_to_xyb(&ref_rgba, n, &mut rx, &mut ry, &mut rb);
+        convert_xyb(backend, &ref_rgba, n, &mut rx, &mut ry, &mut rb);
         let mut levels = Vec::with_capacity(3);
         let (mut w, mut h) = (width, height);
         let (mut cx, mut cy, mut cb) = (rx, ry, rb);
@@ -127,14 +136,17 @@ impl Comparer {
                 let mut ny = vec![0f32; dn];
                 let mut nb = vec![0f32; dn];
                 // PERC-12: move cx/cy/cb into the Level, then borrow them back to feed the
-                // downsample. dn2_into only READS its source and writes the separate nx/ny/nb,
-                // so the planes need not be cloned to stay alive for the next level. Eliminates
-                // 3× full-res clones at s=0 (~288 MB transient @24MP) + 3× half-res at s=1.
+                // downsample. downsample_one only READS its source and writes the separate
+                // nx/ny/nb, so the planes need not be cloned to stay alive for the next level.
+                // Eliminates 3× full-res clones at s=0 (~288 MB transient @24MP) + 3× half-res
+                // at s=1. Dispatched (not scalar dn2_into) so the reference pyramid uses the
+                // same SIMD downsample as the test side; the scalar fallback
+                // (downsample_inplace) is byte-identical to the old dn2_into path.
                 levels.push(Level { x: cx, y: cy, b: cb, mask, w, h });
                 let lvl = levels.last().expect("level just pushed");
-                butteraugli::dn2_into(&lvl.x, &mut nx, w, h, dw, dh);
-                butteraugli::dn2_into(&lvl.y, &mut ny, w, h, dw, dh);
-                butteraugli::dn2_into(&lvl.b, &mut nb, w, h, dw, dh);
+                downsample_one(backend, &lvl.x, &mut nx, w, h, dw, dh);
+                downsample_one(backend, &lvl.y, &mut ny, w, h, dw, dh);
+                downsample_one(backend, &lvl.b, &mut nb, w, h, dw, dh);
                 cx = nx; cy = ny; cb = nb; w = dw; h = dh;
             } else {
                 // Last level (s==2, or image too small to downsample): move cx/cy/cb
@@ -144,31 +156,8 @@ impl Comparer {
             }
         }
         let (ssim_sb, ssim_sbb) = ssim::ref_moments(&ref_rgba, n, 4);
-        let backend = match opts.backend {
-            BackendChoice::ForceScalar => Backend::Scalar,
-            // A forced SIMD id is honoured only if this CPU actually supports the
-            // required target features; otherwise dispatching a #[target_feature]
-            // kernel is UB/SIGILL. Fall back to the next-best supported backend
-            // (avx512 -> avx2 -> scalar). For a CPU that HAS the feature this is a
-            // no-op; it only guards CPUs that lack it.
-            BackendChoice::Force(id) => resolve_forced_backend(id),
-            // rsqrt variant stays opt-in (Force(2)) until the flip-flop bench
-            // promotes it; Auto picks strict sqrt for now. Target-aware.
-            BackendChoice::Auto => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    detect_native(false)
-                }
-                #[cfg(target_arch = "wasm32")]
-                {
-                    simd::detect_wasm()
-                }
-                #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
-                {
-                    Backend::Scalar
-                }
-            }
-        };
+        // `backend` was resolved above (before the reference XYB build) via
+        // resolve_backend(&opts).
         Comparer {
             width, height, n, opts, backend, levels,
             ref_rgba, // CRAWL C-7: moved in (was ref_rgba.to_vec() — a full n*4 copy)
@@ -179,30 +168,10 @@ impl Comparer {
     }
 
     fn fill_test_xyb(&mut self, test: &[u8]) {
-        match self.backend {
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx2Strict | Backend::Avx2Rsqrt => unsafe {
-                // scalar-LUT assembly: flip-measured ~2.6× over the i32-gather kernel
-                // at 1/6/24 MP (examples/xyb_gather_flip.rs), bit-identical output.
-                simd::avx2::pixels_to_xyb_avx2_scalar_lut(
-                    test, self.n, xyb::sqrt_lin_lut_ptr(),
-                    &mut self.tx, &mut self.ty, &mut self.tb,
-                );
-            },
-            #[cfg(target_arch = "x86_64")]
-            Backend::Avx512Strict | Backend::Avx512Rsqrt => unsafe {
-                simd::avx512::pixels_to_xyb_avx512(
-                    test, self.n, xyb::sqrt_lin_lut_ptr(),
-                    &mut self.tx, &mut self.ty, &mut self.tb,
-                );
-            },
-            #[cfg(target_arch = "wasm32")]
-            Backend::WasmSimd => simd::wasm::pixels_to_xyb_wasm(
-                test, self.n, xyb::sqrt_lin_lut(),
-                &mut self.tx, &mut self.ty, &mut self.tb,
-            ),
-            _ => xyb::pixels_to_xyb(test, self.n, &mut self.tx, &mut self.ty, &mut self.tb),
-        }
+        // Same conversion the reference pyramid used in Comparer::new (convert_xyb).
+        // On AVX2 this is the scalar-LUT kernel — flip-measured ~2.6× over the
+        // i32-gather kernel at 1/6/24 MP (examples/xyb_gather_flip.rs).
+        convert_xyb(self.backend, test, self.n, &mut self.tx, &mut self.ty, &mut self.tb);
     }
 
     fn downsample_dispatch(&mut self, w: usize, h: usize, dw: usize, dh: usize) {
@@ -459,6 +428,53 @@ fn resolve_forced_backend(id: u8) -> Backend {
 /// CRAWL C-3: single-plane backend dispatch for the downsample, factored out so the
 /// three X/Y/B planes can run concurrently (see `downsample_dispatch`).
 #[inline]
+/// Resolve the active SIMD backend for `opts` on this CPU. Shared by
+/// `Comparer::new` (reference pyramid) and the test path so both build with the
+/// same kernels. A forced SIMD id is honoured only if the CPU actually supports
+/// the required target features (else dispatching a `#[target_feature]` kernel is
+/// UB/SIGILL); `resolve_forced_backend` degrades avx512→avx2→scalar. The rsqrt
+/// variant stays opt-in (Force(2)); Auto picks strict sqrt.
+fn resolve_backend(opts: &Opts) -> Backend {
+    match opts.backend {
+        BackendChoice::ForceScalar => Backend::Scalar,
+        BackendChoice::Force(id) => resolve_forced_backend(id),
+        BackendChoice::Auto => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                detect_native(false)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                simd::detect_wasm()
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
+            {
+                Backend::Scalar
+            }
+        }
+    }
+}
+
+/// RGBA(u8) → planar X/Y/B through the dispatched backend kernel. Shared by the
+/// reference build (`Comparer::new`) and the per-compare test build
+/// (`fill_test_xyb`) so both sides run the identical conversion — on AVX2 the
+/// scalar-LUT kernel, on AVX-512/wasm their SIMD kernels, else the scalar tail.
+fn convert_xyb(backend: Backend, px: &[u8], n: usize, x: &mut [f32], y: &mut [f32], b: &mut [f32]) {
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2Strict | Backend::Avx2Rsqrt => unsafe {
+            simd::avx2::pixels_to_xyb_avx2_scalar_lut(px, n, xyb::sqrt_lin_lut_ptr(), x, y, b);
+        },
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512Strict | Backend::Avx512Rsqrt => unsafe {
+            simd::avx512::pixels_to_xyb_avx512(px, n, xyb::sqrt_lin_lut_ptr(), x, y, b);
+        },
+        #[cfg(target_arch = "wasm32")]
+        Backend::WasmSimd => simd::wasm::pixels_to_xyb_wasm(px, n, xyb::sqrt_lin_lut(), x, y, b),
+        _ => xyb::pixels_to_xyb(px, n, x, y, b),
+    }
+}
+
 fn downsample_one(backend: Backend, src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usize, dh: usize) {
     match backend {
         #[cfg(target_arch = "x86_64")]

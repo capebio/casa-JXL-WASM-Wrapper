@@ -47,6 +47,15 @@ pub(crate) fn scale_err(
 ///
 /// Allocates its own output Vec. For construction-time use where a pre-allocated
 /// buffer is available, prefer `dn2_into` to avoid the internal allocation.
+///
+/// Retained as the INDEPENDENT scalar parity oracle for the SIMD downsample
+/// kernels (`downsample_avx2_matches_dn2` et al.). The reference pyramid build
+/// now routes through `downsample_one` (production `downsample_inplace` /
+/// `downsample_avx2`), so `dn2`/`dn2_into` are test-only in a non-test build —
+/// kept deliberately separate from `downsample_inplace` so a shared bug can't
+/// hide from the parity tests. `allow(dead_code)` because the non-test lib build
+/// no longer calls them.
+#[allow(dead_code)]
 pub(crate) fn dn2(src: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
     // A 0-extent source has no pixels to sample. The `.max(1)` below would still
     // claim a 1x1 destination, and `h - 1` / `w - 1` would underflow usize and
@@ -67,6 +76,8 @@ pub(crate) fn dn2(src: &[f32], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
 /// `dst` must have length >= dw*dh where dw=(w>>1).max(1), dh=(h>>1).max(1).
 /// Avoids the internal allocation of `dn2`; useful when the caller pre-allocates
 /// the destination buffer (e.g. during Comparer construction to reduce peak RSS).
+/// Test-only since the ref pyramid moved to `downsample_one` (see `dn2`).
+#[allow(dead_code)]
 pub(crate) fn dn2_into(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usize, dh: usize) {
     for y in 0..dh {
         let sy0 = y << 1;
