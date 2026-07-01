@@ -715,66 +715,72 @@ impl Encoder {
     }
 }
 
-/// Streaming (chunked-frame) RGB8 encode: libjxl pulls 256x256 groups (+border) via a
-/// pull `JxlChunkedFrameInputSource` and writes compressed output through a
-/// `JxlEncoderOutputProcessor`, so peak encoder memory is O(group), not O(frame) — no
-/// whole-image float working copy. Same sRGB / lossy VarDCT settings as the whole-frame
-/// path. `rgb` is the full image in RAM (the source returns pointers into it, no copy),
-/// which isolates the ENCODER's memory behaviour for the streaming-encode benchmark;
-/// upstream band-fusion (never holding the source) is a separate future win.
-///
-/// Streaming only actually engages when libjxl's `CanDoStreamingEncoding` permits it
-/// (fast effort, ≥8 groups / >2048 px, VarDCT, buffering>0); otherwise libjxl silently
-/// falls back to whole-image internally but still produces valid output — so this is a
-/// faithful measurement, not a guarantee of low memory.
-pub fn encode_chunked_rgb8(
-    rgb: &[u8],
+/// A pull source of interleaved u8 color pixels for the chunked encoder. libjxl calls
+/// `rect` synchronously during encode, in monotonic-ypos order; `rect` may drive lazy
+/// decode as a side effect. `num_channels` is 3 (RGB) here.
+pub trait ChunkedColorSource {
+    fn num_channels(&self) -> u32;
+    /// Pointer to pixel data for rect [xpos,ypos, xsize×ysize] + byte stride between rows.
+    fn rect(&mut self, xpos: usize, ypos: usize, xsize: usize, ysize: usize) -> (*const u8, usize);
+}
+
+/// Whole-image-in-RAM source (the classic behavior behind `encode_chunked_rgb8`).
+pub struct WholeImageSource<'a> {
+    pub data: &'a [u8],
+    pub width: usize,
+}
+impl ChunkedColorSource for WholeImageSource<'_> {
+    fn num_channels(&self) -> u32 { 3 }
+    fn rect(&mut self, xpos: usize, ypos: usize, _xs: usize, _ys: usize) -> (*const u8, usize) {
+        let stride = self.width * 3;
+        (unsafe { self.data.as_ptr().add(ypos * stride + xpos * 3) }, stride)
+    }
+}
+
+/// Streaming (chunked-frame) RGB8 encode driven by any [`ChunkedColorSource`]. libjxl pulls
+/// ≤2048² super-tiles (+border) top-to-bottom via a pull input source and writes compressed
+/// output through an output processor, so peak encoder memory is O(super-tile), not O(frame).
+/// sRGB / lossy VarDCT; streaming knobs mirror libjxl's own encode_test.cc path. APPENDS the
+/// codestream into `out` (positions are mapped past `out.len()` so append is safe). Proven
+/// byte-identical to whole-frame `encode` (density bench).
+pub fn encode_chunked(
     w: u32,
     h: u32,
     distance: f32,
     effort: i64,
-) -> Result<Vec<u8>, EncodeError> {
-    assert_eq!(rgb.len(), w as usize * h as usize * 3, "rgb must be w*h*3");
+    src: &mut dyn ChunkedColorSource,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    struct Out<'a> { buf: &'a mut Vec<u8>, base: usize, pos: usize, high: usize, final_pos: Option<usize> }
 
-    struct Src {
-        data: *const u8,
-        stride: usize,
-    }
-    struct Out {
-        buf: Vec<u8>,
-        pos: usize,
-        high: usize,
-        final_pos: Option<usize>,
-    }
-
-    unsafe extern "C" fn color_pf(_op: *mut c_void, pf: *mut ffi::JxlPixelFormat) {
-        (*pf).num_channels = 3;
+    unsafe extern "C" fn color_pf(op: *mut c_void, pf: *mut ffi::JxlPixelFormat) {
+        let s = &mut *(op as *mut &mut dyn ChunkedColorSource);
+        (*pf).num_channels = s.num_channels();
         (*pf).data_type = ffi::JxlDataType::JXL_TYPE_UINT8;
         (*pf).endianness = ffi::JxlEndianness::JXL_NATIVE_ENDIAN;
         (*pf).align = 0;
     }
     unsafe extern "C" fn color_at(
-        op: *mut c_void, xpos: usize, ypos: usize, _xs: usize, _ys: usize, row_offset: *mut usize,
+        op: *mut c_void, xpos: usize, ypos: usize, xs: usize, ys: usize, row_offset: *mut usize,
     ) -> *const c_void {
-        let s = &*(op as *const Src);
-        *row_offset = s.stride; // bytes between rows in the returned (whole-image) buffer
-        s.data.add(ypos * s.stride + xpos * 3) as *const c_void
+        let s = &mut *(op as *mut &mut dyn ChunkedColorSource);
+        let (p, stride) = s.rect(xpos, ypos, xs, ys);
+        *row_offset = stride;
+        p as *const c_void
     }
+    unsafe extern "C" fn src_release(_op: *mut c_void, _buf: *const c_void) {}
     unsafe extern "C" fn out_get(op: *mut c_void, size: *mut usize) -> *mut c_void {
         let o = &mut *(op as *mut Out);
         let want = (*size).max(1 << 16);
-        if o.buf.len() < o.pos + want {
-            o.buf.resize(o.pos + want, 0);
-        }
-        *size = o.buf.len() - o.pos;
-        o.buf.as_mut_ptr().add(o.pos) as *mut c_void
+        let need = o.base + o.pos + want;
+        if o.buf.len() < need { o.buf.resize(need, 0); }
+        *size = o.buf.len() - (o.base + o.pos);
+        o.buf.as_mut_ptr().add(o.base + o.pos) as *mut c_void
     }
     unsafe extern "C" fn out_release(op: *mut c_void, written: usize) {
         let o = &mut *(op as *mut Out);
         o.pos += written;
-        if o.pos > o.high {
-            o.high = o.pos;
-        }
+        if o.pos > o.high { o.high = o.pos; }
     }
     unsafe extern "C" fn out_seek(op: *mut c_void, position: u64) {
         (*(op as *mut Out)).pos = position as usize;
@@ -782,15 +788,10 @@ pub fn encode_chunked_rgb8(
     unsafe extern "C" fn out_final(op: *mut c_void, position: u64) {
         (*(op as *mut Out)).final_pos = Some(position as usize);
     }
-    // libjxl calls this per pulled input buffer; must be non-null (our source returns
-    // pointers into the persistent image, so releasing is a no-op).
-    unsafe extern "C" fn src_release(_op: *mut c_void, _buf: *const c_void) {}
 
     unsafe {
         let enc = ffi::JxlEncoderCreate(ptr::null());
-        if enc.is_null() {
-            return Err(EncodeError::Create);
-        }
+        if enc.is_null() { return Err(EncodeError::Create); }
         let mut info = std::mem::MaybeUninit::<ffi::JxlBasicInfo>::uninit();
         ffi::JxlEncoderInitBasicInfo(info.as_mut_ptr());
         let mut info = info.assume_init();
@@ -817,17 +818,16 @@ pub fn encode_chunked_rgb8(
         }
         use ffi::JxlEncoderFrameSettingId as FS;
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_EFFORT, effort);
-        // Streaming knobs, mirroring libjxl's own encode_test.cc streaming path:
-        // buffering=2, buffer-output mode (no seek), and full-image-heuristics OFF (the
-        // switch that both *enables* streaming and is the source of any density delta).
+        // Streaming knobs, mirroring libjxl's own encode_test.cc streaming path.
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_BUFFERING, 2);
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_OUTPUT_MODE, 0);
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS, 0);
         ffi::JxlEncoderSetFrameDistance(fs, distance);
 
-        let mut out = Out { buf: Vec::new(), pos: 0, high: 0, final_pos: None };
+        let base = out.len();
+        let mut ostate = Out { buf: out, base, pos: 0, high: 0, final_pos: None };
         let op = ffi::JxlEncoderOutputProcessor {
-            opaque: &mut out as *mut _ as *mut c_void,
+            opaque: &mut ostate as *mut _ as *mut c_void,
             get_buffer: Some(out_get),
             release_buffer: Some(out_release),
             seek: Some(out_seek),
@@ -838,29 +838,44 @@ pub fn encode_chunked_rgb8(
             return Err(EncodeError::Jxl("SetOutputProcessor".into()));
         }
 
-        let src = Src { data: rgb.as_ptr(), stride: w as usize * 3 };
+        // Thin pointer to the fat `&mut dyn` (extern fns can't be generic).
+        let mut dynsrc: &mut dyn ChunkedColorSource = src;
         let source = ffi::JxlChunkedFrameInputSource {
-            opaque: &src as *const _ as *mut c_void,
+            opaque: &mut dynsrc as *mut _ as *mut c_void,
             get_color_channels_pixel_format: Some(color_pf),
             get_color_channel_data_at: Some(color_at),
             get_extra_channel_pixel_format: None,
             get_extra_channel_data_at: None,
             release_buffer: Some(src_release),
         };
-        // With the output processor set + is_last=TRUE, AddChunkedFrame drives the whole
-        // encode and emits the codestream through the processor (no CloseInput/
-        // ProcessOutput needed — matches encode_test.cc's streaming path). `src`/`out`
-        // stay alive across this call (the callbacks fire during it).
+        // Output processor + is_last=TRUE: AddChunkedFrame drives the whole encode and emits
+        // via the processor (no CloseInput/ProcessOutput — matches encode_test.cc). `ostate`
+        // and `*src` stay alive across this call (callbacks fire during it).
         let st = ffi::JxlEncoderAddChunkedFrame(fs, JXL_TRUE, source);
         let code = encoder_error_code(enc);
         ffi::JxlEncoderDestroy(enc);
         if st != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
             return Err(EncodeError::Jxl(format!("AddChunkedFrame (code {code})")));
         }
-        let end = out.final_pos.unwrap_or(out.high.max(out.pos));
-        out.buf.truncate(end);
-        Ok(out.buf)
+        let end = ostate.final_pos.unwrap_or(ostate.high.max(ostate.pos));
+        ostate.buf.truncate(base + end);
+        Ok(())
     }
+}
+
+/// Whole-image RGB8 streaming encode (thin wrapper over [`encode_chunked`]).
+pub fn encode_chunked_rgb8(
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    distance: f32,
+    effort: i64,
+) -> Result<Vec<u8>, EncodeError> {
+    assert_eq!(rgb.len(), w as usize * h as usize * 3, "rgb must be w*h*3");
+    let mut src = WholeImageSource { data: rgb, width: w as usize };
+    let mut out = Vec::new();
+    encode_chunked(w, h, distance, effort, &mut src, &mut out)?;
+    Ok(out)
 }
 
 impl Drop for Encoder {
