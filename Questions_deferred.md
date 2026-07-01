@@ -1147,3 +1147,16 @@ proven by density bench). ★★ CONSTANT-PEAK: streaming export peak = 57.8MB r
 DEFERRED (own specs): P2 WASM-bridge parity (bridge.cpp C++ chunked encode + browser fusion =
 gigapixel-in-browser); DNG streaming export (needs phase-aware MHC band demosaic); NR/unsharp
 spatial post (band-halo extension — P1 is tone-only export); lossless/modular streaming density.
+
+## Lossless/modular streaming density — INVESTIGATED, GREEN 2026-07-01 (branch m2r7)
+
+encode_chunked gained a lossless path (distance<=0 -> SetFrameLossless + uses_original_profile).
+Probe examples/jxl_lossless_stream_density.rs (20.5MP real photo, effort 2/7/9): streaming
+lossless is BYTE-IDENTICAL to whole-frame lossless at every effort (density +0.00%: 15264664@e2,
+11583716@e7, 11309481@e9), EXACT round-trip (true lossless preserved), -60MB encoder peak
+(-28%), neutral-to-faster. Locked by lib test streaming_export_lossless_bytes_equal_whole.
+=> archival lossless exports can stream too, at zero density/quality cost. Streaming full-res
+export (P1) already supports it via export_jxl_streaming_from_strip(distance=0).
+
+Remaining deferred: P2 WASM-bridge parity (gigapixel-in-browser), DNG streaming export (phase-
+aware MHC band), NR/unsharp spatial-post (band-halo).

@@ -209,4 +209,25 @@ mod tests {
             assert_eq!(streamed, whole, "export bytes differ {}x{}", w, h);
         }
     }
+
+    #[test]
+    fn streaming_export_lossless_bytes_equal_whole() {
+        use crate::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
+        for (w, h) in [(64usize, 96usize), (300, 520)] {
+            let strip = decompress::tests_synth_payload(w, h, 0x7A5);
+            let params = pipeline::PipelineParams::default_olympus();
+            let raw = decompress::decompress(&strip, w, h).unwrap();
+            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let mut rgb8 = vec![0u8; w * h * 3];
+            pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
+            // whole-frame lossless
+            let mut enc = Encoder::with_threads(EncodeOptions::lossless().with_effort(2), 1).unwrap();
+            let mut whole = Vec::new();
+            enc.encode_into(&Frame::rgb(&rgb8, w as u32, h as u32), &mut whole).unwrap();
+            // streamed lossless (distance 0 selects lossless in encode_chunked)
+            let mut streamed = Vec::new();
+            export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 0.0, 2, &mut streamed).unwrap();
+            assert_eq!(streamed, whole, "lossless export bytes differ {}x{}", w, h);
+        }
+    }
 }

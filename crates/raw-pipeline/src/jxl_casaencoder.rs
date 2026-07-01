@@ -801,7 +801,9 @@ pub fn encode_chunked(
         info.exponent_bits_per_sample = 0;
         info.num_color_channels = 3;
         info.num_extra_channels = 0;
-        info.uses_original_profile = JXL_FALSE; // XYB lossy
+        // distance <= 0 selects (modular) lossless, which requires the original profile.
+        let lossless = distance <= 0.0;
+        info.uses_original_profile = if lossless { JXL_TRUE } else { JXL_FALSE };
         if ffi::JxlEncoderSetBasicInfo(enc, &info) != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
             ffi::JxlEncoderDestroy(enc);
             return Err(EncodeError::Jxl("SetBasicInfo".into()));
@@ -822,7 +824,11 @@ pub fn encode_chunked(
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_BUFFERING, 2);
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_OUTPUT_MODE, 0);
         ffi::JxlEncoderFrameSettingsSetOption(fs, FS::JXL_ENC_FRAME_SETTING_USE_FULL_IMAGE_HEURISTICS, 0);
-        ffi::JxlEncoderSetFrameDistance(fs, distance);
+        if lossless {
+            ffi::JxlEncoderSetFrameLossless(fs, JXL_TRUE);
+        } else {
+            ffi::JxlEncoderSetFrameDistance(fs, distance);
+        }
 
         let base = out.len();
         let mut ostate = Out { buf: out, base, pos: 0, high: 0, final_pos: None };
