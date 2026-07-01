@@ -24,6 +24,8 @@ pub mod perceptual;
 pub mod tone_simd;
 pub mod frame_stats;
 pub mod stream_preview;
+#[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+pub mod stream_export;
 
 // Re-export the stable B4 metadata-only public API for convenience
 pub use tiff::{parse_orf_metadata, bench_decode_orf, OrfMetadata, DecodeBench};

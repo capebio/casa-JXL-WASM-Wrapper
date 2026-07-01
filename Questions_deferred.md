@@ -1463,3 +1463,44 @@ agent could not run, or is conditional on data this agent could not measure.
   profile, not surgical byte-exact edits. Each needs a design pass, a build, and a
   multi-frame benchmark harness. **Deferred** wholesale as out-of-scope for a byte-exact
   optimization branch; recorded so the video-codec effort can pick them up with evidence.
+
+## DNG streaming — IMPLEMENTED 2026-07-01 (branch perf/dng-stream-preview-jul01-m2r7)
+
+Extended the streaming preview pipeline to DNG (spec+plan+6-task TDD, off q8z). Approach A
+(generic RawRowSource). Superpixel previews (phase-aware; NOT byte-exact to old full-MHC
+DNG previews — accepted quality delta), full-res MHC path unchanged. comp=7 tile-band
+streaming (~19× measured), comp=1 decode-then-dole (~3.5×). Verified: DngRowSource rows ==
+decode_bytes().raw byte-exact (real comp=7 fixture); phase superpixel == reference (4
+phases); ORF previews unchanged; peak-mem working-set ratio 0.052 (~19×); MSVC --lib 216
+pass; wasm32 clean. Gate: preview-only && Bayer(cps=1) && comp∈{7,1}; else full path.
+
+REMAINING DEFERRED: CR2 streaming — vertical-slice layout means every slice spans all rows,
+so row-streaming requires decoding the whole frame first (no peak win for the raw). Only the
+post-decode demosaic+downscale could stream (~43%). Do only if the half-RGB buffer matters.
+
+## Streaming full-res JXL export P1 (native ORF) — IMPLEMENTED 2026-07-01 (branch m2r7)
+
+Fused decode→demosaic_rggb_mhc_band→tone→encode_chunked over a rolling super-tile band
+(spec+plan docs/superpowers/{specs,plans}/2026-07-01-streaming-jxl-export*). ChunkedColorSource
+trait + encode_chunked(&mut dyn) + WholeImageSource + StreamingExportSource. BYTE-IDENTICAL to
+the whole-frame export (source==whole + export-bytes==whole tests; encode_chunked==AddImageFrame
+proven by density bench). ★★ CONSTANT-PEAK: streaming export peak = 57.8MB regardless of height
+(O band), whole = O(height) (99MB@4096 -> 197MB@8192); win widens 1.7x@4096 -> 3.4x@8192 -> huge
+@gigapixel. jxl-codec lib 218 pass; wasm clean.
+
+DEFERRED (own specs): P2 WASM-bridge parity (bridge.cpp C++ chunked encode + browser fusion =
+gigapixel-in-browser); DNG streaming export (needs phase-aware MHC band demosaic); NR/unsharp
+spatial post (band-halo extension — P1 is tone-only export); lossless/modular streaming density.
+
+## Lossless/modular streaming density — INVESTIGATED, GREEN 2026-07-01 (branch m2r7)
+
+encode_chunked gained a lossless path (distance<=0 -> SetFrameLossless + uses_original_profile).
+Probe examples/jxl_lossless_stream_density.rs (20.5MP real photo, effort 2/7/9): streaming
+lossless is BYTE-IDENTICAL to whole-frame lossless at every effort (density +0.00%: 15264664@e2,
+11583716@e7, 11309481@e9), EXACT round-trip (true lossless preserved), -60MB encoder peak
+(-28%), neutral-to-faster. Locked by lib test streaming_export_lossless_bytes_equal_whole.
+=> archival lossless exports can stream too, at zero density/quality cost. Streaming full-res
+export (P1) already supports it via export_jxl_streaming_from_strip(distance=0).
+
+Remaining deferred: P2 WASM-bridge parity (gigapixel-in-browser), DNG streaming export (phase-
+aware MHC band), NR/unsharp spatial-post (band-halo).

@@ -2740,6 +2740,24 @@ pub fn anti_transpose(src: &[u8], w: usize, h: usize) -> Vec<u8> {
 mod pixel_buffer_validation_tests {
     use super::*;
 
+    /// Locks the streaming-export precondition: `process_into_auto` is pure per-pixel, so a
+    /// row-band produces bytes identical to the matching slice of a whole-frame call. If this
+    /// ever fails, tone has whole-frame state and band-fusion tone would drift.
+    #[test]
+    fn tone_band_equals_whole() {
+        let (w, h) = (64usize, 40usize);
+        let rgb16: Vec<u16> = (0..(w * h * 3)).map(|i| ((i * 29 + 7) & 0xffff) as u16).collect();
+        let params = PipelineParams::default_olympus();
+        let mut whole = vec![0u8; w * h * 3];
+        process_into_auto(&rgb16, &params, &mut whole);
+        for b0 in (0..h).step_by(8) {
+            let b1 = (b0 + 8).min(h);
+            let mut band = vec![0u8; (b1 - b0) * w * 3];
+            process_into_auto(&rgb16[b0 * w * 3..b1 * w * 3], &params, &mut band);
+            assert_eq!(band, whole[b0 * w * 3..b1 * w * 3], "band {b0}..{b1}");
+        }
+    }
+
     #[test]
     fn validate_pixel_buffer_accepts_exact_rgb8() {
         let buf = vec![0u8; 4 * 3 * 3];
