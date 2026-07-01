@@ -31,6 +31,77 @@ thread_local! {
 fn demo_checksum(v: &[u16]) -> u32 {
     v.iter().fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
 }
+
+// === P2c: streaming full-res RAW→RGB8 band producer, callable from JS =========================
+// The browser pulls RGB8 bands top-to-bottom (monotonic ypos) and feeds each into the jxl-wasm
+// bridge's chunked encoder (JxlEncoderAddChunkedFrame). Only one band is ever materialized, so a
+// full-res / gigapixel export runs at O(super-tile band) memory. This is byte-identical to the
+// native streaming export (same `StreamingBandSource` code); the encode side lives in the
+// separate jxl-wasm module, bridged in JS.
+use raw_pipeline::decompress::OrfRowDecoder;
+use raw_pipeline::dng::DngRowSource;
+use raw_pipeline::stream_band::StreamingBandSource;
+
+enum BandSrc {
+    Orf(StreamingBandSource<OrfRowDecoder<'static>>),
+    Dng(StreamingBandSource<DngRowSource<'static>>),
+}
+
+#[wasm_bindgen]
+pub struct RawStreamExporter {
+    // `src` borrows `bytes`. Struct fields drop in declaration order, so `src` (the borrower)
+    // drops before `bytes` (the owner). The Box<[u8]> heap data is address-stable and is never
+    // mutated or moved after construction, so the 'static borrow inside `src` stays valid for the
+    // struct's whole life — a sound self-reference.
+    src: BandSrc,
+    bytes: Box<[u8]>,
+    w: usize,
+    h: usize,
+}
+
+#[wasm_bindgen]
+impl RawStreamExporter {
+    /// Build from ORF container bytes. `nr_strength` (0 = off) + `params.texture/clarity` drive
+    /// the spatial (look-adjusted) band-halo path; all-zero keeps the tone-only fast path.
+    pub fn from_orf(bytes: &[u8], nr_strength: f32) -> Result<RawStreamExporter, JsError> {
+        let owned: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+        // SAFETY: see the struct's field-drop note; `owned`'s heap bytes outlive the borrowing `src`.
+        let bref: &'static [u8] = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
+        let s = StreamingBandSource::from_orf_bytes(bref, nr_strength).map_err(|e| JsError::new(&e))?;
+        let (w, h) = (s.width(), s.height());
+        Ok(Self { src: BandSrc::Orf(s), bytes: owned, w, h })
+    }
+
+    /// Build from DNG container bytes (comp=7 tiled or comp=1 uncompressed).
+    pub fn from_dng(bytes: &[u8], nr_strength: f32) -> Result<RawStreamExporter, JsError> {
+        let owned: Box<[u8]> = bytes.to_vec().into_boxed_slice();
+        // SAFETY: see the struct's field-drop note; `owned`'s heap bytes outlive the borrowing `src`.
+        let bref: &'static [u8] = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
+        let s = StreamingBandSource::from_dng_bytes(bref, nr_strength).map_err(|e| JsError::new(&e))?;
+        let (w, h) = (s.width(), s.height());
+        Ok(Self { src: BandSrc::Dng(s), bytes: owned, w, h })
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 { self.w as u32 }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 { self.h as u32 }
+
+    /// Materialize the RGB8 band `[ypos, ypos+ysize)` and return it tightly packed
+    /// (stride = width*3 ⇒ ysize*width*3 bytes). Bands MUST be pulled top-to-bottom with
+    /// monotonic `ypos` and stay within `[0, height)` (the libjxl chunked pull already does),
+    /// since rows below the request are dropped. wasm-bindgen copies into a JS-owned Uint8Array,
+    /// so only one band exists at a time on each side.
+    pub fn band(&mut self, ypos: usize, ysize: usize) -> Vec<u8> {
+        let w = self.w;
+        let (ptr, stride) = match &mut self.src {
+            BandSrc::Orf(s) => s.band(0, ypos, w, ysize),
+            BandSrc::Dng(s) => s.band(0, ypos, w, ysize),
+        };
+        // The rolling rgb8 window is contiguous with stride == w*3, so the band is ysize*stride.
+        unsafe { std::slice::from_raw_parts(ptr, ysize * stride) }.to_vec()
+    }
+}
 #[wasm_bindgen]
 pub fn demosaic_bench_prepare(w: usize, h: usize) {
     let raw: Vec<u16> = (0..w * h).map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16).collect();

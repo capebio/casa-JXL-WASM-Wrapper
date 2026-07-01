@@ -13,8 +13,9 @@
 //!   - rgb8 window: toned output rows [win_first, produced).
 //! Demosaic (+ spatial ops) + tone run in 256-row sub-chunks so the rgb16 transient stays bounded.
 
-use crate::decompress::RawRowSource;
+use crate::decompress::{OrfRowDecoder, RawRowSource};
 use crate::demosaic::demosaic_bayer_mhc_band;
+use crate::dng::DngRowSource;
 use crate::pipeline::{self, PipelineParams};
 
 const SUB_ROWS: usize = 256;
@@ -227,6 +228,48 @@ impl<S: RawRowSource> StreamingBandSource<S> {
             self.rgb8.drain(0..drop);
             self.win_first += drop / (self.w * 3);
         }
+    }
+}
+
+/// Build a band producer from ORF container bytes (parses TIFF, derives the strip + params).
+/// Single source of truth for the ORF ingest — the native `export_orf_jxl_streaming` and the
+/// WASM binding both go through here, so their pixels stay byte-identical.
+impl<'a> StreamingBandSource<OrfRowDecoder<'a>> {
+    pub fn from_orf_bytes(orf: &'a [u8], nr_strength: f32) -> Result<Self, String> {
+        let info = crate::tiff::parse(orf).map_err(|e| format!("tiff::parse: {e}"))?;
+        let w = info.width as usize;
+        let h = info.height as usize;
+        let end = (info.strip_offset as usize)
+            .checked_add(info.strip_byte_count as usize)
+            .ok_or("strip range overflow")?;
+        let strip = orf.get(info.strip_offset as usize..end).ok_or("strip OOB")?;
+        let mut params = PipelineParams::default_olympus();
+        params.black = 256; // Olympus 12-bit pedestal (matches decode_orf_raw)
+        if let Some(r) = info.wb_r { params.wb_r = r; }
+        if let Some(b) = info.wb_b { params.wb_b = b; }
+        if let Some(m) = info.color_matrix { params.color_matrix = Some(m); }
+        let src = OrfRowDecoder::new(strip, w, h)?;
+        Ok(Self::new(src, w, h, params, nr_strength, (0, 0)))
+    }
+}
+
+/// Build a band producer from DNG container bytes (comp=7 tiled or comp=1 uncompressed).
+/// Single source of truth for the DNG ingest (see `from_orf_bytes`).
+impl<'a> StreamingBandSource<DngRowSource<'a>> {
+    pub fn from_dng_bytes(dng: &'a [u8], nr_strength: f32) -> Result<Self, String> {
+        let src = DngRowSource::new(dng)?;
+        let phase = src.phase();
+        let (w, h, black, white, wb_r, wb_b, cm) = {
+            let m = src.meta();
+            (m.width, m.height, m.black, m.white, m.wb_r, m.wb_b, m.color_matrix)
+        };
+        let mut params = PipelineParams::default_olympus();
+        params.black = black;
+        params.white = white;
+        params.wb_r = wb_r;
+        params.wb_b = wb_b;
+        params.color_matrix = cm;
+        Ok(Self::new(src, w, h, params, nr_strength, phase))
     }
 }
 

@@ -8,7 +8,6 @@
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
 use crate::decompress::{OrfRowDecoder, RawRowSource};
-use crate::dng::DngRowSource;
 use crate::jxl_casaencoder::{encode_chunked, ChunkedColorSource};
 use crate::pipeline::PipelineParams;
 use crate::stream_band::StreamingBandSource;
@@ -36,24 +35,14 @@ pub fn export_jxl_streaming_from_strip(
 }
 
 /// Export a full-res JXL from ORF container bytes (parses TIFF, then streams).
+/// Container entry stays tone-only (nr_strength = 0); spatial look is driven through the
+/// `_from_strip` core / `StreamingBandSource` directly (params carries texture/clarity).
 pub fn export_orf_jxl_streaming(
     orf: &[u8], distance: f32, effort: i64, out: &mut Vec<u8>,
 ) -> Result<(usize, usize), String> {
-    let info = crate::tiff::parse(orf).map_err(|e| format!("tiff::parse: {e}"))?;
-    let w = info.width as usize;
-    let h = info.height as usize;
-    let end = (info.strip_offset as usize)
-        .checked_add(info.strip_byte_count as usize)
-        .ok_or("strip range overflow")?;
-    let strip = orf.get(info.strip_offset as usize..end).ok_or("strip OOB")?;
-    let mut params = PipelineParams::default_olympus();
-    params.black = 256; // Olympus 12-bit pedestal (matches decode_orf_raw)
-    if let Some(r) = info.wb_r { params.wb_r = r; }
-    if let Some(b) = info.wb_b { params.wb_b = b; }
-    if let Some(m) = info.color_matrix { params.color_matrix = Some(m); }
-    // Container entry stays tone-only (nr_strength = 0); spatial look is driven through the
-    // `_from_strip` core / `StreamingBandSource` directly (params carries texture/clarity).
-    export_jxl_streaming_from_strip(strip, w, h, params, 0.0, distance, effort, out)?;
+    let mut s = StreamingBandSource::from_orf_bytes(orf, 0.0)?;
+    let (w, h) = (s.width(), s.height());
+    encode_chunked(w as u32, h as u32, distance, effort, &mut s, out).map_err(|e| format!("{e:?}"))?;
     Ok((w, h))
 }
 
@@ -62,19 +51,8 @@ pub fn export_orf_jxl_streaming(
 pub fn export_dng_jxl_streaming(
     dng: &[u8], distance: f32, effort: i64, out: &mut Vec<u8>,
 ) -> Result<(usize, usize), String> {
-    let src = DngRowSource::new(dng)?;
-    let phase = src.phase();
-    let (w, h, black, white, wb_r, wb_b, cm) = {
-        let m = src.meta();
-        (m.width, m.height, m.black, m.white, m.wb_r, m.wb_b, m.color_matrix)
-    };
-    let mut params = PipelineParams::default_olympus();
-    params.black = black;
-    params.white = white;
-    params.wb_r = wb_r;
-    params.wb_b = wb_b;
-    params.color_matrix = cm;
-    let mut s = StreamingBandSource::new(src, w, h, params, 0.0, phase);
+    let mut s = StreamingBandSource::from_dng_bytes(dng, 0.0)?;
+    let (w, h) = (s.width(), s.height());
     encode_chunked(w as u32, h as u32, distance, effort, &mut s, out).map_err(|e| format!("{e:?}"))?;
     Ok((w, h))
 }
