@@ -1,10 +1,10 @@
 {
-  "corpusManifestPath": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\pgo-manifest.json",
+  "corpusManifestPath": "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\pgo-manifest.json",
   "source": "jxl-test-corpus/pgo-manifest.json",
-  "corpusHash": "c87a1daadf9d6525391cb87e18d6636d1298260da6a5659f86d6058590bc4ec9",
+  "corpusHash": "ad8973a455e2df2c5a3193c33584923aee9ecabdbb4a6a56817c7fda7544f634",
   "summary": {
-    "files": 27,
-    "bytes": 864297201
+    "files": 3,
+    "bytes": 59596681
   },
   "manifest": {
     "scenarios": [
@@ -61,15 +61,7 @@
       "weight": 0.6,
       "op": "encode-tiles",
       "files": [
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\_MG_1750.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\ADH_1248.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\ADH_1490.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\P1110226.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm"
+        "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm"
       ],
       "effort": 3,
       "levels": null,
@@ -80,15 +72,7 @@
       "weight": 0.25,
       "op": "encode-pyramid",
       "files": [
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\_MG_1750.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\ADH_1248.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\ADH_1490.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\P1110226.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm"
+        "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm"
       ],
       "effort": 3,
       "levels": 5,
@@ -99,15 +83,7 @@
       "weight": 0.1,
       "op": "encode-container",
       "files": [
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\_MG_1750.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\ADH_1248.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\ADH_1490.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\P1110226.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm"
+        "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm"
       ],
       "effort": 3,
       "levels": null,
@@ -118,15 +94,7 @@
       "weight": 0.05,
       "op": "encode",
       "files": [
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\_MG_1750.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\ADH_1248.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\ADH_1490.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\P1110226.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
-        "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm"
+        "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm"
       ],
       "effort": 7,
       "levels": null,
@@ -135,138 +103,18 @@
   ],
   "files": [
     {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\_MG_1750.ppm",
-      "sha256": "91cab75f0932920bd9186ecd08eb482b57ef67b896c01f7024ab521e13ac2d2e",
-      "bytes": 53747729
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\ADH_1248.ppm",
-      "sha256": "36e17823207321a5ac5bf8e6ef12c92cb8b8ffaa6eb1defee959fc43a01920ee",
-      "bytes": 72000017
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\ADH_1490.ppm",
-      "sha256": "de484f6a554b46b3fae74424c296f19dd2c87d6f35fa1438bf9dc12b5bb2a352",
-      "bytes": 72000017
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\P1110226.ppm",
-      "sha256": "217f3e54b527dd35050c45a60b99d62acbd0be16a7cb73c24ca5209f4a90828d",
-      "bytes": 61496657
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-      "sha256": "e408145ac1d8147124bef798c94244351e80bb04a34814bbbed78dc05b7db839",
-      "bytes": 37601297
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-      "sha256": "54de4692e0719f082643c2202022ba076c3a8e46ad47f9b6d8bcc2a9ed331fbe",
-      "bytes": 37601297
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-      "sha256": "fc8e3233126503d1584145c12da5cd079708c37fa9bbe26597f5070034ce6f48",
-      "bytes": 29735105
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
+      "path": "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
       "sha256": "6b2feefe5d5d5cedef6068b7fc68dc680b914b4d91172ac65cac11c1db5cd386",
       "bytes": 29724221
     },
     {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm",
-      "sha256": "b3d58d5f65ad6428cc5a41559808db5345b21b8539f773da53a618461ad6fc55",
-      "bytes": 37601297
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\_MG_1750.ppm",
-      "sha256": "91cab75f0932920bd9186ecd08eb482b57ef67b896c01f7024ab521e13ac2d2e",
-      "bytes": 53747729
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\ADH_1248.ppm",
-      "sha256": "36e17823207321a5ac5bf8e6ef12c92cb8b8ffaa6eb1defee959fc43a01920ee",
-      "bytes": 72000017
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\ADH_1490.ppm",
-      "sha256": "de484f6a554b46b3fae74424c296f19dd2c87d6f35fa1438bf9dc12b5bb2a352",
-      "bytes": 72000017
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\P1110226.ppm",
-      "sha256": "217f3e54b527dd35050c45a60b99d62acbd0be16a7cb73c24ca5209f4a90828d",
-      "bytes": 61496657
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-      "sha256": "e408145ac1d8147124bef798c94244351e80bb04a34814bbbed78dc05b7db839",
-      "bytes": 37601297
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-      "sha256": "54de4692e0719f082643c2202022ba076c3a8e46ad47f9b6d8bcc2a9ed331fbe",
-      "bytes": 37601297
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-      "sha256": "fc8e3233126503d1584145c12da5cd079708c37fa9bbe26597f5070034ce6f48",
-      "bytes": 29735105
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
+      "path": "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
       "sha256": "6b2feefe5d5d5cedef6068b7fc68dc680b914b4d91172ac65cac11c1db5cd386",
       "bytes": 29724221
     },
     {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\full\\withmeta\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm",
-      "sha256": "b3d58d5f65ad6428cc5a41559808db5345b21b8539f773da53a618461ad6fc55",
-      "bytes": 37601297
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\_MG_1750.ppm",
-      "sha256": "0c36814d9c1992f38201bd179b5e2c5088934c530ea00e698031d59c62f0add8",
-      "bytes": 131343
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\ADH_1248.ppm",
-      "sha256": "df0e4c6dc58dfacec489a3416a7958470647a90d0d52836579b82c46e608ae1f",
-      "bytes": 131343
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\ADH_1490.ppm",
-      "sha256": "154650fbe43db2a9bcab2129015a0c85b9dcb6d896bdcecb96da16c6bb4dc93c",
-      "bytes": 131343
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\P1110226.ppm",
-      "sha256": "65297d5803879d583f3834375199a36920a0088ed82cfb96bf46bedb1af169b2",
-      "bytes": 146703
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260501_093507165.RAW-02.ORIGINAL.ppm",
-      "sha256": "e564f65a3569fc2895c53b185acfb694ba1875d24ecd935b19c1c47ed1142e80",
-      "bytes": 148239
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260501_095020990.RAW-02.ORIGINAL.ppm",
-      "sha256": "4747626b55f379d593f69d2de46454d9f6bf4ed8ad22bb0992b05eba8f305497",
-      "bytes": 148239
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.ppm",
-      "sha256": "3ce583adb81739179e4c62093eb949d26b94ac332354762a99d62c91ad23bd8b",
-      "bytes": 148239
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
+      "path": "C:\\Foo\\rcw-p2-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260527_180319603.RAW-02.ORIGINAL.ppm",
       "sha256": "8a09a91129c4b9b3b60cb11dffa00dc7d1a4ba232b87a3cce381a3d82248e206",
-      "bytes": 148239
-    },
-    {
-      "path": "C:\\Foo\\raw-converter-wasm\\packages\\jxl-test-corpus\\tiles\\256\\PXL_20260527_200222810.RAW-02.ORIGINAL.ppm",
-      "sha256": "06da283e9af734e26163293d26c05a07c94ee752add4962fa67254c01cb97103",
       "bytes": 148239
     }
   ]
