@@ -451,23 +451,27 @@ Findings:
    real clip (§7), but that was a noise-dominated, small-motion, *lossless* case — build only if a clean,
    structured, high-motion use-case appears (synthetic-parallax dynamics, not dashcam).
 
-### Lossy streaming tier — investigated (negative result)
+### Lossy streaming tier — landed (after two negative results)
 
-Prototyped lossy delta by coding the **residual image** through JXL's lossy (VarDCT) path with in-loop
-reconstruct. It **does not work** and was removed:
-- The **+32768 residual offset wastes lossy precision** and JXL's perceptual model *smooths* the residual, so
-  per-frame error is large (~20 mean-abs/channel even at distance 1.0, a DC bias a finer distance does not fix).
-- Worse, **error accumulates across the GOP** (frame 1 ≈ 21 → frame 4 ≈ 44): the residual carries the prior
-  frame's error (a noise-like pattern) which the perceptual codec cannot faithfully re-code, so the in-loop
-  correction is smoothed away.
+Two approaches that **do not work**, then the one that does:
+1. **Residual-image through lossy VarDCT** — the +32768 offset wastes lossy precision, the perceptual model
+   *smooths* the residual, and error **accumulates** across the GOP (frame 1 ≈ 21 → frame 4 ≈ 44: prior-frame
+   error is re-fed as a residual the codec cannot re-code). Removed.
+2. **`JXL_BLEND_ADD`** — verified in `blending.cc:120` to be a *compositing* add (`out = bg + fg` in float):
+   the encoder still codes the delta perceptually (same problem), and unsigned pixels can only *brighten*. It
+   is **not** inter-frame prediction. JXL has no native motion-compensated residual coding — it is an image
+   codec with compositing (blend) + copy (patches), not a hybrid video codec.
+3. ✔ **Fresh-pixel REPLACE skip (landed):** `encode_casv_delta_lossy_bbox_rgb8` codes each changed rectangle's
+   *actual pixels* (lossy at `distance`); the decoder **overwrites** that region on the reference and copies
+   the rest. Coding *real pixels* keeps JXL's perceptual model correct → error is small (~visually-lossless at
+   distance 1.0, **vs ~20 for the residual**) and does **not** accumulate; decode is deterministic. Changed
+   regions are detected vs the previous *source* frame (comparing to the lossy reference would flag everything
+   via quant noise). Beats lossy all-intra by skipping unchanged regions; on noisy content it degrades to
+   all-intra (no skip), never worse. This is the streaming tier — lossy decode is ~5× cheaper than lossless
+   (~22 ms/f @720p, under the 24fps budget).
 
-**The proper lossy inter-frame path is libjxl's native reference-frame ADD** (`save_as_reference` +
-`JXL_BLEND_ADD` — already present in `bridge.cpp`'s animation encoder), where the perceptual model sees the
-*final* frame, not a residual. That is a **C++ bridge integration** and the real streaming-tier next step —
-it also unblocks the temporal-noise/grain lever (which is lossy-tier only). The Rust residual-image path is
-excellent for **lossless** delta (byte-exact, drift-free by construction) but cannot do quality-controlled
-lossy. (The clamp added to the reconstruction is a harmless no-op for lossless and future-proofs the native
-lossy path.)
+Remaining: threshold-based near-static skip (tolerate small change → skip more on mildly-noisy content); a
+real-content bench of the lossy tier; and the tile-grid form of replace-skip for scattered change.
 
 ### Open questions
 - Real target resolutions/fps per ShareNat device tier? (sets the WASM feasibility line)

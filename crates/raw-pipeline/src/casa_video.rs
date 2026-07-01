@@ -21,6 +21,11 @@
 //! Per-tile skip: `encode_casv_delta_tiled_rgb8(..., gop_len, tile, opts)` codes
 //! only changed tiles (`CASV_TILE_FLAG`, atlas of residual tiles), for scattered
 //! multi-region motion. Byte-exact.
+//!
+//! Lossy tier: `encode_casv_delta_lossy_bbox_rgb8(..., gop_len, distance)` codes
+//! changed rectangles as *fresh lossy pixels* and REPLACEs them (`CASV_REPLACE_FLAG`),
+//! copying unchanged regions from the reference — the working lossy inter-frame
+//! path (residual-through-VarDCT and `BLEND_ADD` do not work; see the code comment).
 
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
@@ -39,6 +44,10 @@ pub const CASV_PFRAME_FLAG: u32 = 0x8000_0000;
 pub const CASV_BBOX_FLAG: u32 = 0x4000_0000;
 /// Third flag bit: a P-frame stored as a tile-grid (changed-tiles) frame.
 pub const CASV_TILE_FLAG: u32 = 0x2000_0000;
+/// Fourth flag bit: a P-frame whose region payload is *fresh pixels to replace*
+/// (not a residual to add). Used by the lossy tier — coding real pixels keeps
+/// JXL's perceptual model correct (a residual would be misjudged).
+pub const CASV_REPLACE_FLAG: u32 = 0x1000_0000;
 
 #[derive(thiserror::Error, Debug)]
 pub enum VideoError {
@@ -48,6 +57,8 @@ pub enum VideoError {
     Empty,
     #[error("frame {idx}: expected {expected} RGB8 bytes, got {got}")]
     FrameSize { idx: usize, expected: usize, got: usize },
+    #[error("in-loop reconstruct: could not decode own frame")]
+    Reconstruct,
 }
 
 /// Parsed 32-byte CasaVideo header.
@@ -246,16 +257,108 @@ pub fn encode_casv_delta_rgb8(
     Ok(out)
 }
 
-// NOTE: a lossy delta tier was prototyped here (lossy full-residual P-frames with
-// in-loop reconstruct) and removed as a **negative result**: feeding a residual
-// image through JXL's perceptual (VarDCT) lossy path does not work — the +32768
-// offset wastes lossy precision and the perceptual model smooths the residual, so
-// error is both large (~20 mean/channel at distance 1.0) AND *accumulates* across
-// the GOP (the residual carries the prior frame's error, which the codec cannot
-// faithfully re-code). The proper lossy inter-frame path is libjxl's **native
-// reference-frame ADD** (`save_as_reference` + `JXL_BLEND_ADD`, exposed in
-// `bridge.cpp`), where the perceptual model sees the final frame. That is the real
-// streaming-tier next step (a C++ bridge integration), not a Rust residual image.
+// LOSSY inter-frame findings:
+//  1. Residual-image through JXL's lossy VarDCT does NOT work — the +32768 offset
+//     wastes precision, the perceptual model smooths the residual, and error
+//     accumulates across the GOP (prior-frame error re-fed as a residual the codec
+//     cannot re-code).
+//  2. `JXL_BLEND_ADD` does NOT help either — it is a *compositing* add (`bg + fg`
+//     in float, `blending.cc`), so the encoder still codes the delta perceptually
+//     (same problem) and unsigned pixels can only brighten. Not inter-frame
+//     prediction.
+// What DOES work (below): code changed regions as *fresh pixels* (perceptually
+// correct — real content) and REPLACE them onto the reference; copy unchanged
+// regions. A lossy skip tier.
+
+/// Copy a `bw×bh` RGB8 crop into a `width`-wide frame at `(x,y)`.
+fn blit_into(dst: &mut [u8], width: u32, x: u32, y: u32, bw: u32, bh: u32, crop: &[u8]) {
+    let (w, x, y, bw, bh) = (width as usize, x as usize, y as usize, bw as usize, bh as usize);
+    for row in 0..bh {
+        let d = ((y + row) * w + x) * 3;
+        let s = row * bw * 3;
+        dst[d..d + bw * 3].copy_from_slice(&crop[s..s + bw * 3]);
+    }
+}
+
+/// Lossy streaming tier: GOP + bounding-box **replace** P-frames via in-loop
+/// reconstruct. Each P-frame codes only the changed rectangle's *fresh pixels*
+/// (lossy at `distance`); the decoder overwrites that region on the previous
+/// reconstructed frame and copies the rest. Because it codes real pixels (not a
+/// residual), JXL's perceptual model is correct — no residual drift. Error is
+/// bounded (I-frame-level in unchanged regions, `distance`-level in changed ones)
+/// and does not accumulate. Emits `PFRAME|BBOX|REPLACE` frames.
+pub fn encode_casv_delta_lossy_bbox_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    gop_len: u32,
+    distance: f32,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+    let gop = gop_len.max(1) as usize;
+    let opts = EncodeOptions::distance(distance);
+
+    let mut streams: Vec<(u32, Vec<u8>)> = Vec::with_capacity(frames.len());
+    let mut recon: Vec<u8> = Vec::new();
+    for (idx, px) in frames.iter().enumerate() {
+        if px.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+        }
+        if idx % gop == 0 {
+            let jxl = encode_rgb8(px, width, height, opts.clone())?;
+            let (r, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+            recon = r;
+            streams.push((0, jxl));
+            continue;
+        }
+        let mut payload = Vec::new();
+        // Detect genuinely-changed regions vs the previous SOURCE frame (comparing
+        // against the lossy `recon` would flag the whole frame via quant noise).
+        match changed_bbox(px, frames[idx - 1], width, height) {
+            None => {
+                for _ in 0..4 {
+                    payload.extend_from_slice(&0u16.to_le_bytes());
+                }
+            }
+            Some((x, y, bw, bh)) => {
+                let crop = crop_rgb(px, width, x, y, bw, bh); // fresh pixels, not a residual
+                let jxl = encode_rgb8(&crop, bw, bh, opts.clone())?;
+                let (dcrop, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+                blit_into(&mut recon, width, x, y, bw, bh, &dcrop);
+                payload.extend_from_slice(&(x as u16).to_le_bytes());
+                payload.extend_from_slice(&(y as u16).to_le_bytes());
+                payload.extend_from_slice(&(bw as u16).to_le_bytes());
+                payload.extend_from_slice(&(bh as u16).to_le_bytes());
+                payload.extend_from_slice(&jxl);
+            }
+        }
+        streams.push((CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG, payload));
+    }
+
+    let header = CasvHeader {
+        width, height, frame_count: frames.len() as u32, fps_num, fps_den, flags: 0,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for (flags, s) in &streams {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
+        offset += s.len();
+    }
+    for (_, s) in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
 
 /// Borrow the JXL codestream bytes for frame `index`, validated against the
 /// index table and file bounds. `None` if `index` is out of range or the index
@@ -278,7 +381,7 @@ pub fn casv_frame_info(data: &[u8], index: usize) -> Option<(bool, &[u8])> {
     let offset = u32::from_le_bytes(data[entry..entry + 4].try_into().ok()?) as usize;
     let len_field = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?);
     let is_p = (len_field & CASV_PFRAME_FLAG) != 0;
-    let len = (len_field & !(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG)) as usize;
+    let len = (len_field & !(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG)) as usize;
     let end = offset.checked_add(len)?;
     if offset < CASV_HEADER_BYTES || end > data.len() {
         return None;
@@ -363,6 +466,21 @@ pub fn casv_frame_is_tile(data: &[u8], index: usize) -> Option<bool> {
     }
     let len_field = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?);
     Some((len_field & CASV_TILE_FLAG) != 0)
+}
+
+/// Report whether P-frame `index` carries replace-pixels (lossy tier) rather than
+/// an additive residual.
+pub fn casv_frame_is_replace(data: &[u8], index: usize) -> Option<bool> {
+    let hdr = parse_casv_header(data)?;
+    if index >= hdr.frame_count as usize {
+        return None;
+    }
+    let entry = CASV_HEADER_BYTES + index * CASV_INDEX_ENTRY_BYTES;
+    if data.len() < entry + CASV_INDEX_ENTRY_BYTES {
+        return None;
+    }
+    let len_field = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?);
+    Some((len_field & CASV_REPLACE_FLAG) != 0)
 }
 
 /// `(tiles_x, tiles_y)` for a `width×height` image at `tile` size.
@@ -581,6 +699,7 @@ fn apply_pframe(
     prev: &mut [u8],
     is_bbox: bool,
     is_tile: bool,
+    is_replace: bool,
     slice: &[u8],
     width: u32,
     height: u32,
@@ -643,6 +762,15 @@ fn apply_pframe(
     if bw == 0 || bh == 0 {
         return Some(());
     }
+    if is_replace {
+        // lossy tier: payload is fresh pixels for the rect — overwrite, don't add.
+        let (pixels, dw, dh) = decode_interleaved::<u8>(&slice[8..], 3)?;
+        if dw != bw || dh != bh || pixels.len() != (bw * bh * 3) as usize {
+            return None;
+        }
+        blit_into(prev, width, x, y, bw, bh, &pixels);
+        return Some(());
+    }
     let (resid, dw, dh) = decode_interleaved::<u16>(&slice[8..], 3)?;
     if dw != bw || dh != bh || resid.len() != (bw * bh * 3) as usize {
         return None;
@@ -669,7 +797,7 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
         let (is_p, slice) = casv_frame_info(data, i)?;
         if is_p {
             let mut prev = cur.take()?;
-            apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, slice, w, h)?;
+            apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
             cur = Some(prev);
         } else {
             let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
@@ -693,7 +821,7 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
         let (is_p, slice) = casv_frame_info(data, i)?;
         let recon = if is_p {
             let mut base = prev.take()?;
-            apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, slice, w, h)?;
+            apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
             base
         } else {
             let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
@@ -1062,5 +1190,57 @@ mod tests {
         }
         let (px8, _, _) = decode_casv_frame_rgb8(&bytes, 8).unwrap();
         assert_eq!(px8, src[8]);
+    }
+
+    // The lossy tier: fresh-pixel REPLACE skip. Unlike the residual approach (which
+    // gave ~20 mean-err and accumulated), coding real pixels is perceptually correct
+    // → small error, no accumulation — and it beats lossy all-intra by skipping
+    // unchanged regions.
+    #[test]
+    fn lossy_replace_smaller_correct_and_stable() {
+        let (w, h) = (64u32, 64u32);
+        let src = low_motion(w, h, 8);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let d = 1.0f32;
+        let skip = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, d).unwrap();
+        let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(d)).unwrap();
+        assert!(
+            skip.len() < intra.len(),
+            "lossy skip ({}) should beat lossy all-intra ({}) by skipping unchanged regions",
+            skip.len(),
+            intra.len()
+        );
+
+        assert!(!casv_frame_info(&skip, 0).unwrap().0);
+        for i in 1..8 {
+            assert!(casv_frame_info(&skip, i).unwrap().0, "frame {i} is P");
+            assert!(casv_frame_is_replace(&skip, i).unwrap(), "frame {i} is replace");
+        }
+
+        let out = decode_casv_all_rgb8(&skip).unwrap();
+        assert_eq!(out.len(), 8);
+        let mean_err = |i: usize| -> f64 {
+            let px = &out[i].0;
+            px.iter()
+                .zip(&src[i])
+                .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64)
+                .sum::<f64>()
+                / px.len() as f64
+        };
+        for i in 0..8 {
+            assert_eq!((out[i].1, out[i].2), (w, h), "frame {i} dims");
+            assert!(mean_err(i) < 8.0, "frame {i} mean err {} (should be ~visually-lossless)", mean_err(i));
+        }
+        assert!(
+            mean_err(7) < mean_err(1) + 4.0,
+            "no accumulation: f1={} f7={}",
+            mean_err(1),
+            mean_err(7)
+        );
+
+        let out2 = decode_casv_all_rgb8(&skip).unwrap();
+        for i in 0..8 {
+            assert_eq!(out[i].0, out2[i].0, "deterministic decode (frame {i})");
+        }
     }
 }
