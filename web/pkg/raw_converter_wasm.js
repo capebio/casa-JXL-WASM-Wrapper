@@ -859,6 +859,23 @@ export class ProcessResult {
         return v1;
     }
     /**
+     * S1 seam: build the lightbox `LookRenderer` directly from the internal packed
+     * preview buffer, without round-tripping the bytes out to JS and back into
+     * `LookRenderer.new_with_options`. Moves `rgb16_lb` out (empties it, exactly like
+     * `take_rgb16_lb`), so the two wasm-bindgen boundary memcpys and the transient JS
+     * `Uint8Array` (per decode) are eliminated — the packed bytes never leave wasm linear
+     * memory. `apply_rotation=false` matches `makeLiveState`'s Phase-2 wiring;
+     * `orientation`/`color_matrix_flat`/`black_used` are read from the same fields the JS
+     * path passed back in, so the renderer — and every `render()` output — is byte-identical
+     * to the take-then-construct path. Returns an empty-buffer renderer on a second call
+     * (ownership transferred, same as `take_rgb16_lb`).
+     * @returns {LookRenderer}
+     */
+    take_lightbox_renderer() {
+        const ret = wasm.processresult_take_lightbox_renderer(this.__wbg_ptr);
+        return LookRenderer.__wrap(ret);
+    }
+    /**
      * Move the RGB buffer out as a `Uint8Array`.  Caller owns the bytes.
      * @returns {Uint8Array}
      */
@@ -869,8 +886,11 @@ export class ProcessResult {
         return v1;
     }
     /**
-     * Move the full-resolution packed u16 LE buffer out (M3 16-bit path). Caller owns the bytes.
+     * Move the full-resolution 16-bit buffer out, packed to LE bytes (M3 16-bit path).
      * Packed 6 bytes per pixel LE (r g b u16). Only non-empty if OUT_FULL_16 was requested.
+     * A-5: the master is held as Vec<u16> and packed here (not eagerly during process), so
+     * no second full-res buffer coexists with the live rgb16 during tone. Byte-identical to
+     * the former eager pack — same pack_rgb16_full over the same pre-unsharp data.
      * @returns {Uint8Array}
      */
     take_rgb16_full() {
@@ -912,6 +932,16 @@ export class ProcessResult {
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v1;
+    }
+    /**
+     * S1 seam twin of [`take_lightbox_renderer`] for the 360 px thumbnail preview.
+     * Moves `rgb16_thumb` out; independent of the lightbox buffer, so the two may be
+     * called in either order.
+     * @returns {LookRenderer}
+     */
+    take_thumb_renderer() {
+        const ret = wasm.processresult_take_thumb_renderer(this.__wbg_ptr);
+        return LookRenderer.__wrap(ret);
     }
 }
 if (Symbol.dispose) ProcessResult.prototype[Symbol.dispose] = ProcessResult.prototype.free;
