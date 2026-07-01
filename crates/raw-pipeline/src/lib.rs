@@ -3,6 +3,8 @@
 pub mod jxl_casaencoder;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 pub mod jxl_casadecoder;
+#[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+pub mod casa_video;
 // Back-compat alias: the BSD decoder's canonical home is `jxl_casadecoder`
 // (JXL-CASADECODER); existing call sites (`crate::jxl_decode::…`) resolve unchanged.
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]

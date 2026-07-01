@@ -1,0 +1,57 @@
+{
+  "config": {
+    "W": 1280,
+    "H": 720,
+    "N": 48,
+    "MAXIT": 280,
+    "effort": 7,
+    "distance": 0,
+    "cjxl": "v0.12.0"
+  },
+  "sequences": {
+    "static": {
+      "intraBytes": 13653864,
+      "deltaNoneBytes": 1649505,
+      "deltaShiftBytes": 0,
+      "deltaLayeredBytes": 0,
+      "intraDecMs": 2598.602099999999,
+      "deltaDecMs": 2192.6530000000002,
+      "perFrame": [],
+      "intraDecMsPerFrame": 54.137543749999985,
+      "deltaDecMsPerFrame": 45.68027083333334
+    },
+    "motion": {
+      "intraBytes": 12501287,
+      "deltaNoneBytes": 19687668,
+      "deltaShiftBytes": 628529,
+      "deltaLayeredBytes": 628529,
+      "intraDecMs": 2680.3603999999996,
+      "deltaDecMs": 2844.080900000001,
+      "perFrame": [],
+      "intraDecMsPerFrame": 55.840841666666655,
+      "deltaDecMsPerFrame": 59.25168541666668
+    },
+    "parallax": {
+      "intraBytes": 12612820,
+      "deltaNoneBytes": 19312351,
+      "deltaShiftBytes": 13494334,
+      "deltaLayeredBytes": 582661,
+      "intraDecMs": 2832.699499999999,
+      "deltaDecMs": 3026.0018999999993,
+      "perFrame": [],
+      "intraDecMsPerFrame": 59.014572916666644,
+      "deltaDecMsPerFrame": 63.04170624999998
+    },
+    "zoom": {
+      "intraBytes": 15466007,
+      "deltaNoneBytes": 21100472,
+      "deltaShiftBytes": 0,
+      "deltaLayeredBytes": 0,
+      "intraDecMs": 3173.8081000000006,
+      "deltaDecMs": 3117.301899999999,
+      "perFrame": [],
+      "intraDecMsPerFrame": 66.12100208333335,
+      "deltaDecMsPerFrame": 64.94378958333331
+    }
+  }
+}
