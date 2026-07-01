@@ -31,10 +31,17 @@
 //! and REPLACE them (`CASV_REPLACE_FLAG`), copying unchanged regions — the working
 //! lossy inter-frame path (residual-through-VarDCT and `BLEND_ADD` do not work; see
 //! the code comment).
+//!
+//! Streaming: `encode_casv_video_streaming(src: &mut dyn VideoFrameSource, opts)`
+//! pulls frames one at a time and encodes I-frames via the chunked constant-peak
+//! encoder ([`crate::jxl_casaencoder::encode_chunked`]) + replace-skip P-frames —
+//! a whole video without buffering all raw frames (the video ⋈ streaming-export fusion).
 
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
-use crate::jxl_casaencoder::{encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame};
+use crate::jxl_casaencoder::{
+    encode_chunked, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame, WholeImageSource,
+};
 use crate::jxl_casadecoder::decode_interleaved;
 use rayon::prelude::*;
 
@@ -64,6 +71,8 @@ pub enum VideoError {
     FrameSize { idx: usize, expected: usize, got: usize },
     #[error("in-loop reconstruct: could not decode own frame")]
     Reconstruct,
+    #[error("streaming encode requires the lossy tier with bbox skip")]
+    Unsupported,
 }
 
 /// Parsed 32-byte CasaVideo header.
@@ -212,6 +221,112 @@ pub fn encode_casv_video(
             }
         }
     }
+}
+
+/// A pull source of RGB8 video frames (from disk, a decode pipeline, a camera…).
+/// Frames are pulled one at a time so the whole video need not be resident.
+pub trait VideoFrameSource {
+    fn dims(&self) -> (u32, u32);
+    fn fps(&self) -> (u32, u32);
+    /// Next frame's interleaved RGB8 (`len == w*h*3`), or `None` at end of stream.
+    fn next_frame(&mut self) -> Option<Vec<u8>>;
+}
+
+/// **Streaming** lossy-tier encode: pulls frames one at a time from `src` and
+/// encodes each — **I-frames via the chunked (constant-peak) encoder**
+/// ([`encode_chunked`]), P-frames via bbox replace-skip — so a whole video encodes
+/// while holding only the previous + current frame (plus the compressed output),
+/// not all raw frames. This is where the video codec meets the streaming-export
+/// band engine.
+///
+/// Requires the streaming tier: `opts.rate = VideoRate::Lossy` and
+/// `opts.skip = SkipMode::Bbox` (else [`VideoError::Unsupported`]). `distance`,
+/// `gop_len`, `effort`, and `thresh` come from `opts`.
+///
+/// v1 buffers the compressed output in RAM (small vs raw frames); a true
+/// stream-to-sink footer format is a later step.
+pub fn encode_casv_video_streaming(
+    src: &mut dyn VideoFrameSource,
+    opts: &CasaVideoOptions,
+) -> Result<Vec<u8>, VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let distance = match opts.rate {
+        VideoRate::Lossy(d) => d,
+        VideoRate::Lossless => return Err(VideoError::Unsupported),
+    };
+    if opts.skip != SkipMode::Bbox {
+        return Err(VideoError::Unsupported);
+    }
+    let thresh = opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance));
+    let gop = opts.gop_len.max(1) as usize;
+    let effort = opts.effort as i64;
+    let crop_opts = EncodeOptions::distance(distance).with_effort(opts.effort);
+    let expected = (width as usize) * (height as usize) * 3;
+
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
+    let mut data: Vec<u8> = Vec::new();
+    let mut recon: Vec<u8> = Vec::new();
+    let mut prev_src: Vec<u8> = Vec::new();
+    let mut idx = 0usize;
+
+    while let Some(px) = src.next_frame() {
+        if px.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+        }
+        let before = data.len();
+        let flags = if idx % gop == 0 {
+            // I-frame via the chunked encoder (O(super-tile) peak), appended to data.
+            let mut isrc = WholeImageSource { data: px.as_slice(), width: width as usize };
+            encode_chunked(width, height, distance, effort, &mut isrc, &mut data)?;
+            let (r, _, _) = decode_interleaved::<u8>(&data[before..], 3).ok_or(VideoError::Reconstruct)?;
+            recon = r;
+            0
+        } else {
+            match changed_bbox_thresh(&px, &prev_src, width, height, thresh) {
+                None => {
+                    for _ in 0..4 {
+                        data.extend_from_slice(&0u16.to_le_bytes());
+                    }
+                }
+                Some((x, y, bw, bh)) => {
+                    let crop = crop_rgb(&px, width, x, y, bw, bh);
+                    let jxl = encode_rgb8(&crop, bw, bh, crop_opts.clone())?;
+                    let (dcrop, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+                    blit_into(&mut recon, width, x, y, bw, bh, &dcrop);
+                    data.extend_from_slice(&(x as u16).to_le_bytes());
+                    data.extend_from_slice(&(y as u16).to_le_bytes());
+                    data.extend_from_slice(&(bw as u16).to_le_bytes());
+                    data.extend_from_slice(&(bh as u16).to_le_bytes());
+                    data.extend_from_slice(&jxl);
+                }
+            }
+            CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG
+        };
+        index.push((flags, (data.len() - before) as u32));
+        prev_src = px;
+        idx += 1;
+    }
+
+    if index.is_empty() {
+        return Err(VideoError::Empty);
+    }
+
+    let header = CasvHeader {
+        width, height, frame_count: index.len() as u32, fps_num, fps_den, flags: 0,
+    };
+    let index_bytes = index.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let mut out = Vec::with_capacity(data_start + data.len());
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for (flags, len) in &index {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(len | flags).to_le_bytes());
+        offset += *len as usize;
+    }
+    out.extend_from_slice(&data);
+    Ok(out)
 }
 
 /// Encode a sequence of interleaved RGB8 frames into a `.casv` byte vector.
@@ -1598,5 +1713,68 @@ mod tests {
         for (i, (px, _, _)) in decode_casv_all_rgb8(&tv).unwrap().iter().enumerate() {
             assert_eq!(px, &src[i], "custom lossless-tile frame {i} byte-exact");
         }
+    }
+
+    struct VecFrames {
+        frames: Vec<Vec<u8>>,
+        i: usize,
+        w: u32,
+        h: u32,
+    }
+    impl VideoFrameSource for VecFrames {
+        fn dims(&self) -> (u32, u32) {
+            (self.w, self.h)
+        }
+        fn fps(&self) -> (u32, u32) {
+            (24, 1)
+        }
+        fn next_frame(&mut self) -> Option<Vec<u8>> {
+            if self.i < self.frames.len() {
+                let f = self.frames[self.i].clone();
+                self.i += 1;
+                Some(f)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_encode_roundtrips_bounded_and_deterministic() {
+        let (w, h) = (64u32, 64u32);
+        let frames = low_motion(w, h, 8);
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 8,
+            skip: SkipMode::Bbox,
+            tile: 32,
+            effort: 3,
+            thresh: Some(0),
+        };
+        let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let casv = encode_casv_video_streaming(&mut fs, &opts).unwrap();
+
+        // Streaming produces the standard container → the normal decoder reads it.
+        let out = decode_casv_all_rgb8(&casv).unwrap();
+        assert_eq!(out.len(), 8);
+        assert!(!casv_frame_info(&casv, 0).unwrap().0, "frame 0 is I");
+        for i in 1..8 {
+            assert!(casv_frame_is_replace(&casv, i).unwrap(), "frame {i} is replace");
+        }
+        for (i, (px, dw, dh)) in out.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
+            let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
+            assert!(me < 8.0, "frame {i} mean err {} (fresh-pixel, ~visually-lossless)", me);
+        }
+
+        // Deterministic (chunked encode is single-threaded).
+        let mut fs2 = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let casv2 = encode_casv_video_streaming(&mut fs2, &opts).unwrap();
+        assert_eq!(casv, casv2, "streaming encode must be deterministic");
+
+        // Unsupported tier rejected.
+        let mut fs3 = VecFrames { frames: low_motion(w, h, 2), i: 0, w, h };
+        let bad = CasaVideoOptions { rate: VideoRate::Lossless, ..opts };
+        assert!(matches!(encode_casv_video_streaming(&mut fs3, &bad), Err(VideoError::Unsupported)));
     }
 }
