@@ -171,14 +171,29 @@ escalation.**
 - **Resolution reality:** the "18 MP encode ≈ 626–1197 ms" figure in `docs/wasm-mt-and-encode-under-1s-findings.md`
   is *photo*-size. Video is far smaller: 1080p = 2 MP, 4K = 8.3 MP. Decode cost scales roughly with
   megapixels and (for P-frames) with residual density.
-- **Per-runtime decode budget (41.6 ms/frame @ 24fps) — measured, not assumed:**
-  - **Native (AVX2 + rayon), measured:** spawn-corrected djxl decode of **lossless 720p** was **63 ms/frame
-    (intra) / 46 ms/frame (delta)** — *over* budget. Lossless is the heaviest path; **lossy** streams
-    (the actual distribution case) decode materially faster and are the plausible 24fps route, but that was
-    **not yet measured** — do not assume headroom. P-frames are cheaper than I-frames but not free.
-  - **Browser WASM (128-bit SIMD, no AVX2, SAB threads, no GPU):** ~3–5× slower than native → 720p@24fps in
-    WASM requires **lossy + threads + resolution scaling**, and 1080p/4K@24fps in WASM is unlikely without
-    downscale. This is the binding constraint; the per-device ladder exists to live within it.
+- **Measured compute envelope** (`examples/casv_bench.rs`, release, native, **single-thread**, all-intra, on
+  48 real dashcam frames; decode = the real-time constraint):
+
+  | tier | 720p (0.92 MP) dec ms/f | 1080p (2.07 MP) dec ms/f | 24fps @ 720p | 24fps @ 1080p |
+  |---|---|---|---|---|
+  | **lossy d1 e3** (distribution) | **22.4** (45 fps) | **48.0** (21 fps) | ✅ single-thread | ⚠️ needs ~2 threads |
+  | lossless e3 (science tier) | 109.6 | 239.7 | ❌ | ❌ |
+  | lossless e7 | 171.7 | 341.1 | ❌ | ❌ |
+
+  This **corrects the earlier spawn-dominated djxl estimate**: the *lossy distribution* tier is far cheaper
+  than first measured. Reads:
+  - **720p lossy decodes at 24fps single-threaded today** (22 ms/f). Motion-JXL is already streamable at 720p.
+  - **1080p lossy needs ~2 threads** (48→<42 ms; decode scales *sub*-linearly, 2.14× for 2.25× pixels). 4K
+    lossy ≈ ~200 ms/f single-thread → ~5 threads *or* the static-skip lever.
+  - **Compute is a lossless / high-resolution problem, not a lossy-720p one.** The science/near-lossless tier
+    (110–341 ms/f) needs skip + threads for real-time — but that tier is usually analysis/scrub, not live.
+  - **Encode is offline and cheap enough for near-real-time capture**: lossy-e3 encode = 37 ms/f @720p (27
+    fps single-thread; GOP-parallel → real-time). Lossless-e7 = ~1–2 s/f (offline transcode only).
+  - **Bandwidth, not decode-speed, is the gap at 720p lossy:** all-intra ≈ 28 Mbps vs HEVC ~3.7 Mbps —
+    **temporal delta's primary job is bandwidth**, and the speed levers (skip/threads) are for 4K, WASM, and
+    the lossless tier.
+  - **Browser WASM (128-bit SIMD, no AVX2, SAB threads):** ~3–5× slower → 720p lossy ≈ 66–112 ms/f
+    single-thread; needs threads + static-skip. **The binding constraint**; the per-device ladder lives here.
   - **Future GPU/WebGPU:** not today; a possible C-lite lane for the transform stage.
 - **Per-device ladder (the tunability the format buys us):** negotiate, against one bitstream —
   resolution (decode a lower pyramid level / DC-only for weak devices), fps (skip to I-frames or every-Nth
