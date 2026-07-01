@@ -2184,13 +2184,69 @@ struct DngDecoded {
     make: String,
     model: String,
     iso: u32,
+    // Streaming preview cache (empty/false unless the DNG streaming fast path filled it).
+    lb_packed: Vec<u8>,
+    lb_w: usize,
+    lb_h: usize,
+    thumb_packed: Vec<u8>,
+    thumb_w: usize,
+    thumb_h: usize,
+    fast_preview: bool,
 }
 
 /// Shared DNG decode path: decode bytes → validate → align CFA → demosaic → NR → WB/params setup.
 /// Returns pre-tonemapped RGB16 and all metadata.  Called by process_dng_impl.
-fn decode_dng_raw(data: &[u8]) -> Result<DngDecoded, JsError> {
+fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError> {
     const MAX_DIM: u32 = 8192;
     const MAX_PIXELS: usize = 50_000_000;
+
+    // Streaming preview-only fast path: previews requested, full-res output not. Build
+    // superpixel previews band-by-band without the full raw / full-res MHC RGB
+    // (~14× lower peak for comp=7, ~3.5× for comp=1). Falls through to the full-MHC
+    // path on any unsupported case (compression/CFA/dims). See design spec.
+    let need_previews = output_flags & (OUT_LIGHTBOX | OUT_THUMB) != 0;
+    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16) != 0;
+    if need_previews && !need_full_rgb {
+        if let Ok(src) = raw_pipeline::dng::DngRowSource::new(data) {
+            let (w, h) = { let m = src.meta(); (m.width, m.height) };
+            if (w as u32) <= MAX_DIM
+                && (h as u32) <= MAX_DIM
+                && w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) <= MAX_PIXELS
+            {
+                let phase = src.phase();
+                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, make, model) = {
+                    let m = src.meta();
+                    (m.black, m.white, m.wb_r, m.wb_b, m.color_matrix, m.orientation,
+                     m.iso.unwrap_or(100), m.make.clone(), m.model.clone())
+                };
+                let (lb_w, lb_h) = target_dims(w, h, 1800);
+                let (thumb_w, thumb_h) = target_dims(w, h, 360);
+                let mut params = pipeline::PipelineParams::default_olympus();
+                params.black = black;
+                params.white = white;
+                params.wb_r = wb_r;
+                params.wb_b = wb_b;
+                params.color_matrix = color_matrix;
+                let color_matrix_flat: [f32; 9] = {
+                    let mm = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+                    [mm[0][0], mm[0][1], mm[0][2], mm[1][0], mm[1][1], mm[1][2], mm[2][0], mm[2][1], mm[2][2]]
+                };
+                let t = now_ms();
+                let previews = raw_pipeline::stream_preview::build_previews_streaming(
+                    src, w, h, phase, &[(lb_w, lb_h), (thumb_w, thumb_h)],
+                ).map_err(|e| JsError::new(&format!("DNG stream: {}", e)))?;
+                let decode_ms = now_ms() - t;
+                let mut it = previews.into_iter();
+                let lb_packed = it.next().unwrap_or_default();
+                let thumb_packed = it.next().unwrap_or_default();
+                return Ok(DngDecoded {
+                    rgb16: Vec::new(), aw: w, ah: h, params, color_matrix_flat,
+                    decode_ms, demosaic_ms: 0.0, orientation, make, model, iso,
+                    lb_packed, lb_w, lb_h, thumb_packed, thumb_w, thumb_h, fast_preview: true,
+                });
+            }
+        }
+    }
 
     let t = now_ms();
     let img = raw_pipeline::dng::decode_bytes(data)
@@ -2266,6 +2322,9 @@ fn decode_dng_raw(data: &[u8]) -> Result<DngDecoded, JsError> {
           make: img.make,
           model: img.model,
         iso,
+        lb_packed: Vec::new(), lb_w: 0, lb_h: 0,
+        thumb_packed: Vec::new(), thumb_w: 0, thumb_h: 0,
+        fast_preview: false,
     })
 }
 
@@ -2289,6 +2348,13 @@ fn process_dng_impl(
         make,
         model,
         iso,
+        lb_packed,
+        lb_w,
+        lb_h,
+        thumb_packed,
+        thumb_w,
+        thumb_h,
+        fast_preview,
     } = decoded;
 
     // M3 full-res 16-bit (DNG/CR2 path). A-5: capture after tone (move, no copy) and pack
@@ -2300,24 +2366,29 @@ fn process_dng_impl(
         (0, 0)
     };
 
-    // Compute lightbox + thumb caches (pre-tonemap, pre-orientation)
-    let (lb_w, lb_h) = target_dims(aw, ah, 1800);
-    let (rgb16_lb, out_lb_w, out_lb_h) = if output_flags & OUT_LIGHTBOX != 0 {
-        let lb = downscale_rgb16_impl(&rgb16, aw, ah, lb_w, lb_h);
-        (lb, lb_w, lb_h)
+    // Compute lightbox + thumb caches (pre-tonemap, pre-orientation). When the DNG
+    // streaming fast path already produced them (rgb16 is empty then), use the cache.
+    let (lb_w2, lb_h2) = target_dims(aw, ah, 1800);
+    let (rgb16_lb, out_lb_w, out_lb_h) = if fast_preview {
+        (lb_packed, lb_w, lb_h)
+    } else if output_flags & OUT_LIGHTBOX != 0 {
+        let lb = downscale_rgb16_impl(&rgb16, aw, ah, lb_w2, lb_h2);
+        (lb, lb_w2, lb_h2)
     } else {
         (vec![], 0, 0)
     };
 
-    let (thumb_w, thumb_h) = target_dims(aw, ah, 360);
-    let (rgb16_thumb, out_thumb_w, out_thumb_h) = if output_flags & OUT_THUMB != 0 {
+    let (thumb_w2, thumb_h2) = target_dims(aw, ah, 360);
+    let (rgb16_thumb, out_thumb_w, out_thumb_h) = if fast_preview {
+        (thumb_packed, thumb_w, thumb_h)
+    } else if output_flags & OUT_THUMB != 0 {
         let thumb = if output_flags & OUT_LIGHTBOX != 0 {
             // Same packed optimization as the main path for consistency and speed.
-            downscale_packed_rgb16_le(&rgb16_lb, lb_w, lb_h, thumb_w, thumb_h)
+            downscale_packed_rgb16_le(&rgb16_lb, lb_w2, lb_h2, thumb_w2, thumb_h2)
         } else {
-            downscale_rgb16_impl(&rgb16, aw, ah, thumb_w, thumb_h)
+            downscale_rgb16_impl(&rgb16, aw, ah, thumb_w2, thumb_h2)
         };
-        (thumb, thumb_w, thumb_h)
+        (thumb, thumb_w2, thumb_h2)
     } else {
         (vec![], 0, 0)
     };
@@ -2474,7 +2545,7 @@ pub fn process_dng(
         clarity,
     };
     process_dng_impl(
-        decode_dng_raw(data)?,
+        decode_dng_raw(data, OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB)?,
         OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB,
         &look,
     )
@@ -2524,7 +2595,7 @@ pub fn process_dng_with_flags(
         texture,
         clarity,
     };
-    process_dng_impl(decode_dng_raw(data)?, output_flags, &look)
+    process_dng_impl(decode_dng_raw(data, output_flags)?, output_flags, &look)
 }
 
 // ─── CR2 pipeline ─────────────────────────────────────────────────────────────
@@ -2699,6 +2770,9 @@ impl From<Cr2Decoded> for DngDecoded {
             make:               c.make,
             model:              c.model,
             iso:                c.iso,
+            lb_packed: Vec::new(), lb_w: 0, lb_h: 0,
+            thumb_packed: Vec::new(), thumb_w: 0, thumb_h: 0,
+            fast_preview: false,
         }
     }
 }
