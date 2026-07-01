@@ -155,7 +155,7 @@ impl Comparer {
                 break;
             }
         }
-        let (ssim_sb, ssim_sbb) = ssim::ref_moments(&ref_rgba, n, 4);
+        let (ssim_sb, ssim_sbb) = ref_moments_dispatch(backend, &ref_rgba, n);
         // `backend` was resolved above (before the reference XYB build) via
         // resolve_backend(&opts).
         Comparer {
@@ -472,6 +472,28 @@ fn convert_xyb(backend: Backend, px: &[u8], n: usize, x: &mut [f32], y: &mut [f3
         #[cfg(target_arch = "wasm32")]
         Backend::WasmSimd => simd::wasm::pixels_to_xyb_wasm(px, n, xyb::sqrt_lin_lut(), x, y, b),
         _ => xyb::pixels_to_xyb(px, n, x, y, b),
+    }
+}
+
+/// Reference per-channel moments (Σy, Σy²) over RGBA, dispatched by backend.
+/// The channel-as-lane SSIM kernel already computes exactly this: for `(b, b)`
+/// its `sa = Σy`, `saa = Σy²` (and `sab = Σy·y = Σy²`, discarded), so
+/// `(sa, saa) == (sb, sbb)` — INTEGER-EXACT, no output change. Reuses the
+/// flip-proven kernel instead of the scalar pass; stride 4 (RGBA), 3 channels.
+/// Reference-build-only (Comparer::new).
+fn ref_moments_dispatch(backend: Backend, b: &[u8], np: usize) -> ([u64; 3], [u64; 3]) {
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2Strict | Backend::Avx2Rsqrt => {
+            let (sa, saa, _sab) = unsafe { simd::avx2::ssim_moments_avx2_cal(b, b, np) };
+            (sa, saa)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512Strict | Backend::Avx512Rsqrt => {
+            let (sa, saa, _sab) = unsafe { simd::avx512::ssim_moments_avx512(b, b, np) };
+            (sa, saa)
+        }
+        _ => ssim::ref_moments(b, np, 4),
     }
 }
 

@@ -538,8 +538,19 @@ pub unsafe fn box_blur_avx2(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f3
     if n == 0 {
         return Vec::new();
     }
-    let mut tmp = vec![0f32; n];
-    let mut dst = vec![0f32; n];
+    // tmp and dst are FULLY overwritten before any read: box_blur_h writes every
+    // tmp element (and only reads src), then the vertical pass + scalar remainder
+    // write every dst element (and only read tmp). So the `vec![0f32; n]` zero-init
+    // would be 2·n·4 B of wasted memset (192 MB at 24 MP). Allocate uninitialised.
+    // SAFETY: f32 has no invalid bit patterns; the n slots exposed by set_len are
+    // each written before they are ever read (H fills all of tmp, V + remainder
+    // fill all of dst), and f32 has no Drop, so leaking uninit on panic is sound.
+    let mut tmp: Vec<f32> = Vec::with_capacity(n);
+    let mut dst: Vec<f32> = Vec::with_capacity(n);
+    unsafe {
+        tmp.set_len(n);
+        dst.set_len(n);
+    }
     let inv = 1.0 / (2 * r + 1) as f32;
 
     // Horizontal pass: shared scalar recurrence (identical to box_blur).
@@ -775,5 +786,18 @@ mod reduction_tests {
         let want = unsafe { ssim_moments_avx2(&a, &b, np) };
         let got = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
         assert_eq!(want, got);
+    }
+
+    /// ref_moments_dispatch reuses ssim_moments_avx2_cal(b, b): its (sa, saa) must
+    /// equal the scalar ref_moments (sb, sbb) exactly (Σy, Σy² — integer, sab
+    /// discarded). Odd np exercises the 2-px-group scalar tail.
+    #[test]
+    fn ref_moments_via_cal_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") { return; }
+        let np = 1000usize + 1;
+        let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
+        let (sb, sbb) = ssim::ref_moments(&b, np, 4);
+        let (sa, saa, _sab) = unsafe { ssim_moments_avx2_cal(&b, &b, np) };
+        assert_eq!((sb, sbb), (sa, saa));
     }
 }
