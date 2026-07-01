@@ -24,6 +24,9 @@ pub mod perceptual;
 pub mod tone_simd;
 pub mod frame_stats;
 pub mod stream_preview;
+// Codec-independent streaming pixel band producer (native + wasm). stream_export wraps it with
+// the JXL encoder (native only); the browser feeds band() into the bridge chunked encoder (P2c).
+pub mod stream_band;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 pub mod stream_export;
 
