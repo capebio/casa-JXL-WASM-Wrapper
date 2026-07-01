@@ -1133,3 +1133,17 @@ pass; wasm32 clean. Gate: preview-only && Bayer(cps=1) && comp∈{7,1}; else ful
 REMAINING DEFERRED: CR2 streaming — vertical-slice layout means every slice spans all rows,
 so row-streaming requires decoding the whole frame first (no peak win for the raw). Only the
 post-decode demosaic+downscale could stream (~43%). Do only if the half-RGB buffer matters.
+
+## Streaming full-res JXL export P1 (native ORF) — IMPLEMENTED 2026-07-01 (branch m2r7)
+
+Fused decode→demosaic_rggb_mhc_band→tone→encode_chunked over a rolling super-tile band
+(spec+plan docs/superpowers/{specs,plans}/2026-07-01-streaming-jxl-export*). ChunkedColorSource
+trait + encode_chunked(&mut dyn) + WholeImageSource + StreamingExportSource. BYTE-IDENTICAL to
+the whole-frame export (source==whole + export-bytes==whole tests; encode_chunked==AddImageFrame
+proven by density bench). ★★ CONSTANT-PEAK: streaming export peak = 57.8MB regardless of height
+(O band), whole = O(height) (99MB@4096 -> 197MB@8192); win widens 1.7x@4096 -> 3.4x@8192 -> huge
+@gigapixel. jxl-codec lib 218 pass; wasm clean.
+
+DEFERRED (own specs): P2 WASM-bridge parity (bridge.cpp C++ chunked encode + browser fusion =
+gigapixel-in-browser); DNG streaming export (needs phase-aware MHC band demosaic); NR/unsharp
+spatial post (band-halo extension — P1 is tone-only export); lossless/modular streaming density.
