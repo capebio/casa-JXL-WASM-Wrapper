@@ -1008,21 +1008,19 @@ untouched and want their own flip/parity before any change:
   at 1/6/24 MP; aggregate ref-build now +27/20/26% (from +4–10%). Remaining ref-build
   follow-ups below.
 
-- **`ref_moments` → reuse `ssim_moments_avx2_cal(b, b, np)`.** ref_moments (per-channel
-  Σy, Σy² over ref RGBA) is exactly the (sa, saa) the channel-as-lane SSIM kernel already
-  computes; `sab = Σy·y = Σy²` so `(sa, saa) == (sb, sbb)`, integer-exact. Dispatch it at
-  mod.rs (like `blur_mask`) for Avx2/Avx512 backends. Low ROI (one bandwidth-bound integer
-  pass, ~1.4× → ~10 ms @24MP) but near-zero code — reuses a flip-proven kernel. Not done to
-  keep the box_blur change focused.
+- **`ref_moments` → reuse `ssim_moments_avx2_cal(b, b, np)`. LANDED.**
+  `ref_moments_dispatch` (mod.rs) uses the channel-as-lane SSIM kernel for Avx2/Avx512:
+  its `(sa, saa)` equals `(sb, sbb)` integer-exact (`sab = Σy² discarded`). Test
+  `ref_moments_via_cal_matches_scalar`; scalar/wasm keep `ssim::ref_moments`.
 
-- **`box_blur` allocates+zeroes `tmp`+`dst` (2× n f32 = 192 MB @24MP) that are then fully
-  overwritten** — the `vec![0f32; n]` memset is wasted work. `box_blur_avx2` writes every
-  element of both before any read (H fills tmp, V+remainder fill dst), so uninit alloc
-  (`Box<[MaybeUninit<f32>]>` / `Vec::with_capacity`+`set_len`) is sound there and saves the
-  192 MB zeroing. Adds `unsafe`; measure separately (the flip zeroes both arms so it is
-  apples-to-apples today). Applies to scalar `box_blur` too.
+- **`box_blur_avx2` uninit tmp/dst. LANDED.** `Vec::with_capacity`+`set_len` instead of
+  `vec![0f32; n]` — both fully overwritten before read; f32 has no invalid bit patterns /
+  no Drop → sound; output bit-identical. Saves the 2·n·4 B (192 MB @24MP) zero-init.
+  **Still open:** the scalar `blur::box_blur` keeps `vec![0f32; n]` (adding `unsafe` to a
+  safe fn), and the pyramid downsample targets `nx/ny/nb` in Comparer::new are also
+  zeroed-then-fully-written — same wasted memset, same uninit opportunity.
 
-- **Parallelise / widen box_blur.** (a) The H rows and V column-tiles are independent →
-  rayon over `y` (H) and over the `x` tile stride (V), gated on `parallel`. (b) AVX-512 /
-  wasm-SIMD `box_blur` for those backends (currently fall back to scalar V). (c) Fold the
+- **Parallelise / widen box_blur (NOT cheap — deferred).** (a) H rows and V column-tiles
+  are independent → rayon over `y` (H) and the `x` tile stride (V), gated on `parallel`.
+  (b) AVX-512 / wasm-SIMD `box_blur` (currently fall back to scalar V). (c) Fold the
   3-level mask blur into the pyramid walk to avoid re-blurring re-read planes.
