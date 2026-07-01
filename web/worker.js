@@ -176,6 +176,25 @@ function makeLiveState(rgb16Bytes, w, h, orientation, wbR, wbB, colorMatrix, bla
     };
 }
 
+// makeLiveStateFromRenderer wraps a LookRenderer that was built INSIDE wasm by
+// ProcessResult.take_lightbox_renderer / take_thumb_renderer. The packed rgb16
+// bytes never cross the wasm boundary, so this skips the take-bytes → JS
+// Uint8Array → new_with_options round-trip that makeLiveState performs (S1 seam).
+// The returned wrapper shape is identical to makeLiveState's; only the two FFI
+// boundary copies + a transient JS Uint8Array (per decode) are eliminated.
+function makeLiveStateFromRenderer(renderer, w, h, orientation, wbR, wbB) {
+    const axisSwap = orientation === 6 || orientation === 8;
+    return {
+        renderer,
+        nativeW: w,
+        nativeH: h,
+        outW: axisSwap ? h : w,
+        outH: axisSwap ? w : h,
+        orientation,
+        wbR, wbB,
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Multi-format (EXR / TIFF) ingest helpers.
 //
@@ -566,13 +585,14 @@ self.addEventListener('message', async (ev) => {
             width: w, height: h,
         };
 
-        // Store lightbox liveState
-        const lb16 = result.take_rgb16_lb();
-        liveStateMap.set(id, makeLiveState(lb16, result.lb_w, result.lb_h, ori, wbR, wbB, colorMatrix, black));
+        // Store lightbox liveState — built in-wasm from the internal packed buffer.
+        // S1 seam: skips take_rgb16_lb() → JS Uint8Array → new_with_options, so the
+        // packed lightbox bytes never leave wasm linear memory (black/orientation/
+        // colorMatrix are read from the same ProcessResult fields inside wasm).
+        liveStateMap.set(id, makeLiveStateFromRenderer(result.take_lightbox_renderer(), result.lb_w, result.lb_h, ori, wbR, wbB));
 
-        // Store thumb liveState
-        const thumb16 = result.take_rgb16_thumb();
-        thumbStateMap.set(id, makeLiveState(thumb16, result.thumb_w, result.thumb_h, ori, wbR, wbB, colorMatrix, black));
+        // Store thumb liveState (S1 seam twin).
+        thumbStateMap.set(id, makeLiveStateFromRenderer(result.take_thumb_renderer(), result.thumb_w, result.thumb_h, ori, wbR, wbB));
 
         // thumb RGB8 — apply look to the pre-scaled rgb16 (360px) already cached in thumbStateMap.
         // Avoids downscaling the full 20MP fullRgb (~200× more pixels) for the same result.
