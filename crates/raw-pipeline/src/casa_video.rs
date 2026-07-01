@@ -71,8 +71,10 @@ pub enum VideoError {
     FrameSize { idx: usize, expected: usize, got: usize },
     #[error("in-loop reconstruct: could not decode own frame")]
     Reconstruct,
-    #[error("streaming encode requires the lossy tier with bbox skip")]
+    #[error("streaming encode requires the lossy tier (bbox or tile skip)")]
     Unsupported,
+    #[error("sink write failed")]
+    Io,
 }
 
 /// Parsed 32-byte CasaVideo header.
@@ -121,6 +123,63 @@ pub fn parse_casv_header(data: &[u8]) -> Option<CasvHeader> {
         return None;
     }
     Some(h)
+}
+
+/// Magic at the end of a *footer-indexed* streaming `.casv` (data-first, index +
+/// footer appended). Lets frames stream straight to a sink without knowing the
+/// frame count up front. See [`encode_casv_video_streaming_to`].
+pub const CASV_FOOTER_MAGIC: u32 = 0x4653_4143; // 'CASF' little-endian
+pub const CASV_FOOTER_BYTES: usize = 32;
+
+/// Trailing footer of a streaming `.casv`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CasvFooter {
+    pub index_offset: u64,
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+}
+
+fn build_casv_footer(f: &CasvFooter) -> [u8; CASV_FOOTER_BYTES] {
+    let mut b = [0u8; CASV_FOOTER_BYTES];
+    b[0..8].copy_from_slice(&f.index_offset.to_le_bytes());
+    b[8..12].copy_from_slice(&f.width.to_le_bytes());
+    b[12..16].copy_from_slice(&f.height.to_le_bytes());
+    b[16..20].copy_from_slice(&f.frame_count.to_le_bytes());
+    b[20..24].copy_from_slice(&f.fps_num.to_le_bytes());
+    b[24..28].copy_from_slice(&f.fps_den.to_le_bytes());
+    b[28..32].copy_from_slice(&CASV_FOOTER_MAGIC.to_le_bytes());
+    b
+}
+
+/// Parse the 32-byte trailing footer of a streaming `.casv`. `None` if absent/invalid.
+pub fn parse_casv_footer(data: &[u8]) -> Option<CasvFooter> {
+    if data.len() < CASV_FOOTER_BYTES {
+        return None;
+    }
+    let o = data.len() - CASV_FOOTER_BYTES;
+    let rd4 = |i: usize| u32::from_le_bytes(data[o + i..o + i + 4].try_into().unwrap());
+    if rd4(28) != CASV_FOOTER_MAGIC {
+        return None;
+    }
+    let f = CasvFooter {
+        index_offset: u64::from_le_bytes(data[o..o + 8].try_into().unwrap()),
+        width: rd4(8),
+        height: rd4(12),
+        frame_count: rd4(16),
+        fps_num: rd4(20),
+        fps_den: rd4(24),
+    };
+    if f.width == 0 || f.height == 0 || f.frame_count == 0 || f.fps_den == 0 {
+        return None;
+    }
+    let idx_end = f.index_offset as usize + f.frame_count as usize * CASV_INDEX_ENTRY_BYTES;
+    if idx_end + CASV_FOOTER_BYTES > data.len() {
+        return None;
+    }
+    Some(f)
 }
 
 // ── Ergonomic top-level API ────────────────────────────────────────────────────
@@ -245,12 +304,18 @@ pub trait VideoFrameSource {
 ///
 /// v1 buffers the compressed output in RAM (small vs raw frames); a true
 /// stream-to-sink footer format is a later step.
-pub fn encode_casv_video_streaming(
-    src: &mut dyn VideoFrameSource,
-    opts: &CasaVideoOptions,
-) -> Result<Vec<u8>, VideoError> {
-    let (width, height) = src.dims();
-    let (fps_num, fps_den) = src.fps();
+struct StreamCtx {
+    width: u32,
+    height: u32,
+    distance: f32,
+    effort: i64,
+    skip: SkipMode,
+    tile: u32,
+    thresh: u8,
+    crop_opts: EncodeOptions,
+}
+
+fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<StreamCtx, VideoError> {
     let distance = match opts.rate {
         VideoRate::Lossy(d) => d,
         VideoRate::Lossless => return Err(VideoError::Unsupported),
@@ -258,10 +323,118 @@ pub fn encode_casv_video_streaming(
     if matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
-    let thresh = opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance));
+    Ok(StreamCtx {
+        width,
+        height,
+        distance,
+        effort: opts.effort as i64,
+        skip: opts.skip,
+        tile: opts.tile,
+        thresh: opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance)),
+        crop_opts: EncodeOptions::distance(distance).with_effort(opts.effort),
+    })
+}
+
+/// Encode one streaming frame into `payload` (cleared by the caller), updating the
+/// running reconstruction `recon`. I-frame via the chunked constant-peak encoder,
+/// P-frame via bbox/tile replace-skip. Returns the index flag bits. Shared by the
+/// buffered and stream-to-sink encoders.
+fn encode_stream_frame(
+    px: &[u8],
+    prev_src: &[u8],
+    recon: &mut Vec<u8>,
+    is_iframe: bool,
+    ctx: &StreamCtx,
+    payload: &mut Vec<u8>,
+) -> Result<u32, VideoError> {
+    let (width, height) = (ctx.width, ctx.height);
+    if is_iframe {
+        let mut isrc = WholeImageSource { data: px, width: width as usize };
+        encode_chunked(width, height, ctx.distance, ctx.effort, &mut isrc, payload)?;
+        let (r, _, _) = decode_interleaved::<u8>(payload.as_slice(), 3).ok_or(VideoError::Reconstruct)?;
+        *recon = r;
+        return Ok(0);
+    }
+    if matches!(ctx.skip, SkipMode::Tile) {
+        let t = ctx.tile.max(1);
+        let (txn, _tyn) = tile_grid(width, height, t);
+        let (wus, ts) = (width as usize, t as usize);
+        let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
+        let changed: Vec<usize> = map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+        payload.extend_from_slice(&(t as u16).to_le_bytes());
+        let bitmap_len = map.len().div_ceil(8);
+        let mut bitmap = vec![0u8; bitmap_len];
+        for &i in &changed {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+        payload.extend_from_slice(&bitmap);
+        if !changed.is_empty() {
+            let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+            for (slot, &i) in changed.iter().enumerate() {
+                let tx = (i as u32 % txn) as usize;
+                let ty = (i as u32 / txn) as usize;
+                let bw = ts.min(wus - tx * ts);
+                let bh = ts.min(height as usize - ty * ts);
+                for row in 0..bh {
+                    let s = ((ty * ts + row) * wus + tx * ts) * 3;
+                    let d = ((slot * ts + row) * ts) * 3;
+                    atlas[d..d + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
+                }
+            }
+            let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, ctx.crop_opts.clone())?;
+            let (datlas, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+            for (slot, &i) in changed.iter().enumerate() {
+                let tx = (i as u32 % txn) as usize;
+                let ty = (i as u32 / txn) as usize;
+                let bw = ts.min(wus - tx * ts);
+                let bh = ts.min(height as usize - ty * ts);
+                for row in 0..bh {
+                    let d = ((ty * ts + row) * wus + tx * ts) * 3;
+                    let s = ((slot * ts + row) * ts) * 3;
+                    recon[d..d + bw * 3].copy_from_slice(&datlas[s..s + bw * 3]);
+                }
+            }
+            payload.extend_from_slice(&jxl);
+        }
+        return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
+    }
+    match changed_bbox_thresh(px, prev_src, width, height, ctx.thresh) {
+        None => {
+            for _ in 0..4 {
+                payload.extend_from_slice(&0u16.to_le_bytes());
+            }
+        }
+        Some((x, y, bw, bh)) => {
+            let crop = crop_rgb(px, width, x, y, bw, bh);
+            let jxl = encode_rgb8(&crop, bw, bh, ctx.crop_opts.clone())?;
+            let (dcrop, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+            blit_into(recon, width, x, y, bw, bh, &dcrop);
+            payload.extend_from_slice(&(x as u16).to_le_bytes());
+            payload.extend_from_slice(&(y as u16).to_le_bytes());
+            payload.extend_from_slice(&(bw as u16).to_le_bytes());
+            payload.extend_from_slice(&(bh as u16).to_le_bytes());
+            payload.extend_from_slice(&jxl);
+        }
+    }
+    Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG)
+}
+
+/// **Streaming** lossy-tier encode (header-indexed, buffered output): pulls frames
+/// one at a time, I-frames via `encode_chunked` (constant peak), P-frames via
+/// bbox/tile replace-skip — holding only prev+cur frame. Returns the standard
+/// (header-first) `.casv`, decodable by [`decode_casv_all_rgb8`]. For long / live
+/// streams that must not buffer the compressed output, use
+/// [`encode_casv_video_streaming_to`] (footer format, straight to a sink).
+///
+/// Requires `opts.rate = Lossy` and `opts.skip = Bbox`/`Tile` (else [`VideoError::Unsupported`]).
+pub fn encode_casv_video_streaming(
+    src: &mut dyn VideoFrameSource,
+    opts: &CasaVideoOptions,
+) -> Result<Vec<u8>, VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let ctx = stream_ctx(width, height, opts)?;
     let gop = opts.gop_len.max(1) as usize;
-    let effort = opts.effort as i64;
-    let crop_opts = EncodeOptions::distance(distance).with_effort(opts.effort);
     let expected = (width as usize) * (height as usize) * 3;
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
@@ -269,98 +442,25 @@ pub fn encode_casv_video_streaming(
     let mut recon: Vec<u8> = Vec::new();
     let mut prev_src: Vec<u8> = Vec::new();
     let mut idx = 0usize;
+    let mut payload = Vec::new();
 
     while let Some(px) = src.next_frame() {
         if px.len() != expected {
             return Err(VideoError::FrameSize { idx, expected, got: px.len() });
         }
-        let before = data.len();
-        let flags = if idx % gop == 0 {
-            // I-frame via the chunked encoder (O(super-tile) peak), appended to data.
-            let mut isrc = WholeImageSource { data: px.as_slice(), width: width as usize };
-            encode_chunked(width, height, distance, effort, &mut isrc, &mut data)?;
-            let (r, _, _) = decode_interleaved::<u8>(&data[before..], 3).ok_or(VideoError::Reconstruct)?;
-            recon = r;
-            0
-        } else if matches!(opts.skip, SkipMode::Tile) {
-            // tile replace-skip: changed tiles' fresh pixels into an atlas.
-            let t = opts.tile.max(1);
-            let (txn, _tyn) = tile_grid(width, height, t);
-            let (wus, ts) = (width as usize, t as usize);
-            let map = changed_tile_map_thresh(&px, &prev_src, width, height, t, thresh);
-            let changed: Vec<usize> = map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
-            data.extend_from_slice(&(t as u16).to_le_bytes());
-            let bitmap_len = map.len().div_ceil(8);
-            let mut bitmap = vec![0u8; bitmap_len];
-            for &i in &changed {
-                bitmap[i / 8] |= 1 << (i % 8);
-            }
-            data.extend_from_slice(&bitmap);
-            if !changed.is_empty() {
-                let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
-                for (slot, &i) in changed.iter().enumerate() {
-                    let tx = (i as u32 % txn) as usize;
-                    let ty = (i as u32 / txn) as usize;
-                    let bw = ts.min(wus - tx * ts);
-                    let bh = ts.min(height as usize - ty * ts);
-                    for row in 0..bh {
-                        let src = ((ty * ts + row) * wus + tx * ts) * 3;
-                        let dst = ((slot * ts + row) * ts) * 3;
-                        atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
-                    }
-                }
-                let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, crop_opts.clone())?;
-                let (datlas, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
-                for (slot, &i) in changed.iter().enumerate() {
-                    let tx = (i as u32 % txn) as usize;
-                    let ty = (i as u32 / txn) as usize;
-                    let bw = ts.min(wus - tx * ts);
-                    let bh = ts.min(height as usize - ty * ts);
-                    for row in 0..bh {
-                        let d = ((ty * ts + row) * wus + tx * ts) * 3;
-                        let s = ((slot * ts + row) * ts) * 3;
-                        recon[d..d + bw * 3].copy_from_slice(&datlas[s..s + bw * 3]);
-                    }
-                }
-                data.extend_from_slice(&jxl);
-            }
-            CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG
-        } else {
-            // bbox replace-skip (default).
-            match changed_bbox_thresh(&px, &prev_src, width, height, thresh) {
-                None => {
-                    for _ in 0..4 {
-                        data.extend_from_slice(&0u16.to_le_bytes());
-                    }
-                }
-                Some((x, y, bw, bh)) => {
-                    let crop = crop_rgb(&px, width, x, y, bw, bh);
-                    let jxl = encode_rgb8(&crop, bw, bh, crop_opts.clone())?;
-                    let (dcrop, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
-                    blit_into(&mut recon, width, x, y, bw, bh, &dcrop);
-                    data.extend_from_slice(&(x as u16).to_le_bytes());
-                    data.extend_from_slice(&(y as u16).to_le_bytes());
-                    data.extend_from_slice(&(bw as u16).to_le_bytes());
-                    data.extend_from_slice(&(bh as u16).to_le_bytes());
-                    data.extend_from_slice(&jxl);
-                }
-            }
-            CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG
-        };
-        index.push((flags, (data.len() - before) as u32));
+        payload.clear();
+        let flags = encode_stream_frame(&px, &prev_src, &mut recon, idx % gop == 0, &ctx, &mut payload)?;
+        index.push((flags, payload.len() as u32));
+        data.extend_from_slice(&payload);
         prev_src = px;
         idx += 1;
     }
-
     if index.is_empty() {
         return Err(VideoError::Empty);
     }
 
-    let header = CasvHeader {
-        width, height, frame_count: index.len() as u32, fps_num, fps_den, flags: 0,
-    };
-    let index_bytes = index.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let header = CasvHeader { width, height, frame_count: index.len() as u32, fps_num, fps_den, flags: 0 };
+    let data_start = CASV_HEADER_BYTES + index.len() * CASV_INDEX_ENTRY_BYTES;
     let mut out = Vec::with_capacity(data_start + data.len());
     out.extend_from_slice(&build_casv_header(&header));
     let mut offset = data_start;
@@ -371,6 +471,92 @@ pub fn encode_casv_video_streaming(
     }
     out.extend_from_slice(&data);
     Ok(out)
+}
+
+/// **Streaming to a sink** (footer-indexed): identical encode to
+/// [`encode_casv_video_streaming`] but writes each frame's codestream straight to
+/// `sink` as produced, buffering only the tiny index (8 bytes/frame), then appends
+/// the index + a 32-byte footer. Constant peak for *both* raw frames and compressed
+/// output — for long / live streams. Read back with [`decode_casv_footer_all_rgb8`].
+pub fn encode_casv_video_streaming_to<W: std::io::Write>(
+    src: &mut dyn VideoFrameSource,
+    opts: &CasaVideoOptions,
+    sink: &mut W,
+) -> Result<(), VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let ctx = stream_ctx(width, height, opts)?;
+    let gop = opts.gop_len.max(1) as usize;
+    let expected = (width as usize) * (height as usize) * 3;
+
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (offset, len_field)
+    let mut recon: Vec<u8> = Vec::new();
+    let mut prev_src: Vec<u8> = Vec::new();
+    let mut idx = 0usize;
+    let mut offset: u64 = 0;
+    let mut payload = Vec::new();
+
+    while let Some(px) = src.next_frame() {
+        if px.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+        }
+        payload.clear();
+        let flags = encode_stream_frame(&px, &prev_src, &mut recon, idx % gop == 0, &ctx, &mut payload)?;
+        sink.write_all(&payload).map_err(|_| VideoError::Io)?;
+        index.push((offset as u32, (payload.len() as u32) | flags));
+        offset += payload.len() as u64;
+        prev_src = px;
+        idx += 1;
+    }
+    if index.is_empty() {
+        return Err(VideoError::Empty);
+    }
+
+    let index_offset = offset;
+    for (off, lenf) in &index {
+        sink.write_all(&off.to_le_bytes()).map_err(|_| VideoError::Io)?;
+        sink.write_all(&lenf.to_le_bytes()).map_err(|_| VideoError::Io)?;
+    }
+    let footer = build_casv_footer(&CasvFooter {
+        index_offset,
+        width,
+        height,
+        frame_count: index.len() as u32,
+        fps_num,
+        fps_den,
+    });
+    sink.write_all(&footer).map_err(|_| VideoError::Io)?;
+    Ok(())
+}
+
+/// Decode a footer-indexed streaming `.casv` (from [`encode_casv_video_streaming_to`])
+/// by re-framing it into the header format and decoding with [`decode_casv_all_rgb8`].
+pub fn decode_casv_footer_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    let f = parse_casv_footer(data)?;
+    let n = f.frame_count as usize;
+    let idx_start = f.index_offset as usize; // frame codestreams occupy [0, idx_start)
+    let new_data_start = CASV_HEADER_BYTES + n * CASV_INDEX_ENTRY_BYTES;
+    let delta = new_data_start as u32;
+
+    let hdr = CasvHeader {
+        width: f.width,
+        height: f.height,
+        frame_count: f.frame_count,
+        fps_num: f.fps_num,
+        fps_den: f.fps_den,
+        flags: 0,
+    };
+    let mut out = Vec::with_capacity(new_data_start + idx_start);
+    out.extend_from_slice(&build_casv_header(&hdr));
+    for i in 0..n {
+        let e = idx_start + i * CASV_INDEX_ENTRY_BYTES;
+        let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
+        let lenf = u32::from_le_bytes(data[e + 4..e + 8].try_into().ok()?);
+        out.extend_from_slice(&off.checked_add(delta)?.to_le_bytes());
+        out.extend_from_slice(&lenf.to_le_bytes());
+    }
+    out.extend_from_slice(&data[0..idx_start]);
+    decode_casv_all_rgb8(&out)
 }
 
 /// Encode a sequence of interleaved RGB8 frames into a `.casv` byte vector.
@@ -1830,5 +2016,40 @@ mod tests {
         let mut fs3 = VecFrames { frames: low_motion(w, h, 2), i: 0, w, h };
         let bad = CasaVideoOptions { rate: VideoRate::Lossless, ..opts };
         assert!(matches!(encode_casv_video_streaming(&mut fs3, &bad), Err(VideoError::Unsupported)));
+    }
+
+    #[test]
+    fn streaming_to_sink_footer_roundtrips() {
+        let (w, h) = (48u32, 48u32);
+        let frames = low_motion(w, h, 8);
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 8,
+            skip: SkipMode::Bbox,
+            tile: 32,
+            effort: 3,
+            thresh: Some(0),
+        };
+
+        // Stream to an in-memory sink (footer-indexed format).
+        let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let mut sink: Vec<u8> = Vec::new();
+        encode_casv_video_streaming_to(&mut fs, &opts, &mut sink).unwrap();
+
+        let f = parse_casv_footer(&sink).expect("footer parses");
+        assert_eq!((f.width, f.height, f.frame_count), (w, h, 8));
+
+        // Footer decode must equal the buffered (header) streaming decode.
+        let via_footer = decode_casv_footer_all_rgb8(&sink).unwrap();
+        let mut fs2 = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let header_casv = encode_casv_video_streaming(&mut fs2, &opts).unwrap();
+        let via_header = decode_casv_all_rgb8(&header_casv).unwrap();
+        assert_eq!(via_footer.len(), 8);
+        for i in 0..8 {
+            assert_eq!(via_footer[i].0, via_header[i].0, "footer vs header decode frame {i}");
+            let px = &via_footer[i].0;
+            let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
+            assert!(me < 8.0, "frame {i} mean err {me}");
+        }
     }
 }
