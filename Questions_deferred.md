@@ -1046,3 +1046,143 @@ untouched and want their own flip/parity before any change:
   which can overflow on adversarial `n`. A division form (`n <= px.len()/4`) avoids it.
   Cosmetic robustness only (callers are always sized); fold into the next avx2.rs edit
   rather than a standalone change.
+
+---
+
+## enc_group.cc — video-throughput backlog (2026-07-01)
+
+Branch `perf/enc-group-fuse-cfl-loopbound-jul01-e7g3` (libjxl-012 submodule). Landed this
+pass: per-worker scratch reuse, CfL zero-ratio channel-skip dispatch, static AC mask, gbench
+CfL-ratio launder. The following are the higher-level throughput levers from the video-codec
+analysis — deferred because each needs a design decision, a full-encode byte-exact regression,
+and/or a dedicated video/throughput config, i.e. beyond a byte-exact single-file pass. Ordered
+by value for frame-after-frame throughput.
+
+1. **Fast-video plane-collapse pipeline.** At `speed_tier > kHare`, Y quant no longer inspects
+   X/B (`AdjustQuantBlockAC` skipped), so the dataflow only needs all three coefficient planes
+   live when CfL is active. Stream by dependency: no-CfL tile → 1 float plane + reuse; one-CfL
+   tile → 2 planes; both-CfL → 3. Transform Y → Y DC → quantize/reconstruct Y → per-chroma
+   transform/quant/split, reusing buffers. Cuts the live coefficient working set (~24 KiB → ~8–16
+   KiB at 32×32) so it stays in L1. **Gate:** gate behind a throughput/video cparams flag (do not
+   change existing modes silently); full-encode byte-identical output across all AC strategies +
+   speed tiers; measured frames/s win. Big refactor of `ComputeCoefficients`.
+
+2. **Fuse CfL into chroma quantization + CfL-aware DC.** Today CfL writes corrected X/B to
+   `coeffs_in` (~8 KiB at 32×32) then the quantizer reloads them. Fold `X' = X - x_factor*Y` into
+   a chroma quantize kernel (load Y once, do X and B together for `cfl_mask==3`), eliminating the
+   write→reload. Companion: a `DCFromLowestFrequenciesWithCfL` that applies the affine correction
+   only to the DC-source coefficients instead of materializing the whole corrected plane.
+   **Gate:** byte-exact vs current; per-ISA register-pressure benchmark (fused-both vs separate-X/B
+   vs current) — two-channel fusion may spill on AVX2. Select by ISA/transform size.
+
+3. **Two quantized buffers, not three.** Interleave quantize+split per channel so int32 scratch
+   drops from `3*kMaxCoeffArea` to `2`. Byte-exact (per-channel `SplitACCoefficients` are
+   independent, so split order is free). Marginal cache win; natural companion to #1. **Gate:**
+   byte-exact + measured.
+
+4. **Splitter bypass for 1-pass.** If `ProgressiveSplitter::SplitACCoefficients` is an identity/
+   deterministic layout copy when `num_passes==1`, the quantizer could write straight into
+   `coeffs[c][0]` and drop the int32 staging plane entirely. **Gate:** prove bit-identical
+   coefficient output for every AC strategy + coeff order at 1 pass before write-through. Do NOT
+   assume safe from `num_passes==1` alone (it takes `acs`, `bx`, `by`).
+
+5. **Fused Y quantize→reconstruct — ISA nuance.** REJECTED on measured AVX2 (+25%, see
+   `docs/1 rejected optimizations.md`). Analysis notes the AVX-512 case differs: `QuantizeBlockAC`
+   is `kBlockDim`(8)-capped while the standalone reconstruct is `kDCTBlockSize`(16)-capped, so
+   fusion narrows AVX-512 reconstruction 16→8. On AVX2/SSE/NEON widths coincide and it still
+   regressed here. **Gate:** only revisit if AVX-512 is a target, with a per-ISA benchmark across
+   8×8…32×32; otherwise stays rejected.
+
+6. **Enriched AdjustQuantBlockAC (loop-bound + invariant hoist).** Loop-bound alone measured +6%
+   (rejected). Analysis pairs it with hoisting `hfix`-Y and the corner predicates (`y>=7*ysize`,
+   `y==H-1`, `y>=4*ysize`) out of the x-loop. **Off the fast/video path** (`effort≥5` only), so
+   low priority. **Gate:** full-body harness (with `hfNonZeros`/`hfMaxError`/corner logic) +
+   effort≥5 corpus parity before it can beat the current per-coeff branch.
+
+7. **Temporal encoder-decision inheritance (Generation 4).** Seed each frame's AC-strategy / raw
+   quant / CfL-mode / activity maps from the previous frame, then locally validate + mutate only
+   where RD diverges. Biggest higher-level lever, but cross-frame + cross-file (enc_frame /
+   enc_cache / scheduler) and needs a frame-sequence API — out of `enc_group.cc` scope.
+
+8. **Pipeline group-produce → tokenize → entropy.** If the encoder imposes a full-frame barrier
+   between `ComputeCoefficients` and tokenization, a producer/consumer pipeline (coeffs N+1 ‖
+   tokenize N ‖ entropy N-1) may beat further scalar cleanup. Scheduler-level, out of file.
+
+9. **gbench coverage expansion.** Add X-only/B-only/none CfL benches with runtime ratios; a
+   batch of independent blocks per iteration (avoid the loop-carried store→load in the current
+   both-active bench); block geometries 8×8/16×16/32×16/16×32/32×32; ≥3 Y coefficient
+   distributions; and a full-group pipeline bench (transform→roundtrip→CfL→quant→split) reporting
+   frames/s, allocs/frame, transient bytes, L1D/branch misses. Requires google/benchmark buildable
+   locally (currently not vendored). The standalone A/B (`C:\Tmp\enc-group-ab`) already covers
+   X-only/B-only/none at runtime.
+
+Skipped as compiler-handled cosmetics (not worth diff churn): CSE of `acs.Strategy()`, hoist of
+`DivCeil(xsize_blocks, kColorTileDimInBlocks)` out of the by-loop, skipping the fast-tier
+`row_quant_ac[bx]=quant_ac` write-back, and removing the dead `error_diffusion` parameter (maint,
+touches call sites).
+
+---
+
+## Entropy subsystem (enc_context_map / enc_cluster / ans_common) — deferred (2026-07-01)
+
+Context: full "hologram/genetics-lens" analysis of the entropy-coding path. The byte-exact
+micro-wins were either already landed (enc-cluster v8n3, ans-common z7k) or a `reserve()`
+(branch perf/enc-ctxmap-candidate-plan-jul01-c3k7). The following are larger and NOT
+byte-exact-by-construction — each needs a plan/emit refactor and/or a bitrate+fps corpus
+A/B before it can ship:
+
+1. **Plan/emit split in BuildAndEncodeHistograms** (enc_ans.cc). Factor into
+   BuildEntropyCodePlan (cost + retained serialized header) + EmitPlan, so EncodeContextMap
+   can decide the winner and emit it without the 3rd histogram construction. Blocker: the
+   function is shared across DC/AC/modular/context-map encoding; changing its contract risks
+   encoder-wide regressions. Byte-exact IF the retained header equals an inline build; gate =
+   full cjxl OLD/NEW byte-compare across stills/animation/screen/multi-frame.
+
+2. **ANS reverse-map direct expansion** (enc_ans.cc, NOT ans_common — the encoder-side
+   `reverse_map_` build). Replace the per-state generic `AliasTable::Lookup` loop (ANS_TAB_SIZE
+   calls per histogram) with two sequential fills per alias `Entry` (left run [0,cutoff),
+   right run [offsets1+cutoff, entry_size)), and drop the `assign(ANS_TAB_SIZE,0)` zero-fill
+   (immediately overwritten). Contiguous per-codebook reverse-map arena instead of per-symbol
+   vectors. Byte-exact by alias semantics; decoder `AliasTable::Lookup` left untouched. Not in
+   the three files handed to this pass — separate branch.
+
+3. **Video-throughput clustering policy / temporal seed lineage / joint cluster+context-map
+   cost objective / worker-local EntropyWorkspace / genetic content-class policy table.**
+   All speculative and non-byte-exact (they change bitstream and/or model decisions). Explicitly
+   require benchmark evidence (bits/frame, enc fps, p95/p99 latency, peak transient bytes,
+   decoder cycles/symbol) across a real temporal corpus. NOTE: prev_histograms is a LIVE table
+   prefix (constrains reindex + disables exact kBest refinement — enc_cluster), NOT a generic
+   previous-frame cache; a temporal cache must be a separate seed-only mechanism. Do not wire
+   prior-frame histograms through prev_histograms.
+
+---
+
+## enc_ans / dec_ans entropy-path — deferred (2026-07-01, branch perf/enc-ans-encodetoken-writesplit-jul01-a4x7)
+
+Byte-exact-or-plausible but need a WASM/decode benchmark the integrator runs on rebuild:
+
+1. **Decoder degenerate-histogram fast path.** `ANSCode::degenerate_symbols` is already
+   populated but unused by the reader. Wire a `const int* degenerate_symbols_` into
+   `ANSSymbolReader` and early-return in `ReadSymbolANSWithoutRefill` (and drop the alias
+   Lookup + per-element masked stores in `IsSingleValueAndAdvance`, using `std::fill_n`).
+   Byte-exact for valid streams: a bin with `freq==ANS_TAB_SIZE` makes the state update an
+   identity and never renormalizes. BUT it adds a load+predictable-branch to the hot AC-decode
+   inner loop that only degenerate/zero-heavy contexts benefit from → photo-regression risk.
+   Gate on an INTERLEAVED real-photo WASM decode flipflop before adopting. Genuinely promising
+   for video/zero-heavy residuals; the analysis's own prompt-9 warns it "burdens normal
+   contexts", so do NOT ship it blind.
+2. **`reverse_map_pool` uninitialized-resize.** `ANSBuildInfoTable` overwrites all ANS_TAB_SIZE
+   pool slots (verified: sum of freqs == ANS_TAB_SIZE, each written once), so the value-init
+   from `resize/assign` is dead. Skipping it byte-exactly needs a raw/AlignedMemory buffer
+   (pool must stay owned+movable so `reverse_map_` pointers survive `RemoveUnusedHistograms`
+   moves). Modest: ~few histograms/frame × 8KiB.
+3. **Split `ANSEncSymbolInfo`** into ANS-only (freq/ifreq/reverse-map-offset) vs Huffman-only
+   (depth/bits), offset-based reverse map, single codebook arena. Cache-layout experiment —
+   may reduce hot metadata to 16B but risks cache-line splits at a 24B stride. Needs
+   cycles/token + L1-miss A/B; do not ship on nominal-size argument alone.
+4. **LZ77 window:** worker-local pool (avoid the 4 MiB alloc per reader) + adaptive size
+   `min(kWindowSize, RoundUpPow2(max_output_symbols))` + zero-run / distance-one (RLE) /
+   batch-replay reader modes. Decoder memory + consumer API changes; needs decode bench.
+5. **Branchless-vs-branchy ANS renorm + alias prefetch policy** — currently branchless
+   unconditionally (comment cites Skylake-X parity only). Add a per-arch (Zen3 / WASM) decode
+   benchmark toggle; do not flip globally without data.

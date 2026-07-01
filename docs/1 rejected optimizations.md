@@ -1281,3 +1281,113 @@ the gathers entirely and wins decisively, so gather16 was dropped (code removed;
 kept here so the unroll is not re-attempted). The scalar-LUT kernel
 (`pixels_to_xyb_avx2_scalar_lut`) is now the wired AVX2 path; the gather baseline is
 retained only as the flip's A-arm + the bit-exact reference oracle.
+
+---
+
+## enc_group.cc — RoundtripY loop fusion (2026-07-01)
+
+Branch `perf/enc-group-fuse-cfl-loopbound-jul01-e7g3` (libjxl-012 submodule).
+Candidate from `lib/jxl/enc_group_gbench.cc` (`BM_RoundtripY_Old/New`): fuse the two
+loops in `QuantizeRoundtripYBlockAC` — the `QuantizeBlockAC` quantize pass and the
+separate reload-quantized + `AdjustQuantBias` + dequant reconstruct pass — into one
+loop that reconstructs from the live `v` register instead of storing to `quantized+size`
+and reloading it.
+
+Byte-exact (the quantized store is still required for `SplitACCoefficients`; only the
+reload is elided; verified 0 diff on both `quantized` and `coeff_recon`). But the
+interleaved standalone A/B (native AVX2, clang 22) measured **new/old = 1.24–1.26 →
+~25% REGRESSION**, consistent across runs. Fusing the reconstruct into the
+`kBlockDim`-wide quantize loop breaks the two clean, separately-vectorized passes and
+raises register pressure (`AdjustQuantBias` pulls in extra float ops + the dequant
+matrix load per quantize chunk). The two-loop form lets the compiler keep each pass
+tight; the reload is L1-cache-hot and cheap. **Kept the two-loop production code.** Do
+not re-attempt fusion without measuring — it is a real regression, not a wash.
+
+## enc_group.cc — AdjustQuantBlockAC DC-region loop-bound rewrite (2026-07-01)
+
+Same branch. Candidate `BM_AdjustDCT16_Old/New`: replace the per-coefficient DC-region
+skip `if (x < xsize && y < ysize) continue;` in the `AdjustQuantBlockAC` accumulation
+loop with a per-row loop bound `x_begin = (y < ysize) ? xsize : 0`.
+
+Byte-exact (identical iterations, same accumulation order → identical float sums;
+verified 0 diff on `sum_of_error`/`sum_of_vals`). But the standalone A/B measured
+**new/old = 1.05–1.08 → ~6% REGRESSION**, consistent across runs. The skipped region is
+only `xsize*ysize` of the block (e.g. 4/256 for DCT16X16) and the branch `x < xsize` is
+trivially predicted not-taken; the variable inner-loop start defeats the fixed-trip-count
+codegen the compiler applies to the original loop. In production the accumulation body is
+even heavier (`hfNonZeros`/`hfMaxError`/corner logic), making the branch cost even more
+negligible. **Kept the per-coeff branch.** Not a win.
+
+---
+
+## enc_ans / dec_ans entropy-path sweep — 2026-07-01 (branch perf/enc-ans-encodetoken-writesplit-jul01-a4x7)
+
+Reviewed the full ANS entropy pipeline (dec_ans.{h,cc}, enc_ans.{h,cc}) against a large
+ChatGPT-style analysis (byte-exact wins vs video-codec/genetics speculation). Landed 4
+byte-exact changes (see memory). Rejected:
+
+- **`reverse_map_pool.assign(ANS_TAB_SIZE,0)` → `resize(ANS_TAB_SIZE)`** (enc_ans.cc:710).
+  FALSE win. The pool is a *fresh* (empty) `std::vector<uint16_t>` per clustered histogram,
+  so `resize(N)` value-initializes (zero-fills) N elements exactly as `assign(N,0)` — zero
+  work removed. Removing the fill needs an uninitialized-resize (C++23 `resize_default_init`,
+  unavailable) or a raw-buffer refactor; the pool must stay owned+movable so pointers survive
+  `RemoveUnusedHistograms`. Deferred as a buffer-refactor, not a one-liner.
+- **RebalanceHistogram priority-queue / heap rewrite** (replace the per-step
+  `std::max_element`/`std::min_element` full scans). NOT byte-exact: `*_element` return the
+  FIRST extremum; a heap changes tie-breaking → a different bin is grown on ties → different
+  normalized histogram → different bitstream. The O(steps·log bins) speedup is real but
+  output-changing; out of a byte-exact pass.
+- **Re-cluster after HybridUint selection / exact-duplicate histogram merge / codebook
+  reorder-by-temperature / near-merge.** All change the number and ordering of signalled
+  histograms → different context map + bitstream. Not byte-exact. Architectural.
+- **Temporal entropy-model inheritance across frames / "JXL-as-video-codec" / genetics
+  (epigenetics/selection) reframing.** No JXL video/inter-frame entropy-reference profile
+  exists; encoder-only warm-start is a large architectural change with no byte-exact
+  guarantee. Belongs in a design doc, not this file.
+- **Decoder `context_map->resize`→`assign` and `degenerate_symbols.resize`→`assign`
+  stale-reuse "fix".** Not a proven bug: `ANSCode` and the `context_map` are constructed
+  fresh per decode, so the single-context entry is always zero-initialized. Speculative
+  defensive churn with no perf value — skipped per surgical-change policy.
+
+---
+
+## enc_context_map.cc — eliminate the 3rd BuildAndEncodeHistograms build (2026-07-01, branch perf/enc-ctxmap-candidate-plan-jul01-c3k7)
+
+Proposed (ChatGPT "biggest immediate win"): `EncodeContextMap` currently builds the
+raw and MTF candidates as dry runs (`writer=nullptr`) to get `ans_cost`/`mtf_cost`,
+picks a winner, then calls `BuildAndEncodeHistograms` a **third** time (with a real
+writer) to emit the winner — reconstructing the winner's histograms from scratch.
+Proposal: build each candidate once into its own temp `BitWriter`, decide from those
+costs, and emit the winner's already-serialized header via `writer->AppendUnaligned(...)`
+(which does exist and is bit-continuous — enc_bit_writer.cc:127), saving one full
+histogram construction.
+
+**REJECTED — not byte-exact.** `BuildAndEncodeHistograms` returns a **writer-dependent
+cost**. In writer mode several terms are written-but-uncounted, so `writer_cost <
+no_writer_cost`:
+- LZ77 bundle bits: `enc_ans.cc:1125-1131` — writer branch does `Bundle::Write` and
+  does NOT add to `cost`; nullptr branch does `cost += CanEncode(...)`.
+- `use_prefix_code` alphabet-size varlen bits: `enc_ans.cc:1003-1013` — counted via
+  `size_writer` only in nullptr mode. Context maps are small (`total_tokens<100` ⇒
+  `use_prefix_code` usually true), so this fires for typical context maps.
+- (multi-context only) context-map bits: `enc_ans.cc:975-978` — encoded only when
+  `writer!=nullptr`. N/A here (num_contexts=1) but confirms the pattern.
+
+The OLD code decides `use_mtf` and simple-vs-entropy from **no-writer** costs. Deciding
+from temp-writer costs uses a different basis: the omitted terms differ between the raw
+and MTF candidates (different alphabet sizes) so they don't cancel in `mtf_cost <
+ans_cost`, and they shift the `simple_cost < ans_cost` / `simple_cost < mtf_cost`
+thresholds. On boundary cases this **flips the chosen representation → different (valid)
+output**. Reconstructing the no-writer cost as `writer_cost + CanEncode(lz77).bits +
+prefix_varlen_bits` is fragile (multiple conditional terms across the ANS/prefix split,
+version-dependent) and was not pursued. A truly byte-exact version needs a plan/emit
+split inside `BuildAndEncodeHistograms`/`BuildAndStoreEntropyCodes` that retains the
+serialized header from the cost pass — invasive to a hot function shared across the whole
+encoder (DC/AC/modular/context maps); deferred (Questions_deferred.md).
+
+LANDED from the same file instead: byte-exact `reserve()` on the two token vectors
+(capacity-only; contents/order unchanged). Single-TU compile clean (clang-cl, jxl_enc-obj
+flags). enc_cluster.cc and ans_common.cc from the same ChatGPT analysis were already
+implemented byte-exact on parked branches perf/enc-cluster-fuse-reindex-jun30-v8n3 and
+perf/ans-common-allocfree-jun30-z7k (scratch merge-cost, no-copy/move reindex, union-find,
+const-ref distribution, stack scratch, `range` not `ANS_TAB_SIZE`) — not redone.
