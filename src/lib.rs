@@ -1291,6 +1291,64 @@ pub fn rotate_rgb8(
     })
 }
 
+/// Sum R,G,B over a box `[y0,y1) × x_count` (row stride `sw` px, interleaved RGB8).
+///
+/// On wasm32+simd128 the shipped hot path (`scale_ms`): pack each pixel's R,G,B into
+/// three lanes of one v128 and do a single `i32x4_add` per pixel — LLVM cannot
+/// autovectorise the 3-way u8 AoS deinterleave, so this replaces 3 scalar byte-adds/px.
+/// Byte-exact vs scalar by construction: integer adds are associative and lane 3 is
+/// masked to 0, so the truncating `sum/n` divide yields identical bytes (proven in
+/// `examples/downscale_rgb_simd_flip.rs`). Every other target uses the scalar fallback.
+#[inline]
+fn box_sum_rgb(src: &[u8], y0: usize, y1: usize, x0: usize, x_count: usize, sw: usize) -> (u32, u32, u32) {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        use core::arch::wasm32::*;
+        let len = src.len();
+        let sp = src.as_ptr();
+        let mask3 = i32x4(-1, -1, -1, 0); // keep R,G,B; drop the 4th byte the u32 load drags in
+        let mut acc = i32x4(0, 0, 0, 0);
+        let mut row_base = (y0 * sw + x0) * 3;
+        for _y in y0..y1 {
+            let mut i = row_base;
+            for _ in 0..x_count {
+                let w = if i + 4 <= len {
+                    // SAFETY: `i + 4 <= len` bounds the 4-byte load fully inside `src`.
+                    let b = unsafe { v128_load32_zero(sp.add(i) as *const u32) };
+                    v128_and(u32x4_extend_low_u16x8(u16x8_extend_low_u8x16(b)), mask3)
+                } else {
+                    // Final pixel of the image: scalar, avoids a 1-byte over-read.
+                    i32x4(src[i] as i32, src[i + 1] as i32, src[i + 2] as i32, 0)
+                };
+                acc = i32x4_add(acc, w);
+                i += 3;
+            }
+            row_base += sw * 3;
+        }
+        return (
+            i32x4_extract_lane::<0>(acc) as u32,
+            i32x4_extract_lane::<1>(acc) as u32,
+            i32x4_extract_lane::<2>(acc) as u32,
+        );
+    }
+    #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+    {
+        let (mut rr, mut gg, mut bb) = (0u32, 0u32, 0u32);
+        let mut row_base = (y0 * sw + x0) * 3;
+        for _y in y0..y1 {
+            let mut i = row_base;
+            for _ in 0..x_count {
+                rr += src[i] as u32;
+                gg += src[i + 1] as u32;
+                bb += src[i + 2] as u32;
+                i += 3;
+            }
+            row_base += sw * 3;
+        }
+        (rr, gg, bb)
+    }
+}
+
 /// Box-filter downscale an RGB8 buffer.  Useful for thumbnail generation.
 ///
 /// Fast path: when src dims are exact integer multiple of dst (common for 1/2, 1/4, 1/8 thumbs),
@@ -1368,18 +1426,7 @@ pub fn downscale_rgb(
             let x1 = x1.max(x0 + 1);
             let x_count = x1 - x0;
             let n = ((y1 - y0) * x_count).max(1) as u32;
-            let (mut rr, mut gg, mut bb) = (0u32, 0u32, 0u32);
-            let mut row_base = (y0 * sw + x0) * 3;
-            for _y in y0..y1 {
-                let mut i = row_base;
-                for _ in 0..x_count {
-                    rr += src[i] as u32;
-                    gg += src[i + 1] as u32;
-                    bb += src[i + 2] as u32;
-                    i += 3;
-                }
-                row_base += sw * 3;
-            }
+            let (rr, gg, bb) = box_sum_rgb(src, y0, y1, x0, x_count, sw);
             out[o]     = (rr / n) as u8;
             out[o + 1] = (gg / n) as u8;
             out[o + 2] = (bb / n) as u8;
