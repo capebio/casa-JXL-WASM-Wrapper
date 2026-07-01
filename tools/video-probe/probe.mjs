@@ -645,9 +645,80 @@ async function cmdDiag() {
   console.log('\n[diag] wrote results-diag.json');
 }
 
+// ---- deepened diagnostic: DC/AC, region heatmap, reference choice, cross-sequence ----
+const TILE = 64, GX = Math.ceil(W / TILE), GY = Math.ceil(H / TILE);
+function resSigned(cur, prev) { const a = new Int16Array(W * H * 3); for (let i = 0; i < a.length; i++) a[i] = cur[i] - prev[i]; return a; }
+function ppm16Signed(arr) { const hdr = Buffer.from(`P6\n${W} ${H}\n65535\n`, 'ascii'), body = Buffer.allocUnsafe(W * H * 6); for (let i = 0; i < arr.length; i++) body.writeUInt16BE((arr[i] + 32768) | 0, i * 2); return Buffer.concat([hdr, body]); }
+const cl = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+function boxBlur3(a, r) {                          // separable box low-pass on signed 3ch
+  const win = 2 * r + 1, tmp = new Float32Array(a.length), out = new Float32Array(a.length);
+  for (let y = 0; y < H; y++) for (let c = 0; c < 3; c++) {
+    let s = 0; for (let x = -r; x <= r; x++) s += a[(y * W + cl(x, 0, W - 1)) * 3 + c];
+    for (let x = 0; x < W; x++) { tmp[(y * W + x) * 3 + c] = s / win; s += a[(y * W + cl(x + r + 1, 0, W - 1)) * 3 + c] - a[(y * W + cl(x - r, 0, W - 1)) * 3 + c]; }
+  }
+  for (let x = 0; x < W; x++) for (let c = 0; c < 3; c++) {
+    let s = 0; for (let y = -r; y <= r; y++) s += tmp[(cl(y, 0, H - 1) * W + x) * 3 + c];
+    for (let y = 0; y < H; y++) { out[(y * W + x) * 3 + c] = s / win; s += tmp[(cl(y + r + 1, 0, H - 1) * W + x) * 3 + c] - tmp[(cl(y - r, 0, H - 1) * W + x) * 3 + c]; }
+  }
+  return out;
+}
+function heatColor(v) { v = cl(v, 0, 1); return [Math.round(255 * cl(1.5 - Math.abs(4 * v - 3), 0, 1)), Math.round(255 * cl(1.5 - Math.abs(4 * v - 2), 0, 1)), Math.round(255 * cl(1.5 - Math.abs(4 * v - 1), 0, 1))]; }
+function writeHeatmap(path, heat) {
+  const mx = Math.max(1e-9, ...heat), S = 32, w = GX * S, h = GY * S, buf = Buffer.allocUnsafe(w * h * 3);
+  for (let ty = 0; ty < GY; ty++) for (let tx = 0; tx < GX; tx++) {
+    const [r, g, b] = heatColor(heat[ty * GX + tx] / mx);
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) { const o = ((ty * S + y) * w + tx * S + x) * 3; buf[o] = r; buf[o + 1] = g; buf[o + 2] = b; }
+  }
+  writePng(path, buf, w, h);
+}
+async function cmdDiag2() {
+  mkdirSync(WORK, { recursive: true });
+  const require = createRequire('C:/Foo/raw-converter-wasm/package.json'), sharp = require('sharp');
+  const real = [];
+  for (let i = 1; i <= N; i++) real.push(await sharp(join(OUT_ROOT, 'real_video_ghana', `rv_${String(i).padStart(3, '0')}.png`)).removeAlpha().raw().toBuffer());
+  const seqs = [{ name: 'real_dashcam', frames: real }, { name: 'syn_static', frames: buildSequence('static') }, { name: 'syn_parallax', frames: buildSequence('parallax') }];
+  const SAMPLE = new Set([6, 12, 18, 24, 30, 36, 42]);
+  const out = {};
+  for (const { name, frames } of seqs) {
+    console.log(`[diag2] ${name}…`);
+    const bg = new Float64Array(W * H * 3); let bgN = 0;
+    const a = { full: 0, low: 0, ac: 0, ref2: 0, refBg: 0, nz: 0, nzT: 0, heat: new Float64Array(GX * GY), ns: 0 };
+    for (let i = 0; i < N; i++) {
+      if (SAMPLE.has(i) && i >= 2) {
+        const cur = frames[i], prev = frames[i - 1], prev2 = frames[i - 2];
+        const res = resSigned(cur, prev);
+        for (let k = 0; k < res.length; k++) if (res[k] >= -1 && res[k] <= 1) a.nz++; a.nzT += res.length;
+        const low = boxBlur3(res, 4), lowI = new Int16Array(res.length), acI = new Int16Array(res.length);
+        for (let k = 0; k < res.length; k++) { const l = Math.round(low[k]); lowI[k] = l; acI[k] = res[k] - l; }
+        a.full += encode(ppm16Signed(res), `g_f_${name}_${i}`).bytes;
+        a.low += encode(ppm16Signed(lowI), `g_l_${name}_${i}`).bytes;
+        a.ac += encode(ppm16Signed(acI), `g_a_${name}_${i}`).bytes;
+        const r2 = new Int16Array(res.length), rb = new Int16Array(res.length);
+        for (let k = 0; k < res.length; k++) { r2[k] = cur[k] - Math.round((prev[k] + prev2[k]) / 2); rb[k] = bgN ? cur[k] - Math.round(bg[k] / bgN) : res[k]; }
+        a.ref2 += encode(ppm16Signed(r2), `g_2_${name}_${i}`).bytes;
+        a.refBg += encode(ppm16Signed(rb), `g_b_${name}_${i}`).bytes;
+        for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const o = (y * W + x) * 3, t = Math.floor(y / TILE) * GX + Math.floor(x / TILE); a.heat[t] += Math.abs(res[o]) + Math.abs(res[o + 1]) + Math.abs(res[o + 2]); }
+        a.ns++;
+      }
+      const cur = frames[i]; for (let k = 0; k < bg.length; k++) bg[k] += cur[k]; bgN++;
+    }
+    // concentration: fraction of residual energy in the top 10% of tiles
+    const sorted = [...a.heat].sort((x, y) => y - x), tot = sorted.reduce((p, q) => p + q, 0) || 1;
+    const top = sorted.slice(0, Math.max(1, Math.round(0.1 * sorted.length))).reduce((p, q) => p + q, 0);
+    writeHeatmap(join(__dir, `heatmap-${name}.png`), a.heat);
+    out[name] = { noisePct: 100 * a.nz / a.nzT, lowShare: 100 * a.low / (a.low + a.ac), acShare: 100 * a.ac / (a.low + a.ac), full: a.full, ref2: a.ref2, refBg: a.refBg, top10pctEnergy: 100 * top / tot };
+    const r = out[name], best = Math.min(r.full, r.ref2, r.refBg), nm = best === r.full ? 'prev' : best === r.ref2 ? '2-avg' : 'bg-mean';
+    console.log(`  noise |Δ|≤1: ${r.noisePct.toFixed(1)}%   DC/AC energy: low ${r.lowShare.toFixed(0)}% / high ${r.acShare.toFixed(0)}%   top-10%-tiles hold ${r.top10pctEnergy.toFixed(0)}% of residual`);
+    console.log(`  reference: prev ${kb(r.full)}KB | 2-avg ${kb(r.ref2)}KB | bg-mean ${kb(r.refBg)}KB  -> best=${nm} (${((1 - best / r.full) * 100).toFixed(1)}% vs prev)   heatmap-${name}.png`);
+  }
+  writeFileSync(join(__dir, 'results-diag2.json'), JSON.stringify(out, null, 2));
+  console.log('[diag2] wrote results-diag2.json + heatmaps');
+}
+
 const cmd = process.argv[2] || 'all';
 if (cmd === 'gen' || cmd === 'all') await cmdGen();
 if (cmd === 'measure' || cmd === 'all') cmdMeasure();
 if (cmd === 'video') await cmdVideo();
 if (cmd === 'videoblock') await cmdVideoBlock();
 if (cmd === 'diag') await cmdDiag();
+if (cmd === 'diag2') await cmdDiag2();

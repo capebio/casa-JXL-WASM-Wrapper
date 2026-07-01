@@ -313,11 +313,36 @@ true *lossless* the noise is signal and must be kept (the grain lever applies to
 distribution tier); block-skip and chroma levers apply at every tier. This "use the video to improve the
 codec" win stands **independent of any codec race**.
 
+**Deepened analysis** (`node probe.mjs diag2`, `results-diag2.json`, `heatmap-<seq>.png`) across real dashcam
++ synthetic nature + synthetic train:
+
+| sequence | noise \|Δ\|≤1 | residual energy low/high-freq | top-10% tiles hold | best reference |
+|---|---|---|---|---|
+| real dashcam | 78.8% | 25% / **75%** | 43% | **prev** (2-avg worse, bg-mean +76% worse) |
+| synth nature | 99.8% | 20% / 80% | **63%** | prev |
+| synth train (parallax) | 81.1% | 32% / 68% | 26% | prev |
+
+Three further decisions confirmed:
+- **Single previous frame is the best reference on every content type.** 2-frame-average and running-
+  background references were *worse everywhere* (they blur moving content; the static synthetic gains nothing
+  because `prev` already predicts a static background perfectly). → **single-reference prediction is
+  sufficient; multi-reference/background modelling is not a lever here** (would help only a locked-off static
+  camera, and even then marginally). Simplifies the codec.
+- **Residual energy is high-frequency dominated (68–80%).** Bits live in noise, texture and edges, not
+  smooth structure → global illumination/DC prediction has little to gain; the two real levers remain the
+  **noise model** (high-freq noise) and **motion** (edges).
+- **Bit-cost concentration is content-dependent** (heatmaps confirm: the dashcam map is hot on the moving
+  exterior, cold on the static interior/overlay). Localized-motion content (nature 63%, dashcam 43% of energy
+  in 10% of tiles) makes **ROI / region-adaptive quant** a real lever; distributed-motion content (parallax
+  26%) makes **motion compensation** the lever instead. → the codec should carry *both* and pick per content
+  — reinforcing the pluggable/adaptive thesis.
+
 **Probe caveats:** lossless residuals isolate information content but a shipping codec would use lossy
 residuals + in-loop reconstruct (§3.2); byte-offset residual images are a compressibility proxy, not the
-final residual transform; the HEVC bitrate figures are a *wrong-regime* comparison (see above), retained
-only to illustrate JXL's *distribution* weakness — not as a verdict. Reproduce:
-`node probe.mjs {gen,measure,video,videoblock,diag}`.
+final residual transform; separate-plane and DC/AC encodes double-count coding overhead so shares are
+indicative of *energy distribution*, not exact bit allocation; the HEVC bitrate figures are a *wrong-regime*
+comparison (see above), retained only to illustrate JXL's *distribution* weakness — not as a verdict.
+Reproduce: `node probe.mjs {gen,measure,video,videoblock,diag,diag2}`.
 
 ---
 
@@ -347,8 +372,11 @@ only to illustrate JXL's *distribution* weakness — not as a verdict. Reproduce
 6. **Parallel track — diagnostic-driven codec levers ("improve the codec" wins).** Independent of phase order
    and of any codec race, land the bit-sink levers the diagnostic ranked (§7): **(a) temporal noise/grain
    model** (~18–48% of delta bits on real footage; near-lossless/distribution tier only), **(b) static
-   block-skip flag** (~14%; all tiers), **(c) temporal chroma coding** (targets the 22% chroma share). Each
-   is a targeted pipeline addition, flipflop/A-B measurable with this harness.
+   block-skip flag** (~14%; all tiers), **(c) temporal chroma coding** (22% chroma share), **(d) ROI /
+   region-adaptive quant** (localized-motion content packs 43–63% of residual energy into 10% of tiles). The
+   deepened diagnostic also *simplifies* the design: **single-reference (previous frame) is sufficient — skip
+   multi-reference/background modelling.** Each lever is a targeted pipeline addition, flipflop/A-B measurable
+   with this harness.
 7. **(Deferred — unproven here) C.** General block ME/MC. Per-block MC was *worse* than plain delta on the
    real clip (§7), but that was a noise-dominated, small-motion, *lossless* case — build only if a clean,
    structured, high-motion use-case appears (synthetic-parallax dynamics, not dashcam).
