@@ -60,7 +60,7 @@ fn measure(w: usize, h: usize, params: &pipeline::PipelineParams) -> (usize, usi
     PEAK.store(base, Ordering::Relaxed);
     {
         let mut out = Vec::new();
-        stream_export::export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 1.0, 3, &mut out).unwrap();
+        stream_export::export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 0.0, 1.0, 3, &mut out).unwrap();
         std::hint::black_box(&out);
     }
     let stream = PEAK.load(Ordering::Relaxed) - base;
