@@ -451,6 +451,24 @@ Findings:
    real clip (§7), but that was a noise-dominated, small-motion, *lossless* case — build only if a clean,
    structured, high-motion use-case appears (synthetic-parallax dynamics, not dashcam).
 
+### Lossy streaming tier — investigated (negative result)
+
+Prototyped lossy delta by coding the **residual image** through JXL's lossy (VarDCT) path with in-loop
+reconstruct. It **does not work** and was removed:
+- The **+32768 residual offset wastes lossy precision** and JXL's perceptual model *smooths* the residual, so
+  per-frame error is large (~20 mean-abs/channel even at distance 1.0, a DC bias a finer distance does not fix).
+- Worse, **error accumulates across the GOP** (frame 1 ≈ 21 → frame 4 ≈ 44): the residual carries the prior
+  frame's error (a noise-like pattern) which the perceptual codec cannot faithfully re-code, so the in-loop
+  correction is smoothed away.
+
+**The proper lossy inter-frame path is libjxl's native reference-frame ADD** (`save_as_reference` +
+`JXL_BLEND_ADD` — already present in `bridge.cpp`'s animation encoder), where the perceptual model sees the
+*final* frame, not a residual. That is a **C++ bridge integration** and the real streaming-tier next step —
+it also unblocks the temporal-noise/grain lever (which is lossy-tier only). The Rust residual-image path is
+excellent for **lossless** delta (byte-exact, drift-free by construction) but cannot do quality-controlled
+lossy. (The clamp added to the reconstruction is a harmless no-op for lossless and future-proofs the native
+lossy path.)
+
 ### Open questions
 - Real target resolutions/fps per ShareNat device tier? (sets the WASM feasibility line)
 - Live vs on-demand: is any *encode* real-time, or always offline? (affects latency/GOP design)

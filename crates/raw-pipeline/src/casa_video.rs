@@ -246,6 +246,17 @@ pub fn encode_casv_delta_rgb8(
     Ok(out)
 }
 
+// NOTE: a lossy delta tier was prototyped here (lossy full-residual P-frames with
+// in-loop reconstruct) and removed as a **negative result**: feeding a residual
+// image through JXL's perceptual (VarDCT) lossy path does not work — the +32768
+// offset wastes lossy precision and the perceptual model smooths the residual, so
+// error is both large (~20 mean/channel at distance 1.0) AND *accumulates* across
+// the GOP (the residual carries the prior frame's error, which the codec cannot
+// faithfully re-code). The proper lossy inter-frame path is libjxl's **native
+// reference-frame ADD** (`save_as_reference` + `JXL_BLEND_ADD`, exposed in
+// `bridge.cpp`), where the perceptual model sees the final frame. That is the real
+// streaming-tier next step (a C++ bridge integration), not a Rust residual image.
+
 /// Borrow the JXL codestream bytes for frame `index`, validated against the
 /// index table and file bounds. `None` if `index` is out of range or the index
 /// entry points outside the file.
@@ -275,10 +286,12 @@ pub fn casv_frame_info(data: &[u8], index: usize) -> Option<(bool, &[u8])> {
     Some((is_p, &data[offset..end]))
 }
 
-/// In-place `base[i] += residual16[i] - 32768` (exact for in-range u8).
+/// In-place `base[i] += residual16[i] - 32768`, clamped to `[0,255]`. The clamp
+/// is a no-op for lossless residuals (result already in range) and keeps lossy
+/// residuals valid.
 fn add_residual16_into(base: &mut [u8], resid: &[u16]) {
     for (b, &r) in base.iter_mut().zip(resid) {
-        *b = (*b as i32 + r as i32 - 32768) as u8;
+        *b = (*b as i32 + r as i32 - 32768).clamp(0, 255) as u8;
     }
 }
 
@@ -607,7 +620,7 @@ fn apply_pframe(
                     let asrc = ((slot * ts + row) * ts + col) * 3;
                     let fdst = ((ty * ts + row) * w + tx * ts + col) * 3;
                     for c in 0..3 {
-                        prev[fdst + c] = (prev[fdst + c] as i32 + atlas[asrc + c] as i32 - 32768) as u8;
+                        prev[fdst + c] = (prev[fdst + c] as i32 + atlas[asrc + c] as i32 - 32768).clamp(0, 255) as u8;
                     }
                 }
             }
@@ -639,7 +652,7 @@ fn apply_pframe(
         let dst = ((y as usize + row) * w + x as usize) * 3;
         let srow = row * bw as usize * 3;
         for c in 0..(bw as usize * 3) {
-            prev[dst + c] = (prev[dst + c] as i32 + resid[srow + c] as i32 - 32768) as u8;
+            prev[dst + c] = (prev[dst + c] as i32 + resid[srow + c] as i32 - 32768).clamp(0, 255) as u8;
         }
     }
     Some(())
