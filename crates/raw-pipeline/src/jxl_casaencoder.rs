@@ -815,6 +815,21 @@ mod tests {
         (0..n).map(|i| (i % 251) as u8).collect()
     }
 
+    /// Deterministic pseudo-random bytes. Incompressible enough that the lossy
+    /// encoded size stays large, so a cold reserve hint is guaranteed to
+    /// underflow the real output and force the drain grow path.
+    fn xorshift_u8(len: usize) -> Vec<u8> {
+        let mut state = 0xA511_E9B3u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
     #[test]
     fn output_hint_scales_with_total_input_footprint() {
         // Lossy hint scales with submitted bytes, not pixel count: doubling the
@@ -950,6 +965,68 @@ mod tests {
         };
         let mut enc = Encoder::new(EncodeOptions::lossless()).unwrap();
         assert!(matches!(enc.encode(&frame), Err(EncodeError::Channels(_))));
+    }
+
+    #[test]
+    fn drain_grow_preserves_prefix_and_all_emitted_bytes() {
+        // Coverage for the multi-drain grow path (JXL_ENC_NEED_MORE_OUTPUT). The
+        // tuned reserve hint means production almost never grows, so this is the
+        // only exercise of that branch. Force several grows with a cold, floored
+        // hint on incompressible input and assert the grow path stays correct:
+        // the caller's prefix survives and every emitted byte matches a clean
+        // single-pass reference exactly. Guards the drain loop's pos/base
+        // accounting and buffer growth against future regressions (e.g. a change
+        // that reuses/reallocates the output such that emitted bytes are lost).
+        //
+        // NB: the current loop is already correct — `Vec` reallocates by capacity
+        // and `realloc` preserves `min(old_cap, new)` bytes, so the emitted tail
+        // above `len` survives a relocation. This test locks that in.
+        const BIG_W: u32 = 512;
+        const BIG_H: u32 = 512;
+
+        let src = xorshift_u8((BIG_W * BIG_H * 3) as usize);
+        let frame = Frame::rgb(&src, BIG_W, BIG_H);
+        // distance > 0 keeps the encode lossy (so the ratio-scaled hint/grow path
+        // runs) and stays large on incompressible noise. distance 0.0 would
+        // demand uses_original_profile and libjxl rejects it.
+        let opts = EncodeOptions::distance(0.3);
+
+        // Reference: an oversized ratio makes the hint far exceed the real output,
+        // so the reference never grows and is produced by a single clean drain.
+        let mut reference = Encoder::new(opts.clone()).unwrap();
+        reference.output_ratio_ema.set(8.0);
+        let expected = reference.encode(&frame).unwrap();
+
+        // encode_into appends: a non-empty caller prefix must survive byte-exact.
+        let prefix = [0xA5u8; 17];
+        let mut out = prefix.to_vec();
+        out.reserve(OUTPUT_HINT_MIN);
+        let initial_capacity = out.capacity();
+
+        // Fragment the heap so the grow reallocation actually relocates the
+        // buffer — the exact condition under which the pre-fix bug loses bytes.
+        let _blocker = vec![0u8; OUTPUT_HINT_MIN];
+
+        assert!(
+            prefix.len() + expected.len() > initial_capacity,
+            "corpus must exceed the initial reservation to force a grow \
+             (expected {} + prefix {} vs cap {})",
+            expected.len(),
+            prefix.len(),
+            initial_capacity,
+        );
+
+        let mut enc = Encoder::new(opts).unwrap();
+        // Near-zero ratio → hint clamps to the floor → many NEED_MORE_OUTPUT grows.
+        enc.output_ratio_ema.set(0.0);
+        enc.encode_into(&frame, &mut out).unwrap();
+
+        assert_eq!(&out[..prefix.len()], &prefix[..], "caller prefix clobbered");
+        assert_eq!(
+            &out[prefix.len()..],
+            expected.as_slice(),
+            "drain grow path dropped or corrupted emitted output bytes",
+        );
     }
 
     #[test]
