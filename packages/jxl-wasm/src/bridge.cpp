@@ -757,6 +757,160 @@ static JxlWasmBuffer* EncodeRgba(const uint8_t* pixels, uint32_t width, uint32_t
   return EncodeRgbaWithMetadata(pixels, width, height, distance, effort, fmt, has_alpha, progressive_dc, progressive_ac, qprogressive_ac, buffering, group_order, modular, brotli_effort, decoding_speed, photon_noise_iso, resampling, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, epf, gaborish, dots, color_transform, orientation);
 }
 
+// === P2a: streaming (chunked-frame) RGB8 encode ==============================================
+// Mirror of the proven native encode_chunked (crates/raw-pipeline/src/jxl_casaencoder.rs):
+// JxlEncoderSetOutputProcessor + JxlChunkedFrameInputSource pull + buffering=2, driven by
+// JxlEncoderAddChunkedFrame(is_last=TRUE) — no CloseInput/ProcessOutput. Input is a whole
+// 3-channel RGB8 buffer for now (P2a isolates the streaming-encode wiring from row production);
+// libjxl still pulls it in <=2048-row super-tiles, so this is byte-identical to the whole-frame
+// encoder while exercising the streaming path that P2b/P2c will feed band-by-band. distance <= 0
+// selects (modular) lossless.
+namespace {
+
+struct ChunkedRgbSrc {
+  const uint8_t* data;
+  uint32_t width;
+  uint32_t num_channels;  // 3 (RGB8)
+};
+
+struct ChunkedOut {
+  uint8_t* buf;
+  size_t cap;
+  size_t pos;         // current write cursor
+  size_t high;        // high-water mark of bytes written
+  size_t final_pos;   // set by set_finalized_position
+  bool has_final;
+  bool oom;
+};
+
+void ChunkedColorPf(void* op, JxlPixelFormat* pf) {
+  auto* s = static_cast<ChunkedRgbSrc*>(op);
+  pf->num_channels = s->num_channels;
+  pf->data_type = JXL_TYPE_UINT8;
+  pf->endianness = JXL_NATIVE_ENDIAN;
+  pf->align = 0;
+}
+
+const void* ChunkedColorAt(void* op, size_t xpos, size_t ypos,
+                           size_t /*xsize*/, size_t /*ysize*/, size_t* row_offset) {
+  auto* s = static_cast<ChunkedRgbSrc*>(op);
+  const size_t stride = static_cast<size_t>(s->width) * s->num_channels;
+  *row_offset = stride;
+  return s->data + ypos * stride + xpos * s->num_channels;
+}
+
+void ChunkedSrcRelease(void* /*op*/, const void* /*buf*/) {}
+
+void* ChunkedOutGet(void* op, size_t* size) {
+  auto* o = static_cast<ChunkedOut*>(op);
+  const size_t want = std::max<size_t>(*size, static_cast<size_t>(1) << 16);
+  const size_t need = o->pos + want;
+  if (o->cap < need) {
+    size_t newcap = o->cap ? o->cap : (static_cast<size_t>(1) << 16);
+    while (newcap < need) newcap *= 2u;
+    uint8_t* grown = static_cast<uint8_t*>(realloc(o->buf, newcap));
+    if (grown == nullptr) { o->oom = true; *size = 0; return nullptr; }
+    o->buf = grown;
+    o->cap = newcap;
+  }
+  *size = o->cap - o->pos;
+  return o->buf + o->pos;
+}
+
+void ChunkedOutRelease(void* op, size_t written_bytes) {
+  auto* o = static_cast<ChunkedOut*>(op);
+  o->pos += written_bytes;
+  if (o->pos > o->high) o->high = o->pos;
+}
+
+void ChunkedOutSeek(void* op, uint64_t position) {
+  static_cast<ChunkedOut*>(op)->pos = static_cast<size_t>(position);
+}
+
+void ChunkedOutFinal(void* op, uint64_t finalized_position) {
+  auto* o = static_cast<ChunkedOut*>(op);
+  o->final_pos = static_cast<size_t>(finalized_position);
+  o->has_final = true;
+}
+
+}  // namespace
+
+static JxlWasmBuffer* EncodeRgbChunked(
+    const uint8_t* pixels, uint32_t width, uint32_t height, float distance, uint32_t effort) {
+  if (pixels == nullptr || width == 0 || height == 0) return MakeError(20);
+
+  JxlEncoder* enc = JxlEncoderCreate(nullptr);
+  if (enc == nullptr) return MakeError(21);
+  JXL_SETUP_ENC_RUNNER(enc, MakeError(57));
+
+  JxlBasicInfo info;
+  JxlEncoderInitBasicInfo(&info);
+  info.xsize = width;
+  info.ysize = height;
+  info.bits_per_sample = 8;
+  info.exponent_bits_per_sample = 0;
+  info.num_color_channels = 3;
+  info.num_extra_channels = 0;
+  const bool lossless = (distance <= 0.0f);
+  info.uses_original_profile = lossless ? JXL_TRUE : JXL_FALSE;
+  if (JxlEncoderSetBasicInfo(enc, &info) != JXL_ENC_SUCCESS) { JxlEncoderDestroy(enc); return MakeError(22); }
+
+  JxlColorEncoding color;
+  JxlColorEncodingSetToSRGB(&color, JXL_FALSE);
+  if (JxlEncoderSetColorEncoding(enc, &color) != JXL_ENC_SUCCESS) { JxlEncoderDestroy(enc); return MakeError(23); }
+
+  JxlEncoderFrameSettings* frame = JxlEncoderFrameSettingsCreate(enc, nullptr);
+  JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_EFFORT, static_cast<int64_t>(effort));
+  // Streaming input buffering (present since libjxl 0.10; the shipped bridge builds 0.11.2 —
+  // build-manifest.json). OUTPUT_MODE / USE_FULL_IMAGE_HEURISTICS (0.12) are deliberately NOT set
+  // here: they are absent in 0.11.2 and the native proof showed they don't change output bytes
+  // (chunked == whole). Add them in P2b when the bridge moves to the libjxl-012 source.
+  JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_BUFFERING, 2);
+  if (lossless) JxlEncoderSetFrameLossless(frame, JXL_TRUE);
+  else JxlEncoderSetFrameDistance(frame, distance);
+
+  ChunkedOut ostate;
+  ostate.buf = nullptr; ostate.cap = 0; ostate.pos = 0; ostate.high = 0;
+  ostate.final_pos = 0; ostate.has_final = false; ostate.oom = false;
+  JxlEncoderOutputProcessor out_proc;
+  out_proc.opaque = &ostate;
+  out_proc.get_buffer = ChunkedOutGet;
+  out_proc.release_buffer = ChunkedOutRelease;
+  out_proc.seek = ChunkedOutSeek;
+  out_proc.set_finalized_position = ChunkedOutFinal;
+  if (JxlEncoderSetOutputProcessor(enc, out_proc) != JXL_ENC_SUCCESS) {
+    free(ostate.buf); JxlEncoderDestroy(enc); return MakeError(240);
+  }
+
+  ChunkedRgbSrc srcstate;
+  srcstate.data = pixels; srcstate.width = width; srcstate.num_channels = 3;
+  JxlChunkedFrameInputSource source;
+  source.opaque = &srcstate;
+  source.get_color_channels_pixel_format = ChunkedColorPf;
+  source.get_color_channel_data_at = ChunkedColorAt;
+  source.get_extra_channel_pixel_format = nullptr;
+  source.get_extra_channel_data_at = nullptr;
+  source.release_buffer = ChunkedSrcRelease;
+
+  // Output processor + is_last=TRUE: AddChunkedFrame drives the whole encode and emits via the
+  // processor (no CloseInput/ProcessOutput). ostate/srcstate stay alive across this call.
+  const JxlEncoderStatus st = JxlEncoderAddChunkedFrame(frame, JXL_TRUE, source);
+  JxlEncoderDestroy(enc);
+  if (ostate.oom) { free(ostate.buf); return MakeError(241); }
+  if (st != JXL_ENC_SUCCESS) { free(ostate.buf); return MakeError(static_cast<int>(st)); }
+
+  const size_t final_size = ostate.has_final ? ostate.final_pos : std::max(ostate.high, ostate.pos);
+  JxlWasmBuffer* result = static_cast<JxlWasmBuffer*>(calloc(1, sizeof(JxlWasmBuffer)));
+  if (result == nullptr) { free(ostate.buf); return MakeError(26); }
+  result->data = ostate.buf;
+  result->size = final_size;
+  result->width = width;
+  result->height = height;
+  result->bits_per_sample = 8;
+  result->has_alpha = 0;
+  return result;
+}
+
 static JxlWasmBuffer* EncodeRgbaWithGainMap(
     const uint8_t* pixels, uint32_t width, uint32_t height,
     float distance, uint32_t effort, uint32_t fmt, uint32_t has_alpha,
@@ -2497,6 +2651,13 @@ JxlWasmBuffer* jxl_wasm_decode_rgbaf32(const uint8_t* input, size_t input_size, 
 JxlWasmBuffer* jxl_wasm_encode_rgba8(const uint8_t* pixels, uint32_t width, uint32_t height, float distance, uint32_t effort, uint32_t has_alpha,
     uint32_t progressive_dc, uint32_t progressive_ac, uint32_t qprogressive_ac, uint32_t buffering, uint32_t group_order, uint32_t resampling) {
   return EncodeRgba(pixels, width, height, distance, effort, 0, has_alpha, progressive_dc, progressive_ac, qprogressive_ac, buffering, group_order, -1, -1, -1, 0, resampling);
+}
+// P2a: streaming chunked RGB8 encode (3-channel input, w*h*3 bytes). Byte-identical to the
+// whole-frame encoder; exercises the JxlEncoderAddChunkedFrame path (O(super-tile) encoder peak).
+// distance <= 0 => lossless. This is the browser primitive P2b/P2c feed band-by-band.
+JxlWasmBuffer* jxl_wasm_encode_rgb8_chunked(const uint8_t* pixels, uint32_t width, uint32_t height,
+    float distance, uint32_t effort) {
+  return EncodeRgbChunked(pixels, width, height, distance, effort);
 }
 JxlWasmBuffer* jxl_wasm_encode_rgba16(const uint8_t* pixels, uint32_t width, uint32_t height, float distance, uint32_t effort, uint32_t has_alpha,
     uint32_t progressive_dc, uint32_t progressive_ac, uint32_t qprogressive_ac, uint32_t buffering, uint32_t group_order, uint32_t resampling) {
