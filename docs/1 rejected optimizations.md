@@ -1281,3 +1281,46 @@ the gathers entirely and wins decisively, so gather16 was dropped (code removed;
 kept here so the unroll is not re-attempted). The scalar-LUT kernel
 (`pixels_to_xyb_avx2_scalar_lut`) is now the wired AVX2 path; the gather baseline is
 retained only as the flip's A-arm + the bit-exact reference oracle.
+
+---
+
+## dec_group decode subsystem (2026-07-01, branch perf/dec-group-border-atomic-jul01-b3k9)
+
+Context: reviewing `dec_group.cc/.h` + `dec_group_border.cc/.h` for a JXL-as-video
+throughput pass. LANDED: `dec_group_border.cc` corner-atomic coalescing (byte-exact,
+−44% atomic RMW ops, harness `tools/dec_group_border_ab.cc`). The proposals below,
+mostly from the accompanying ChatGPT analysis, were **rejected**:
+
+- **Rebuild the AC-occupancy sidecar from entropy `nzeros` instead of scanning the
+  decoded coefficients.** The analysis's own headline ("emit the AC mask at
+  `DecodeACVarBlock` time") is **wrong for the mode where the sidecar exists**:
+  `ac_occupancy` is populated only in *accumulate* mode, where `DecodeACVarBlock` writes
+  coefficients with `+=` across passes. A single pass's `nzeros` is therefore not the final
+  occupancy (a later pass can cancel a coefficient back to zero), and the mask must be the
+  *accumulated* result — which is exactly what the current post-`LoadBlock` scan of the
+  real `qblock` reads. Deriving the mask from per-pass `nzeros` would be *conservative*
+  (over-flags non-zero AC), changing sidecar semantics for no benefit. Rejected; keep the
+  coefficient scan.
+
+- **Consume `ac_occupancy` in `DecodeGroupFromStoredCoefficients` as it exists today.**
+  Tempting (it would replace the redraw's `scan_ac_zero` loops with a mask lookup, and it
+  is byte-exact *where the mask is populated*), but **unsafe as-is**: `DecodeGroupNoDraw`
+  loads coefficients on hidden passes **without** populating the sidecar. A redraw that
+  follows a no-draw pass would read a zero/stale mask, conclude "DC-only", and DC-fill a
+  block that actually has accumulated AC → wrong pixels. Consuming the mask is only safe
+  after `DecodeGroupNoDraw` also populates it (moved to Questions_deferred.md, not landed).
+
+- **Supergroup/clustered scheduling and multi-frame pipelining as the default decode
+  path.** Proposed to cut border-atomic contention by giving one worker a 2×2 group cluster
+  and interleaving frame N render with frame N+1 decode. Rejected as a *default*: both
+  trade load balance and cache locality for reduced handoffs and can regress on large
+  frames or skewed group cost; per CLAUDE.md "adaptive/heuristic changes require benchmark
+  data — do not add tunables without evidence." Legitimate only as an *adaptive* mode with
+  a multi-frame benchmark behind it (recorded as deferred, not rejected outright as an
+  idea — rejected only as an unconditional change).
+
+- **Padding the border counter array to cache lines to kill false sharing.** Speculative:
+  the analysis itself says "test three layouts, use profiling not intuition." Packed
+  8-corner words give better locality on small CPUs; padding may help only at high core
+  counts. No evidence either way here, and the atomic *count* (not layout) was the
+  addressable cost — which the landed coalescing already halves. Not changed.
