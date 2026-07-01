@@ -12,7 +12,10 @@
 
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn main() {
-    use raw_pipeline::casa_video::{decode_casv_frame_rgb8, encode_casv_rgb8};
+    use raw_pipeline::casa_video::{
+        decode_casv_all_rgb8, encode_casv_delta_bbox_rgb8, encode_casv_delta_rgb8,
+        encode_casv_delta_tiled_rgb8, encode_casv_rgb8,
+    };
     use raw_pipeline::jxl_casaencoder::EncodeOptions;
     use std::time::Instant;
 
@@ -41,45 +44,53 @@ fn main() {
     let mp = (w as f64 * h as f64) / 1e6;
 
     println!(
-        "CasaVideo bench: {n} frames @ {w}x{h} ({mp:.2} MP), single-thread, all-intra (arch A)"
+        "CasaVideo encoder comparison: {n} frames @ {w}x{h} ({mp:.2} MP), single-thread, lossless e3"
     );
-    println!("24fps budget = 41.7 ms/frame; decode = real-time constraint\n");
+    println!("(decode = sequential playback via decode_casv_all_rgb8; 24fps budget 41.7 ms/frame)\n");
     println!(
-        "{:<16} {:>9} {:>10} {:>10} {:>9} {:>9}  {}",
-        "config", "size MB", "enc ms/f", "dec ms/f", "enc fps", "dec fps", "24fps decode?"
+        "{:<16} {:>9} {:>10} {:>10} {:>10} {:>9}  {}",
+        "encoder", "size MB", "vs intra", "enc ms/f", "dec ms/f", "dec fps", "24fps?"
     );
 
-    let configs: Vec<(&str, EncodeOptions)> = vec![
-        ("lossless e1", EncodeOptions::lossless().with_effort(1)),
-        ("lossless e3", EncodeOptions::lossless().with_effort(3)),
-        ("lossless e7", EncodeOptions::lossless().with_effort(7)),
-        ("lossy d1 e3", EncodeOptions::distance(1.0).with_effort(3)),
-        ("lossy d1 e7", EncodeOptions::distance(1.0).with_effort(7)),
-    ];
+    let gop = 24u32;
+    let tile = 32u32;
+    let o = || EncodeOptions::lossless().with_effort(3);
+    let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.0 / n as f64;
 
-    for (label, opts) in configs {
-        let t0 = Instant::now();
-        let casv = encode_casv_rgb8(&refs, w, h, 24, 1, opts).expect("encode");
-        let enc = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
+    let t = Instant::now();
+    let intra = encode_casv_rgb8(&refs, w, h, 24, 1, o()).expect("intra");
+    let e_intra = ms(t);
+    let t = Instant::now();
+    let delta = encode_casv_delta_rgb8(&refs, w, h, 24, 1, gop, o()).expect("delta");
+    let e_delta = ms(t);
+    let t = Instant::now();
+    let bbox = encode_casv_delta_bbox_rgb8(&refs, w, h, 24, 1, gop, o()).expect("bbox");
+    let e_bbox = ms(t);
+    let t = Instant::now();
+    let tiled = encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, gop, tile, o()).expect("tile");
+    let e_tile = ms(t);
 
-        let t1 = Instant::now();
-        for i in 0..n {
-            let _ = decode_casv_frame_rgb8(&casv, i).expect("decode");
-        }
-        let dec = t1.elapsed().as_secs_f64() * 1000.0 / n as f64;
-
-        let mb = casv.len() as f64 / (1024.0 * 1024.0);
+    let intra_sz = intra.len() as f64;
+    let show = |label: String, casv: &[u8], enc: f64| {
+        let t = Instant::now();
+        let frames = decode_casv_all_rgb8(casv).expect("decode");
+        let dec = ms(t);
+        assert_eq!(frames.len(), n);
         println!(
-            "{:<16} {:>9.2} {:>10.1} {:>10.1} {:>9.1} {:>9.1}  {}",
+            "{:<16} {:>9.2} {:>+9.1}% {:>10.1} {:>10.1} {:>9.1}  {}",
             label,
-            mb,
+            casv.len() as f64 / 1048576.0,
+            (casv.len() as f64 / intra_sz - 1.0) * 100.0,
             enc,
             dec,
-            1000.0 / enc,
             1000.0 / dec,
             if dec <= 41.7 { "OK" } else { "OVER" }
         );
-    }
+    };
+    show("intra".into(), &intra, e_intra);
+    show(format!("delta g{gop}"), &delta, e_delta);
+    show(format!("bbox g{gop}"), &bbox, e_bbox);
+    show(format!("tile g{gop} t{tile}"), &tiled, e_tile);
 }
 
 #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]

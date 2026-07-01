@@ -361,6 +361,36 @@ Reproduce: `node probe.mjs {gen,measure,video,videoblock,diag,diag2}`.
 
 ---
 
+## 7b. Encoder comparison — real end-to-end (the four built stages)
+
+`examples/casv_bench.rs` encodes+decodes the four implemented stages (lossless e3, GOP=24, tile=32) on 48
+real frames; decode = sequential playback (`decode_casv_all_rgb8`), single-thread native.
+
+**Low-motion (seahorse-static, target-content proxy) — the thesis holds:**
+
+| stage | size MB | vs intra | enc ms/f | dec ms/f | dec fps |
+|---|---:|---:|---:|---:|---:|
+| intra | 16.71 | +0.0% | 143.4 | 102.4 | 9.8 |
+| delta g24 | 7.46 | −55.4% | 131.2 | 105.4 | 9.5 |
+| bbox g24 | 7.44 | −55.4% | 89.7 | 82.1 | 12.2 |
+| **tile g24 t32** | 7.78 | −53.4% | **72.8** | **66.1** | **15.1** |
+
+**Noisy general (Ghana dashcam):** intra 26.70 MB; delta/bbox/tile all **≈ +45% WORSE**.
+
+Two decisive findings:
+- **On low-motion (target) content the thesis holds end-to-end: −53–55% bytes AND faster** — tile-skip decode
+  15.1 fps vs intra 9.8 (≈1.5×), encode ≈2× faster (73 vs 143 ms/f). **Static-skip is a real *speed* lever,
+  proven on real frames — the direct answer to "too heavy at 24fps".** (All rows are over budget here only
+  because this is the heavy *lossless* tier; the relative speedups compound with the ~5× cheaper lossy tier.)
+- **On noisy content all delta forms are +45% *worse* than intra — a fixable residual-representation bug, not
+  a fundamental limit.** The v0 residual is **wrapping-8bit** (`cur.wrapping_sub(prev)`), chosen for
+  simplicity/byte-exactness, but it maps small negative diffs to large values (−1 → 255): a high-entropy
+  bimodal signal JXL compresses terribly on noise. The diagnostic's **16-bit-offset** residual (−1 → 32767,
+  tight/unimodal) got **−34%** on the *same* dashcam. → **Concrete improvement target: switch the delta
+  residual to 16-bit-offset (or a signed transform).** ~2× swing from representation alone.
+
+---
+
 ## 8. Hard problems, risks & mitigations; phased plan
 
 ### Risks
@@ -385,7 +415,10 @@ Reproduce: `node probe.mjs {gen,measure,video,videoblock,diag,diag2}`.
    disocclusion-intra + parallax-depth sidecar. Target: train survey. *Months.*
 5. **P4 — Streaming hardening.** Mux/seek/error-resilience/audio; WebCodecs-style player integration.
 6. **Parallel track — diagnostic-driven codec levers ("improve the codec" wins).** Independent of phase order
-   and of any codec race, land the bit-sink levers the diagnostic ranked (§7): **(a) temporal noise/grain
+   and of any codec race. **(0) FIRST — fix the delta residual representation** (wrapping-8bit → 16-bit-offset
+   or signed): §7b shows wrapping-8bit is +45% *worse* than intra on noisy content vs −34% for 16-bit-offset —
+   the biggest, cheapest correctness+compression fix, and it makes delta net-positive on more content. Then
+   land the bit-sink levers the diagnostic ranked (§7): **(a) temporal noise/grain
    model** (~18–48% of delta bits; distribution tier only) — **~80% already built**: JXL's noise-synthesis
    feature (`noise.h` `NoiseParams` 8-pt LUT; `enc_frame.cc:700` estimate/`--photon_noise_iso`/manual →
    `kNoise` flag; `dec_cache.cc:220` `GetAddNoiseStage` synthesises; verified live via `cjxl
