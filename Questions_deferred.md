@@ -1151,3 +1151,20 @@ Remaining deferred (with honest blockers):
 - **Wall-clock pan bench** — decode-COUNT reduction is proven by metrics; a wall-clock
   number is noise-dominated at test-tile scale and needs real-size fixtures + a native
   pan-loop (Tauri) to be meaningful.
+
+### UPDATE 2026-07-01c — decode_into error-path uninit exposure FIXED (same branch)
+
+The first-pass "set_len-before-fill restructure" deferral is resolved (minimal form).
+Proven real by a truncated-stream test: after `decode_into` errors post-buffer-bind, the
+caller's reused Vec was left with `len == elems` (12288) over bytes libjxl never wrote —
+an uninit read (benign only because samples are POD). Fix: `decode_into` clears `buf`
+(len→0, capacity kept) on any error, so the caller can never observe uninitialised
+samples. Kept the hot `run_full_into` loop untouched (its set_len feeds the partial/empty
+guards); `decode_into` is the ONLY caller with a caller-owned buffer (decode/decode_view/
+run_raw/time_* all use internal Vecs dropped on error), so the one-site fix is complete.
+New test `decode_into_error_clears_buffer` (RED 12288≠0 → GREEN). 218/218 crate (MSVC).
+
+The broader "defer set_len entirely in the loop" is NOT needed — that was the risky
+restructure; the exposure is fully closed at the wrapper. Remaining deferred unchanged:
+strip-staging (peak-RSS unmeasurable in unit test), extra-channel completeness contract
+(API decision), animation policy (doc-only), wall-clock pan bench (needs Tauri pan-loop).
