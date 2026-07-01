@@ -24,10 +24,11 @@
 
 import { deflateSync, crc32 } from 'node:zlib';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, rmSync, statSync, existsSync } from 'node:fs';
+import { mkdirSync, writeFileSync, rmSync, statSync, existsSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const CJXL = String.raw`C:\Foo\bld-libjxl-static\tools\cjxl.exe`;
@@ -379,6 +380,203 @@ function printSummary(res) {
   }
 }
 
+// ---- real-video extension -----------------------------------------------------
+const HEVC_KBPS = 8388, VID_FPS = 25;          // source: ffprobe of the Ghana clip @1080p25
+const HEVC_720P_EQUIV = HEVC_KBPS * (1280 * 720) / (1920 * 1080); // ~3728 kb/s
+
+function ppm8FromRgb8(rgb8) {                   // real 8-bit photo for lossy intra encode
+  return Buffer.concat([Buffer.from(`P6\n${W} ${H}\n255\n`, 'ascii'), rgb8]);
+}
+// estimate best global integer (dx,dy) so cur[x,y] ~ prev[x+dx,y+dy] (luma SAD, subsampled)
+function estGlobalShift(cur, prev, sr = 20, step = 8) {
+  let best = { dx: 0, dy: 0, sad: Infinity };
+  for (let dy = -sr; dy <= sr; dy++)
+    for (let dx = -sr; dx <= sr; dx++) {
+      let sad = 0;
+      for (let y = sr; y < H - sr; y += step)
+        for (let x = sr; x < W - sr; x += step) {
+          const c = (y * W + x) * 3, p = ((y + dy) * W + (x + dx)) * 3;
+          const lc = cur[c] + 2 * cur[c + 1] + cur[c + 2];
+          const lp = prev[p] + 2 * prev[p + 1] + prev[p + 2];
+          sad += lc > lp ? lc - lp : lp - lc;
+        }
+      if (sad < best.sad) best = { dx, dy, sad };
+    }
+  return best;
+}
+function shift2D(prev, dx, dy) {                // shifted[x,y] = prev[x+dx,y+dy]; OOB -> 0
+  const out = Buffer.alloc(W * H * 3);
+  for (let y = 0; y < H; y++) {
+    const sy = y + dy; if (sy < 0 || sy >= H) continue;
+    for (let x = 0; x < W; x++) {
+      const sx = x + dx; if (sx < 0 || sx >= W) continue;
+      const so = (sy * W + sx) * 3, doo = (y * W + x) * 3;
+      out[doo] = prev[so]; out[doo + 1] = prev[so + 1]; out[doo + 2] = prev[so + 2];
+    }
+  }
+  return out;
+}
+function spawnBaselineMs() {                     // isolate process-spawn from real decode
+  const inp = join(WORK, 'tiny.ppm'), out = join(WORK, 'tiny.jxl');
+  writeFileSync(inp, Buffer.concat([Buffer.from('P6\n16 16\n255\n'), Buffer.alloc(16 * 16 * 3)]));
+  execFileSync(CJXL, [inp, out, '-e', '1', '-d', '0', '--quiet'], { stdio: 'ignore' });
+  let best = Infinity;
+  for (let k = 0; k < 9; k++) {
+    const t0 = process.hrtime.bigint();
+    execFileSync(DJXL, [out, join(WORK, 'tiny.dec.ppm'), '--quiet'], { stdio: 'ignore' });
+    best = Math.min(best, Number(process.hrtime.bigint() - t0) / 1e6);
+  }
+  return best;
+}
+const kbps = (bytes, n) => (bytes * 8 / 1000) * (VID_FPS / n);
+
+async function cmdVideo() {
+  mkdirSync(WORK, { recursive: true });
+  const dir = join(OUT_ROOT, 'real_video_ghana');
+  const require = createRequire('C:/Foo/raw-converter-wasm/package.json');
+  const sharp = require('sharp');
+  console.log('[video] loading 48 real frames (720p, HEVC-decoded)…');
+  const frames = [];
+  for (let i = 1; i <= N; i++)
+    frames.push(await sharp(join(dir, `rv_${String(i).padStart(3, '0')}.png`)).removeAlpha().raw().toBuffer());
+
+  const r = { intraLossless: 0, deltaNone: 0, deltaGmc: 0, intraLossy: {}, shifts: [], decode: {} };
+
+  // INTRA lossless (16-bit) — ratio denominator
+  const intraJxl = [];
+  for (let i = 0; i < N; i++) {
+    const e = encode(ppm16FromRgb8(frames[i]), `v_intra_${i}`); r.intraLossless += e.bytes; intraJxl.push(e.out);
+  }
+  // INTRA lossy (8-bit) at streaming distances — bitrate vs HEVC
+  for (const d of [1, 2, 3]) {
+    let b = 0;
+    for (let i = 0; i < N; i++) b += encode(ppm8FromRgb8(frames[i]), `v_il${d}_${i}`, 7, d).bytes;
+    r.intraLossy[d] = b;
+  }
+  // DELTA_NONE lossless
+  r.deltaNone += encode(ppm16FromRgb8(frames[0]), `v_dn_0`).bytes;
+  for (let i = 1; i < N; i++) {
+    const sp = shift2D(frames[i - 1], 0, 0);
+    r.deltaNone += encode(ppm16Residual(frames[i], sp), `v_dn_${i}`).bytes;
+  }
+  // DELTA_GMC lossless (estimated one global motion vector per frame)
+  const gmcJxl = [encode(ppm16FromRgb8(frames[0]), `v_gmc_0`).out];
+  r.deltaGmc += statSync(gmcJxl[0]).size;
+  for (let i = 1; i < N; i++) {
+    const mv = estGlobalShift(frames[i], frames[i - 1]); r.shifts.push(mv);
+    const sp = shift2D(frames[i - 1], mv.dx, mv.dy);
+    const e = encode(ppm16Residual(frames[i], sp), `v_gmc_${i}`); r.deltaGmc += e.bytes; gmcJxl.push(e.out);
+  }
+
+  // decode timing, spawn-corrected (native 720p)
+  const spawn = spawnBaselineMs();
+  const realDec = (paths) => {
+    let sum = 0;
+    for (const p of paths) {
+      let best = Infinity;
+      for (let k = 0; k < 2; k++) {
+        const t0 = process.hrtime.bigint();
+        execFileSync(DJXL, [p, join(WORK, 'v.dec.ppm'), '--quiet'], { stdio: 'ignore' });
+        best = Math.min(best, Number(process.hrtime.bigint() - t0) / 1e6);
+      }
+      sum += Math.max(0, best - spawn);
+    }
+    return sum / paths.length;
+  };
+  r.decode = { spawnMs: spawn, intraMsPerFrame: realDec(intraJxl), gmcMsPerFrame: realDec(gmcJxl) };
+  intraJxl.concat(gmcJxl).forEach((p) => rmSync(p, { force: true }));
+
+  writeFileSync(join(__dir, 'results-video.json'), JSON.stringify(r, null, 2));
+  reportVideo(r);
+}
+
+function reportVideo(r) {
+  const den = r.intraLossless;
+  const mvMag = r.shifts.map((s) => Math.hypot(s.dx, s.dy));
+  const avgMv = mvMag.reduce((a, b) => a + b, 0) / (mvMag.length || 1);
+  const maxMv = Math.max(0, ...mvMag);
+  console.log('\n================ REAL VIDEO (Ghana dashcam, 720p, 48 frames) ================');
+  console.log(`estimated global motion: avg |mv| ${avgMv.toFixed(1)} px, max ${maxMv.toFixed(0)} px/frame`);
+  console.log('\n-- LOSSLESS temporal headroom (clean, quality-agnostic ratio) --');
+  console.log(`  INTRA (Motion-JXL)  ${kb(r.intraLossless)} KB`);
+  console.log(`  DELTA_NONE          ${kb(r.deltaNone)} KB   ${((1 - r.deltaNone / den) * 100).toFixed(1)}% vs intra`);
+  console.log(`  DELTA_GMC           ${kb(r.deltaGmc)} KB   ${((1 - r.deltaGmc / den) * 100).toFixed(1)}% vs intra`);
+  const gmcRatio = r.deltaGmc / den;
+  console.log(`  => temporal removes ${((1 - gmcRatio) * 100).toFixed(1)}% of bits on real footage (GMC, lossless)`);
+  console.log('\n-- LOSSY bitrate vs HEVC (HEVC source 8388 kb/s @1080p; 720p-equiv ~' + Math.round(HEVC_720P_EQUIV) + ' kb/s) --');
+  for (const d of [1, 2, 3])
+    console.log(`  Motion-JXL intra -d${d}: ${kbps(r.intraLossy[d], N).toFixed(0)} kb/s   (proj. arch-B ~${(kbps(r.intraLossy[d], N) * gmcRatio).toFixed(0)} kb/s = intra×GMC-ratio)`);
+  console.log('\n-- native decode (720p, spawn-corrected) --');
+  console.log(`  spawn baseline ${r.decode.spawnMs.toFixed(1)} ms; INTRA ${r.decode.intraMsPerFrame.toFixed(1)} ms/f; GMC-delta ${r.decode.gmcMsPerFrame.toFixed(1)} ms/f  (24fps budget = 41.7 ms)`);
+}
+
+// per-block motion compensation on the real video (mini block-ME, like HEVC does)
+function estBlockMV(cur, prev, bx, by, bw, bh, sr, step) {
+  let best = { dx: 0, dy: 0, sad: Infinity };
+  for (let dy = -sr; dy <= sr; dy++)
+    for (let dx = -sr; dx <= sr; dx++) {
+      let sad = 0;
+      for (let y = by; y < by + bh; y += step)
+        for (let x = bx; x < bx + bw; x += step) {
+          let sx = x + dx, sy = y + dy;
+          sx = sx < 0 ? 0 : sx >= W ? W - 1 : sx;   // clamp to edge
+          sy = sy < 0 ? 0 : sy >= H ? H - 1 : sy;
+          const c = (y * W + x) * 3, p = (sy * W + sx) * 3;
+          const lc = cur[c] + 2 * cur[c + 1] + cur[c + 2];
+          const lp = prev[p] + 2 * prev[p + 1] + prev[p + 2];
+          sad += lc > lp ? lc - lp : lp - lc;
+        }
+      if (sad < best.sad) best = { dx, dy, sad };
+    }
+  return best;
+}
+function blockPredict(prev, cur, bs = 32, sr = 12, step = 2) {
+  const pred = Buffer.allocUnsafe(W * H * 3);
+  let mvBits = 0;
+  for (let by = 0; by < H; by += bs)
+    for (let bx = 0; bx < W; bx += bs) {
+      const bw = Math.min(bs, W - bx), bh = Math.min(bs, H - by);
+      const mv = estBlockMV(cur, prev, bx, by, bw, bh, sr, step);
+      mvBits += mv.dx || mv.dy ? 12 : 1;           // rough MV signalling cost (bits)
+      for (let y = by; y < by + bh; y++)
+        for (let x = bx; x < bx + bw; x++) {
+          let sx = x + mv.dx, sy = y + mv.dy;
+          sx = sx < 0 ? 0 : sx >= W ? W - 1 : sx;
+          sy = sy < 0 ? 0 : sy >= H ? H - 1 : sy;
+          const s = (sy * W + sx) * 3, d = (y * W + x) * 3;
+          pred[d] = prev[s]; pred[d + 1] = prev[s + 1]; pred[d + 2] = prev[s + 2];
+        }
+    }
+  return { pred, mvBytes: mvBits / 8 };
+}
+async function cmdVideoBlock() {
+  mkdirSync(WORK, { recursive: true });
+  const dir = join(OUT_ROOT, 'real_video_ghana');
+  const require = createRequire('C:/Foo/raw-converter-wasm/package.json');
+  const sharp = require('sharp');
+  const frames = [];
+  for (let i = 1; i <= N; i++)
+    frames.push(await sharp(join(dir, `rv_${String(i).padStart(3, '0')}.png`)).removeAlpha().raw().toBuffer());
+  const prev = JSON.parse(readFileSync(join(__dir, 'results-video.json'), 'utf8'));
+  const intra = prev.intraLossless;                 // KB denominator from earlier run
+  console.log('[videoblock] per-block MC (32px blocks, ±12 search)…');
+  let deltaBlock = encode(ppm16FromRgb8(frames[0]), 'vb_0').bytes, mvTotal = 0;
+  for (let i = 1; i < N; i++) {
+    const { pred, mvBytes } = blockPredict(frames[i - 1], frames[i]);
+    mvTotal += mvBytes;
+    deltaBlock += encode(ppm16Residual(frames[i], pred), `vb_${i}`).bytes + mvBytes;
+    if (i % 12 === 0) console.log(`  ${i}/${N}`);
+  }
+  console.log('\n================ REAL VIDEO — block motion comp ================');
+  console.log(`  INTRA (Motion-JXL)   ${kb(intra)} KB`);
+  console.log(`  DELTA_NONE           ${kb(prev.deltaNone)} KB   ${((1 - prev.deltaNone / intra) * 100).toFixed(1)}% vs intra`);
+  console.log(`  DELTA_GMC (global)   ${kb(prev.deltaGmc)} KB   ${((1 - prev.deltaGmc / intra) * 100).toFixed(1)}% vs intra`);
+  console.log(`  DELTA_BLOCK (32px)   ${kb(deltaBlock)} KB   ${((1 - deltaBlock / intra) * 100).toFixed(1)}% vs intra   (+${kb(mvTotal)} KB MV overhead)`);
+  writeFileSync(join(__dir, 'results-videoblock.json'), JSON.stringify({ intra, deltaNone: prev.deltaNone, deltaGmc: prev.deltaGmc, deltaBlock, mvBytes: mvTotal }, null, 2));
+}
+
 const cmd = process.argv[2] || 'all';
 if (cmd === 'gen' || cmd === 'all') await cmdGen();
 if (cmd === 'measure' || cmd === 'all') cmdMeasure();
+if (cmd === 'video') await cmdVideo();
+if (cmd === 'videoblock') await cmdVideoBlock();

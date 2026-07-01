@@ -171,12 +171,14 @@ escalation.**
 - **Resolution reality:** the "18 MP encode ≈ 626–1197 ms" figure in `docs/wasm-mt-and-encode-under-1s-findings.md`
   is *photo*-size. Video is far smaller: 1080p = 2 MP, 4K = 8.3 MP. Decode cost scales roughly with
   megapixels and (for P-frames) with residual density.
-- **Per-runtime decode budget (41.6 ms/frame @ 24fps):**
-  - **Native (AVX2 + rayon):** 1080p and 4K decode both within reach with headroom; P-frames far cheaper
-    than I-frames. Realistic for a workstation analysis tool and server transcode.
-  - **Browser WASM (128-bit SIMD, no AVX2, SAB threads, no GPU):** hardest case. 1080p all-intra is
-    marginal at 24fps; with mostly-cheap P-frames the *average* decode drops well under budget. 4K in WASM
-    at 24fps is doubtful without downscale.
+- **Per-runtime decode budget (41.6 ms/frame @ 24fps) — measured, not assumed:**
+  - **Native (AVX2 + rayon), measured:** spawn-corrected djxl decode of **lossless 720p** was **63 ms/frame
+    (intra) / 46 ms/frame (delta)** — *over* budget. Lossless is the heaviest path; **lossy** streams
+    (the actual distribution case) decode materially faster and are the plausible 24fps route, but that was
+    **not yet measured** — do not assume headroom. P-frames are cheaper than I-frames but not free.
+  - **Browser WASM (128-bit SIMD, no AVX2, SAB threads, no GPU):** ~3–5× slower than native → 720p@24fps in
+    WASM requires **lossy + threads + resolution scaling**, and 1080p/4K@24fps in WASM is unlikely without
+    downscale. This is the binding constraint; the per-device ladder exists to live within it.
   - **Future GPU/WebGPU:** not today; a possible C-lite lane for the transform stage.
 - **Per-device ladder (the tunability the format buys us):** negotiate, against one bitstream —
   resolution (decode a lower pyramid level / DC-only for weak devices), fps (skip to I-frames or every-Nth
@@ -248,14 +250,59 @@ information signal with zero drift; residuals stored as 16-bit offset images):
   scaling defeats shift/delta; INTRA wins. This is the honest boundary where Architecture C (general ME/MC)
   would be required — and a signal to fall back to all-intra for such content rather than force a bad model.
 
-**Bottom line:** on the two ShareNat-relevant regimes (low-motion nature, train parallax) a JXL backend with
-the right cheap prediction front-end is **~19–22× smaller than Motion-JXL** at identical (lossless) fidelity,
-using only zero-motion or 1-D horizontal-shift prediction — no 2-D motion search. The predictor is
-content-specific, which is exactly what owning the format buys.
+**Bottom line (synthetic ceiling):** on *clean, structured* content matching the two ShareNat regimes
+(low-motion nature, train parallax) a JXL backend with the right cheap prediction front-end is **~19–22×
+smaller than Motion-JXL** at identical (lossless) fidelity, using only zero-motion or 1-D horizontal-shift
+prediction — no 2-D motion search. The predictor is content-specific, which is exactly what owning the
+format buys. *(But see the real-video floor below: on noisy general footage the gain collapses to ~34% and
+motion comp stops helping — the win is real but content-gated.)*
 
-**Probe caveats:** lossless residuals isolate information content but a shipping codec uses lossy residuals
-+ in-loop reconstruct (§3.2); byte-offset residual images are a faithful compressibility proxy, not the
-final residual transform; decode-time figures include process-spawn overhead and are indicative only.
+### Real-video validation — Ghana dashcam clip (HEVC source)
+
+The synthetic sequences give a *clean-content ceiling*. To find the *floor*, the same measurement was run on
+48 real frames extracted (ffmpeg) from a **1080p25 HEVC dashcam clip** (`c:\995\Videos Ghana\…MP4`, 8388 kb/s
+source), scaled to 720p. Content: vehicle interior + a moving street through the windshield + a static
+timestamp overlay — mixed motion, real sensor noise, and source compression artifacts.
+
+| strategy | KB | vs intra |
+|---|---:|---|
+| INTRA (Motion-JXL, lossless) | 21 833 | — |
+| DELTA_NONE (zero-motion) | 14 355 | **−34.3%** |
+| DELTA_GMC (global MV, estimated) | 14 355 | −34.3% *(MV estimated to 0)* |
+| DELTA_BLOCK (per-32px-block MC, ±12) | 14 608 | −33.1% *(worse — MV overhead + block-edge residual)* |
+
+**Sobering, decisive findings:**
+- **Temporal delta on real noisy footage yields ~34%, not 88–95%.** Sensor noise, real motion, and source
+  artifacts don't delta cleanly. Synthetic = ceiling; real handheld/vehicle content ≈ floor.
+- **Motion compensation does not pay on real footage.** The global MV estimated to zero (static interior +
+  overlay dominate the frame), and *per-block* MC came out **slightly worse** than plain delta — MV
+  signalling + block-edge residual discontinuities cost more than the motion saved, because JXL's own
+  spatial context modelling already captures most residual redundancy. **Direct evidence that building a
+  motion engine (Architecture C) is not justified for this content class** — it only helps *clean,
+  structured* motion (the synthetic parallax, where layered shift won 95%).
+- **JXL-video does not beat HEVC on bitrate for general content.** All-intra Motion-JXL at streaming
+  distances measured 15 600–32 700 kb/s; even projected arch-B (intra × the 0.66 delta ratio) is
+  ~10 300 kb/s at −d3 vs HEVC's ~3 700 kb/s (720p-equivalent). HEVC's joint rate-distortion motion+transform
+  loop wins on pure bitrate. *(Caveat: doubly unfair to JXL — re-encoding already-lossy HEVC output + a
+  downscaled bitrate estimate — but the direction is unambiguous.)*
+- **Decode is marginal, not free.** Spawn-corrected native decode of the lossless 720p streams was
+  **63 ms/frame (intra) / 46 ms/frame (delta)** — *over* the 41.7 ms 24fps budget. Lossy streams decode
+  faster, but 24fps at 720p in WASM/mobile needs lossy + threading + resolution scaling; the "delta frames
+  are cheap" reading alone is too optimistic.
+
+**Honest recalibration of the design:**
+1. The value proposition **cannot** be "smaller than HEVC on arbitrary video." It must rest on **(a)** the
+   favorable content classes — clean low-motion nature, and high-shutter *structured* train parallax where
+   temporal/layered prediction genuinely wins — and **(b)** the fidelity/feature differentiators (§6:
+   lossless/near-lossless, HDR, ROI, progressive, provenance, parallax-depth metadata, per-device).
+2. **Keep the predictor simple.** Zero-motion delta (model 1) captures the achievable real-content gain; the
+   layered-shift model (model 2) is worth it only where content is clean and structured (train). **General
+   block ME/MC (Architecture C) is now further deprioritized — it empirically did not help real footage.**
+
+**Probe caveats:** lossless residuals isolate information content but a shipping codec would use lossy
+residuals + in-loop reconstruct (§3.2); byte-offset residual images are a faithful compressibility proxy,
+not the final residual transform; the lossy-vs-HEVC comparison re-encodes already-lossy HEVC output at a
+downscaled bitrate estimate (indicative, not a fair head-to-head). Reproduce: `node probe.mjs {gen,measure,video,videoblock}`.
 
 ---
 
@@ -272,7 +319,9 @@ final residual transform; decode-time figures include process-spawn overhead and
 | **Ecosystem/interop** (nobody else decodes it) | Medium | Ship a WASM decoder as the portable runtime; it is our own player anyway |
 
 ### Phased build plan (each phase independently shippable / measurable)
-1. **P0 — Probe & decide (this document).** Confirm compression deltas on synthetic + a few real clips.
+1. **P0 — Probe & decide (this document).** ✔ Done for compression on synthetic + a real HEVC clip. **Still
+   to measure before P2 commits:** lossy (rate-controlled) temporal gain via the real reference-frame/ADD
+   API, and **WASM/mobile lossy decode fps** (the binding constraint — native lossless was already over budget).
 2. **P1 — Architecture A MVP.** Video-tuned low-effort encode profile + setup amortisation across a GOP;
    container + timing + per-device decode ladder; all-intra. Ship as mezzanine/archive. *Weeks.*
 3. **P2 — Prediction model 1 (zero-motion delta).** GOP + reference + ADD-residual + in-loop reconstruct +
@@ -280,7 +329,9 @@ final residual transform; decode-time figures include process-spawn overhead and
 4. **P3 — Prediction model 2 (layered horizontal shift).** 1-D per-band motion estimate + patch copy +
    disocclusion-intra + parallax-depth sidecar. Target: train survey. *Months.*
 5. **P4 — Streaming hardening.** Mux/seek/error-resilience/audio; WebCodecs-style player integration.
-6. **(Deferred) C.** General block ME/MC only if an escalation trigger appears.
+6. **(Deferred — now evidence-against) C.** General block ME/MC. The real-clip probe tested per-block MC and
+   it was *worse* than plain delta (§7); build only if a clean, structured, high-motion use-case appears
+   where the synthetic-parallax dynamics (not the dashcam dynamics) dominate.
 
 ### Open questions
 - Real target resolutions/fps per ShareNat device tier? (sets the WASM feasibility line)
