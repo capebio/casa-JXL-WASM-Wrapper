@@ -237,11 +237,11 @@ pub trait VideoFrameSource {
 /// ([`encode_chunked`]), P-frames via bbox replace-skip — so a whole video encodes
 /// while holding only the previous + current frame (plus the compressed output),
 /// not all raw frames. This is where the video codec meets the streaming-export
-/// band engine.
+/// band engine. P-frames use bbox or tile replace-skip per `opts.skip`.
 ///
 /// Requires the streaming tier: `opts.rate = VideoRate::Lossy` and
-/// `opts.skip = SkipMode::Bbox` (else [`VideoError::Unsupported`]). `distance`,
-/// `gop_len`, `effort`, and `thresh` come from `opts`.
+/// `opts.skip = SkipMode::Bbox` or `SkipMode::Tile` (else [`VideoError::Unsupported`]).
+/// `distance`, `gop_len`, `effort`, and `thresh` come from `opts`.
 ///
 /// v1 buffers the compressed output in RAM (small vs raw frames); a true
 /// stream-to-sink footer format is a later step.
@@ -255,7 +255,7 @@ pub fn encode_casv_video_streaming(
         VideoRate::Lossy(d) => d,
         VideoRate::Lossless => return Err(VideoError::Unsupported),
     };
-    if opts.skip != SkipMode::Bbox {
+    if matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
     let thresh = opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance));
@@ -282,7 +282,51 @@ pub fn encode_casv_video_streaming(
             let (r, _, _) = decode_interleaved::<u8>(&data[before..], 3).ok_or(VideoError::Reconstruct)?;
             recon = r;
             0
+        } else if matches!(opts.skip, SkipMode::Tile) {
+            // tile replace-skip: changed tiles' fresh pixels into an atlas.
+            let t = opts.tile.max(1);
+            let (txn, _tyn) = tile_grid(width, height, t);
+            let (wus, ts) = (width as usize, t as usize);
+            let map = changed_tile_map_thresh(&px, &prev_src, width, height, t, thresh);
+            let changed: Vec<usize> = map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+            data.extend_from_slice(&(t as u16).to_le_bytes());
+            let bitmap_len = map.len().div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_len];
+            for &i in &changed {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+            data.extend_from_slice(&bitmap);
+            if !changed.is_empty() {
+                let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+                for (slot, &i) in changed.iter().enumerate() {
+                    let tx = (i as u32 % txn) as usize;
+                    let ty = (i as u32 / txn) as usize;
+                    let bw = ts.min(wus - tx * ts);
+                    let bh = ts.min(height as usize - ty * ts);
+                    for row in 0..bh {
+                        let src = ((ty * ts + row) * wus + tx * ts) * 3;
+                        let dst = ((slot * ts + row) * ts) * 3;
+                        atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
+                    }
+                }
+                let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, crop_opts.clone())?;
+                let (datlas, _, _) = decode_interleaved::<u8>(&jxl, 3).ok_or(VideoError::Reconstruct)?;
+                for (slot, &i) in changed.iter().enumerate() {
+                    let tx = (i as u32 % txn) as usize;
+                    let ty = (i as u32 / txn) as usize;
+                    let bw = ts.min(wus - tx * ts);
+                    let bh = ts.min(height as usize - ty * ts);
+                    for row in 0..bh {
+                        let d = ((ty * ts + row) * wus + tx * ts) * 3;
+                        let s = ((slot * ts + row) * ts) * 3;
+                        recon[d..d + bw * 3].copy_from_slice(&datlas[s..s + bw * 3]);
+                    }
+                }
+                data.extend_from_slice(&jxl);
+            }
+            CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG
         } else {
+            // bbox replace-skip (default).
             match changed_bbox_thresh(&px, &prev_src, width, height, thresh) {
                 None => {
                     for _ in 0..4 {
@@ -1771,6 +1815,16 @@ mod tests {
         let mut fs2 = VecFrames { frames: frames.clone(), i: 0, w, h };
         let casv2 = encode_casv_video_streaming(&mut fs2, &opts).unwrap();
         assert_eq!(casv, casv2, "streaming encode must be deterministic");
+
+        // Tile skip also works via the streaming path.
+        let topts = CasaVideoOptions { skip: SkipMode::Tile, tile: 16, ..opts };
+        let mut fst = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let casvt = encode_casv_video_streaming(&mut fst, &topts).unwrap();
+        let outt = decode_casv_all_rgb8(&casvt).unwrap();
+        assert_eq!(outt.len(), 8);
+        for i in 1..8 {
+            assert!(casv_frame_is_tile(&casvt, i).unwrap(), "streaming tile frame {i}");
+        }
 
         // Unsupported tier rejected.
         let mut fs3 = VecFrames { frames: low_motion(w, h, 2), i: 0, w, h };
