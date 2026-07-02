@@ -564,25 +564,25 @@ fn decode_plane_into(
             }
             _ => &ext.unwrap()[y * w..(y + 1) * w],
         };
-        match modes[y] {
+        let seg: &[u8] = match modes[y] {
             MODE_COPY => {
                 row.copy_from_slice(pr);
                 continue;
             }
             MODE_RANS => {
-                let seg = resbuf.get(decoded_syms..decoded_syms + w)?;
+                let s = resbuf.get(decoded_syms..decoded_syms + w)?;
                 decoded_syms += w;
-                row.copy_from_slice(seg);
+                s
             }
-            MODE_RAW => {
-                row.copy_from_slice(raw.take(w)?);
-            }
+            MODE_RAW => raw.take(w)?,
             _ => return None,
-        }
+        };
+        // Fused reconstruction: each output byte is written exactly once
+        // (no copy_from_slice + second read-modify-write pass).
         if transform == TRANSFORM_LEFT_DELTA {
-            prefix_add_pred(row, pr);
+            prefix_add_pred_from(row, seg, pr);
         } else {
-            add_pred(row, pr);
+            add_pred_from(row, seg, pr);
         }
     }
     if decoded_syms != resbuf.len() {
@@ -666,16 +666,18 @@ mod kernels {
         }
     }
 
-    /// Fused: undo left-delta (mod-256 prefix sum) and add the prediction row.
-    /// SSE2-only, so unconditionally available on x86-64.
+    /// Fused row reconstruction: undo left-delta (mod-256 prefix sum) over the
+    /// coded segment and add the prediction row, writing each output byte once
+    /// (replaces copy_from_slice + in-place pass). SSE2-only, so
+    /// unconditionally available on x86-64.
     #[target_feature(enable = "sse2")]
-    pub unsafe fn prefix_add_pred_sse2(row: &mut [u8], pred: &[u8]) {
-        let n = row.len();
-        debug_assert_eq!(pred.len(), n);
+    pub unsafe fn prefix_add_pred_from_sse2(out: &mut [u8], seg: &[u8], pred: &[u8]) {
+        let n = out.len();
+        debug_assert!(seg.len() == n && pred.len() == n);
         let mut carry = 0u8;
         let mut i = 0;
         while i + 16 <= n {
-            let mut x = _mm_loadu_si128(row.as_ptr().add(i) as *const __m128i);
+            let mut x = _mm_loadu_si128(seg.as_ptr().add(i) as *const __m128i);
             x = _mm_add_epi8(x, _mm_slli_si128(x, 1));
             x = _mm_add_epi8(x, _mm_slli_si128(x, 2));
             x = _mm_add_epi8(x, _mm_slli_si128(x, 4));
@@ -685,44 +687,50 @@ mod kernels {
             carry = ((_mm_extract_epi16(x, 7) as u32) >> 8) as u8;
             let p = _mm_loadu_si128(pred.as_ptr().add(i) as *const __m128i);
             let y = _mm_add_epi8(x, p);
-            _mm_storeu_si128(row.as_mut_ptr().add(i) as *mut __m128i, y);
+            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, y);
             i += 16;
         }
         while i < n {
-            carry = carry.wrapping_add(row[i]);
-            row[i] = carry.wrapping_add(pred[i]);
+            carry = carry.wrapping_add(seg[i]);
+            out[i] = carry.wrapping_add(pred[i]);
             i += 1;
         }
     }
 }
 
-/// Undo left-delta and add prediction (scalar reference; also the wasm path).
+/// Undo left-delta over `seg` and add prediction, writing into `out` (scalar
+/// reference; also the wasm path).
 #[inline]
-fn prefix_add_pred_scalar(row: &mut [u8], pred: &[u8]) {
+fn prefix_add_pred_from_scalar(out: &mut [u8], seg: &[u8], pred: &[u8]) {
+    let n = out.len();
+    let (seg, pred) = (&seg[..n], &pred[..n]);
     let mut acc = 0u8;
-    for i in 0..row.len() {
-        acc = acc.wrapping_add(row[i]);
-        row[i] = acc.wrapping_add(pred[i]);
+    for i in 0..n {
+        acc = acc.wrapping_add(seg[i]);
+        out[i] = acc.wrapping_add(pred[i]);
     }
 }
 
 #[inline]
-fn prefix_add_pred(row: &mut [u8], pred: &[u8]) {
+fn prefix_add_pred_from(out: &mut [u8], seg: &[u8], pred: &[u8]) {
     #[cfg(target_arch = "x86_64")]
     {
         // SSE2 is baseline on x86-64.
-        unsafe { kernels::prefix_add_pred_sse2(row, pred) };
+        unsafe { kernels::prefix_add_pred_from_sse2(out, seg, pred) };
         return;
     }
     #[allow(unreachable_code)]
-    prefix_add_pred_scalar(row, pred);
+    prefix_add_pred_from_scalar(out, seg, pred);
 }
 
+/// out = seg + pred, one pass (replaces copy_from_slice + in-place add).
+/// Plain wrapping add; LLVM auto-vectorizes this shape to paddb.
 #[inline]
-fn add_pred(row: &mut [u8], pred: &[u8]) {
-    // Plain wrapping add; LLVM auto-vectorizes this shape to paddb.
-    for i in 0..row.len() {
-        row[i] = row[i].wrapping_add(pred[i]);
+fn add_pred_from(out: &mut [u8], seg: &[u8], pred: &[u8]) {
+    let n = out.len();
+    let (seg, pred) = (&seg[..n], &pred[..n]);
+    for i in 0..n {
+        out[i] = seg[i].wrapping_add(pred[i]);
     }
 }
 
@@ -1209,11 +1217,22 @@ mod tests {
         for n in [0usize, 1, 7, 15, 16, 17, 47, 48, 100, 854] {
             let res: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
             let pred: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
-            let mut a = res.clone();
-            prefix_add_pred(&mut a, &pred);
-            let mut b = res.clone();
-            prefix_add_pred_scalar(&mut b, &pred);
-            assert_eq!(a, b, "prefix_add_pred n={n}");
+            let mut a = vec![0u8; n];
+            prefix_add_pred_from(&mut a, &res, &pred);
+            let mut b = vec![0u8; n];
+            prefix_add_pred_from_scalar(&mut b, &res, &pred);
+            assert_eq!(a, b, "prefix_add_pred_from n={n}");
+            // scalar reference vs first principles (mod-256 prefix sum + pred)
+            let mut acc = 0u8;
+            for i in 0..n {
+                acc = acc.wrapping_add(res[i]);
+                assert_eq!(b[i], acc.wrapping_add(pred[i]));
+            }
+            let mut c = vec![0u8; n];
+            add_pred_from(&mut c, &res, &pred);
+            for i in 0..n {
+                assert_eq!(c[i], res[i].wrapping_add(pred[i]), "add_pred_from n={n}");
+            }
 
             let r: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
             let g: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
