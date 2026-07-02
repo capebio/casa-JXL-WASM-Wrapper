@@ -395,6 +395,54 @@ pub fn reassemble_slices_scatter(
     raster
 }
 
+/// Fused multi-slice reassembly + crop. Builds the final crop_w×crop_h raster
+/// directly from the STACKED slice decode buffer — no full-raster temp, no
+/// zero-fill, no separate crop pass. Row-major output construction: for each
+/// output row, append the crop-window intersection of each vertical slice in
+/// left-to-right order. The intersections tile [0, crop_w) exactly because the
+/// slices tile [0, stride) and decode_impl enforces stride == n*nw + lw.
+/// Byte-identical to reassemble_slices(..) followed by the row crop (see
+/// tests::fused_reassemble_crop_matches_split_composition).
+fn reassemble_slices_crop(
+    src: &[u16],
+    stride: usize,
+    high: usize,
+    n: usize,
+    nw: usize,
+    lw: usize,
+    left: usize,
+    top: usize,
+    crop_w: usize,
+    crop_h: usize,
+) -> Vec<u16> {
+    // Per-slice crop intersection: source block base, slice width, first source
+    // column, run length. ≤ n+1 entries — computed once, reused for every row.
+    struct Seg { src_base: usize, sw: usize, src_col: usize, run: usize }
+    let block = nw * high;
+    let crop_right = left + crop_w;
+    let mut segs: Vec<Seg> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let sw = if i < n { nw } else { lw };
+        if sw == 0 { continue; } // lw==0 → no remainder slice
+        let col0 = i * nw;
+        if col0 >= stride { break; }
+        let sw_eff = sw.min(stride - col0);
+        let lo = col0.max(left);
+        let hi = (col0 + sw_eff).min(crop_right);
+        if lo >= hi { continue; }
+        segs.push(Seg { src_base: i * block, sw, src_col: lo - col0, run: hi - lo });
+    }
+    let mut out = Vec::with_capacity(crop_w * crop_h);
+    for row in 0..crop_h {
+        let y = top + row;
+        for s in &segs {
+            let p = s.src_base + y * s.sw + s.src_col;
+            out.extend_from_slice(&src[p..p + s.run]);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Core implementation
 // ---------------------------------------------------------------------------
@@ -916,6 +964,37 @@ mod tests {
             let scalar = reassemble_slices_scatter(&src, stride, high, n, nw, lw);
             assert_eq!(bulk, scalar,
                 "mismatch for n={n} nw={nw} lw={lw} high={high}");
+        }
+    }
+
+    #[test]
+    fn fused_reassemble_crop_matches_split_composition() {
+        // (n, nw, lw, high, left, top, crop_w, crop_h); stride = n*nw + lw.
+        // left/top even (decode_impl snaps), crop within bounds. Includes real 550D
+        // geometry, lw==0 (no remainder), crop==full, crop inside one slice, crop
+        // spanning all slices.
+        let cases = [
+            (2usize, 4usize, 6usize, 5usize, 2usize, 0usize, 8usize, 4usize),
+            (3, 8, 8, 7, 0, 2, 32, 5),
+            (1, 16, 4, 9, 4, 2, 10, 6),
+            (2, 1728, 1888, 12, 80, 2, 5184, 8),  // real Canon widths
+            (4, 5, 3, 6, 0, 0, 23, 6),             // crop == full frame
+            (2, 8, 0, 5, 2, 0, 12, 5),             // lw == 0
+            (3, 10, 5, 8, 12, 2, 6, 4),            // crop inside slice 1
+        ];
+        for &(n, nw, lw, high, left, top, cw, ch) in &cases {
+            let stride = n * nw + lw;
+            assert!(left + cw <= stride && top + ch <= high, "bad case");
+            let src: Vec<u16> = (0..stride * high).map(|i| (i % 65535) as u16).collect();
+            // Split composition: full reassemble then crop.
+            let raster = reassemble_slices(&src, stride, high, n, nw, lw);
+            let mut want = Vec::with_capacity(cw * ch);
+            for row in 0..ch {
+                let s = (top + row) * stride + left;
+                want.extend_from_slice(&raster[s..s + cw]);
+            }
+            let got = reassemble_slices_crop(&src, stride, high, n, nw, lw, left, top, cw, ch);
+            assert_eq!(got, want, "n={n} nw={nw} lw={lw} high={high} l={left} t={top} {cw}x{ch}");
         }
     }
 
