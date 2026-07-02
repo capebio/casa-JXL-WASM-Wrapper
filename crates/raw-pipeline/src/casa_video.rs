@@ -1711,6 +1711,40 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     Some(gops.into_iter().flatten().collect())
 }
 
+/// Streaming decode: lend every frame, in order, to `f` as
+/// `(frame_index, pixels, width, height)` **without retaining previous
+/// frames** — peak memory is one reconstruction buffer plus decode scratch
+/// (~2 frames) instead of `frame_count × frame_size` (a 10 s 720p24 batch is
+/// ~660 MB resident; this is ~8 MB). The pixel borrow is invalidated when `f`
+/// returns (the same lend-then-reuse contract as `Decoder::decode_view`);
+/// clone inside `f` if a frame must outlive the callback. Returns the frame
+/// count; `None` if any frame fails to decode (frames already delivered to `f`
+/// stand — the return value is the success signal).
+pub fn decode_casv_for_each_rgb8(
+    data: &[u8],
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_for_each_rgb8_threaded(data, 1, f)
+}
+
+/// [`decode_casv_for_each_rgb8`] with a persistent **multi-threaded** inner
+/// libjxl decoder (`num_threads <= 1` = single-threaded, byte-identical output
+/// either way): the sequential-playback shape — frame-at-a-time latency with
+/// libjxl group parallelism inside each frame, and streaming peak memory.
+pub fn decode_casv_for_each_rgb8_threaded(
+    data: &[u8],
+    num_threads: usize,
+    mut f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    let hdr = parse_casv_header(data)?;
+    let (w, h) = (hdr.width, hdr.height);
+    let n = hdr.frame_count as usize;
+    let mut sess = CasvDecodeSession::with_threads(num_threads)?;
+    let mut recon: Vec<u8> = Vec::new();
+    decode_casv_range(data, w, h, 0..n, &mut sess, &mut recon, &mut |i, px| f(i, px, w, h))?;
+    Some(n)
+}
+
 /// [`decode_casv_all_rgb8`] with a persistent **multi-threaded** libjxl decoder:
 /// the sequential-playback latency lever. Each frame's JXL decode fans out over
 /// `num_threads` libjxl worker threads (one runner held across all frames);
@@ -2346,6 +2380,42 @@ mod tests {
             let px = &via_footer[i].0;
             let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
             assert!(me < 8.0, "frame {i} mean err {me}");
+        }
+    }
+
+    #[test]
+    fn for_each_matches_batch_decode() {
+        let (w, h) = (64u32, 48u32);
+        let src = low_motion(w, h, 7);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        // Cover residual-none, lossless tile, and lossy REPLACE bbox tiers.
+        let files = [
+            encode_casv_delta_rgb8(&refs, w, h, 24, 1, 3, EncodeOptions::lossless()).unwrap(),
+            encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, 3, 16, EncodeOptions::lossless())
+                .unwrap(),
+            encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, 1.0, 0).unwrap(),
+        ];
+        for bytes in &files {
+            let batch = decode_casv_all_rgb8(bytes).unwrap();
+            let mut streamed: Vec<(usize, Vec<u8>, u32, u32)> = Vec::new();
+            let n = decode_casv_for_each_rgb8(bytes, |i, px, dw, dh| {
+                streamed.push((i, px.to_vec(), dw, dh));
+            })
+            .unwrap();
+            assert_eq!(n, batch.len());
+            assert_eq!(streamed.len(), batch.len());
+            for (i, (si, spx, sw, sh)) in streamed.iter().enumerate() {
+                assert_eq!(*si, i, "callback order");
+                assert_eq!((spx, *sw, *sh), (&batch[i].0, batch[i].1, batch[i].2), "frame {i}");
+            }
+            // MT for-each byte-identical too.
+            let mut k = 0usize;
+            decode_casv_for_each_rgb8_threaded(bytes, 4, |i, px, _, _| {
+                assert_eq!((i, px), (k, batch[k].0.as_slice()), "MT frame {k}");
+                k += 1;
+            })
+            .unwrap();
+            assert_eq!(k, batch.len());
         }
     }
 

@@ -132,6 +132,36 @@ fn main() {
         return;
     }
 
+    if mode == "foreach" {
+        // Streaming for-each must deliver byte-identical frames in order vs the
+        // batch decode, on the whole header-format corpus.
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read corpus dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "casv"))
+            .collect();
+        names.sort();
+        for p in &names {
+            let data = std::fs::read(p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            if parse_casv_header(&data).is_none() {
+                continue; // footer format handled by its own entry points
+            }
+            let batch = decode_casv_all_rgb8(&data).expect("batch decode");
+            let mut k = 0usize;
+            let n = decode_casv_for_each_rgb8(&data, |i, px, dw, dh| {
+                assert_eq!(i, k, "{name}: order");
+                assert_eq!((dw, dh), (batch[k].1, batch[k].2), "{name}: dims {k}");
+                assert_eq!(px, batch[k].0.as_slice(), "{name}: frame {k} bytes");
+                k += 1;
+            })
+            .expect("for_each decode");
+            assert_eq!((n, k), (batch.len(), batch.len()), "{name}: count");
+            println!("{name:<24} for_each == batch, {n} frames byte-equal");
+        }
+        return;
+    }
+
     if mode == "mt" {
         // Verify MT == ST bytes on the whole corpus (header-format files) and
         // report sequential-playback decode times per thread width.
