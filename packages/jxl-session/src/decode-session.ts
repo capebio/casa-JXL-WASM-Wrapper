@@ -36,6 +36,22 @@ function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
   return typeof (value as Promise<T>)?.then === "function";
 }
 
+export function computeDecodeWeight(opts: {
+  expectedOutputBytes?: number;
+  targetWidth?: number | null;
+  targetHeight?: number | null;
+}): number | undefined {
+  const explicit = opts.expectedOutputBytes;
+  if (typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0) return explicit;
+  const w = opts.targetWidth;
+  const h = opts.targetHeight;
+  if (typeof w === "number" && typeof h === "number" && w > 0 && h > 0) {
+    const bytes = w * h * 4;
+    if (Number.isFinite(bytes) && bytes <= Number.MAX_SAFE_INTEGER) return bytes;
+  }
+  return undefined;
+}
+
 export class DecodeSessionImpl implements DecodeSession {
   readonly id: string;
 
@@ -101,12 +117,14 @@ export class DecodeSessionImpl implements DecodeSession {
       // Register the message handler BEFORE acquireSlot sends decode_start,
       // so decode_header is never missed.
       scheduler.onMessage(this.id, (msg) => this.handleMessage(msg));
+      const weight = computeDecodeWeight(opts);
       return scheduler.acquireSlot({
         sessionId: this.id,
         priority: startMsg.priority,
         startMsg,
         sourceKey: null,
         signal: opts.signal ?? null,
+        ...(weight !== undefined ? { weight } : {}),
       });
     };
 

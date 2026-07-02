@@ -79,6 +79,8 @@ export interface DecodeOptions {
   priority?: "visible" | "near" | "background";
   budgetMs?: number;
   signal?: AbortSignal;
+  /** Estimated decoded output size in bytes; used as the scheduler admission weight. */
+  expectedOutputBytes?: number;
   // Telemetry
   onMetric?: (m: CodecMetric) => void;
 }
