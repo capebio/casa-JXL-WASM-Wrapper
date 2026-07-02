@@ -72,7 +72,7 @@ All byte-exact unless noted; every timing <10% via interleaved flipflop; goldens
 - Post-pass jolt_bench: **Realtime 98 fps, Balanced 90 fps, Quality 109 fps** (all pass 24fps budget); archive batch 9→18 fps (2-GOP file caps parallelism).
 
 ### FableBraid (fable, 7 commits on fbw2)
-- FB-4 dead zero-fills/alloc churn; FB-2 DeltaDecodeSession planar-SG state across P-frames (−32.7%); FB-3 fused row reconstruction (−5.7%); FB-6 plane-parallel rayon join, 64K-px gate (−41.4% @720p); FB-1 wasm32 simd128 kernels (compile-gated, plans pinned natively; browser flipflopdom pending); FB-9 encoder trims (−9.6% encode); FB-5 fable-arm clone drop.
+- FB-4 dead zero-fills/alloc churn; FB-2 DeltaDecodeSession planar-SG state across P-frames (−32.7%); FB-3 fused row reconstruction (−5.7%); FB-6 plane-parallel rayon join, 64K-px gate (−41.4% @720p); FB-1 wasm32 simd128 kernels — **wasm-runtime VERIFIED −27.3% med / −27.1% floor** (node scalar-vs-simd128 artifacts, interleaved, parity-gated; harness `tools/fable-wasm-flip.mjs` @73ee1f26; kernels already live in shipped builds via `.cargo/config.toml` +simd128); FB-9 encoder trims (−9.6% encode); FB-5 fable-arm clone drop.
 - **Cumulative 720p decode: 505.8→145.2 ms/clip = −71.3% (3.0 ms/f ≈ 330 fps)**; encode −5.8%. FBR1 bitstream + pixels frozen, golden SHAs identical every commit. 273 MSVC tests.
 
 ### E3 app path (appe3, 5 commits, merged)
