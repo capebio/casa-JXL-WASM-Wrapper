@@ -1667,3 +1667,13 @@ Per the deferred docs' own analysis these cannot pay for their risk/effort; move
 - **chroma_from_luma micro-cleanups (transactional DecodeDC, u32 GetColorFactor)** — header-decode cold path, not ms-level.
 - **dec_group `RatioJPEG` hoist + compressed_dc #6 vertical chroma reuse** — JPEG-reconstruction / subsampled paths only; the RAW→XYB app pipeline is 4:4:4 and never executes them.
 - **enc_modular subsampled `AddVarDCTDC` exact allocation** — 4:2:0/4:2:2 only; the app path is 4:4:4, the branch never runs.
+
+---
+
+## TTFP-4-DNG: two-phase RAW split for DNG — previews NOT byte-identical (2026-07-02)
+
+**Target:** `web/worker.js` two-phase RAW task (previews-only WASM call first, full-res call second; landed for ORF on `perf/jf-ttfp-jul02`).
+**Proposed:** extend the split to DNG — recon noted a DNG streaming previews twin at `src/lib.rs:2404-2454`.
+**Rejected (proven by A/B):** DNG's MONOLITHIC previews are downscaled from the full-res MHC demosaic (`process_dng_impl` has no superpixel preview path — `downscale_rgb16_impl(&rgb16 /* MHC */, ...)` at lib.rs:2580), while the previews-only twin streams a 2×2 superpixel demosaic. Different demosaic source ⇒ different preview bytes. `web/two-phase-raw.test.js` pins this: thumb/lightbox SHAs diverge on the real DNG fixture while the full-res encode output stays identical. ORF does NOT have this problem because its monolithic preview build already uses the same superpixel path (`demosaic_rggb_half`) the streaming gate uses — proven byte-identical on real ORFs in the same test.
+**Re-open only if** lib.rs unifies the DNG preview sources (superpixel previews in the monolithic path, a deliberate pixel change needing its own quality sign-off) — the guard test flips and the split can be extended by changing one gate in worker.js (`canSplit`).
+**CR2:** also excluded, different reason — `decode_cr2_raw` ignores output flags at decode time (no streaming twin), so a split doubles the full decode+demosaic for zero preview speedup.

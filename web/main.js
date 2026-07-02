@@ -740,7 +740,14 @@ class WorkerPool {
             return;
         }
         if (type === WorkerMsg.ENCODE_REQUEST) {
-            const { id, pixels, rgba, format, width, height, quality, effort, lossless, progressive, orientation } = ev.data;
+            const { id, pixels, rgba, format, width, height, quality, effort, lossless, progressive, orientation, pipelineMs, phaseMs } = ev.data;
+            // TTFP-4: ENCODE_REQUEST is the RAW worker's final message for a
+            // task (the encode itself runs on the jxl worker pool), so release
+            // the worker slot here. Previously released on LIGHTBOX — with the
+            // two-phase split LIGHTBOX arrives before the full-res phase, when
+            // the worker is still genuinely busy.
+            const reqTask = this.tasks.get(id);
+            if (reqTask && !reqTask.released) this._releaseWorker(worker, id);
             const t0 = performance.now();
             // A3: accept new pixels/format fields; fall back to legacy rgba field for jxl-progressive.js
             encodeJxlSession(pixels ?? rgba, width, height, quality, effort, Boolean(lossless), Boolean(progressive), format ?? 'rgba8', orientation)
@@ -748,7 +755,9 @@ class WorkerPool {
                     const jxlMs = performance.now() - t0;
                     const t = this.tasks.get(id);
                     if (t?.handlers.onDone) {
-                        t.handlers.onDone({ id, type: WorkerMsg.DONE, jxl, jxlMs, w: width, h: height, effortUsed: effort, effortRequested: effort });
+                        // pipelineMs/phaseMs: split-task totals (both WASM
+                        // phases); absent for monolithic CR2/EXR/TIFF tasks.
+                        t.handlers.onDone({ id, type: WorkerMsg.DONE, jxl, jxlMs, w: width, h: height, effortUsed: effort, effortRequested: effort, pipelineMs, phaseMs });
                     }
                     this.tasks.delete(id);
                 })
@@ -767,13 +776,14 @@ class WorkerPool {
         if (type === WorkerMsg.THUMB && handlers.onThumb) handlers.onThumb(ev.data);
         else if (type === WorkerMsg.LIGHTBOX && handlers.onLightbox) {
             handlers.onLightbox(ev.data);
-            // Release worker after lightbox — JXL encode is now handled by
-            // jxl-worker.js, so the RAW worker is free for the next file.
-            this._releaseWorker(worker, id);
+            // TTFP-4: do NOT release the worker here. With the two-phase RAW
+            // split, LIGHTBOX posts right after the streaming preview phase
+            // while the worker still owns the full-res phase; the release
+            // moved to ENCODE_REQUEST (the task's final worker message).
         }
         else if (type === WorkerMsg.DONE) {
             if (handlers.onDone) handlers.onDone(ev.data);
-            this.tasks.delete(id);  // Worker already freed on lightbox
+            this.tasks.delete(id);  // Worker already freed on encode_request
             // KEEP workerForTask[id] alive — the owning worker still holds
             // liveStateMap[id], so reprocess_live for the lightbox needs to
             // know which worker to message even long after JXL is done.
@@ -868,7 +878,13 @@ class WorkerPool {
     }
 
     reprocessLive(taskId, look) {
-        const worker = this.workerForTask.get(taskId);
+        // TTFP-4: workerForTask is populated at ENCODE_REQUEST (worker
+        // release), but with the two-phase split the lightbox is interactive
+        // during phase 2 — fall back to the task's assigned worker (same
+        // pattern as cancelTask) so live slider edits route correctly in that
+        // window. The worker answers after its current phase completes.
+        const worker = this.workerForTask.get(taskId)
+            || this.tasks.get(taskId)?.worker;
         if (!worker) return false;
         worker.postMessage({ id: taskId, type: WorkerMsg.REPROCESS_LIVE, look });
         return true;
@@ -876,11 +892,21 @@ class WorkerPool {
 
     reprocessAllLive(taskIds, look) {
         if (!taskIds.length) return;
-        const wanted = new Set(taskIds);
-        for (const w of this.workers) {
-            if (!w._taskIds) continue;
-            const mine = [...w._taskIds].filter(id => wanted.has(id));
-            if (mine.length) w.postMessage({ type: WorkerMsg.REPROCESS_THUMB_LIVE, taskIds: mine, look });
+        // TTFP-4: route via workerForTask (released tasks — same contents as
+        // the old per-worker _taskIds scan) PLUS the tasks map, so split tasks
+        // still mid-phase-2 (thumb posted, worker not yet released) also get
+        // gallery-wide thumb look updates; the worker answers after its
+        // current phase completes (thumbStateMap is populated in phase 1).
+        const byWorker = new Map();
+        for (const id of taskIds) {
+            const w = this.workerForTask.get(id) || this.tasks.get(id)?.worker;
+            if (!w) continue;
+            let mine = byWorker.get(w);
+            if (!mine) byWorker.set(w, mine = []);
+            mine.push(id);
+        }
+        for (const [w, mine] of byWorker) {
+            w.postMessage({ type: WorkerMsg.REPROCESS_THUMB_LIVE, taskIds: mine, look });
         }
     }
 
@@ -1754,6 +1780,16 @@ function startConvert(file, existingCard) {
                 },
                 onDone(msg) {
                     card.classList.remove('encoding');
+                    // TTFP-4 (two-phase RAW split): THUMB carried phase-1-only
+                    // timings and exif with width/height 0 (lib.rs previews-only
+                    // results have no sensor dims). Patch the real totals and
+                    // dims now — before the stats push below reads them.
+                    if (msg.pipelineMs != null) card._pipelineMs = msg.pipelineMs;
+                    if (msg.phaseMs) card._phaseMs = msg.phaseMs;
+                    if (card._exif && !card._exif.width && msg.w) {
+                        card._exif.width  = msg.w;
+                        card._exif.height = msg.h;
+                    }
                     const blob = new Blob([msg.jxl], { type: 'image/jxl' });
                     // Revoke any previous blob URL for this card before creating a new one.
                     if (card._blobUrl) URL.revokeObjectURL(card._blobUrl);
