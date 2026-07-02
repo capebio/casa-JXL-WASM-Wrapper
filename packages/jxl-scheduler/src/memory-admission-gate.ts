@@ -57,7 +57,7 @@ export class MemoryWeightedAdmissionGate implements AdmissionGate {
       return Promise.resolve(this.makeRelease(w));
     }
     return new Promise<AdmissionRelease>((resolve) => {
-      this.waiters.push({ sessionId, priority, weight: w, resolve });
+      this.insertWaiter({ sessionId, priority, weight: w, resolve });
     });
   }
 
@@ -66,6 +66,15 @@ export class MemoryWeightedAdmissionGate implements AdmissionGate {
       return this.defaultWeightBytes;
     }
     return weight;
+  }
+
+  private insertWaiter(waiter: Waiter): void {
+    // Priority-ordered (visible < near < background by rank), FIFO within a priority:
+    // insert after the last waiter of equal-or-higher priority.
+    const rank = PRIORITY_RANK[waiter.priority];
+    let i = this.waiters.length;
+    while (i > 0 && PRIORITY_RANK[this.waiters[i - 1]!.priority] > rank) i--;
+    this.waiters.splice(i, 0, waiter);
   }
 
   private fits(w: number): boolean {
@@ -85,16 +94,17 @@ export class MemoryWeightedAdmissionGate implements AdmissionGate {
   }
 
   private drain(): void {
-    // Admit the first fitting waiter, repeat until none fit. (Priority ordering
-    // is added in Task 2; Task 1 uses FIFO order.)
+    // Admit the first fitting waiter (scan-forward: a non-fitting task does not block smaller
+    // tasks behind it); repeat until none fit. Queue is priority-ordered by insertWaiter.
     let progress = true;
     while (progress) {
       progress = false;
       for (let i = 0; i < this.waiters.length; i++) {
         if (this.fits(this.waiters[i]!.weight)) {
           const [waiter] = this.waiters.splice(i, 1);
-          this._runningBytes += waiter!.weight;
-          waiter!.resolve(this.makeRelease(waiter!.weight));
+          const w = waiter!.weight;
+          this._runningBytes += w;
+          waiter!.resolve(this.makeRelease(w));
           progress = true;
           break;
         }
@@ -103,5 +113,3 @@ export class MemoryWeightedAdmissionGate implements AdmissionGate {
   }
 }
 
-// PRIORITY_RANK is used starting in Task 2 for priority-ordered drain.
-void (PRIORITY_RANK satisfies Record<Priority, number>);

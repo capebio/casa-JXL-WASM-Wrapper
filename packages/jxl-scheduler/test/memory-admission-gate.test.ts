@@ -34,3 +34,36 @@ describe("MemoryWeightedAdmissionGate core", () => {
     assert.throws(() => new MemoryWeightedAdmissionGate({ budgetBytes: Number.POSITIVE_INFINITY }));
   });
 });
+
+describe("MemoryWeightedAdmissionGate priority", () => {
+  it("drains the highest-priority waiter first, even if enqueued later", async () => {
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 100 * MB });
+    const rel = await gate.admit("running", "visible", 100 * MB); // fills budget
+    const order: string[] = [];
+    const pBg = gate.admit("bg", "background", 100 * MB).then((r) => { order.push("bg"); return r; });
+    const pVis = gate.admit("vis", "visible", 100 * MB).then((r) => { order.push("vis"); return r; });
+    await Promise.resolve();
+    assert.equal(gate.pendingCount, 2);
+    rel();
+    const r1 = await pVis;
+    assert.deepEqual(order, ["vis"]);
+    r1();
+    await pBg;
+    assert.deepEqual(order, ["vis", "bg"]);
+  });
+
+  it("preserves FIFO within the same priority", async () => {
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 100 * MB });
+    const rel = await gate.admit("run", "visible", 100 * MB);
+    const order: string[] = [];
+    const p1 = gate.admit("first", "near", 100 * MB).then((r) => { order.push("first"); return r; });
+    const p2 = gate.admit("second", "near", 100 * MB).then((r) => { order.push("second"); return r; });
+    await Promise.resolve();
+    rel();
+    const r1 = await p1;
+    assert.deepEqual(order, ["first"]);
+    r1();
+    await p2;
+    assert.deepEqual(order, ["first", "second"]);
+  });
+});
