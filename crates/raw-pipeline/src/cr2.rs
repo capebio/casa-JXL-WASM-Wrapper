@@ -473,6 +473,89 @@ pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)>
     Ok((strip_off, strip_len, sof_w as usize * ncomp as usize, sof_h as usize))
 }
 
+/// Canon MakerNote SensorInfo (tag 0x00E0): true sensor geometry + active-area
+/// borders. Border indices follow exiftool's CanonSensorInfo: the active image
+/// area is [left..=right] × [top..=bottom] in decoded-sensor coordinates.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensorInfo {
+    pub sensor_width:  u16,
+    pub sensor_height: u16,
+    pub left:   u16,
+    pub top:    u16,
+    pub right:  u16,
+    pub bottom: u16,
+}
+
+impl SensorInfo {
+    #[inline]
+    pub fn active_width(&self) -> usize {
+        (self.right as usize).saturating_sub(self.left as usize) + 1
+    }
+    #[inline]
+    pub fn active_height(&self) -> usize {
+        (self.bottom as usize).saturating_sub(self.top as usize) + 1
+    }
+}
+
+/// Parse Canon SensorInfo (MakerNote tag 0x00E0, SHORT array) from a CR2.
+/// Walk mirrors decode_impl: IFD0 → ExifIFD → MakerNote. Returns None when the
+/// tag is missing/malformed (caller falls back to the center-crop heuristic).
+#[doc(hidden)]
+pub fn parse_sensor_info(data: &[u8]) -> Option<SensorInfo> {
+    if data.len() < 16 { return None; }
+    let le = match &data[0..4] {
+        [0x49, 0x49, 0x2A, 0x00] => true,
+        [0x4D, 0x4D, 0x00, 0x2A] => false,
+        _ => return None,
+    };
+    if &data[8..10] != b"CR" { return None; }
+    let ifd0_off = read_u32(data, 4, le) as usize;
+
+    let mut exif_ifd_off: u32 = 0;
+    visit_ifd(data, ifd0_off, le, |tag, _dtype, _cnt, val, _ip| {
+        if tag == 0x8769 { exif_ifd_off = val; }
+    });
+    if exif_ifd_off == 0 || (exif_ifd_off as usize) >= data.len() { return None; }
+
+    let mut makernote_off: u32 = 0;
+    let mut makernote_len: u32 = 0;
+    visit_ifd(data, exif_ifd_off as usize, le, |tag, _dtype, cnt, val, _ip| {
+        if tag == 0x927C { makernote_off = val; makernote_len = cnt; }
+    });
+    if makernote_off == 0 || makernote_len < 2 { return None; }
+    let mn_off = makernote_off as usize;
+    if mn_off.checked_add(2).map_or(true, |e| e > data.len()) { return None; }
+
+    let mut si: Option<SensorInfo> = None;
+    visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
+        // SensorInfo: ≥ 9 SHORTs (idx 0 reserved, 1..=8 geometry). cnt>2 ⇒ out-of-line.
+        if tag == 0x00E0 && dtype == 3 && cnt >= 9 {
+            let p = if cnt <= 2 { ip } else { val as usize };
+            // 9 SHORTs = 18 bytes needed from p.
+            if p.checked_add(18).map_or(true, |e| e > data.len()) { return; }
+            let at = |i: usize| read_u16(data, p + i * 2, le);
+            let cand = SensorInfo {
+                sensor_width:  at(1),
+                sensor_height: at(2),
+                left:   at(5),
+                top:    at(6),
+                right:  at(7),
+                bottom: at(8),
+            };
+            // Sanity: borders must be ordered and inside the sensor grid.
+            if cand.left < cand.right
+                && cand.top < cand.bottom
+                && (cand.right as usize) < cand.sensor_width as usize
+                && (cand.bottom as usize) < cand.sensor_height as usize
+            {
+                si = Some(cand);
+            }
+        }
+    });
+    si
+}
+
 /// Fused multi-slice reassembly + crop. Builds the final crop_w×crop_h raster
 /// directly from the STACKED slice decode buffer — no full-raster temp, no
 /// zero-fill, no separate crop pass. Row-major output construction: for each
