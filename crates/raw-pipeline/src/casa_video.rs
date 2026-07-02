@@ -42,7 +42,7 @@
 use crate::jxl_casaencoder::{
     encode_chunked, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame, WholeImageSource,
 };
-use crate::jxl_casadecoder::decode_interleaved;
+use crate::jxl_casadecoder::{decode_interleaved, Channels, DecodeOptions, Decoder};
 use rayon::prelude::*;
 
 pub const CASV_MAGIC: u32 = 0x5641_5343; // 'CASV' little-endian
@@ -1423,10 +1423,64 @@ pub fn encode_casv_delta_bbox_rgb8(
     Ok(out)
 }
 
+/// Persistent per-loop decode state for the CASV decode paths: one reusable
+/// [`Decoder`] (a single `JxlDecoderCreate` for the whole video instead of one
+/// per frame) plus u8/u16 scratch buffers reused across frames (region payloads
+/// — replace-pixel atlas/crop and residuals — are pure scratch, so their
+/// allocations amortize to zero after the first frame). Byte-exact vs the
+/// per-frame `decode_interleaved` path by construction: `decode_into_dims`
+/// drives the same `run_full_into` loop with the same `DecodeOptions::default()`
+/// (the decoder resets between decodes on every exit path).
+struct CasvDecodeSession {
+    dec: Decoder,
+    /// u8 region scratch (replace-pixel atlas / bbox crop).
+    px8: Vec<u8>,
+    /// u16 residual scratch (full-frame / bbox / tile-atlas residuals).
+    px16: Vec<u16>,
+}
+
+impl CasvDecodeSession {
+    fn new() -> Option<Self> {
+        Self::with_threads(1)
+    }
+
+    /// `num_threads <= 1` = single-threaded (bit-for-bit the shape
+    /// `decode_interleaved` had); `> 1` holds a persistent libjxl thread runner
+    /// across all frames — MT decode is deterministic and byte-identical to ST
+    /// (pinned by `parallel_decode_byte_identical_to_serial`).
+    fn with_threads(num_threads: usize) -> Option<Self> {
+        Some(CasvDecodeSession {
+            dec: Decoder::with_threads(DecodeOptions::default(), num_threads)?,
+            px8: Vec::new(),
+            px16: Vec::new(),
+        })
+    }
+
+    /// Decode `jxl` into the u8 scratch; `(width, height)` on success.
+    fn decode_u8(&mut self, jxl: &[u8]) -> Option<(u32, u32)> {
+        let (w, h, _) = self.dec.decode_into_dims::<u8>(jxl, Channels::Rgb, &mut self.px8).ok()?;
+        Some((w, h))
+    }
+
+    /// Decode `jxl` into the u16 scratch; `(width, height)` on success.
+    fn decode_u16(&mut self, jxl: &[u8]) -> Option<(u32, u32)> {
+        let (w, h, _) = self.dec.decode_into_dims::<u16>(jxl, Channels::Rgb, &mut self.px16).ok()?;
+        Some((w, h))
+    }
+
+    /// Decode a full frame into `out` (the reconstruction buffer), reusing its
+    /// capacity across frames.
+    fn decode_frame_into(&mut self, jxl: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let (w, h, _) = self.dec.decode_into_dims::<u8>(jxl, Channels::Rgb, out).ok()?;
+        Some((w, h))
+    }
+}
+
 /// Reconstruct a P-frame in place: `prev` holds the previous reconstructed frame
 /// and is mutated into the current frame. Handles both full-residual and
 /// bounding-box P-frames. `None` on malformed payloads.
 fn apply_pframe(
+    sess: &mut CasvDecodeSession,
     prev: &mut [u8],
     is_bbox: bool,
     is_tile: bool,
@@ -1450,19 +1504,22 @@ fn apply_pframe(
             return None;
         }
         let bitmap = &slice[2..2 + bitmap_len];
-        let changed: Vec<usize> =
-            (0..n).filter(|&i| bitmap[i / 8] & (1 << (i % 8)) != 0).collect();
-        if changed.is_empty() {
+        // Changed-tile positions are read straight off the bitmap (same
+        // ascending order, same count as the old collected Vec — zero alloc).
+        let tile_set = |i: usize| bitmap[i / 8] & (1 << (i % 8)) != 0;
+        let changed_count = (0..n).filter(|&i| tile_set(i)).count();
+        if changed_count == 0 {
             return Some(());
         }
         let (w, ts) = (width as usize, t as usize);
         if is_replace {
             // lossy tier: atlas holds fresh pixels — replace each tile.
-            let (atlas, aw, ah) = decode_interleaved::<u8>(&slice[2 + bitmap_len..], 3)?;
-            if aw != t || ah != t * changed.len() as u32 {
+            let (aw, ah) = sess.decode_u8(&slice[2 + bitmap_len..])?;
+            if aw != t || ah != t * changed_count as u32 {
                 return None;
             }
-            for (slot, &i) in changed.iter().enumerate() {
+            let atlas = &sess.px8;
+            for (slot, i) in (0..n).filter(|&i| tile_set(i)).enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(w - tx * ts);
@@ -1475,11 +1532,12 @@ fn apply_pframe(
             }
             return Some(());
         }
-        let (atlas, aw, ah) = decode_interleaved::<u16>(&slice[2 + bitmap_len..], 3)?;
-        if aw != t || ah != t * changed.len() as u32 {
+        let (aw, ah) = sess.decode_u16(&slice[2 + bitmap_len..])?;
+        if aw != t || ah != t * changed_count as u32 {
             return None;
         }
-        for (slot, &i) in changed.iter().enumerate() {
+        let atlas = &sess.px16;
+        for (slot, i) in (0..n).filter(|&i| tile_set(i)).enumerate() {
             let tx = (i as u32 % txn) as usize;
             let ty = (i as u32 / txn) as usize;
             let bw = ts.min(w - tx * ts);
@@ -1497,11 +1555,11 @@ fn apply_pframe(
         return Some(());
     }
     if !is_bbox {
-        let (resid, _, _) = decode_interleaved::<u16>(slice, 3)?;
-        if resid.len() != prev.len() {
+        sess.decode_u16(slice)?;
+        if sess.px16.len() != prev.len() {
             return None;
         }
-        add_residual16_into(prev, &resid);
+        add_residual16_into(prev, &sess.px16);
         return Some(());
     }
     if slice.len() < 8 {
@@ -1514,17 +1572,18 @@ fn apply_pframe(
     }
     if is_replace {
         // lossy tier: payload is fresh pixels for the rect — overwrite, don't add.
-        let (pixels, dw, dh) = decode_interleaved::<u8>(&slice[8..], 3)?;
-        if dw != bw || dh != bh || pixels.len() != (bw * bh * 3) as usize {
+        let (dw, dh) = sess.decode_u8(&slice[8..])?;
+        if dw != bw || dh != bh || sess.px8.len() != (bw * bh * 3) as usize {
             return None;
         }
-        blit_into(prev, width, x, y, bw, bh, &pixels);
+        blit_into(prev, width, x, y, bw, bh, &sess.px8);
         return Some(());
     }
-    let (resid, dw, dh) = decode_interleaved::<u16>(&slice[8..], 3)?;
-    if dw != bw || dh != bh || resid.len() != (bw * bh * 3) as usize {
+    let (dw, dh) = sess.decode_u16(&slice[8..])?;
+    if dw != bw || dh != bh || sess.px16.len() != (bw * bh * 3) as usize {
         return None;
     }
+    let resid = &sess.px16;
     let w = width as usize;
     for row in 0..bh as usize {
         let dst = ((y as usize + row) * w + x as usize) * 3;
@@ -1537,51 +1596,62 @@ fn apply_pframe(
 }
 
 /// Decode a single frame to interleaved RGB8. For a P-frame this decodes forward
-/// from the preceding I-frame (O(GOP)), reconstructing each residual.
+/// from the preceding I-frame (O(GOP)), reconstructing each residual. One
+/// persistent decoder + reused scratch serve the whole chain.
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
     let start = preceding_iframe(data, index)?;
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
-    let mut cur: Option<Vec<u8>> = None;
+    let mut sess = CasvDecodeSession::new()?;
+    let mut cur: Vec<u8> = Vec::new();
     for i in start..=index {
         let (is_p, slice) = casv_frame_info(data, i)?;
         if is_p {
-            let mut prev = cur.take()?;
-            apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-            cur = Some(prev);
+            // A P-frame needs a full previous reconstruction (`cur` is non-empty
+            // exactly when a prior I-frame decoded with validated dims).
+            if cur.is_empty() {
+                return None;
+            }
+            apply_pframe(&mut sess, &mut cur, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
         } else {
-            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
+            let (dw, dh) = sess.decode_frame_into(slice, &mut cur)?;
             if (dw, dh) != (w, h) {
                 return None;
             }
-            cur = Some(px);
         }
     }
-    cur.map(|px| (px, w, h))
+    if cur.is_empty() {
+        return None;
+    }
+    Some((cur, w, h))
 }
 
 /// Decode every frame in order, reconstructing P-frames against the running
-/// previous frame. `None` if any frame fails to decode.
+/// previous frame. `None` if any frame fails to decode. One persistent decoder
+/// + reused reconstruction/scratch buffers serve the whole video (no per-frame
+/// `JxlDecoderCreate`/`Destroy`, no per-frame region mallocs).
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
+    let mut sess = CasvDecodeSession::new()?;
     let mut out = Vec::with_capacity(hdr.frame_count as usize);
-    let mut prev: Option<Vec<u8>> = None;
+    let mut recon: Vec<u8> = Vec::new();
     for i in 0..hdr.frame_count as usize {
         let (is_p, slice) = casv_frame_info(data, i)?;
-        let recon = if is_p {
-            let mut base = prev.take()?;
-            apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-            base
+        if is_p {
+            // A P-frame needs a full previous reconstruction (`recon` is
+            // non-empty exactly when a prior I-frame decoded with valid dims).
+            if recon.is_empty() {
+                return None;
+            }
+            apply_pframe(&mut sess, &mut recon, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
         } else {
-            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
+            let (dw, dh) = sess.decode_frame_into(slice, &mut recon)?;
             if (dw, dh) != (w, h) {
                 return None;
             }
-            px
-        };
-        prev = Some(recon.clone());
-        out.push((recon, w, h));
+        }
+        out.push((recon.clone(), w, h));
     }
     Some(out)
 }
