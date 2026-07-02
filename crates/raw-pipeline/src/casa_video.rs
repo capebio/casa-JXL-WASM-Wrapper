@@ -899,38 +899,43 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
     let expected = (width as usize) * (height as usize) * 3;
     let gop = gop_len.max(1) as usize;
 
-    let mut streams: Vec<(u32, Vec<u8>)> = Vec::with_capacity(frames.len());
-    for (idx, px) in frames.iter().enumerate() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
-        }
-        if idx % gop == 0 {
-            streams.push((0, encode_rgb8(px, width, height, opts.clone())?));
-            continue;
-        }
-        let mut payload = Vec::new();
-        // Detect genuinely-changed regions vs the previous SOURCE frame (comparing
-        // against a lossy reconstruction would flag the whole frame via quant
-        // noise). `thresh` skips near-static regions — essential on noisy real
-        // content.
-        match changed_bbox_thresh(px, frames[idx - 1], width, height, thresh) {
-            None => {
-                for _ in 0..4 {
-                    payload.extend_from_slice(&0u16.to_le_bytes());
+    // Each frame depends only on resident source frames (change detection runs
+    // on `frames[idx-1]`, never on encoder state) → encode in parallel, exactly
+    // like the lossless siblings (order preserved by collect).
+    let streams: Vec<(u32, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            if idx % gop == 0 {
+                return Ok((0, encode_rgb8(px, width, height, opts.clone())?));
+            }
+            let mut payload = Vec::new();
+            // Detect genuinely-changed regions vs the previous SOURCE frame
+            // (comparing against a lossy reconstruction would flag the whole
+            // frame via quant noise). `thresh` skips near-static regions —
+            // essential on noisy real content.
+            match changed_bbox_thresh(px, frames[idx - 1], width, height, thresh) {
+                None => {
+                    for _ in 0..4 {
+                        payload.extend_from_slice(&0u16.to_le_bytes());
+                    }
+                }
+                Some((x, y, bw, bh)) => {
+                    let crop = crop_rgb(px, width, x, y, bw, bh); // fresh pixels, not a residual
+                    let jxl = encode_rgb8(&crop, bw, bh, opts.clone())?;
+                    payload.extend_from_slice(&(x as u16).to_le_bytes());
+                    payload.extend_from_slice(&(y as u16).to_le_bytes());
+                    payload.extend_from_slice(&(bw as u16).to_le_bytes());
+                    payload.extend_from_slice(&(bh as u16).to_le_bytes());
+                    payload.extend_from_slice(&jxl);
                 }
             }
-            Some((x, y, bw, bh)) => {
-                let crop = crop_rgb(px, width, x, y, bw, bh); // fresh pixels, not a residual
-                let jxl = encode_rgb8(&crop, bw, bh, opts.clone())?;
-                payload.extend_from_slice(&(x as u16).to_le_bytes());
-                payload.extend_from_slice(&(y as u16).to_le_bytes());
-                payload.extend_from_slice(&(bw as u16).to_le_bytes());
-                payload.extend_from_slice(&(bh as u16).to_le_bytes());
-                payload.extend_from_slice(&jxl);
-            }
-        }
-        streams.push((CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG, payload));
-    }
+            Ok((CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG, payload))
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
 
     let header = CasvHeader {
         width, height, frame_count: frames.len() as u32, fps_num, fps_den, flags: 0,
@@ -979,48 +984,52 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
     let (txn, _tyn) = tile_grid(width, height, t);
     let (w, ts) = (width as usize, t as usize);
 
-    let mut streams: Vec<(u32, Vec<u8>)> = Vec::with_capacity(frames.len());
-    for (idx, px) in frames.iter().enumerate() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
-        }
-        if idx % gop == 0 {
-            streams.push((0, encode_rgb8(px, width, height, opts.clone())?));
-            continue;
-        }
-        // Changed tiles detected vs the previous SOURCE frame (see the bbox path).
-        let map = changed_tile_map_thresh(px, frames[idx - 1], width, height, t, thresh);
-        let changed: Vec<usize> =
-            map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
-
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&(t as u16).to_le_bytes());
-        let bitmap_len = map.len().div_ceil(8);
-        let mut bitmap = vec![0u8; bitmap_len];
-        for &i in &changed {
-            bitmap[i / 8] |= 1 << (i % 8);
-        }
-        payload.extend_from_slice(&bitmap);
-
-        if !changed.is_empty() {
-            // atlas of FRESH pixels (not residuals), zero-padded edge tiles.
-            let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
-            for (slot, &i) in changed.iter().enumerate() {
-                let tx = (i as u32 % txn) as usize;
-                let ty = (i as u32 / txn) as usize;
-                let bw = ts.min(w - tx * ts);
-                let bh = ts.min(height as usize - ty * ts);
-                for row in 0..bh {
-                    let src = ((ty * ts + row) * w + tx * ts) * 3;
-                    let dst = ((slot * ts + row) * ts) * 3;
-                    atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
-                }
+    // Frame-parallel exactly like the lossless tiled sibling: change detection
+    // reads only source frames, so P-frames have no encoder-state dependency.
+    let streams: Vec<(u32, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
             }
-            let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone())?;
-            payload.extend_from_slice(&jxl);
-        }
-        streams.push((CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG, payload));
-    }
+            if idx % gop == 0 {
+                return Ok((0, encode_rgb8(px, width, height, opts.clone())?));
+            }
+            // Changed tiles detected vs the previous SOURCE frame (see the bbox path).
+            let map = changed_tile_map_thresh(px, frames[idx - 1], width, height, t, thresh);
+            let changed: Vec<usize> =
+                map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(t as u16).to_le_bytes());
+            let bitmap_len = map.len().div_ceil(8);
+            let mut bitmap = vec![0u8; bitmap_len];
+            for &i in &changed {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+            payload.extend_from_slice(&bitmap);
+
+            if !changed.is_empty() {
+                // atlas of FRESH pixels (not residuals), zero-padded edge tiles.
+                let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+                for (slot, &i) in changed.iter().enumerate() {
+                    let tx = (i as u32 % txn) as usize;
+                    let ty = (i as u32 / txn) as usize;
+                    let bw = ts.min(w - tx * ts);
+                    let bh = ts.min(height as usize - ty * ts);
+                    for row in 0..bh {
+                        let src = ((ty * ts + row) * w + tx * ts) * 3;
+                        let dst = ((slot * ts + row) * ts) * 3;
+                        atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
+                    }
+                }
+                let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone())?;
+                payload.extend_from_slice(&jxl);
+            }
+            Ok((CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG, payload))
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
 
     let header = CasvHeader {
         width, height, frame_count: frames.len() as u32, fps_num, fps_den, flags: 0,
