@@ -414,12 +414,12 @@ interface LibjxlWasmModule {
   _jxl_wasm_decode_rgba8(inputPtr: number, inputSize: number, downsample: number): number;
   _jxl_wasm_decode_rgba16?(inputPtr: number, inputSize: number, downsample: number): number;
   _jxl_wasm_decode_rgbaf32?(inputPtr: number, inputSize: number, downsample: number): number;
-  _jxl_wasm_encode_rgba8(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
-  _jxl_wasm_encode_rgba16?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
+  _jxl_wasm_encode_rgba8(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
+  _jxl_wasm_encode_rgba16?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
   _jxl_wasm_encode_rgb16_planar?(rPtr: number, gPtr: number, bPtr: number, width: number, height: number, distance: number, effort: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
-  _jxl_wasm_encode_rgbaf32?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
-  _jxl_wasm_encode_rgba8_with_metadata?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number): number;
-  _jxl_wasm_encode_rgba8_with_metadata_adv?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number, idsPtr: number, valuesPtr: number, count: number): number;
+  _jxl_wasm_encode_rgbaf32?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
+  _jxl_wasm_encode_rgba8_with_metadata?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number): number;
+  _jxl_wasm_encode_rgba8_with_metadata_adv?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number, idsPtr: number, valuesPtr: number, count: number): number;
   _jxl_wasm_buffer_data(handle: number): number;
   _jxl_wasm_buffer_size(handle: number): number;
   _jxl_wasm_buffer_width(handle: number): number;
@@ -2306,7 +2306,12 @@ class LibjxlEncoder implements JxlEncoder {
         const distance = this.options.distance ?? distanceFromQuality(this.options.quality);
         const hasAlpha = this.options.hasAlpha ? 1 : 0;
         const caps = getCapabilities(module);
-        const { progressiveDc, progressiveAc, qProgressiveAc, buffering } = resolveEncoderBridgeSettings(this.options);
+        const { progressiveDc, progressiveAc, qProgressiveAc, buffering, groupOrder } = resolveEncoderBridgeSettings(this.options);
+        const resampling = this.options.resampling ?? 1;
+        // ICC/EXIF/XMP can only ride the buffered encode_rgba8_with_metadata
+        // path — enc_push_pixels (streaming encode) has no metadata parameters
+        // and would silently drop the boxes.
+        const hasMetadata = this.options.iccProfile !== null || this.options.exif !== null || this.options.xmp !== null;
 
         // Sidecar thumbnails — yield smallest first for faster first-paint.
         if (this.sortedSidecarSizes.length > 0 && caps.sidecars) {
@@ -2354,7 +2359,7 @@ class LibjxlEncoder implements JxlEncoder {
           } finally {
             module._free(dimsPtr);
           }
-        } else if (caps.streamingEncode) {
+        } else if (caps.streamingEncode && !hasMetadata) {
           // #11: streaming encoder — yields 256 KB chunks, reducing peak JS heap usage.
           const fmtIndex = this.options.format === "rgbaf32" ? 2 : this.options.format === "rgba16" ? 1 : this.options.format === "rgb8" ? 3 : 0;
             const encState = module._jxl_wasm_enc_create!();
@@ -2377,7 +2382,6 @@ class LibjxlEncoder implements JxlEncoder {
           // Use metadata path if any metadata is present.
           // fmt: 0=rgba8, 1=rgba16, 2=rgbaf32, 3=rgb8 — matches bridge parameter order.
           const fmt = this.options.format === "rgba16" ? 1 : this.options.format === "rgbaf32" ? 2 : this.options.format === "rgb8" ? 3 : 0;
-          const hasMetadata = this.options.iccProfile !== null || this.options.exif !== null || this.options.xmp !== null;
           if (hasMetadata && module._jxl_wasm_encode_rgba8_with_metadata) {
             const iccView = this.options.iccProfile ? copyOrBorrowInput(this.options.iccProfile, false) : new Uint8Array(0);
             const exifView = this.options.exif ? copyOrBorrowInput(this.options.exif, false) : new Uint8Array(0);
@@ -2422,6 +2426,7 @@ class LibjxlEncoder implements JxlEncoder {
                   ptr, this.options.width, this.options.height,
                   distance, this.options.effort, fmt, hasAlpha,
                   progressiveDc, progressiveAc, qProgressiveAc, buffering,
+                  groupOrder, resampling,
                   iccPtr, iccSize,
                   exifPtr, exifSize,
                   xmpPtr, xmpSize,
@@ -2432,6 +2437,7 @@ class LibjxlEncoder implements JxlEncoder {
                   ptr, this.options.width, this.options.height,
                   distance, this.options.effort, fmt, hasAlpha,
                   progressiveDc, progressiveAc, qProgressiveAc, buffering,
+                  groupOrder, resampling,
                   iccPtr, iccSize,
                   exifPtr, exifSize,
                   xmpPtr, xmpSize
@@ -2447,11 +2453,11 @@ class LibjxlEncoder implements JxlEncoder {
             // Fallback: plain encode (no metadata) used when bridge fn absent
             // or when no metadata was provided.
             if (this.options.format === "rgba16" && module._jxl_wasm_encode_rgba16) {
-              handle = module._jxl_wasm_encode_rgba16(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering);
+              handle = module._jxl_wasm_encode_rgba16(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering, groupOrder, resampling);
             } else if (this.options.format === "rgbaf32" && module._jxl_wasm_encode_rgbaf32) {
-              handle = module._jxl_wasm_encode_rgbaf32(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering);
+              handle = module._jxl_wasm_encode_rgbaf32(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering, groupOrder, resampling);
             } else {
-              handle = module._jxl_wasm_encode_rgba8(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering);
+              handle = module._jxl_wasm_encode_rgba8(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering, groupOrder, resampling);
             }
           }
           const encoded = takeBuffer(module, handle, "encode");

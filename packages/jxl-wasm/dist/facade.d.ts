@@ -85,6 +85,24 @@ export interface DecoderOptions {
     emitEveryPass: boolean;
     progressiveDetail?: ProgressiveDetail;
     /**
+     * Target number of progressive AC paints (including the final image) when
+     * `progressiveDetail` resolves to `"passes"`. Undefined/0 keeps libjxl's
+     * per-pass pausing. A value in [2, num_passes) makes the decoder emit ~N
+     * evenly spaced ::JXL_DEC_FRAME_PROGRESSION events instead of one per encoded
+     * pass, trading refinement granularity against per-paint flush cost.
+     * @note Requires a WASM rebuild exposing `_jxl_wasm_dec_set_paint_target`;
+     * silently ignored on older modules.
+     */
+    progressivePaintTarget?: number;
+    /**
+     * Allow progressive pausing for VarDCT images with alpha (or other extra
+     * channels). libjxl disables progressive pausing whenever an extra channel is
+     * present; this opt-in lifts that — intermediate flushes are valid and the
+     * final image is byte-exact. No effect on modular images.
+     * @note Requires a WASM rebuild from the patched libjxl; ignored otherwise.
+     */
+    allowAlphaProgressive?: boolean;
+    /**
      * Strip ICC profile from decoded output.
      * @note **WASM no-op.** `_jxl_wasm_dec_create` has no ICC-strip parameter.
      * ICC is always preserved in the WASM decoder path. Honoured by jxl-native.
@@ -122,6 +140,10 @@ export interface DecoderOptions {
     targetHeight?: number | null;
     fitMode?: "contain" | "cover" | "stretch" | null;
     onMetric?: (name: string, value: number) => void;
+    /** Optional: pre-allocate chunk buffer at session start if file size is known upfront. Improves first-batch latency. */
+    expectedBytes?: number;
+    /** When true, emit pixel buffers without transferring ownership (decoder reuses buffer across frames). Default false. */
+    deferredRelease?: boolean;
 }
 export interface EncoderOptions {
     format: PixelFormat;
@@ -191,11 +213,56 @@ export interface EncoderOptions {
     /**
      * Extra channels to encode alongside the main image (Phase 2 full support).
      * Each descriptor's pixel data is supplied out-of-band for the low-level path
-     * (or future high-level Encoder extension). The 72-byte packed descriptor form
+     * (or future high-level Encoder extension). The 20-byte packed descriptor form
      * (matching WasmExtraChannel in bridge.cpp) is used for the WASM FFI.
      * (serializeExtraChannelsForWasm + post-malloc plane_ptr writes by caller.)
      */
     extraChannels?: ExtraChannel[];
+    /** Optional structured telemetry sink; mirrors DecoderOptions.onMetric. Read by LibjxlEncoder. */
+    onMetric?: (name: string, value: number) => void;
+    /**
+     * EXIF orientation tag (1..8). 1 = identity (default), 3 = 180°, 6 = 90° CW, 8 = 90° CCW.
+     * Stored in JXL basic info — pixels stay sensor-native, no CPU rotation on encode.
+     * Requires the _z WASM variant (streamingInputZ capability).
+     */
+    orientation?: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+    /**
+     * CasaSneyers_Parity (Ch3): display width in pixels when it differs from encoded pixel width
+     * (e.g. Retina @2×). Stored as JxlBasicInfo.intrinsic_xsize. 0 / omit = same as encoded width.
+     * Must be paired with intrinsicHeight. Requires streamingInputZ capability.
+     */
+    intrinsicWidth?: number;
+    /**
+     * CasaSneyers_Parity (Ch3): display height in pixels when it differs from encoded pixel height.
+     * Stored as JxlBasicInfo.intrinsic_ysize. 0 / omit = same as encoded height.
+     * Must be paired with intrinsicWidth. Requires streamingInputZ capability.
+     */
+    intrinsicHeight?: number;
+    /**
+     * CasaSneyers_Parity: disable psychovisual (butteraugli/XYB) heuristics for fair codec
+     * benchmarking. -1 = encoder default (heuristics enabled), 1 = disable.
+     * Maps to JXL_ENC_FRAME_SETTING_DISABLE_PERCEPTUAL_HEURISTICS (ID 39).
+     * Requires streamingInputZ capability.
+     */
+    disablePerceptualHeuristics?: -1 | 1;
+    /**
+     * Force a specific JXL codestream level. -1 = libjxl automatic (default), 5 = level 5,
+     * 10 = level 10. Values other than 5 and 10 are ignored (libjxl rejects them).
+     * Requires streamingInputZ capability.
+     */
+    codestreamLevel?: -1 | 5 | 10;
+    /**
+     * Horizontal center offset (pixels, signed) for center-out group ordering.
+     * Only meaningful when groupOrder === 1. 0 = image center (default).
+     * Currently a bridge passthrough; libjxl does not yet expose a public API for this.
+     */
+    centerX?: number;
+    /**
+     * Vertical center offset (pixels, signed) for center-out group ordering.
+     * Only meaningful when groupOrder === 1. 0 = image center (default).
+     * Currently a bridge passthrough; libjxl does not yet expose a public API for this.
+     */
+    centerY?: number;
 }
 /**
  * Named constants for common JXL_ENC_FRAME_SETTING_* values.
@@ -269,6 +336,12 @@ export interface JxlEncoder {
     /** Populated after chunks() completes normally. Null before or on error. */
     getStats(): EncodeStats | null;
 }
+interface ResizeAxis {
+    i0: Int32Array;
+    i1: Int32Array;
+    t: Float32Array;
+    fixed256?: Int16Array;
+}
 interface LibjxlWasmModule {
     HEAPU8: Uint8Array;
     HEAP32: Int32Array;
@@ -278,12 +351,12 @@ interface LibjxlWasmModule {
     _jxl_wasm_decode_rgba8(inputPtr: number, inputSize: number, downsample: number): number;
     _jxl_wasm_decode_rgba16?(inputPtr: number, inputSize: number, downsample: number): number;
     _jxl_wasm_decode_rgbaf32?(inputPtr: number, inputSize: number, downsample: number): number;
-    _jxl_wasm_encode_rgba8(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
-    _jxl_wasm_encode_rgba16?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
+    _jxl_wasm_encode_rgba8(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
+    _jxl_wasm_encode_rgba16?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
     _jxl_wasm_encode_rgb16_planar?(rPtr: number, gPtr: number, bPtr: number, width: number, height: number, distance: number, effort: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
-    _jxl_wasm_encode_rgbaf32?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
-    _jxl_wasm_encode_rgba8_with_metadata?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number): number;
-    _jxl_wasm_encode_rgba8_with_metadata_adv?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number, idsPtr: number, valuesPtr: number, count: number): number;
+    _jxl_wasm_encode_rgbaf32?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
+    _jxl_wasm_encode_rgba8_with_metadata?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number): number;
+    _jxl_wasm_encode_rgba8_with_metadata_adv?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number, iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number, idsPtr: number, valuesPtr: number, count: number): number;
     _jxl_wasm_buffer_data(handle: number): number;
     _jxl_wasm_buffer_size(handle: number): number;
     _jxl_wasm_buffer_width(handle: number): number;
@@ -294,6 +367,8 @@ interface LibjxlWasmModule {
     _jxl_wasm_buffer_free(handle: number): void;
     _jxl_wasm_dec_create?(format: number, progressiveDetail: number): number;
     _jxl_wasm_dec_create_x?(format: number, progressiveDetail: number, flags: number): number;
+    _jxl_wasm_dec_set_paint_target?(state: number, paints: number): void;
+    _jxl_wasm_dec_set_region?(state: number, x: number, y: number, w: number, h: number, downsample: number): void;
     _jxl_wasm_dec_push?(state: number, dataPtr: number, size: number): number;
     _jxl_wasm_dec_close_input?(state: number): void;
     _jxl_wasm_dec_width?(state: number): number;
@@ -316,6 +391,10 @@ interface LibjxlWasmModule {
     _jxl_wasm_enc_create_image?(width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
     _jxl_wasm_enc_create_image_x?(width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, modular: number, brotliEffort: number, decodingSpeed: number, photonNoiseIso: number, resampling: number, jpegKeepExif: number, jpegKeepXmp: number, jpegKeepJumbf: number, alreadyDownsampled: number, upsamplingMode: number, ecResampling: number): number;
     _jxl_wasm_enc_create_image_y?(width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, modular: number, brotliEffort: number, decodingSpeed: number, photonNoiseIso: number, resampling: number, epf: number, gaborish: number, dots: number, patches: number, colorTransform: number, centerX: number, centerY: number, jpegKeepExif: number, jpegKeepXmp: number, jpegKeepJumbf: number, alreadyDownsampled: number, upsamplingMode: number, ecResampling: number): number;
+    _jxl_wasm_enc_create_image_z?(width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, modular: number, brotliEffort: number, decodingSpeed: number, photonNoiseIso: number, resampling: number, epf: number, gaborish: number, dots: number, patches: number, colorTransform: number, orientation: number, centerX: number, centerY: number, jpegKeepExif: number, jpegKeepXmp: number, jpegKeepJumbf: number, alreadyDownsampled: number, upsamplingMode: number, ecResampling: number): number;
+    _jxl_wasm_enc_set_intrinsic_size?(state: number, w: number, h: number): void;
+    _jxl_wasm_enc_set_frame_flags?(state: number, disablePerceptual: number): void;
+    _jxl_wasm_enc_set_codestream_level?(state: number, level: number): void;
     _jxl_wasm_enc_create_image_adv?(width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, idsPtr: number, valuesPtr: number, count: number): number;
     _jxl_wasm_enc_pixels_ptr?(state: number, size: number): number;
     _jxl_wasm_enc_advance_written?(state: number, size: number): number;
@@ -368,12 +447,15 @@ export declare function setJxlModuleFactoryForTesting(factory: JxlModuleFactory 
 export declare function setForcedTier(tier: Tier | null): void;
 export declare function getForcedTier(): Tier | null;
 export declare function createDecoder(options: DecoderOptions): JxlDecoder;
-export declare const EC_BYTES = 72;
+export declare const EC_BYTES = 20;
 /**
- * Serializes ExtraChannel[] to a 72*N byte ArrayBuffer for the EC encode FFI.
- * Names UTF-8 truncated to 31 bytes, zero-padded. plane_ptr/plane_size left as 0 (filled by caller after malloc).
+ * Serializes ExtraChannel[] to a 20*N byte ArrayBuffer for the EC encode FFI.
+ * Layout matches `struct WasmExtraChannel` in bridge.cpp exactly — the ONLY consumer:
+ *   0:type(u32), 4:bits(u32), 8:distance(f32), 12:plane_ptr(u32), 16:plane_size(u32).
+ * plane_ptr/plane_size left as 0 (filled by caller after per-plane malloc).
  * Returns { buffer, view } for direct DataView writes of pointers/sizes by caller.
- * Offsets match bridge.cpp WasmExtraChannel exactly (critical for num_ec > 0; prior 56B caused overlap).
+ * NOTE: dimShift / spotColor / name on ExtraChannel are NOT serialized — the C++ struct
+ * does not read them yet. Wiring them requires growing WasmExtraChannel in bridge.cpp first.
  */
 export declare function serializeExtraChannelsForWasm(channels: ExtraChannel[]): {
     buffer: ArrayBuffer;
@@ -399,6 +481,8 @@ export declare class ButteraugliComparator {
     private readonly height;
     private refPtr;
     private refStatePtr;
+    private candidatePtr;
+    private candidateCap;
     private constructor();
     static create(reference: ArrayBuffer | Uint8Array, width: number, height: number): Promise<ButteraugliComparator>;
     compare(candidate: ArrayBuffer | Uint8Array): number;
@@ -480,6 +564,7 @@ export declare function encodeTileContainerRgba8(pixels: ArrayBuffer | Uint8Arra
     distance?: number;
     effort?: number;
     hasAlpha?: boolean;
+    onMetric?: (name: string, value: number) => void;
 }): Promise<Uint8Array>;
 /**
  * Encode RGBA16 as a JXTC tile container — N independent standalone JXL bitstreams
@@ -491,6 +576,7 @@ export declare function encodeTileContainerRgba16(pixels: ArrayBuffer | Uint8Arr
     distance?: number;
     effort?: number;
     hasAlpha?: boolean;
+    onMetric?: (name: string, value: number) => void;
 }): Promise<Uint8Array>;
 export declare function encodeRgb16Planar(r: Uint16Array | number, g: Uint16Array | number, b: Uint16Array | number, width: number, height: number, distance?: number, effort?: number, progressiveDc?: number, progressiveAc?: number, qProgressiveAc?: number, buffering?: number, groupOrder?: number, resampling?: number): Promise<Uint8Array>;
 /**
@@ -542,6 +628,7 @@ export interface DecodeViewportOptions {
     progressionTarget?: "header" | "dc" | "pass" | "final";
     emitEveryPass?: boolean;
     progressiveDetail?: ProgressiveDetail;
+    progressivePaintTarget?: number;
 }
 export declare function decodeViewport(options: DecodeViewportOptions): JxlDecoder;
 export interface DecodeRegionLodOptions {
@@ -562,6 +649,26 @@ export declare function pixelToNormalizedExtent(region: Region, imageWidth: numb
     w: number;
     h: number;
 };
+export interface JxlCapabilities {
+    progressiveDecode: boolean;
+    streamingEncode: boolean;
+    streamingInput: boolean;
+    streamingInputX: boolean;
+    streamingInputY: boolean;
+    streamingInputZ: boolean;
+    sidecars: boolean;
+    jpegTranscode: boolean;
+}
+export declare function getCapabilities(module: LibjxlWasmModule): JxlCapabilities;
+export declare function applyRegionAndDownsample(data: Uint8Array, width: number, height: number, region: Region | null, downsample: 1 | 2 | 4 | 8, bytesPerChannel?: number): {
+    data: Uint8Array;
+    width: number;
+    height: number;
+    region?: Region;
+};
+export declare function buildResizeAxis(srcSize: number, dstSize: number, srcStart?: number, srcSpan?: number): ResizeAxis;
+export declare function bilinearResize(src: Uint8Array, srcW: number, srcH: number, dstW: number, dstH: number, stride: number, // 4=rgba8, 8=rgba16, 16=rgbaf32
+xAxisIn?: ResizeAxis, yAxisIn?: ResizeAxis): Uint8Array;
 export interface PerceptualConstancySupport {
     hasScalar: boolean;
     hasAvx2Bulk: boolean;

@@ -770,7 +770,17 @@ describe("@casabio/jxl-wasm facade", () => {
   test("encodes with ICC profile, EXIF, and XMP metadata", async () => {
     setJxlModuleFactoryForTesting(loadPreferredLibjxlModule);
     const rgba = new Uint8Array([255, 128, 64, 255]);
-    const iccProfile = new Uint8Array([1, 2, 3, 4]); // dummy ICC profile
+    // Real profile required: since the metadata arg-shift fix the ICC bytes
+    // actually reach JxlEncoderSetICCProfile, which rejects garbage. (The old
+    // 4-byte dummy only "worked" because the shifted call dropped it.)
+    let iccProfile: Uint8Array | null = null;
+    try {
+      iccProfile = new Uint8Array(
+        readFileSync(new URL("../../../external/libjxl/third_party/skcms/profiles/color.org/sRGB2014.icc", import.meta.url))
+      );
+    } catch {
+      iccProfile = null; // fixture unavailable — still exercises EXIF/XMP path
+    }
     const exif = new Uint8Array([5, 6, 7, 8]); // dummy EXIF
     const xmp = new Uint8Array([9, 10, 11, 12]); // dummy XMP
 

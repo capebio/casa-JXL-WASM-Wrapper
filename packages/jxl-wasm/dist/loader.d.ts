@@ -7,7 +7,9 @@ export interface LoaderOptions {
     fetchImpl?: typeof fetch;
     idbFactory?: IDBFactory;
     nodeFs?: {
-        readFile(path: string | URL): Promise<Uint8Array>;
+        readFile(path: string | URL, options?: {
+            signal?: AbortSignal;
+        }): Promise<Uint8Array>;
     };
     cacheDbName?: string;
     wasmUrl?: string;

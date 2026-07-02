@@ -68,7 +68,8 @@ async function compileFromResponse(response, getFreshResponse) {
                 const fresh = await getFreshResponse();
                 return WebAssembly.compile(await fresh.arrayBuffer());
             }
-            // Last-ditch: original response may be partially consumed.
+            // No refetcher provided and compileStreaming failed; body is spent.
+            throw new Error('[jxl-wasm] compileStreaming failed and no refetcher was provided to recover');
         }
     }
     return WebAssembly.compile(await response.arrayBuffer());
