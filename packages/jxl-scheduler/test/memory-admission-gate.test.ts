@@ -114,3 +114,14 @@ describe("MemoryWeightedAdmissionGate edge cases", () => {
     assert.equal(gate.runningBytes, 0);
   });
 });
+
+describe("AdmissionGate interface", () => {
+  it("accepts implementations called with or without weight", async () => {
+    // Budget fits both (a=default 256MB weightless + b=50MB) so neither queues.
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 512 * MB });
+    const r1 = await gate.admit("a", "visible");        // no weight → default
+    const r2 = await gate.admit("b", "near", 50 * MB);  // explicit weight
+    r1(); r2();
+    assert.equal(gate.runningBytes, 0);
+  });
+});

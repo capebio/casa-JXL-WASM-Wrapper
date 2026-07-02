@@ -378,10 +378,10 @@ git commit -m "test(scheduler): lock over-budget-alone, default weight, idempote
 ```ts
 describe("AdmissionGate interface", () => {
   it("accepts implementations called with or without weight", async () => {
-    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 300 * MB });
-    // Both call shapes must type-check and run.
-    const r1 = await gate.admit("a", "visible");
-    const r2 = await gate.admit("b", "near", 50 * MB);
+    // Budget fits both (a=default 256MB weightless + b=50MB) so neither queues.
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 512 * MB });
+    const r1 = await gate.admit("a", "visible");        // no weight → default
+    const r2 = await gate.admit("b", "near", 50 * MB);  // explicit weight
     r1(); r2();
     assert.equal(gate.runningBytes, 0);
   });
