@@ -4,6 +4,23 @@ This document records optimizations proposed during pipeline reviews that were f
 
 ---
 
+## CV-E6 / JE-6: default multi-threaded libjxl runner for JOLT streaming per-frame encode — MEASURED REGRESSION/WASH (2026-07-02)
+
+**Target:** `casa_video.rs` streaming encode (`encode_casv_video_streaming{,_to}`) — wire `StreamCtx` to a threaded `Encoder::with_threads` for P-frame crops/atlases + an `encode_chunked_threaded` for I-frames, default `available_parallelism()`.
+**Byte-exactness gate PASSED:** libjxl encode output proven thread-count-invariant — whole Ghana 48f 720p corpus, all 3 JOLT presets, threads 1 vs 2 vs 8 footer streams byte-identical, plus 36/36 golden `.casv` (auto-threads) SHA-identical to the single-threaded build. Determinism was NOT the problem.
+**Rejected on the timing gate.** Single-process interleaved flipflop (arms `[1,MT,MT,1,MT,1,1,MT]`, MT=12, per-frame enc ms on the dashcam corpus, footer entry):
+
+| preset | ST median | MT(12) median | verdict |
+|---|---|---|---|
+| Realtime (d2/e1) | 36.7 (36.5–42.6) | 47.3 (40.9–48.2) | MT ~29% SLOWER, every MT arm ≥ ST cluster |
+| Balanced (d1/e3) | 83.5 | 101.9 (high variance) | MT worse / noise-dominated |
+| Quality (d0.5/e4) | 75.0 | 75.9 | wash |
+
+Why the recon's "2–4x" didn't materialize: the dominant P-frame encode is a 32-px-wide tall tile atlas — one group column of 32×256 slivers gives threads tiny work items with high per-group fixed cost, and the per-frame fork-join runner sync is paid 24×/s; at e1 the per-group work is smallest, so Realtime (the preset that needed the speedup) regresses hardest. Machine was agent-contended (which oversubscription makes worse, honestly noted), but even best-case MT arms lost to the ST cluster on Realtime.
+**Disposition:** fully reverted (no plumbing shipped — dead `threads` knobs are speculative surface). If live-capture MT is revisited: re-measure on idle hardware, and pair with the JE-8 square-ish atlas packing (format bump) that would give libjxl real 2-D group parallelism; the thread-determinism proof above stands, so only the timing gate needs re-passing.
+
+---
+
 ## ANS-R1..R3: ans_common.cc / .h ChatGPT pass (2026-06-30)
 
 Ground-truthed an external (ChatGPT) optimization pass for `lib/jxl/ans_common.{cc,h,_test.cc}` against the real libjxl-012 source and both call sites (`enc_ans.cc:706`, `dec_ans.cc:274`).
