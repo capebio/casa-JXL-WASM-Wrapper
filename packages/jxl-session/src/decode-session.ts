@@ -40,13 +40,16 @@ export function computeDecodeWeight(opts: {
   expectedOutputBytes?: number;
   targetWidth?: number | null;
   targetHeight?: number | null;
+  format?: string;
 }): number | undefined {
   const explicit = opts.expectedOutputBytes;
   if (typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0) return explicit;
   const w = opts.targetWidth;
   const h = opts.targetHeight;
   if (typeof w === "number" && typeof h === "number" && w > 0 && h > 0) {
-    const bytes = w * h * 4;
+    // Use the requested output format's bytes-per-pixel; default to 4 (rgba8) for unknown.
+    const bpp = opts.format === "rgba16" ? 8 : opts.format === "rgbaf32" ? 16 : opts.format === "rgb8" ? 3 : 4;
+    const bytes = w * h * bpp;
     if (Number.isFinite(bytes) && bytes <= Number.MAX_SAFE_INTEGER) return bytes;
   }
   return undefined;

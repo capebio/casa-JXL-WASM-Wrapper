@@ -17,3 +17,12 @@ describe("computeDecodeWeight", () => {
     assert.equal(computeDecodeWeight({ expectedOutputBytes: Number.NaN }), undefined);
   });
 });
+
+describe("computeDecodeWeight format bpp", () => {
+  it("uses the output format's bpp for the dimension fallback", () => {
+    assert.equal(computeDecodeWeight({ targetWidth: 100, targetHeight: 100, format: "rgba16" }), 100 * 100 * 8);
+    assert.equal(computeDecodeWeight({ targetWidth: 100, targetHeight: 100, format: "rgb8" }), 100 * 100 * 3);
+    assert.equal(computeDecodeWeight({ targetWidth: 100, targetHeight: 100, format: "rgbaf32" }), 100 * 100 * 16);
+    assert.equal(computeDecodeWeight({ targetWidth: 100, targetHeight: 100 }), 100 * 100 * 4); // default rgba8
+  });
+});
