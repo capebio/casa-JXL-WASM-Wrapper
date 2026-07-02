@@ -413,6 +413,19 @@ pub trait VideoFrameSource {
     fn fps(&self) -> (u32, u32);
     /// Next frame's interleaved RGB8 (`len == w*h*3`), or `None` at end of stream.
     fn next_frame(&mut self) -> Option<Vec<u8>>;
+    /// Pull the next frame into `buf`, returning `false` at end of stream. The
+    /// default delegates to [`Self::next_frame`]; sources that can fill a
+    /// caller buffer should override it so the streaming encoder's ping-pong
+    /// frame buffers avoid a fresh allocation per frame.
+    fn next_frame_into(&mut self, buf: &mut Vec<u8>) -> bool {
+        match self.next_frame() {
+            Some(v) => {
+                *buf = v;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 /// **Streaming** lossy-tier encode: pulls frames one at a time from `src` and
@@ -441,6 +454,12 @@ struct StreamCtx {
     /// create/destroy + settings resend and appends compressed bytes straight
     /// into `payload` (no intermediate Vec + memcpy).
     enc: Encoder,
+    /// Per-frame scratch reused across frames (capacity persists; contents are
+    /// rebuilt from empty every frame, so reuse cannot leak stale bytes).
+    changed: Vec<usize>,
+    bitmap: Vec<u8>,
+    atlas: Vec<u8>,
+    crop: Vec<u8>,
 }
 
 fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<StreamCtx, VideoError> {
@@ -460,6 +479,10 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
         tile: opts.tile,
         thresh: opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance)),
         enc: Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?,
+        changed: Vec::new(),
+        bitmap: Vec::new(),
+        atlas: Vec::new(),
+        crop: Vec::new(),
     })
 }
 
@@ -488,17 +511,23 @@ fn encode_stream_frame(
         let (txn, _tyn) = tile_grid(width, height, t);
         let (wus, ts) = (width as usize, t as usize);
         let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
-        let changed: Vec<usize> = map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+        ctx.changed.clear();
+        ctx.changed.extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
         payload.extend_from_slice(&(t as u16).to_le_bytes());
         let bitmap_len = map.len().div_ceil(8);
-        let mut bitmap = vec![0u8; bitmap_len];
-        for &i in &changed {
-            bitmap[i / 8] |= 1 << (i % 8);
+        ctx.bitmap.clear();
+        ctx.bitmap.resize(bitmap_len, 0);
+        for &i in &ctx.changed {
+            ctx.bitmap[i / 8] |= 1 << (i % 8);
         }
-        payload.extend_from_slice(&bitmap);
-        if !changed.is_empty() {
-            let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
-            for (slot, &i) in changed.iter().enumerate() {
+        payload.extend_from_slice(&ctx.bitmap);
+        if !ctx.changed.is_empty() {
+            // Zero-filled from empty every frame: edge-tile padding bytes are
+            // load-bearing (they are encoded), so a reused buffer must never
+            // leak a previous frame's pixels into the padding.
+            ctx.atlas.clear();
+            ctx.atlas.resize(ts * ts * 3 * ctx.changed.len(), 0);
+            for (slot, &i) in ctx.changed.iter().enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(wus - tx * ts);
@@ -506,11 +535,11 @@ fn encode_stream_frame(
                 for row in 0..bh {
                     let s = ((ty * ts + row) * wus + tx * ts) * 3;
                     let d = ((slot * ts + row) * ts) * 3;
-                    atlas[d..d + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
+                    ctx.atlas[d..d + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
                 }
             }
-            ctx.enc
-                .encode_into(&Frame::rgb(atlas.as_slice(), t, t * changed.len() as u32), payload)?;
+            let ah = t * ctx.changed.len() as u32;
+            ctx.enc.encode_into(&Frame::rgb(ctx.atlas.as_slice(), t, ah), payload)?;
         }
         return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
     }
@@ -521,12 +550,12 @@ fn encode_stream_frame(
             }
         }
         Some((x, y, bw, bh)) => {
-            let crop = crop_rgb(px, width, x, y, bw, bh);
+            crop_rgb_into(px, width, x, y, bw, bh, &mut ctx.crop);
             payload.extend_from_slice(&(x as u16).to_le_bytes());
             payload.extend_from_slice(&(y as u16).to_le_bytes());
             payload.extend_from_slice(&(bw as u16).to_le_bytes());
             payload.extend_from_slice(&(bh as u16).to_le_bytes());
-            ctx.enc.encode_into(&Frame::rgb(crop.as_slice(), bw, bh), payload)?;
+            ctx.enc.encode_into(&Frame::rgb(ctx.crop.as_slice(), bw, bh), payload)?;
         }
     }
     Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG)
@@ -552,19 +581,26 @@ pub fn encode_casv_video_streaming(
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
     let mut data: Vec<u8> = Vec::new();
+    // Ping-pong frame buffers: after each frame `cur` becomes `prev_src` and the
+    // old `prev_src` buffer is refilled by the source (no per-frame allocation
+    // for sources implementing `next_frame_into`).
+    let mut cur: Vec<u8> = Vec::new();
     let mut prev_src: Vec<u8> = Vec::new();
     let mut idx = 0usize;
     let mut payload = Vec::new();
 
-    while let Some(px) = src.next_frame() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+    loop {
+        std::mem::swap(&mut cur, &mut prev_src);
+        if !src.next_frame_into(&mut cur) {
+            break;
+        }
+        if cur.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: cur.len() });
         }
         payload.clear();
-        let flags = encode_stream_frame(&px, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
+        let flags = encode_stream_frame(&cur, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
         index.push((flags, payload.len() as u32));
         data.extend_from_slice(&payload);
-        prev_src = px;
         idx += 1;
     }
     if index.is_empty() {
@@ -609,21 +645,26 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
     let expected = (width as usize) * (height as usize) * 3;
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (offset, len_field)
+    // Ping-pong frame buffers (see encode_casv_video_streaming).
+    let mut cur: Vec<u8> = Vec::new();
     let mut prev_src: Vec<u8> = Vec::new();
     let mut idx = 0usize;
     let mut offset: u64 = 0;
     let mut payload = Vec::new();
 
-    while let Some(px) = src.next_frame() {
-        if px.len() != expected {
-            return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+    loop {
+        std::mem::swap(&mut cur, &mut prev_src);
+        if !src.next_frame_into(&mut cur) {
+            break;
+        }
+        if cur.len() != expected {
+            return Err(VideoError::FrameSize { idx, expected, got: cur.len() });
         }
         payload.clear();
-        let flags = encode_stream_frame(&px, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
+        let flags = encode_stream_frame(&cur, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
         sink.write_all(&payload).map_err(|_| VideoError::Io)?;
         index.push((offset as u32, (payload.len() as u32) | flags));
         offset += payload.len() as u64;
-        prev_src = px;
         idx += 1;
     }
     if index.is_empty() {
@@ -1137,13 +1178,20 @@ fn changed_bbox(cur: &[u8], prev: &[u8], width: u32, height: u32) -> Option<(u32
 
 /// Copy a `bw×bh` RGB8 sub-rectangle at `(x,y)` out of a `width`-wide image.
 fn crop_rgb(src: &[u8], width: u32, x: u32, y: u32, bw: u32, bh: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    crop_rgb_into(src, width, x, y, bw, bh, &mut out);
+    out
+}
+
+/// [`crop_rgb`] into a caller-supplied buffer (cleared first; capacity reused).
+fn crop_rgb_into(src: &[u8], width: u32, x: u32, y: u32, bw: u32, bh: u32, out: &mut Vec<u8>) {
     let (w, x, y, bw, bh) = (width as usize, x as usize, y as usize, bw as usize, bh as usize);
-    let mut out = Vec::with_capacity(bw * bh * 3);
+    out.clear();
+    out.reserve(bw * bh * 3);
     for row in 0..bh {
         let start = ((y + row) * w + x) * 3;
         out.extend_from_slice(&src[start..start + bw * 3]);
     }
-    out
 }
 
 /// Report whether P-frame `index` is stored in bounding-box form.
@@ -2270,6 +2318,59 @@ mod tests {
         )
         .unwrap();
         assert_ne!(e1, e3, "effort must change the encoded stream");
+    }
+
+    #[test]
+    fn streaming_tile_scratch_reuse_matches_batch_on_edge_tiles() {
+        // Non-multiple-of-16 dims → the right/bottom edge tiles carry zero
+        // padding inside the atlas, and that padding is ENCODED. The changed
+        // tile count varies frame to frame, so a reused streaming atlas that
+        // failed to re-zero would leak the previous frame's pixels into the
+        // padding and change output bytes. The batch encoder allocates a fresh
+        // zeroed atlas per frame — byte-equal P-frame payloads prove the
+        // streaming scratch reuse is clean.
+        let (w, h) = (40u32, 24u32); // tile 16 → 3x2 grid, 8px right + 8px bottom padding
+        let base = gradient(w, h, 7);
+        let mut frames: Vec<Vec<u8>> = vec![base.clone()];
+        let mut f1 = base.clone(); // touch every tile (max changed count)
+        for ty in 0..2u32 {
+            for tx in 0..3u32 {
+                let o = (((ty * 16 + 2) * w + tx * 16 + 2) * 3) as usize;
+                f1[o] = f1[o].wrapping_add(60);
+            }
+        }
+        frames.push(f1);
+        let mut f2 = frames[1].clone(); // only the corner edge tile (1-slot atlas)
+        let o = (((h - 2) * w + (w - 2)) * 3) as usize;
+        f2[o] = f2[o].wrapping_add(60);
+        frames.push(f2);
+        let mut f3 = frames[2].clone(); // two tiles (interior + bottom edge)
+        let o0 = ((2 * w + 2) * 3) as usize;
+        f3[o0] = f3[o0].wrapping_add(60);
+        let o1 = (((h - 2) * w + 2) * 3) as usize;
+        f3[o1] = f3[o1].wrapping_add(60);
+        frames.push(f3);
+
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 8,
+            skip: SkipMode::Tile,
+            tile: 16,
+            effort: 3,
+            thresh: Some(0),
+        };
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let batch = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();
+        let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let stream = encode_casv_video_streaming(&mut src, &opts).unwrap();
+        for i in 1..frames.len() {
+            assert_eq!(
+                casv_frame_slice(&batch, i).unwrap(),
+                casv_frame_slice(&stream, i).unwrap(),
+                "P-frame {i}: reused streaming scratch must match batch's fresh buffers"
+            );
+        }
+        assert!(decode_casv_all_rgb8(&stream).is_some());
     }
 
     #[test]
