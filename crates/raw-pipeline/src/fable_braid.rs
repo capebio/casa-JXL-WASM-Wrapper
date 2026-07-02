@@ -177,8 +177,14 @@ fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>) {
 }
 
 /// slot → freq(12b) << 20 | offset-within-symbol(12b) << 8 | sym(8b)
-fn build_decode_table(freqs: &[u16; 256]) -> Vec<u32> {
-    let mut tab = vec![0u32; TAB_SIZE as usize];
+///
+/// Fills a caller-owned scratch (16 KiB) so per-plane decode allocates nothing.
+/// Callers verify `sum(freqs) == TAB_SIZE` first, so the slot loop writes every
+/// entry; the resize zero-fill runs once per scratch lifetime.
+fn build_decode_table_into(freqs: &[u16; 256], tab: &mut Vec<u32>) {
+    if tab.len() != TAB_SIZE as usize {
+        tab.resize(TAB_SIZE as usize, 0);
+    }
     let mut slot = 0usize;
     for s in 0..256u32 {
         let f = freqs[s as usize] as u32;
@@ -188,7 +194,6 @@ fn build_decode_table(freqs: &[u16; 256]) -> Vec<u32> {
         }
     }
     debug_assert_eq!(slot, TAB_SIZE as usize);
-    tab
 }
 
 /// Braided rANS decoder over one shared stream. Bounds-safety without a branch:
@@ -199,21 +204,15 @@ struct RansDecoder<'a> {
     buf: &'a [u8],
     pos: usize,
     end2: usize, // last valid u16 offset
-    tab: Vec<u32>,
+    tab: &'a [u32],
 }
 
 impl<'a> RansDecoder<'a> {
-    fn new(states: [u32; LANES], buf: &'a [u8], freqs: &[u16; 256]) -> Option<Self> {
+    fn new(states: [u32; LANES], buf: &'a [u8], tab: &'a [u32]) -> Option<Self> {
         if buf.len() < 2 {
             return None;
         }
-        Some(RansDecoder {
-            x: states,
-            buf,
-            pos: 0,
-            end2: buf.len() - 2,
-            tab: build_decode_table(freqs),
-        })
+        Some(RansDecoder { x: states, buf, pos: 0, end2: buf.len() - 2, tab })
     }
 
     /// Decode the *entire* symbol sequence into `out` in one run (must be
@@ -222,7 +221,7 @@ impl<'a> RansDecoder<'a> {
     /// the stream cursor (one add). The clamped read keeps a corrupt stream
     /// memory-safe; `finish()` rejects its garbage.
     fn decode_all(&mut self, out: &mut [u8]) {
-        let tab = self.tab.as_slice();
+        let tab = self.tab;
         let buf = self.buf;
         let end2 = self.end2;
         let mut pos = self.pos;
@@ -465,24 +464,27 @@ fn encode_plane(plane: &[u8], w: usize, h: usize, pred: Predictor, out: &mut Vec
 }
 
 /// Decode one plane; `ext` must be Some(w*h bytes) iff the plane was encoded
-/// with `Predictor::External`. Returns the decoded plane.
+/// with `Predictor::External`. `tab_scratch`/`resbuf` are caller-owned scratch
+/// (reused across planes/frames — no per-plane allocation). Returns the plane.
 fn decode_plane(
     r: &mut Reader,
     w: usize,
     h: usize,
     ext: Option<&[u8]>,
+    tab_scratch: &mut Vec<u32>,
+    resbuf: &mut Vec<u8>,
 ) -> Option<Vec<u8>> {
     let pred_id = r.u8()?;
     let transform = r.u8()?;
     if transform > TRANSFORM_LEFT_DELTA {
         return None;
     }
-    let modes = r.take(h)?.to_vec();
+    let modes = r.take(h)?;
     let n_syms = r.u32()? as usize;
 
     // Decode the whole braided symbol sequence up front (one aligned run —
     // lane K owns symbol indices ≡ K mod 8); rows then slice it.
-    let mut resbuf: Vec<u8> = Vec::new();
+    resbuf.clear();
     if n_syms > 0 {
         if n_syms > w * h {
             return None;
@@ -503,9 +505,20 @@ fn decode_plane(
         }
         let rans_len = r.u32()? as usize;
         let stream = r.take(rans_len)?;
-        let mut dec = RansDecoder::new(states, stream, &freqs)?;
-        resbuf = vec![0u8; n_syms];
-        dec.decode_all(&mut resbuf);
+        build_decode_table_into(&freqs, tab_scratch);
+        let mut dec = RansDecoder::new(states, stream, tab_scratch)?;
+        // No zero-fill: decode_all writes every byte of the slice before any
+        // byte is read (the chunks_exact_mut loop covers len − len%8, the
+        // remainder loop writes the rest; every step is a pure store to the
+        // output). Initialization-order proof: between set_len and decode_all
+        // there is no read and no panic path (decode_all indexes fixed-size
+        // chunks and uses masked table lookups — no bounds panic, no unwind).
+        // Miri view: fresh capacity stays untyped until the stores in
+        // decode_all initialize each byte; reused capacity is already
+        // initialized. u8 has no drop glue, so error-path drops never read.
+        resbuf.reserve(n_syms);
+        unsafe { resbuf.set_len(n_syms) };
+        dec.decode_all(resbuf);
         if !dec.finish() {
             return None;
         }
@@ -521,7 +534,13 @@ fn decode_plane(
         _ => return None,
     }
 
-    let mut plane = vec![0u8; w * h];
+    // No zero-fill: the row loop below writes row y in full (copy_from_slice
+    // in every mode arm) before anything reads it; the Top predictor reads
+    // only rows < y, each fully written by an earlier iteration; COPY/External
+    // predictions read `zero_row`/`ext`, never `plane`. Error paths return
+    // None and drop the Vec — u8 has no drop glue, dealloc never reads.
+    let mut plane: Vec<u8> = Vec::with_capacity(w * h);
+    unsafe { plane.set_len(w * h) };
     let zero_row = vec![0u8; w];
     let mut decoded_syms = 0usize;
     for y in 0..h {
@@ -869,11 +888,20 @@ fn decode_planes(bytes: &[u8], ext: Option<[&[u8]; 3]>) -> Option<(Vec<Vec<u8>>,
         return None;
     }
     let mut planes = Vec::with_capacity(3);
+    let mut tab_scratch = Vec::new();
+    let mut resbuf = Vec::new();
     for i in 0..3usize {
         let len = r.u32()? as usize;
         let blob = r.take(len)?;
         let mut pr = Reader { b: blob, p: 0 };
-        planes.push(decode_plane(&mut pr, w as usize, h as usize, ext.map(|e| e[i]))?);
+        planes.push(decode_plane(
+            &mut pr,
+            w as usize,
+            h as usize,
+            ext.map(|e| e[i]),
+            &mut tab_scratch,
+            &mut resbuf,
+        )?);
     }
     Some((planes, w, h, rct))
 }
@@ -997,7 +1025,9 @@ mod tests {
         }
         let freqs = normalize_freqs(&hist).unwrap();
         let (states, stream) = rans_encode(&syms, &freqs);
-        let mut dec = RansDecoder::new(states, &stream, &freqs).unwrap();
+        let mut tab = Vec::new();
+        build_decode_table_into(&freqs, &mut tab);
+        let mut dec = RansDecoder::new(states, &stream, &tab).unwrap();
         let mut out = vec![0u8; syms.len()];
         dec.decode_all(&mut out);
         assert!(dec.finish(), "final state check");
@@ -1011,7 +1041,9 @@ mod tests {
         hist[7] = 999;
         let freqs = normalize_freqs(&hist).unwrap();
         let (states, stream) = rans_encode(&syms, &freqs);
-        let mut dec = RansDecoder::new(states, &stream, &freqs).unwrap();
+        let mut tab = Vec::new();
+        build_decode_table_into(&freqs, &mut tab);
+        let mut dec = RansDecoder::new(states, &stream, &tab).unwrap();
         let mut out = vec![0u8; 999];
         dec.decode_all(&mut out);
         assert!(dec.finish());
