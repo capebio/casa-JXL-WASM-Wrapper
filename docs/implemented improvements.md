@@ -370,7 +370,7 @@ Ten deferred items attempted + JOLT lossy video. Winners below; the losers (down
 
 ### JOLT — JXL-Optimized Lossy Transport (new)
 
-The lossy CASV tier is now a branded codec profile (`docs/jolt-lossy-video.md`): JXL VarDCT intra (chunked constant-peak encoder) + fresh-pixel REPLACE-skip P-frames with in-loop reconstruct. New in this batch: **rate metadata in the container** (CasvHeader.flags bit0=lossy, distance q0.1 in bits 8..15, effort in 16..19 + accessors; CASR rate box for footer/streamed files with legacy-safe parsing), **presets** (`JoltPreset::{Realtime, Balanced, Quality}`), one-call `jolt_encode` / `jolt_encode_stream_to`, and `examples/jolt_bench.rs`.
+The lossy CASAVA (Casabio's Video Apparatus) tier is now a branded codec profile (`docs/jolt-lossy-video.md`): JXL VarDCT intra (chunked constant-peak encoder) + fresh-pixel REPLACE-skip P-frames with in-loop reconstruct. New in this batch: **rate metadata in the container** (CasvHeader.flags bit0=lossy, distance q0.1 in bits 8..15, effort in 16..19 + accessors; CASR rate box for footer/streamed files with legacy-safe parsing), **presets** (`JoltPreset::{Realtime, Balanced, Quality}`), one-call `jolt_encode` / `jolt_encode_stream_to`, and `examples/jolt_bench.rs`.
 
 Measured on 48 real dashcam frames @1280×720 (single-threaded decode, 24 fps budget):
 

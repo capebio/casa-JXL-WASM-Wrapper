@@ -1,7 +1,8 @@
 # JOLT — JXL-Optimized Lossy Transport
 
-**JOLT** is the lossy streaming profile of the CASV video container
-(`crates/raw-pipeline/src/casa_video.rs`). It is built for *quick and
+**JOLT** is the lossy streaming profile of **CASAVA** — *Casabio's Video
+Apparatus* — the video container
+(`crates/raw-pipeline/src/casa_video.rs`; on-disk tag `CASV`, `.casv`). It is built for *quick and
 efficient* video streaming: JXL VarDCT intra frames encoded with the chunked
 constant-peak encoder, plus fresh-pixel **REPLACE-skip** P-frames (bbox or
 tile) with in-loop reconstruction so encoder and decoder never drift.
@@ -72,6 +73,6 @@ near-real-time; GOP-parallel encode multiplies throughput by core count.)
   video-codec spec §3.5, not built. JOLT is quality-targeted (distance).
 - **Motion models / temporal prediction** beyond replace-skip — block-MC
   measured worse on real content; parked.
-- **Browser playback** — CASV/JOLT is native-only (`not(target_arch =
+- **Browser playback** — CASAVA/JOLT is native-only (`not(target_arch =
   "wasm32")`); the browser side has Motion-JXL `EncodeAnimation` only.
 - **Mux** (audio, seek tables beyond the frame index, MP4/WebM wrapping).

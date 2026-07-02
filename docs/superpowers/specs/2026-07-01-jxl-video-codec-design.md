@@ -1,5 +1,9 @@
 # JPEG XL as a Video Codec — Design Contemplation
 
+> **Format name: CASAVA — *Casabio's Video Apparatus*.** The container this paper
+> designs ships as CASAVA. Its on-disk tag / magic (`CASV`, `.casv`) and all code
+> identifiers keep the `casv` spelling; "CASAVA" is the public-facing name.
+
 **Date:** 2026-07-01
 **Status:** Design / feasibility contemplation (pre-plan)
 **Worktree:** `C:\Foo\rcw-video-codec` on branch `docs/jxl-video-codec-jul01`
