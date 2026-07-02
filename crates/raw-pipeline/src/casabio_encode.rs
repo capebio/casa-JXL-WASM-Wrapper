@@ -11,7 +11,10 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::jxl_casaencoder::{Encoder, EncodeOptions, Frame, GroupOrder};
+use crate::jxl_casaencoder::{
+    distance_from_quality, encode_chunked_threaded, EncodeOptions, Encoder, Frame, GroupOrder,
+    WholeImageSource,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceType {
@@ -431,7 +434,7 @@ fn encode_variants_rgb_cancellable(
                             if cancel.load(Ordering::Acquire) {
                                 return Err(EncodeError::Cancelled);
                             }
-                            encode_variant_rgb(rgb, width, height, full_quality, EFFORT_FULL, opts, width, height)
+                            encode_full_tier_rgb(rgb, width, height, full_quality, opts)
                         },
                     )
                 },
@@ -455,7 +458,7 @@ fn encode_variants_rgb_cancellable(
         let f = if coalesce_preview_full {
             p.clone()
         } else {
-            encode_rgb_into(&mut enc, rgb, width, height, full_quality, EFFORT_FULL, opts, width, height)?
+            encode_full_tier_rgb(rgb, width, height, full_quality, opts)?
         };
         (t, p, f)
     };
@@ -602,6 +605,38 @@ fn encode_variant_rgb(
 ) -> Result<Vec<u8>, EncodeError> {
     let mut enc = Encoder::new(EncodeOptions::default())?;
     encode_rgb_into(&mut enc, rgb, w, h, quality, effort, prog, orig_w, orig_h)
+}
+
+/// Full-res tier encode for the RGB-native variant core. Default-shape tiers (no
+/// progressive_dc, no group_order) route through the chunked (streaming-input) encoder:
+/// byte-identical to the whole-frame path for every production quality/distance incl.
+/// across thread counts (examples/chunked_vs_whole_ab.rs) and measured faster with a
+/// lower peak (examples/ae6_peak_probe.rs: −4.0% wall, −28MB peak RSS @9.9MP ST) —
+/// libjxl buffers O(super-tile) instead of O(frame) and skips the AddImageFrame
+/// full-frame input copy. progressive/group-order tiers keep the whole-frame encoder
+/// (those frame settings have no chunked-path equivalent).
+fn encode_full_tier_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    opts: ProgressiveOpts,
+) -> Result<Vec<u8>, EncodeError> {
+    if opts.progressive_dc == 0 && opts.group_order == 0 {
+        let mut out = Vec::new();
+        encode_chunked_threaded(
+            width,
+            height,
+            distance_from_quality(quality as f32),
+            EFFORT_FULL as i64,
+            1, // runs inside the variant fan-out — rayon already saturates cores
+            &mut WholeImageSource { data: rgb, width: width as usize },
+            &mut out,
+        )?;
+        Ok(out)
+    } else {
+        encode_variant_rgb(rgb, width, height, quality, EFFORT_FULL, opts, width, height)
+    }
 }
 
 fn resize_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, EncodeError> {
@@ -1139,10 +1174,23 @@ fn pyramid_encode_rgb(
     sides.reverse();
 
     // Full-resolution encode (serial, post-barrier → libjxl gets its own thread runner).
+    // Routed through the chunked (streaming-input) encoder: byte-identical to the
+    // whole-frame path incl. across thread counts (examples/chunked_vs_whole_ab.rs) and
+    // measured −7.1% wall / −28MB peak RSS at 9.9MP MT (examples/ae6_peak_probe.rs) —
+    // libjxl buffers O(super-tile) instead of O(frame) + the AddImageFrame copy.
     let full = {
         let threads = serial_encode_threads(width as usize * height as usize);
-        let mut enc = Encoder::with_threads(EncodeOptions::default(), threads)?;
-        encode_distance_rgb_into(&mut enc, rgb, width, height, full_distance, effort)?
+        let mut out = Vec::new();
+        encode_chunked_threaded(
+            width,
+            height,
+            full_distance,
+            effort as i64,
+            threads,
+            &mut WholeImageSource { data: rgb, width: width as usize },
+            &mut out,
+        )?;
+        out
     };
     sides.push(PyramidLevel { data: full, width, height, bits_per_sample: 8 });
     Ok(sides)
