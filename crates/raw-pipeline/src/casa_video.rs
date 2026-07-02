@@ -42,7 +42,7 @@
 use crate::jxl_casaencoder::{
     encode_chunked, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame, WholeImageSource,
 };
-use crate::jxl_casadecoder::decode_interleaved;
+use crate::jxl_casadecoder::{decode_interleaved, Channels, DecodeOptions, Decoder};
 use rayon::prelude::*;
 
 pub const CASV_MAGIC: u32 = 0x5641_5343; // 'CASV' little-endian
@@ -60,6 +60,10 @@ pub const CASV_TILE_FLAG: u32 = 0x2000_0000;
 /// (not a residual to add). Used by the lossy tier — coding real pixels keeps
 /// JXL's perceptual model correct (a residual would be misjudged).
 pub const CASV_REPLACE_FLAG: u32 = 0x1000_0000;
+
+/// All index-entry flag bits (the `len` field's payload mask is the complement).
+const CASV_FLAG_BITS: u32 =
+    CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG;
 
 // ── JOLT rate metadata (CasvHeader.flags layout) ──────────────────────────────
 // JOLT (JXL-Optimized Lossy Transport) is the lossy streaming profile of CASV.
@@ -716,33 +720,14 @@ pub fn parse_casv_rate_box(data: &[u8]) -> Option<u32> {
 }
 
 /// Decode a footer-indexed streaming `.casv` (from [`encode_casv_video_streaming_to`])
-/// by re-framing it into the header format and decoding with [`decode_casv_all_rgb8`].
+/// **in place**, straight off the trailing index — no re-framing copy of the
+/// compressed stream (the old path memcpy'd the entire file into a rebuilt
+/// header-format Vec first: ~file-size peak memory + an O(file) copy before the
+/// first frame decoded). Byte-identical output; GOP-parallel like
+/// [`decode_casv_all_rgb8`]. Streaming consumers that don't need all frames
+/// resident want [`decode_casv_footer_for_each_rgb8`].
 pub fn decode_casv_footer_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    let f = parse_casv_footer(data)?;
-    let n = f.frame_count as usize;
-    let idx_start = f.index_offset as usize; // frame codestreams occupy [0, idx_start)
-    let new_data_start = CASV_HEADER_BYTES + n * CASV_INDEX_ENTRY_BYTES;
-    let delta = new_data_start as u32;
-
-    let hdr = CasvHeader {
-        width: f.width,
-        height: f.height,
-        frame_count: f.frame_count,
-        fps_num: f.fps_num,
-        fps_den: f.fps_den,
-        flags: 0,
-    };
-    let mut out = Vec::with_capacity(new_data_start + idx_start);
-    out.extend_from_slice(&build_casv_header(&hdr));
-    for i in 0..n {
-        let e = idx_start + i * CASV_INDEX_ENTRY_BYTES;
-        let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
-        let lenf = u32::from_le_bytes(data[e + 4..e + 8].try_into().ok()?);
-        out.extend_from_slice(&off.checked_add(delta)?.to_le_bytes());
-        out.extend_from_slice(&lenf.to_le_bytes());
-    }
-    out.extend_from_slice(&data[0..idx_start]);
-    decode_casv_all_rgb8(&out)
+    decode_casv_view_all_rgb8(&CasvView::from_footer(data)?)
 }
 
 /// Encode a sequence of interleaved RGB8 frames into a `.casv` byte vector.
@@ -1105,23 +1090,9 @@ pub fn casv_frame_slice(data: &[u8], index: usize) -> Option<&[u8]> {
 /// Like `casv_frame_slice` but also reports whether the frame is a P-frame
 /// (delta) vs an I-frame (keyframe).
 pub fn casv_frame_info(data: &[u8], index: usize) -> Option<(bool, &[u8])> {
-    let hdr = parse_casv_header(data)?;
-    if index >= hdr.frame_count as usize {
-        return None;
-    }
-    let entry = CASV_HEADER_BYTES + index * CASV_INDEX_ENTRY_BYTES;
-    if data.len() < entry + CASV_INDEX_ENTRY_BYTES {
-        return None;
-    }
-    let offset = u32::from_le_bytes(data[entry..entry + 4].try_into().ok()?) as usize;
-    let len_field = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?);
-    let is_p = (len_field & CASV_PFRAME_FLAG) != 0;
-    let len = (len_field & !(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG)) as usize;
-    let end = offset.checked_add(len)?;
-    if offset < CASV_HEADER_BYTES || end > data.len() {
-        return None;
-    }
-    Some((is_p, &data[offset..end]))
+    let view = CasvView::from_header(data)?;
+    let (flags, slice) = view.entry(index)?;
+    Some((flags & CASV_PFRAME_FLAG != 0, slice))
 }
 
 /// In-place `base[i] += residual16[i] - 32768`, clamped to `[0,255]`. The clamp
@@ -1133,11 +1104,13 @@ fn add_residual16_into(base: &mut [u8], resid: &[u16]) {
     }
 }
 
-/// Index of the I-frame at or before `index` (the GOP start needed to decode it).
-fn preceding_iframe(data: &[u8], index: usize) -> Option<usize> {
+/// Index of the I-frame at or before `index` (the GOP start needed to decode
+/// it). Probes the already-parsed view — one header parse for the whole O(GOP)
+/// backward scan instead of one per probed frame.
+fn preceding_iframe(view: &CasvView, index: usize) -> Option<usize> {
     (0..=index)
         .rev()
-        .find(|&j| casv_frame_info(data, j).map(|(is_p, _)| !is_p).unwrap_or(false))
+        .find(|&j| matches!(view.entry(j), Some((flags, _)) if flags & CASV_PFRAME_FLAG == 0))
 }
 
 /// Tight bounding box `(x, y, w, h)` of pixels whose max channel difference
@@ -1453,10 +1426,144 @@ pub fn encode_casv_delta_bbox_rgb8(
     Ok(out)
 }
 
+/// Zero-copy view over a parsed CASV container, header-indexed or
+/// footer-indexed (streamed). Carries the geometry plus an index accessor that
+/// parses and validates one entry **once** per frame — `(flags, codestream)` —
+/// which is what lets footer files decode **in place** (no re-framing memcpy of
+/// the whole compressed stream) and spares the decode loops the four
+/// header/index re-parses per frame the public flag helpers would cost.
+struct CasvView<'a> {
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    frame_count: usize,
+    /// Byte offset of the index table.
+    index_pos: usize,
+    /// Frame offsets below this are invalid (header layout: the header itself).
+    min_offset: usize,
+    /// Frame slices must end at or before this (footer layout: the index start).
+    max_end: usize,
+}
+
+impl<'a> CasvView<'a> {
+    fn from_header(data: &'a [u8]) -> Option<Self> {
+        let hdr = parse_casv_header(data)?;
+        Some(CasvView {
+            data,
+            width: hdr.width,
+            height: hdr.height,
+            frame_count: hdr.frame_count as usize,
+            index_pos: CASV_HEADER_BYTES,
+            min_offset: CASV_HEADER_BYTES,
+            max_end: data.len(),
+        })
+    }
+
+    fn from_footer(data: &'a [u8]) -> Option<Self> {
+        let f = parse_casv_footer(data)?;
+        let n = f.frame_count as usize;
+        let idx_start = f.index_offset as usize;
+        // Replicate the retired re-framing decoder's per-entry
+        // `offset + delta` u32-overflow refusal so in-place decode accepts and
+        // rejects the exact same files (the case is only reachable with
+        // pathological >4 GB in-memory streams, but parity is parity).
+        let delta = (CASV_HEADER_BYTES + n * CASV_INDEX_ENTRY_BYTES) as u32;
+        for i in 0..n {
+            let e = idx_start + i * CASV_INDEX_ENTRY_BYTES;
+            let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
+            off.checked_add(delta)?;
+        }
+        Some(CasvView {
+            data,
+            width: f.width,
+            height: f.height,
+            frame_count: n,
+            index_pos: idx_start,
+            min_offset: 0,
+            max_end: idx_start,
+        })
+    }
+
+    /// `(flags, codestream slice)` for frame `index`: one parse, one validation
+    /// (the same bounds checks `casv_frame_info` performs, generalized over the
+    /// two layouts).
+    fn entry(&self, index: usize) -> Option<(u32, &'a [u8])> {
+        if index >= self.frame_count {
+            return None;
+        }
+        let e = self.index_pos + index * CASV_INDEX_ENTRY_BYTES;
+        if self.data.len() < e + CASV_INDEX_ENTRY_BYTES {
+            return None;
+        }
+        let offset = u32::from_le_bytes(self.data[e..e + 4].try_into().ok()?) as usize;
+        let len_field = u32::from_le_bytes(self.data[e + 4..e + 8].try_into().ok()?);
+        let len = (len_field & !CASV_FLAG_BITS) as usize;
+        let end = offset.checked_add(len)?;
+        if offset < self.min_offset || end > self.max_end {
+            return None;
+        }
+        Some((len_field & CASV_FLAG_BITS, &self.data[offset..end]))
+    }
+}
+
+/// Persistent per-loop decode state for the CASV decode paths: one reusable
+/// [`Decoder`] (a single `JxlDecoderCreate` for the whole video instead of one
+/// per frame) plus u8/u16 scratch buffers reused across frames (region payloads
+/// — replace-pixel atlas/crop and residuals — are pure scratch, so their
+/// allocations amortize to zero after the first frame). Byte-exact vs the
+/// per-frame `decode_interleaved` path by construction: `decode_into_dims`
+/// drives the same `run_full_into` loop with the same `DecodeOptions::default()`
+/// (the decoder resets between decodes on every exit path).
+struct CasvDecodeSession {
+    dec: Decoder,
+    /// u8 region scratch (replace-pixel atlas / bbox crop).
+    px8: Vec<u8>,
+    /// u16 residual scratch (full-frame / bbox / tile-atlas residuals).
+    px16: Vec<u16>,
+}
+
+impl CasvDecodeSession {
+    fn new() -> Option<Self> {
+        Self::with_threads(1)
+    }
+
+    /// `num_threads <= 1` = single-threaded (bit-for-bit the shape
+    /// `decode_interleaved` had); `> 1` holds a persistent libjxl thread runner
+    /// across all frames — MT decode is deterministic and byte-identical to ST
+    /// (pinned by `parallel_decode_byte_identical_to_serial`).
+    fn with_threads(num_threads: usize) -> Option<Self> {
+        Some(CasvDecodeSession {
+            dec: Decoder::with_threads(DecodeOptions::default(), num_threads)?,
+            px8: Vec::new(),
+            px16: Vec::new(),
+        })
+    }
+
+    /// Decode `jxl` into the u8 scratch; `(width, height)` on success.
+    fn decode_u8(&mut self, jxl: &[u8]) -> Option<(u32, u32)> {
+        let (w, h, _) = self.dec.decode_into_dims::<u8>(jxl, Channels::Rgb, &mut self.px8).ok()?;
+        Some((w, h))
+    }
+
+    /// Decode `jxl` into the u16 scratch; `(width, height)` on success.
+    fn decode_u16(&mut self, jxl: &[u8]) -> Option<(u32, u32)> {
+        let (w, h, _) = self.dec.decode_into_dims::<u16>(jxl, Channels::Rgb, &mut self.px16).ok()?;
+        Some((w, h))
+    }
+
+    /// Decode a full frame into `out` (the reconstruction buffer), reusing its
+    /// capacity across frames.
+    fn decode_frame_into(&mut self, jxl: &[u8], out: &mut Vec<u8>) -> Option<(u32, u32)> {
+        let (w, h, _) = self.dec.decode_into_dims::<u8>(jxl, Channels::Rgb, out).ok()?;
+        Some((w, h))
+    }
+}
+
 /// Reconstruct a P-frame in place: `prev` holds the previous reconstructed frame
 /// and is mutated into the current frame. Handles both full-residual and
 /// bounding-box P-frames. `None` on malformed payloads.
 fn apply_pframe(
+    sess: &mut CasvDecodeSession,
     prev: &mut [u8],
     is_bbox: bool,
     is_tile: bool,
@@ -1480,19 +1587,22 @@ fn apply_pframe(
             return None;
         }
         let bitmap = &slice[2..2 + bitmap_len];
-        let changed: Vec<usize> =
-            (0..n).filter(|&i| bitmap[i / 8] & (1 << (i % 8)) != 0).collect();
-        if changed.is_empty() {
+        // Changed-tile positions are read straight off the bitmap (same
+        // ascending order, same count as the old collected Vec — zero alloc).
+        let tile_set = |i: usize| bitmap[i / 8] & (1 << (i % 8)) != 0;
+        let changed_count = (0..n).filter(|&i| tile_set(i)).count();
+        if changed_count == 0 {
             return Some(());
         }
         let (w, ts) = (width as usize, t as usize);
         if is_replace {
             // lossy tier: atlas holds fresh pixels — replace each tile.
-            let (atlas, aw, ah) = decode_interleaved::<u8>(&slice[2 + bitmap_len..], 3)?;
-            if aw != t || ah != t * changed.len() as u32 {
+            let (aw, ah) = sess.decode_u8(&slice[2 + bitmap_len..])?;
+            if aw != t || ah != t * changed_count as u32 {
                 return None;
             }
-            for (slot, &i) in changed.iter().enumerate() {
+            let atlas = &sess.px8;
+            for (slot, i) in (0..n).filter(|&i| tile_set(i)).enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(w - tx * ts);
@@ -1505,11 +1615,12 @@ fn apply_pframe(
             }
             return Some(());
         }
-        let (atlas, aw, ah) = decode_interleaved::<u16>(&slice[2 + bitmap_len..], 3)?;
-        if aw != t || ah != t * changed.len() as u32 {
+        let (aw, ah) = sess.decode_u16(&slice[2 + bitmap_len..])?;
+        if aw != t || ah != t * changed_count as u32 {
             return None;
         }
-        for (slot, &i) in changed.iter().enumerate() {
+        let atlas = &sess.px16;
+        for (slot, i) in (0..n).filter(|&i| tile_set(i)).enumerate() {
             let tx = (i as u32 % txn) as usize;
             let ty = (i as u32 / txn) as usize;
             let bw = ts.min(w - tx * ts);
@@ -1527,11 +1638,11 @@ fn apply_pframe(
         return Some(());
     }
     if !is_bbox {
-        let (resid, _, _) = decode_interleaved::<u16>(slice, 3)?;
-        if resid.len() != prev.len() {
+        sess.decode_u16(slice)?;
+        if sess.px16.len() != prev.len() {
             return None;
         }
-        add_residual16_into(prev, &resid);
+        add_residual16_into(prev, &sess.px16);
         return Some(());
     }
     if slice.len() < 8 {
@@ -1544,17 +1655,18 @@ fn apply_pframe(
     }
     if is_replace {
         // lossy tier: payload is fresh pixels for the rect — overwrite, don't add.
-        let (pixels, dw, dh) = decode_interleaved::<u8>(&slice[8..], 3)?;
-        if dw != bw || dh != bh || pixels.len() != (bw * bh * 3) as usize {
+        let (dw, dh) = sess.decode_u8(&slice[8..])?;
+        if dw != bw || dh != bh || sess.px8.len() != (bw * bh * 3) as usize {
             return None;
         }
-        blit_into(prev, width, x, y, bw, bh, &pixels);
+        blit_into(prev, width, x, y, bw, bh, &sess.px8);
         return Some(());
     }
-    let (resid, dw, dh) = decode_interleaved::<u16>(&slice[8..], 3)?;
-    if dw != bw || dh != bh || resid.len() != (bw * bh * 3) as usize {
+    let (dw, dh) = sess.decode_u16(&slice[8..])?;
+    if dw != bw || dh != bh || sess.px16.len() != (bw * bh * 3) as usize {
         return None;
     }
+    let resid = &sess.px16;
     let w = width as usize;
     for row in 0..bh as usize {
         let dst = ((y as usize + row) * w + x as usize) * 3;
@@ -1567,53 +1679,207 @@ fn apply_pframe(
 }
 
 /// Decode a single frame to interleaved RGB8. For a P-frame this decodes forward
-/// from the preceding I-frame (O(GOP)), reconstructing each residual.
+/// from the preceding I-frame (O(GOP)), reconstructing each residual. One
+/// persistent decoder + reused scratch serve the whole chain.
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
-    let start = preceding_iframe(data, index)?;
-    let hdr = parse_casv_header(data)?;
-    let (w, h) = (hdr.width, hdr.height);
-    let mut cur: Option<Vec<u8>> = None;
-    for i in start..=index {
-        let (is_p, slice) = casv_frame_info(data, i)?;
-        if is_p {
-            let mut prev = cur.take()?;
-            apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-            cur = Some(prev);
+    let view = CasvView::from_header(data)?;
+    let start = preceding_iframe(&view, index)?;
+    let end = index.checked_add(1)?;
+    let (w, h) = (view.width, view.height);
+    let mut sess = CasvDecodeSession::new()?;
+    let mut cur: Vec<u8> = Vec::new();
+    decode_casv_range(&view, start..end, &mut sess, &mut cur, &mut |_, _| {})?;
+    if cur.is_empty() {
+        return None;
+    }
+    Some((cur, w, h))
+}
+
+/// Core sequential reconstruct loop: decode frames `range` in order, lending
+/// each reconstructed frame to `sink` as `(frame_index, pixels)`. `range.start`
+/// must be an I-frame unless `recon` already holds the prior reconstruction
+/// (`recon` is non-empty exactly when a frame with validated dims is resident).
+fn decode_casv_range(
+    view: &CasvView,
+    range: std::ops::Range<usize>,
+    sess: &mut CasvDecodeSession,
+    recon: &mut Vec<u8>,
+    sink: &mut impl FnMut(usize, &[u8]),
+) -> Option<()> {
+    let (w, h) = (view.width, view.height);
+    for i in range {
+        let (flags, slice) = view.entry(i)?;
+        if flags & CASV_PFRAME_FLAG != 0 {
+            // A P-frame needs a full previous reconstruction.
+            if recon.is_empty() {
+                return None;
+            }
+            apply_pframe(
+                sess,
+                recon,
+                flags & CASV_BBOX_FLAG != 0,
+                flags & CASV_TILE_FLAG != 0,
+                flags & CASV_REPLACE_FLAG != 0,
+                slice,
+                w,
+                h,
+            )?;
         } else {
-            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
+            let (dw, dh) = sess.decode_frame_into(slice, recon)?;
             if (dw, dh) != (w, h) {
                 return None;
             }
-            cur = Some(px);
         }
+        sink(i, recon);
     }
-    cur.map(|px| (px, w, h))
+    Some(())
+}
+
+/// Sequential decode loop shared by the MT batch entry point and single-GOP
+/// files: one session, one running reconstruction, one owned clone per frame.
+fn decode_casv_all_rgb8_with(
+    view: &CasvView,
+    mut sess: CasvDecodeSession,
+) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    let (w, h) = (view.width, view.height);
+    let mut out = Vec::with_capacity(view.frame_count);
+    let mut recon: Vec<u8> = Vec::new();
+    decode_casv_range(view, 0..view.frame_count, &mut sess, &mut recon, &mut |_, px| {
+        out.push((px.to_vec(), w, h))
+    })?;
+    Some(out)
 }
 
 /// Decode every frame in order, reconstructing P-frames against the running
 /// previous frame. `None` if any frame fails to decode.
+///
+/// Batch decode is **GOP-parallel**: reconstruction chains only run
+/// I-frame→P…P within a GOP, and each GOP starts at its own I-frame, so GOPs
+/// are mutually independent by construction. Each GOP decodes serially on its
+/// own worker (persistent decoder + reused buffers per worker, single-threaded
+/// inner decode — no oversubscription); ordered collect preserves frame order,
+/// so the output is byte-identical to the serial loop. Playback consumers that
+/// need frame-at-a-time latency instead of batch throughput want
+/// [`decode_casv_all_rgb8_threaded`].
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    let hdr = parse_casv_header(data)?;
-    let (w, h) = (hdr.width, hdr.height);
-    let mut out = Vec::with_capacity(hdr.frame_count as usize);
-    let mut prev: Option<Vec<u8>> = None;
-    for i in 0..hdr.frame_count as usize {
-        let (is_p, slice) = casv_frame_info(data, i)?;
-        let recon = if is_p {
-            let mut base = prev.take()?;
-            apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-            base
-        } else {
-            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
-            if (dw, dh) != (w, h) {
-                return None;
-            }
-            px
-        };
-        prev = Some(recon.clone());
-        out.push((recon, w, h));
+    decode_casv_view_all_rgb8(&CasvView::from_header(data)?)
+}
+
+/// GOP-parallel batch decode over either container layout (see
+/// [`decode_casv_all_rgb8`] for the parallelism contract).
+fn decode_casv_view_all_rgb8(view: &CasvView) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    let (w, h) = (view.width, view.height);
+    let n = view.frame_count;
+    // GOP boundaries = I-frame positions. The scan also validates every index
+    // entry up front (any malformed entry fails the whole decode, exactly as
+    // the serial loop's lazy per-frame parse would).
+    let mut starts: Vec<usize> = Vec::new();
+    for i in 0..n {
+        let (flags, _) = view.entry(i)?;
+        if flags & CASV_PFRAME_FLAG == 0 {
+            starts.push(i);
+        }
     }
-    Some(out)
+    // A leading P-frame has no reference — fail as the serial loop does.
+    if starts.first() != Some(&0) {
+        return None;
+    }
+    if starts.len() == 1 {
+        // Single GOP: nothing to fan out.
+        return decode_casv_all_rgb8_with(view, CasvDecodeSession::new()?);
+    }
+    let gops: Vec<Vec<(Vec<u8>, u32, u32)>> = starts
+        .par_iter()
+        .enumerate()
+        .map(|(k, &s)| {
+            let e = starts.get(k + 1).copied().unwrap_or(n);
+            let mut sess = CasvDecodeSession::new()?;
+            let mut recon: Vec<u8> = Vec::new();
+            let mut out = Vec::with_capacity(e - s);
+            decode_casv_range(view, s..e, &mut sess, &mut recon, &mut |_, px| {
+                out.push((px.to_vec(), w, h))
+            })?;
+            Some(out)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(gops.into_iter().flatten().collect())
+}
+
+/// Streaming decode: lend every frame, in order, to `f` as
+/// `(frame_index, pixels, width, height)` **without retaining previous
+/// frames** — peak memory is one reconstruction buffer plus decode scratch
+/// (~2 frames) instead of `frame_count × frame_size` (a 10 s 720p24 batch is
+/// ~660 MB resident; this is ~8 MB). The pixel borrow is invalidated when `f`
+/// returns (the same lend-then-reuse contract as `Decoder::decode_view`);
+/// clone inside `f` if a frame must outlive the callback. Returns the frame
+/// count; `None` if any frame fails to decode (frames already delivered to `f`
+/// stand — the return value is the success signal).
+pub fn decode_casv_for_each_rgb8(
+    data: &[u8],
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_for_each_rgb8_threaded(data, 1, f)
+}
+
+/// [`decode_casv_for_each_rgb8`] with a persistent **multi-threaded** inner
+/// libjxl decoder (`num_threads <= 1` = single-threaded, byte-identical output
+/// either way): the sequential-playback shape — frame-at-a-time latency with
+/// libjxl group parallelism inside each frame, and streaming peak memory.
+pub fn decode_casv_for_each_rgb8_threaded(
+    data: &[u8],
+    num_threads: usize,
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_view_for_each(&CasvView::from_header(data)?, num_threads, f)
+}
+
+/// Streaming decode of a **footer-indexed** (streamed/JOLT) `.casv`, straight
+/// off the index — no re-framing copy, no batch buffering. Same contract as
+/// [`decode_casv_for_each_rgb8`].
+pub fn decode_casv_footer_for_each_rgb8(
+    data: &[u8],
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_view_for_each(&CasvView::from_footer(data)?, 1, f)
+}
+
+/// [`decode_casv_footer_for_each_rgb8`] with a persistent multi-threaded inner
+/// libjxl decoder (`num_threads <= 1` = single-threaded, byte-identical).
+pub fn decode_casv_footer_for_each_rgb8_threaded(
+    data: &[u8],
+    num_threads: usize,
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_view_for_each(&CasvView::from_footer(data)?, num_threads, f)
+}
+
+fn decode_casv_view_for_each(
+    view: &CasvView,
+    num_threads: usize,
+    mut f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    let (w, h) = (view.width, view.height);
+    let mut sess = CasvDecodeSession::with_threads(num_threads)?;
+    let mut recon: Vec<u8> = Vec::new();
+    decode_casv_range(view, 0..view.frame_count, &mut sess, &mut recon, &mut |i, px| {
+        f(i, px, w, h)
+    })?;
+    Some(view.frame_count)
+}
+
+/// [`decode_casv_all_rgb8`] with a persistent **multi-threaded** libjxl decoder:
+/// the sequential-playback latency lever. Each frame's JXL decode fans out over
+/// `num_threads` libjxl worker threads (one runner held across all frames);
+/// `num_threads <= 1` is single-threaded and identical to
+/// [`decode_casv_all_rgb8`]. libjxl MT decode is deterministic and
+/// byte-identical to ST, so the output is byte-exact either way — use this
+/// where per-frame latency (not batch throughput) is the budget, e.g. the
+/// lossless-archive tier whose I/P frames are whole-image lossless decodes.
+pub fn decode_casv_all_rgb8_threaded(
+    data: &[u8],
+    num_threads: usize,
+) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    decode_casv_all_rgb8_with(&CasvView::from_header(data)?, CasvDecodeSession::with_threads(num_threads)?)
 }
 
 #[cfg(test)]
@@ -2237,6 +2503,79 @@ mod tests {
             let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
             assert!(me < 8.0, "frame {i} mean err {me}");
         }
+
+        // Footer streaming for-each delivers the same frames in order (ST + MT).
+        let mut k = 0usize;
+        let n = decode_casv_footer_for_each_rgb8(&sink, |i, px, dw, dh| {
+            assert_eq!((i, dw, dh), (k, w, h), "footer for_each frame {k} meta");
+            assert_eq!(px, via_footer[k].0.as_slice(), "footer for_each frame {k}");
+            k += 1;
+        })
+        .unwrap();
+        assert_eq!((n, k), (8, 8));
+        let mut k = 0usize;
+        decode_casv_footer_for_each_rgb8_threaded(&sink, 4, |_, px, _, _| {
+            assert_eq!(px, via_footer[k].0.as_slice(), "footer MT for_each frame {k}");
+            k += 1;
+        })
+        .unwrap();
+        assert_eq!(k, 8);
+    }
+
+    #[test]
+    fn for_each_matches_batch_decode() {
+        let (w, h) = (64u32, 48u32);
+        let src = low_motion(w, h, 7);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        // Cover residual-none, lossless tile, and lossy REPLACE bbox tiers.
+        let files = [
+            encode_casv_delta_rgb8(&refs, w, h, 24, 1, 3, EncodeOptions::lossless()).unwrap(),
+            encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, 3, 16, EncodeOptions::lossless())
+                .unwrap(),
+            encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, 1.0, 0).unwrap(),
+        ];
+        for bytes in &files {
+            let batch = decode_casv_all_rgb8(bytes).unwrap();
+            let mut streamed: Vec<(usize, Vec<u8>, u32, u32)> = Vec::new();
+            let n = decode_casv_for_each_rgb8(bytes, |i, px, dw, dh| {
+                streamed.push((i, px.to_vec(), dw, dh));
+            })
+            .unwrap();
+            assert_eq!(n, batch.len());
+            assert_eq!(streamed.len(), batch.len());
+            for (i, (si, spx, sw, sh)) in streamed.iter().enumerate() {
+                assert_eq!(*si, i, "callback order");
+                assert_eq!((spx, *sw, *sh), (&batch[i].0, batch[i].1, batch[i].2), "frame {i}");
+            }
+            // MT for-each byte-identical too.
+            let mut k = 0usize;
+            decode_casv_for_each_rgb8_threaded(bytes, 4, |i, px, _, _| {
+                assert_eq!((i, px), (k, batch[k].0.as_slice()), "MT frame {k}");
+                k += 1;
+            })
+            .unwrap();
+            assert_eq!(k, batch.len());
+        }
+    }
+
+    #[test]
+    fn threaded_decode_is_byte_identical_to_st() {
+        let (w, h) = (64u32, 48u32);
+        let src = low_motion(w, h, 6);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        // Lossless tile (residual P) + lossy bbox (REPLACE P) cover both
+        // P-frame decode kinds plus whole-frame I decodes.
+        let tile =
+            encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, 3, 16, EncodeOptions::lossless())
+                .unwrap();
+        let lossy = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, 1.0, 0).unwrap();
+        for bytes in [&tile, &lossy] {
+            let st = decode_casv_all_rgb8(bytes).unwrap();
+            let mt = decode_casv_all_rgb8_threaded(bytes, 4).unwrap();
+            assert_eq!(st, mt, "MT decode must be byte-identical to ST");
+        }
+        // num_threads <= 1 is the ST shape.
+        assert_eq!(decode_casv_all_rgb8_threaded(&tile, 1).unwrap(), decode_casv_all_rgb8(&tile).unwrap());
     }
 
     #[test]
