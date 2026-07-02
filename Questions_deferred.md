@@ -1774,14 +1774,17 @@ strip-staging (peak-RSS unmeasurable in unit test), extra-channel completeness c
 
 ## CR2 pass deferrals (perf/cr2-fused-crop-jul02-c2f8, 2026-07-02)
 
-- **Canon SensorInfo (MakerNote 0x00E0) true active area + real CFA phase.** cr2.rs
-  center-crops with even-snapping and hard-codes cfa_phase=(0,0); src/lib.rs compensates
-  with a green-channel sanity check that can retry up to 3 more full MHC demosaics
-  (~144 MB RGB pass each). Parsing SensorInfo would give the actual crop rectangle +
-  mosaic parity, kill the retries, and fix potentially off-by-one crop geometry.
-  **NOT byte-exact** — changes which sensor pixels are output → needs golden references
-  per body (550D multi-slice + cps=2 bodies), demosaicer phase plumbing verification,
-  and user sign-off. Gate: dcraw/libraw cross-reference on the 11 local fixtures.
+- **Canon SensorInfo (MakerNote 0x00E0) true active area + real CFA phase.**
+  **IMPLEMENTED 2026-07-02** on `perf/cr2-sensorinfo-jul02-a9e4` (user-approved
+  non-byte-exact pathway). Probe result: ALL 11 fixtures had the WRONG rectangle —
+  center-crop origin off by 72 (550D) / 132 (ADH) columns; the shipped output included
+  optical-black masked pixels (band mean == black level exactly, see
+  examples/cr2_activearea_evidence.rs) and discarded the same width of live image.
+  SensorInfo origin is now the default (validated: active dims == IFD0 crop, sensor
+  grid == decoded grid, fits) with even-snapped center-crop fallback; CFA phase =
+  true origin parity. Remaining follow-up: bodies whose LJPEG origin is not RGGB
+  still rely on the lib.rs green-channel net; a body with odd borders now gets the
+  correct phase directly instead of triggering retry demosaics.
 
 - **DecodeLimits before allocation.** decode_impl allows 200 MP (≈400 MB u16) before the
   browser caller's 50 MP policy check runs (post-decode). On wasm32 an adversarial header

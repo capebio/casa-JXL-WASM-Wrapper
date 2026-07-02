@@ -41,8 +41,10 @@ pub struct Cr2Image {
     pub model:        String,
     pub orientation:  u16,
     /// Bayer CFA phase (row_parity, col_parity) of the top-left cropped pixel.
-    /// (0,0) = RGGB origin (Red at top-left).  Non-(0,0) means the center-crop
-    /// heuristic landed on a non-RGGB site; the demosaicer must be told this.
+    /// (0,0) = RGGB origin (Red at top-left). Derived from the SensorInfo
+    /// active-area origin parity when the tag is present and consistent; the
+    /// center-crop fallback is even-snapped so it always reports (0,0). The
+    /// demosaicer must be told this.
     pub cfa_phase:    (u8, u8),
 }
 
@@ -498,7 +500,34 @@ impl SensorInfo {
     }
 }
 
-/// Parse Canon SensorInfo (MakerNote tag 0x00E0, SHORT array) from a CR2.
+/// Decode a MakerNote SensorInfo entry (tag 0x00E0, SHORT array, ≥ 9 elements:
+/// idx 0 reserved, 1..=8 geometry). Returns None unless the borders are ordered
+/// and inside the sensor grid.
+fn sensor_info_from_entry(
+    data: &[u8], dtype: u16, cnt: u32, val: u32, ip: usize, le: bool,
+) -> Option<SensorInfo> {
+    if dtype != 3 || cnt < 9 { return None; }
+    // cnt ≥ 9 SHORTs never fits inline, but keep the general multiply-free test.
+    let p = if cnt <= 2 { ip } else { val as usize };
+    // 9 SHORTs = 18 bytes needed from p (checked add: p is file-controlled).
+    if p.checked_add(18).map_or(true, |e| e > data.len()) { return None; }
+    let at = |i: usize| read_u16(data, p + i * 2, le);
+    let cand = SensorInfo {
+        sensor_width:  at(1),
+        sensor_height: at(2),
+        left:   at(5),
+        top:    at(6),
+        right:  at(7),
+        bottom: at(8),
+    };
+    (cand.left < cand.right
+        && cand.top < cand.bottom
+        && (cand.right as usize) < cand.sensor_width as usize
+        && (cand.bottom as usize) < cand.sensor_height as usize)
+        .then_some(cand)
+}
+
+/// Parse Canon SensorInfo (MakerNote tag 0x00E0) from a CR2.
 /// Walk mirrors decode_impl: IFD0 → ExifIFD → MakerNote. Returns None when the
 /// tag is missing/malformed (caller falls back to the center-crop heuristic).
 #[doc(hidden)]
@@ -529,31 +558,44 @@ pub fn parse_sensor_info(data: &[u8]) -> Option<SensorInfo> {
 
     let mut si: Option<SensorInfo> = None;
     visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
-        // SensorInfo: ≥ 9 SHORTs (idx 0 reserved, 1..=8 geometry). cnt>2 ⇒ out-of-line.
-        if tag == 0x00E0 && dtype == 3 && cnt >= 9 {
-            let p = if cnt <= 2 { ip } else { val as usize };
-            // 9 SHORTs = 18 bytes needed from p.
-            if p.checked_add(18).map_or(true, |e| e > data.len()) { return; }
-            let at = |i: usize| read_u16(data, p + i * 2, le);
-            let cand = SensorInfo {
-                sensor_width:  at(1),
-                sensor_height: at(2),
-                left:   at(5),
-                top:    at(6),
-                right:  at(7),
-                bottom: at(8),
-            };
-            // Sanity: borders must be ordered and inside the sensor grid.
-            if cand.left < cand.right
-                && cand.top < cand.bottom
-                && (cand.right as usize) < cand.sensor_width as usize
-                && (cand.bottom as usize) < cand.sensor_height as usize
-            {
+        if tag == 0x00E0 {
+            if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
                 si = Some(cand);
             }
         }
     });
     si
+}
+
+/// Select the crop origin + CFA phase. Prefers the camera's own SensorInfo
+/// active-area borders when they are consistent with the decoded grid and the
+/// IFD0 crop dims; otherwise falls back to the even-snapped center-crop
+/// heuristic (phase (0,0) by construction). The SensorInfo origin is NOT
+/// snapped — its true parity is carried out as the CFA phase.
+fn choose_crop_origin(
+    si: Option<SensorInfo>,
+    decoded_width: usize,
+    decoded_height: usize,
+    crop_w: usize,
+    crop_h: usize,
+) -> (usize, usize, (u8, u8)) {
+    if let Some(si) = si {
+        let (ls, ts) = (si.left as usize, si.top as usize);
+        if si.active_width() == crop_w
+            && si.active_height() == crop_h
+            && si.sensor_width as usize == decoded_width
+            && si.sensor_height as usize == decoded_height
+            && ls + crop_w <= decoded_width
+            && ts + crop_h <= decoded_height
+        {
+            return (ls, ts, ((ts & 1) as u8, (ls & 1) as u8));
+        }
+    }
+    let mut left = (decoded_width - crop_w) / 2;
+    let mut top = (decoded_height - crop_h) / 2;
+    if left & 1 != 0 { left -= 1; }
+    if top & 1 != 0 { top -= 1; }
+    (left, top, (0, 0))
 }
 
 /// Fused multi-slice reassembly + crop. Builds the final crop_w×crop_h raster
@@ -687,16 +729,18 @@ fn decode_impl(
         });
     }
 
-    // Canon MakerNote: zero-alloc WB extraction (item 5)
+    // Canon MakerNote: zero-alloc WB extraction (item 5) + SensorInfo capture
+    // (0x00E0, true active-area borders) in the same single visit.
     let mut wb_r: f32 = 2.0;
     let mut wb_b: f32 = 1.7;
+    let mut sensor_info: Option<SensorInfo> = None;
 
     if makernote_off > 0 && makernote_len >= 2 {
         let mn_off = makernote_off as usize;
         // Checked add: makernote_off is file-controlled; `mn_off + 2` can wrap on 32-bit.
         if mn_off.checked_add(2).map_or(false, |e| e <= data.len()) {
-            visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
-                if tag == 0x4001 && dtype == 3 && cnt > 0 {
+            visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| match tag {
+                0x4001 if dtype == 3 && cnt > 0 => {
                     // cnt<=2 ⟺ 2*cnt<=4 without the file-controlled multiply
                     // (2*cnt wraps usize on 32-bit/wasm for huge cnt).
                     let p = if cnt <= 2 { ip } else { val as usize };
@@ -705,6 +749,12 @@ fn decode_impl(
                         wb_b = b;
                     }
                 }
+                0x00E0 => {
+                    if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
+                        sensor_info = Some(cand);
+                    }
+                }
+                _ => {}
             });
         }
     }
@@ -861,24 +911,17 @@ fn decode_impl(
               decoded_width, sof_h, crop_w, crop_h);
     }
 
-    let mut left = (decoded_width - crop_w) / 2;
-    let mut top  = (sof_h - crop_h) / 2;
-    // Snap DOWN to even — keeps the crop within bounds.
-    if left & 1 != 0 { left -= 1; }
-    if top  & 1 != 0 { top  -= 1; }
-    // Record the Bayer CFA phase of the top-left crop pixel.
-    //
-    // After snapping both `top` and `left` to even above, (top & 1) and
-    // (left & 1) are tautologically 0, so the decoded-buffer parity is always
-    // (0, 0).  We record it explicitly rather than computing it from the snapped
-    // coordinates to make this invariant clear.
-    //
-    // The correct per-model phase (for Canon bodies whose LJPEG strip starts at
-    // an odd sensor column, i.e. decoded col 0 = Green, not Red) requires a
-    // per-model sensor-margin table that does not yet exist.  The green-channel
-    // sanity check in the caller (src/lib.rs) detects phase errors at runtime
-    // and retries the remaining three phases as a fallback.
-    let cfa_phase: (u8, u8) = (0, 0);
+    // Crop origin: prefer the camera's own active-area borders (SensorInfo,
+    // MakerNote 0x00E0) over the legacy center-crop heuristic. On real bodies
+    // the center guess is wrong by up to 132 columns — it keeps optical-black
+    // masked pixels in the output (band mean == black level) and discards the
+    // same width of live image on the opposite edge (proof:
+    // examples/cr2_activearea_evidence.rs). The CFA phase is the true origin
+    // parity (no snapping); the green-channel check in the caller (src/lib.rs)
+    // remains as a safety net for bodies whose LJPEG origin is not RGGB.
+    // Fallback (tag absent/inconsistent): even-snapped center crop, phase (0,0).
+    let (left, top, cfa_phase) =
+        choose_crop_origin(sensor_info, decoded_width, sof_h, crop_w, crop_h);
 
     if left + crop_w > decoded_width || top + crop_h > sof_h {
         bail!("CR2: crop region [left={}, top={}, w={}, h={}] exceeds decoded {}×{}",
@@ -1175,6 +1218,50 @@ mod tests {
         let dir = std::env::var("CR2_FIXTURE_DIR")
             .unwrap_or_else(|_| r"C:\Foo\raw-converter\tests".into());
         std::fs::read(std::path::Path::new(&dir).join(name)).ok()
+    }
+
+    #[test]
+    fn choose_crop_origin_prefers_valid_sensor_info() {
+        // Real ADH-body geometry: active 6000x4000 at (276,48) inside 6288x4056.
+        let si = SensorInfo { sensor_width: 6288, sensor_height: 4056, left: 276, top: 48, right: 6275, bottom: 4047 };
+        assert_eq!(choose_crop_origin(Some(si), 6288, 4056, 6000, 4000), (276, 48, (0, 0)));
+        // Odd origin → real parity carried through as CFA phase, no snapping.
+        let si_odd = SensorInfo { sensor_width: 100, sensor_height: 60, left: 5, top: 3, right: 84, bottom: 42 };
+        assert_eq!(choose_crop_origin(Some(si_odd), 100, 60, 80, 40), (5, 3, (1, 1)));
+    }
+
+    #[test]
+    fn choose_crop_origin_falls_back_when_inconsistent() {
+        // Active dims disagree with the IFD0 crop → center fallback.
+        let si = SensorInfo { sensor_width: 100, sensor_height: 60, left: 4, top: 2, right: 93, bottom: 51 };
+        assert_eq!(choose_crop_origin(Some(si), 100, 60, 80, 40), (10, 10, (0, 0)));
+        // Sensor grid disagrees with the decoded grid → center fallback.
+        let si2 = SensorInfo { sensor_width: 200, sensor_height: 60, left: 4, top: 2, right: 83, bottom: 41 };
+        assert_eq!(choose_crop_origin(Some(si2), 100, 60, 80, 40), (10, 10, (0, 0)));
+        // Tag absent → center fallback (even-snapped).
+        assert_eq!(choose_crop_origin(None, 100, 60, 80, 40), (10, 10, (0, 0)));
+        assert_eq!(choose_crop_origin(None, 101, 61, 80, 40), (10, 10, (0, 0)));
+    }
+
+    #[test]
+    fn sensor_crop_matches_grid_single_slice() {
+        // Single-slice body: the decoded grid IS the raster, so the shipped crop
+        // must equal grid rows at the SensorInfo origin, row for row.
+        let Some(data) = fixture("ADH 1234.CR2") else { return };
+        let si = parse_sensor_info(&data).expect("SensorInfo present");
+        let (off, len, stride, rows) = ljpeg_strip_geometry(&data).unwrap();
+        let img = decode_bytes(&data).unwrap();
+        assert_eq!(img.width, si.active_width());
+        assert_eq!(img.height, si.active_height());
+        let mut grid = vec![0u16; stride * rows];
+        crate::ljpeg::decode_tile(&data[off..off + len], &mut grid, 0, stride, stride, rows).unwrap();
+        let (ls, ts) = (si.left as usize, si.top as usize);
+        for &row in &[0usize, img.height / 2, img.height - 1] {
+            let g = (ts + row) * stride + ls;
+            assert_eq!(&img.raw[row * img.width..(row + 1) * img.width],
+                       &grid[g..g + img.width], "row {row}");
+        }
+        assert_eq!(img.cfa_phase, (0, 0), "ADH origin is even/even");
     }
 
     #[test]
