@@ -45,9 +45,11 @@ const config = {
       "simd": 1_363_149
     },
     enc: {
-      "relaxed-simd-mt": 3_350_000,
-      "simd-mt": 3_250_000,
-      "simd": 3_050_000
+      // +~2.7 KB for the P2c streaming encode (EncodeViaChunkedSource + JS-pull EncodeRgbStream +
+      // EM_JS glue); headroom restored to ~the prior ~6%.
+      "relaxed-simd-mt": 3_400_000,
+      "simd-mt": 3_300_000,
+      "simd": 3_100_000
     }
   },
   // Phase 1 module split: dec for viewer (decode-only, smaller), enc for ingest (lazy loaded).
@@ -109,6 +111,16 @@ const sourceDir = process.env.LIBJXL_SRC_DIR
 // (third_party are submodules already present in the fork).
 const useLocalSource = !!process.env.LIBJXL_SRC_DIR;
 
+// Resolve the git HEAD of a local libjxl source tree (submodule), for honest manifest labelling.
+async function localSourceCommit(dir) {
+  try {
+    const { execFileSync } = await import("node:child_process");
+    return execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   const insideDocker = process.argv.includes("--inside-docker");
   const hostToolchain = process.argv.includes("--host-toolchain");
@@ -146,9 +158,14 @@ async function main() {
     return;
   }
 
+  // When building from a local source tree (LIBJXL_SRC_DIR, e.g. the in-repo libjxl-012 fork),
+  // record THAT commit — not the default upstream clone pin. Otherwise the manifest mislabels a
+  // 012 dist as 0.11.2 (the trap that shipped a wrongly-tagged bridge).
+  const localLibjxlCommit = useLocalSource ? await localSourceCommit(sourceDir) : null;
   const manifest = {
     buildId: config.buildId,
-    libjxlCommit: config.libjxlCommit,
+    libjxlCommit: localLibjxlCommit ?? config.libjxlCommit,
+    libjxlSource: useLocalSource ? "local" : "clone",
     emscriptenTag: config.emscriptenTag,
     emscriptenCommit: config.emscriptenCommit,
     emsdkImage: process.env.JXL_WASM_EMSDK_IMAGE ?? null,

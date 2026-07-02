@@ -8,6 +8,12 @@ tmp/
 .flipflop/
 flipflop-corpus/
 
+# wasm-pack intermediate out-dir (the shipped RAW module is web/pkg/, copied by build-parallel-wasm.ps1)
+/pkg/
+# Local single-threaded RAW module for the headless P2c e2e harness
+# (wasm-pack build --target web --out-dir web/pkg-st --release). Not shipped; the harness gates on it.
+web/pkg-st/
+
 # ============================================================================
 # Build artifacts, dependencies, and runtime profiles
 # (These were accidentally committed in the past; this .gitignore + rm --cached

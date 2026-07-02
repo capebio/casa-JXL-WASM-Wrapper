@@ -946,6 +946,87 @@ export class ProcessResult {
 }
 if (Symbol.dispose) ProcessResult.prototype[Symbol.dispose] = ProcessResult.prototype.free;
 
+export class RawStreamExporter {
+    static __wrap(ptr) {
+        const obj = Object.create(RawStreamExporter.prototype);
+        obj.__wbg_ptr = ptr;
+        RawStreamExporterFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        RawStreamExporterFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_rawstreamexporter_free(ptr, 0);
+    }
+    /**
+     * Materialize the RGB8 band `[ypos, ypos+ysize)` and return it tightly packed
+     * (stride = width*3 ⇒ ysize*width*3 bytes). Bands MUST be pulled top-to-bottom with
+     * monotonic `ypos` and stay within `[0, height)` (the libjxl chunked pull already does),
+     * since rows below the request are dropped. wasm-bindgen copies into a JS-owned Uint8Array,
+     * so only one band exists at a time on each side.
+     * @param {number} ypos
+     * @param {number} ysize
+     * @returns {Uint8Array}
+     */
+    band(ypos, ysize) {
+        const ret = wasm.rawstreamexporter_band(this.__wbg_ptr, ypos, ysize);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * Build from DNG container bytes (comp=7 tiled or comp=1 uncompressed).
+     * @param {Uint8Array} bytes
+     * @param {number} nr_strength
+     * @returns {RawStreamExporter}
+     */
+    static from_dng(bytes, nr_strength) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.rawstreamexporter_from_dng(ptr0, len0, nr_strength);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return RawStreamExporter.__wrap(ret[0]);
+    }
+    /**
+     * Build from ORF container bytes. `nr_strength` (0 = off) + `params.texture/clarity` drive
+     * the spatial (look-adjusted) band-halo path; all-zero keeps the tone-only fast path.
+     * @param {Uint8Array} bytes
+     * @param {number} nr_strength
+     * @returns {RawStreamExporter}
+     */
+    static from_orf(bytes, nr_strength) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.rawstreamexporter_from_orf(ptr0, len0, nr_strength);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return RawStreamExporter.__wrap(ret[0]);
+    }
+    /**
+     * @returns {number}
+     */
+    get height() {
+        const ret = wasm.rawstreamexporter_height(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    get width() {
+        const ret = wasm.rawstreamexporter_width(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) RawStreamExporter.prototype[Symbol.dispose] = RawStreamExporter.prototype.free;
+
 /**
  * Rotated RGB8 buffer with updated dimensions.
  */
@@ -1762,6 +1843,9 @@ const PerceptualComparerFinalization = (typeof FinalizationRegistry === 'undefin
 const ProcessResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_processresult_free(ptr, 1));
+const RawStreamExporterFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_rawstreamexporter_free(ptr, 1));
 const RotateResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_rotateresult_free(ptr, 1));
