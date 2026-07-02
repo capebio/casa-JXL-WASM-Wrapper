@@ -29,7 +29,10 @@ export interface AdmissionGate {
      * the scheduler releases the returned token immediately in that case.
      * Implementations should resolve promptly and must tolerate the release being
      * the first and only interaction.
+     * @param weight optional estimated memory footprint (output bytes) of the task; a
+     *   memory-weighted gate uses it to bound the concurrent working set. Ignored by
+     *   gates that only count sessions.
      */
-    admit(sessionId: string, priority: Priority): Promise<AdmissionRelease>;
+    admit(sessionId: string, priority: Priority, weight?: number): Promise<AdmissionRelease>;
 }
 //# sourceMappingURL=types.d.ts.map

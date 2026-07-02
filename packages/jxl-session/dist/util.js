@@ -20,6 +20,10 @@ export function deferred() {
 export function toTransferableBuffer(chunk) {
     if (chunk instanceof ArrayBuffer)
         return chunk;
+    // chunk.buffer is ArrayBufferLike (ArrayBuffer | SharedArrayBuffer) under TS 5.5 +
+    // @types/node 22. These helpers normalize a chunk for postMessage transfer; the SAB
+    // case is handled by callers (omitted from the transfer list, shared by reference), so
+    // the cast is safe. Mirrors toTransferablePixels() in jxl-worker-browser/decode-handler.
     if (chunk.byteOffset === 0 && chunk.byteLength === chunk.buffer.byteLength) {
         return chunk.buffer;
     }

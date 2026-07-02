@@ -1,5 +1,11 @@
 import type { DecodeOptions, DecodeSession, DecodeFrameEvent, ImageInfo } from "@casabio/jxl-core";
 import type { Scheduler } from "@casabio/jxl-scheduler";
+export declare function computeDecodeWeight(opts: {
+    expectedOutputBytes?: number;
+    targetWidth?: number | null;
+    targetHeight?: number | null;
+    format?: string;
+}): number | undefined;
 export declare class DecodeSessionImpl implements DecodeSession {
     readonly id: string;
     private scheduler;
@@ -37,6 +43,14 @@ export declare class DecodeSessionImpl implements DecodeSession {
     private emitFoldedMetrics;
     private handleMessage;
     private cleanup;
+    /**
+     * @param localEarlyFinish - true when the session completes locally without a terminal
+     *   worker message (progressionTarget="header" or emitEveryPass=false non-final target).
+     *   In those cases no decode_final/decode_cancelled ack arrives, so the scheduler slot
+     *   and onMessage handler are never released by the normal terminal path — we must
+     *   release them here via completeSession().
+     *   False/absent on the normal decode_final path where the scheduler cleans up itself.
+     */
     private finish;
     private finishWithError;
     private fail;

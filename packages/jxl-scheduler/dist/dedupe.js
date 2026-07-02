@@ -132,6 +132,25 @@ export class DedupeRegistry {
         const subs = this.sessionToSubscribers.get(primaryId);
         if (subs === undefined)
             return;
+        // Hot-path fast paths. register() seeds the Set with the primary's own id, so a
+        // non-deduped session always has size 1 — the common case on the per-message
+        // dispatch path (handleWorkerMessage calls this for every worker→main message).
+        // Avoid the throwaway snapshot array there.
+        if (subs.size === 0)
+            return;
+        if (subs.size === 1) {
+            // Extract the single id, then call fn after iteration has ended, so any
+            // add/delete fn performs on the Set cannot affect this invocation — fully
+            // equivalent to the snapshot semantics below, with no array allocation.
+            let only;
+            for (const s of subs) {
+                only = s;
+                break;
+            }
+            if (only !== undefined)
+                fn(only);
+            return;
+        }
         // Spread into a local array so mutations to the Set during fn() don't skip entries.
         for (const sub of [...subs])
             fn(sub);

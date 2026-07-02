@@ -4,6 +4,64 @@
 import { JxlError } from "@casabio/jxl-core/errors";
 import { AsyncEventStream } from "./event-stream.js";
 import { deferred, newSessionId, toTransferableBuffer } from "./util.js";
+/**
+ * Forwards all user-provided EncodeOptions to worker. See encodeOptionsToStartMsg for field mapping.
+ *
+ * Intentionally omitted from MsgEncodeStart (session-level or caller-side only):
+ *   signal, onMetric, modular, brotliEffort, decodingSpeed, photonNoiseIso,
+ *   buffering, advancedControls, jpegReconstruction
+ *
+ * distance/quality defaulting is resolved by the caller before invoking this
+ * function (distance defaults to 1.0 when neither is supplied; distance wins
+ * when both are supplied).
+ */
+export function encodeOptionsToStartMsg(sessionId, opts, distance, quality) {
+    const msg = {
+        type: "encode_start",
+        sessionId,
+        format: opts.format,
+        width: opts.width,
+        height: opts.height,
+        hasAlpha: opts.hasAlpha,
+        iccProfile: opts.iccProfile != null ? toTransferableBuffer(opts.iccProfile) : null,
+        exif: opts.exif != null ? toTransferableBuffer(opts.exif) : null,
+        xmp: opts.xmp != null ? toTransferableBuffer(opts.xmp) : null,
+        distance,
+        quality,
+        effort: opts.effort ?? 4,
+        progressive: opts.progressive ?? false,
+        previewFirst: opts.previewFirst ?? false,
+        chunked: opts.chunked ?? false,
+        priority: opts.priority ?? "visible",
+    };
+    // Optional fields: assign conditionally to satisfy exactOptionalPropertyTypes
+    // (explicit undefined in an object literal is rejected by strict mode).
+    if (opts.progressiveDc != null)
+        msg.progressiveDc = opts.progressiveDc;
+    if (opts.groupOrder != null)
+        msg.groupOrder = opts.groupOrder;
+    if (opts.progressiveFlavor != null)
+        msg.progressiveFlavor = opts.progressiveFlavor;
+    if (opts.progressiveAc != null)
+        msg.progressiveAc = opts.progressiveAc;
+    if (opts.qProgressiveAc != null)
+        msg.qProgressiveAc = opts.qProgressiveAc;
+    if (opts.sidecarSizes !== undefined)
+        msg.sidecarSizes = opts.sidecarSizes;
+    if (opts.orientation != null)
+        msg.orientation = opts.orientation;
+    if (opts.centerX != null)
+        msg.centerX = opts.centerX;
+    if (opts.centerY != null)
+        msg.centerY = opts.centerY;
+    if (opts.intrinsicSize != null)
+        msg.intrinsicSize = opts.intrinsicSize;
+    if (opts.disablePerceptualHeuristics === true)
+        msg.disablePerceptualHeuristics = true;
+    if (opts.codestreamLevel != null)
+        msg.codestreamLevel = opts.codestreamLevel;
+    return msg;
+}
 const KNOWN_JXL_ERROR_CODES = new Set([
     "MalformedCodestream",
     "TruncatedStream",
@@ -16,9 +74,17 @@ const KNOWN_JXL_ERROR_CODES = new Set([
     "ConfigError",
     "QueueOverflow", // task 007-contracts-2d3e4f: was missing, decode side already had it
     "Internal",
+    "DuplicateSession", "UnhandledError", "UnhandledRejection", "WorkerError", "MessageDeserializeError",
 ]);
 function isPromiseLike(value) {
     return typeof value?.then === "function";
+}
+/** Estimated encode input footprint (width*height*bpp) used as the scheduler admission
+ *  weight. Returns undefined for hostile/overflowing dims so the gate applies its default. */
+export function computeEncodeWeight(opts) {
+    const bpp = opts.format === "rgba8" ? 4 : opts.format === "rgba16" ? 8 : opts.format === "rgb8" ? 3 : 16;
+    const bytes = opts.width * opts.height * bpp;
+    return Number.isFinite(bytes) && bytes > 0 && bytes <= Number.MAX_SAFE_INTEGER ? bytes : undefined;
 }
 export class EncodeSessionImpl {
     id;
@@ -43,56 +109,25 @@ export class EncodeSessionImpl {
         const hasQuality = opts.quality !== undefined;
         const distance = hasDistance ? opts.distance : hasQuality ? null : 1.0;
         const quality = !hasDistance && hasQuality ? opts.quality : null;
-        const startMsg = {
-            type: "encode_start",
-            sessionId: this.id,
-            format: opts.format,
-            width: opts.width,
-            height: opts.height,
-            hasAlpha: opts.hasAlpha,
-            iccProfile: opts.iccProfile != null ? toTransferableBuffer(opts.iccProfile) : null,
-            exif: opts.exif != null ? toTransferableBuffer(opts.exif) : null,
-            xmp: opts.xmp != null ? toTransferableBuffer(opts.xmp) : null,
-            distance,
-            quality,
-            effort: opts.effort ?? 4,
-            progressive: opts.progressive ?? false,
-            previewFirst: opts.previewFirst ?? false,
-            chunked: opts.chunked ?? false,
-            priority: opts.priority ?? "visible",
-        };
-        // progressiveDc + groupOrder (predator): assign conditionally to satisfy exactOptionalPropertyTypes in MsgEncodeStart
-        // (the ? in protocol + exact mode dislikes explicit undefined in the literal from opts?: )
-        if (opts.progressiveDc != null)
-            startMsg.progressiveDc = opts.progressiveDc;
-        if (opts.groupOrder != null)
-            startMsg.groupOrder = opts.groupOrder;
-        if (opts.sidecarSizes !== undefined)
-            startMsg.sidecarSizes = opts.sidecarSizes;
-        if (opts.orientation != null)
-            startMsg.orientation = opts.orientation;
-        if (opts.centerX != null)
-            startMsg.centerX = opts.centerX;
-        if (opts.centerY != null)
-            startMsg.centerY = opts.centerY;
-        if (opts.intrinsicSize != null)
-            startMsg.intrinsicSize = opts.intrinsicSize;
-        if (opts.disablePerceptualHeuristics === true)
-            startMsg.disablePerceptualHeuristics = true;
-        if (opts.codestreamLevel != null)
-            startMsg.codestreamLevel = opts.codestreamLevel;
+        const startMsg = encodeOptionsToStartMsg(this.id, opts, distance, quality);
         // No-op catch so a rejected done() promise with no caller handler (caller
         // used only chunks()) does not surface as an unhandledRejection.
         void this.doneDeferred.promise.catch(() => undefined);
         const initAcquire = (scheduler) => {
+            // Mirror decode-session: abort may fire before the async scheduler promise resolved;
+            // terminated is already set — do not acquire a slot that will never be released.
+            if (this.terminated)
+                return Promise.resolve();
             this.scheduler = scheduler;
             scheduler.onMessage(this.id, (msg) => this.handleMessage(msg));
+            const weight = computeEncodeWeight(opts);
             return scheduler.acquireSlot({
                 sessionId: this.id,
                 priority: startMsg.priority,
                 startMsg,
                 sourceKey: null,
                 signal: opts.signal ?? null,
+                ...(weight !== undefined ? { weight } : {}),
             });
         };
         this.acquirePromise = (isPromiseLike(schedulerOrPromise)
@@ -172,8 +207,11 @@ export class EncodeSessionImpl {
     getStats() {
         if (this.totalBytesWritten === null)
             return null;
-        const bpp = this.opts.format === "rgba8" ? 4 : this.opts.format === "rgba16" ? 8 : 16;
-        const originalBytes = this.opts.width * this.opts.height * bpp;
+        const bpp = this.opts.format === "rgba8" ? 4 : this.opts.format === "rgba16" ? 8 : this.opts.format === "rgb8" ? 3 : 16;
+        const rawProduct = this.opts.width * this.opts.height * bpp;
+        // Guard against non-finite or unsafe-integer result from hostile/huge dims
+        // (width*height*bpp can exceed Number.MAX_SAFE_INTEGER for very large images).
+        const originalBytes = Number.isFinite(rawProduct) && rawProduct <= Number.MAX_SAFE_INTEGER ? rawProduct : 0;
         const compressedBytes = this.totalBytesWritten;
         return {
             originalBytes,
@@ -203,39 +241,40 @@ export class EncodeSessionImpl {
     handleMessage(msg) {
         if (this.terminated)
             return;
+        // Top-level sessionId guard (mirrors decode-session DS-6 pattern) so any
+        // future message type added without an inline check is safe by default.
+        if (msg.sessionId !== this.id)
+            return;
         switch (msg.type) {
             case "encode_chunk":
-                if (msg.sessionId !== this.id)
-                    return;
+                if (msg.chunk == null)
+                    break; // defensive: malformed worker message
                 this.chunkStream.push(msg.chunk);
                 break;
             case "encode_first_byte_ready":
                 // Informational only; time_to_first_byte_ms arrives via a metric message.
-                if (msg.sessionId !== this.id)
-                    return;
                 break;
             case "encode_done":
-                if (msg.sessionId !== this.id)
-                    return;
                 // Capture sidecarOffsets before calling complete() so getStats() can
                 // return them (task 007-contracts-1a2b3c).
                 this.sidecarOffsets = msg.sidecarOffsets;
                 this.complete(msg.totalBytes);
                 break;
             case "encode_error": {
-                if (msg.sessionId !== this.id)
-                    return;
-                this.terminate(new JxlError(this.normalizeCode(msg.code), msg.message, { sessionId: this.id }));
+                this.terminate(new JxlError(this.normalizeCode(msg.code), String(msg.message).slice(0, 512), { sessionId: this.id }));
                 break;
             }
             case "encode_cancelled":
-                if (msg.sessionId !== this.id)
-                    return;
                 this.terminate(new JxlError("Cancelled", "Encode cancelled by worker", { sessionId: this.id }));
                 break;
             case "metric":
-                if (msg.sessionId === this.id && this.opts.onMetric !== undefined) {
-                    this.opts.onMetric(msg.metric);
+                if (this.opts.onMetric !== undefined) {
+                    try {
+                        this.opts.onMetric(msg.metric);
+                    }
+                    catch {
+                        // Consumer callback must not break this session's message pump.
+                    }
                 }
                 break;
             default:
@@ -273,6 +312,9 @@ export class EncodeSessionImpl {
         }
     }
     normalizeCode(code) {
+        // Cast to any for the has() call: Set<JxlErrorCode> rejects a plain string
+        // parameter under strict typing, but we deliberately receive an untyped wire
+        // string here and want the compile-time check on the Set's element type only.
         return KNOWN_JXL_ERROR_CODES.has(code) ? code : "Internal";
     }
 }
