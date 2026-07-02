@@ -1310,19 +1310,23 @@ fn choose_camera_to_srgb_matrix(
 }
 
 fn read_ascii(data: &[u8], _dtype: u16, cnt: u32, val: u32, inline_pos: usize) -> String {
-    if cnt <= 4 {
-        let b = &data[inline_pos..inline_pos + cnt as usize];
-        return String::from_utf8_lossy(b)
+    // Both branches use checked math + get(): a crafted IFD entry can place
+    // inline_pos/val near EOF (or wrap p + cnt on 32-bit wasm) — return ""
+    // instead of panicking. Valid files take identical in-bounds slices.
+    let slice = if cnt <= 4 {
+        inline_pos
+            .checked_add(cnt as usize)
+            .and_then(|end| data.get(inline_pos..end))
+    } else {
+        let p = val as usize;
+        p.checked_add(cnt as usize).and_then(|end| data.get(p..end))
+    };
+    match slice {
+        Some(b) => String::from_utf8_lossy(b)
             .trim_end_matches('\0')
-            .to_string();
+            .to_string(),
+        None => String::new(),
     }
-    let p = val as usize;
-    if p + cnt as usize > data.len() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&data[p..p + cnt as usize])
-        .trim_end_matches('\0')
-        .to_string()
 }
 
 fn type_size(t: u16) -> usize {
@@ -1376,6 +1380,21 @@ fn read_u32(data: &[u8], off: usize, le: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ascii_oob_inline_and_pointer_return_empty() {
+        let data = [b'A', b'B', b'C'];
+        // In-bounds inline read (cnt <= 4) unchanged.
+        assert_eq!(read_ascii(&data, 2, 3, 0, 0), "ABC");
+        // Inline slice past EOF: inline_pos near end, cnt 4 -> was a panic.
+        assert_eq!(read_ascii(&data, 2, 4, 0, 2), "");
+        // Inline pos itself past EOF.
+        assert_eq!(read_ascii(&data, 2, 2, 0, 7), "");
+        // Pointer read past EOF.
+        assert_eq!(read_ascii(&data, 2, 100, 1, 0), "");
+        // Pointer read with p + cnt wrapping usize on 32-bit targets.
+        assert_eq!(read_ascii(&data, 2, u32::MAX, u32::MAX, 0), "");
+    }
 
     fn assert_matrix_close(actual: [[f32; 3]; 3], expected: [[f32; 3]; 3]) {
         for row in 0..3 {
