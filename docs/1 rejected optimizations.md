@@ -1667,3 +1667,35 @@ Per the deferred docs' own analysis these cannot pay for their risk/effort; move
 - **chroma_from_luma micro-cleanups (transactional DecodeDC, u32 GetColorFactor)** — header-decode cold path, not ms-level.
 - **dec_group `RatioJPEG` hoist + compressed_dc #6 vertical chroma reuse** — JPEG-reconstruction / subsampled paths only; the RAW→XYB app pipeline is 4:4:4 and never executes them.
 - **enc_modular subsampled `AddVarDCTDC` exact allocation** — 4:2:0/4:2:2 only; the app path is 4:4:4, the branch never runs.
+
+---
+
+## AE5-JUL02: RAW input by value (`process_orf/dng/cr2` take `Vec<u8>`, drop after decompress) — REJECTED (measured wash + regression) (2026-07-02)
+
+**Claim** (recon jul02, area 7 JE-3): taking the file bytes by value and `drop(data)` right
+after the last read (decompress / dng::decode_bytes / cr2 LJPEG) frees W·H·1.5 bytes before
+the 3×-larger demosaic allocation; dlmalloc reuses the block → wasm heap high-water −36MB
+(~14%) per 24MP ORF photo. CPU-neutral, byte-exact.
+
+**Implemented and A/B-measured** (full wasm-pack nodejs builds OLD vs NEW, real fixtures
+P1110226.ORF 5240×3912 / PXL_20260501_093507165 DNG / _MG_1744.CR2, `tools/ae5-membench.mjs`
+one process per config, `WebAssembly.Memory.buffer.byteLength` after process = true monotonic
+high-water; outputs FNV-verified byte-identical across all 12 configs):
+
+| config | OLD peak MB | NEW peak MB | Δ |
+|---|---|---|---|
+| ORF flags=7 (full+lb+thumb, the classic path) | 219.0 | 263.3 | **+44.3 REGRESSION** |
+| ORF flags=1 / 17 / 9 | 233.9 | 233.9 | 0 |
+| DNG flags=7 / 9 | 152.6 | 152.6 | 0 |
+| CR2 flags=7 / 9 | 248.5 | 248.5 | 0 |
+
+Reproducible (re-run identical). **Why the theory fails:** wasm linear memory never shrinks
+and dlmalloc cannot service the 123MB `rgb16` master from the freed ~36MB input hole, so the
+early free never lowers the high-water — and on the preview+full path the perturbed
+allocation order makes dlmalloc grow the heap 44MB HIGHER. The win only exists if the freed
+block can host a later allocation of ≤ its size at the peak moment, which no full-res path does.
+
+**Not rule #10** — no work is removed (same single boundary copy either way); the change is a
+lifetime/layout gamble that measured as a wash-or-regression on its only claimed benefit.
+Reverted. Do not re-attempt without an allocator-level plan (e.g. arena for the input or
+demosaic-in-place) that provably reuses the block at the peak.
