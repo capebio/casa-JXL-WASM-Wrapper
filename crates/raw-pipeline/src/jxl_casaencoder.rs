@@ -737,17 +737,41 @@ impl ChunkedColorSource for WholeImageSource<'_> {
     }
 }
 
+/// Map a 0..=100 quality to a butteraugli distance exactly as [`Encoder::encode`]'s
+/// `Rate::Quality` path does (`JxlEncoderDistanceFromQuality`). Lets chunked-encode call
+/// sites express the production quality tiers with byte-identical rate settings.
+pub fn distance_from_quality(q: f32) -> f32 {
+    unsafe { ffi::JxlEncoderDistanceFromQuality(q) }
+}
+
 /// Streaming (chunked-frame) RGB8 encode driven by any [`ChunkedColorSource`]. libjxl pulls
 /// ≤2048² super-tiles (+border) top-to-bottom via a pull input source and writes compressed
 /// output through an output processor, so peak encoder memory is O(super-tile), not O(frame).
 /// sRGB / lossy VarDCT; streaming knobs mirror libjxl's own encode_test.cc path. APPENDS the
 /// codestream into `out` (positions are mapped past `out.len()` so append is safe). Proven
-/// byte-identical to whole-frame `encode` (density bench).
+/// byte-identical to whole-frame `encode` for the production lossy distances AND lossless
+/// (examples/chunked_vs_whole_ab.rs; lossless also test-locked in stream_export.rs).
 pub fn encode_chunked(
     w: u32,
     h: u32,
     distance: f32,
     effort: i64,
+    src: &mut dyn ChunkedColorSource,
+    out: &mut Vec<u8>,
+) -> Result<(), EncodeError> {
+    encode_chunked_threaded(w, h, distance, effort, 1, src, out)
+}
+
+/// [`encode_chunked`] with a multi-threaded parallel runner (`num_threads` ≤ 1 = no runner,
+/// identical to `encode_chunked`). Output is byte-identical across thread counts — gated by
+/// examples/chunked_vs_whole_ab.rs before any caller was wired. Use ONLY for encodes that
+/// run serially (e.g. the post-barrier full-res tier), never inside a rayon fan-out.
+pub fn encode_chunked_threaded(
+    w: u32,
+    h: u32,
+    distance: f32,
+    effort: i64,
+    num_threads: usize,
     src: &mut dyn ChunkedColorSource,
     out: &mut Vec<u8>,
 ) -> Result<(), EncodeError> {
@@ -789,9 +813,38 @@ pub fn encode_chunked(
         (*(op as *mut Out)).final_pos = Some(position as usize);
     }
 
+    // RAII for the optional runner: dropped on every exit path, after the encoder
+    // (JxlEncoderDestroy runs before each return; the guard drops at scope end).
+    struct RunnerGuard(*mut c_void);
+    impl Drop for RunnerGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { ffi::JxlThreadParallelRunnerDestroy(self.0) }
+            }
+        }
+    }
+
     unsafe {
         let enc = ffi::JxlEncoderCreate(ptr::null());
         if enc.is_null() { return Err(EncodeError::Create); }
+        // Optional MT runner (must be set before basic info / frame settings).
+        let _runner_guard = if num_threads > 1 {
+            let r = ffi::JxlThreadParallelRunnerCreate(ptr::null(), num_threads);
+            if r.is_null() {
+                ffi::JxlEncoderDestroy(enc);
+                return Err(EncodeError::Jxl("JxlThreadParallelRunnerCreate failed".into()));
+            }
+            let g = RunnerGuard(r);
+            if ffi::JxlEncoderSetParallelRunner(enc, Some(ffi::JxlThreadParallelRunner), r)
+                != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS
+            {
+                ffi::JxlEncoderDestroy(enc);
+                return Err(EncodeError::Jxl("SetParallelRunner (chunked)".into()));
+            }
+            g
+        } else {
+            RunnerGuard(ptr::null_mut())
+        };
         let mut info = std::mem::MaybeUninit::<ffi::JxlBasicInfo>::uninit();
         ffi::JxlEncoderInitBasicInfo(info.as_mut_ptr());
         let mut info = info.assume_init();
