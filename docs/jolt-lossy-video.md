@@ -4,7 +4,10 @@
 (`crates/raw-pipeline/src/casa_video.rs`). It is built for *quick and
 efficient* video streaming: JXL VarDCT intra frames encoded with the chunked
 constant-peak encoder, plus fresh-pixel **REPLACE-skip** P-frames (bbox or
-tile) with in-loop reconstruction so encoder and decoder never drift.
+tile). Drift-freedom comes from REPLACE semantics plus source-frame change
+detection: replaced regions are fresh decoder-side decodes, unchanged regions
+stay at I-frame-level error, and errors never accumulate — the encoder never
+decodes its own output (reconstruction is decoder-side only).
 
 Additive lossy residual coding is proven **not** to work in JXL — the
 perceptual model misjudges residual planes (see
