@@ -1716,3 +1716,10 @@ block can host a later allocation of ≤ its size at the peak moment, which no f
 lifetime/layout gamble that measured as a wash-or-regression on its only claimed benefit.
 Reverted. Do not re-attempt without an allocator-level plan (e.g. arena for the input or
 demosaic-in-place) that provably reuses the block at the peak.
+## TTFP-4-DNG: two-phase RAW split for DNG — previews NOT byte-identical (2026-07-02)
+
+**Target:** `web/worker.js` two-phase RAW task (previews-only WASM call first, full-res call second; landed for ORF on `perf/jf-ttfp-jul02`).
+**Proposed:** extend the split to DNG — recon noted a DNG streaming previews twin at `src/lib.rs:2404-2454`.
+**Rejected (proven by A/B):** DNG's MONOLITHIC previews are downscaled from the full-res MHC demosaic (`process_dng_impl` has no superpixel preview path — `downscale_rgb16_impl(&rgb16 /* MHC */, ...)` at lib.rs:2580), while the previews-only twin streams a 2×2 superpixel demosaic. Different demosaic source ⇒ different preview bytes. `web/two-phase-raw.test.js` pins this: thumb/lightbox SHAs diverge on the real DNG fixture while the full-res encode output stays identical. ORF does NOT have this problem because its monolithic preview build already uses the same superpixel path (`demosaic_rggb_half`) the streaming gate uses — proven byte-identical on real ORFs in the same test.
+**Re-open only if** lib.rs unifies the DNG preview sources (superpixel previews in the monolithic path, a deliberate pixel change needing its own quality sign-off) — the guard test flips and the split can be extended by changing one gate in worker.js (`canSplit`).
+**CR2:** also excluded, different reason — `decode_cr2_raw` ignores output flags at decode time (no streaming twin), so a split doubles the full decode+demosaic for zero preview speedup.

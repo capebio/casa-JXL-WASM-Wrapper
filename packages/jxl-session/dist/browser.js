@@ -8,6 +8,11 @@ export { AsyncEventStream } from "./event-stream.js";
 export { JxlError } from "@casabio/jxl-core/errors";
 export function createBrowserContext(opts) {
     const poolSize = opts?.poolSize ?? Math.max(1, Math.min(4, hardwareConcurrency() - 1));
+    // TTFP-3: prewarm one worker by default so the first decode hits a spawned
+    // worker (which also boot-loads its WASM — see jxl-worker-browser worker.ts)
+    // instead of paying spawn + fetch + compile serially. Pass prewarmSize: 0 to
+    // opt out; the pool's idle reap (idleTimeoutMs) covers never-used prewarms.
+    const effectiveOpts = { ...opts, prewarmSize: opts?.prewarmSize ?? 1 };
     if (opts?.wasmUrl !== undefined) {
         validateWasmUrl(opts.wasmUrl);
     }
@@ -20,10 +25,10 @@ export function createBrowserContext(opts) {
         ? new TieredJxlContextImpl({
             mtFactory: factoryForUrl(withWorkerTier(opts?.wasmUrl, requestedTier)),
             stFactory: factoryForUrl(withWorkerTier(opts?.wasmUrl, "simd")),
-            opts,
+            opts: effectiveOpts,
             maxWorkers: poolSize,
         })
-        : new JxlContextImpl(factoryForUrl(opts?.wasmUrl), opts, poolSize);
+        : new JxlContextImpl(factoryForUrl(opts?.wasmUrl), effectiveOpts, poolSize);
     ctx.probeCapabilities();
     return ctx;
 }

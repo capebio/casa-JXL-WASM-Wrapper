@@ -18,6 +18,11 @@ export const WorkerMsg = Object.freeze({
     REPROCESS_LIVE:       'reprocess_live',
     REPROCESS_THUMB_LIVE: 'reprocess_thumb_live',
     CANCEL:               'cancel',
+    // Prewarm: load + init the RAW-pipeline WASM (and rayon pool) before the
+    // first file task so the fetch/compile/instantiate leg overlaps user think
+    // time instead of sitting on the first thumb's critical path. Same literal
+    // the JXL decode worker uses for its own preload message.
+    PRELOAD:              'preload',
 
     // worker -> main (responses / progress)
     THUMB:          'thumb',
