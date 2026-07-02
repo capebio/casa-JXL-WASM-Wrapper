@@ -1495,17 +1495,18 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
-    let mut out = Vec::with_capacity(hdr.frame_count as usize);
+    let mut out: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(hdr.frame_count as usize);
     if hdr.flags & CASV_HDR_FABLE_FLAG != 0 {
         // FableBraid tier: one session carries the previous frame's planar
         // subtract-green form across P-frames (no per-frame re-derivation).
         let mut sess = crate::fable_braid::DeltaDecodeSession::new();
-        let mut prev: Option<Vec<u8>> = None;
         for i in 0..hdr.frame_count as usize {
             let (is_p, slice) = casv_frame_info(data, i)?;
             let recon = if is_p {
-                let base = prev.take()?;
-                sess.decode_delta(slice, &base, w, h)?
+                // The fable decoder never mutates its reference — borrow the
+                // last pushed frame instead of cloning every frame.
+                let base = &out.last()?.0;
+                sess.decode_delta(slice, base, w, h)?
             } else {
                 let (px, dw, dh) = sess.decode_intra(slice)?;
                 if (dw, dh) != (w, h) {
@@ -1513,7 +1514,6 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
                 }
                 px
             };
-            prev = Some(recon.clone());
             out.push((recon, w, h));
         }
         return Some(out);
