@@ -6,18 +6,38 @@
 /// — the H pass is a per-row scalar recurrence (sequential `sum += add - sub`),
 /// so it stays scalar in every backend; only the column-parallel V pass vectorises.
 pub(crate) fn box_blur_h(src: &[f32], tmp: &mut [f32], w: usize, h: usize, r: usize, inv: f32) {
-    let w_max = w - 1;
-    for y in 0..h {
+    // Per-row kernel: the sliding-window recurrence is sequential within a row,
+    // but rows are fully independent — identical math whether rows run serial
+    // or parallel, so the parallel path below is byte-exact by construction.
+    let row_pass = |y: usize, out_row: &mut [f32]| {
+        let w_max = w - 1;
         let base = y * w;
         let mut sum = src[base] * (r as f32 + 1.0);
         for k in 1..=r {
             sum += src[base + k.min(w_max)];
         }
         for x in 0..w {
-            tmp[base + x] = sum * inv;
+            out_row[x] = sum * inv;
             let add = src[base + (x + r + 1).min(w_max)];
             let sub = src[base + x.saturating_sub(r)];
             sum += add - sub;
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        // Row-parallel H pass. Measured via examples/box_blur_h_par_flip.rs
+        // (see header there for numbers); rows chunked by rayon, one output
+        // row per task, no shared mutable state.
+        let _ = h;
+        tmp.par_chunks_mut(w)
+            .enumerate()
+            .for_each(|(y, row)| row_pass(y, row));
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for (y, row) in tmp.chunks_mut(w).enumerate().take(h) {
+            row_pass(y, row);
         }
     }
 }
@@ -31,8 +51,19 @@ pub(crate) fn box_blur(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     if n == 0 {
         return Vec::new();
     }
-    let mut tmp = vec![0f32; n];
-    let mut dst = vec![0f32; n];
+    // tmp and dst are FULLY overwritten before any read (box_blur_h writes every
+    // tmp element; the tiled V pass + scalar remainder write every dst element),
+    // so vec![0f32; n] would be 2·n·4 B of dead memset. Same pattern as
+    // box_blur_avx2.
+    // SAFETY: f32 has no invalid bit patterns; every slot exposed by set_len is
+    // written before it is read, and f32 has no Drop, so leaking uninit on
+    // panic is sound.
+    let mut tmp: Vec<f32> = Vec::with_capacity(n);
+    let mut dst: Vec<f32> = Vec::with_capacity(n);
+    unsafe {
+        tmp.set_len(n);
+        dst.set_len(n);
+    }
     let inv = 1.0 / (2 * r + 1) as f32;
 
     box_blur_h(src, &mut tmp, w, h, r, inv);

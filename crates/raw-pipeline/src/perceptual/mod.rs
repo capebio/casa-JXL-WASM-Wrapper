@@ -119,7 +119,10 @@ impl Comparer {
         // carries a scalar-vs-fmadd rounding asymmetry).
         let backend = resolve_backend(&opts);
         // Build reference XYB pyramid + masks (3 scales, blur radius ~w/64 clamped 1..8).
-        let (mut rx, mut ry, mut rb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+        // convert_xyb writes every element of all three planes before any read,
+        // so the zero-init would be 3·n·4 B of dead memset (same pattern as
+        // box_blur_avx2's uninit tmp/dst).
+        let (mut rx, mut ry, mut rb) = (uninit_f32_vec(n), uninit_f32_vec(n), uninit_f32_vec(n));
         convert_xyb(backend, &ref_rgba, n, &mut rx, &mut ry, &mut rb);
         let mut levels = Vec::with_capacity(3);
         let (mut w, mut h) = (width, height);
@@ -131,10 +134,12 @@ impl Comparer {
                 let dw = (w >> 1).max(1);
                 let dh = (h >> 1).max(1);
                 let dn = dw * dh;
-                // Pre-allocate the downsample targets (PERC-09: explicit alloc at call site).
-                let mut nx = vec![0f32; dn];
-                let mut ny = vec![0f32; dn];
-                let mut nb = vec![0f32; dn];
+                // Pre-allocate the downsample targets (PERC-09: explicit alloc at call
+                // site). downsample_one writes every dst element (bulk + clamped tail)
+                // before any read, so these are uninit rather than zeroed.
+                let mut nx = uninit_f32_vec(dn);
+                let mut ny = uninit_f32_vec(dn);
+                let mut nb = uninit_f32_vec(dn);
                 // PERC-12: move cx/cy/cb into the Level, then borrow them back to feed the
                 // downsample. downsample_one only READS its source and writes the separate
                 // nx/ny/nb, so the planes need not be cloned to stay alive for the next level.
@@ -503,6 +508,23 @@ fn ref_moments_dispatch(backend: Backend, b: &[u8], np: usize) -> ([u64; 3], [u6
 /// AVX2 path is bit-identical to the scalar oracle. This is the dominant
 /// reference-build cost (examples/ref_build_effect.rs); the mask is built once
 /// per Comparer, never on the per-compare test path.
+/// Allocate an n-slot f32 Vec without the zero-init memset. For buffers whose
+/// every element is written before any read (XYB planes via convert_xyb,
+/// downsample targets via downsample_one).
+///
+/// SAFETY-BY-CONTRACT: callers must fully overwrite the buffer before reading.
+/// f32 has no Drop, so leaking uninit contents on panic is sound; the pattern
+/// matches box_blur_avx2's uninit tmp/dst.
+fn uninit_f32_vec(n: usize) -> Vec<f32> {
+    let mut v: Vec<f32> = Vec::with_capacity(n);
+    // SAFETY: capacity is n; every slot is written by the caller before it is
+    // ever read (see doc contract above).
+    unsafe {
+        v.set_len(n);
+    }
+    v
+}
+
 fn blur_mask(backend: Backend, src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     match backend {
         #[cfg(target_arch = "x86_64")]
