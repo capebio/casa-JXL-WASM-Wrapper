@@ -1506,16 +1506,6 @@ class LibjxlDecoder implements JxlDecoder {
     const decFree         = module._jxl_wasm_dec_free!;
     let chunkBufPtr = 0;
     let chunkBufCap = 0;
-    // Rank #6: Pre-allocate chunk buffer upfront if expectedBytes provided.
-    if (this.options.expectedBytes != null && this.options.expectedBytes > 0) {
-      const tMalloc0 = performance.now();
-      chunkBufPtr = module._malloc(this.options.expectedBytes);
-      if (chunkBufPtr === 0) {
-        throw new Error("WASM Memory Allocation OOM during pre-allocation for progressive stream");
-      }
-      chunkBufCap = this.options.expectedBytes;
-      this.options.onMetric?.("malloc_prealloc_ms", performance.now() - tMalloc0);
-    }
     // Rank #2: Deferred-release buffer reuse (zero-copy pixel emission).
     let reusablePixelBuf: ArrayBuffer | null = null;
     let reusablePixelCap = 0; // capacity in bytes
@@ -1523,6 +1513,18 @@ class LibjxlDecoder implements JxlDecoder {
     // A fixed 1920×1080×4 pre-allocation would throw for images larger than HD (e.g. 4K = 33 MB).
     // Instead, allocate (or grow) lazily on first use inside preparePixelsForEmit.
     try {
+      // Rank #6: Pre-allocate chunk buffer upfront if expectedBytes provided.
+      // Inside the try so an OOM here still frees the decoder in the finally
+      // (it used to run before the try and leak `dec` on throw).
+      if (this.options.expectedBytes != null && this.options.expectedBytes > 0) {
+        const tMalloc0 = performance.now();
+        chunkBufPtr = module._malloc(this.options.expectedBytes);
+        if (chunkBufPtr === 0) {
+          throw new Error("WASM Memory Allocation OOM during pre-allocation for progressive stream");
+        }
+        chunkBufCap = this.options.expectedBytes;
+        this.options.onMetric?.("malloc_prealloc_ms", performance.now() - tMalloc0);
+      }
       let headerEmitted = false;
       let info: ImageInfo | undefined;
       let gotRealFlush = false;
