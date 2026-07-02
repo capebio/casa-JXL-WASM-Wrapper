@@ -1648,10 +1648,14 @@ following were identified but NOT taken; each needs a gate.
 - **AVX-512 register-resident token/Huffman/pack** (keep tokenise→Huffman→interleave→
   Bits32 in registers instead of the ~5 stack round-trip arrays per vector batch).
   AVX-512-only (AVX2 has too few vector regs — do not apply globally). Gate: AVX-512 A/B.
-- **Reuse Huffman DP workspace + copy baseline prefix code into unused channels.**
-  `ComputeCodeLengthsNonZeroImpl` allocates a fresh vector per code; grayscale/GA emit
-  4 codes but unused-channel histograms are identical after pseudo-count injection.
-  Byte-exact, small setup win. Gate: confirm identical code-lengths on real frames.
+- ~~**Reuse Huffman DP workspace.**~~ **DONE** — branch
+  `perf/enc-fl-prefix-code-reuse-jul02-h5m3 @4da44ae8` (capebio). `ComputeCodeLengthsNonZeroImpl`
+  now reuses a thread_local DP table (was a fresh multi-MiB `std::vector` per call, ~8 calls/frame).
+  Byte-exact verified (fjxl A/B 10/10 identical vs 6479ef13). PUSHED not-merged.
+- **Copy baseline prefix code into unused channels** (the companion idea) — STILL DEFERRED, but
+  LOW value: unused channels are only [nb_chans,4), so grayscale saves 2 builds, GA saves 1,
+  **RGB/RGBA save 0** — i.e. ~zero for the RAW path's dominant 3/4-channel inputs. Not worth the
+  branch. Would need a real gray/GA-heavy workload to justify.
 - **Lifecycle/persistence (video):** per-worker row scratch reuse across frames;
   `BitWriter` capacity/reset + per-batch arena/pool (also makes late DC-global padding
   explicit rather than relying on the 100000-bit over-reserve); expose the integrated
