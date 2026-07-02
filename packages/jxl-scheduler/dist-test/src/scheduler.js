@@ -197,7 +197,7 @@ export class Scheduler {
         // tryAcquireIdle, or preemption. Controls concurrent active sessions
         // before workers are touched. Only primaries (non-deduped) reach here.
         if (this.admissionGate !== undefined) {
-            const release = await this.admissionGate.admit(params.sessionId, params.priority);
+            const release = await this.admissionGate.admit(params.sessionId, params.priority, params.weight);
             this.gateReleases.set(params.sessionId, release);
             if (this.destroyed)
                 this.abortAcquisition(params, "[jxl-scheduler] Scheduler is shut down.");

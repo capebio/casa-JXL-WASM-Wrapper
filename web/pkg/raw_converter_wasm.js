@@ -1307,6 +1307,76 @@ export function downscale_rgba(src, src_w, src_h, dst_w, dst_h) {
 }
 
 /**
+ * @param {Uint8Array} bytes
+ * @returns {Uint8Array}
+ */
+export function fable_decode_rgb8(bytes) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.fable_decode_rgb8(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {Uint8Array} bytes
+ * @param {Uint8Array} prev
+ * @param {number} width
+ * @param {number} height
+ * @returns {Uint8Array}
+ */
+export function fable_decode_rgb8_delta(bytes, prev, width, height) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(prev, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.fable_decode_rgb8_delta(ptr0, len0, ptr1, len1, width, height);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {Uint8Array} rgb
+ * @param {number} width
+ * @param {number} height
+ * @returns {Uint8Array}
+ */
+export function fable_encode_rgb8(rgb, width, height) {
+    const ptr0 = passArray8ToWasm0(rgb, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.fable_encode_rgb8(ptr0, len0, width, height);
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {Uint8Array} cur
+ * @param {Uint8Array} prev
+ * @param {number} width
+ * @param {number} height
+ * @returns {Uint8Array}
+ */
+export function fable_encode_rgb8_delta(cur, prev, width, height) {
+    const ptr0 = passArray8ToWasm0(cur, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(prev, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.fable_encode_rgb8_delta(ptr0, len0, ptr1, len1, width, height);
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * PRODUCTION export. Returns the same numeric fields the JS analyzeProgressiveFrame
  * produces (the JS wrapper adds the hex frameHash, byteLength, truncated, validPixels).
  * frameHashInt is the exact FNV-1a value — bit-identical to the shipped JS hash.

@@ -79,6 +79,7 @@ export declare class Scheduler {
         startMsg: MsgDecodeStart | MsgEncodeStart;
         sourceKey: string | null;
         signal: AbortSignal | null;
+        weight?: number;
     }): Promise<{
         workerId: number;
     }>;
