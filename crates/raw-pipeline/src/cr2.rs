@@ -418,6 +418,47 @@ pub fn reassemble_slices_scatter(
     raster
 }
 
+/// Locate the raw LJPEG strip and its output geometry (bench/parity tooling
+/// only — mirrors the strip/SOF3 walk in decode_impl without decoding).
+/// Returns (strip_offset, strip_len, stride_pixels = sof_w*ncomp, rows = sof_h).
+#[doc(hidden)]
+pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    if data.len() < 16 {
+        bail!("CR2: file too small ({} bytes)", data.len());
+    }
+    let le = match &data[0..4] {
+        [0x49, 0x49, 0x2A, 0x00] => true,
+        [0x4D, 0x4D, 0x00, 0x2A] => false,
+        m => bail!("CR2: not a TIFF file (magic {:?})", m),
+    };
+    if &data[8..10] != b"CR" {
+        bail!("CR2: missing Canon CR marker at offset 8");
+    }
+    let raw_ifd_off = read_u32(data, 12, le) as usize;
+    if raw_ifd_off == 0 || raw_ifd_off >= data.len() {
+        bail!("CR2: invalid raw IFD offset {}", raw_ifd_off);
+    }
+    let mut strip_offset: u32 = 0;
+    let mut strip_byte_count: u32 = 0;
+    visit_ifd(data, raw_ifd_off, le, |tag, dtype, cnt, val, ip| match tag {
+        0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        _ => {}
+    });
+    if strip_offset == 0 || strip_byte_count == 0 {
+        bail!("CR2: missing strip offset or byte count in raw IFD");
+    }
+    let strip_off = strip_offset as usize;
+    let strip_len = strip_byte_count as usize;
+    match strip_off.checked_add(strip_len) {
+        Some(e) if e <= data.len() => {}
+        _ => bail!("CR2: strip out of bounds"),
+    }
+    let (_prec, sof_h, sof_w, ncomp) = parse_ljpeg_sof(data, strip_off, strip_len)
+        .ok_or_else(|| anyhow!("CR2: could not find SOF3 marker in LJPEG strip"))?;
+    Ok((strip_off, strip_len, sof_w as usize * ncomp as usize, sof_h as usize))
+}
+
 /// Fused multi-slice reassembly + crop. Builds the final crop_w×crop_h raster
 /// directly from the STACKED slice decode buffer — no full-raster temp, no
 /// zero-fill, no separate crop pass. Row-major output construction: for each

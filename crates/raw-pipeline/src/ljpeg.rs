@@ -704,6 +704,9 @@ fn execute<const COLLECT_STATS: bool>(
         (2, 12) => decode_c2::<12, COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
         (2, 14) => decode_c2::<14, COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
         (2, 16) => decode_c2::<16, COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
+        (4, 12) => decode_c4::<12, COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
+        (4, 14) => decode_c4::<14, COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
+        (4, 16) => decode_c4::<16, COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
         _ => decode_generic::<COLLECT_STATS>(plan, src, out, base, stride_pixels, out_pixel_cols, out_rows),
     }
 }
@@ -965,6 +968,153 @@ fn decode_c2<const PRECISION: u8, const COLLECT_STATS: bool>(
         sof_w: width as u32,
         sof_h: height as u32,
         cps: 2,
+        precision: PRECISION,
+        total_symbols,
+        fill_calls: br.fill_calls,
+        bulk_fill_hits: br.bulk_hits,
+        slow_fill_hits: br.slow_hits,
+        fast8_hits,
+        slow_huffman_hits,
+        get_bits_calls,
+        get_bits_total_bits,
+        category_hist,
+    })
+}
+
+/// Monomorphized four-component kernel — the Canon multi-slice CR2 layout
+/// (5D/550D-era bodies encode cps=4). Same unrolling rationale as [`decode_c2`]:
+/// four independent scalar predictor chains (`left0..left3`, `prev0..prev3`)
+/// with four fixed Huffman tables remove the inner `for comp` loop, the
+/// per-pixel `comp_tables[comp]` / `left[comp]` array indexing, and (via the
+/// const `PRECISION`) the dynamic category guards. Bit-identical to
+/// [`decode_generic`] for `components == 4`.
+#[inline(always)]
+fn decode_c4<const PRECISION: u8, const COLLECT_STATS: bool>(
+    plan: &LjpegPlan,
+    src: &[u8],
+    out: &mut [u16],
+    base: usize,
+    stride_pixels: usize,
+    out_pixel_cols: usize,
+    out_rows: usize,
+) -> Result<LjpegStats> {
+    let table0 = plan.tables[0].as_deref().expect("c4: table[0] resolved in prepare");
+    let table1 = plan.tables[1].as_deref().expect("c4: table[1] resolved in prepare");
+    let table2 = plan.tables[2].as_deref().expect("c4: table[2] resolved in prepare");
+    let table3 = plan.tables[3].as_deref().expect("c4: table[3] resolved in prepare");
+    let point_transform = plan.point_transform;
+    let base_pred = 1i32 << (PRECISION - point_transform - 1);
+    let width = plan.width;
+    let height = plan.height;
+    let mut br = BitReader::<COLLECT_STATS>::new(plan.entropy(src));
+
+    let mut total_symbols = 0u64;
+    let mut fast8_hits = 0u64;
+    let mut slow_huffman_hits = 0u64;
+    let mut get_bits_calls = 0u64;
+    let mut get_bits_total_bits = 0u64;
+    let mut category_hist = [0u64; 17];
+
+    // Column-0 value of the previous row, per component (scalars). Seeded to
+    // base_pred so row 0 / col 0 needs no `row == 0` special case (each is
+    // overwritten with the decoded value as the row's column 0 completes).
+    let mut prev0 = base_pred;
+    let mut prev1 = base_pred;
+    let mut prev2 = base_pred;
+    let mut prev3 = base_pred;
+
+    for row in 0..height {
+        let row_base = base + row * stride_pixels;
+        let emit_row = row < out_rows;
+        let mut left0 = 0i32;
+        let mut left1 = 0i32;
+        let mut left2 = 0i32;
+        let mut left3 = 0i32;
+        for col in 0..width {
+            let at_col0 = col == 0;
+            // --- component 0 ---
+            let pred0 = if at_col0 { prev0 } else { left0 };
+            let t0 = next_category::<COLLECT_STATS>(
+                &mut br, table0, &mut fast8_hits, &mut slow_huffman_hits, &mut total_symbols,
+                &mut category_hist,
+            )?;
+            let diff0 = decode_diff::<COLLECT_STATS>(
+                &mut br, t0, &mut get_bits_calls, &mut get_bits_total_bits,
+            )?;
+            let val0 = pred0.wrapping_add(diff0);
+            left0 = val0;
+            if at_col0 { prev0 = val0; }
+
+            // --- component 1 ---
+            let pred1 = if at_col0 { prev1 } else { left1 };
+            let t1 = next_category::<COLLECT_STATS>(
+                &mut br, table1, &mut fast8_hits, &mut slow_huffman_hits, &mut total_symbols,
+                &mut category_hist,
+            )?;
+            let diff1 = decode_diff::<COLLECT_STATS>(
+                &mut br, t1, &mut get_bits_calls, &mut get_bits_total_bits,
+            )?;
+            let val1 = pred1.wrapping_add(diff1);
+            left1 = val1;
+            if at_col0 { prev1 = val1; }
+
+            // --- component 2 ---
+            let pred2 = if at_col0 { prev2 } else { left2 };
+            let t2 = next_category::<COLLECT_STATS>(
+                &mut br, table2, &mut fast8_hits, &mut slow_huffman_hits, &mut total_symbols,
+                &mut category_hist,
+            )?;
+            let diff2 = decode_diff::<COLLECT_STATS>(
+                &mut br, t2, &mut get_bits_calls, &mut get_bits_total_bits,
+            )?;
+            let val2 = pred2.wrapping_add(diff2);
+            left2 = val2;
+            if at_col0 { prev2 = val2; }
+
+            // --- component 3 ---
+            let pred3 = if at_col0 { prev3 } else { left3 };
+            let t3 = next_category::<COLLECT_STATS>(
+                &mut br, table3, &mut fast8_hits, &mut slow_huffman_hits, &mut total_symbols,
+                &mut category_hist,
+            )?;
+            let diff3 = decode_diff::<COLLECT_STATS>(
+                &mut br, t3, &mut get_bits_calls, &mut get_bits_total_bits,
+            )?;
+            let val3 = pred3.wrapping_add(diff3);
+            left3 = val3;
+            if at_col0 { prev3 = val3; }
+
+            if emit_row {
+                let raw_col0 = col * 4;
+                if raw_col0 < out_pixel_cols {
+                    // SAFETY: row<out_rows + raw_col0<out_pixel_cols ⇒ index ≤ the
+                    // maximum validated < out.len() by geometry_check before this
+                    // kernel runs. Same elision model as the measured decode_c2.
+                    unsafe { *out.get_unchecked_mut(row_base + raw_col0) = ((val0 << point_transform) & 0xFFFF) as u16; }
+                }
+                let raw_col1 = raw_col0 + 1;
+                if raw_col1 < out_pixel_cols {
+                    // SAFETY: as above; raw_col1 < out_pixel_cols.
+                    unsafe { *out.get_unchecked_mut(row_base + raw_col1) = ((val1 << point_transform) & 0xFFFF) as u16; }
+                }
+                let raw_col2 = raw_col0 + 2;
+                if raw_col2 < out_pixel_cols {
+                    // SAFETY: as above; raw_col2 < out_pixel_cols.
+                    unsafe { *out.get_unchecked_mut(row_base + raw_col2) = ((val2 << point_transform) & 0xFFFF) as u16; }
+                }
+                let raw_col3 = raw_col0 + 3;
+                if raw_col3 < out_pixel_cols {
+                    // SAFETY: as above; raw_col3 < out_pixel_cols.
+                    unsafe { *out.get_unchecked_mut(row_base + raw_col3) = ((val3 << point_transform) & 0xFFFF) as u16; }
+                }
+            }
+        }
+    }
+
+    Ok(LjpegStats {
+        sof_w: width as u32,
+        sof_h: height as u32,
+        cps: 4,
         precision: PRECISION,
         total_symbols,
         fill_calls: br.fill_calls,
@@ -1286,6 +1436,26 @@ mod tests {
             // entropy + pad
             0x32, 0x00,
         ]
+    }
+
+    #[test]
+    fn c4_matches_generic_on_real_cr2_strip() {
+        // Real cps=4 p14 stream (550D-era multi-slice CR2): the dispatched
+        // decode_tile (→ decode_c4::<14>) must match decode_tile_generic
+        // sample-for-sample over the whole 18.8M-symbol strip.
+        let path = std::env::var("CR2_TEST_FILE")
+            .unwrap_or_else(|_| r"C:\Foo\raw-converter\tests\_MG_1744.CR2".into());
+        let Ok(data) = std::fs::read(path) else { return }; // fixture absent — skip
+        let Ok((off, len, w, h)) = crate::cr2::ljpeg_strip_geometry(&data) else { return };
+        let strip = &data[off..off + len];
+        let mut a = vec![0u16; w * h];
+        let mut b = vec![0u16; w * h];
+        decode_tile(strip, &mut a, 0, w, w, h).expect("dispatched decode");
+        decode_tile_generic(strip, &mut b, 0, w, w, h).expect("generic decode");
+        assert_eq!(a, b, "decode_c4 must match decode_generic sample-for-sample");
+        // Confirm this fixture really routes the cps=4 arm.
+        let stats = decode_tile_stats(strip, &mut a, 0, w, w, h).expect("stats decode");
+        assert_eq!(stats.cps, 4, "fixture expected to be cps=4");
     }
 
     #[test]
