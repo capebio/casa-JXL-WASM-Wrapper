@@ -69,6 +69,18 @@ Every JOLT preset decodes 720p in real time single-threaded; the lossless tier
 does not — that is exactly the gap JOLT exists to fill. (Encode is offline /
 near-real-time; GOP-parallel encode multiplies throughput by core count.)
 
+**Encode-side pass (2026-07-02, byte-exact except the effort fix):** the
+encoder no longer decodes its own output (the in-loop `recon` was write-only —
+detection runs on source frames; one full FFI decode per frame removed), the
+batch lossy encoders are frame-parallel (`into_par_iter`, 4.3–5.6× measured on
+this corpus) and honor `opts.effort` (batch Realtime/Quality bitstreams changed
+deliberately; batch now equals streaming byte-for-byte per preset), and the
+streaming loop reuses one `Encoder` handle + all per-frame scratch. Interleaved
+binary flipflop (8 arms, agent-contended box, untouched-archive control ±7%):
+streaming enc ms/f min-of-arms Realtime 57.8→42.6, Balanced 75.6→53.9, Quality
+79.6→66.2. A default multi-threaded libjxl runner for streaming was measured a
+regression/wash and rejected — see `docs/1 rejected optimizations.md` (CV-E6).
+
 ## Not in scope yet
 
 - **Rate control** (target-bytes/VBV → distance search) — designed in the
