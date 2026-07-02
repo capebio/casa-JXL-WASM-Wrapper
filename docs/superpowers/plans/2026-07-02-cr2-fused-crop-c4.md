@@ -346,7 +346,7 @@ fn scratch_warm_reuse_across_geometries() {
 
 - [x] **Steps:** create example (same interleaved start-rotated pattern, 11 rounds, round-0 dropped, parity assert), run on 1 multi (`_MG_1750.CR2`) + 1 single (`ADH 1234.CR2` — expect ≈0, checks no regression) + scratch-mode arm if trivial. Record numbers in commit message. Keep Fused if ≥ Split (rule 10: strictly less work — no zero-fill, no temp raster, no second pass).
 
-Result (2026-07-02, 13 rounds): MULTI −53.5 ms (−7.2%) owned, −64.9 ms (−8.5%) scratch; single-slice scratch −9.9 ms; all parity EXACT. Fused shipped, split retained doc(hidden) for parity/bench.
+Result (2026-07-02, 13 rounds, 3-arm rotation, round0 dropped): _MG_1750 (multi) split-bulk 169.7 ms → fused 159.0 ms (−10.7 ms, −6.3%); fused warm scratch 150.5 ms (−19.2 ms vs split, −11.3%). ADH 1234 (single): A==B same code path → noise floor ±1.2%; warm scratch −3.0 ms (clone elision). All parity EXACT. Fused shipped; split retained doc(hidden) for parity/bench.
 
 ### Task 5: ljpeg decode_c4 kernel + dispatch
 
@@ -421,14 +421,14 @@ Dispatch: add
 
 - [x] **Steps:** create, run on `_MG_1744.CR2`. Expect c2-like gain (−10..30% of ljpeg stage). Keep c4 if ≥ generic (rule 10: strictly less per-symbol work). Record numbers.
 
-Result (2026-07-02, 13 rounds): −80.6 ms = −12.9% on the LJPEG stage (627.2 → 546.6 ms), parity EXACT.
+Result (2026-07-02, 13 rounds interleaved, round0 dropped): _MG_1744 strip 5344×3516 (cps=4 p14): generic 149.0 ms → decode_c4 136.2 ms (−12.7 ms, −8.5% of the LJPEG stage), parity EXACT.
 
 ### Task 7: Full verification sweep
 
-- [x] All 11 fixtures: `variants_byte_identical_on_real_files` (Fused == SplitBulk == SplitScatter) — via `cargo test --no-default-features` + fixture-gated tests, and end-to-end flips assert parity.
-- [x] Full suite MSVC: `.\build-msvc.ps1 test` equivalent from repo root (memory: run tests from `crates/raw-pipeline`; MSVC for casaencoder FFI). Expect ≥ 216 pass, 0 fail. → 262 passed / 0 failed (`cargo +msvc test --features parallel` full crate).
-- [x] WASM: `cargo check --target wasm32-unknown-unknown --no-default-features` from `crates/raw-pipeline` — clean (0 warnings for touched files).
-- [x] Re-run `cr2_slice_scan` on all fixtures — confirm reassemble_ms now visible, totals improved. → multi total 785→624 ms (−20%), c4 ljpeg −80 ms + fused −54 ms.
+- [x] All 11 fixtures byte-identical across Fused / SplitBulk / SplitScatter / warm scratch (`cr2_parity_sweep` example, exit 0, every file EXACT incl. wb bit-equality).
+- [ ] Full suite MSVC: `..\..\build-msvc.ps1 test --release --lib --tests` from `crates/raw-pipeline` (examples excluded: `demosaic_preview_demo.rs` has a PRE-EXISTING stale `Comparer::new(&Vec)` call that breaks `cargo test`'s example build — untouched by this branch).
+- [x] WASM: `cargo check --target wasm32-unknown-unknown --no-default-features --lib` (raw-pipeline) clean, 0 warnings in cr2/ljpeg; root crate `--no-default-features` clean (parallel-wasm needs the build script's atomics RUSTFLAGS — pre-existing, unrelated).
+- [x] `cr2_parity_sweep` shows reassemble_ms visible: multi ≈10 ms fused (crop_ms 0), singles crop 5–12 ms; multi ljpeg now ~150 ms via decode_c4.
 
 ### Task 8: Ledger updates + push
 

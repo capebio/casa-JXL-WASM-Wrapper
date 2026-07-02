@@ -1624,3 +1624,25 @@ at the median. Net: adds a hot-loop check for no benefit → not worth carrying.
 manufactured a phantom 15% win here. For sub-10% deltas use INTERLEAVED A/B (flipflop/flipflopdom
 with start-rotation). Test kept at .flipflop/dom-tests/dec-degenerate.mjs; journal in
 docs/outputs/timing tests/flipflop/flipflopdom-journal.toon.
+
+---
+
+## CR2 pass (perf/cr2-fused-crop-jul02-c2f8, 2026-07-02) — rejected items
+
+### Eliminate the "double SOF3 parse" (cr2::parse_ljpeg_sof + ljpeg plan prepare)
+Proposed (ChatGPT deep-analysis): expose an LjpegPlan handle so cr2.rs does not scan SOF3
+and then have decode_tile re-parse the same headers. **Rejected — no measurable gain.**
+`parse_ljpeg_sof` is a linear scan of a few marker segments (~100 bytes) before SOS;
+ljpeg.rs already carries a 1-entry plan cache (jun30 z7k) so the second parse hits warm
+state. Wiring a plan handle across the module boundary adds API surface for µs-scale work
+in a ~150 ms decode. Timing evidence: parse_ms ≈ 0.0–0.1 ms in cr2_parity_sweep.
+
+### In-place slice permutation (reassemble multi-slice without any second buffer)
+Idea: permute the stacked slice buffer into raster order in place (cycle-walking) to reach
+"zero extra buffers". **Rejected — cache-hostile and strictly worse than the shipped fused
+path.** Cycle-walking a large non-contiguous permutation does irregular single-element
+accesses with div/mod per step, destroys the contiguous-run copies (rows are 1728/1888 px
+runs), and complicates correctness for the remainder slice. The shipped alternative
+(fused reassemble+crop straight into the output Vec, branch c2f8) removes the full-raster
+temp AND the separate crop pass while keeping contiguous row-run copies; measured −6.3%
+whole-decode (owned) / −11.3% (warm scratch) on _MG_1750 with byte-exact parity.

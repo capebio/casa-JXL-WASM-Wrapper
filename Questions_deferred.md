@@ -1771,3 +1771,37 @@ strip-staging (peak-RSS unmeasurable in unit test), extra-channel completeness c
   are independent → rayon over `y` (H) and the `x` tile stride (V), gated on `parallel`.
   (b) AVX-512 / wasm-SIMD `box_blur` (currently fall back to scalar V). (c) Fold the
   3-level mask blur into the pyramid walk to avoid re-blurring re-read planes.
+
+## CR2 pass deferrals (perf/cr2-fused-crop-jul02-c2f8, 2026-07-02)
+
+- **Canon SensorInfo (MakerNote 0x00E0) true active area + real CFA phase.** cr2.rs
+  center-crops with even-snapping and hard-codes cfa_phase=(0,0); src/lib.rs compensates
+  with a green-channel sanity check that can retry up to 3 more full MHC demosaics
+  (~144 MB RGB pass each). Parsing SensorInfo would give the actual crop rectangle +
+  mosaic parity, kill the retries, and fix potentially off-by-one crop geometry.
+  **NOT byte-exact** — changes which sensor pixels are output → needs golden references
+  per body (550D multi-slice + cps=2 bodies), demosaicer phase plumbing verification,
+  and user sign-off. Gate: dcraw/libraw cross-reference on the 11 local fixtures.
+
+- **DecodeLimits before allocation.** decode_impl allows 200 MP (≈400 MB u16) before the
+  browser caller's 50 MP policy check runs (post-decode). On wasm32 an adversarial header
+  can force a huge allocation → OOM trap instead of graceful error. Fix = plumb a
+  max_pixels/max_raw_bytes limit into the decoder (API/behavior change for native callers).
+
+- **MaybeUninit LJPEG output sink.** First decode into a fresh buffer still pays a full
+  resize zero-fill (~37 MB @550D) that the kernels then overwrite completely. The kernels'
+  full-write invariant holds (write every row<out_rows × col<out_pixel_cols on success,
+  bail on any entropy error), but eliding the zero-fill means set_len before write —
+  an unsafe boundary that wants a mechanical full-write test harness first. (The warm
+  scratch path no longer re-zeroes as of c2f8; this only affects cold/owned decodes.)
+
+- **Caller-owned output pool (`decode_into(data, scratch, output)`).** Completes the
+  batch/video ownership story (scratch stream buffer + reusable output frames). No
+  production caller exists yet (decode_with_scratch itself is test-only); add when the
+  batch RAW→JXL path materialises. Pairs with the memory-admission-gate work (rcw-mag).
+
+- **LJPEG rolling-row / stripe emitter.** Deeper restructure: decode LJPEG into a few
+  predictor rows and emit active-area stripes directly to demosaic/JXL (kills the
+  full-frame raw buffer for raster CR2s; multi-slice needs stripe-aware scheduling since
+  the stream is slice-major). Research-grade; mirrors the ORF streaming-preview pipeline
+  (decompress.rs q8z) which proved the pattern byte-exact there.
