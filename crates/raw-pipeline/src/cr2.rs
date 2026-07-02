@@ -346,6 +346,20 @@ pub fn decode_with_scratch(data: &[u8], scratch: &mut ScratchBuffers) -> Result<
         .map(|(img, _, _)| img)
 }
 
+/// Batch decode with reusable scratch AND per-phase timings — the production
+/// wasm path: the full-frame decode buffer stays warm across frames within a
+/// worker, so repeat decodes skip the full-frame allocation + zero-fill.
+/// `clock` is a caller-supplied monotonic millisecond clock (wasm-safe; see
+/// decode_bytes_with_clock).
+pub fn decode_with_scratch_clock(
+    data: &[u8],
+    scratch: &mut ScratchBuffers,
+    clock: &dyn Fn() -> f64,
+) -> Result<(Cr2Image, Cr2Timings)> {
+    decode_impl(data, &mut scratch.raw, false, Some(clock), false, ReassemblyVariant::Fused)
+        .map(|(img, t, _)| (img, t))
+}
+
 /// Reorder Canon multi-slice LJPEG output from stream-stacked vertical slices into
 /// a single side-by-side raster of width `stride`. The decoded buffer holds slice 0's
 /// whole `nw × high` block, then slice 1's, …, then a trailing remainder slice of
