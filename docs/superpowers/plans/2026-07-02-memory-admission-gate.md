@@ -326,12 +326,15 @@ describe("MemoryWeightedAdmissionGate edge cases", () => {
   });
 
   it("treats a non-positive / non-finite weight as the default", async () => {
-    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 300 * MB, defaultWeightBytes: 200 * MB });
+    // Budget fits all four so none queue; each consumes exactly the default weight,
+    // proving 0 / negative / NaN / Infinity all normalize to defaultWeightBytes.
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 1000 * MB, defaultWeightBytes: 200 * MB });
     await gate.admit("a", "visible", 0);
     await gate.admit("b", "visible", -5);
-    // both → 200MB each; second queues
-    assert.equal(gate.runningBytes, 200 * MB);
-    assert.equal(gate.pendingCount, 1);
+    await gate.admit("c", "visible", Number.NaN);
+    await gate.admit("d", "visible", Number.POSITIVE_INFINITY);
+    assert.equal(gate.runningBytes, 800 * MB); // 4 × 200MB default
+    assert.equal(gate.pendingCount, 0);
   });
 
   it("release is idempotent (double-call frees budget once)", async () => {

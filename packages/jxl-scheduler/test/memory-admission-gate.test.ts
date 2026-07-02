@@ -67,3 +67,50 @@ describe("MemoryWeightedAdmissionGate priority", () => {
     assert.deepEqual(order, ["first", "second"]);
   });
 });
+
+describe("MemoryWeightedAdmissionGate edge cases", () => {
+  it("admits a single over-budget task alone, then queues the next", async () => {
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 100 * MB });
+    const rel = await gate.admit("huge", "visible", 500 * MB);
+    assert.equal(gate.runningBytes, 500 * MB);
+    let admitted2 = false;
+    const p2 = gate.admit("next", "visible", 10 * MB).then((r) => { admitted2 = true; return r; });
+    await Promise.resolve();
+    assert.equal(admitted2, false, "nothing admits while an over-budget task runs");
+    assert.equal(gate.pendingCount, 1);
+    rel();
+    await p2;
+    assert.equal(admitted2, true);
+  });
+
+  it("applies the default weight when admit() is called without a weight", async () => {
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 300 * MB, defaultWeightBytes: 200 * MB });
+    await gate.admit("a", "visible");
+    assert.equal(gate.runningBytes, 200 * MB);
+    let admittedB = false;
+    gate.admit("b", "visible").then(() => { admittedB = true; });
+    await Promise.resolve();
+    assert.equal(admittedB, false);
+    assert.equal(gate.pendingCount, 1);
+  });
+
+  it("treats a non-positive / non-finite weight as the default", async () => {
+    // Budget fits all four so none queue; each must consume exactly the default weight,
+    // proving 0 / negative / NaN / Infinity all normalize to defaultWeightBytes.
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 1000 * MB, defaultWeightBytes: 200 * MB });
+    await gate.admit("a", "visible", 0);
+    await gate.admit("b", "visible", -5);
+    await gate.admit("c", "visible", Number.NaN);
+    await gate.admit("d", "visible", Number.POSITIVE_INFINITY);
+    assert.equal(gate.runningBytes, 800 * MB); // 4 × 200MB default
+    assert.equal(gate.pendingCount, 0);
+  });
+
+  it("release is idempotent (double-call frees budget once)", async () => {
+    const gate = new MemoryWeightedAdmissionGate({ budgetBytes: 300 * MB });
+    const rel = await gate.admit("a", "visible", 100 * MB);
+    rel();
+    rel();
+    assert.equal(gate.runningBytes, 0);
+  });
+});
