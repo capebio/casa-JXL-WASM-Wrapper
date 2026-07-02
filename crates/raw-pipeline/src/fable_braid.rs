@@ -463,17 +463,19 @@ fn encode_plane(plane: &[u8], w: usize, h: usize, pred: Predictor, out: &mut Vec
     out.extend_from_slice(&raw);
 }
 
-/// Decode one plane; `ext` must be Some(w*h bytes) iff the plane was encoded
-/// with `Predictor::External`. `tab_scratch`/`resbuf` are caller-owned scratch
-/// (reused across planes/frames — no per-plane allocation). Returns the plane.
-fn decode_plane(
+/// Decode one plane into `out`; `ext` must be Some(w*h bytes) iff the plane
+/// was encoded with `Predictor::External`. `tab_scratch`/`resbuf`/`out` are
+/// caller-owned buffers (reused across planes/frames — no per-plane
+/// allocation once warm).
+fn decode_plane_into(
     r: &mut Reader,
     w: usize,
     h: usize,
     ext: Option<&[u8]>,
     tab_scratch: &mut Vec<u32>,
     resbuf: &mut Vec<u8>,
-) -> Option<Vec<u8>> {
+    out: &mut Vec<u8>,
+) -> Option<()> {
     let pred_id = r.u8()?;
     let transform = r.u8()?;
     if transform > TRANSFORM_LEFT_DELTA {
@@ -537,10 +539,13 @@ fn decode_plane(
     // No zero-fill: the row loop below writes row y in full (copy_from_slice
     // in every mode arm) before anything reads it; the Top predictor reads
     // only rows < y, each fully written by an earlier iteration; COPY/External
-    // predictions read `zero_row`/`ext`, never `plane`. Error paths return
-    // None and drop the Vec — u8 has no drop glue, dealloc never reads.
-    let mut plane: Vec<u8> = Vec::with_capacity(w * h);
-    unsafe { plane.set_len(w * h) };
+    // predictions read `zero_row`/`ext`, never `out`. Error paths return
+    // None; the caller-owned Vec keeps stale bytes it never exposes (u8 has
+    // no drop glue, dealloc never reads).
+    out.clear();
+    out.reserve(w * h);
+    unsafe { out.set_len(w * h) };
+    let plane = &mut out[..];
     let zero_row = vec![0u8; w];
     let mut decoded_syms = 0usize;
     for y in 0..h {
@@ -583,7 +588,7 @@ fn decode_plane(
     if decoded_syms != resbuf.len() {
         return None;
     }
-    Some(plane)
+    Some(())
 }
 
 // ───────────────────────────── SIMD kernels ─────────────────────────────
@@ -623,16 +628,19 @@ mod kernels {
         _mm_loadu_si128(m.as_ptr() as *const __m128i)
     }
 
-    /// Interleave 16 pixels (16 bytes per plane → 48 output bytes).
+    /// Interleave 16 pixels with fused subtract-green undo: the RCT-undo adds
+    /// (`r = r_sg + g`, `b = b_sg + g`) run on registers already loaded for the
+    /// shuffle, deleting the standalone RCT pass over both planes — and leaving
+    /// the input planes in subtract-green form for the session cache.
     #[target_feature(enable = "ssse3")]
-    pub unsafe fn interleave3_ssse3(r: &[u8], g: &[u8], b: &[u8], out: &mut [u8]) {
-        let n = r.len();
-        debug_assert!(g.len() == n && b.len() == n && out.len() == n * 3);
+    pub unsafe fn interleave3_rct_undo_ssse3(g: &[u8], r_sg: &[u8], b_sg: &[u8], out: &mut [u8]) {
+        let n = g.len();
+        debug_assert!(r_sg.len() == n && b_sg.len() == n && out.len() == n * 3);
         let mut i = 0;
         while i + 16 <= n {
-            let vr = _mm_loadu_si128(r.as_ptr().add(i) as *const __m128i);
             let vg = _mm_loadu_si128(g.as_ptr().add(i) as *const __m128i);
-            let vb = _mm_loadu_si128(b.as_ptr().add(i) as *const __m128i);
+            let vr = _mm_add_epi8(_mm_loadu_si128(r_sg.as_ptr().add(i) as *const __m128i), vg);
+            let vb = _mm_add_epi8(_mm_loadu_si128(b_sg.as_ptr().add(i) as *const __m128i), vg);
             let dst = out.as_mut_ptr().add(i * 3);
             let mut k = 0;
             while k < 3 {
@@ -650,9 +658,10 @@ mod kernels {
         }
         // scalar tail
         while i < n {
-            out[3 * i] = r[i];
-            out[3 * i + 1] = g[i];
-            out[3 * i + 2] = b[i];
+            let gi = g[i];
+            out[3 * i] = r_sg[i].wrapping_add(gi);
+            out[3 * i + 1] = gi;
+            out[3 * i + 2] = b_sg[i].wrapping_add(gi);
             i += 1;
         }
     }
@@ -736,18 +745,33 @@ fn deinterleave3(rgb: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     (r, g, b)
 }
 
-fn interleave3(r: &[u8], g: &[u8], b: &[u8], n: usize) -> Vec<u8> {
-    let mut rgb = vec![0u8; n * 3];
+/// Scalar reference for the fused RCT-undo interleave (also the wasm path).
+#[inline]
+fn interleave3_rct_undo_scalar(g: &[u8], r_sg: &[u8], b_sg: &[u8], out: &mut [u8]) {
+    for i in 0..g.len() {
+        let gi = g[i];
+        out[3 * i] = r_sg[i].wrapping_add(gi);
+        out[3 * i + 1] = gi;
+        out[3 * i + 2] = b_sg[i].wrapping_add(gi);
+    }
+}
+
+/// Interleave subtract-green planes to RGB with the RCT-undo fused in
+/// (`out[3i] = r_sg+g, out[3i+1] = g, out[3i+2] = b_sg+g`). The planes are
+/// left untouched (still subtract-green) — that is what lets the decode
+/// session cache them for the next P-frame.
+fn interleave3_rct_undo(g: &[u8], r_sg: &[u8], b_sg: &[u8], n: usize) -> Vec<u8> {
+    // No zero-fill: both kernels below write every byte of out (SIMD blocks
+    // cover 16-pixel groups, the scalar tail the rest) before any read; u8 has
+    // no drop glue. Initialization-order proof as in decode_plane.
+    let mut rgb: Vec<u8> = Vec::with_capacity(n * 3);
+    unsafe { rgb.set_len(n * 3) };
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("ssse3") {
-        unsafe { kernels::interleave3_ssse3(r, g, b, &mut rgb) };
+        unsafe { kernels::interleave3_rct_undo_ssse3(g, r_sg, b_sg, &mut rgb) };
         return rgb;
     }
-    for i in 0..n {
-        rgb[3 * i] = r[i];
-        rgb[3 * i + 1] = g[i];
-        rgb[3 * i + 2] = b[i];
-    }
+    interleave3_rct_undo_scalar(g, r_sg, b_sg, &mut rgb);
     rgb
 }
 
@@ -870,7 +894,16 @@ fn delta_is_identity(bytes: &[u8], h: usize) -> Option<bool> {
     Some(true)
 }
 
-fn decode_planes(bytes: &[u8], ext: Option<[&[u8]; 3]>) -> Option<(Vec<Vec<u8>>, u32, u32, u8)> {
+/// Parsed image container: header fields plus the three length-prefixed plane
+/// blobs (validated bounds; dims guarded before any allocation).
+struct PlaneBlobs<'a> {
+    w: u32,
+    h: u32,
+    rct: u8,
+    blobs: [&'a [u8]; 3],
+}
+
+fn split_container(bytes: &[u8]) -> Option<PlaneBlobs<'_>> {
     let mut r = Reader { b: bytes, p: 0 };
     if r.take(4)? != MAGIC {
         return None;
@@ -882,76 +915,147 @@ fn decode_planes(bytes: &[u8], ext: Option<[&[u8]; 3]>) -> Option<(Vec<Vec<u8>>,
     if w == 0 || h == 0 || nplanes != 3 {
         return None;
     }
-    let n = w as usize * h as usize;
     // Guard absurd dimensions before allocating.
-    if n > (1usize << 31) / 4 {
+    if w as usize * h as usize > (1usize << 31) / 4 {
         return None;
     }
-    let mut planes = Vec::with_capacity(3);
-    let mut tab_scratch = Vec::new();
-    let mut resbuf = Vec::new();
-    for i in 0..3usize {
+    let mut blobs = [&bytes[0..0]; 3];
+    for b in blobs.iter_mut() {
         let len = r.u32()? as usize;
-        let blob = r.take(len)?;
-        let mut pr = Reader { b: blob, p: 0 };
-        planes.push(decode_plane(
-            &mut pr,
-            w as usize,
-            h as usize,
-            ext.map(|e| e[i]),
-            &mut tab_scratch,
-            &mut resbuf,
-        )?);
+        *b = r.take(len)?;
     }
-    Some((planes, w, h, rct))
+    Some(PlaneBlobs { w, h, rct, blobs })
+}
+
+/// Per-plane decode scratch (rANS table + braided symbol buffer).
+#[derive(Default)]
+struct DecodeScratch {
+    tab: Vec<u32>,
+    res: Vec<u8>,
+}
+
+/// Streaming decode session for a chain of frames (I-frame, then temporal
+/// deltas). Caches the previous frame's subtract-green planes so each P-frame
+/// skips re-deriving them from interleaved RGB (deinterleave + 2n subtracts +
+/// 3 allocs per frame) — the cached values are identical by mod-256 ring
+/// construction (cached, not recomputed). Plane output buffers ping-pong, so a
+/// warm session decodes frames with no per-frame plane allocation.
+///
+/// Contract: `decode_delta`'s `prev` must be the immediately preceding frame
+/// of the same chain (what this session last returned). For arbitrary
+/// references use the stateless [`decode_rgb8_delta`].
+pub struct DeltaDecodeSession {
+    /// Subtract-green planes (G, R−G, B−G) of the last decoded frame.
+    planes: [Vec<u8>; 3],
+    /// Decode destination for the next frame (last frame's discarded planes).
+    spare: [Vec<u8>; 3],
+    scratch: DecodeScratch,
+    /// Dimensions the cached `planes` describe; None until the first decode.
+    dims: Option<(u32, u32)>,
+}
+
+impl Default for DeltaDecodeSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeltaDecodeSession {
+    pub fn new() -> Self {
+        DeltaDecodeSession {
+            planes: [Vec::new(), Vec::new(), Vec::new()],
+            spare: [Vec::new(), Vec::new(), Vec::new()],
+            scratch: DecodeScratch::default(),
+            dims: None,
+        }
+    }
+
+    /// Decode the three planes of `pb` (External-predicted against the cached
+    /// planes iff `ext`), emit interleaved RGB with the RCT-undo fused in, and
+    /// promote the freshly decoded planes to the session cache.
+    fn decode_planes_into(&mut self, pb: &PlaneBlobs, ext: bool) -> Option<Vec<u8>> {
+        let (w, h) = (pb.w as usize, pb.h as usize);
+        let planes = &self.planes;
+        let spare = &mut self.spare;
+        let scratch = &mut self.scratch;
+        for i in 0..3 {
+            let mut pr = Reader { b: pb.blobs[i], p: 0 };
+            let e = if ext { Some(planes[i].as_slice()) } else { None };
+            decode_plane_into(&mut pr, w, h, e, &mut scratch.tab, &mut scratch.res, &mut spare[i])?;
+        }
+        let out = interleave3_rct_undo(&spare[0], &spare[1], &spare[2], w * h);
+        std::mem::swap(&mut self.planes, &mut self.spare);
+        self.dims = Some((pb.w, pb.h));
+        Some(out)
+    }
+
+    /// Decode an intra frame, caching its planes for subsequent
+    /// [`Self::decode_delta`] calls. Output identical to [`decode_rgb8`].
+    pub fn decode_intra(&mut self, bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+        let pb = split_container(bytes)?;
+        if pb.rct != RCT_SUBTRACT_GREEN {
+            return None;
+        }
+        let (w, h) = (pb.w, pb.h);
+        let out = self.decode_planes_into(&pb, false)?;
+        Some((out, w, h))
+    }
+
+    /// Decode a temporal-delta frame against `prev` (the interleaved RGB8 this
+    /// session returned for the previous frame). Output identical to
+    /// [`decode_rgb8_delta`].
+    pub fn decode_delta(&mut self, bytes: &[u8], prev: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+        let n = w as usize * h as usize;
+        if prev.len() != n * 3 {
+            return None;
+        }
+        // Identity fast path: every plane is External-predicted with all-COPY
+        // rows (unchanged frame) → the reconstruction is exactly `prev`, no
+        // plane work. Cached planes still describe the (identical) new frame.
+        if delta_is_identity(bytes, h as usize) == Some(true) {
+            return Some(prev.to_vec());
+        }
+        let pb = split_container(bytes)?;
+        // Validate container dims against the caller's BEFORE decoding: the
+        // External predictor slices w*h-sized planes (a mismatched container
+        // must fail cleanly, not index out of bounds).
+        if (pb.w, pb.h) != (w, h) || pb.rct != RCT_SUBTRACT_GREEN {
+            return None;
+        }
+        if self.dims != Some((w, h)) {
+            self.seed_from_rgb(prev, w, h);
+        }
+        self.decode_planes_into(&pb, true)
+    }
+
+    /// Derive the subtract-green planes of `prev` — identical values to what a
+    /// previous decode would have cached (mod-256 ring is exact both ways).
+    fn seed_from_rgb(&mut self, prev: &[u8], w: u32, h: u32) {
+        let n = w as usize * h as usize;
+        let (r, g, b) = deinterleave3(prev, n);
+        let [pg, pr, pb] = &mut self.planes;
+        *pg = g;
+        *pr = r;
+        *pb = b;
+        for i in 0..n {
+            pr[i] = pr[i].wrapping_sub(pg[i]);
+            pb[i] = pb[i].wrapping_sub(pg[i]);
+        }
+        self.dims = Some((w, h));
+    }
 }
 
 /// Decode an intra FableBraid image to interleaved RGB8.
 pub fn decode_rgb8(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
-    let (mut planes, w, h, rct) = decode_planes(bytes, None)?;
-    let n = w as usize * h as usize;
-    if rct != RCT_SUBTRACT_GREEN {
-        return None;
-    }
-    let (g, rest) = planes.split_at_mut(1);
-    let (rp, bp) = rest.split_at_mut(1);
-    for i in 0..n {
-        rp[0][i] = rp[0][i].wrapping_add(g[0][i]);
-        bp[0][i] = bp[0][i].wrapping_add(g[0][i]);
-    }
-    Some((interleave3(&rp[0], &g[0], &bp[0], n), w, h))
+    DeltaDecodeSession::new().decode_intra(bytes)
 }
 
 /// Decode a temporal-delta FableBraid frame against `prev` (interleaved RGB8 of
-/// the previous decoded frame). Returns the reconstructed frame.
+/// the previous decoded frame). Returns the reconstructed frame. Stateless —
+/// for frame chains prefer [`DeltaDecodeSession`], which caches the planar
+/// form of `prev` between frames.
 pub fn decode_rgb8_delta(bytes: &[u8], prev: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
-    let n = w as usize * h as usize;
-    if prev.len() != n * 3 {
-        return None;
-    }
-    // Identity fast path: every plane is External-predicted with all-COPY rows
-    // (unchanged frame) → the reconstruction is exactly `prev`, no plane work.
-    if delta_is_identity(bytes, h as usize) == Some(true) {
-        return Some(prev.to_vec());
-    }
-    // External prediction happens in the same subtract-green space the planes
-    // were encoded in (plane order G, R−G, B−G).
-    let (mut pr, pg, mut pb) = deinterleave3(prev, n);
-    for i in 0..n {
-        pr[i] = pr[i].wrapping_sub(pg[i]);
-        pb[i] = pb[i].wrapping_sub(pg[i]);
-    }
-    let (mut planes, dw, dh, rct) = decode_planes(bytes, Some([&pg, &pr, &pb]))?;
-    if (dw, dh) != (w, h) || rct != RCT_SUBTRACT_GREEN {
-        return None;
-    }
-    let (g, rest) = planes.split_at_mut(1);
-    let (rp, bp) = rest.split_at_mut(1);
-    for i in 0..n {
-        rp[0][i] = rp[0][i].wrapping_add(g[0][i]);
-        bp[0][i] = bp[0][i].wrapping_add(g[0][i]);
-    }
-    Some(interleave3(&rp[0], &g[0], &bp[0], n))
+    DeltaDecodeSession::new().decode_delta(bytes, prev, w, h)
 }
 
 // ───────────────────────────── tests ─────────────────────────────
@@ -1114,15 +1218,58 @@ mod tests {
             let r: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
             let g: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
             let bl: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
-            let fast = interleave3(&r, &g, &bl, n);
+            let fast = interleave3_rct_undo(&g, &r, &bl, n);
             let mut slow = vec![0u8; n * 3];
+            interleave3_rct_undo_scalar(&g, &r, &bl, &mut slow);
+            assert_eq!(fast, slow, "interleave3_rct_undo dispatch n={n}");
+            // scalar reference is itself checked against first principles
             for i in 0..n {
-                slow[3 * i] = r[i];
-                slow[3 * i + 1] = g[i];
-                slow[3 * i + 2] = bl[i];
+                assert_eq!(slow[3 * i], r[i].wrapping_add(g[i]));
+                assert_eq!(slow[3 * i + 1], g[i]);
+                assert_eq!(slow[3 * i + 2], bl[i].wrapping_add(g[i]));
             }
-            assert_eq!(fast, slow, "interleave3 n={n}");
         }
+    }
+
+    #[test]
+    fn delta_session_matches_stateless_and_rejects_dim_mismatch() {
+        let (w, h) = (61u32, 33u32);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..6u32 {
+            let mut f = photo_like(w as usize, h as usize, 100 + i as u64);
+            if i == 2 {
+                f = frames[1].clone(); // identity frame
+            }
+            frames.push(f);
+        }
+        let mut encs: Vec<Vec<u8>> = vec![encode_rgb8(&frames[0], w, h)];
+        for i in 1..frames.len() {
+            encs.push(encode_rgb8_delta(&frames[i], &frames[i - 1], w, h));
+        }
+        // Session decode must equal the stateless functions frame by frame.
+        let mut sess = DeltaDecodeSession::new();
+        let (mut cur, dw, dh) = sess.decode_intra(&encs[0]).expect("intra");
+        assert_eq!((dw, dh), (w, h));
+        assert_eq!(cur, frames[0]);
+        for i in 1..frames.len() {
+            let stateless = decode_rgb8_delta(&encs[i], &cur, w, h).expect("stateless");
+            cur = sess.decode_delta(&encs[i], &cur, w, h).expect("session");
+            assert_eq!(cur, stateless, "frame {i} session == stateless");
+            assert_eq!(cur, frames[i], "frame {i} byte-exact");
+        }
+        // A non-identity delta whose container dims disagree with the
+        // reference must fail cleanly (None), not slice the External planes
+        // out of bounds. (An identity delta short-circuits before the dims
+        // check — pre-existing semantics, unchanged.)
+        let bigger_a = photo_like(w as usize * 2, h as usize, 7);
+        let bigger_b = photo_like(w as usize * 2, h as usize, 8);
+        let bad = encode_rgb8_delta(&bigger_b, &bigger_a, w * 2, h);
+        assert!(decode_rgb8_delta(&bad, &frames[0], w, h).is_none());
+        assert!(DeltaDecodeSession::new().decode_delta(&bad, &frames[0], w, h).is_none());
+        // 3n/8 syms per plane keeps lane alignment; also cover a fresh session
+        // starting mid-chain (seeds from prev).
+        let mut mid = DeltaDecodeSession::new();
+        assert_eq!(mid.decode_delta(&encs[1], &frames[0], w, h).expect("mid-chain"), frames[1]);
     }
 
     #[test]

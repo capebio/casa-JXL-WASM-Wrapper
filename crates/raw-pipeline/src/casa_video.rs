@@ -1452,24 +1452,35 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
     let start = preceding_iframe(data, index)?;
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
-    let fable = hdr.flags & CASV_HDR_FABLE_FLAG != 0;
+    if hdr.flags & CASV_HDR_FABLE_FLAG != 0 {
+        // FableBraid tier: one session carries the previous frame's planar
+        // subtract-green form across the P-chain (no per-frame re-derivation).
+        let mut sess = crate::fable_braid::DeltaDecodeSession::new();
+        let mut cur: Option<Vec<u8>> = None;
+        for i in start..=index {
+            let (is_p, slice) = casv_frame_info(data, i)?;
+            cur = Some(if is_p {
+                let prev = cur.take()?;
+                sess.decode_delta(slice, &prev, w, h)?
+            } else {
+                let (px, dw, dh) = sess.decode_intra(slice)?;
+                if (dw, dh) != (w, h) {
+                    return None;
+                }
+                px
+            });
+        }
+        return cur.map(|px| (px, w, h));
+    }
     let mut cur: Option<Vec<u8>> = None;
     for i in start..=index {
         let (is_p, slice) = casv_frame_info(data, i)?;
         if is_p {
             let mut prev = cur.take()?;
-            if fable {
-                prev = crate::fable_braid::decode_rgb8_delta(slice, &prev, w, h)?;
-            } else {
-                apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-            }
+            apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
             cur = Some(prev);
         } else {
-            let (px, dw, dh) = if fable {
-                crate::fable_braid::decode_rgb8(slice)?
-            } else {
-                decode_interleaved::<u8>(slice, 3)?
-            };
+            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
             if (dw, dh) != (w, h) {
                 return None;
             }
@@ -1484,25 +1495,38 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
-    let fable = hdr.flags & CASV_HDR_FABLE_FLAG != 0;
     let mut out = Vec::with_capacity(hdr.frame_count as usize);
+    if hdr.flags & CASV_HDR_FABLE_FLAG != 0 {
+        // FableBraid tier: one session carries the previous frame's planar
+        // subtract-green form across P-frames (no per-frame re-derivation).
+        let mut sess = crate::fable_braid::DeltaDecodeSession::new();
+        let mut prev: Option<Vec<u8>> = None;
+        for i in 0..hdr.frame_count as usize {
+            let (is_p, slice) = casv_frame_info(data, i)?;
+            let recon = if is_p {
+                let base = prev.take()?;
+                sess.decode_delta(slice, &base, w, h)?
+            } else {
+                let (px, dw, dh) = sess.decode_intra(slice)?;
+                if (dw, dh) != (w, h) {
+                    return None;
+                }
+                px
+            };
+            prev = Some(recon.clone());
+            out.push((recon, w, h));
+        }
+        return Some(out);
+    }
     let mut prev: Option<Vec<u8>> = None;
     for i in 0..hdr.frame_count as usize {
         let (is_p, slice) = casv_frame_info(data, i)?;
         let recon = if is_p {
             let mut base = prev.take()?;
-            if fable {
-                base = crate::fable_braid::decode_rgb8_delta(slice, &base, w, h)?;
-            } else {
-                apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-            }
+            apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
             base
         } else {
-            let (px, dw, dh) = if fable {
-                crate::fable_braid::decode_rgb8(slice)?
-            } else {
-                decode_interleaved::<u8>(slice, 3)?
-            };
+            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
             if (dw, dh) != (w, h) {
                 return None;
             }
