@@ -1067,23 +1067,9 @@ pub fn casv_frame_slice(data: &[u8], index: usize) -> Option<&[u8]> {
 /// Like `casv_frame_slice` but also reports whether the frame is a P-frame
 /// (delta) vs an I-frame (keyframe).
 pub fn casv_frame_info(data: &[u8], index: usize) -> Option<(bool, &[u8])> {
-    let hdr = parse_casv_header(data)?;
-    if index >= hdr.frame_count as usize {
-        return None;
-    }
-    let entry = CASV_HEADER_BYTES + index * CASV_INDEX_ENTRY_BYTES;
-    if data.len() < entry + CASV_INDEX_ENTRY_BYTES {
-        return None;
-    }
-    let offset = u32::from_le_bytes(data[entry..entry + 4].try_into().ok()?) as usize;
-    let len_field = u32::from_le_bytes(data[entry + 4..entry + 8].try_into().ok()?);
-    let is_p = (len_field & CASV_PFRAME_FLAG) != 0;
-    let len = (len_field & !(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG)) as usize;
-    let end = offset.checked_add(len)?;
-    if offset < CASV_HEADER_BYTES || end > data.len() {
-        return None;
-    }
-    Some((is_p, &data[offset..end]))
+    let view = CasvView::from_header(data)?;
+    let (flags, slice) = view.entry(index)?;
+    Some((flags & CASV_PFRAME_FLAG != 0, slice))
 }
 
 /// In-place `base[i] += residual16[i] - 32768`, clamped to `[0,255]`. The clamp
@@ -1095,11 +1081,13 @@ fn add_residual16_into(base: &mut [u8], resid: &[u16]) {
     }
 }
 
-/// Index of the I-frame at or before `index` (the GOP start needed to decode it).
-fn preceding_iframe(data: &[u8], index: usize) -> Option<usize> {
+/// Index of the I-frame at or before `index` (the GOP start needed to decode
+/// it). Probes the already-parsed view — one header parse for the whole O(GOP)
+/// backward scan instead of one per probed frame.
+fn preceding_iframe(view: &CasvView, index: usize) -> Option<usize> {
     (0..=index)
         .rev()
-        .find(|&j| casv_frame_info(data, j).map(|(is_p, _)| !is_p).unwrap_or(false))
+        .find(|&j| matches!(view.entry(j), Some((flags, _)) if flags & CASV_PFRAME_FLAG == 0))
 }
 
 /// Tight bounding box `(x, y, w, h)` of pixels whose max channel difference
@@ -1664,9 +1652,9 @@ fn apply_pframe(
 /// from the preceding I-frame (O(GOP)), reconstructing each residual. One
 /// persistent decoder + reused scratch serve the whole chain.
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
-    let start = preceding_iframe(data, index)?;
-    let end = index.checked_add(1)?;
     let view = CasvView::from_header(data)?;
+    let start = preceding_iframe(&view, index)?;
+    let end = index.checked_add(1)?;
     let (w, h) = (view.width, view.height);
     let mut sess = CasvDecodeSession::new()?;
     let mut cur: Vec<u8> = Vec::new();
