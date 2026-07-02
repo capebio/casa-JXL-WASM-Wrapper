@@ -1786,3 +1786,40 @@ strip-staging (peak-RSS unmeasurable in unit test), extra-channel completeness c
   are independent → rayon over `y` (H) and the `x` tile stride (V), gated on `parallel`.
   (b) AVX-512 / wasm-SIMD `box_blur` (currently fall back to scalar V). (c) Fold the
   3-level mask blur into the pyramid walk to avoid re-blurring re-read planes.
+
+## CR2 pass deferrals (perf/cr2-fused-crop-jul02-c2f8, 2026-07-02)
+
+- **Canon SensorInfo (MakerNote 0x00E0) true active area + real CFA phase.**
+  **IMPLEMENTED 2026-07-02** on `perf/cr2-sensorinfo-jul02-a9e4` (user-approved
+  non-byte-exact pathway). Probe result: ALL 11 fixtures had the WRONG rectangle —
+  center-crop origin off by 72 (550D) / 132 (ADH) columns; the shipped output included
+  optical-black masked pixels (band mean == black level exactly, see
+  examples/cr2_activearea_evidence.rs) and discarded the same width of live image.
+  SensorInfo origin is now the default (validated: active dims == IFD0 crop, sensor
+  grid == decoded grid, fits) with even-snapped center-crop fallback; CFA phase =
+  true origin parity. Remaining follow-up: bodies whose LJPEG origin is not RGGB
+  still rely on the lib.rs green-channel net; a body with odd borders now gets the
+  correct phase directly instead of triggering retry demosaics.
+
+- **DecodeLimits before allocation.** decode_impl allows 200 MP (≈400 MB u16) before the
+  browser caller's 50 MP policy check runs (post-decode). On wasm32 an adversarial header
+  can force a huge allocation → OOM trap instead of graceful error. Fix = plumb a
+  max_pixels/max_raw_bytes limit into the decoder (API/behavior change for native callers).
+
+- **MaybeUninit LJPEG output sink.** First decode into a fresh buffer still pays a full
+  resize zero-fill (~37 MB @550D) that the kernels then overwrite completely. The kernels'
+  full-write invariant holds (write every row<out_rows × col<out_pixel_cols on success,
+  bail on any entropy error), but eliding the zero-fill means set_len before write —
+  an unsafe boundary that wants a mechanical full-write test harness first. (The warm
+  scratch path no longer re-zeroes as of c2f8; this only affects cold/owned decodes.)
+
+- **Caller-owned output pool (`decode_into(data, scratch, output)`).** Completes the
+  batch/video ownership story (scratch stream buffer + reusable output frames). No
+  production caller exists yet (decode_with_scratch itself is test-only); add when the
+  batch RAW→JXL path materialises. Pairs with the memory-admission-gate work (rcw-mag).
+
+- **LJPEG rolling-row / stripe emitter.** Deeper restructure: decode LJPEG into a few
+  predictor rows and emit active-area stripes directly to demosaic/JXL (kills the
+  full-frame raw buffer for raster CR2s; multi-slice needs stripe-aware scheduling since
+  the stream is slice-major). Research-grade; mirrors the ORF streaming-preview pipeline
+  (decompress.rs q8z) which proved the pattern byte-exact there.

@@ -2827,6 +2827,16 @@ const CANON_CAM_TO_SRGB: [[f32; 3]; 3] = [
     [ 0.0388, 0.0791, 0.8824],
 ];
 
+thread_local! {
+    // Warm CR2 decode buffer: survives across frames within a worker so repeat
+    // decodes skip the full-frame allocation + zero-fill (cr2 scratch keeps the
+    // buffer at full logical length — the next resize is a no-op). Retaining
+    // ~40 MB between frames is free on wasm32: the heap never shrinks, so this
+    // converts alloc/free churn into stable reuse without raising peak memory.
+    static CR2_SCRATCH: std::cell::RefCell<raw_pipeline::cr2::ScratchBuffers> =
+        std::cell::RefCell::new(raw_pipeline::cr2::ScratchBuffers::default());
+}
+
 fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     const MAX_DIM: u32 = 8192;
     const MAX_PIXELS: usize = 50_000_000;
@@ -2835,7 +2845,8 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     // so CR2 decompress_ms is apples-to-apples with the ORF path, whose decompress_ms
     // is also entropy-only. now_ms() is the wasm-safe clock (Instant panics on wasm32).
     let clock = || now_ms();
-    let (cr2, cr2_timings) = raw_pipeline::cr2::decode_bytes_with_clock(data, &clock)
+    let (cr2, cr2_timings) = CR2_SCRATCH
+        .with(|sc| raw_pipeline::cr2::decode_with_scratch_clock(data, &mut sc.borrow_mut(), &clock))
         .map_err(|e| JsError::new(&format!("CR2 decode: {}", e)))?;
     let decode_ms = cr2_timings.ljpeg_ms;
 

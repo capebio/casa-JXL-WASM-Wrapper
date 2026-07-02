@@ -1667,3 +1667,22 @@ Per the deferred docs' own analysis these cannot pay for their risk/effort; move
 - **chroma_from_luma micro-cleanups (transactional DecodeDC, u32 GetColorFactor)** — header-decode cold path, not ms-level.
 - **dec_group `RatioJPEG` hoist + compressed_dc #6 vertical chroma reuse** — JPEG-reconstruction / subsampled paths only; the RAW→XYB app pipeline is 4:4:4 and never executes them.
 - **enc_modular subsampled `AddVarDCTDC` exact allocation** — 4:2:0/4:2:2 only; the app path is 4:4:4, the branch never runs.
+## CR2 pass (perf/cr2-fused-crop-jul02-c2f8, 2026-07-02) — rejected items
+
+### Eliminate the "double SOF3 parse" (cr2::parse_ljpeg_sof + ljpeg plan prepare)
+Proposed (ChatGPT deep-analysis): expose an LjpegPlan handle so cr2.rs does not scan SOF3
+and then have decode_tile re-parse the same headers. **Rejected — no measurable gain.**
+`parse_ljpeg_sof` is a linear scan of a few marker segments (~100 bytes) before SOS;
+ljpeg.rs already carries a 1-entry plan cache (jun30 z7k) so the second parse hits warm
+state. Wiring a plan handle across the module boundary adds API surface for µs-scale work
+in a ~150 ms decode. Timing evidence: parse_ms ≈ 0.0–0.1 ms in cr2_parity_sweep.
+
+### In-place slice permutation (reassemble multi-slice without any second buffer)
+Idea: permute the stacked slice buffer into raster order in place (cycle-walking) to reach
+"zero extra buffers". **Rejected — cache-hostile and strictly worse than the shipped fused
+path.** Cycle-walking a large non-contiguous permutation does irregular single-element
+accesses with div/mod per step, destroys the contiguous-run copies (rows are 1728/1888 px
+runs), and complicates correctness for the remainder slice. The shipped alternative
+(fused reassemble+crop straight into the output Vec, branch c2f8) removes the full-raster
+temp AND the separate crop pass while keeping contiguous row-run copies; measured −6.3%
+whole-decode (owned) / −11.3% (warm scratch) on _MG_1750 with byte-exact parity.

@@ -41,8 +41,10 @@ pub struct Cr2Image {
     pub model:        String,
     pub orientation:  u16,
     /// Bayer CFA phase (row_parity, col_parity) of the top-left cropped pixel.
-    /// (0,0) = RGGB origin (Red at top-left).  Non-(0,0) means the center-crop
-    /// heuristic landed on a non-RGGB site; the demosaicer must be told this.
+    /// (0,0) = RGGB origin (Red at top-left). Derived from the SensorInfo
+    /// active-area origin parity when the tag is present and consistent; the
+    /// center-crop fallback is even-snapped so it always reports (0,0). The
+    /// demosaicer must be told this.
     pub cfa_phase:    (u8, u8),
 }
 
@@ -71,7 +73,12 @@ pub struct Cr2Timings {
     pub parse_ms: f64,
     /// LJPEG decode time (dominant stage).
     pub ljpeg_ms: f64,
-    /// In-place crop compaction time.
+    /// Slice reassembly time. Fused path (shipped): the single fused
+    /// reassemble+crop pass (crop_ms is then 0). Split path (bench-only): the
+    /// full-raster rebuild. 0 for single-slice files.
+    pub reassemble_ms: f64,
+    /// Crop/output-construction time (single-slice compaction, scratch row copy,
+    /// or split-path crop).
     pub crop_ms: f64,
     /// Bytes in full-frame decode buffer (before crop).
     pub raw_buf_bytes: usize,
@@ -139,8 +146,10 @@ fn entry_first_u32(data: &[u8], dtype: u16, cnt: u32, val: u32, inline_pos: usiz
     if cnt == 0 { return None; }
     let ts = type_size(dtype);
     if ts == 0 { return None; }
-    let bytes = ts * cnt as usize;
-    let p = if bytes <= 4 { inline_pos } else { val as usize };
+    // u64 math: ts*cnt is file-controlled and can wrap usize on 32-bit/wasm,
+    // spuriously selecting the inline branch. Same result for all valid files.
+    let inline = (ts as u64) * (cnt as u64) <= 4;
+    let p = if inline { inline_pos } else { val as usize };
     // Checked add: `p` and `ts` are file-controlled; `p + ts` can wrap on 32-bit/wasm and
     // defeat the bounds guard. OOB/overflow returns None (unchanged for valid files).
     if p.checked_add(ts).map_or(true, |e| e > data.len()) { return None; }
@@ -256,7 +265,9 @@ fn canon_cam_xyz(_model: &str) -> Option<[i32; 9]> {
 /// XYZ->cam like a DNG ColorMatrix, invert to camera->XYZ, then apply XYZ_D50_TO_SRGB. This
 /// keeps CR2 colour consistent with how DNG colour is rendered in this pipeline.
 fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
-    if !make.to_ascii_lowercase().contains("canon") {
+    // Alloc-free ASCII case-insensitive "canon" search (was a String alloc per decode).
+    let has_canon = make.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"canon"));
+    if !has_canon {
         return None;
     }
     let raw = canon_cam_xyz(model)?;
@@ -273,18 +284,33 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
 // Decode entry points
 // ---------------------------------------------------------------------------
 
+/// Bench/parity-only selector for the slice-reassembly pipeline.
+/// Fused is the shipped path; Split* preserve the legacy two-pass pipeline
+/// (full-raster rebuild, then in-place crop) for A/B flips and parity tests.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReassemblyVariant { Fused, SplitBulk, SplitScatter }
+
 /// Decode CR2 from raw bytes. Single call, no second Vec allocation.
 pub fn decode_bytes(data: &[u8]) -> Result<Cr2Image> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, false, false).map(|(img, _, _)| img)
+    decode_impl(data, &mut buf, true, None, false, ReassemblyVariant::Fused)
+        .map(|(img, _, _)| img)
 }
 
-/// Decode forcing a specific slice-reassembly variant (bench only).
-/// `use_scatter=true` selects the pre-#1 scalar scatter; `false` the shipped bulk copy.
+/// Decode forcing a legacy split slice-reassembly variant (bench only).
+/// `use_scatter=true` selects the pre-#1 scalar scatter; `false` the split bulk copy.
 #[doc(hidden)]
 pub fn decode_bytes_variant(data: &[u8], use_scatter: bool) -> Result<Cr2Image> {
+    let v = if use_scatter { ReassemblyVariant::SplitScatter } else { ReassemblyVariant::SplitBulk };
+    decode_bytes_reassembly(data, v)
+}
+
+/// Decode with an explicit reassembly variant (bench/parity only).
+#[doc(hidden)]
+pub fn decode_bytes_reassembly(data: &[u8], v: ReassemblyVariant) -> Result<Cr2Image> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, false, use_scatter).map(|(img, _, _)| img)
+    decode_impl(data, &mut buf, true, None, false, v).map(|(img, _, _)| img)
 }
 
 /// Decode with per-phase timings for benchmarking (native — uses std::time::Instant).
@@ -292,7 +318,8 @@ pub fn decode_bytes_bench(data: &[u8]) -> Result<(Cr2Image, Cr2Timings)> {
     let mut buf = Vec::new();
     let base = std::time::Instant::now();
     let clock = move || base.elapsed().as_secs_f64() * 1000.0;
-    decode_impl(data, &mut buf, true, Some(&clock), false, false).map(|(img, t, _)| (img, t))
+    decode_impl(data, &mut buf, true, Some(&clock), false, ReassemblyVariant::Fused)
+        .map(|(img, t, _)| (img, t))
 }
 
 /// Decode with per-phase timings using a caller-supplied monotonic millisecond clock.
@@ -303,20 +330,36 @@ pub fn decode_bytes_with_clock(
     clock: &dyn Fn() -> f64,
 ) -> Result<(Cr2Image, Cr2Timings)> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, Some(clock), false, false).map(|(img, t, _)| (img, t))
+    decode_impl(data, &mut buf, true, Some(clock), false, ReassemblyVariant::Fused)
+        .map(|(img, t, _)| (img, t))
 }
 
 /// Decode with full LJPEG stage statistics (for profiling only — slightly slower due to counters).
 pub fn decode_bytes_with_ljpeg_stats(data: &[u8]) -> Result<(Cr2Image, ljpeg::LjpegStats)> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, true, false)
+    decode_impl(data, &mut buf, true, None, true, ReassemblyVariant::Fused)
         .map(|(img, _, stats)| (img, stats.expect("capture_stats=true always yields Some")))
 }
 
 /// Decode reusing scratch buffer to avoid per-call full-frame allocation (batch mode).
 /// The scratch.raw buffer grows to full-frame size on the first call and is reused thereafter.
 pub fn decode_with_scratch(data: &[u8], scratch: &mut ScratchBuffers) -> Result<Cr2Image> {
-    decode_impl(data, &mut scratch.raw, false, None, false, false).map(|(img, _, _)| img)
+    decode_impl(data, &mut scratch.raw, false, None, false, ReassemblyVariant::Fused)
+        .map(|(img, _, _)| img)
+}
+
+/// Batch decode with reusable scratch AND per-phase timings — the production
+/// wasm path: the full-frame decode buffer stays warm across frames within a
+/// worker, so repeat decodes skip the full-frame allocation + zero-fill.
+/// `clock` is a caller-supplied monotonic millisecond clock (wasm-safe; see
+/// decode_bytes_with_clock).
+pub fn decode_with_scratch_clock(
+    data: &[u8],
+    scratch: &mut ScratchBuffers,
+    clock: &dyn Fn() -> f64,
+) -> Result<(Cr2Image, Cr2Timings)> {
+    decode_impl(data, &mut scratch.raw, false, Some(clock), false, ReassemblyVariant::Fused)
+        .map(|(img, t, _)| (img, t))
 }
 
 /// Reorder Canon multi-slice LJPEG output from stream-stacked vertical slices into
@@ -391,6 +434,218 @@ pub fn reassemble_slices_scatter(
     raster
 }
 
+/// Locate the raw LJPEG strip and its output geometry (bench/parity tooling
+/// only — mirrors the strip/SOF3 walk in decode_impl without decoding).
+/// Returns (strip_offset, strip_len, stride_pixels = sof_w*ncomp, rows = sof_h).
+#[doc(hidden)]
+pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    if data.len() < 16 {
+        bail!("CR2: file too small ({} bytes)", data.len());
+    }
+    let le = match &data[0..4] {
+        [0x49, 0x49, 0x2A, 0x00] => true,
+        [0x4D, 0x4D, 0x00, 0x2A] => false,
+        m => bail!("CR2: not a TIFF file (magic {:?})", m),
+    };
+    if &data[8..10] != b"CR" {
+        bail!("CR2: missing Canon CR marker at offset 8");
+    }
+    let raw_ifd_off = read_u32(data, 12, le) as usize;
+    if raw_ifd_off == 0 || raw_ifd_off >= data.len() {
+        bail!("CR2: invalid raw IFD offset {}", raw_ifd_off);
+    }
+    let mut strip_offset: u32 = 0;
+    let mut strip_byte_count: u32 = 0;
+    visit_ifd(data, raw_ifd_off, le, |tag, dtype, cnt, val, ip| match tag {
+        0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        _ => {}
+    });
+    if strip_offset == 0 || strip_byte_count == 0 {
+        bail!("CR2: missing strip offset or byte count in raw IFD");
+    }
+    let strip_off = strip_offset as usize;
+    let strip_len = strip_byte_count as usize;
+    match strip_off.checked_add(strip_len) {
+        Some(e) if e <= data.len() => {}
+        _ => bail!("CR2: strip out of bounds"),
+    }
+    let (_prec, sof_h, sof_w, ncomp) = parse_ljpeg_sof(data, strip_off, strip_len)
+        .ok_or_else(|| anyhow!("CR2: could not find SOF3 marker in LJPEG strip"))?;
+    Ok((strip_off, strip_len, sof_w as usize * ncomp as usize, sof_h as usize))
+}
+
+/// Canon MakerNote SensorInfo (tag 0x00E0): true sensor geometry + active-area
+/// borders. Border indices follow exiftool's CanonSensorInfo: the active image
+/// area is [left..=right] × [top..=bottom] in decoded-sensor coordinates.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SensorInfo {
+    pub sensor_width:  u16,
+    pub sensor_height: u16,
+    pub left:   u16,
+    pub top:    u16,
+    pub right:  u16,
+    pub bottom: u16,
+}
+
+impl SensorInfo {
+    #[inline]
+    pub fn active_width(&self) -> usize {
+        (self.right as usize).saturating_sub(self.left as usize) + 1
+    }
+    #[inline]
+    pub fn active_height(&self) -> usize {
+        (self.bottom as usize).saturating_sub(self.top as usize) + 1
+    }
+}
+
+/// Decode a MakerNote SensorInfo entry (tag 0x00E0, SHORT array, ≥ 9 elements:
+/// idx 0 reserved, 1..=8 geometry). Returns None unless the borders are ordered
+/// and inside the sensor grid.
+fn sensor_info_from_entry(
+    data: &[u8], dtype: u16, cnt: u32, val: u32, ip: usize, le: bool,
+) -> Option<SensorInfo> {
+    if dtype != 3 || cnt < 9 { return None; }
+    // cnt ≥ 9 SHORTs never fits inline, but keep the general multiply-free test.
+    let p = if cnt <= 2 { ip } else { val as usize };
+    // 9 SHORTs = 18 bytes needed from p (checked add: p is file-controlled).
+    if p.checked_add(18).map_or(true, |e| e > data.len()) { return None; }
+    let at = |i: usize| read_u16(data, p + i * 2, le);
+    let cand = SensorInfo {
+        sensor_width:  at(1),
+        sensor_height: at(2),
+        left:   at(5),
+        top:    at(6),
+        right:  at(7),
+        bottom: at(8),
+    };
+    (cand.left < cand.right
+        && cand.top < cand.bottom
+        && (cand.right as usize) < cand.sensor_width as usize
+        && (cand.bottom as usize) < cand.sensor_height as usize)
+        .then_some(cand)
+}
+
+/// Parse Canon SensorInfo (MakerNote tag 0x00E0) from a CR2.
+/// Walk mirrors decode_impl: IFD0 → ExifIFD → MakerNote. Returns None when the
+/// tag is missing/malformed (caller falls back to the center-crop heuristic).
+#[doc(hidden)]
+pub fn parse_sensor_info(data: &[u8]) -> Option<SensorInfo> {
+    if data.len() < 16 { return None; }
+    let le = match &data[0..4] {
+        [0x49, 0x49, 0x2A, 0x00] => true,
+        [0x4D, 0x4D, 0x00, 0x2A] => false,
+        _ => return None,
+    };
+    if &data[8..10] != b"CR" { return None; }
+    let ifd0_off = read_u32(data, 4, le) as usize;
+
+    let mut exif_ifd_off: u32 = 0;
+    visit_ifd(data, ifd0_off, le, |tag, _dtype, _cnt, val, _ip| {
+        if tag == 0x8769 { exif_ifd_off = val; }
+    });
+    if exif_ifd_off == 0 || (exif_ifd_off as usize) >= data.len() { return None; }
+
+    let mut makernote_off: u32 = 0;
+    let mut makernote_len: u32 = 0;
+    visit_ifd(data, exif_ifd_off as usize, le, |tag, _dtype, cnt, val, _ip| {
+        if tag == 0x927C { makernote_off = val; makernote_len = cnt; }
+    });
+    if makernote_off == 0 || makernote_len < 2 { return None; }
+    let mn_off = makernote_off as usize;
+    if mn_off.checked_add(2).map_or(true, |e| e > data.len()) { return None; }
+
+    let mut si: Option<SensorInfo> = None;
+    visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
+        if tag == 0x00E0 {
+            if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
+                si = Some(cand);
+            }
+        }
+    });
+    si
+}
+
+/// Select the crop origin + CFA phase. Prefers the camera's own SensorInfo
+/// active-area borders when they are consistent with the decoded grid and the
+/// IFD0 crop dims; otherwise falls back to the even-snapped center-crop
+/// heuristic (phase (0,0) by construction). The SensorInfo origin is NOT
+/// snapped — its true parity is carried out as the CFA phase.
+fn choose_crop_origin(
+    si: Option<SensorInfo>,
+    decoded_width: usize,
+    decoded_height: usize,
+    crop_w: usize,
+    crop_h: usize,
+) -> (usize, usize, (u8, u8)) {
+    if let Some(si) = si {
+        let (ls, ts) = (si.left as usize, si.top as usize);
+        if si.active_width() == crop_w
+            && si.active_height() == crop_h
+            && si.sensor_width as usize == decoded_width
+            && si.sensor_height as usize == decoded_height
+            && ls + crop_w <= decoded_width
+            && ts + crop_h <= decoded_height
+        {
+            return (ls, ts, ((ts & 1) as u8, (ls & 1) as u8));
+        }
+    }
+    let mut left = (decoded_width - crop_w) / 2;
+    let mut top = (decoded_height - crop_h) / 2;
+    if left & 1 != 0 { left -= 1; }
+    if top & 1 != 0 { top -= 1; }
+    (left, top, (0, 0))
+}
+
+/// Fused multi-slice reassembly + crop. Builds the final crop_w×crop_h raster
+/// directly from the STACKED slice decode buffer — no full-raster temp, no
+/// zero-fill, no separate crop pass. Row-major output construction: for each
+/// output row, append the crop-window intersection of each vertical slice in
+/// left-to-right order. The intersections tile [0, crop_w) exactly because the
+/// slices tile [0, stride) and decode_impl enforces stride == n*nw + lw.
+/// Byte-identical to reassemble_slices(..) followed by the row crop (see
+/// tests::fused_reassemble_crop_matches_split_composition).
+fn reassemble_slices_crop(
+    src: &[u16],
+    stride: usize,
+    high: usize,
+    n: usize,
+    nw: usize,
+    lw: usize,
+    left: usize,
+    top: usize,
+    crop_w: usize,
+    crop_h: usize,
+) -> Vec<u16> {
+    // Per-slice crop intersection: source block base, slice width, first source
+    // column, run length. ≤ n+1 entries — computed once, reused for every row.
+    struct Seg { src_base: usize, sw: usize, src_col: usize, run: usize }
+    let block = nw * high;
+    let crop_right = left + crop_w;
+    let mut segs: Vec<Seg> = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let sw = if i < n { nw } else { lw };
+        if sw == 0 { continue; } // lw==0 → no remainder slice
+        let col0 = i * nw;
+        if col0 >= stride { break; }
+        let sw_eff = sw.min(stride - col0);
+        let lo = col0.max(left);
+        let hi = (col0 + sw_eff).min(crop_right);
+        if lo >= hi { continue; }
+        segs.push(Seg { src_base: i * block, sw, src_col: lo - col0, run: hi - lo });
+    }
+    let mut out = Vec::with_capacity(crop_w * crop_h);
+    for row in 0..crop_h {
+        let y = top + row;
+        for s in &segs {
+            let p = s.src_base + y * s.sw + s.src_col;
+            out.extend_from_slice(&src[p..p + s.run]);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Core implementation
 // ---------------------------------------------------------------------------
@@ -403,7 +658,7 @@ fn decode_impl(
     move_buf:       bool,
     clock:          Option<&dyn Fn() -> f64>,
     capture_stats:  bool,
-    use_scatter:    bool, // bench-only: force the pre-#1 scalar scatter reassembly
+    variant:        ReassemblyVariant, // Fused = shipped; Split* = bench/parity only
 ) -> Result<(Cr2Image, Cr2Timings, Option<ljpeg::LjpegStats>)> {
     // Phase timing is driven by an injected monotonic millisecond clock rather than
     // std::time::Instant, which is unavailable on wasm32-unknown-unknown (panics).
@@ -474,23 +729,32 @@ fn decode_impl(
         });
     }
 
-    // Canon MakerNote: zero-alloc WB extraction (item 5)
+    // Canon MakerNote: zero-alloc WB extraction (item 5) + SensorInfo capture
+    // (0x00E0, true active-area borders) in the same single visit.
     let mut wb_r: f32 = 2.0;
     let mut wb_b: f32 = 1.7;
+    let mut sensor_info: Option<SensorInfo> = None;
 
     if makernote_off > 0 && makernote_len >= 2 {
         let mn_off = makernote_off as usize;
         // Checked add: makernote_off is file-controlled; `mn_off + 2` can wrap on 32-bit.
         if mn_off.checked_add(2).map_or(false, |e| e <= data.len()) {
-            visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
-                if tag == 0x4001 && dtype == 3 && cnt > 0 {
-                    let bytes = 2 * cnt as usize;
-                    let p = if bytes <= 4 { ip } else { val as usize };
+            visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| match tag {
+                0x4001 if dtype == 3 && cnt > 0 => {
+                    // cnt<=2 ⟺ 2*cnt<=4 without the file-controlled multiply
+                    // (2*cnt wraps usize on 32-bit/wasm for huge cnt).
+                    let p = if cnt <= 2 { ip } else { val as usize };
                     if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le) {
                         wb_r = r;
                         wb_b = b;
                     }
                 }
+                0x00E0 => {
+                    if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
+                        sensor_info = Some(cand);
+                    }
+                }
+                _ => {}
             });
         }
     }
@@ -510,8 +774,9 @@ fn decode_impl(
         0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
         0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
         0xC640 if dtype == 3 && cnt >= 3 => {
-            let bytes = 2 * cnt as usize;
-            let p = if bytes <= 4 { ip } else { val as usize };
+            // cnt >= 3 SHORTs = 6 bytes — never inline; the old `2 * cnt` form
+            // could wrap usize on 32-bit/wasm and spuriously pick the inline arm.
+            let p = val as usize;
             // Checked add: `p + 6` can wrap on 32-bit/wasm and spuriously pass the guard.
             if p.checked_add(6).map_or(false, |e| e <= data.len()) {
                 cr2_slices[0] = read_u16(data, p,     le);
@@ -620,31 +885,6 @@ fn decode_impl(
     let ljpeg_ms = elapsed(t_ljpeg);
 
     // -----------------------------------------------------------------------
-    // CR2 slice reassembly (Canon multi-slice). The LJPEG decodes to a buffer where the N+1
-    // vertical slices are STACKED in stream order (slice 0's whole nw×sof_h block, then slice 1's,
-    // …); they must be reordered into a single side-by-side raster of width `decoded_width`.
-    // Without this, multi-slice CR2s (e.g. 5D-era, CR2Slices=[2,1728,1888], ncomp=4) decode to
-    // scrambled garbage. Single-slice files (have_slices=false) are already in raster order and
-    // skip this. Algorithm mirrors dcraw's lossless_jpeg slice distribution; components (ncomp) are
-    // absorbed into `stride` so they need no separate de-interleave.
-    if have_slices {
-        let n = cr2_slices[0] as usize;
-        let nw = cr2_slices[1] as usize;
-        let lw = cr2_slices[2] as usize;
-        // Overflow guard for nw*high (reassemble_slices uses saturating mul internally).
-        nw.checked_mul(sof_h).ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
-        let raster = if use_scatter {
-            reassemble_slices_scatter(raw_buf, stride, sof_h, n, nw, lw)
-        } else {
-            reassemble_slices(raw_buf, stride, sof_h, n, nw, lw)
-        };
-        // CRAWL E1: move the reassembled raster into raw_buf (O(1) pointer move) instead
-        // of clear()+extend_from_slice, which copied the whole frame back (~48MB @24MP).
-        // The old stacked-slice buffer is dropped here.
-        *raw_buf = raster;
-    }
-
-    // -----------------------------------------------------------------------
     // Black/white levels: IFD value overrides precision-table default (item 1)
     // -----------------------------------------------------------------------
     let (mut black, white) = match precision {
@@ -671,24 +911,17 @@ fn decode_impl(
               decoded_width, sof_h, crop_w, crop_h);
     }
 
-    let mut left = (decoded_width - crop_w) / 2;
-    let mut top  = (sof_h - crop_h) / 2;
-    // Snap DOWN to even — keeps the crop within bounds.
-    if left & 1 != 0 { left -= 1; }
-    if top  & 1 != 0 { top  -= 1; }
-    // Record the Bayer CFA phase of the top-left crop pixel.
-    //
-    // After snapping both `top` and `left` to even above, (top & 1) and
-    // (left & 1) are tautologically 0, so the decoded-buffer parity is always
-    // (0, 0).  We record it explicitly rather than computing it from the snapped
-    // coordinates to make this invariant clear.
-    //
-    // The correct per-model phase (for Canon bodies whose LJPEG strip starts at
-    // an odd sensor column, i.e. decoded col 0 = Green, not Red) requires a
-    // per-model sensor-margin table that does not yet exist.  The green-channel
-    // sanity check in the caller (src/lib.rs) detects phase errors at runtime
-    // and retries the remaining three phases as a fallback.
-    let cfa_phase: (u8, u8) = (0, 0);
+    // Crop origin: prefer the camera's own active-area borders (SensorInfo,
+    // MakerNote 0x00E0) over the legacy center-crop heuristic. On real bodies
+    // the center guess is wrong by up to 132 columns — it keeps optical-black
+    // masked pixels in the output (band mean == black level) and discards the
+    // same width of live image on the opposite edge (proof:
+    // examples/cr2_activearea_evidence.rs). The CFA phase is the true origin
+    // parity (no snapping); the green-channel check in the caller (src/lib.rs)
+    // remains as a safety net for bodies whose LJPEG origin is not RGGB.
+    // Fallback (tag absent/inconsistent): even-snapped center crop, phase (0,0).
+    let (left, top, cfa_phase) =
+        choose_crop_origin(sensor_info, decoded_width, sof_h, crop_w, crop_h);
 
     if left + crop_w > decoded_width || top + crop_h > sof_h {
         bail!("CR2: crop region [left={}, top={}, w={}, h={}] exceeds decoded {}×{}",
@@ -696,34 +929,100 @@ fn decode_impl(
     }
 
     // -----------------------------------------------------------------------
-    // In-place crop: compact rows within raw_buf — no second Vec (items 8,9)
+    // Output construction. Multi-slice: the LJPEG decodes to a buffer where the
+    // N+1 vertical slices are STACKED in stream order (slice 0's whole nw×sof_h
+    // block, then slice 1's, …); without reordering, multi-slice CR2s (e.g.
+    // 5D-era, CR2Slices=[2,1728,1888], ncomp=4) decode to scrambled garbage.
+    // Shipped Fused path: build the final crop directly from the stacked buffer
+    // (no full-raster temp, no zero-fill, no separate crop pass). Algorithm
+    // mirrors dcraw's lossless_jpeg slice distribution; components (ncomp) are
+    // absorbed into `stride` so they need no separate de-interleave.
+    // Single-slice files are already in raster order: owned path compacts rows
+    // in place (no second Vec); scratch path copies crop rows straight out.
     // -----------------------------------------------------------------------
-    let t_crop = mark();
-    let crop_needed = top != 0 || left != 0 || decoded_width != crop_w;
-    if crop_needed {
+    let crop_len = crop_w * crop_h;
+    let mut reassemble_ms = 0.0;
+    let mut crop_ms = 0.0;
+    let raw_out: Vec<u16>;
+
+    if have_slices {
+        let n  = cr2_slices[0] as usize;
+        let nw = cr2_slices[1] as usize;
+        let lw = cr2_slices[2] as usize;
+        // Overflow guard for nw*high (both paths derive block = nw*high).
+        nw.checked_mul(sof_h).ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
+        if variant == ReassemblyVariant::Fused {
+            // raw_buf keeps the full-length stacked decode → in scratch mode the
+            // next resize(total_pixels) is a no-op (no tail re-zero-fill).
+            let t = mark();
+            let out = reassemble_slices_crop(
+                raw_buf, stride, sof_h, n, nw, lw, left, top, crop_w, crop_h);
+            reassemble_ms = elapsed(t);
+            if out.len() != crop_len {
+                bail!("CR2: fused reassembly produced {} px, expected {}", out.len(), crop_len);
+            }
+            raw_out = out;
+        } else {
+            // Legacy split pipeline (bench/parity only): full raster, then crop.
+            let t = mark();
+            let raster = if variant == ReassemblyVariant::SplitScatter {
+                reassemble_slices_scatter(raw_buf, stride, sof_h, n, nw, lw)
+            } else {
+                reassemble_slices(raw_buf, stride, sof_h, n, nw, lw)
+            };
+            // CRAWL E1: O(1) pointer move; the old stacked-slice buffer drops here.
+            *raw_buf = raster;
+            reassemble_ms = elapsed(t);
+            let t_crop = mark();
+            let crop_needed = top != 0 || left != 0 || decoded_width != crop_w;
+            if crop_needed {
+                for row in 0..crop_h {
+                    let src = (top + row) * stride + left;
+                    raw_buf.copy_within(src..src + crop_w, row * crop_w);
+                }
+            }
+            raw_buf.truncate(crop_len);
+            crop_ms = elapsed(t_crop);
+            raw_out = if move_buf {
+                std::mem::take(raw_buf)     // zero-copy — raw_buf left empty
+            } else {
+                raw_buf[..crop_len].to_vec()   // batch mode: clone crop, retain capacity
+            };
+        }
+    } else if move_buf {
+        // Single-slice owned path: in-place compaction within raw_buf — no
+        // second Vec (items 8,9) — then move out.
+        let t_crop = mark();
+        let crop_needed = top != 0 || left != 0 || decoded_width != crop_w;
+        if crop_needed {
+            for row in 0..crop_h {
+                let src = (top + row) * stride + left;
+                raw_buf.copy_within(src..src + crop_w, row * crop_w);
+            }
+        }
+        raw_buf.truncate(crop_len);
+        crop_ms = elapsed(t_crop);
+        raw_out = std::mem::take(raw_buf);  // zero-copy — raw_buf left empty
+    } else {
+        // Single-slice scratch path: copy crop rows straight into the output —
+        // raw_buf is untouched and stays full-length, so the next decode's
+        // resize(total_pixels) is a no-op (kills the warm-path tail re-zero and
+        // the old crop-in-place + clone double copy).
+        let t_crop = mark();
+        let mut out = Vec::with_capacity(crop_len);
         for row in 0..crop_h {
             let src = (top + row) * stride + left;
-            let dst = row * crop_w;
-            raw_buf.copy_within(src..src + crop_w, dst);
+            out.extend_from_slice(&raw_buf[src..src + crop_w]);
         }
+        crop_ms = elapsed(t_crop);
+        raw_out = out;
     }
-    raw_buf.truncate(crop_w * crop_h);
-    let crop_ms        = elapsed(t_crop);
-    let crop_buf_bytes = crop_w * crop_h * 2;
 
-    // -----------------------------------------------------------------------
-    // Build return value
-    // -----------------------------------------------------------------------
-    let raw_out = if move_buf {
-        std::mem::take(raw_buf)     // zero-copy — raw_buf left empty
-    } else {
-        raw_buf[..crop_w * crop_h].to_vec()   // batch mode: clone crop, retain capacity
-    };
-
+    let crop_buf_bytes = crop_len * 2;
     let total_ms = elapsed(t_total);
 
     let timings = Cr2Timings {
-        total_ms, parse_ms, ljpeg_ms, crop_ms,
+        total_ms, parse_ms, ljpeg_ms, reassemble_ms, crop_ms,
         raw_buf_bytes, crop_buf_bytes,
         slices: if have_slices { cr2_slices } else { [0; 3] },
     };
@@ -913,6 +1212,123 @@ mod tests {
         }
     }
 
+    /// Real-fixture loader: CR2_FIXTURE_DIR override, default raw-converter tests dir.
+    /// Returns None (test skips) when the file is not present on this machine.
+    fn fixture(name: &str) -> Option<Vec<u8>> {
+        let dir = std::env::var("CR2_FIXTURE_DIR")
+            .unwrap_or_else(|_| r"C:\Foo\raw-converter\tests".into());
+        std::fs::read(std::path::Path::new(&dir).join(name)).ok()
+    }
+
+    #[test]
+    fn choose_crop_origin_prefers_valid_sensor_info() {
+        // Real ADH-body geometry: active 6000x4000 at (276,48) inside 6288x4056.
+        let si = SensorInfo { sensor_width: 6288, sensor_height: 4056, left: 276, top: 48, right: 6275, bottom: 4047 };
+        assert_eq!(choose_crop_origin(Some(si), 6288, 4056, 6000, 4000), (276, 48, (0, 0)));
+        // Odd origin → real parity carried through as CFA phase, no snapping.
+        let si_odd = SensorInfo { sensor_width: 100, sensor_height: 60, left: 5, top: 3, right: 84, bottom: 42 };
+        assert_eq!(choose_crop_origin(Some(si_odd), 100, 60, 80, 40), (5, 3, (1, 1)));
+    }
+
+    #[test]
+    fn choose_crop_origin_falls_back_when_inconsistent() {
+        // Active dims disagree with the IFD0 crop → center fallback.
+        let si = SensorInfo { sensor_width: 100, sensor_height: 60, left: 4, top: 2, right: 93, bottom: 51 };
+        assert_eq!(choose_crop_origin(Some(si), 100, 60, 80, 40), (10, 10, (0, 0)));
+        // Sensor grid disagrees with the decoded grid → center fallback.
+        let si2 = SensorInfo { sensor_width: 200, sensor_height: 60, left: 4, top: 2, right: 83, bottom: 41 };
+        assert_eq!(choose_crop_origin(Some(si2), 100, 60, 80, 40), (10, 10, (0, 0)));
+        // Tag absent → center fallback (even-snapped).
+        assert_eq!(choose_crop_origin(None, 100, 60, 80, 40), (10, 10, (0, 0)));
+        assert_eq!(choose_crop_origin(None, 101, 61, 80, 40), (10, 10, (0, 0)));
+    }
+
+    #[test]
+    fn sensor_crop_matches_grid_single_slice() {
+        // Single-slice body: the decoded grid IS the raster, so the shipped crop
+        // must equal grid rows at the SensorInfo origin, row for row.
+        let Some(data) = fixture("ADH 1234.CR2") else { return };
+        let si = parse_sensor_info(&data).expect("SensorInfo present");
+        let (off, len, stride, rows) = ljpeg_strip_geometry(&data).unwrap();
+        let img = decode_bytes(&data).unwrap();
+        assert_eq!(img.width, si.active_width());
+        assert_eq!(img.height, si.active_height());
+        let mut grid = vec![0u16; stride * rows];
+        crate::ljpeg::decode_tile(&data[off..off + len], &mut grid, 0, stride, stride, rows).unwrap();
+        let (ls, ts) = (si.left as usize, si.top as usize);
+        for &row in &[0usize, img.height / 2, img.height - 1] {
+            let g = (ts + row) * stride + ls;
+            assert_eq!(&img.raw[row * img.width..(row + 1) * img.width],
+                       &grid[g..g + img.width], "row {row}");
+        }
+        assert_eq!(img.cfa_phase, (0, 0), "ADH origin is even/even");
+    }
+
+    #[test]
+    fn variants_byte_identical_on_real_files() {
+        // Fused (shipped) == SplitBulk == SplitScatter on one multi-slice and one
+        // single-slice body. The full 11-fixture sweep lives in the release
+        // example cr2_fused_flip / Task-7 verification.
+        for name in ["_MG_1744.CR2", "ADH 1234.CR2"] {
+            let Some(data) = fixture(name) else { continue };
+            let f = decode_bytes_reassembly(&data, ReassemblyVariant::Fused).expect("fused");
+            let b = decode_bytes_reassembly(&data, ReassemblyVariant::SplitBulk).expect("bulk");
+            let s = decode_bytes_reassembly(&data, ReassemblyVariant::SplitScatter).expect("scatter");
+            assert_eq!(f.raw, b.raw, "fused vs bulk: {name}");
+            assert_eq!(f.raw, s.raw, "fused vs scatter: {name}");
+            assert_eq!((f.width, f.height, f.black, f.white, f.cfa_phase),
+                       (b.width, b.height, b.black, b.white, b.cfa_phase), "{name}");
+            assert_eq!(f.wb_r.to_bits(), b.wb_r.to_bits(), "{name}");
+            assert_eq!(f.wb_b.to_bits(), b.wb_b.to_bits(), "{name}");
+        }
+    }
+
+    #[test]
+    fn scratch_warm_reuse_across_geometries() {
+        // multi → single → multi with ONE scratch: byte-identical to fresh decodes.
+        // Exercises the no-truncate warm path (stale tail must be fully overwritten
+        // by the next LJPEG decode — full-write invariant).
+        let (Some(m), Some(s)) = (fixture("_MG_1744.CR2"), fixture("ADH 1234.CR2")) else { return };
+        let mut sc = ScratchBuffers::default();
+        for (i, data) in [&m, &s, &m].into_iter().enumerate() {
+            let a = decode_with_scratch(data, &mut sc).expect("scratch decode");
+            let b = decode_bytes(data).expect("fresh decode");
+            assert_eq!(a.raw, b.raw, "call {i}");
+            assert_eq!((a.width, a.height, a.black, a.white), (b.width, b.height, b.black, b.white));
+        }
+    }
+
+    #[test]
+    fn fused_reassemble_crop_matches_split_composition() {
+        // (n, nw, lw, high, left, top, crop_w, crop_h); stride = n*nw + lw.
+        // left/top even (decode_impl snaps), crop within bounds. Includes real 550D
+        // geometry, lw==0 (no remainder), crop==full, crop inside one slice, crop
+        // spanning all slices.
+        let cases = [
+            (2usize, 4usize, 6usize, 5usize, 2usize, 0usize, 8usize, 4usize),
+            (3, 8, 8, 7, 0, 2, 32, 5),
+            (1, 16, 4, 9, 4, 2, 10, 6),
+            (2, 1728, 1888, 12, 80, 2, 5184, 8),  // real Canon widths
+            (4, 5, 3, 6, 0, 0, 23, 6),             // crop == full frame
+            (2, 8, 0, 5, 2, 0, 12, 5),             // lw == 0
+            (3, 10, 5, 8, 12, 2, 6, 4),            // crop inside slice 1
+        ];
+        for &(n, nw, lw, high, left, top, cw, ch) in &cases {
+            let stride = n * nw + lw;
+            assert!(left + cw <= stride && top + ch <= high, "bad case");
+            let src: Vec<u16> = (0..stride * high).map(|i| (i % 65535) as u16).collect();
+            // Split composition: full reassemble then crop.
+            let raster = reassemble_slices(&src, stride, high, n, nw, lw);
+            let mut want = Vec::with_capacity(cw * ch);
+            for row in 0..ch {
+                let s = (top + row) * stride + left;
+                want.extend_from_slice(&raster[s..s + cw]);
+            }
+            let got = reassemble_slices_crop(&src, stride, high, n, nw, lw, left, top, cw, ch);
+            assert_eq!(got, want, "n={n} nw={nw} lw={lw} high={high} l={left} t={top} {cw}x{ch}");
+        }
+    }
+
     #[test]
     fn scratch_produces_same_output() {
         let path = std::env::var("CR2_TEST_FILE")
@@ -927,6 +1343,24 @@ mod tests {
         assert_eq!(img1.raw, img2.raw, "scratch must produce identical output");
         assert_eq!(img1.black, img2.black);
         assert_eq!(img1.wb_r.to_bits(), img2.wb_r.to_bits());
+    }
+
+    #[test]
+    fn entry_first_u32_huge_count_no_wrap() {
+        // cnt*ts would wrap 32-bit usize; must fall through to the out-of-line branch
+        // (val as usize = OOB) and return None — not read the inline area.
+        let data = vec![0xABu8; 32];
+        // dtype=3 (SHORT, ts=2), cnt = 0x8000_0003 → 2*cnt wraps to 6 on 32-bit.
+        assert_eq!(entry_first_u32(&data, 3, 0x8000_0003, 0xFFFF_FFFF, 4, true), None);
+    }
+
+    #[test]
+    fn canon_make_check_case_variants() {
+        // Same behavior for all case variants; still None while canon_cam_xyz is disabled.
+        assert!(canon_color_matrix("CANON", "Canon EOS 550D").is_none());
+        assert!(canon_color_matrix("canon inc.", "Canon EOS 550D").is_none());
+        assert!(canon_color_matrix("Nikon", "D850").is_none());
+        assert!(canon_color_matrix("Cano", "trunc").is_none()); // shorter than needle
     }
 
     #[test]
