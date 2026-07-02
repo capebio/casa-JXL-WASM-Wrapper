@@ -426,7 +426,7 @@ Result (2026-07-02, 13 rounds interleaved, round0 dropped): _MG_1744 strip 5344�
 ### Task 7: Full verification sweep
 
 - [x] All 11 fixtures byte-identical across Fused / SplitBulk / SplitScatter / warm scratch (`cr2_parity_sweep` example, exit 0, every file EXACT incl. wb bit-equality).
-- [ ] Full suite MSVC: `..\..\build-msvc.ps1 test --release --lib --tests` from `crates/raw-pipeline` (examples excluded: `demosaic_preview_demo.rs` has a PRE-EXISTING stale `Comparer::new(&Vec)` call that breaks `cargo test`'s example build — untouched by this branch).
+- [x] Full suite MSVC (`..\..\build-msvc.ps1 test --release --lib --tests --no-fail-fast`): **282 passed / 1 failed** — the failure (`cross_encoder::full_variant_roundtrips_pixels_through_oxide`, sRGB channel error 0.147 at the libjxl↔jxl-oxide boundary) **also fails on unmodified main** (verified from the primary checkout) → pre-existing, unrelated to this branch. Examples excluded: `demosaic_preview_demo.rs` has a pre-existing stale `Comparer::new(&Vec)` call that breaks `cargo test`'s example build — also untouched by this branch.
 - [x] WASM: `cargo check --target wasm32-unknown-unknown --no-default-features --lib` (raw-pipeline) clean, 0 warnings in cr2/ljpeg; root crate `--no-default-features` clean (parallel-wasm needs the build script's atomics RUSTFLAGS — pre-existing, unrelated).
 - [x] `cr2_parity_sweep` shows reassemble_ms visible: multi ≈10 ms fused (crop_ms 0), singles crop 5–12 ms; multi ljpeg now ~150 ms via decode_c4.
 
