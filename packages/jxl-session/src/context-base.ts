@@ -122,7 +122,8 @@ function getGlobalMemoryGate(budgetBytes: number | undefined): AdmissionGate {
   return globalMemoryGate;
 }
 
-function createScheduler(factory: WorkerFactory, opts: ContextOptions | undefined, maxWorkers: number, workerCost: number): Scheduler {
+// Merged: mag's memory gate + jxl-flow's TTFP-3 prewarmSize param (both optional, compose).
+function createScheduler(factory: WorkerFactory, opts: ContextOptions | undefined, maxWorkers: number, workerCost: number, prewarmSize?: number): Scheduler {
   const useMemoryGate = opts?.memoryGate === true;
   // With the memory gate, the byte budget is the concurrency limiter, so raise the worker
   // ceiling past the flat default; without it, keep the caller's maxWorkers unchanged.
@@ -134,6 +135,9 @@ function createScheduler(factory: WorkerFactory, opts: ContextOptions | undefine
     maxWorkers: effectiveMaxWorkers,
     idleTimeoutMs: opts?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
     ...(opts?.pushHwm !== undefined ? { pushHwm: opts.pushHwm } : {}),
+    // TTFP-3: prewarmSize is an explicit parameter (not read from opts) so the
+    // tiered context can prewarm only the scheduler its first pick will hit.
+    ...(prewarmSize !== undefined && prewarmSize > 0 ? { prewarmSize } : {}),
     coreBudget: globalCoreBudget,
     workerCost,
     ...(useMemoryGate ? { admissionGate: getGlobalMemoryGate(opts?.memoryCapBytes) } : {}),
@@ -211,7 +215,7 @@ export class JxlContextImpl extends CapabilityAwareContext {
   constructor(factory: WorkerFactory, opts: ContextOptions | undefined, maxWorkers: number) {
     super();
     const workerCost = computeWorkerCostForWasmUrl(opts?.wasmUrl);
-    this.scheduler = createScheduler(factory, opts, maxWorkers, workerCost);
+    this.scheduler = createScheduler(factory, opts, maxWorkers, workerCost, opts?.prewarmSize);
   }
 
   decode(opts: DecodeOptions): DecodeSession {
@@ -248,7 +252,11 @@ export class TieredJxlContextImpl extends CapabilityAwareContext {
   }) {
     super();
     const mtCost = computeWorkerCostForWasmUrl(params.opts?.wasmUrl);
-    this.mtScheduler = createScheduler(params.mtFactory, params.opts, params.maxWorkers, mtCost);
+    // TTFP-3: prewarm only the MT scheduler — with a fresh pool and untouched
+    // core budget the router's first pick is MT, so an ST prewarm would spawn
+    // a second speculative worker (+ a second ~MB-scale WASM fetch) for a
+    // scheduler the first decode does not hit.
+    this.mtScheduler = createScheduler(params.mtFactory, params.opts, params.maxWorkers, mtCost, params.opts?.prewarmSize);
     this.stScheduler = createScheduler(params.stFactory, params.opts, params.maxWorkers, 1);
     this.router = createTieredSchedulerRouter({
       mtScheduler: {

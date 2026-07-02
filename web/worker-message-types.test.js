@@ -9,6 +9,7 @@ test('WorkerMsg carries the exact RAW-worker protocol strings', () => {
     expect(WorkerMsg.REPROCESS_LIVE).toBe('reprocess_live');
     expect(WorkerMsg.REPROCESS_THUMB_LIVE).toBe('reprocess_thumb_live');
     expect(WorkerMsg.CANCEL).toBe('cancel');
+    expect(WorkerMsg.PRELOAD).toBe('preload');
     expect(WorkerMsg.THUMB).toBe('thumb');
     expect(WorkerMsg.LIGHTBOX).toBe('lightbox');
     expect(WorkerMsg.LIGHTBOX_LIVE).toBe('lightbox_live');

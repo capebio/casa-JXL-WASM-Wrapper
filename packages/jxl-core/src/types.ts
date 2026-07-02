@@ -370,6 +370,11 @@ export interface ContextOptions {
   pushHwm?: number;
   wasmUrl?: string;
   cache?: CacheOptions;
+  // Workers to spawn eagerly at context creation so the first decode/encode
+  // hits a booted (and, in the browser worker, WASM-warm) worker instead of
+  // paying spawn + fetch + compile serially. 0 disables. Browser contexts
+  // default to 1; idle reap (idleTimeoutMs) covers abandonment.
+  prewarmSize?: number;
 }
 
 export interface CacheOptions {

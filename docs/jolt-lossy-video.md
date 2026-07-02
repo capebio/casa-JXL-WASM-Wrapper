@@ -5,7 +5,10 @@ Apparatus* — the video container
 (`crates/raw-pipeline/src/casa_video.rs`; on-disk tag `CASV`, `.casv`). It is built for *quick and
 efficient* video streaming: JXL VarDCT intra frames encoded with the chunked
 constant-peak encoder, plus fresh-pixel **REPLACE-skip** P-frames (bbox or
-tile) with in-loop reconstruction so encoder and decoder never drift.
+tile). Drift-freedom comes from REPLACE semantics plus source-frame change
+detection: replaced regions are fresh decoder-side decodes, unchanged regions
+stay at I-frame-level error, and errors never accumulate — the encoder never
+decodes its own output (reconstruction is decoder-side only).
 
 Additive lossy residual coding is proven **not** to work in JXL — the
 perceptual model misjudges residual planes (see
@@ -66,6 +69,18 @@ All presets use GOP 24 and the auto change-detection threshold
 Every JOLT preset decodes 720p in real time single-threaded; the lossless tier
 does not — that is exactly the gap JOLT exists to fill. (Encode is offline /
 near-real-time; GOP-parallel encode multiplies throughput by core count.)
+
+**Encode-side pass (2026-07-02, byte-exact except the effort fix):** the
+encoder no longer decodes its own output (the in-loop `recon` was write-only —
+detection runs on source frames; one full FFI decode per frame removed), the
+batch lossy encoders are frame-parallel (`into_par_iter`, 4.3–5.6× measured on
+this corpus) and honor `opts.effort` (batch Realtime/Quality bitstreams changed
+deliberately; batch now equals streaming byte-for-byte per preset), and the
+streaming loop reuses one `Encoder` handle + all per-frame scratch. Interleaved
+binary flipflop (8 arms, agent-contended box, untouched-archive control ±7%):
+streaming enc ms/f min-of-arms Realtime 57.8→42.6, Balanced 75.6→53.9, Quality
+79.6→66.2. A default multi-threaded libjxl runner for streaming was measured a
+regression/wash and rejected — see `docs/1 rejected optimizations.md` (CV-E6).
 
 ## Not in scope yet
 

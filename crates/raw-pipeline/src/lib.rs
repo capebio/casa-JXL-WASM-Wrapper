@@ -14,6 +14,8 @@ pub mod casabio_encode;
 pub mod cr2;
 pub mod decompress;
 pub mod demosaic;
+// FableBraid: braided-rANS + mod-256-predictor lossless codec (native + wasm).
+pub mod fable_braid;
 pub mod dng;
 pub mod exif;
 pub mod image_formats;

@@ -1,0 +1,47 @@
+
+######## cam1 ########
+CASV tier benchmark: 48 frames @ 3840x2160  raw 1194.4 MB  gop 24  12 threads  (24fps budget 41.7 ms/f)
+
+tier                size MB  vs raw  enc ms/f   batch ms/f      fps  seq-MT ms/f      fps
+JOLT Realtime         20.86    1.7%     839.2         93.4       11         50.6       20
+JOLT Balanced         44.08    3.7%    2668.8        148.9        7         91.7       11
+JOLT Quality          71.66    6.0%    1249.5        112.1        9         54.7       18
+archive (JXL)        248.09   20.8%     374.7        555.9        2        276.3        4
+fable (braid)        226.18   18.9%      50.5         25.7       39         24.7       40
+
+######## cam2 ########
+CASV tier benchmark: 48 frames @ 3840x2160  raw 1194.4 MB  gop 24  12 threads  (24fps budget 41.7 ms/f)
+
+tier                size MB  vs raw  enc ms/f   batch ms/f      fps  seq-MT ms/f      fps
+JOLT Realtime         15.97    1.3%     815.0         91.7       11         48.1       21
+JOLT Balanced         35.65    3.0%    2554.7        139.9        7         75.3       13
+JOLT Quality          60.16    5.0%    1181.4        109.1        9         52.6       19
+archive (JXL)        248.57   20.8%     398.6        556.3        2        271.0        4
+fable (braid)        202.05   16.9%      44.3         26.0       38         24.2       41
+
+######## cam3 ########
+CASV tier benchmark: 48 frames @ 1920x1080  raw 298.6 MB  gop 24  12 threads  (24fps budget 41.7 ms/f)
+
+tier                size MB  vs raw  enc ms/f   batch ms/f      fps  seq-MT ms/f      fps
+JOLT Realtime          6.03    2.0%      94.5         23.5       43         13.1       76
+JOLT Balanced         15.14    5.1%     241.5         35.1       28         22.9       44
+JOLT Quality          23.99    8.0%     208.2         30.1       33         17.0       59
+archive (JXL)         50.69   17.0%      93.2        181.9        5         72.9       14
+fable (braid)         51.35   17.2%      14.8          8.9      112          8.2      122
+
+######## dist x effort probe (cam1, 12 frames, both directions) ########
+distance x effort probe: 12 frames @ 3840x2160 (streaming footer encode)
+
+d / e              enc ms/f   size MB
+d2 / e1               768.3      5.03
+d1 / e3              2493.3     10.81
+d0.5 / e3            3288.3     17.39
+d1 / e4               908.8     11.14
+d0.5 / e4            1237.1     17.68
+d2 / e3               749.2      4.61
+d2 / e3               762.8      4.61
+d0.5 / e4            1260.9     17.68
+d1 / e4               962.9     11.14
+d0.5 / e3            3270.3     17.39
+d1 / e3              2479.6     10.81
+d2 / e1               758.9      5.03

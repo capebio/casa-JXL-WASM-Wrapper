@@ -1,0 +1,764 @@
+{
+  "summary": "Phase 1 recon: parallel deep-readers find perf/memory candidates across image E3, TTFP, JOLT, FableBraid",
+  "agentCount": 7,
+  "logs": [],
+  "result": [
+    {
+      "area": "JOLT lossy video ENCODE path (crates/raw-pipeline/src/casa_video.rs, commit 05adabaa)",
+      "summary": "Per-frame cost is dominated by the libjxl VarDCT encode FFI call (60-82 ms/f @720p ST per docs/jolt-lossy-video.md) — that interior cost belongs to the libjxl reader. On our side of the boundary the single biggest waste is the \"in-loop reconstruct\": every I-frame and P-frame payload is immediately decoded back via decode_interleaved (casa_video.rs:476, 507, 532, 921, 939, 1038) into a `recon` buffer that is provably WRITE-ONLY in all four encode paths — change detection compares against the previous SOURCE frame (px vs prev_src/frames[idx-1] at :484, :523, :930, :1009), never against recon, so ~15-30% of measured encode ms/f is a full FFI decode whose result is dropped. Second, the batch lossy encoders (encode_casv_delta_lossy_bbox/tiled_rgb8) run serially across frames although (with recon dead) each frame depends only on resident source frames — their lossless siblings already use into_par_iter (:819, :1274, :1369). Third, the batch lossy paths hard-code EncodeOptions::distance(distance) at effort 3 (:911, :994), ignoring opts.effort, while encode_casv_video stamps the requested effort into the header flags (:403) — batch JOLT Realtime pays e3 while its rate metadata claims e1. Finally there is per-frame FFI call-pattern churn (fresh JxlEncoderCreate/Destroy + settings resend + fresh output Vec + memcpy into payload per P-frame via encode_rgb8, jxl_casaencoder.rs:960-967) and per-frame scratch allocation (2.8MB zeroed atlas, bitmap, changed vec, crop, 2.7MB source Vec per next_frame). Streaming peak memory is already good (~3 frames + 2 atlas-size ≈ 14MB @720p); removing recon+datlas cuts ~5.5MB of it.",
+      "candidates": [
+        {
+          "id": "JE-1",
+          "title": "Delete dead in-loop reconstruct: per-frame FFI decode feeds a write-only recon buffer",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:464-542 (encode_stream_frame: decode_interleaved at 476, 507, 532 + recon blits 516, 533)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:552-603 and 610-665 (streaming callers: recon declared 564/622, only passed &mut)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:896-969 (batch lossy bbox: decode at 921/939, writes 922/940)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:975-1073 (batch lossy tiled: decode at 1004/1038, writes 1005/1047)"
+          ],
+          "mechanism": "Every encoded payload (full I-frame, bbox crop, or tile atlas) is immediately decoded back through decode_interleaved (a fresh libjxl decoder session per call, jxl_casadecoder.rs:942-946) and blitted into `recon`. Grep-verified: recon is written at :477/:516/:533/:922/:940/:1005/:1047 and NEVER read — change detection uses the previous SOURCE frame (changed_bbox_thresh(px, prev_src,...) at :523/:930; changed_tile_map_thresh(px, prev_src,...) at :484/:1009). Drift-freedom comes from REPLACE semantics + source-based detection, not from the encoder-side recon. Removing recon, the decode_interleaved calls, and the blit loops eliminates one full FFI decode per frame (dashcam: atlas ≈ full frame on most P-frames; full-frame decode on every I-frame) plus the decoded-Vec allocations (~5.5MB working set: recon 2.7MB + datlas up to 2.8MB).",
+          "expected_win": "~15-30% of streaming encode ms/f on the 720p dashcam workload (measured lossy decode is 18-24 ms/f vs encode 60-82 ms/f, and the in-loop decode is roughly that same work embedded in the enc number); −5.5MB streaming peak. Uncertain exact share — confirm by flipflop.",
+          "byte_exact": "yes-by-construction — recon never feeds the bitstream; output bytes cannot change. Only behavioral delta: the VideoError::Reconstruct failure path (self-decode failure) disappears.",
+          "risk": "Low for output; medium for intent — the docs/commit brand 'in-loop reconstruction' as a feature, and future recon-based change detection or rate control would need it back. If removal is vetoed, gate it behind an opt-in flag so JOLT encode stops paying for unused scaffolding. Removes a defensive can-we-decode-our-own-frame check.",
+          "verify_plan": "cargo test casa_video (27 tests) + A/B: encode the 48-frame dashcam set with OLD and NEW binaries through jolt_encode + jolt_encode_stream_to for all 3 presets, SHA-compare the .casv byte streams (must be identical). Then interleaved flipflop on examples/jolt_bench encode arm (per-frame enc ms, start-rotated) to quantify the win."
+        },
+        {
+          "id": "JE-2",
+          "title": "Parallelize batch lossy encoders across frames (dependency on recon is dead)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:913-949 (serial for-loop, lossy bbox)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:996-1053 (serial for-loop, lossy tiled)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:819,1274,1369 (lossless siblings already into_par_iter — the template)"
+          ],
+          "mechanism": "encode_casv_delta_lossy_bbox_rgb8 and _tiled_rgb8 iterate frames serially solely because the loop threads `recon` through. Per JE-1 that state is write-only; each frame's payload depends only on (frames[idx], frames[idx-1]), both resident in the batch API. Converting to (0..frames.len()).into_par_iter().map(...).collect::<Result<Vec<_>>>() — exactly the shape the lossless paths at :819/:1274/:1369 already use — makes jolt_encode() scale with cores. Container assembly is unchanged (order preserved by collect).",
+          "expected_win": "Near-linear with core count for the batch jolt_encode() entry point (e.g. ~8-20x wall-clock on this machine for the 48-frame bench; docs/jolt-lossy-video.md already notes 'GOP-parallel encode multiplies throughput by core count' — frame-parallel is strictly better once recon is gone). Streaming path unaffected.",
+          "byte_exact": "yes — per-frame encode_rgb8 is deterministic single-threaded libjxl; identical per-frame bytes, identical order, identical container. SHA A/B proves it.",
+          "risk": "Low. Per-worker transient memory (atlas + jxl, ~5MB/worker) times thread count. Depends on JE-1 landing (or on excluding recon from the parallel refactor).",
+          "verify_plan": "A/B SHA-compare .casv output serial vs parallel on dashcam corpus (all presets, both skip modes, gop 1/24). cargo test casa_video. Wall-clock before/after on the batch path (large delta, sequential timing acceptable >10%; otherwise flipflop)."
+        },
+        {
+          "id": "JE-3",
+          "title": "Batch lossy paths ignore opts.effort while the header stamps it — Realtime pays e3, metadata lies",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:389-397 (dispatch drops opts.effort for Bbox/Tile lossy)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:911,994 (EncodeOptions::distance(distance) — default effort 3, no .with_effort)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:400-403 (header stamped with casv_rate_flags(opts) = the UNUSED effort)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:440-458 (stream_ctx DOES honor effort — the streaming/batch divergence)"
+          ],
+          "mechanism": "encode_casv_delta_lossy_{bbox,tiled}_rgb8 take no effort parameter and build EncodeOptions::distance(distance) with default effort 3 (jxl_casaencoder.rs:263). The streaming path honors opts.effort (:456 with_effort, :475 encode_chunked(..., ctx.effort)). So jolt_encode(frames,...,JoltPreset::Realtime) batch-encodes every frame at e3 instead of the promised e1 (wasted encode effort), JoltPreset::Quality at e3 instead of e4 (silent quality-knob no-op), AND the dispatcher stamps bits16..19 of CasvHeader.flags with the effort that was NOT used — CasvHeader::rate_effort() returns wrong metadata for every batch JOLT file. The pre-JOLT doc comment (:266-268) documents effort-3-for-lossy-skip as intentional, but JOLT presets turned it into a preset/metadata contradiction.",
+          "expected_win": "Batch Realtime encode: e3→e1 is plausibly 1.5-3x faster per frame (libjxl effort scaling; streaming Realtime measured 60.1 ms/f at true e1). Also fixes a metadata correctness bug. Quality preset gets its promised e4 (slower but honest).",
+          "byte_exact": "no — bitstream changes for batch Realtime/Quality users (Balanced is e3 either way, unchanged). This is a knob-honoring/metadata fix, not a pure perf opt; needs a decision on which semantics wins.",
+          "risk": "Medium: e1 output is larger than e3 (size regression for Realtime batch); anyone relying on the documented 'lossy skip tiers use effort 3' behavior changes. Alternative minimal fix: stamp the header with the effort actually used (3) — byte-exact-per-frame, metadata-only change.",
+          "verify_plan": "Add effort param (or pass EncodeOptions) to both batch lossy fns; assert header rate_effort == effort actually applied in a test; A/B size+enc-time table on the dashcam corpus for all 3 presets, batch vs streaming (streaming = reference truth); confirm Balanced batch output SHA-identical pre/post."
+        },
+        {
+          "id": "JE-4",
+          "title": "Hold one Encoder in StreamCtx + encode_into(payload): kill per-P-frame FFI session churn and compressed-bytes memcpy",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:506,531 (encode_rgb8(..., ctx.crop_opts.clone()) per P-frame)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:519,538,945,1050 (payload.extend_from_slice(&jxl) — extra memcpy of compressed bytes)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casaencoder.rs:960-967 (encode_rgb8 = Encoder::new per call → JxlEncoderCreate/Destroy + FrameSettingsCreate + all settings resent per frame)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casaencoder.rs:416-443,683-706 (the designed reuse pattern: Reset-based encode_into appends past out.len())"
+          ],
+          "mechanism": "Every P-frame calls the free-fn encode_rgb8, which creates a fresh JxlEncoder, creates frame settings, re-sends all options over FFI, allocates a fresh output Vec, encodes, and destroys the handle — then casa_video memcpys the compressed bytes into payload. The encoder module already ships the amortized shape: hold one Encoder (docs :326-327 'Reused across encodes via JxlEncoderReset'), call encode_into(payload) which APPENDS at base=out.len() (:683) into reserved-uninit capacity with an EMA-warmed reserve hint (:680-684). StreamCtx should own an Encoder; the bbox/tile paths write their 8-byte / bitmap header into payload then encode_into(payload) directly — eliminating per-frame create/destroy, settings resend, the intermediate jxl Vec, the memcpy, and the per-frame EncodeOptions::clone. The I-frame path already appends directly (encode_chunked into payload, :475). Batch paths get the same via rayon map_init(per-thread Encoder).",
+          "expected_win": "Small on 720p (JxlEncoderCreate is a malloc; dominated by the encode itself) — honestly 1-3% of enc ms/f plus elimination of one multi-100KB alloc + memcpy per frame. Ships on rule #10 (strictly less work + alloc churn) even at noise floor; the EMA-warmed reserve hint also stops the cold-start output-grow loop firing every frame.",
+          "byte_exact": "yes-by-construction — encode() Resets the handle on every path so a reused handle re-enters encode_inner_into in identical state; output_ratio_ema affects only reserve sizing (allocation-only). SHA A/B as belt-and-braces.",
+          "risk": "Low. In-loop reconstruct (if JE-1 not landed) still needs the jxl slice — available as payload[jxl_start..]. Encoder is Send not Sync — fine for the serial streaming loop and per-thread rayon init.",
+          "verify_plan": "SHA A/B of .casv bytes old vs new on dashcam corpus (all presets, bbox+tile, streaming+batch); cargo test casa_video; flipflop the streaming encode arm to confirm no regression and measure the (small) win."
+        },
+        {
+          "id": "JE-5",
+          "title": "Reuse per-frame scratch across frames: atlas, bitmap, changed-list, crop, and source-frame buffer",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:485-494 (changed Vec + vec![0u8; bitmap_len] + vec![0u8; ts*ts*3*changed.len()] atlas per streaming P-frame)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1010-1024 (same trio in batch tiled)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1157-1165 (crop_rgb allocates per bbox P-frame)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:409-414,569,628 (VideoFrameSource::next_frame returns a fresh 2.7MB Vec per frame; prev_src = px moves it, old prev dropped)"
+          ],
+          "mechanism": "The streaming loop allocates and frees per frame: a w*h*3-scale atlas (720p dashcam mostly-changed: ~920 tiles x 3072B ≈ 2.8MB, zero-initialized then largely overwritten), a bitmap, a changed-index Vec, and (bbox mode) a crop Vec; the frame source itself allocates a fresh 2.7MB Vec per pull. Fixes: (a) move atlas/bitmap/changed into a mutable scratch struct owned by the streaming loop — atlas zeroing must be preserved only for edge-tile padding slots to stay byte-exact (zero the reused buffer or just each edge-tile slot before gather); (b) add a default-implemented VideoFrameSource::next_frame_into(&mut Vec<u8>) -> bool and ping-pong two frame buffers in the encoder (cur/prev swap instead of alloc+drop). ~8-11MB/frame of allocator traffic and page-fault churn eliminated.",
+          "expected_win": "1-3% enc ms/f (allocator + page-fault churn; the 2.8MB fresh-mmap zeroing per frame is the main component). Rule #10: strictly-less-allocation ships even at noise floor. No peak-memory change (same high-water, less churn).",
+          "byte_exact": "yes — provided reused atlas padding bytes are re-zeroed where edge tiles read them (interior slots fully overwritten by the gather at :495-505/:1025-1035); the bitmap is rebuilt fully; SHA A/B proves it.",
+          "risk": "Low-medium: the zero-padding of edge-tile slots is load-bearing for output bytes — a missed re-zero on a reused atlas leaks previous-frame pixels into the encoded padding (changes bytes, silently). Cover with a test whose right/bottom edge tiles change across frames of different changed-counts. next_frame_into is a trait API addition (default impl keeps existing sources working).",
+          "verify_plan": "SHA A/B .casv old vs new on dashcam + a synthetic non-multiple-of-32 resolution (e.g. 1280x723) with varying changed-tile counts to exercise reused-atlas padding; cargo test casa_video; flipflop streaming encode arm."
+        },
+        {
+          "id": "JE-6",
+          "title": "Threaded libjxl runner for the per-frame streaming encode (atlas + I-frame)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:475,506,531 (all streaming encodes are single-threaded)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casaencoder.rs:374-391 (Encoder::with_threads — runner held for encoder lifetime, re-applied per encode)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casaencoder.rs:746-870 (encode_chunked has no runner path today)"
+          ],
+          "mechanism": "The streaming encoder cannot parallelize across frames (pull source, in-order sink, constant peak), so at 60-82 ms/f it is 1.4-2x too slow for live 24fps capture — while all other cores idle. Encoder::with_threads already exists and holds the (costly) JxlThreadParallelRunner across encodes; wiring StreamCtx to own a threaded Encoder (composes with JE-4) parallelizes WITHIN each frame's VarDCT encode. encode_chunked would need a runner parameter added for I-frames. This is the only lever that moves streaming JOLT toward real-time encode without touching libjxl internals.",
+          "expected_win": "2-4x streaming enc ms/f on multicore for the dominant atlas encode (libjxl group-parallel; atlas is 32px wide → groups stack vertically, so parallelism exists). Realtime preset could cross the 41.7 ms/f live budget. Genuinely uncertain — the tall-skinny atlas shape may limit group parallelism; must measure.",
+          "byte_exact": "unproven — libjxl encode output is normally invariant across thread widths, but this repo has never verified it on this path (the streaming determinism test at casa_video.rs:2156 explicitly leans on 'chunked encode is single-threaded'). Gate: SHA-compare 1/2/4/8-thread output first; if not byte-identical, reject.",
+          "risk": "Medium: thread-width-dependent output would break the streaming determinism contract; per-encoder runner threads cost memory; contention if the app already saturates cores elsewhere. Heuristic-flavored (needs benchmark evidence per house rules).",
+          "verify_plan": "Step 1: SHA A/B same-input encode at threads=1 vs 2/4/8 (atlas shapes + full frames) — abort if any mismatch. Step 2: interleaved flipflop of ST vs MT streaming encode on the dashcam corpus (start-rotated, per-frame timing). Step 3: cargo test casa_video with the runner enabled."
+        },
+        {
+          "id": "JE-7",
+          "title": "Marginal: single-pass row-major change scan emitting the bitmap directly",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1218-1243 (changed_tile_map_thresh: tile-major traversal, per-tile strided row reads)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1124-1149 (changed_bbox_thresh: full per-pixel scan with branchy min/max tracking)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:485-492,1010-1020 (map Vec<bool> → changed Vec<usize> → bitmap: three per-frame intermediates for one bitset)"
+          ],
+          "mechanism": "changed_tile_map_thresh walks tile-by-tile, so each 32px tile reads 32 rows of 96B strided 3840B apart — the 5.4MB (cur+prev) scan touches cache lines non-sequentially, and unchanged tiles always scan fully (inherent). A row-major pass (for each row, for each tile-column not yet marked, compare the 96B segment) reads both frames exactly once sequentially and retains the early-exit per tile-column; it can set bitmap bits directly, deleting the Vec<bool> map and the changed Vec<usize> intermediate (indices recoverable by iterating set bits). For bbox mode: find miny scanning forward, maxy backward, then scan interior rows only until minx==0 && maxx==w-1 saturate — on full-motion content this collapses the 2.7M-pixel scan to a few rows.",
+          "expected_win": "~1-2% of enc ms/f in tile mode (scan is ~0.5-1ms vs 60-80ms encode); bbox mode on high-motion content up to ~an order of magnitude on the scan itself but bbox is not the JOLT preset default. Honest verdict: cache/alloc hygiene, ships on rule #10 only if the refactor stays simple.",
+          "byte_exact": "yes — same changed set, same bbox, same bitmap bits by construction; SHA A/B proves it.",
+          "risk": "Low; the bbox early-exit variant has real edge-case surface (empty diff, single row, saturation logic) — needs the existing changed_bbox_is_tight/threshold tests plus new saturation cases.",
+          "verify_plan": "Unit-equivalence: fuzz cur/prev pairs (incl. edge tiles, w%32!=0), assert new scan == old scan output exactly; SHA A/B of full .casv; flipflop only if claiming a timing win."
+        },
+        {
+          "id": "JE-8",
+          "title": "Deferred/format: square-ish atlas packing instead of 32-wide tall strip",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:494-506 (atlas built t wide x t*changed tall; 920 changed tiles @720p → 32 x 29440 image)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1459-1477 (decoder unpacks assuming t-wide column — format contract)"
+          ],
+          "mechanism": "The tile atlas is a 32px-wide, up-to-29440px-tall image. JXL groups are 256x256: a 32-wide image wastes 87% of each group's width, multiplying per-group header/entropy overhead, hurting both encode speed and compression density (no horizontal context between tiles). Packing k tiles per row (k = ceil(sqrt(n)) or fixed 8 → 256px-wide atlas aligning with group width) reduces group count ~8x and gives VarDCT real 2D context. Requires a format bump (decoder at :1461-1476 assumes t-wide) — e.g. a new flag bit or encoding k in the payload next to the existing tile-size u16.",
+          "expected_win": "Unknown until measured: plausibly 5-15% smaller P-frame payloads and faster atlas encode+decode (fewer groups). Could also be a wash — VarDCT context across unrelated adjacent tiles may hurt ringing/quality at tile borders. Genuinely two-sided.",
+          "byte_exact": "no — bitstream format change (both encoder and decoder), plus perceptual-quality surface at new tile adjacencies. Needs flipflop + size + quality (butteraugli/mean-err) gates, and versioned format handling.",
+          "risk": "High relative to others: format compatibility (old readers must reject or handle), quality regression risk at tile seams, decoder change required in the same commit. This is a design-level deferred item, not a quick opt.",
+          "verify_plan": "Prototype behind a flag; measure on dashcam corpus: bytes/frame, enc ms/f, dec ms/f, per-frame mean-err + butteraugli vs source for old vs new packing; roundtrip tests incl. edge tiles; only promote if size AND speed win with no quality regression."
+        }
+      ]
+    },
+    {
+      "area": "CASV/JOLT video decode path (crates/raw-pipeline/src/casa_video.rs + jxl_casadecoder.rs helpers)",
+      "summary": "The decode flow is decode_casv_all_rgb8 (casa_video.rs:1565-1587) → casv_frame_info + 3 per-frame flag re-parses → apply_pframe (1429-1537) or full-frame decode, every JXL decode going through the compat free-fn decode_interleaved (jxl_casadecoder.rs:942-946) which constructs a fresh Decoder per call with DecodeOptions::default() — i.e. parallel:false (jxl_casadecoder.rs:190), so every frame decodes single-threaded and pays JxlDecoderCreate/Destroy plus a fresh output Vec, despite the crate already owning a reusable Decoder with zero-alloc decode_into (jxl_casadecoder.rs:401-420) and an explicit with_threads constructor (:317). The loop is fully serial even though GOPs are independent by construction (each starts at an I-frame; P-chains never cross a GOP), and the encoders in the same file already use rayon. Per frame the loop clones the entire reconstruction buffer (casa_video.rs:1583, 2.76MB @720p) and the batch API holds every decoded frame resident (240 frames of 720p = ~663MB); the footer/streamed format decoder (decode_casv_footer_all_rgb8, :690-716) additionally memcpys the whole compressed file into a re-framed header-format Vec before decoding — and that is the exact path jolt_bench measures for JOLT presets (examples/jolt_bench.rs:89-93). Rect blitting itself is near-free (row memcpys, blit_into :880-887), so \"decode-while-blitting\" pipelining is not the lever — parallelism across GOPs and inside libjxl is. Note: the fable tier is NOT on main @a3bc6e7a (branch fb8x unmerged; rg finds zero 'fable' hits in src), so there is no dispatch/reassembly glue to optimize yet.",
+      "candidates": [
+        {
+          "id": "JD-1",
+          "title": "GOP-parallel batch decode in decode_casv_all_rgb8 (rayon over independent GOP ranges)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1565-1587 (serial frame loop)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:46 (rayon already imported; encoders at :738-747, :819-834 already par_iter)"
+          ],
+          "mechanism": "decode_casv_all_rgb8 decodes 100% serially, but reconstruction chains only run I-frame→P…P within a GOP; GOPs (default gop_len=24) are mutually independent. Today a 10-GOP file uses one core while the encode side of the same file is already rayon-parallel. Change: scan the index for I-frame starts (is_p bit, casv_frame_info :1084-1102), par_iter over GOP slices, decode each GOP serially into its own Vec of frames, collect in order and concatenate. No shared mutable state; decode_interleaved already constructs per-call decoders so it is thread-safe as-is.",
+          "expected_win": "Near-linear with min(cores, GOP count) on batch decode/transcode: lossless-archive tier 9fps → plausibly 40-60fps on 8 cores; JOLT batch 42-55fps → 200+fps. Zero win on single-GOP files and on sequential-playback latency (JD-2 covers that). High confidence for multi-GOP batch.",
+          "byte_exact": "yes-by-construction — identical per-frame decode operations and per-GOP chains, only scheduling changes; ordered collect preserves output order",
+          "risk": "Low. Working-set grows by ~cores × 1 recon buffer (~2.76MB each @720p) — trivial vs the already-resident output. Must not nest with an MT inner decoder (oversubscription) — keep inner ST when GOP-parallel. Rayon usage matches existing cfg gates in this file.",
+          "verify_plan": "A/B: frame-by-frame assert_eq of serial vs parallel decode on jolt_bench Ghana 720p×48 (2 GOPs) plus a synthetic 240-frame/10-GOP fixture, all four tiers (lossless none/bbox/tile, lossy tile). Timing: interleaved flipflop of old/new decode_casv_all_rgb8 (expected >>10%, but interleave anyway per house rule); record peak RSS to confirm no regression."
+        },
+        {
+          "id": "JD-2",
+          "title": "Multi-threaded libjxl decode for sequential playback (persistent Decoder with parallel:true / with_threads)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casadecoder.rs:942-946 (decode_interleaved uses DecodeOptions::default())",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casadecoder.rs:186-200 (default parallel:false), :317-336 (with_threads), :2261-2267 (ST==MT bit-identical test)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:476, 1461, 1478, 1500, 1517, 1553, 1577 (all decode_interleaved call sites)"
+          ],
+          "mechanism": "Every CASV frame decode is single-threaded because decode_interleaved hardcodes DecodeOptions::default() (parallel:false). A 720p frame has ~15 libjxl groups (5×3 @256px), so the 110ms/frame lossless-archive I-frame decode leaves 5-7 cores idle during sequential playback where JD-1 cannot help. Change: the CASV decode loop holds one Decoder created once with parallel:true (runner created once, held across decodes per the :281-283 contract) and calls decode/decode_into on it per frame.",
+          "expected_win": "Archive tier: 2-4× per-frame latency @720p (9fps → ~20-35fps, potentially crossing the 24fps budget — the headline user-visible unlock). JOLT P-frames benefit less (tile atlases are 32px wide → fewer groups); JOLT I-frames similar to archive. Uncertain scaling: must measure; libjxl group-level parallelism on 15 groups won't reach 8×.",
+          "byte_exact": "yes — libjxl MT decode is deterministic and bit-identical to ST; already pinned by the test at jxl_casadecoder.rs:2261-2267; re-assert per-frame equality on the real corpus",
+          "risk": "Medium-low. Interacts with JD-1 (choose per workload: MT-inner for playback latency, GOP-parallel+ST-inner for batch). Thread-runner sizing is a knob — use available_parallelism default (existing new() behaviour) to avoid adding a tunable.",
+          "verify_plan": "assert_eq ST vs MT full decode on all tiers/corpus (extends the existing st-vs-mt test to CASV level), then interleaved flipflop of per-frame decode times ST vs MT on Ghana 720p, per JOLT preset + lossless_archive; report per-frame p50/p95 vs the 41.7ms budget."
+        },
+        {
+          "id": "JD-3",
+          "title": "Persistent Decoder + decode_into scratch reuse across frames (kill per-frame JxlDecoderCreate/Destroy and region-buffer mallocs)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casadecoder.rs:942-946 (fresh Decoder per decode_interleaved call), :401-420 (decode_into: zero per-decode allocation, buffer reuse), :719-722 (buf.clear/reserve — capacity reused)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1461 (tile atlas Vec/frame), :1517 (bbox crop Vec/frame), :1500 (full residual 5.5MB Vec/frame), :1453-1454 (changed Vec<usize>/frame)"
+          ],
+          "mechanism": "Per frame the decode loop pays: JxlDecoderCreate + Subscribe + Destroy (decode_interleaved constructs and drops a Decoder each call), a fresh output Vec for every region decode (atlas/crop/residual are pure scratch — 2.7-5.5MB mallocs per P-frame), and a Vec<usize> of changed tile indices that could be iterated straight off the bitmap. Change: decode_casv_all_rgb8/decode_casv_frame_rgb8/apply_pframe thread one reused Decoder plus two scratch Vecs (u8 + u16) down the loop, using the already-shipped decode_into (Channels::Rgb exists, :81); iterate the tile bitmap directly instead of collecting.",
+          "expected_win": "3-10% on JOLT Realtime (18ms/frame where fixed per-frame overhead and allocator churn are the biggest share), 1-3% on archive. Uncertain — could be noise-floor; ships regardless under rule #10 (strictly less work/alloc: N decoder creations → 1, N scratch mallocs → 2).",
+          "byte_exact": "yes-by-construction — identical libjxl call sequence per frame (Decoder resets on every exit path, :380-384, :408; decode_into parity pinned by tests :2085-2124)",
+          "risk": "Low. apply_pframe signature grows a scratch/decoder parameter (private fn). decode_into clears buf on error (:411-418) so failed frames cannot leak stale pixels. This is native Rust buffer reuse with clear single-owner lifecycle — NOT the rejected JS transferred-ArrayBuffer pool.",
+          "verify_plan": "assert_eq full decode output old vs new on all four tiers + corrupted/truncated fixtures (existing tests at casa_video.rs:1666-1689 cover safety), then interleaved flipflop on jolt_bench per preset; ship on rule #10 even if timing is noise, per repo convention."
+        },
+        {
+          "id": "JD-4",
+          "title": "Streaming for-each decode API — stop holding every decoded frame in RAM (peak-memory hog #1)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1565-1587 (decode_casv_all_rgb8 returns Vec of all frames; prev clone at :1583)"
+          ],
+          "mechanism": "decode_casv_all_rgb8 materializes frame_count owned frames: 10s @720p24 = ~663MB, @1080p = ~1.5GB — plus one extra recon clone in flight. For playback/transcode consumers only the current frame is needed. Change: add decode_casv_for_each_rgb8(data, |px: &[u8], w, h| ...) that keeps a single recon buffer (P-frames already mutate it in place via apply_pframe) and lends it to the callback per frame; reimplement decode_casv_all_rgb8 on top (push clone) so existing callers/tests are byte-identical. Also removes the per-frame full clone for streaming consumers (I-frame decode overwrites recon via decode_into).",
+          "expected_win": "Peak memory: frame_count×frame_size → ~1-2 frames (~663MB → ~6MB for the 10s/720p case). CPU: minor (drops one 2.76MB clone/frame ≈ 0.1-0.3ms, <1% of budget); memory is the headline. This is the same shape as the proven RAW/JXL streaming-vs-full RSS findings (flat ~100MB vs linear growth) in the preview-concurrency benchmarks.",
+          "byte_exact": "yes-by-construction — identical pixels delivered per frame; batch API reimplemented over it must assert_eq against current output",
+          "risk": "Low-medium: new public API surface (additive, no behaviour change to existing fns). Callback borrows the recon buffer — document that it is invalidated on return (same contract as decode_view, jxl_casadecoder.rs:425-451, an established pattern in this crate).",
+          "verify_plan": "assert_eq: collect-via-for_each vs decode_casv_all_rgb8 frame-by-frame on all tiers. Memory: peak-RSS harness (same method as examples/dng_preview_concurrency.rs) old batch vs new streaming on a 240-frame 720p file; expect order-of-magnitude flat vs linear."
+        },
+        {
+          "id": "JD-5",
+          "title": "Decode footer-indexed (streamed/JOLT) files without re-framing the whole compressed stream",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:690-716 (decode_casv_footer_all_rgb8: builds a full header-format copy; :714 copies all frame data bytes)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\examples\\jolt_bench.rs:89-93 (JOLT presets measured through this path)"
+          ],
+          "mechanism": "decode_casv_footer_all_rgb8 re-frames the file by allocating a new Vec and memcpying the ENTIRE compressed stream (out.extend_from_slice(&data[0..idx_start])) plus a rebuilt index, purely to reuse the header-format decoder — 2× compressed-file peak residency and an O(file) copy before the first frame decodes. And this is the measured JOLT decode path in jolt_bench. Change: factor the decode loop to consume index entries via a small accessor (entry i → (flags, &data[off..off+len])) with two impls: header-format (current math, casv_frame_info :1084-1102) and footer-format (index at f.index_offset, offsets relative to 0). Zero data copies.",
+          "expected_win": "Eliminates one full-file memcpy (~30-60ms for a 100MB stream, once) and ~file-size peak memory; on short benches a small % of total, on long streamed files a first-class memory win (streamed files are exactly the long ones). Deterministic, not workload-dependent.",
+          "byte_exact": "yes-by-construction — same frame slices handed to the same decode routines; existing test casa_video.rs:2199-2206 already pins footer==header decode equality",
+          "risk": "Low. Index-entry validation must replicate the bounds checks casv_frame_info does (offset/len vs idx_start instead of file end). Private refactor; public signatures unchanged.",
+          "verify_plan": "assert_eq footer-path output vs current implementation on the existing streaming fixtures + a large synthetic file; peak-RSS A/B; run the splice/legacy rate-box tests (casa_video.rs:2246-2271) unchanged."
+        },
+        {
+          "id": "JD-6",
+          "title": "Decode full-width REPLACE rects directly into the reconstruct buffer (decode-in-place fast path)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1515-1522 (bbox REPLACE: decode to temp Vec then blit_into), :880-887 (blit_into row loop)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casadecoder.rs:643-738 (run_full_into: SetImageOutBuffer wants one contiguous buffer — a strided rect can't decode in place, but a full-width rect is contiguous)"
+          ],
+          "mechanism": "A REPLACE bbox with x==0 && bw==width covers rows [y, y+bh) which are CONTIGUOUS in the frame buffer — precisely the high-motion/scene-change P-frames where the temp buffer is largest (up to 2.76MB alloc + full-rect copy per frame). JxlPixelFormat has no stride (known FFI wall), so general rects need the temp+blit, but the full-width case can pass prev[y*w*3..(y+bh)*w*3] straight to JxlDecoderSetImageOutBuffer via a new decode-into-slice variant of run_full_into (exact-size check against ImageOutBufferSize). Eliminates the intermediate allocation and the blit copy on the heaviest frames. This also answers the row-by-row blit question: for non-full-width rects the per-row copy_from_slice IS memcpy already (~µs total), so the win is skipping the intermediate buffer, not vectorizing the blit.",
+          "expected_win": "On scene-cut/global-motion P-frames: one ~MB-scale alloc + copy removed (~0.3-0.6ms + allocator churn), i.e. 1-3% of those frames; ~0% on low-motion content. Modest, content-dependent; qualifies under rule #10 (strictly less work when the path fires).",
+          "byte_exact": "yes-by-construction — libjxl writes the identical decoded bytes at the identical final addresses; on decode failure apply_pframe already returns None and decode_casv_all_rgb8 fails the whole decode (partial writes never escape as success)",
+          "risk": "Medium: needs a new unsafe-adjacent decode-into-slice entry in jxl_casadecoder.rs (exact-length gate before set_len-free write into borrowed slice). Failure mid-rect leaves prev partially written — acceptable because the whole decode fails, but must be documented. Only implement if the tier actually produces full-width rects in real corpora (measure first).",
+          "verify_plan": "Instrument first: count full-width REPLACE rects on the Ghana corpus per preset — if <5% of P-frames, drop the candidate. Otherwise assert_eq whole-video decode vs current on all tiers incl. corrupt-payload fixtures, and interleaved flipflop on a high-motion clip."
+        },
+        {
+          "id": "JD-7",
+          "title": "Single-parse frame metadata: casv_frame_info returns all flag bits (kill 3 redundant header parses + index reads per frame)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1084-1102 (casv_frame_info), :1168-1208 (casv_frame_is_bbox/is_tile/is_replace each re-run parse_casv_header + re-read the index entry), :1550 and :1574 (call sites doing 4 lookups per frame), :1114-1118 (preceding_iframe re-parses header per probed frame)"
+          ],
+          "mechanism": "Per decoded frame the loop parses the 32-byte header and reads the same 8-byte index entry four times (info + is_bbox + is_tile + is_replace); the seek path's preceding_iframe adds O(GOP) more header parses. Change: internal fn returning (flags: u32, slice: &[u8]) parsed once per frame (public helpers delegate for compat); the decode loops and preceding_iframe consume it.",
+          "expected_win": "Noise-floor (ns of integer parsing vs ms of JXL decode) — honestly ~0% wall clock. Ships only under rule #10 (strictly less work) and as enabling cleanup for JD-1/JD-3/JD-5, which all want a single index accessor anyway.",
+          "byte_exact": "yes-by-construction — same bits read, same validation outcomes",
+          "risk": "Negligible; keep public helpers' semantics (out-of-range → None) identical.",
+          "verify_plan": "Existing unit tests (casa_video.rs:1606-1703 header/flag/random-access suites) pass unchanged; assert_eq full decode old vs new. No timing claim made."
+        },
+        {
+          "id": "JD-8",
+          "title": "Flatten the lossless tile-residual add loop to row-linear form (match the bbox residual path)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1482-1496 (tile residual: per-col, per-channel indexed loop), :1529-1535 (bbox residual already flat: for c in 0..bw*3), :1107-1111 (add_residual16_into full-frame, already flat)"
+          ],
+          "mechanism": "The lossless tile-residual reconstruct does 'for col { for c in 0..3 }' with asrc/fdst recomputed per column, while the sibling bbox path does one flat 'for c in 0..bw*3' per row that LLVM can vectorize. Both compute the identical element-wise clamp-add; rows in both source atlas and dest frame are contiguous, so the tile path can adopt the flat form (asrc_row = ((slot*ts+row)*ts)*3, fdst_row = ((ty*ts+row)*w+tx*ts)*3, then flat inner loop of bw*3).",
+          "expected_win": "Small and honestly uncertain: residual add is maybe 1-3ms of a ~100ms archive-tier frame, and the DS-HADD/DC-XZERO lesson (2026-07-02) says byte-exact work-elimination in load/store-bound loops often nets ≤0. Only worth doing while touching the file for JD-3; must be flipflop-gated, expect ≤1% whole-frame.",
+          "byte_exact": "yes — identical element-wise i32 clamp-add per sample, same iteration order over the same elements; prove with an equality harness over random tile patterns incl. edge tiles",
+          "risk": "Low correctness risk; main risk is a measured wash → then keep only if it simplifies (it does slightly).",
+          "verify_plan": "Equality harness: random frames + edge-tile sizes, old vs new apply_pframe output byte-equal. Interleaved flipflop on lossless-archive tile decode (the 9fps tier); drop if wash AND no simplification consensus."
+        }
+      ]
+    },
+    {
+      "area": "FableBraid codec (crates/raw-pipeline/src/fable_braid.rs + casv fable tier in casa_video.rs), decode-side first",
+      "summary": "The braided rANS symbol loop itself is already carefully built — 8-way scalar ILP, one 16KiB-LUT load per symbol, branchless renorm via core::hint::select_unpredictable, unsafe unchecked loads in a proven fast region (fable_braid.rs:224-298); it already IS the single-load LUT design the brief asks about, and the file's own doc comment (:10-11) pre-rejects SIMD-gather-across-lanes per the xyb scalar-LUT lesson. What is NOT tight is everything around it: on wasm32 the entire kernels module is #[cfg(target_arch = \"x86_64\")] (:575), so the browser build — the product target, with simd128 enabled globally in .cargo/config.toml:1-2 — runs a per-byte serial prefix-sum chain for left-delta rows (:673-679) plus scalar interleave (:727-732), i.e. exactly the serial dependency the codec was invented to kill; deinterleave3 has no SIMD path on any target (:708-718). Per P-frame (23 of every 24 frames at gop 24), decode_rgb8_delta re-derives the planar subtract-green representation of the previous frame from scratch (deinterleave + 2n subs, :911-915) even though the previous decode computed those exact planes and threw them away, and decode_casv_all_rgb8 additionally clones every reconstructed frame (casa_video.rs:1511). Decode also zero-fills resbuf and plane buffers that are provably fully overwritten (:507, :524) and does copy-then-add two-pass row reconstruction (:548-562) plus a separate RCT-undo pass before interleave (:888-894). Net: the entropy core is near its scalar-ILP ceiling without a format change; the remaining 25-40% of native frame time (and likely more on wasm) is eliminable passes, allocs, and redundant per-frame work, all byte-exact by mod-256 ring construction.",
+      "candidates": [
+        {
+          "id": "FB-1",
+          "title": "wasm32 simd128 ports of prefix_add_pred / interleave3 / deinterleave3 (wasm currently runs the serial scalar fallbacks)",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:575 (kernels mod is x86_64-only)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:673-691 (prefix_add_pred dispatch → scalar on wasm)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:708-733 (deinterleave3 scalar everywhere; interleave3 scalar on wasm)",
+            "C:\\Foo\\rcw-fableflow\\.cargo\\config.toml:1-2 (+simd128 already on for wasm32)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\demosaic.rs:57-63,419-509 (existing core::arch::wasm32 i8x16_shuffle precedent)"
+          ],
+          "mechanism": "On wasm the left-delta undo is a per-byte serial chain (acc = acc.wrapping_add(row[i]), :673-679) — the exact bit-serial dependency FableBraid exists to eliminate — paid on every RANS row of every plane whose encoder chose TRANSFORM_LEFT_DELTA (the common case for photo/video residuals per the 0.995 Shannon gate at :402). wasm simd128 has i8x16_shuffle (= _mm_slli_si128 via shuffle-with-zero) and i8x16 add, so the SSE2 log-step prefix sum (:644-668) ports 1:1; interleave3/deinterleave3 port via the same const-shuffle trick already used in demosaic.rs. Mod-256 ring arithmetic makes the SIMD output bit-equal to scalar by construction.",
+          "expected_win": "wasm decode only: est 10-25% on left-delta-heavy clips (prefix chain ~1-1.5 cyc/byte over up to 3n bytes/frame, plus scalar interleave/deinterleave every frame); 0% native. Uncertain until a wasm profile exists — no wasm timing was taken in the author session (results table is native MSVC only, docs/FableBraid-spec.md:73-97).",
+          "byte_exact": "yes-by-construction (mod-256 ring; extend the existing simd_kernels_match_scalar test :1071-1094 to run on wasm)",
+          "risk": "low-medium: unsafe SIMD, but scalar reference stays as the oracle; needs wasm-pack test run + target_feature simd128 gating so a non-simd128 build still compiles",
+          "verify_plan": "1) wasm-pack test (or bench-wasm crate, crates/raw-pipeline/bench-wasm) running simd_kernels_match_scalar + image roundtrips on wasm32; 2) flipflopdom interleaved OLD/NEW decode of a real casv fable clip in headless Chrome (repo rule: interleaved only for <10% deltas); 3) per-frame byte-exact asserts as in fable_video_ab.rs:30-32."
+        },
+        {
+          "id": "FB-2",
+          "title": "Carry planar subtract-green state across P-frames (kill per-frame deinterleave3 + RCT-forward of prev)",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:899-927 (decode_rgb8_delta: deinterleave3(prev) at :911, RCT-forward :912-915, RCT-undo :920-925, interleave3 :926)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\casa_video.rs:1484-1515 (decode_casv_all_rgb8 frame loop)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\casa_video.rs:1451-1480 (decode_casv_frame_rgb8 random-access loop)"
+          ],
+          "mechanism": "Every P-frame decode reconstructs the planar G/R−G/B−G representation of the previous frame from its interleaved RGB (3n strided scalar reads via deinterleave3 + 2n wrapping subs + 3 plane allocs) — but the previous frame's decode already had exactly those planes in hand before it interleaved them (decode_planes output, :916). A stateful decode session (or planar-in/planar-out delta entry point) keeps the 3 planes alive between frames: per P-frame it saves ~5n byte-ops + 3 allocs, and the identity fast path (:906-908, prev.to_vec() full-frame copy) becomes a plane reuse. Output interleave (already SSSE3) still runs once per frame for the returned RGB. At gop 24, 23/24 frames benefit. Bitstream untouched; arithmetic identical on identical values.",
+          "expected_win": "est 5-15% whole-clip native decode (Sintel 4.05 ms/f has the least entropy work so highest fraction; BBB 7.08 ms/f lower end); larger on wasm where deinterleave3 is scalar and stays scalar until FB-1. Honest uncertainty: deinterleave cost not separately profiled.",
+          "byte_exact": "yes-by-construction (same mod-256 operations, values merely cached instead of recomputed)",
+          "risk": "medium: new pub API in fable_braid + glue changes in two casv decode loops; must keep the stateless decode_rgb8_delta for random access and non-video callers",
+          "verify_plan": "Whole-clip fable_video_ab on BBB/Sintel/ToS with per-frame assert_eq vs source (already in the harness), plus casa_video fable_roundtrip_is_byte_exact_with_gop_and_random_access test; interleaved flipflop OLD/NEW whole-clip decode for timing."
+        },
+        {
+          "id": "FB-3",
+          "title": "Fuse row reconstruction (seg-copy + add_pred → one pass) and RCT-undo into the interleave kernel",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:543-562 (MODE_RANS/RAW: copy_from_slice then separate add_pred/prefix_add_pred pass)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:888-894 and :920-926 (RCT-undo loops via Vec<Vec> indexing, then separate interleave3)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:609-639 (SSSE3 interleave — add-before-shuffle fusion point)"
+          ],
+          "mechanism": "Two pass-fusion wins: (a) RANS/RAW rows do row.copy_from_slice(seg) then a second read-modify-write pass add_pred(row, pr) — a fused add_pred_into(row, seg, pr) / prefix_add_pred_from writes each output byte once, halving row-reconstruction memory traffic (~2.4 MB/frame at 854×480); (b) the RCT-undo (r+=g, b+=g) is a separate 2-pass loop written through rp[0][i]/bp[0][i] Vec<Vec> indexing (bounds checks LLVM may not hoist), immediately followed by interleave3 which reloads all three planes — the SSSE3 (and FB-1 wasm) interleave already has vr/vg/vb in registers, so fusing is two paddb per 16 pixels and deletes the standalone RCT pass (~1.6 MB traffic/frame).",
+          "expected_win": "est 3-8% native frame decode (pure memory-traffic elimination on ~8-10 MB/frame of non-entropy passes); similar shape on wasm. Rule #10 applies: strictly fewer loads/stores, ships even at noise floor.",
+          "byte_exact": "yes-by-construction (identical wrapping-add arithmetic, different write schedule)",
+          "risk": "low: local refactor; keep scalar reference kernels and the match-scalar test",
+          "verify_plan": "All fable_braid roundtrip tests + fable_video_ab per-frame byte-exact asserts; interleaved flipflop keyframe decode (BBB #0) OLD/NEW; extend simd_kernels_match_scalar for the fused variants."
+        },
+        {
+          "id": "FB-4",
+          "title": "Eliminate dead zero-fills and small alloc churn in decode (resbuf, plane, modes.to_vec, 16KiB decode table per plane)",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:507 (resbuf = vec![0u8; n_syms], fully overwritten by decode_all :267-295)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:524 (plane = vec![0u8; w*h], every row written in all mode arms :543-557 or the function bails)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:480 (modes = r.take(h)?.to_vec() — borrow suffices, take returns &'a [u8] independent of &mut Reader)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:180-192,215 (build_decode_table: fresh 16 KiB Vec<u32> per plane per frame — reusable scratch)"
+          ],
+          "mechanism": "resbuf (≤ w*h bytes/plane) and plane (w*h bytes) are zero-filled then provably fully overwritten — up to ~2.4 MB of pure memset per 854×480 frame that decode_all and the row loop immediately rewrite. Use the crate's existing uninit-alloc pattern (precedent: commit 1c0df576 'uninit pyramid allocs'). modes.to_vec() and the per-plane 4096×u32 table Vec are alloc churn (3 tables + 3 mode copies per frame) removable by borrowing and by threading one scratch Vec through decode_planes. Table build cost itself is <0.3% (profiled) — this is allocation elimination, not table-build speed.",
+          "expected_win": "est 2-4% native frame decode (memset at ~10-20 GB/s vs 3.9-7 ms frames) + allocator pressure in the video loop; rule #10 ships regardless of timing noise",
+          "byte_exact": "yes-by-construction (initialization-order proof required for the unsafe uninit part; Vec<u8> drop never reads contents on early-return paths)",
+          "risk": "low-medium: unsafe set_len/MaybeUninit needs the every-byte-written proof kept in sync with the row-mode match (the `_ => return None` arm at :556 leaves plane partial but dropped)",
+          "verify_plan": "Existing roundtrip + truncated/corrupt-input tests (:1097-1110) under Miri for the unsafe path if feasible; whole-clip byte-exact asserts; interleaved flipflop for the timing claim."
+        },
+        {
+          "id": "FB-5",
+          "title": "Drop the per-frame full-frame clone in decode_casv_all_rgb8 (fable path never mutates prev)",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\casa_video.rs:1511 (prev = Some(recon.clone()) every frame)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\casa_video.rs:1490-1513 (loop structure)"
+          ],
+          "mechanism": "Every decoded frame is cloned (alloc + full-frame memcpy, 1.2 MB at 854×480) solely so prev survives the out.push. decode_rgb8_delta takes &prev and returns a fresh Vec, so the fable path can borrow the last pushed frame (let base = &out.last()?.0) and clone only in the legacy JXL apply_pframe arm that mutates in place. 360-527 clones per clip eliminated.",
+          "expected_win": "est 1-3% whole-clip decode + removes ~430-630 MB of transient memcpy per clip; rule #10 (strictly less work)",
+          "byte_exact": "yes-by-construction (no arithmetic change)",
+          "risk": "low: pure control-flow restructure in one function; JXL arm keeps its clone",
+          "verify_plan": "casa_video fable + JXL roundtrip tests (both paths exercised); fable_video_ab per-frame asserts; interleaved flipflop whole-clip decode."
+        },
+        {
+          "id": "FB-6",
+          "title": "Plane-level parallel decode (rayon join over the 3 independent planes)",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:871-877 (decode_planes serial 0..3 loop)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\casa_video.rs:1296-1310 (encode already uses into_par_iter — precedent)"
+          ],
+          "mechanism": "The three plane blobs are length-prefixed and fully independent at decode time (External predictor planes are all available up front; Top only needs the plane's own rows). Today they decode serially. A 3-way rayon join costs nothing in bitstream or output and converts the headline 141-247 fps single-thread numbers into ~2-2.5x wall-clock per frame on multicore native; on wasm it needs the existing parallel-wasm feature gating (threads + SAB, COOP/COEP already documented).",
+          "expected_win": "wall-clock decode up to ~2.2x per frame (3 planes, G usually largest so sub-linear); single-thread metric unchanged; only worth it where the video loop isn't already frame-parallel (decode is inherently serial across P-frames, so per-frame parallelism is the only decode-side MT available without a format change)",
+          "byte_exact": "yes-by-construction (identical per-plane computation, no shared mutable state)",
+          "risk": "medium: threading semantics decision (feature-gate like the rest of the crate: parallel / parallel-wasm); rayon overhead could eat the gain on tiny frames — gate on plane size",
+          "verify_plan": "Byte-exact asserts unchanged; A/B wall-clock via fable_video_ab with/without the feature; keep a serial cfg path so the single-thread benchmark story stays reproducible."
+        },
+        {
+          "id": "FB-7",
+          "title": "FBR2: stripe-segmented braids (versioned format change) — independent rANS segments per row-group",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:224-298 (decode_all: single shared stream cursor is the only cross-lane dependency)",
+            "C:\\Foo\\rcw-fableflow\\docs\\FableBraid-spec.md:26-49 (plane blob layout: one 8-state braid per plane)"
+          ],
+          "mechanism": "Today one 8-lane braid spans a whole plane's symbol sequence: the stream cursor pos chains every renorm-word load address through the previous lane's need bit (:248, :263-264), and in-plane multithreading is impossible. Segmenting the symbol stream per stripe (e.g. every 64 RANS rows: own 8×u32 initial states + u32 len ≈ 36 B overhead, ~0.02% at 854-wide) gives (a) independent cursors that a single thread can software-pipeline two-at-a-time for deeper ILP without blowing x86-64's 15 GPRs the way 16 flat lanes would, and (b) real in-plane MT. This is the only remaining lever on the entropy loop itself — the LUT is already single-load, renorm already branchless, and SIMD-gather across lanes is pre-rejected by the file's own design note (:10-11) per the xyb gather lesson.",
+          "expected_win": "single-thread: uncertain, est 0-20% (depends on whether the pos chain or load ports bound the loop — needs a 2-cursor prototype flipflop before committing the format); multithreaded: ~linear with stripes up to core count. High ceiling, highest cost.",
+          "byte_exact": "no — versioned format change (new magic/flag, FBR1 decode retained); allowed by brief when justified by decode-speed/bytes, so gate on measured single-thread win OR the MT product need",
+          "risk": "high: format churn, encoder/decoder both touched, more surface for the corrupt-input paths; do the 2-cursor ILP prototype first and reject if flipflop shows <5%",
+          "verify_plan": "Prototype: same-format two-braid decode on synthetic split streams, interleaved flipflop vs current; if it clears the bar, implement FBR2 behind a flag, A/B bytes overhead (<0.1%) and decode speed on BBB/Sintel/ToS, roundtrip byte-exact per frame, wasm32 check clean."
+        },
+        {
+          "id": "FB-8",
+          "title": "Streaming casv decode API (peak-memory: whole-clip Vec<Vec<u8>> is ~590 MB for Sintel)",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\casa_video.rs:1484-1515 (decode_casv_all_rgb8 collects every frame)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\examples\\fable_video_ab.rs:28-32 (harness holds all frames + source clip simultaneously)"
+          ],
+          "mechanism": "decode_casv_all_rgb8 materializes every reconstructed frame: 527 frames × 1.166 MB ≈ 590 MB resident for Sintel (plus the FB-5 clone transient, plus the raw source in the harness → multi-GB A/B runs). Decode only ever needs the previous frame. A visitor/iterator API (decode_casv_frames_with(data, |i, px| ...)) caps the codec's working set at ~2 frames + codestream; decode_casv_all becomes a thin collector over it. This is the dominant memory hog in the fable tier by two orders of magnitude — per-frame codec working set is only ~4 frame-sizes (prev + planar prev + planes + out), which FB-2 further trims.",
+          "expected_win": "peak RSS for streaming consumers: ~590 MB → ~10 MB on Sintel-class clips; no CPU change. First-class per the brief's memory mandate.",
+          "byte_exact": "yes-by-construction (same frames, delivered incrementally)",
+          "risk": "low: additive API; existing callers keep the collecting wrapper",
+          "verify_plan": "Collector-over-visitor result compared byte-equal to current decode_casv_all_rgb8 on the test corpus; peak-RSS A/B via flipflopMem or OS counters on a 500-frame clip."
+        },
+        {
+          "id": "FB-9",
+          "title": "Encoder pass/alloc trims: right-size + write-backward rANS buffer, reuse predictor_cost histogram, fuse zero-check into histogram pass",
+          "files": [
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:160 (rev capacity syms.len()/2+16 — up to ~1 byte/sym emitted near the 8.05 bpp RAW threshold → guaranteed realloc+copy on dense planes)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:174-175 (rev.reverse() full extra pass — fill a right-sized buffer from the end instead)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:771-792 vs :367-397 (predictor_cost builds and discards the residual histogram; encode_plane pass A rebuilds it for the chosen predictor)",
+            "C:\\Foo\\rcw-fableflow\\crates\\raw-pipeline\\src\\fable_braid.rs:386-394 (per-row all-zero check then separate histogram walk — fusable)"
+          ],
+          "mechanism": "Delta encode currently walks each plane ~6-7 times: 2 predictor_cost passes (histograms thrown away), pass A (residual + zero-check + dual histogram + extend), optional left-delta rewrite, pass B cost, rans_encode (+full reverse, + possible doubling-realloc since pass B already computed the near-exact bit count that could size the buffer). Returning the winning histogram from predictor selection, fusing the zero-check into the histogram walk, sizing the rANS buffer from the pass-B bit sum, and emitting backward into it removes ~2-3 whole-plane passes and the realloc/reverse copies. Encode is secondary by spec (:24) and already frame-parallel, so this is a churn cleanup, not a headline.",
+          "expected_win": "est 3-8% encode wall (encode already 6-7x faster than the JXL tier); alloc churn reduction under par_iter; rule #10 covers the buffer-sizing/reverse items",
+          "byte_exact": "yes-by-construction for buffer sizing/write-backward (identical bytes); histogram reuse must reproduce identical freqs → identical bitstream (same counts, just cached) — assert stream-identical in the A/B",
+          "risk": "low-medium: encoder-only; histogram-reuse refactor must not drift model selection (assert identical output bytes, not just roundtrip)",
+          "verify_plan": "A/B encoded bytes must be byte-identical OLD vs NEW on the test corpus + BBB/Sintel/ToS clips (stream equality, stronger than roundtrip); interleaved flipflop on encode timing; full fable_braid + casa_video test suites."
+        }
+      ]
+    },
+    {
+      "area": "APP-SIDE image encode pathway at effort 3 (decoded RAW pixels → JXL bytes): casabio_encode.rs, jxl_casaencoder.rs, pipeline.rs feed paths, stream_preview/stream_export/stream_band, jxl-ffi boundary",
+      "summary": "Wall time is dominated by libjxl-internal e3 encodes; the app-side waste that remains is concentrated in full-frame allocations and copies around them. The RGB-native cut (d1x9) landed ONLY for the pyramid path (casabio_encode.rs:789-854, 895-897): the variants path still fabricates alpha end-to-end — encode_variants_from_rgb16 calls process_rgba (casabio_encode.rs:425-431, pipeline.rs:1978 writes hardcoded α=255), rescans the whole frame for alpha (casabio_encode.rs:149), Lanczos3/Triangle-resizes 4 channels via the image crate (casabio_encode.rs:383-399, with an sw×dh×4×f32 intermediate ≈104MB @24MP→1080), and strips RGBA→RGB per tier inside encode_into (casabio_encode.rs:360, a 72MB alloc + full pass for the full tier). Separately, every full-res tier goes through JxlEncoderAddImageFrame (jxl_casaencoder.rs:636-644), which copies the whole frame into libjxl and buffers O(frame) internals — while a proven byte-identical O(super-tile) chunked encoder already exists in the same file (encode_chunked, jxl_casaencoder.rs:746-870; measured constant 57.8MB encoder peak vs 99MB@4096²→197MB@8192², Questions_deferred.md:1553-1575) but is only wired to the streaming export. Peak memory for a 24MP from_rgb16 variant encode with texture/clarity: rgb16 144MB + rgb16.to_vec() clone 144MB (casabio_encode.rs:426) + RGBA 96MB + full-tier RGB strip 72MB + resize f32 transient ~104MB + libjxl whole-frame internals — roughly 5-6 full-res-equivalent buffers alive. stream_band.rs additionally re-copies every 256-row raw sub-chunk into a fresh zero-initialized ctx buffer (stream_band.rs:131-136, ~3.1MB alloc+memset+memcpy per chunk at 6000px width) and zero-fills output bands it immediately overwrites (stream_band.rs:139-141).",
+      "candidates": [
+        {
+          "id": "JE-1",
+          "title": "RGB-native variant path (the deferred D1 'variant half' of landed d1x9)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:144-191 (alpha scan + RGBA cascade)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:329-399 (encode_into strip at 355-362; resize_rgba/resize_rgba_fast 383-399)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:403-433 (from_rgb16 entry calls process_rgba)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\pipeline.rs:2013-2072 (process_rgb, the byte-exact 3ch twin, already exists)",
+            "C:\\Foo\\raw-converter-wasm\\Questions_deferred.md:1040-1060 (CASA-ENC-D1: pyramid half LANDED, variant half explicitly still deferred)"
+          ],
+          "mechanism": "On the dominant opaque (RAW) variant path, alpha is pure ballast: process_rgba writes a constant α=255 per pixel (24MP: 96MB out vs 72MB), has_meaningful_alpha then scans all 24M alpha bytes to rediscover opacity, image-crate Lanczos3/Triangle resize filters 4 channels (25% wasted filter work plus a ~104MB sw×dh×Rgba<f32> intermediate that would be ~78MB as Rgb<f32>), and each of the 3 tier encodes re-strips RGBA→RGB (full tier: 72MB alloc + full bandwidth pass inside the encode branch). Change: from_rgb16 entry tone-maps straight to RGB via existing process_rgb (zero strips, zero alpha writes, zero alpha scan — RAW is opaque by construction); the RGBA entry strips once up front when !has_alpha then cascades/encodes in RGB via ImageBuffer<Rgb<u8>> resize + Frame::rgb. Exactly mirrors the pyramid meta-seam cut that already landed (casabio_encode.rs:895-897, cbcb5d73).",
+          "expected_win": "Eliminates ~170-240MB of full-frame allocs/passes per 24MP variant set and −24..26MB steady + −26MB transient peak. Wall: per-level downscale+strip fraction gained +13.8..28.4% in the pyramid analogue (d1x9 measurements); whole-variant-set wall likely only −2..8% since e3 encode dominates — primary value is strictly-less-work + peak memory (rule #10 ships it).",
+          "byte_exact": "yes — needs one new parity proof: image 0.25 resize is per-channel independent, so resize_rgb(x) == strip(resize_rgba(x)) for Lanczos3 and Triangle; lock with unit tests like the existing box_downscale_rgb8_matches_rgba8_then_strip (casabio_encode.rs:1262-1280). Encoder input bytes then identical → JXL bytes identical.",
+          "risk": "Low. Alpha inputs keep the existing RGBA path untouched; predicate is the already-computed has_alpha. Main risk is the image-crate resize parity assumption — gated by the parity test before wiring.",
+          "verify_plan": "1) Unit parity: resize Rgb<u8> vs Rgba<u8>+strip, both filters, exact + non-exact dims (incl. 24MP-shaped ratios). 2) Full VariantSet bytes OLD==NEW on opaque fixtures (gradient, LCG-random, real DNG-derived rgb16), all quality/progressive combos incl. coalesced path; alpha fixtures byte-unchanged. 3) flipflop (interleaved) at 4/12/24MP for the timing number; MSVC test suite green."
+        },
+        {
+          "id": "JE-2",
+          "title": "Route full-res tier encodes through the existing chunked encoder (deferred casaencoder lever #1 — its 'needs new jxl-ffi bindings' blocker is now stale)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casaencoder.rs:746-870 (encode_chunked: chunked input + output processor already bound and working)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\jxl_casaencoder.rs:627-644 (AddImageFrame whole-frame copy path)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:846-852,965-976 (pyramid full-res encode, distance+effort only)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:243-260,276-281 (variants full tier)",
+            "C:\\Foo\\raw-converter-wasm\\Questions_deferred.md:964-977 (the deferred item), 1553-1575 (byte-identical + peak-memory evidence)"
+          ],
+          "mechanism": "Every full-res tier encode uses Encoder::encode → JxlEncoderAddImageFrame, which copies the entire frame into libjxl and holds O(frame) internal buffers (measured: whole-frame encoder peak 99MB@4096² scaling to 197MB@8192²; streaming constant 57.8MB; lossless probe −60MB/−28% peak, neutral-to-faster wall). encode_chunked (BUFFERING=2, super-tile pull input) already exists in the same file, is used by stream_export, and is documented byte-identical to AddImageFrame (lossless locked by test streaming_export_lossless_bytes_equal_whole at stream_export.rs:83-99; lossy 'proven by density bench' + WASM P2a byte-identical memo). Wire: (a) pyramid full-res encode — distance+effort expressible today; (b) variants full tier when progressive_dc==0 && group_order==0 && !has_alpha, converting quality via JxlEncoderDistanceFromQuality; feed via a band-stripping ChunkedColorSource (RGBA→RGB per ≤2048-row super-tile) so the 72MB whole-frame strip also disappears (synergy with JE-1). Requires adding the parallel runner to encode_chunked (JxlEncoderSetParallelRunner binding exists, used at jxl_casaencoder.rs:515-520) to keep the measured 1.33-1.51× threaded full-res win.",
+          "expected_win": "Peak encoder memory on the 24MP full tier drops from O(frame) (~150-250MB libjxl-internal + 72MB strip) to O(super-tile) (~60MB constant) — the single biggest peak-memory lever in this area; wall neutral-to-faster per the lossless probe. First-class memory candidate.",
+          "byte_exact": "yes with re-verification — strong prior evidence (lossless locked by an in-tree test at every effort; lossy claimed identical via density bench and the WASM bridge P2a memo) but the lossy byte-equality is NOT currently test-locked; USE_FULL_IMAGE_HEURISTICS=0 could in principle diverge on some config. Hard gate: bytes must equal per exact tier config before switching, else fall back to whole-frame.",
+          "risk": "Medium. Config-space parity (e3 × q85/q90/q95-derived distances × pyramid distances 0.55/1.45) must all be byte-equal; runner-attached chunked must equal single-thread chunked (libjxl encode is deterministic across thread counts — assert it). Progressive/group-order/alpha paths stay on the whole-frame encoder.",
+          "verify_plan": "1) A/B bytes: encode_chunked vs Encoder::encode for every production tier config on ≥6 images (sizes crossing 2048 super-tile boundaries, odd dims, 1×N degenerate) — any mismatch disqualifies that config. 2) Thread-count parity: chunked with runner N∈{1,4,12} byte-equal. 3) Peak-RSS probe like examples/jxl_lossless_stream_density.rs for the lossy tier. 4) Interleaved flipflop for wall-time neutrality; MSVC suite green."
+        },
+        {
+          "id": "JE-3",
+          "title": "stream_band: borrow raw window instead of per-chunk ctx alloc+memset+memcpy; drop dead output zero-fill",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\stream_band.rs:122-141 (tone-only: fresh vec![0u16; ctx_h*w] + row copies + rgb8.resize(...,0))",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\stream_band.rs:177-211 (spatial twin: same pattern with SPATIAL_HALO)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\stream_band.rs:106-118,161-173 (per-call rowbuf alloc)"
+          ],
+          "mechanism": "Three strictly-less-work eliminations in the streaming export band producer. (a) For every 256-row sub-chunk, ctx is freshly allocated zero-initialized then filled row-by-row from raw_win via raw_row() — but for interior chunks (no top/bottom clamp) rows [s0-2, s1+2) are bit-identical to a CONTIGUOUS window of raw_win; pass &raw_win[(s0-2-raw_first)*w..(s1+2-raw_first)*w] straight to demosaic_bayer_mhc_band and keep the copy only for the clamped first/last chunks. At 6000px width that removes ~3.1MB memset + 3.1MB memcpy per chunk (~16 chunks per 4000-row frame ≈ 100MB of dead traffic per 24MP export). (b) rgb8.resize(start+ns*w*3, 0) memsets bytes process_into_auto immediately fully overwrites — w*h*3 ≈72MB of dead memset per 24MP export; write into spare capacity + set_len (the encoder wrapper already uses this exact pattern at jxl_casaencoder.rs:670-713). (c) rowbuf and the clamped-chunk ctx are per-call/per-chunk allocs — hoist to struct fields.",
+          "expected_win": "~170MB less memory traffic + ~30 fewer allocations per 24MP streaming export; wall likely −1..3% of the export (encode dominates) — ships on rule #10 (strictly less work), and trims the streaming path's already-small peak further.",
+          "byte_exact": "yes-by-construction — identical bytes reach demosaic (same rows, same order); output bytes are written identically by process_into_auto. The existing whole-vs-streamed byte-equality tests (stream_band.rs:283-311, 314-351; stream_export.rs:67-123) lock it.",
+          "risk": "Low-medium: borrow restructuring across &mut self (raw_win borrowed while rgb8 grows — needs split borrows or a take/put pattern) and halo off-by-one at the clamp boundaries; both fully covered by the in-tree byte-parity tests including odd heights and multi-pull sequences.",
+          "verify_plan": "Run streaming_source_matches_whole + streaming_spatial_source_matches_whole + all three stream_export byte-equality tests (they compare streamed JXL bytes vs whole-frame); add a case whose first/last chunks exercise the clamped-copy fallback (h not multiple of 256, tiny h). flipflop the export end-to-end at 2048² and 24MP-shaped synth for the timing note."
+        },
+        {
+          "id": "JE-4",
+          "title": "Variant fan-out schedule: threaded full-res after the small-tier barrier, and/or overlap the Lanczos preview resize with the full encode (deferred D2 — bench-gated)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:161-191 (serial resizes run before any encode)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:215-262 (rayon join tree; full tier = one single-threaded Encoder branch)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:708-724,965-976 (serial_encode_threads + the pyramid precedent: post-barrier full-res with_threads = 1.33-1.51× measured)",
+            "C:\\Foo\\raw-converter-wasm\\Questions_deferred.md:1062-1071 (CASA-ENC-D2, explicitly bench-gated, not rejected)"
+          ],
+          "mechanism": "Two wasted-resource windows on a 24MP variant set: (1) the single-threaded image-crate Lanczos3 preview resize runs serially BEFORE the fan-out although the full-res encode does not depend on it — the machine is single-threaded for the whole resize; (2) inside the fan-out, thumb+preview finish early and all cores but one idle while the full e3 encode grinds single-threaded (the pyramid path already fixed its symmetric case with a post-barrier Encoder::with_threads at 1.33-1.51×). Restructure options: spawn the full-res encode first and do resizes+small encodes concurrently, or run thumb+preview in parallel then give the full tier serial_encode_threads(px). No work is added or removed — pure schedule/topology, so per house rules this REQUIRES interleaved flipflop evidence before landing (resize and JXL both saturate memory bandwidth; overlap is not a guaranteed win).",
+          "expected_win": "−10..25% wall on big-RAW variant sets if the pyramid's 1.33-1.51× threaded-full-res measurement transfers (full encode is the critical path); honest uncertainty is high — could be a wash if bandwidth-bound. No memory change.",
+          "byte_exact": "yes-by-construction for reordering (same encodes, same inputs); the with_threads variant relies on libjxl encode determinism across thread counts, which the pyramid path already banks (casabio_encode.rs:712-713 'output byte-identical') — assert VariantSet bytes OLD==NEW anyway.",
+          "risk": "Medium: heuristic/topology change, explicitly bench-gated per CLAUDE.md; oversubscription if full-res threads overlap the small-tier fan-out (avoid: barrier shape, not overlap shape, for the threaded variant).",
+          "verify_plan": "Interleaved flipflop (rotated-start) of the three shapes — current, full-first-overlap, barrier+threads — on real 12MP/24MP RAW-derived RGBA at q90/e3, ≥30 iters; byte-equality assert on all three VariantSet outputs each iteration. Ship only a sign-stable winner; log a reject entry otherwise."
+        },
+        {
+          "id": "JE-5",
+          "title": "Owned rgb16 entry point: kill the 144MB full-frame clone on the texture/clarity path (deferred D4a)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:425-431 (rgb16.to_vec() before apply_unsharp_masks)",
+            "C:\\Foo\\raw-converter-wasm\\Questions_deferred.md:1085-1088 (CASA-ENC-D4a)"
+          ],
+          "mechanism": "encode_variants_from_rgb16_with_progressive clones the entire rgb16 buffer (144MB @24MP) whenever texture or clarity is nonzero, solely because the borrowed &[u16] input cannot be mutated by apply_unsharp_masks. An additive `encode_variants_from_rgb16_owned(rgb16: Vec<u16>, ...)` twin mutates in place and can drop the buffer before the encode fan-out starts, removing one full-res-equivalent buffer from the peak at the widest point of the pipeline (where rgb16 + clone + RGBA coexist = 384MB @24MP today). Callers that keep their buffer stay on the borrowing entry.",
+          "expected_win": "Zero wall change; peak-memory −137MB @24MP on the spatial-look ingest path (first-class memory hog). Combined with JE-1 the same entry drops another 24MB (RGBA→RGB).",
+          "byte_exact": "yes-by-construction — identical operations on identical bytes, only buffer ownership changes.",
+          "risk": "Low; additive API, no behavior change to existing entries. Needs the Tauri caller to adopt the owned entry to realize the win.",
+          "verify_plan": "Unit test: owned vs borrowed entry produce byte-identical VariantSet for texture/clarity ≠ 0 and == 0. Peak-RSS probe (existing dng_preview_concurrency-style harness) before/after at 24MP to document the drop."
+        },
+        {
+          "id": "JE-6",
+          "title": "Marginal: skip the full-frame alpha scan on the from_rgb16 entry (opaque by construction) — subsumed by JE-1",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casabio_encode.rs:144-149 (has_meaningful_alpha on the full-res RGBA)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\pipeline.rs:1978,2000 (process_rgba writes hardcoded α=255)"
+          ],
+          "mechanism": "The from_rgb16 entry builds the RGBA buffer itself via process_rgba, which writes a constant α=255 — then encode_variants strided-reads all 24M alpha bytes of that same buffer to rediscover has_alpha=false. Thread a known-opaque flag from the entry (or route to an internal fn taking has_alpha) and the scan disappears. Only worth doing standalone if JE-1 is not taken — JE-1 deletes the RGBA buffer entirely on this path.",
+          "expected_win": "~5-15ms per 24MP ingest (one strided pass over 96MB). Tiny; rule-10 strictly-less-work.",
+          "byte_exact": "yes-by-construction — the scan provably returns false on this input; every downstream decision is unchanged.",
+          "risk": "Trivial; keep the scan on the generic RGBA entries where opacity is unknown.",
+          "verify_plan": "Unit: from_rgb16 output byte-identical before/after; debug_assert!(!has_meaningful_alpha(&rgba)) in the skipped path under cfg(test) to lock the invariant."
+        }
+      ]
+    },
+    {
+      "area": "libjxl VarDCT encode internals, effort-3 lossy path (JOLT Balanced d1.0/e3; app image tiers)",
+      "summary": "e3 maps to SpeedTier::kFalcon (encode.cc: `static_cast<SpeedTier>(10 - value)`; common.h:64). Traced what actually runs at falcon/d1.0: splines/patches/dots OFF (enc_heuristics.cc:1053-1070, ≤kSquirrel), AQ map OFF (constant quant field FillImage, enc_heuristics.cc:1102-1120), gaborish OFF (enc_frame.cc:319-324, ≤kHare), CfL search OFF (enc_heuristics.cc:1173/1194 → default cmap), butteraugli loop OFF (enc_adaptive_quantization.cc:1415, ≤kKitten), ACS search OFF (FillDCT8 everywhere, enc_ac_strategy.cc:1325-1328), AR/EPF search OFF (enc_heuristics.cc:910-915, ≤kWombat), noise OFF (kMinButteraugliForNoise=99). Remaining e3 wall time = input u8→float conversion, ToXYB (mined), DCT8+quantize in enc_group (mined), TokenizeCoefficients (mined), BuildAndEncodeHistograms+rANS in EncodeGroups (mined — in-tree comment at enc_frame.cc:1718 marks it the cost center), modular DC/ACMeta streams, plus three pieces of genuinely dead or scalar work I found: a full-frame Image3F copy whose only consumer early-returns at falcon (enc_frame.cc:1137-1143 → enc_heuristics.cc:911), a sequential scalar zero-count scan over 50% of all AC coefficients with an upstream `TODO(veluca): SIMDfy` (enc_coeff_order.cc:104-153), and a 3-pass scalar strided input conversion (base/float.h:64-68 via enc_frame.cc:206-210). The heavily-mined files (enc_ans/cluster/lz77/group/entropy_coder/xyb/modular-AddVarDCTDC) are confirmed tight; the wins left are work-elimination and two SIMDfy gaps outside those files.",
+      "candidates": [
+        {
+          "id": "JE-1",
+          "title": "Skip dead full-frame orig_opsin alloc+copy at e3 (AR heuristics never read it at falcon)",
+          "files": [
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_frame.cc:1137-1143 (alloc + CopyImageTo)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_frame.cc:1152-1153 (sole consumer)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_heuristics.cc:909-915 (early-return predicate: dist<kMinButteraugliForDynamicAR || tier>kWombat || epf_iters==0)"
+          ],
+          "mechanism": "ComputeVarDCTEncodingData unconditionally allocates a rect-sized Image3F and row-copies all 3 opsin planes into it ('save pre-Gaborish opsin for AR heuristics'). Its ONLY consumer is ComputeARHeuristics, which at falcon (7 > kWombat=4) hits the early return at enc_heuristics.cc:911 — FillPlane(4, epf_sharpness) — and never touches orig_opsin. So at e3 the copy is 100% dead: ~12 bytes/pixel of allocation + memcpy traffic (12MP whole-frame: 144MB alloc + 144MB copy; app streaming path: ~48MB alloc+copy PER 2048x2048 DC group, enc_frame.cc:2155-2184 loop). Fix: hoist the exact ComputeARHeuristics early-return predicate into a shared helper (e.g. WillComputeDynamicAR(cparams, frame_header)); when false, skip the Create+CopyImageTo and pass an empty Image3F. Also removes one of the three image-sized peak-memory buffers alive during the heuristics phase.",
+          "expected_win": "CPU: ~1-4% of e3 wall time native (one full-image read+write pass eliminated), likely more on WASM where large allocs hit memory.grow. Peak memory: −144MB @12MP non-streaming / −48MB per DC group streaming — first-class peak-mem win for the WASM heap. Timing may be near noise floor on small tiles; ships on rule #10 (strictly less work).",
+          "byte_exact": "yes-by-construction",
+          "risk": "Low. Predicate duplication drift between enc_frame.cc and ComputeARHeuristics — mitigate with one shared helper used by both. Verify ComputeARHeuristics has no size assertion before its early return (it doesn't; reads only cparams/epf_sharpness).",
+          "verify_plan": "Native cjxl OLD/NEW A/B (junction third_party + clang-cl static tools recipe from memory): encode fixture set at e3/d1.0 (plus e4/kWombat and e7 to prove the copy still happens when AR runs) — SHA-compare codestreams, must be byte-identical. Streaming coverage via the repo WASM enc harness (bridge.cpp buffering=2 path), enc-sha gate. Peak-mem A/B with the examples/dng_preview-style RSS sampler. Interleaved flipflop on 12-24MP e3 encodes for the timing claim; WASM rebuild gate (no SIMD involved, low risk)."
+        },
+        {
+          "id": "JE-2",
+          "title": "SIMDfy the coeff-order zero-count scan (upstream TODO), currently scalar AND fully sequential at e3",
+          "files": [
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_coeff_order.cc:74 (num_zeros alloc)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_coeff_order.cc:104-153 (sequential group loop; scalar count at 130-138; `TODO(veluca): SIMDfy` at 118)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_coeff_order.cc:37-42 (falcon returns used_orders={1,1} → loop RUNS at e3)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_frame.cc:1160-1175 (ComputeAllCoeffOrders call site, per DC group in streaming)"
+          ],
+          "mechanism": "Despite the comment 'No coefficient reordering in Falcon or faster', ComputeUsedOrders returns {1,1} at falcon so ComputeCoeffOrder DOES run its zero-counting pass: a single-threaded scalar loop visiting 50% of all first blocks (block_fraction=0.5 at line 80-82), 3 channels x 64 int32 coeffs each — i.e. ~1.5x the pixel count in int32 loads with per-element compare+int64 RMW, on the main thread while the pool idles. Fix (surgical): vectorize the inner k-loop — Eq(coeff, 0) mask, accumulate per-position lane counts in a small local u32[64x3] (counts fit u32 trivially), add into num_zeros[] once per group or at end. The per-block LLF '-1' overwrite (lines 144-148) always ends at -1 regardless of intermediate adds, so a single deferred -1 store yields the identical final array the sort reads at line 210. Integer sums are exact and order-independent → identical order → identical codestream. The RNG sampling sequence (use_sample(), lines 91-100) is untouched. Optional follow-up (bigger, more complex): parallelize per group with per-group xorshift fast-forward — at falcon every block is a first block so the RNG step count per group is computable without scanning.",
+          "expected_win": "The scan is O(1.5x image) sequential scalar work; SIMD gives ~4-8x on the loop. Estimate 2-5% of e3 wall time on 12-24MP photos (loop share ~3-6%, single-threaded so it bites wall time directly); uncertain — needs the stage timer + flipflop to confirm share. WASM SIMD128 win smaller (~2-4x) but the loop is pure int ops.",
+          "byte_exact": "yes (integer counting, order-independent; final num_zeros array provably identical including LLF -1 entries)",
+          "risk": "Medium-low. WASM portability GOOD: Eq(i32)/VecFromMask/Add(i32,u32)/widen — all have wasm128 overloads (the b9f2 trap was f64 DemoteTo/MulAdd; no floats here). Care needed with the u32-local-then-widen accumulation and with keeping ACType::k16 branch handled (app path is k32 per enc_frame.cc:1207 JXL_ENSURE).",
+          "verify_plan": "Standalone harness (tools/ pattern like ans_reverse_map_ab.cc): feed real coeff dumps + synthetic, assert num_zeros[] and final order[] arrays byte-identical OLD vs NEW across sizes incl. partial edge groups. Then real cjxl e3/d1.0 A/B SHA-identical codestreams (also e2/kThunder, e1). Interleaved flipflop (JXL_STAGE_TIMERS around ComputeAllCoeffOrders + whole-encode) on 12/24MP. WASM-COMPILE gate: rebuild wasm dist before ship."
+        },
+        {
+          "id": "JE-3",
+          "title": "Fused single-pass SIMD RGBA8→3-plane float input conversion (currently 3 scalar strided passes over the interleaved buffer)",
+          "files": [
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_frame.cc:181-227 (CopyColorChannels: one ConvertFromExternalNoSizeCheck call PER channel)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_external_image.cc:48-93 (per-channel row loop)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/base/float.h:64-68 (scalar strided u8 loop: src[stride*i] * scale)"
+          ],
+          "mechanism": "Every app encode (bridge.cpp chunked input, both whole-frame and streaming) deinterleaves the RGBA8/RGB8 buffer into 3 float planes by calling ConvertFromExternalNoSizeCheck once per channel: each call re-reads the WHOLE interleaved buffer (stride-4 scalar byte gather) and does one scalar u8→float multiply per element — 3x redundant memory traffic (12MP RGBA8: 48MB read 3x = 144MB) plus zero SIMD. Fix: add a fused fast path in CopyColorChannels for (JXL_TYPE_UINT8, num_channels 3/4, bits_per_sample==8): one pass with LoadInterleaved4/3(u8) → PromoteTo i32 → ConvertTo f32 → Mul(scale) → store 3 (or 4, incl. alpha) planes. float(u8) conversion is exact and the single multiply per element is identical to scalar → bit-identical planes. Leave LoadFloatRow untouched (shared with other types); fall back for exotic formats.",
+          "expected_win": "Stage is row-parallel already, so wall-time win depends on pool width; single-thread estimate ~3-6x on the conversion (~15-30ms native @12MP → ~5ms) and 3x less input traffic. Overall e3 share ~2-5% on WASM (conversion is relatively more expensive there), ~1-3% native. Uncertain — measure stage share first.",
+          "byte_exact": "yes (pure per-element map: exact int→float conversion + one IEEE multiply, same value per pixel; no reductions)",
+          "risk": "Medium. WASM portability: LoadInterleaved4(u8) is implemented generically in Highway for wasm128 (shuffle-based) and PromoteTo/ConvertTo i32→f32 have wasm overloads — but shuffle-heavy deinterleave has regressed on wasm before (conv5 memory) → MUST measure on WASM, not just compile. Keep scalar fallback for correctness.",
+          "verify_plan": "Unit A/B: fixture RGBA8/RGB8 buffers (odd widths, all alignments) → assert 3 planes byte-identical to old path. Real cjxl/bridge e3 A/B SHA-identical codestreams. Interleaved flipflopdom in-browser (this is where the win matters) + native flipflop; WASM-COMPILE + measured-on-wasm gate before ship (reject if wasm shuffle cost eats the win, per conv5 lesson)."
+        },
+        {
+          "id": "JE-4",
+          "title": "Skip CfLHeuristics::PrepareForThreads scratch alloc at >kHare (ComputeTile never called; ACS side already has this exact short-circuit)",
+          "files": [
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_heuristics.cc:1203-1207 (prepare lambda allocates unconditionally)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_heuristics.cc:1173,1193-1198 (ComputeTile gated ≤kSquirrel / ≤kHare)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_chroma_from_luma.h:41-64 (ItemsPerThread ≈ 344k floats ≈ 1.38MB/thread)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_ac_strategy.cc:1303-1318 (precedent: ACS PrepareForThreads already short-circuits at ≥kCheetah)"
+          ],
+          "mechanism": "LossyFrameHeuristics' RunOnPool prepare callback calls cfl_heuristics.PrepareForThreads(num_threads) unconditionally, allocating num_threads x ~1.38MB of aligned scratch. At falcon, both ComputeTile call sites are behind ≤kSquirrel / ≤kHare gates, so the scratch is never touched — dead allocation, repeated per DC group in streaming mode (e.g. 8 threads x 1.38MB x 6 DC groups ≈ 66MB of alloc churn per 24MP image). The sibling AcStrategyHeuristics::PrepareForThreads got exactly this short-circuit already (mem_per_thread=0 at ≥kCheetah); CfL was missed. Fix: gate on cparams.speed_tier <= SpeedTier::kHare (mirroring the ComputeTile gates).",
+          "expected_win": "Timing noise-floor native (alloc without touch is cheap); on WASM it avoids transient memory.grow pressure. Ships on rule #10 (strictly less work) — no benchmark burden, just byte-exact proof.",
+          "byte_exact": "yes-by-construction (mem is only read inside ComputeTile, which is unreachable at >kHare)",
+          "risk": "Very low. Only consumer of CfLHeuristics::mem is ComputeTile (verified via enc_chroma_from_luma.h — mem passed nowhere else). Guard must exactly mirror the ≤kHare gate.",
+          "verify_plan": "cjxl A/B at e3 AND e5 (kHare — allocation must still happen) AND e7: SHA-identical codestreams. MSVC test suite + wasm32 check. No timing claim needed (rule #10)."
+        },
+        {
+          "id": "JE-5",
+          "title": "Right-size the num_zeros scratch in ComputeCoeffOrder (3.15MB zero-init per call, 192 entries used at falcon)",
+          "files": [
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_coeff_order.cc:74 (std::vector<int64_t> num_zeros(kCoeffOrderMaxSize))",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/coeff_order.h:26-40 (kCoeffOrderMaxSize = 6156*64 = 393,984 entries = 3.15MB)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_coeff_order.cc:126-149,205-215 (all accesses via CoeffOrderOffset(ord,c) — bounded by max used ord)"
+          ],
+          "mechanism": "Every ComputeCoeffOrder call (per pass; per DC group in streaming) value-initializes a 3.15MB int64 vector. All reads/writes go through CoeffOrderOffset(ord, c) for ords present in current_used_acs; at falcon only ord 0 (DCT8) exists → entries [0, 192) are ever touched (CoeffOrderOffset(1,0)=192*64... precisely kCoeffOrderOffset[3]*64). Fix: size the vector to CoeffOrderOffset(max_set_ord+1, 0) computed from current_used_acs (covers counting writes, -1 stores, and sort reads). At e3 that's 1.5KB instead of 3.15MB of calloc per DC group.",
+          "expected_win": "~0.5-1ms per DC group of page-touch/zeroing saved; noise-floor on whole encode. Rule #10 alloc-churn elimination; also helps slower tiers proportionally (they use more orders but rarely all 6156 blocks' worth).",
+          "byte_exact": "yes (untouched entries never read; counting/sort behavior over the used span unchanged)",
+          "risk": "Low. The sizing predicate must use current_used_acs (counting loop writes for every ord present in the image, lines 126-148), NOT current_used_orders (sort-read set) — using the wrong mask would UB on the -1 LLF stores. One-line comment + JXL_DASSERT bound check mitigates.",
+          "verify_plan": "cjxl A/B SHA-identical at e1/e3/e7/e9 + a mixed-transform image (e7 exercises high ords). ASAN/DASSERT run to prove no out-of-bounds on the resized vector. No timing claim (rule #10)."
+        },
+        {
+          "id": "JE-6",
+          "title": "Hoist TokenizeAllCoefficients' per-thread EncCache into PassesEncoderState (re-allocated per DC group in streaming mode)",
+          "files": [
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_frame.cc:1177-1228 (EncCache + local group_caches vector per TokenizeAllCoefficients call)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_frame.cc:2155-2189 (streaming loop calls ComputeEncodingData → TokenizeAllCoefficients once per DC group)",
+            "C:/Foo/raw-converter-wasm/external/libjxl-012/lib/jxl/enc_entropy_coder.cc:162-175 (num_nzeroes write-before-read within group; top row uses nullptr at sby==0 — no stale reads)"
+          ],
+          "mechanism": "group_caches (one Image3B num_nzeroes = 32x32x3 blocks ≈ 196KB per thread) is a function-local vector in TokenizeAllCoefficients, so in streaming mode every DC group re-allocates num_threads x 196KB. The scratch is provably write-before-read per group: TokenizeCoefficients fills nzeros rows as blocks are processed and the top-row predictor explicitly takes nullptr at sby==0 (enc_entropy_coder.cc:171-175), so values from a previous group are never observed. Fix: move the per-thread EncCache vector into PassesEncoderState (same pattern as the landed enc_group ACGroupScratch per-worker reuse), InitOnce keeps lazy sizing. Non-streaming path unaffected (called once).",
+          "expected_win": "Alloc churn only: ~num_threads x 196KB per DC group (8 threads x 6 DC groups @24MP ≈ 9MB churn). Noise-floor timing; rule #10. Mainly benefits the app's streaming encodes and JOLT video (per-frame streaming).",
+          "byte_exact": "yes-by-construction (scratch never read before written within a group — verified at enc_entropy_coder.cc:171-175; contents don't influence tokens across groups)",
+          "risk": "Low-medium. PassesEncoderState lifetime spans frames in the encoder API — must not break the 'workers stateless between sessions' invariant on the app side (it doesn't; state is per-encoder). Thread-count growth between calls needs resize handling in the init callback.",
+          "verify_plan": "cjxl A/B SHA-identical on multi-DC-group images (>2048px) streaming + non-streaming, 1 and N threads. Repo WASM enc flip. No timing claim (rule #10); optionally count allocations with a debug memory manager to demonstrate the churn removal."
+        }
+      ]
+    },
+    {
+      "area": "TIME TO FIRST PAINT — JXL progressive decode + RAW preview (file bytes → first pixels on screen)",
+      "summary": "The two flows have opposite maturity. JXL flow: the dedicated decode worker preloads its WASM at page load (web/jxl-decode-worker.js:6-10 + main.js:824), decode-handler posts the first progressive flush immediately with no drain/EMA gating (packages/jxl-worker-browser/src/decode-handler.ts:501-521; DRAIN_MIN_INTERVAL_MS=8/BYTE_DRAIN_HWM=2MiB only pace worker_drain, never frame posts) — but the MAIN-THREAD paint path then does a full-canvas getImageData readback plus a second redundant putImageData on EVERY progressive frame at full decoded resolution (web/main.js:2349-2351 → captureCleanAndApplyLens:2101-2111 → applyPerceptualLens re-put at 2123), ~2×80MB extra canvas traffic per pass at 20MP. The scheduler stack (pyramid lightbox/gallery) never prewarm: createBrowserContext (packages/jxl-session/src/browser.ts:39-62) doesn't pass prewarmSize (scheduler.ts:260-262 support is dead), and workers post worker_ready before loading WASM (worker.ts:653-654) with getWasm() lazy on first decode_start (worker.ts:90-119, 377) — so the first decode pays spawn + ~2.9MB enc.simd fetch+compile serially (facade prefers the enc superset over the 1.0MB dec artifact, facade.ts:2570). RAW flow: the embedded-JPEG Phase A thumb is a good fast placeholder (main.js:1629-1680), but the real RAW pipeline pays (1) fully-lazy WASM init on the first task — ensureWasm() is only called inside the task handler (web/worker.js:489) though 12 workers are spawned at page load (main.js:901-904) with no preload message — and (2) one monolithic WASM call with OUT_FULL_RGB8|OUT_LIGHTBOX|OUT_THUMB (worker.js:519-540) so the 360px thumb and 1800px lightbox only post after the entire 20MP decompress+demosaic+tonemap completes; the byte-identical streaming preview path (src/lib.rs:813-861) is gated OFF whenever full-res is requested (should_stream_previews, lib.rs:776-778). jxl-stream's fromReadableStream one-ahead prefetch is used by no production page (grep: only docs/tests); production decodes fetch whole buffers first (jxl-decode-worker.js:244-245), which is fine for the blob: URLs main.js uses.",
+      "candidates": [
+        {
+          "id": "TTFP-1",
+          "title": "Prewarm RAW-pipeline WASM in web/worker.js (ensureWasm on a preload message at pool.init)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\web\\worker.js:121-149 (ensureWasm)",
+            "C:\\Foo\\raw-converter-wasm\\web\\worker.js:489 (only call site, inside first-task handler)",
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:901-904 (pool.init spawns workers with no preload; contrast :824 where the JXL decode worker DOES get a 'preload' message)"
+          ],
+          "mechanism": "Workers are spawned at page load but stay WASM-cold: module import + init() (1.6MB raw_converter_wasm_bg.wasm, instantiateStreaming) + rayon initThreadPool(hardwareConcurrency) all run inside the FIRST file task, fully serial between 'user picks file' and the first RAW thumb/lightbox. Add a WorkerMsg.PREWARM handled by `void ensureWasm()` and post it to 1-2 workers at pool.init (or to all on dragenter/file-input interaction). All setup then overlaps user think time / the file read. Note ensureWasm already retries on failure (wasmReady=null on catch), so prewarm failure self-heals.",
+          "expected_win": "First RAW file only: eliminates the WASM fetch+compile+instantiate+thread-pool leg from the visible path — plausibly 200-800ms cold / 100-300ms warm-cache on desktop; exact number unmeasured. Zero effect on steady-state throughput.",
+          "byte_exact": "yes-by-construction (timing/lifecycle only; no pixel path touched)",
+          "risk": "Low. Prewarming ALL 12 workers eagerly would burn ~12 module instances + rayon pools for users who never drop a file — prewarm 1-2 at load and the rest on first drag. No layer-invariant impact (web legacy tier).",
+          "verify_plan": "flipflopdom: fresh worker per round, interleave arms (prewarm-message-then-submit vs submit-cold), measure submit→THUMB wall time on the same ORF fixture; assert THUMB rgb bytes hash-identical across arms. Also assert no behavior change when prewarm message races a real submit."
+        },
+        {
+          "id": "TTFP-2",
+          "title": "Kill the per-progressive-pass full-canvas getImageData readback + redundant putImageData in the lightbox JXL paint",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:2346-2356 (per jxl_progress: putImageData then captureCleanAndApplyLens(ctx.getImageData(...)))",
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:2101-2111 (captureCleanAndApplyLens)",
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:2113-2126 (applyPerceptualLens re-puts cleanSnapshot at :2123 even when lens inactive)",
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:2301-2303, 2326-2328, 2408-2410 (same pattern on the jpeg/jxl-cached/raw one-shot paint paths)"
+          ],
+          "mechanism": "Every progressive frame (including the FIRST paint) at full decoded resolution does: putImageData(new ImageData(msg.rgba,w,h)) → ctx.getImageData(0,0,W,H) (full readback, fresh ~4·W·H allocation) → applyPerceptualLens which, with the lens off (default), putImageData(cleanSnapshot) AGAIN — three full-canvas ops where one suffices, ~160MB of extra canvas traffic per pass at 20MP. Fix: construct the ImageData once, putImageData it, pass that same ImageData object to captureCleanAndApplyLens (no readback), and make applyPerceptualLens skip the re-put when the incoming snapshot was just painted (idempotent write of identical pixels).",
+          "expected_win": "Per progressive pass at 20MP: eliminates one full getImageData (~30-80ms) + one full putImageData (~20-50ms) + one 80MB allocation of main-thread time; first-paint present latency drops by roughly that much, later passes each get the same saving. Small images proportionally less. Unmeasured; browser-dependent.",
+          "byte_exact": "yes for the canvas (skipped re-put writes pixels the canvas already holds; passing the source ImageData is exact for alpha=255). For translucent pixels the current putImageData→getImageData round-trip is itself lossy (premultiplication), so the new snapshot is exact-or-better — verify on an alpha fixture.",
+          "risk": "Low-medium: cleanSnapshot feeds the perceptual lens + Tauri-parity FilterEngine baseline; must keep feeding an ImageData with identical semantics (not a detached/reused buffer). The ImageData handed to putImageData is not detached, so reuse is safe.",
+          "verify_plan": "A/B: dump cleanSnapshot.data hash old-vs-new on opaque + alpha JXL fixtures (expect identical on opaque). flipflopdom in-page: interleave old/new handlers on the same decode message replay, measure putImageData→task-end main-thread time per pass and first-paint present timestamp via rAF."
+        },
+        {
+          "id": "TTFP-3",
+          "title": "Make scheduler-stack prewarm real: wire prewarmSize in createBrowserContext AND kick getWasm() at worker boot",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-session\\src\\browser.ts:39-62 (no prewarmSize passed)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-scheduler\\src\\scheduler.ts:260-262 (prewarmSize supported, unwired)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-scheduler\\src\\pool.ts:289-321 (prewarm + 16ms stagger)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-worker-browser\\src\\worker.ts:90-119 (getWasm lazy), :377 (awaited only inside handleDecodeStart), :653-654 (worker_ready posted WASM-cold)"
+          ],
+          "mechanism": "Answering the AREA question 'is prewarm actually warm at first decode?': No, twice over. (1) No production context ever calls pool.prewarm — prewarmSize is never passed. (2) Even a prewarmed worker is WASM-cold: worker_ready is posted at module eval and the ~2.9MB jxl-core wasm is fetched+compiled only when the first decode_start awaits getWasm() (cold-start chunk buffering already exists, so pushes overlap the load, but the compile itself is serial after the request). Fix: (a) `void getWasm()` at worker boot right after posting worker_ready — the URL is fully determined by self.location (tier is a worker-URL query param; _wasmUrl has no other writers), so boot-load resolves identically; (b) expose/pass prewarmSize (e.g. 1) from createBrowserContext or from the pyramid-lightbox/gallery pages so the first ctx.decode hits a spawned, compiled worker.",
+          "expected_win": "First scheduler decode per page (pyramid lightbox/gallery first image): removes worker spawn + ~2.9MB wasm fetch+compile from the serial path — plausibly 150-600ms cold, less with HTTP/code cache. Since workers today spawn only on demand, boot-time getWasm wastes nothing (a spawned worker is about to decode).",
+          "byte_exact": "yes-by-construction (lifecycle/timing only)",
+          "risk": "Medium-low: prewarmSize=1 is a policy default (idle reap at 30s covers abandonment); boot-time getWasm on a prewarmed-but-never-used worker fetches ~3MB speculatively — acceptable when prewarm is opt-in per page. Check the 'no top-level bare jxl-wasm import' test guard (wasm-loader.ts:12-13) — the boot kick must go through the existing dynamic loadWasmModule, not a static import.",
+          "verify_plan": "flipflopdom on pyramid-lightbox open: fresh context per round, interleave (prewarm+bootload) vs baseline, measure ctx.decode→first decode_progress wall time; assert decode_final pixel hash identical. Unit: worker posts worker_ready before any wasm fetch starts (ordering preserved)."
+        },
+        {
+          "id": "TTFP-4",
+          "title": "Two-phase RAW task: streaming-preview WASM call first (post THUMB+LIGHTBOX), full-res encode call second",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\web\\worker.js:519-540 (single call with OUT_FULL_RGB8|OUT_LIGHTBOX|OUT_THUMB|OUT_NO_ORIENT), :602-620 (THUMB/LIGHTBOX posted only after the full call returns)",
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:776-778 (should_stream_previews gate: previews && !need_full_rgb)",
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:813-861 (streaming preview path, 'Byte-identical to the full path (stream_preview tests)', ~6x lower peak)"
+          ],
+          "mechanism": "Today the 360px thumb and 1800px lightbox are hostage to the full 20MP pipeline because everything is one synchronous WASM call — and requesting OUT_FULL_RGB8 disables the existing byte-identical streaming preview path. Split the worker task: call 1 = process_*_with_flags(OUT_LIGHTBOX|OUT_THUMB) which takes the stream_preview fast path (strip-streamed decompress + superpixel demosaic, never materializes full raw, ~6x lower peak); post THUMB+LIGHTBOX immediately. Call 2 = OUT_FULL_RGB8|OUT_NO_ORIENT for the encode request. Cancellation checkpoint between calls comes free (cancelledTasks check already exists at worker.js:544). Also fixes the first-paint peak-memory profile: previews no longer co-resident with the full-res rgb16 + rgb8 buffers.",
+          "expected_win": "RAW thumb/lightbox latency drops from (full decompress + full demosaic + full tonemap + downscales) to (streamed preview build + two small tonemaps) — plausibly 40-70% earlier real-pixels paint per file; cost is one extra decompress on the encode leg (~+20-35% total CPU per file, workload-dependent). Latency-vs-throughput trade — needs measurement and product sign-off, not rule#10.",
+          "byte_exact": "yes for pixel outputs (streaming previews are byte-identical per lib.rs comment + stream_preview tests; full RGB8 unchanged) — only ordering/total-work changes. Gate falls back to today's behavior when !wb_from_camera or !can_halve, so must handle the fallback (skip split) to avoid double full pipelines.",
+          "risk": "Medium-high: doubles decompress on the batch-encode path (12-file drop = 12 extra decompresses); wb/color-matrix/exif consistency between the two calls must be verified (streaming path requires camera WB so values match); ORF-only gate today (DNG has its own twin at lib.rs:2412-2440). Prior art warning: 'ORF preview double-read fusion' was rejected NOT byte-exact — this proposal deliberately does NOT fuse, it reorders whole calls.",
+          "verify_plan": "Hash-compare THUMB/LIGHTBOX/ENCODE rgb outputs split vs monolithic on the ORF+DNG fixture set (expect identical where the stream gate holds). flipflop (native harness) + flipflopdom (browser): interleave split vs monolithic, record submit→THUMB, submit→LIGHTBOX, submit→ENCODE_REQUEST and peak WASM memory; ship only if TTFP win is large and encode-leg regression acceptable to the user."
+        },
+        {
+          "id": "TTFP-5",
+          "title": "previewFirst 'DC-only' decode actually decodes the full image — use progressionTarget:'dc' to stop after the first flush",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\web\\jxl-decode-worker.js:103-152 (previewFirst block; progressionTarget:'final' + progressiveDetail:'dc' at :108-118)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-wasm\\src\\facade.ts:1718-1722 (with target 'final' + !emitEveryPass every flush is taken and DISCARDED, decode runs to completion)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-wasm\\src\\facade.ts:1769 (with target 'dc' the generator returns right after emitting the first flush — true early stop)"
+          ],
+          "mechanism": "The comment claims 'DC-only decode at downsample=2 for fast low-res first paint', but the options produce a FULL decode: progressionTarget:'final' + emitEveryPass:false makes the facade discard every intermediate flush (paying flush cost each pass) and emit only the final frame; the main progressive decode then decodes the same bytes AGAIN. Setting progressionTarget:'dc' emits the first (DC) flush and returns — the preview paints after DC work only, and total preview cost drops from ~1 full decode to ~DC. The existing consumer already handles event.type 'progress' (jxl-decode-worker.js:132).",
+          "expected_win": "Large where used (preview paint moves from after-full-decode to after-DC, and removes a duplicate full decode) — BUT no production main.js caller passes decode-side previewFirst today (grep: only benchmark/gallery pages, e.g. jxl-progressive-best-preset.test.js). Rank reflects latent-path status; it is a cheap intent-bug fix that unblocks previewFirst for production use.",
+          "byte_exact": "no for the transient preview frame (DC pass at downsample=2 instead of final-quality at downsample=2 — which is the feature's stated intent); the subsequent main decode's frames are unchanged. Final displayed pixels identical.",
+          "risk": "Low: option-flip in a legacy-tier (3/5) file; consumers treat jxl_preview as a placeholder that the main decode overwrites. Confirm dispose of the early-returned decoder frees WASM state (facade finally { decFree } on generator return — it does).",
+          "verify_plan": "Unit test in web/test: previewFirst decode emits jxl_preview before N% of decode work (instrument via facade onMetric flush count: expect 1 flush, not all passes). A/B wall time preview-emit timestamp on a multi-pass progressive JXL; assert main-decode final frame hash unchanged."
+        },
+        {
+          "id": "TTFP-6",
+          "title": "repaintThumbFromJxl decodes full-res (no downsample, result discarded) on the single decode worker",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:2058-2092 (repaintThumbFromJxl: decodeJxl with no downsample/cache options, then createImageBitmap resize to 360px)",
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:584-599 (_jxlDecodeBusy: ONE decode at a time, priority-sorted queue, no preemption of in-flight)",
+            "C:\\Foo\\raw-converter-wasm\\web\\main.js:833-858 (dedupe by URL only — options-blind, so any downsample variant must fold options into the dedupe key)"
+          ],
+          "mechanism": "After every encode completes, a full-resolution JXL decode (~20MP RGBA) runs at 'low' priority solely to draw a 360px grid thumb, and the pixels are thrown away (cachePolicy defaults to 'never'). In a batch, these full decodes occupy the single decode worker; an in-flight one cannot be preempted, so a user opening the lightbox ('high') waits behind up to one full-res decode. Two fixes, pick one: (a) byte-preserving — pass cacheTarget:card + cachePolicy:'onFinal' so the decode doubles as the lightbox/prefetch cache (memory cost ~4·W·H per card; prefetchJxl already accepts exactly this cost for neighbors); (b) cheaper decode — pass downsample (8 for thumbs) which requires making _jxlPendingByUrl dedupe options-aware so a thumb decode can never be fanned out to a full-res listener.",
+          "expected_win": "Not the first paint of the first image, but directly shortens time-to-first-JXL-paint for lightbox opens during/after a batch (removes up to one full-res decode of head-of-line blocking, ~0.5-3s on large files) and cuts total decode work ~8x per thumb under option (b).",
+          "byte_exact": "(a) yes — same decode, result additionally cached (watch peak memory: N cards × full-res RGBA). (b) no — thumb pixels change (DC-path downsample + resize vs full decode + resize); needs a visual/SSIM gate on the 360px thumb.",
+          "risk": "Medium: (a) is a peak-memory trade in the opposite direction of recent memory work; (b) touches the options-blind dedupe (correctness hazard if done naively). The 'jxl' thumb badge semantics ('shows what the JXL roundtrip looks like') argue for (a) or a high-quality downsample.",
+          "verify_plan": "For (a): assert card._jxlDecoded populated post-encode and lightbox open does zero new decodes (count decode_jxl messages); measure lightbox-open→paint during a 12-file batch, interleaved A/B. For (b): SSIM/visual diff of 360px thumbs old-vs-new across corpus + dedupe unit test (thumb request + full request same URL → two decodes, correct routing)."
+        },
+        {
+          "id": "TTFP-7",
+          "title": "Decode-only contexts load the 2.9MB enc-superset WASM; prefer the 1.0MB dec artifact where no encode can occur",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-wasm\\src\\facade.ts:2565-2582 (candidates = [`enc.${tier}`, `${tier}`] — dec.* never considered)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-wasm\\dist (jxl-core.enc.simd.wasm 2.9MB vs jxl-core.dec.simd.wasm 1.0MB — dec artifacts exist despite the stale CLAUDE.md note)",
+            "C:\\Foo\\raw-converter-wasm\\web\\jxl-decode-worker.js:3-10 (decode-only worker, preloads via this facade)"
+          ],
+          "mechanism": "loadGeneratedLibjxlModule always prefers the enc superset, so the dedicated decode worker (and any decode-only page) fetches+compiles ~2.9MB where ~1.0MB suffices — ~3x the fetch and roughly proportional compile. Add an opt-in hint (e.g. preloadJxlModule({prefer:'dec'}) or a module-level setModulePreference('dec') callable before first load) that prepends `dec.${tier}` to the candidate list; jxl-decode-worker sets it. Scheduler pool workers serve BOTH decode and encode sessions (worker.ts routes both) and must keep the superset.",
+          "expected_win": "Cold-path only: cuts the decode worker's module cold-start ~2-3x (fetch + compile). Largely hidden in main.js by the page-load preload; real on slow networks, first visits, and any page that decodes immediately. Honest estimate: 100-400ms cold, ~0 warm.",
+          "byte_exact": "should be — same libjxl build, decode-only symbols; MUST verify because dist provenance is suspect (memory: committed dist build-manifest showed libjxl 0.11.2; hard rule = ship against libjxl-012 fork). If dec.* artifacts are from a different libjxl version than enc.*, decode output may differ — that is a blocker until a same-source rebuild.",
+          "risk": "Medium: dist artifact provenance (version skew between dec.* and enc.*); facade API surface grows; a decode-only realm that later encodes would double-load (~4MB total) — restrict the hint to jxl-decode-worker.",
+          "verify_plan": "First: check dist build-manifest / rebuild dec+enc from the same libjxl-012 source. Then SHA-compare decode_final pixels dec-module vs enc-module across the JXL corpus (all formats/progressive modes, incl. alpha + animation). flipflopdom cold-start: interleave module-preference arms with cache disabled, measure preload→first decode_final."
+        }
+      ]
+    },
+    {
+      "area": "PEAK MEMORY across photo + video flow (raw-converter-wasm @a3bc6e7a)",
+      "summary": "Photo peak is dominated by the full-res ORF/DNG path in src/lib.rs: at 24MP the live set during tone is input copy 36MB (W*H*1.5, held by wasm-bindgen glue for the whole call) + rgb16 master 144MB (W*H*3*u16, src/lib.rs:960-964) + rgb8 out 72MB, ~252MB/photo; ISO>=1600 adds 2 full-frame u16 BLUR_SCRATCH slots (+288MB, pipeline.rs:2114-2129) that persist in the thread_local forever. The streaming preview path (stream_preview.rs:151-190) is verified bounded (~1MB strips) but only gates on previews-only+camera-WB+halveable (lib.rs:776-778). Batch RSS linearity (940MB@12 RAW, 6GB@24 JXL from prior benches) comes from a flat concurrency cap; the AdmissionGate hook already exists in scheduler.ts:57-58/1297-1303 but no memory-weighted implementation is wired (mag7). Video: all CASV lossy encoders (batch + streaming, casa_video.rs) maintain an in-loop `recon` buffer that is provably write-only — every I-frame does a full self-decode of its own payload and every P-frame decodes its crop/atlas purely to update a buffer nothing reads — and decode_casv_all_rgb8 retains every decoded frame (132MB @48x720p) plus a full-frame clone per frame. The jxl-wasm bridge/facade are disciplined (per-session grow-only buffers freed at dec_free; ChunkRing capped at MAX_QUEUED_BYTES); the only structural WASM-memory fact is that linear memory never shrinks, so per-worker high-water persists until pool idle-reap terminates the worker.",
+      "candidates": [
+        {
+          "id": "JE-1",
+          "title": "Delete write-only in-loop `recon` from all CASV lossy encoders (dead full-frame self-decode per I-frame + crop decode per P-frame)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:464-542 (encode_stream_frame; recon writes at 476-477, 507-518, 529-533)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:552-603 and 610-665 (streaming encoders; recon at 564, 622)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:896-969 (bbox batch; recon at 914, 920-924, 940)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:975-1073 (tiled batch; recon at 997, 1003-1007, 1038-1049)"
+          ],
+          "mechanism": "Change detection compares px vs prev SOURCE frame (explicitly commented at casa_video.rs:927-929) and payloads are fresh source pixels, so the encoder-side reconstruction is never read: grep confirms every `recon` reference in encode paths is a write. Today each I-frame pays decode_interleaved of its own just-encoded full frame (2.76MB buffer + libjxl decode state, @720p) and each P-frame decodes its crop/atlas just to blit into recon. Deleting recon removes 1 full JXL decode per GOP frame, 1 crop/atlas decode per P-frame, the resident W*H*3 recon buffer (2.76MB @720p, 24.9MB @4K), and all decode transients — for the 48-frame 720p JOLT workload that is 4 full-frame decodes + 44 crop decodes of pure dead work.",
+          "expected_win": "Est. 10-30% of lossy/JOLT streaming-encode wall time (decode work is a large fraction of the 18ms/frame @55fps budget from the JOLT memo — must measure); peak −(W*H*3 + per-frame libjxl decode transients). Ships on rule #10 (strictly less work) even if timing is noise-floor.",
+          "byte_exact": "yes-by-construction — the output bitstream is assembled entirely from px/prev_src/encode results; recon never influences a byte",
+          "risk": "Low. Removes the encoder's incidental self-validation (VideoError::Reconstruct on undecodable own output — previously encode failed, now succeeds); a future residual-vs-recon tier would need to reintroduce it. Comment at casa_video.rs:322 claims 'encoder and decoder stay in sync' — the sync is currently fictional.",
+          "verify_plan": "SHA-256 of .casv bytes OLD vs NEW across the unit-test corpus + real dashcam fixtures for encode_casv_delta_lossy_bbox/tiled, encode_casv_video_streaming(_to), and all JOLT presets; cargo test (roundtrip tests already assert decoder-side byte-exactness); interleaved flipflop on examples/jolt_bench.rs encode wall + peak-RSS before/after."
+        },
+        {
+          "id": "JE-2",
+          "title": "Wire the mag7 memory-weighted AdmissionGate into the scheduler (integration points only — do not redesign)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-scheduler\\src\\scheduler.ts:57-58 (admissionGate option, 'admit() awaited before any pool touches')",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-scheduler\\src\\scheduler.ts:174-175, 1297-1303 (gateReleases map + releaseAdmission)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-scheduler\\src\\types.ts:40-56 (AdmissionGate interface, T3 cancellation contract)"
+          ],
+          "mechanism": "Today concurrency is a flat count cap, never memory-weighted, so 12 concurrent FULL RAW tasks reach ~940MB and 24 full JXL decodes ~6GB (prior bench evidence), while cheap small-pyramid tasks are starved ~2x below capacity. The hook (admit/release per session) already exists and is plumbed; what is missing is the mag7 memory-weighted implementation passed as SchedulerOptions.admissionGate, weighted by estimated output bytes (MsgDecodeStart target dims x bytes/px for decodes; input dims for RAW). No pipeline code changes — pure wiring at scheduler construction in the app.",
+          "expected_win": "Bounds batch peak RSS to the configured budget (6GB→budget @24 JXL decodes) and prior bench showed +66% throughput when cheap tasks are admitted up to cores instead of the flat cap. Workload (b) is the main beneficiary.",
+          "byte_exact": "yes — pixel outputs unchanged; only admission order/timing changes",
+          "risk": "Medium: scheduling-order changes can surface latent ordering assumptions in tests; weight estimator must be conservative for unknown dims (admit-as-max). Cancellation must release the slot exactly once (T3 contract already documented).",
+          "verify_plan": "A/B the existing concurrency benches (examples/dng_preview_concurrency.rs, jxl_decode_concurrency.rs patterns from branch m2r7): RSS-vs-N curve with gate on/off, throughput at N=cores and N=24; assert byte-identical outputs per task; interleaved runs to cancel drift."
+        },
+        {
+          "id": "JE-3",
+          "title": "Take RAW input by value (Vec<u8>) in process_orf/process_dng/process_cr2 and drop it right after decompress",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:1219-1235 (process_orf signature, data: &[u8])",
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:795-1002 (decode_orf_raw: strip borrow at 811, decompress at 865, mhc demosaic at 960-964, drop(raw) at 966)",
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:2719-2735 (process_dng), 2989+ (cr2 entries)"
+          ],
+          "mechanism": "wasm-bindgen copies the JS Uint8Array into wasm memory and holds it for the whole call because the signature is &[u8]. The last read of the input is decompress::decompress(strip,..) at lib.rs:865 (OrfInfo is fully owned — Strings, no borrows; verified tiff.rs:10-22), but the 36MB @24MP (W*H*1.5 packed 12-bit) copy stays alive through the 144MB mhc demosaic and the 144+72MB tone window. Taking Vec<u8> lets Rust drop it after decompress, and dlmalloc reuses the freed block for the rgb16 allocation — heap high-water drops in both the demosaic window (228→192MB) and the tone window (252→216MB).",
+          "expected_win": "−36MB (~14%) per-photo peak @24MP ORF; scales xN for concurrent batch (−432MB @12 full-path). CPU-neutral (same single copy at the boundary).",
+          "byte_exact": "yes — no data-dependent change; all outputs identical",
+          "risk": "Low-medium: public wasm-bindgen signature change (JS still passes Uint8Array; .d.ts type unchanged) requires pkg rebuild and touching every process_* entry + native tests/benches that pass slices (mechanical .to_vec() in tests). Check no caller relies on reusing the same Uint8Array (wasm-bindgen copies either way).",
+          "verify_plan": "FNV/SHA of take_rgb/take_rgb16_lb/take_rgb16_thumb/take_rgb16_full outputs OLD==NEW on the 11 real fixtures (ORF+DNG+CR2); wasm heap high-water via the tools/a5-pack16-membench.mjs pattern (WebAssembly.Memory.buffer.byteLength after process); full MSVC + wasm32 check gates."
+        },
+        {
+          "id": "JE-4",
+          "title": "RGB-native pyramid ingest: stop manufacturing alpha in raw-backend and add an rgb8 sidecars FFI entry (fmt=3 passthrough already exists)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\packages\\pyramid-ingest\\src\\raw-backend.ts:44-62 (take_rgba preferred; JS RGB→RGBA expand fallback)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\pyramid-ingest\\src\\backends.ts:119-135 (encodeRgba8Pyramid)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-wasm\\src\\bridge.cpp:3033-3121 (EncodeRgba8WithSidecars: RGBA cascade, fmt=0 hardcoded in EncodeRgba calls at 3088-3090/3099)",
+            "C:\\Foo\\raw-converter-wasm\\packages\\jxl-wasm\\src\\bridge.cpp:663-686 (fmt==3 RGB passthrough + StripAlphaToRgb copy at 680-683)",
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:391-398 (take_rgba manufactures the RGBA)"
+          ],
+          "mechanism": "Per 24MP ingest the alpha channel is pure ballast created and destroyed three times: take_rgba allocates 96MB RGBA in the raw wasm heap, wasm-bindgen copies 96MB to JS, facade stages 96MB into the jxl wasm heap, then EncodeRgba's !has_alpha path mallocs a 72MB RGB copy and strips the alpha right back out (bridge.cpp:675-683), and BoxDownscaleRgba8 averages a 4th channel at every cascade level. bridge.cpp already supports fmt==3 (3-channel input, no strip) for plain encodes — the sidecars entry just never uses it. Wiring take_rgb → an rgb8 sidecars entry removes ~24MB per living copy plus the whole 72MB strip alloc, and the alpha math in the cascade. This is the fix the d1x9 memo names: 'FFI wall… only fix = never make alpha'.",
+          "expected_win": "~−120-190MB transient per 24MP ingest spread across two wasm heaps + JS heap (each heap's high-water is permanent for the worker's life); CPU saves the RGB→RGBA expand, one 96MB and one 72MB memcpy, and 25% of cascade arithmetic. Workload (b) ingest path.",
+          "byte_exact": "yes with a parity gate: EncodeRgba fmt=3 feeds libjxl the identical 3-channel content the strip path produces (same frame settings ⇒ identical codestream); the C++ cascade needs a BoxDownscaleRgb8 == strip(BoxDownscaleRgba8) parity harness — the identical claim was already proven for the Rust twin (d1x9, examples/box_downscale_rgb_parity_flip.rs)",
+          "risk": "Medium: cross-layer (Rust entry + bridge.cpp + facade + raw-backend); requires the emscripten dist rebuild ship-gate (must build against external/libjxl-012 per hard rule); alpha-bearing masters must keep the RGBA path (has_meaningful_alpha gate pattern from casabio_encode.rs:888-898).",
+          "verify_plan": "Per-level SHA of pyramid outputs RGBA-path vs RGB-path on real RAW fixtures (expect identical); new C++ downscale parity harness over odd widths/heights/tails; heap high-water A/B via WebAssembly.Memory byteLength probes in the ingest bench; WASM-compile gate (butteraugli b9f2 lesson)."
+        },
+        {
+          "id": "JE-5",
+          "title": "Streaming CASV frame decode: stop retaining all frames + per-frame full clone in decode_casv_all_rgb8",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1565-1587 (decode_casv_all_rgb8: retains N frames, `prev = Some(recon.clone())` at 1583)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:1541-1561 (decode_casv_frame_rgb8, O(GOP) random access)",
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\examples\\jolt_bench.rs:90-91 and examples\\casv_bench.rs:76,108 (current callers)"
+          ],
+          "mechanism": "decode_casv_all_rgb8 keeps every decoded frame (N x W*H*3 = 132MB @48x720p, unbounded for longer clips) AND allocates a full-frame clone per frame (1583) to keep a mutable P-frame base. A pull iterator (`CasvFrameIter` holding only prev + current, yielding owned frames) bounds sequential playback peak to ~2 frames (5.5MB @720p) with identical total decode work; decode_casv_all_rgb8 becomes a collect() over it (byte-identical), and the per-frame clone drops to P-frames only (I-frame → I-frame transitions clone nothing).",
+          "expected_win": "Peak for sequential 48x720p playback: 132MB → ~6MB (~96%); for any real player/WASM playback path this is the difference between bounded and O(video) memory. CPU: −1 full-frame memcpy per I-frame (marginal).",
+          "byte_exact": "yes — same decode operations in the same order; collect() of the iterator must equal current output vec exactly",
+          "risk": "Low: new API + caller switch (currently only examples/benches call it); keep decode_casv_all_rgb8 delegating for compatibility. Not on the browser path yet (casa_video is not exposed in src/lib.rs wasm).",
+          "verify_plan": "assert_eq! frame-by-frame of iterator output vs unmodified decode_casv_all_rgb8 across the existing unit corpus (bbox/tile/lossy/lossless) + dashcam fixture; peak-RSS A/B in jolt_bench decode leg; interleaved flipflop to confirm decode wall unchanged."
+        },
+        {
+          "id": "JE-6",
+          "title": "take_rgb16_full: pack straight to a JS Uint8Array instead of an intermediate wasm Vec<u8> (kills a second full-res buffer at the boundary)",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:377-384 (take_rgb16_full: pack while Vec<u16> master still alive)",
+            "C:\\Foo\\raw-converter-wasm\\src\\lib.rs:486-503 (pack_rgb16_full: LE memcpy into fresh vec![0u8; n*2])",
+            "C:\\Foo\\raw-converter-wasm\\tools\\a5-pack16-membench.mjs (existing measurement harness for exactly this path)"
+          ],
+          "mechanism": "At take time three W*H*6 buffers coexist: the Vec<u16> master (144MB @24MP), the packed Vec<u8> (144MB, pack_rgb16_full), then wasm-bindgen's copy into a JS Uint8Array (144MB). On little-endian wasm the packed form is byte-for-byte the master's memory, so constructing the js_sys::Uint8Array directly from the &[u8] reinterpretation of the Vec<u16> (the same unsafe view pack_rgb16_full already uses at lib.rs:493) eliminates the intermediate wasm Vec<u8> entirely: wasm high-water at the take drops from +288MB to +144MB, and since wasm memory never shrinks that 144MB is permanent worker-lifetime savings. This is the unfinished half of the shipped A-5 deferred-move (rejected-doc lines 955-969).",
+          "expected_win": "−144MB wasm heap high-water @24MP whenever OUT_FULL_16 is requested. Caveat: the path is currently semi-dormant (only the pyramid-ingest 16-bit big-levels variant consumes it; no web/ callers) — win is real but conditional on M3 adoption.",
+          "byte_exact": "yes-by-construction — identical bytes delivered to JS (wasm32 is little-endian); return type changes Vec<u8> → js_sys::Uint8Array, same JS-visible Uint8Array",
+          "risk": "Low-medium: wasm-only signature (needs cfg or a js-specific method so native tests keep the Vec<u8> form); big-endian fallback keeps the current pack (dead on all shipped targets).",
+          "verify_plan": "tools/a5-pack16-membench.mjs already reports FNV hashes of take_rgb16_full + after-process peak — run OLD vs NEW, expect identical hashes and ~W*H*6 lower WebAssembly.Memory high-water; wasm32 --lib check + bindgen dts diff."
+        },
+        {
+          "id": "JE-7",
+          "title": "decode_casv_footer_all_rgb8: decode from the footer index in place instead of copying the entire compressed stream to re-frame it",
+          "files": [
+            "C:\\Foo\\raw-converter-wasm\\crates\\raw-pipeline\\src\\casa_video.rs:690-716 (builds `out` = header + rewritten index + full copy of data[0..idx_start] at 714, then delegates)"
+          ],
+          "mechanism": "Footer-format decode currently materializes a second full copy of the whole compressed video (out.extend_from_slice(&data[0..idx_start]) at casa_video.rs:714) purely to translate footer offsets into header-format offsets. A footer-aware frame-info lookup (read offset/len from the trailing index, slice `data` directly) feeds the identical frame slices to the identical decode loop with zero copy. Compressed size is ~3% of raw (JOLT), so this is ~4MB @48x720p but grows linearly with clip length and doubles the resident compressed footprint for long streams — the exact streams the footer format exists for.",
+          "expected_win": "−(compressed size) transient + one full-stream memcpy; small on 48-frame clips (~4MB), material on long/live recordings (the footer format's target). Pure work/allocation elimination (rule #10).",
+          "byte_exact": "yes — identical frame byte-slices reach the same decode functions; assert decoded frames equal current path",
+          "risk": "Low: internal refactor of one function; index-bounds validation must be kept (checked_add at 711).",
+          "verify_plan": "Frame-by-frame equality of NEW footer decode vs OLD (and vs header-format decode of the same content) on streaming-encoded fixtures incl. rate-box and legacy no-rate-box files; peak-RSS A/B on a long synthetic stream in jolt_bench."
+        }
+      ]
+    }
+  ]
+}

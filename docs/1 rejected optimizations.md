@@ -4,6 +4,23 @@ This document records optimizations proposed during pipeline reviews that were f
 
 ---
 
+## CV-E6 / JE-6: default multi-threaded libjxl runner for JOLT streaming per-frame encode — MEASURED REGRESSION/WASH (2026-07-02)
+
+**Target:** `casa_video.rs` streaming encode (`encode_casv_video_streaming{,_to}`) — wire `StreamCtx` to a threaded `Encoder::with_threads` for P-frame crops/atlases + an `encode_chunked_threaded` for I-frames, default `available_parallelism()`.
+**Byte-exactness gate PASSED:** libjxl encode output proven thread-count-invariant — whole Ghana 48f 720p corpus, all 3 JOLT presets, threads 1 vs 2 vs 8 footer streams byte-identical, plus 36/36 golden `.casv` (auto-threads) SHA-identical to the single-threaded build. Determinism was NOT the problem.
+**Rejected on the timing gate.** Single-process interleaved flipflop (arms `[1,MT,MT,1,MT,1,1,MT]`, MT=12, per-frame enc ms on the dashcam corpus, footer entry):
+
+| preset | ST median | MT(12) median | verdict |
+|---|---|---|---|
+| Realtime (d2/e1) | 36.7 (36.5–42.6) | 47.3 (40.9–48.2) | MT ~29% SLOWER, every MT arm ≥ ST cluster |
+| Balanced (d1/e3) | 83.5 | 101.9 (high variance) | MT worse / noise-dominated |
+| Quality (d0.5/e4) | 75.0 | 75.9 | wash |
+
+Why the recon's "2–4x" didn't materialize: the dominant P-frame encode is a 32-px-wide tall tile atlas — one group column of 32×256 slivers gives threads tiny work items with high per-group fixed cost, and the per-frame fork-join runner sync is paid 24×/s; at e1 the per-group work is smallest, so Realtime (the preset that needed the speedup) regresses hardest. Machine was agent-contended (which oversubscription makes worse, honestly noted), but even best-case MT arms lost to the ST cluster on Realtime.
+**Disposition:** fully reverted (no plumbing shipped — dead `threads` knobs are speculative surface). If live-capture MT is revisited: re-measure on idle hardware, and pair with the JE-8 square-ish atlas packing (format bump) that would give libjxl real 2-D group parallelism; the thread-determinism proof above stands, so only the timing gate needs re-passing.
+
+---
+
 ## ANS-R1..R3: ans_common.cc / .h ChatGPT pass (2026-06-30)
 
 Ground-truthed an external (ChatGPT) optimization pass for `lib/jxl/ans_common.{cc,h,_test.cc}` against the real libjxl-012 source and both call sites (`enc_ans.cc:706`, `dec_ans.cc:274`).
@@ -1699,3 +1716,42 @@ This is DISTINCT from the still-rejected MT-routing work-class hint in G2-F6 (th
 `router.pick`/`shouldUseMtImmediately`, not admission). Spec:
 docs/superpowers/specs/2026-07-02-memory-admission-gate-design.md; plan:
 docs/superpowers/plans/2026-07-02-memory-admission-gate.md.
+
+---
+
+## AE5-JUL02: RAW input by value (`process_orf/dng/cr2` take `Vec<u8>`, drop after decompress) — REJECTED (measured wash + regression) (2026-07-02)
+
+**Claim** (recon jul02, area 7 JE-3): taking the file bytes by value and `drop(data)` right
+after the last read (decompress / dng::decode_bytes / cr2 LJPEG) frees W·H·1.5 bytes before
+the 3×-larger demosaic allocation; dlmalloc reuses the block → wasm heap high-water −36MB
+(~14%) per 24MP ORF photo. CPU-neutral, byte-exact.
+
+**Implemented and A/B-measured** (full wasm-pack nodejs builds OLD vs NEW, real fixtures
+P1110226.ORF 5240×3912 / PXL_20260501_093507165 DNG / _MG_1744.CR2, `tools/ae5-membench.mjs`
+one process per config, `WebAssembly.Memory.buffer.byteLength` after process = true monotonic
+high-water; outputs FNV-verified byte-identical across all 12 configs):
+
+| config | OLD peak MB | NEW peak MB | Δ |
+|---|---|---|---|
+| ORF flags=7 (full+lb+thumb, the classic path) | 219.0 | 263.3 | **+44.3 REGRESSION** |
+| ORF flags=1 / 17 / 9 | 233.9 | 233.9 | 0 |
+| DNG flags=7 / 9 | 152.6 | 152.6 | 0 |
+| CR2 flags=7 / 9 | 248.5 | 248.5 | 0 |
+
+Reproducible (re-run identical). **Why the theory fails:** wasm linear memory never shrinks
+and dlmalloc cannot service the 123MB `rgb16` master from the freed ~36MB input hole, so the
+early free never lowers the high-water — and on the preview+full path the perturbed
+allocation order makes dlmalloc grow the heap 44MB HIGHER. The win only exists if the freed
+block can host a later allocation of ≤ its size at the peak moment, which no full-res path does.
+
+**Not rule #10** — no work is removed (same single boundary copy either way); the change is a
+lifetime/layout gamble that measured as a wash-or-regression on its only claimed benefit.
+Reverted. Do not re-attempt without an allocator-level plan (e.g. arena for the input or
+demosaic-in-place) that provably reuses the block at the peak.
+## TTFP-4-DNG: two-phase RAW split for DNG — previews NOT byte-identical (2026-07-02)
+
+**Target:** `web/worker.js` two-phase RAW task (previews-only WASM call first, full-res call second; landed for ORF on `perf/jf-ttfp-jul02`).
+**Proposed:** extend the split to DNG — recon noted a DNG streaming previews twin at `src/lib.rs:2404-2454`.
+**Rejected (proven by A/B):** DNG's MONOLITHIC previews are downscaled from the full-res MHC demosaic (`process_dng_impl` has no superpixel preview path — `downscale_rgb16_impl(&rgb16 /* MHC */, ...)` at lib.rs:2580), while the previews-only twin streams a 2×2 superpixel demosaic. Different demosaic source ⇒ different preview bytes. `web/two-phase-raw.test.js` pins this: thumb/lightbox SHAs diverge on the real DNG fixture while the full-res encode output stays identical. ORF does NOT have this problem because its monolithic preview build already uses the same superpixel path (`demosaic_rggb_half`) the streaming gate uses — proven byte-identical on real ORFs in the same test.
+**Re-open only if** lib.rs unifies the DNG preview sources (superpixel previews in the monolithic path, a deliberate pixel change needing its own quality sign-off) — the guard test flips and the split can be extended by changing one gate in worker.js (`canSplit`).
+**CR2:** also excluded, different reason — `decode_cr2_raw` ignores output flags at decode time (no streaming twin), so a split doubles the full decode+demosaic for zero preview speedup.

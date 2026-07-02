@@ -36,3 +36,5 @@ required-features = ["jxl-codec"]
 
 [dev-dependencies]
 jxl-oxide = "0.11"
+# golden-corpus hashing for the casa_video decode harnesses (examples only)
+sha2 = "0.10"

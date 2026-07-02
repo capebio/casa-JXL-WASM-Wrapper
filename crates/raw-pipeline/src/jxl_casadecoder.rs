@@ -404,10 +404,22 @@ impl Decoder {
         ch: Channels,
         buf: &mut Vec<S>,
     ) -> Result<DecodedMeta, DecodeError> {
+        self.decode_into_dims(jxl, ch, buf).map(|(_, _, meta)| meta)
+    }
+
+    /// Like [`Decoder::decode_into`] but also returns the decoded `(width,
+    /// height)` — the shape region/atlas consumers (CASV P-frames) need to
+    /// validate payload geometry without allocating an owned [`Image`].
+    pub fn decode_into_dims<S: Sample>(
+        &mut self,
+        jxl: &[u8],
+        ch: Channels,
+        buf: &mut Vec<S>,
+    ) -> Result<(u32, u32, DecodedMeta), DecodeError> {
         let r = unsafe { self.run_full_into::<S>(jxl, ch.count(), buf, false) };
         unsafe { ffi::JxlDecoderReset(self.handle) };
         match r {
-            Ok((_, _, meta, _)) => Ok(meta),
+            Ok((w, h, meta, _)) => Ok((w, h, meta)),
             Err(e) => {
                 // `run_full_into` `set_len`s `buf` before libjxl fills it; on this
                 // error path some of those bytes were never written. Clear (len→0,

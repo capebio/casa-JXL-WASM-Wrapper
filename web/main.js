@@ -650,6 +650,16 @@ class WorkerPool {
         for (let i = 0; i < this.size; i++) {
             this._spawnWorker();
         }
+        // TTFP-1: prewarm the RAW-pipeline WASM in the workers the next submits
+        // will actually receive. `_dispatch` pops from the TAIL of `free`, so
+        // warm the last two spawned workers — the first 1-2 files then skip the
+        // fetch+compile+instantiate+rayon-init leg entirely. Only two (not all
+        // `size`) so a user who never drops a file doesn't pay `size` WASM
+        // instances + rayon pools; the rest warm lazily on their first task.
+        const PREWARM_COUNT = Math.min(2, this.free.length);
+        for (let i = 0; i < PREWARM_COUNT; i++) {
+            this.free[this.free.length - 1 - i].postMessage({ type: WorkerMsg.PRELOAD });
+        }
     }
 
     _spawnWorker() {
@@ -730,7 +740,14 @@ class WorkerPool {
             return;
         }
         if (type === WorkerMsg.ENCODE_REQUEST) {
-            const { id, pixels, rgba, format, width, height, quality, effort, lossless, progressive, orientation } = ev.data;
+            const { id, pixels, rgba, format, width, height, quality, effort, lossless, progressive, orientation, pipelineMs, phaseMs } = ev.data;
+            // TTFP-4: ENCODE_REQUEST is the RAW worker's final message for a
+            // task (the encode itself runs on the jxl worker pool), so release
+            // the worker slot here. Previously released on LIGHTBOX — with the
+            // two-phase split LIGHTBOX arrives before the full-res phase, when
+            // the worker is still genuinely busy.
+            const reqTask = this.tasks.get(id);
+            if (reqTask && !reqTask.released) this._releaseWorker(worker, id);
             const t0 = performance.now();
             // A3: accept new pixels/format fields; fall back to legacy rgba field for jxl-progressive.js
             encodeJxlSession(pixels ?? rgba, width, height, quality, effort, Boolean(lossless), Boolean(progressive), format ?? 'rgba8', orientation)
@@ -738,7 +755,9 @@ class WorkerPool {
                     const jxlMs = performance.now() - t0;
                     const t = this.tasks.get(id);
                     if (t?.handlers.onDone) {
-                        t.handlers.onDone({ id, type: WorkerMsg.DONE, jxl, jxlMs, w: width, h: height, effortUsed: effort, effortRequested: effort });
+                        // pipelineMs/phaseMs: split-task totals (both WASM
+                        // phases); absent for monolithic CR2/EXR/TIFF tasks.
+                        t.handlers.onDone({ id, type: WorkerMsg.DONE, jxl, jxlMs, w: width, h: height, effortUsed: effort, effortRequested: effort, pipelineMs, phaseMs });
                     }
                     this.tasks.delete(id);
                 })
@@ -757,13 +776,14 @@ class WorkerPool {
         if (type === WorkerMsg.THUMB && handlers.onThumb) handlers.onThumb(ev.data);
         else if (type === WorkerMsg.LIGHTBOX && handlers.onLightbox) {
             handlers.onLightbox(ev.data);
-            // Release worker after lightbox — JXL encode is now handled by
-            // jxl-worker.js, so the RAW worker is free for the next file.
-            this._releaseWorker(worker, id);
+            // TTFP-4: do NOT release the worker here. With the two-phase RAW
+            // split, LIGHTBOX posts right after the streaming preview phase
+            // while the worker still owns the full-res phase; the release
+            // moved to ENCODE_REQUEST (the task's final worker message).
         }
         else if (type === WorkerMsg.DONE) {
             if (handlers.onDone) handlers.onDone(ev.data);
-            this.tasks.delete(id);  // Worker already freed on lightbox
+            this.tasks.delete(id);  // Worker already freed on encode_request
             // KEEP workerForTask[id] alive — the owning worker still holds
             // liveStateMap[id], so reprocess_live for the lightbox needs to
             // know which worker to message even long after JXL is done.
@@ -858,7 +878,13 @@ class WorkerPool {
     }
 
     reprocessLive(taskId, look) {
-        const worker = this.workerForTask.get(taskId);
+        // TTFP-4: workerForTask is populated at ENCODE_REQUEST (worker
+        // release), but with the two-phase split the lightbox is interactive
+        // during phase 2 — fall back to the task's assigned worker (same
+        // pattern as cancelTask) so live slider edits route correctly in that
+        // window. The worker answers after its current phase completes.
+        const worker = this.workerForTask.get(taskId)
+            || this.tasks.get(taskId)?.worker;
         if (!worker) return false;
         worker.postMessage({ id: taskId, type: WorkerMsg.REPROCESS_LIVE, look });
         return true;
@@ -866,11 +892,21 @@ class WorkerPool {
 
     reprocessAllLive(taskIds, look) {
         if (!taskIds.length) return;
-        const wanted = new Set(taskIds);
-        for (const w of this.workers) {
-            if (!w._taskIds) continue;
-            const mine = [...w._taskIds].filter(id => wanted.has(id));
-            if (mine.length) w.postMessage({ type: WorkerMsg.REPROCESS_THUMB_LIVE, taskIds: mine, look });
+        // TTFP-4: route via workerForTask (released tasks — same contents as
+        // the old per-worker _taskIds scan) PLUS the tasks map, so split tasks
+        // still mid-phase-2 (thumb posted, worker not yet released) also get
+        // gallery-wide thumb look updates; the worker answers after its
+        // current phase completes (thumbStateMap is populated in phase 1).
+        const byWorker = new Map();
+        for (const id of taskIds) {
+            const w = this.workerForTask.get(id) || this.tasks.get(id)?.worker;
+            if (!w) continue;
+            let mine = byWorker.get(w);
+            if (!mine) byWorker.set(w, mine = []);
+            mine.push(id);
+        }
+        for (const [w, mine] of byWorker) {
+            w.postMessage({ type: WorkerMsg.REPROCESS_THUMB_LIVE, taskIds: mine, look });
         }
     }
 
@@ -1744,6 +1780,16 @@ function startConvert(file, existingCard) {
                 },
                 onDone(msg) {
                     card.classList.remove('encoding');
+                    // TTFP-4 (two-phase RAW split): THUMB carried phase-1-only
+                    // timings and exif with width/height 0 (lib.rs previews-only
+                    // results have no sensor dims). Patch the real totals and
+                    // dims now — before the stats push below reads them.
+                    if (msg.pipelineMs != null) card._pipelineMs = msg.pipelineMs;
+                    if (msg.phaseMs) card._phaseMs = msg.phaseMs;
+                    if (card._exif && !card._exif.width && msg.w) {
+                        card._exif.width  = msg.w;
+                        card._exif.height = msg.h;
+                    }
                     const blob = new Blob([msg.jxl], { type: 'image/jxl' });
                     // Revoke any previous blob URL for this card before creating a new one.
                     if (card._blobUrl) URL.revokeObjectURL(card._blobUrl);
@@ -2057,6 +2103,27 @@ function classifyJpegThumbSource(w, h) {
 // or RAW-pipeline thumb was there). Best-effort — failures stay silent.
 function repaintThumbFromJxl(card) {
     if (!card?._blobUrl) return;
+    // TTFP-6 (bounded cache-join): this decode runs at FULL resolution and was
+    // previously discarded after the 360px resize. If the card sits inside the
+    // lightbox prefetch neighbourhood (current ±PREFETCH_NEIGHBORS, wrap-around
+    // exactly like prefetchAroundCurrent's modulo), let it double as the
+    // prefetch cache write: prefetchJxl would otherwise decode the same URL
+    // again moments later and cache the same final frame ('onFinal'), so the
+    // memory cost equals existing prefetch policy while one full-res decode is
+    // saved (and a subsequent lightbox open paints instantly from the cache —
+    // same final pixels the progressive decode would converge to). Cards
+    // OUTSIDE the neighbourhood keep today's no-cache behaviour: a batch
+    // encode must not pin 4·W·H bytes per card (~80 MB at 20 MP).
+    let cacheOpts;
+    if (lightboxIndex >= 0 && cards.length > 0) {
+        const idx = cards.indexOf(card);
+        if (idx >= 0) {
+            const d = Math.abs(idx - lightboxIndex);
+            if (Math.min(d, cards.length - d) <= PREFETCH_NEIGHBORS) {
+                cacheOpts = { cachePolicy: 'onFinal', cacheTarget: card };
+            }
+        }
+    }
     pool.decodeJxl(card._blobUrl, (msg) => {
         if (msg.type === 'decode_error') {
             console.warn('JXL thumb decode error:', msg.error);
@@ -2088,7 +2155,7 @@ function repaintThumbFromJxl(card) {
             card.classList.remove('embedded-thumb');
             setThumbSource(card, 'jxl');
         }).catch(e => console.warn('JXL thumb bitmap failed:', e));
-    }, 'low');
+    }, 'low', cacheOpts);
 }
 
 // ---------------------------------------------------------------------------
@@ -2322,9 +2389,18 @@ function drawLightboxForCard(card) {
             lightboxCanvas.width  = w;
             lightboxCanvas.height = h;
             const ctx = lightboxCanvas.getContext('2d');
-            ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+            // TTFP-2: hand the ImageData we just painted straight to the
+            // snapshot instead of reading the whole canvas back. The put fills
+            // the full canvas at (0,0) with opaque (alpha=255) pixels, so
+            // getImageData would return byte-identical data — the readback +
+            // its fresh 4·W·H allocation are pure waste. Consumers of
+            // cleanSnapshot (applyLens, setCleanCanvas, feedTauriParityBaseline,
+            // ensureLabBuf) are all read-only or deep-copy, so aliasing the
+            // cached rgba buffer is safe.
+            const frame = new ImageData(rgba, w, h);
+            ctx.putImageData(frame, 0, 0);
             if (lightboxCanvas.width > 0) {
-                captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+                captureCleanAndApplyLens(frame);
             }
             setPaintedSourceBadge('jxl');
             lbLoadingBadge.hidden = true;
@@ -2346,9 +2422,21 @@ function drawLightboxForCard(card) {
                 lightboxCanvas.width  = msg.w;
                 lightboxCanvas.height = msg.h;
                 const ctx = lightboxCanvas.getContext('2d');
-                ctx.putImageData(new ImageData(msg.rgba, msg.w, msg.h), 0, 0);
+                // TTFP-2: this runs on EVERY progressive pass at full decoded
+                // resolution. Reuse the ImageData we just painted as the clean
+                // snapshot rather than reading the full canvas back — the put
+                // covers the whole canvas at (0,0) with opaque pixels, so the
+                // readback returned byte-identical data at the cost of a full
+                // GPU→CPU sync + a fresh 4·W·H allocation per pass (~80 MB at
+                // 20 MP). NOTE: the putImageData inside applyPerceptualLens is
+                // NOT redundant and must stay — feedTauriParityBaseline →
+                // onBaseFramePainted → paintFromBaseline paints the M2-adjusted
+                // baseline onto this same canvas in between, and the lens-off
+                // re-put is what restores clean pixels on top of it.
+                const frame = new ImageData(msg.rgba, msg.w, msg.h);
+                ctx.putImageData(frame, 0, 0);
                 if (lightboxCanvas.width > 0) {
-                    captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+                    captureCleanAndApplyLens(frame);
                 }
                 setPaintedSourceBadge('jxl');
                 lbLoadingBadge.hidden = true;

@@ -349,6 +349,7 @@ export interface ContextOptions {
     pushHwm?: number;
     wasmUrl?: string;
     cache?: CacheOptions;
+    prewarmSize?: number;
 }
 export interface CacheOptions {
     persistent?: boolean;

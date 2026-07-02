@@ -1,0 +1,163 @@
+diff --git a/lib/jxl/dec_ans.cc b/lib/jxl/dec_ans.cc
+index 0e177e67..e113a3eb 100644
+--- a/lib/jxl/dec_ans.cc
++++ b/lib/jxl/dec_ans.cc
+@@ -17,6 +17,7 @@
+ #include "lib/jxl/ans_common.h"
+ #include "lib/jxl/ans_params.h"
+ #include "lib/jxl/base/bits.h"
++#include "lib/jxl/casa_prof.h"
+ #include "lib/jxl/base/compiler_specific.h"
+ #include "lib/jxl/base/printf_macros.h"
+ #include "lib/jxl/base/status.h"
+@@ -350,6 +351,7 @@ void ANSCode::UpdateMaxNumBits(size_t ctx, size_t symbol) {
+ Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
+                         size_t num_contexts, ANSCode* code,
+                         std::vector<uint8_t>* context_map, bool disallow_lz77) {
++  CASA_PROF_SCOPE(casa_prof::kDecHistograms);
+   JXL_RETURN_IF_ERROR(Bundle::Read(br, &code->lz77));
+   if (code->lz77.enabled) {
+     num_contexts++;
+@@ -371,8 +373,10 @@ Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
+   code->lz77.nonserialized_distance_context = context_map->back();
+   code->use_prefix_code = static_cast<bool>(br->ReadFixedBits<1>());
+   if (code->use_prefix_code) {
++    CASA_PROF_COUNT(prefix_code_sets, 1);
+     code->log_alpha_size = PREFIX_MAX_BITS;
+   } else {
++    CASA_PROF_COUNT(ans_code_sets, 1);
+     code->log_alpha_size = br->ReadFixedBits<2>() + 5;
+   }
+   code->uint_config.resize(num_histograms);
+@@ -387,6 +391,7 @@ Status DecodeHistograms(JxlMemoryManager* memory_manager, BitReader* br,
+ StatusOr<ANSSymbolReader> ANSSymbolReader::Create(const ANSCode* code,
+                                                   BitReader* JXL_RESTRICT br,
+                                                   size_t distance_multiplier) {
++  CASA_PROF_SCOPE(casa_prof::kAnsReaderCreate);
+   AlignedMemory lz77_window_storage;
+   if (code->lz77.enabled) {
+     JxlMemoryManager* memory_manager = code->memory_manager;
+diff --git a/lib/jxl/dec_huffman.cc b/lib/jxl/dec_huffman.cc
+index d258483d..a01717c0 100644
+--- a/lib/jxl/dec_huffman.cc
++++ b/lib/jxl/dec_huffman.cc
+@@ -14,6 +14,7 @@
+ #include "lib/jxl/ans_params.h"
+ #include "lib/jxl/base/bits.h"
+ #include "lib/jxl/base/compiler_specific.h"
++#include "lib/jxl/casa_prof.h"
+ #include "lib/jxl/dec_bit_reader.h"
+ #include "lib/jxl/huffman_table.h"
+ 
+@@ -190,6 +191,7 @@ static JXL_INLINE bool ReadSimpleCode(size_t alphabet_size, BitReader* br,
+ 
+ bool HuffmanDecodingData::ReadFromBitStream(size_t alphabet_size,
+                                             BitReader* br) {
++  CASA_PROF_SCOPE(casa_prof::kHuffReadStream);
+   if (alphabet_size > (1 << PREFIX_MAX_BITS)) return false;
+ 
+   /* simple_code_or_skip is used as follows:
+diff --git a/lib/jxl/huffman_table.cc b/lib/jxl/huffman_table.cc
+index c615b9e5..df4e6dfc 100644
+--- a/lib/jxl/huffman_table.cc
++++ b/lib/jxl/huffman_table.cc
+@@ -10,6 +10,7 @@
+ #include <vector>
+ 
+ #include "lib/jxl/ans_params.h"
++#include "lib/jxl/casa_prof.h"
+ 
+ namespace jxl {
+ 
+@@ -51,6 +52,7 @@ static inline size_t NextTableBitSize(const uint16_t* const count, size_t len,
+ uint32_t BuildHuffmanTable(HuffmanCode* root_table, int root_bits,
+                            const uint8_t* const code_lengths,
+                            size_t code_lengths_size, uint16_t* count) {
++  CASA_PROF_SCOPE(casa_prof::kHuffTableBuild);
+   HuffmanCode code;   /* current table entry */
+   HuffmanCode* table; /* next available space in table */
+   size_t len;         /* current code length */
+diff --git a/lib/jxl/modular/encoding/encoding.cc b/lib/jxl/modular/encoding/encoding.cc
+index f3f1d5ab..7d3a66b2 100644
+--- a/lib/jxl/modular/encoding/encoding.cc
++++ b/lib/jxl/modular/encoding/encoding.cc
+@@ -21,6 +21,7 @@
+ #include "lib/jxl/base/printf_macros.h"
+ #include "lib/jxl/base/scope_guard.h"
+ #include "lib/jxl/base/status.h"
++#include "lib/jxl/casa_prof.h"
+ #include "lib/jxl/dec_ans.h"
+ #include "lib/jxl/dec_bit_reader.h"
+ #include "lib/jxl/fields.h"
+@@ -164,6 +165,7 @@ Status DecodeModularChannelMAANS(
+ 
+   // zero pixel channel? could happen
+   if (channel.w == 0 || channel.h == 0) return true;
++  CASA_PROF_COUNT(maans_pixels, channel.w * channel.h);
+ 
+   bool tree_has_wp_prop_or_pred = false;
+   bool is_wp_only = false;
+@@ -209,6 +211,7 @@ Status DecodeModularChannelMAANS(
+         // Special-case: histogram has a single symbol, with no extra bits, and
+         // we use ANS mode.
+         JXL_DEBUG_V(8, "Fastest track.");
++        CASA_PROF_SCOPE(casa_prof::kMaansFastestFill);
+         pixel_type v = make_pixel(value, multiplier, offset);
+         for (size_t y = 0; y < channel.h; y++) {
+           pixel_type *JXL_RESTRICT r = channel.Row(y);
+@@ -216,6 +219,7 @@ Status DecodeModularChannelMAANS(
+         }
+       } else {
+         JXL_DEBUG_V(8, "Fast track.");
++        CASA_PROF_SCOPE(casa_prof::kMaansFastZero);
+         if (multiplier == 1 && offset == 0) {
+           for (size_t y = 0; y < channel.h; y++) {
+             pixel_type *JXL_RESTRICT r = channel.Row(y);
+@@ -241,6 +245,7 @@ Status DecodeModularChannelMAANS(
+     } else if (uses_lz77 && reader->IsHuffRleOnly() &&
+                global_tree_is_all_gradient_noop) {
+       JXL_DEBUG_V(8, "Gradient RLE (fjxl) very fast track.");
++      CASA_PROF_SCOPE(casa_prof::kMaansGradRle);
+       pixel_type_w sv = UnpackSigned(fl_v);
+       for (size_t y = 0; y < channel.h; y++) {
+         pixel_type *JXL_RESTRICT r = channel.Row(y);
+@@ -275,6 +280,7 @@ Status DecodeModularChannelMAANS(
+     } else if (predictor == Predictor::Gradient && offset == 0 &&
+                multiplier == 1) {
+       JXL_DEBUG_V(8, "Gradient very fast track.");
++      CASA_PROF_SCOPE(casa_prof::kMaansGradVeryFast);
+       // Single-symbol histogram: the whole channel is one Gradient residual.
+       uint32_t single;
+       if (reader->IsSingleValueAndAdvance(ctx_id, &single,
+@@ -343,6 +349,7 @@ Status DecodeModularChannelMAANS(
+ 
+   if (is_gradient_only) {
+     JXL_DEBUG_V(8, "Gradient fast track.");
++    CASA_PROF_SCOPE(casa_prof::kMaansGradLut);
+     const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+     for (size_t y = 0; y < channel.h; y++) {
+       pixel_type *JXL_RESTRICT r = channel.Row(y);
+@@ -364,6 +371,7 @@ Status DecodeModularChannelMAANS(
+     }
+   } else if (!uses_lz77 && is_wp_only && channel.w > 8) {
+     JXL_DEBUG_V(8, "WP fast track.");
++    CASA_PROF_SCOPE(casa_prof::kMaansWpLut);
+     weighted::State wp_state(wp_header, channel.w, channel.h);
+     Properties properties(1);
+     for (size_t y = 0; y < channel.h; y++) {
+@@ -426,6 +434,7 @@ Status DecodeModularChannelMAANS(
+     // special optimized case: the weighted predictor and its properties are not
+     // used, so no need to compute weights and properties.
+     JXL_DEBUG_V(8, "Slow track.");
++    CASA_PROF_SCOPE(casa_prof::kMaansSlow);
+     MATreeLookup tree_lookup(tree);
+     Properties properties = Properties(num_props);
+     const ptrdiff_t onerow = channel.plane.PixelsPerRow();
+@@ -480,6 +489,7 @@ Status DecodeModularChannelMAANS(
+     }
+   } else {
+     JXL_DEBUG_V(8, "Slowest track.");
++    CASA_PROF_SCOPE(casa_prof::kMaansSlowest);
+     MATreeLookup tree_lookup(tree);
+     Properties properties = Properties(num_props);
+     const ptrdiff_t onerow = channel.plane.PixelsPerRow();

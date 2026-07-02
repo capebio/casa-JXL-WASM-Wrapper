@@ -15,10 +15,18 @@
 // Worker posts (in order, transferring buffers where safe):
 //   { id, type: 'thumb',         rgb, w, h, pipelineMs, phaseMs, wbR, wbB, ... }
 //   { id, type: 'lightbox',      rgb, w, h }
+//   { id, type: 'encode_request', pixels, width, height, ..., pipelineMs?, phaseMs? }
 //   { id, type: 'lightbox_live', rgb, w, h, liveMs }
 //   { id, type: 'thumb_live',    rgb, w, h }  (one per taskId in batch)
 //   { id, type: 'done',          jxl, jxlMs, w, h }
 //   { id, type: 'error',         error }
+//
+// TTFP-4 two-phase RAW split (ORF/DNG): thumb + lightbox post after a
+// previews-only WASM call (streaming fast path), encode_request after a second
+// full-res call. encode_request carries the split task's summed pipelineMs /
+// phaseMs (both phases); on the monolithic paths (CR2, EXR/TIFF) those fields
+// are absent and the THUMB-time values remain authoritative. The main thread
+// releases the worker slot on encode_request, not lightbox.
 
 // WASM build selection. Only the threaded build (./pkg/) is shipped; it hard-codes
 // shared memory and needs SharedArrayBuffer + crossOriginIsolated (COOP/COEP) to
@@ -397,6 +405,16 @@ function applyLookToState(state, look) {
 }
 
 self.addEventListener('message', async (ev) => {
+    // --- prewarm: run ensureWasm before the first file task (TTFP-1) ---
+    // Fire-and-forget: on failure ensureWasm resets wasmReady=null, so the
+    // first real task simply retries the load — prewarm failure self-heals.
+    if (ev.data.type === WorkerMsg.PRELOAD) {
+        ensureWasm().catch((err) => {
+            console.warn('[worker] wasm prewarm failed (will retry on first task):', err?.message || err);
+        });
+        return;
+    }
+
     // --- release cached LookRenderer state for a re-submitted task ---
     if (ev.data.type === WorkerMsg.RELEASE_STATE) {
         const lbState = liveStateMap.get(ev.data.id);
@@ -512,32 +530,62 @@ self.addEventListener('message', async (ev) => {
         }
         // route === 'raw' — fall through to the unchanged RAW pipeline below.
 
+        const decoderFn = pickRawDecoderWithFlags(bytes);
+        const lookArgs = {
+            exposureEv: look.exposureEv ?? 0,
+            contrast:   look.contrast   ?? 0,
+            highlights: look.highlights ?? 0,
+            shadows:    look.shadows    ?? 0,
+            whites:     look.whites     ?? 0,
+            blacks:     look.blacks     ?? 0,
+            saturation: look.saturation ?? 0,
+            vibrance:   look.vibrance   ?? 0,
+            temp:       look.temp       ?? 0,
+            tint:       look.tint       ?? 0,
+            wbR: Number.isFinite(opts.wbR) ? opts.wbR : NaN,
+            wbB: Number.isFinite(opts.wbB) ? opts.wbB : NaN,
+            texture: look.texture ?? 0,
+            clarity: look.clarity ?? 0,
+        };
+
+        // TTFP-4 two-phase split (ORF only): previews first, full-res second.
+        //
+        // The monolithic call held the 360px thumb and 1800px lightbox hostage
+        // to the full-res decompress+demosaic+tonemap, because requesting
+        // OUT_FULL_RGB8 disables lib.rs's streaming preview-only fast path
+        // (should_stream_previews). Phase 1 asks for previews only, so ORF
+        // takes the strip-streamed superpixel path (byte-identical previews —
+        // stream_preview tests + web/two-phase-raw.test.js A/B) and
+        // THUMB/LIGHTBOX post before any full-res work; phase 2 re-runs the
+        // decoder for OUT_FULL_RGB8 only (no preview build). Cost: the encode
+        // leg pays a second decompress — a deliberate first-paint-latency vs
+        // total-CPU trade.
+        //
+        // DNG stays monolithic: its monolithic previews are downscaled from
+        // the FULL-RES MHC demosaic (process_dng_impl has no superpixel
+        // preview path), while its previews-only twin streams a superpixel
+        // demosaic — measurably different preview bytes (proven by the A/B in
+        // web/two-phase-raw.test.js). CR2 stays monolithic: decode_cr2_raw has
+        // no streaming twin and ignores output flags at decode time, so a
+        // split would repeat the full decode+demosaic for zero preview
+        // speedup.
+        //
+        // Phase-1 results have width/height == 0 (lib.rs previews-only path);
+        // sensor dims travel on ENCODE_REQUEST (phase 2) and main.js patches
+        // exif.width/height at DONE. Cancel semantics unchanged: one
+        // checkpoint after the first WASM call, none between phases (a
+        // between-phase skip would strand the pool slot, since the worker is
+        // released on ENCODE_REQUEST).
+        const canSplit = decoderFn === process_orf_with_flags;
+
         const pT0 = performance.now();
         // OUT_NO_ORIENT: skip apply_orientation on the full RGB8 — JXL records
         // rotation as metadata, so pixels stay sensor-native and we avoid the
         // 60–200 MB intermediate buffer + cache-hostile transpose at encode prep.
-        const fullPipeFlags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT;
-        const result = processRawWithFlagsNamed(
-            pickRawDecoderWithFlags(bytes),
-            bytes,
-            fullPipeFlags,
-            {
-                exposureEv: look.exposureEv ?? 0,
-                contrast:   look.contrast   ?? 0,
-                highlights: look.highlights ?? 0,
-                shadows:    look.shadows    ?? 0,
-                whites:     look.whites     ?? 0,
-                blacks:     look.blacks     ?? 0,
-                saturation: look.saturation ?? 0,
-                vibrance:   look.vibrance   ?? 0,
-                temp:       look.temp       ?? 0,
-                tint:       look.tint       ?? 0,
-                wbR: Number.isFinite(opts.wbR) ? opts.wbR : NaN,
-                wbB: Number.isFinite(opts.wbB) ? opts.wbB : NaN,
-                texture: look.texture ?? 0,
-                clarity: look.clarity ?? 0,
-            },
-        );
+        const phase1Flags = canSplit
+            ? (OUT_LIGHTBOX | OUT_THUMB)
+            : (OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
+        const result = processRawWithFlagsNamed(decoderFn, bytes, phase1Flags, lookArgs);
         // Best-effort cancel checkpoint: the synchronous decode could not be
         // interrupted, but if the task was cancelled while it ran, free the
         // decode result and emit nothing further (no renderer state cached yet).
@@ -624,7 +672,40 @@ self.addEventListener('message', async (ev) => {
         // same tag, so userTurns also never triggers a CPU rotate.
         const userTurns = Math.round(((opts.userRotation || 0) % 360 + 360) % 360 / 90) % 4;
         const encodeOrientation = composeOrientation(ori, userTurns);
-        let fullRgb = result.take_rgb();
+
+        // Phase 2 (split only): full-res decode for the encode leg. Previews
+        // are already on screen; this runs after their postMessages so the
+        // main thread paints while the worker crunches. The phase-1 result is
+        // freed first (renderers were moved out by take_*_renderer) so the
+        // preview and full-res WASM buffers are never co-resident.
+        let fullRgb, encW, encH, encTimings;
+        if (canSplit) {
+            result.free();
+            const p2T0 = performance.now();
+            const result2 = processRawWithFlagsNamed(
+                decoderFn, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT, lookArgs);
+            const p2Ms = performance.now() - p2T0;
+            encW = result2.width;
+            encH = result2.height;
+            // Real totals for the stats line — decompress ran in BOTH phases,
+            // so the summed figure is the honest per-file CPU cost. Travels on
+            // ENCODE_REQUEST because THUMB (with the phase-1 partials) has
+            // already been posted; main.js patches card state at DONE.
+            encTimings = {
+                pipelineMs: pipelineMs + p2Ms,
+                phaseMs: {
+                    decompress: phaseMs.decompress + result2.decompress_ms,
+                    demosaic:   phaseMs.demosaic   + result2.demosaic_ms,
+                    tonemap:    result2.tonemap_ms,
+                    orient:     result2.orient_ms,
+                },
+            };
+            fullRgb = result2.take_rgb();
+        } else {
+            encW = w;
+            encH = h;
+            fullRgb = result.take_rgb();
+        }
 
         // A3: send RGB8 directly — skip the ~210ms rgb_to_rgba conversion and 25% larger transfer.
         // P0 (a44e6a96): take_rgb() = std::mem::take → an OWNED buffer (byteOffset 0), so the old
@@ -634,11 +715,12 @@ self.addEventListener('message', async (ev) => {
         const rgbBuf = fullRgb.buffer;
         fullRgb = null; // allow GC (the transfer detaches the buffer anyway)
         self.postMessage(
-            { id, type: WorkerMsg.ENCODE_REQUEST, pixels: rgbBuf, format: 'rgb8', width: w, height: h,
+            { id, type: WorkerMsg.ENCODE_REQUEST, pixels: rgbBuf, format: 'rgb8', width: encW, height: encH,
               quality: opts.lossless ? 100 : opts.quality,
               effort: opts.effort ?? 3,
               lossless: !!opts.lossless,
-              orientation: encodeOrientation },
+              orientation: encodeOrientation,
+              ...(encTimings ?? {}) },
             [rgbBuf],
         );
     } catch (err) {

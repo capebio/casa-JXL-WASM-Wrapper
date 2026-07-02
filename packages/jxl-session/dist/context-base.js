@@ -1,6 +1,6 @@
 // Shared JxlContext implementation. Environment-specific entry points live in
 // context.ts and browser.ts so browser bundlers never see node worker imports.
-import { Scheduler, globalCoreBudget, defaultCoreBudgetCapacity, MemoryWeightedAdmissionGate, } from "@casabio/jxl-scheduler";
+import { Scheduler, globalCoreBudget, defaultCoreBudgetCapacity, } from "@casabio/jxl-scheduler";
 import { DecodeSessionImpl } from "./decode-session.js";
 import { EncodeSessionImpl } from "./encode-session.js";
 import { shouldUseMtImmediately } from "./tier-routing.js";
@@ -71,34 +71,17 @@ export function computeWorkerCostForWasmUrl(url) {
     }
     return 1;
 }
-// Shared across every scheduler/context (like globalCoreBudget) so the byte budget bounds
-// total concurrent decode/encode memory, not per-scheduler memory. Lazily created on first
-// opt-in; the first budget wins (subsequent budgets are ignored, mirroring globalCoreBudget).
-const DEFAULT_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024;
-let globalMemoryGate;
-function getGlobalMemoryGate(budgetBytes) {
-    if (globalMemoryGate === undefined) {
-        globalMemoryGate = new MemoryWeightedAdmissionGate({
-            budgetBytes: budgetBytes ?? DEFAULT_MEMORY_BUDGET_BYTES,
-        });
-    }
-    return globalMemoryGate;
-}
-function createScheduler(factory, opts, maxWorkers, workerCost) {
-    const useMemoryGate = opts?.memoryGate === true;
-    // With the memory gate, the byte budget is the concurrency limiter, so raise the worker
-    // ceiling past the flat default; without it, keep the caller's maxWorkers unchanged.
-    const effectiveMaxWorkers = useMemoryGate
-        ? Math.max(maxWorkers, 2 * hardwareConcurrency())
-        : maxWorkers;
+function createScheduler(factory, opts, maxWorkers, workerCost, prewarmSize) {
     return new Scheduler({
         factory,
-        maxWorkers: effectiveMaxWorkers,
+        maxWorkers,
         idleTimeoutMs: opts?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         ...(opts?.pushHwm !== undefined ? { pushHwm: opts.pushHwm } : {}),
+        // TTFP-3: prewarmSize is an explicit parameter (not read from opts) so the
+        // tiered context can prewarm only the scheduler its first pick will hit.
+        ...(prewarmSize !== undefined && prewarmSize > 0 ? { prewarmSize } : {}),
         coreBudget: globalCoreBudget,
         workerCost,
-        ...(useMemoryGate ? { admissionGate: getGlobalMemoryGate(opts?.memoryCapBytes) } : {}),
     });
 }
 class CapabilityAwareContext {
@@ -148,7 +131,7 @@ export class JxlContextImpl extends CapabilityAwareContext {
     constructor(factory, opts, maxWorkers) {
         super();
         const workerCost = computeWorkerCostForWasmUrl(opts?.wasmUrl);
-        this.scheduler = createScheduler(factory, opts, maxWorkers, workerCost);
+        this.scheduler = createScheduler(factory, opts, maxWorkers, workerCost, opts?.prewarmSize);
     }
     decode(opts) {
         if (this.shuttingDown) {
@@ -174,7 +157,11 @@ export class TieredJxlContextImpl extends CapabilityAwareContext {
     constructor(params) {
         super();
         const mtCost = computeWorkerCostForWasmUrl(params.opts?.wasmUrl);
-        this.mtScheduler = createScheduler(params.mtFactory, params.opts, params.maxWorkers, mtCost);
+        // TTFP-3: prewarm only the MT scheduler — with a fresh pool and untouched
+        // core budget the router's first pick is MT, so an ST prewarm would spawn
+        // a second speculative worker (+ a second ~MB-scale WASM fetch) for a
+        // scheduler the first decode does not hit.
+        this.mtScheduler = createScheduler(params.mtFactory, params.opts, params.maxWorkers, mtCost, params.opts?.prewarmSize);
         this.stScheduler = createScheduler(params.stFactory, params.opts, params.maxWorkers, 1);
         this.router = createTieredSchedulerRouter({
             mtScheduler: {
