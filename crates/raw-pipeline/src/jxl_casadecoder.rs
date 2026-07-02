@@ -406,8 +406,17 @@ impl Decoder {
     ) -> Result<DecodedMeta, DecodeError> {
         let r = unsafe { self.run_full_into::<S>(jxl, ch.count(), buf, false) };
         unsafe { ffi::JxlDecoderReset(self.handle) };
-        let (_, _, meta, _) = r?;
-        Ok(meta)
+        match r {
+            Ok((_, _, meta, _)) => Ok(meta),
+            Err(e) => {
+                // `run_full_into` `set_len`s `buf` before libjxl fills it; on this
+                // error path some of those bytes were never written. Clear (len→0,
+                // capacity kept for reuse) so the caller's reused buffer can never
+                // expose uninitialised samples after a failed decode.
+                buf.clear();
+                Err(e)
+            }
+        }
     }
 
     /// Decode, lend the buffer to `f`, then reset. No owned `Vec` escapes; no
@@ -2086,6 +2095,34 @@ mod tests {
         let _ = dec.decode_into::<u8>(&jxl, Channels::Rgba, &mut buf).unwrap();
         assert_eq!(buf.capacity(), cap, "equal-size redecode must not reallocate");
         assert!(m1.num_color_channels >= 3);
+    }
+
+    #[test]
+    fn decode_into_error_clears_buffer() {
+        // decode_into binds the caller's Vec and set_len()s it BEFORE libjxl writes.
+        // On an error after that point the buffer would otherwise be left with a
+        // length spanning bytes libjxl never wrote (an uninit read). After any
+        // error the caller-owned buffer must expose no such bytes → cleared to 0.
+        let (w, h) = (64u32, 48u32);
+        let rgba = gradient_rgba8(w, h);
+        let jxl = enc_lossless(&Frame::rgba8(&rgba, w, h));
+        let mut dec = Decoder::new(DecodeOptions::default()).unwrap();
+
+        let mut buf: Vec<u8> = Vec::new();
+        dec.decode_into::<u8>(&jxl, Channels::Rgba, &mut buf).unwrap();
+        assert_eq!(buf.len(), (w * h * 4) as usize);
+        let cap = buf.capacity();
+
+        // Header intact, body truncated → error after the output buffer is sized.
+        let truncated = &jxl[..jxl.len() * 6 / 10];
+        let r = dec.decode_into::<u8>(truncated, Channels::Rgba, &mut buf);
+        assert!(r.is_err(), "truncated stream must error");
+        assert_eq!(buf.len(), 0, "error must not leave a length over unwritten bytes");
+        assert_eq!(buf.capacity(), cap, "capacity retained for reuse (only len cleared)");
+
+        // Decoder + buffer still reusable afterwards.
+        dec.decode_into::<u8>(&jxl, Channels::Rgba, &mut buf).unwrap();
+        assert_eq!(buf, rgba, "reuse after error decodes correctly");
     }
 
     #[test]
