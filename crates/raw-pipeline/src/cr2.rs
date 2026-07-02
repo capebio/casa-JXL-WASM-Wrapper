@@ -139,8 +139,10 @@ fn entry_first_u32(data: &[u8], dtype: u16, cnt: u32, val: u32, inline_pos: usiz
     if cnt == 0 { return None; }
     let ts = type_size(dtype);
     if ts == 0 { return None; }
-    let bytes = ts * cnt as usize;
-    let p = if bytes <= 4 { inline_pos } else { val as usize };
+    // u64 math: ts*cnt is file-controlled and can wrap usize on 32-bit/wasm,
+    // spuriously selecting the inline branch. Same result for all valid files.
+    let inline = (ts as u64) * (cnt as u64) <= 4;
+    let p = if inline { inline_pos } else { val as usize };
     // Checked add: `p` and `ts` are file-controlled; `p + ts` can wrap on 32-bit/wasm and
     // defeat the bounds guard. OOB/overflow returns None (unchanged for valid files).
     if p.checked_add(ts).map_or(true, |e| e > data.len()) { return None; }
@@ -256,7 +258,9 @@ fn canon_cam_xyz(_model: &str) -> Option<[i32; 9]> {
 /// XYZ->cam like a DNG ColorMatrix, invert to camera->XYZ, then apply XYZ_D50_TO_SRGB. This
 /// keeps CR2 colour consistent with how DNG colour is rendered in this pipeline.
 fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
-    if !make.to_ascii_lowercase().contains("canon") {
+    // Alloc-free ASCII case-insensitive "canon" search (was a String alloc per decode).
+    let has_canon = make.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"canon"));
+    if !has_canon {
         return None;
     }
     let raw = canon_cam_xyz(model)?;
@@ -484,8 +488,9 @@ fn decode_impl(
         if mn_off.checked_add(2).map_or(false, |e| e <= data.len()) {
             visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
                 if tag == 0x4001 && dtype == 3 && cnt > 0 {
-                    let bytes = 2 * cnt as usize;
-                    let p = if bytes <= 4 { ip } else { val as usize };
+                    // cnt<=2 ⟺ 2*cnt<=4 without the file-controlled multiply
+                    // (2*cnt wraps usize on 32-bit/wasm for huge cnt).
+                    let p = if cnt <= 2 { ip } else { val as usize };
                     if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le) {
                         wb_r = r;
                         wb_b = b;
@@ -510,8 +515,9 @@ fn decode_impl(
         0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
         0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
         0xC640 if dtype == 3 && cnt >= 3 => {
-            let bytes = 2 * cnt as usize;
-            let p = if bytes <= 4 { ip } else { val as usize };
+            // cnt >= 3 SHORTs = 6 bytes — never inline; the old `2 * cnt` form
+            // could wrap usize on 32-bit/wasm and spuriously pick the inline arm.
+            let p = val as usize;
             // Checked add: `p + 6` can wrap on 32-bit/wasm and spuriously pass the guard.
             if p.checked_add(6).map_or(false, |e| e <= data.len()) {
                 cr2_slices[0] = read_u16(data, p,     le);
@@ -927,6 +933,24 @@ mod tests {
         assert_eq!(img1.raw, img2.raw, "scratch must produce identical output");
         assert_eq!(img1.black, img2.black);
         assert_eq!(img1.wb_r.to_bits(), img2.wb_r.to_bits());
+    }
+
+    #[test]
+    fn entry_first_u32_huge_count_no_wrap() {
+        // cnt*ts would wrap 32-bit usize; must fall through to the out-of-line branch
+        // (val as usize = OOB) and return None — not read the inline area.
+        let data = vec![0xABu8; 32];
+        // dtype=3 (SHORT, ts=2), cnt = 0x8000_0003 → 2*cnt wraps to 6 on 32-bit.
+        assert_eq!(entry_first_u32(&data, 3, 0x8000_0003, 0xFFFF_FFFF, 4, true), None);
+    }
+
+    #[test]
+    fn canon_make_check_case_variants() {
+        // Same behavior for all case variants; still None while canon_cam_xyz is disabled.
+        assert!(canon_color_matrix("CANON", "Canon EOS 550D").is_none());
+        assert!(canon_color_matrix("canon inc.", "Canon EOS 550D").is_none());
+        assert!(canon_color_matrix("Nikon", "D850").is_none());
+        assert!(canon_color_matrix("Cano", "trunc").is_none()); // shorter than needle
     }
 
     #[test]
