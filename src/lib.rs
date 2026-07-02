@@ -3769,3 +3769,35 @@ pub fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
+
+// ───────────── FableBraid bench/parity forwarders (tools/fable-wasm-flip.mjs) ─────────────
+// Thin wasm exports so the codec's scalar vs +simd128 wasm artifacts can be
+// flipflopped and parity-checked from node. Not called by the app UI.
+
+#[wasm_bindgen]
+pub fn fable_encode_rgb8(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
+    raw_pipeline::fable_braid::encode_rgb8(rgb, width, height)
+}
+
+#[wasm_bindgen]
+pub fn fable_encode_rgb8_delta(cur: &[u8], prev: &[u8], width: u32, height: u32) -> Vec<u8> {
+    raw_pipeline::fable_braid::encode_rgb8_delta(cur, prev, width, height)
+}
+
+#[wasm_bindgen]
+pub fn fable_decode_rgb8(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+    raw_pipeline::fable_braid::decode_rgb8(bytes)
+        .map(|(px, _, _)| px)
+        .ok_or_else(|| JsValue::from_str("fable: corrupt intra stream"))
+}
+
+#[wasm_bindgen]
+pub fn fable_decode_rgb8_delta(
+    bytes: &[u8],
+    prev: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, JsValue> {
+    raw_pipeline::fable_braid::decode_rgb8_delta(bytes, prev, width, height)
+        .ok_or_else(|| JsValue::from_str("fable: corrupt delta stream"))
+}

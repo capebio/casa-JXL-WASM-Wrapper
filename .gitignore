@@ -96,3 +96,5 @@ Papers/
 # packages/jxl-test-corpus/scripts/generate-pgo-fixtures.mjs.
 # Full-res .ppm are ~30-70MB each (864MB this session); kept on disk, not tracked, to keep clones lean.
 packages/jxl-test-corpus/**/*.ppm
+
+pkg-fbench-*/

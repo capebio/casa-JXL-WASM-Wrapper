@@ -60,6 +60,14 @@ pub const CASV_TILE_FLAG: u32 = 0x2000_0000;
 /// (not a residual to add). Used by the lossy tier — coding real pixels keeps
 /// JXL's perceptual model correct (a residual would be misjudged).
 pub const CASV_REPLACE_FLAG: u32 = 0x1000_0000;
+/// Header-level flag (CasvHeader.flags bit 1): every frame codestream in this
+/// file is FableBraid (crate::fable_braid), not JXL. I-frames are intra images;
+/// P-frames are temporal mod-256 deltas against the previous frame (COPY rows
+/// make unchanged rows near-free, subsuming the bbox/tile machinery).
+/// Bit 1, NOT bit 0: bit 0 is `CASV_HDRFLAG_LOSSY` (JOLT) — the fb8x branch
+/// picked bit 0 before JOLT landed and the two collided at integration
+/// (every JOLT file mis-routed to the fable decoder).
+pub const CASV_HDR_FABLE_FLAG: u32 = 0x0000_0002;
 
 /// All index-entry flag bits (the `len` field's payload mask is the complement).
 const CASV_FLAG_BITS: u32 =
@@ -1559,6 +1567,67 @@ impl CasvDecodeSession {
     }
 }
 
+/// Encode RGB8 frames as a FableBraid `.casv` (lossless, drift-free): I-frames
+/// every `gop_len`, P-frames as full-frame mod-256 temporal deltas against the
+/// previous *source* frame (lossless ⇒ reconstruction equals source, no in-loop
+/// decode). Decode side is the SIMD-rate FableBraid path — this is the tier
+/// that answers the Huffman challenge.
+pub fn encode_casv_fable_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    gop_len: u32,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+    let gop = gop_len.max(1) as usize;
+
+    let streams: Vec<(u32, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            if idx % gop == 0 {
+                Ok((0u32, crate::fable_braid::encode_rgb8(px, width, height)))
+            } else {
+                let delta =
+                    crate::fable_braid::encode_rgb8_delta(px, frames[idx - 1], width, height);
+                Ok((CASV_PFRAME_FLAG, delta))
+            }
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
+
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: frames.len() as u32,
+        fps_num,
+        fps_den,
+        flags: CASV_HDR_FABLE_FLAG,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for (flags, s) in &streams {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
+        offset += s.len();
+    }
+    for (_, s) in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
 /// Reconstruct a P-frame in place: `prev` holds the previous reconstructed frame
 /// and is mutated into the current frame. Handles both full-residual and
 /// bounding-box P-frames. `None` on malformed payloads.
@@ -1682,6 +1751,30 @@ fn apply_pframe(
 /// from the preceding I-frame (O(GOP)), reconstructing each residual. One
 /// persistent decoder + reused scratch serve the whole chain.
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
+    let hdr = parse_casv_header(data)?;
+    if hdr.flags & CASV_HDR_FABLE_FLAG != 0 {
+        // FableBraid tier: one session carries the previous frame's planar
+        // subtract-green form across the P-chain (no per-frame re-derivation).
+        let view = CasvView::from_header(data)?;
+        let start = preceding_iframe(&view, index)?;
+        let (w, h) = (view.width, view.height);
+        let mut sess = crate::fable_braid::DeltaDecodeSession::new();
+        let mut cur: Option<Vec<u8>> = None;
+        for i in start..=index {
+            let (flags, slice) = view.entry(i)?;
+            cur = Some(if flags & CASV_PFRAME_FLAG != 0 {
+                let prev = cur.take()?;
+                sess.decode_delta(slice, &prev, w, h)?
+            } else {
+                let (px, dw, dh) = sess.decode_intra(slice)?;
+                if (dw, dh) != (w, h) {
+                    return None;
+                }
+                px
+            });
+        }
+        return cur.map(|px| (px, w, h));
+    }
     let view = CasvView::from_header(data)?;
     let start = preceding_iframe(&view, index)?;
     let end = index.checked_add(1)?;
@@ -1762,6 +1855,32 @@ fn decode_casv_all_rgb8_with(
 /// need frame-at-a-time latency instead of batch throughput want
 /// [`decode_casv_all_rgb8_threaded`].
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    let hdr = parse_casv_header(data)?;
+    if hdr.flags & CASV_HDR_FABLE_FLAG != 0 {
+        // FableBraid tier: serial chain — one session carries the previous
+        // frame's planar subtract-green state across P-frames, and the fable
+        // decoder never mutates its reference, so the last pushed frame is
+        // borrowed instead of cloned.
+        let view = CasvView::from_header(data)?;
+        let (w, h) = (view.width, view.height);
+        let mut out: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(view.frame_count);
+        let mut sess = crate::fable_braid::DeltaDecodeSession::new();
+        for i in 0..view.frame_count {
+            let (flags, slice) = view.entry(i)?;
+            let recon = if flags & CASV_PFRAME_FLAG != 0 {
+                let base = &out.last()?.0;
+                sess.decode_delta(slice, base, w, h)?
+            } else {
+                let (px, dw, dh) = sess.decode_intra(slice)?;
+                if (dw, dh) != (w, h) {
+                    return None;
+                }
+                px
+            };
+            out.push((recon, w, h));
+        }
+        return Some(out);
+    }
     decode_casv_view_all_rgb8(&CasvView::from_header(data)?)
 }
 
@@ -1955,6 +2074,41 @@ mod tests {
         for (i, (px, dw, dh)) in all.iter().enumerate() {
             assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
             assert_eq!(px, &src[i], "frame {i} must be byte-exact (lossless)");
+        }
+    }
+
+    #[test]
+    fn fable_roundtrip_is_byte_exact_with_gop_and_random_access() {
+        let (w, h) = (30u32, 22u32);
+        // 9 frames, GOP 4 → I at 0/4/8; includes identical consecutive frames
+        // (all-COPY deltas) and motion.
+        let mut src: Vec<Vec<u8>> = Vec::new();
+        for i in 0..9u32 {
+            let mut f = gradient(w, h, (i * 17) as u8);
+            if i == 3 {
+                f = src[2].clone(); // identical frame → pure-COPY P-frame
+            }
+            src.push(f);
+        }
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_fable_rgb8(&refs, w, h, 24, 1, 4).unwrap();
+
+        let hdr = parse_casv_header(&bytes).unwrap();
+        assert_eq!(hdr.flags & CASV_HDR_FABLE_FLAG, CASV_HDR_FABLE_FLAG);
+        assert!(!casv_frame_info(&bytes, 0).unwrap().0, "frame 0 is I");
+        assert!(casv_frame_info(&bytes, 1).unwrap().0, "frame 1 is P");
+        assert!(!casv_frame_info(&bytes, 4).unwrap().0, "frame 4 is I (GOP)");
+
+        let all = decode_casv_all_rgb8(&bytes).expect("decode all");
+        assert_eq!(all.len(), 9);
+        for (i, (px, dw, dh)) in all.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
+            assert_eq!(px, &src[i], "frame {i} byte-exact");
+        }
+        // Random access decodes forward from the preceding I-frame.
+        for i in [0usize, 3, 5, 8] {
+            let (px, _, _) = decode_casv_frame_rgb8(&bytes, i).expect("random access");
+            assert_eq!(px, src[i], "random access frame {i}");
         }
     }
 
