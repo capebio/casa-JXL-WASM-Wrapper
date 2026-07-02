@@ -4,6 +4,50 @@
 
 ---
 
+## butteraugli SpeedCodeReview — deferred items (2026-07-02)
+
+Context: LANDED the byte-exact SIMD hot-path pass on `butteraugli.cc`+`.h`
+(submodule branch `perf/butteraugli-simd-hotpath-jul01-b9f2` @b6162a03, capebio,
+off e4fbf789, worktree `C:\Foo\rcw-butteraugli`, PUSHED not-merged). Native
+−48..53% / WASM −33..48% end-to-end, diffmap FNV + score bits identical on
+25/25 native + 63/63 WASM sizes (incl odd 513×385, 255×257, 31×29 and tiny 9×8).
+Harness `C:\Tmp\butteraugli-ab` (native clang-cl OLD/NEW + em++ wasm OLD/NEW,
+interleaved min). **Ship gate: rebuild web/pkg + jxl-wasm dist from this rev**
+(no gitlink bump done — parked remote-only like the other jul01 perf branches).
+
+Deferred (real but out of the byte-exact / low-risk envelope):
+
+1. **Malta directional-stencil reduction (the big algorithmic lever, NOT
+   byte-exact).** `MaltaDiffMapT` runs 16 directional line-kernels per pixel and
+   is called 6× (uhf/hf/mf × X/Y). It dominates the diffmap cost. A cheaper
+   basis (separable approximation, fewer directions, or a learned surrogate)
+   could cut butteraugli far more than SIMD did — but it changes the score, and
+   the score feeds encoder AQ/heuristics and quality gates. Needs a
+   score-correlation study (Spearman vs stock butteraugli on a photo+screenshot
+   corpus) + a cjxl size/quality regression, not the SHA gate. Research-grade.
+2. **web/jxl-butteraugli.js `scaleErr` reciprocal-hoist** (`/m` ×3 → `inv=1/m`
+   then ×3, as the Rust twin already does). Real per-pixel win but changes float
+   rounding in an *approximation* that drives progressive cutoff decisions;
+   gate with the Node flipflop before landing. Low EV now that the WASM
+   comparator (faster after this pass) is the primary path and the JS approx is
+   the fallback.
+3. **web/jxl-butteraugli.js → prefer the WASM `ButteraugliComparator`** in the
+   progressive cutoff loop instead of the JS approx (`_backend.score` hook
+   already exists). Behavior/wiring change (approx→exact scores shift plateau
+   detection) → user decision, measure cutoff-count impact.
+4. **bridge.cpp gamma-decode+planarize SIMD** (3 `build_image` loops). Already
+   LUT-based; vectorizing the u8→planar-f32 scatter is a small fraction of the
+   (now-halved) butteraugli compute and forces a full WASM rebuild. Low value.
+5. **perceptual/butteraugli.rs** — no action: it is the deliberate independent
+   scalar parity oracle for the avx2/avx512/wasm `scale_err`/`downsample`
+   kernels (`dn2`/`scale_err`, already inv-hoisted + f64-accum + cbrt).
+   Optimizing it would defeat its purpose. Production perceptual butteraugli
+   rides `simd/*.rs`, a separate subsystem from libjxl butteraugli.
+6. **butteraugli_main.cc** — no action: CLI dev tool (2 reads, 1 compare,
+   print). Not on any app hot path.
+
+---
+
 ## Organization: By Workstream & Effort
 
 Deferred items grouped by file/package scope + dependency + effort.
@@ -1147,13 +1191,26 @@ A/B before it can ship:
    encoder-wide regressions. Byte-exact IF the retained header equals an inline build; gate =
    full cjxl OLD/NEW byte-compare across stills/animation/screen/multi-frame.
 
-2. **ANS reverse-map direct expansion** (enc_ans.cc, NOT ans_common — the encoder-side
-   `reverse_map_` build). Replace the per-state generic `AliasTable::Lookup` loop (ANS_TAB_SIZE
-   calls per histogram) with two sequential fills per alias `Entry` (left run [0,cutoff),
-   right run [offsets1+cutoff, entry_size)), and drop the `assign(ANS_TAB_SIZE,0)` zero-fill
-   (immediately overwritten). Contiguous per-codebook reverse-map arena instead of per-symbol
-   vectors. Byte-exact by alias semantics; decoder `AliasTable::Lookup` left untouched. Not in
-   the three files handed to this pass — separate branch.
+2. **ANS reverse-map direct expansion** — **DONE 2026-07-01**, branch
+   perf/ans-reverse-map-direct-jul01-r5m8 @5bd2d2b5 (capebio). `ANSBuildInfoTable` now walks the
+   alias table entry-by-entry (left run [0,cutoff)->symbol i, right run [cutoff,entry_size)->
+   right_value at offsets1+pos) instead of ANS_TAB_SIZE per-state `AliasTable::Lookup` calls.
+   Byte-exact (63/63 harness cases, tools/ans_reverse_map_ab.cc); full ANSBuildInfoTable ~45%
+   faster. Decoder `AliasTable::Lookup` untouched.
+   NOTE: the `assign(ANS_TAB_SIZE,0)` zero-fill was NOT dropped — the pool is a fresh
+   `encoding_info.back().reverse_map_pool` each histogram, so `resize` value-inits to zero too;
+   skipping the memset needs uninitialized storage (UB via std::vector). Left as-is.
+
+2b. **Plan/emit split for EncodeContextMap's 3rd build** (was #1). Re-attempted 2026-07-01:
+   a byte-exact version could build both candidates into temp writers (getting serialized
+   headers) and reconstruct the no-writer decision cost as
+   `writer_cost + Bundle::CanEncode(lz77).bits + prefix_alphabet_varlen_bits`. Blocked: the
+   prefix-varlen term needs `StoreVarLenUint16`/its size, which are static internals of
+   enc_ans.cc — not reachable from enc_context_map.cc. So it still requires a plan/emit
+   refactor INSIDE BuildAndEncodeHistograms/BuildAndStoreEntropyCodes (retain the serialized
+   header from the cost pass). Blast radius = shared across DC/AC/modular/context-map; payoff =
+   2-vs-3 histogram builds on a low-freq setup fn (and #2 already sped those builds up ~45%).
+   Risk >> reward — deferred.
 
 3. **Video-throughput clustering policy / temporal seed lineage / joint cluster+context-map
    cost objective / worker-local EntropyWorkspace / genetic content-class policy table.**
@@ -1504,3 +1561,171 @@ export (P1) already supports it via export_jxl_streaming_from_strip(distance=0).
 
 Remaining deferred: P2 WASM-bridge parity (gigapixel-in-browser), DNG streaming export (phase-
 aware MHC band), NR/unsharp spatial-post (band-halo).
+
+### UPDATE 2026-07-01 — deferred #1 (decoder degenerate fast path) IMPLEMENTED + tested
+Branch **perf/dec-ans-degenerate-fastpath-jul01-d5p2 @bb187e74** on capebio (submodule),
+worktree C:\Foo\rcw-dec-degenerate, PUSHED not-merged. Wired degenerate_symbols_ into
+ReadSymbolANSWithoutRefill (early return) + IsSingleValueAndAdvance (fill_n bulk fill).
+**Byte-exact PROVEN**: djxl OLD vs NEW SHA-identical decoded pixels, 10 real streams
+(5 production photos + fractal + degenerate-heavy synthetics), 0 mismatches. **Native decode:
+NEUTRAL within noise** (in-process JxlDecoder loop; min NEW/OLD swings 0.987..1.059 both
+directions, ~25% run variance — per-symbol ANS is a small non-isolable fraction of total
+decode). Kept per user rule (0%/positive-step or potentially-positive-elsewhere). **Remaining
+gate = WASM decode flipflop** (the intended win case: no HW prefetch / weaker branch predict on
+WASM make the skipped ANS work relatively more expensive; + zero-heavy/video-residual content).
+Native corpus can't exercise the video-residual case (RAW→JXL→decode of photographic content
+has few degenerate hot contexts).
+
+### 2026-07-01 — enc_patch_dictionary.cc deep pass (branch perf/enc-patch-subtractfrom-jul01-p4d7)
+Landed (byte-exact): SubtractFrom blend-hoist + plane-major loop; Encode tokens.reserve. The whole
+file is **app-cold** for the RAW converter — patch dict only fires on screenshot/text/flat-4×4
+content; natural photos hit num_seeds==0 early-return (line ~345) before any flood/CC/atlas/
+roundtrip. Items below are deferred because they are NOT byte-exact (change the codestream),
+architectural, or only matter for the JXL-as-video ambition where the file becomes hot. Each needs
+its own gate before landing.
+
+- **"P0" seed-scan coverage off-by-one (`RunOnPool(pool,1,ph-2,…)` line ~332).** VERIFIED real:
+  RunOnPool end is exclusive, `process_row(py)` is safe up to py=ph-2 (reads row (py+1)*4 < ysize),
+  and the flood loop (line ~375) already iterates `py < ph-1` (=up to ph-2) — so detection skips
+  its last valid tile row while the flood expects it. ChatGPT's fix `ph-2 → ph-1` is the maximal
+  safe coverage. **NOT a byte-exact perf win**: it makes detection do MORE work and CHANGES which
+  patches are found → changes the encoded codestream; it is an upstream-heuristic behavior change
+  on a fork we ship. Gate = OLD-vs-NEW cjxl A/B on real >1-tile-row screenshot/UI content (size +
+  decoded-pixel delta) + a decision on diverging from upstream libjxl detection. Candidate upstream
+  bug report rather than a silent land.
+- **Crop atlas WIDTH after packing (track max_x, `ref_xsize = max_x`).** Height is already cropped
+  (`ref_ysize = max_y`) but width is not. NOT byte-exact: shrinks the reference-atlas image →
+  different special-frame (modular/gradient) bytes → different codestream. ChatGPT itself flags
+  shape-dependent modular rate effects. Gate = encoded-size A/B (rate experiment). Also crop→
+  smaller special frame = less encode/decode/zero-fill (video-relevant).
+- **Reusable GetPatchesForRow out-param** (`void GetPatchesForRow(y, vector*)`), reused across the
+  image instead of per-row alloc+sort. Crosses the decoder-side dec_patch_dictionary API. App-cold.
+  Byte-exact if ordering preserved. Defer (medium risk, cross-layer).
+- **Source-label map replacing the copied 3-plane `background` Image3F** (+ merge is_background/
+  visited into 2-bit flags). Big peak-RSS win on screenshot frames (~95MB→~32MB @4K); only runs
+  when seeds>0 (app-cold). Byte-exact only if near-equal-tile source selection is preserved
+  (canonicalise ONLY bit-identical flat tiles as the safe first step). Architectural.
+- **Span/frontier flood + tiled parallel connected-components.** Replace pixel queue/stack with
+  scanline spans; parallelize the serial tail. Byte-exactness is delicate (see rejected ledger:
+  mark-on-discovery changes `reference`). Architectural, needs a background-mask regression oracle.
+- **Marginal-gain patch planner** (select patch groups by estimated total-bit benefit, not just
+  ≥2 occurrences / ≥20px), and **per-region dots-vs-patches** instead of the global either/or.
+  Changes output; needs a real encoded-size scoring loop.
+- **Encoder-owned reconstructed reference** (expose EncodeFrame's post-quant reconstruction, drop
+  the internal DecodeFrame in RoundtripPatchFrame). High-value throughput when dicts are used
+  (video), high risk; must match decoder reconstruction pixel-exactly. Also fold the second
+  decode-and-consume branch (the encoded_size==0 assert path) into one helper.
+- **Persistent inter-frame patch-atlas cache + reference-slot allocator** (replace hardcoded
+  kPatchFrameReferenceId=3). The largest JXL-as-video win (reuse subtitle/HUD/UI atlases across
+  frames with delta/rebuild/retire + hysteresis). Needs sequence-encoder/reference-lifetime work
+  outside this file; see [[project-jxl-video-codec-20260701]].
+- **Content/overlap-aware atlas layout** (place visually similar patches adjacent for the gradient
+  predictor; exact-subrectangle overlap = 2-D CSE for shared glyph stems). Rate experiment.
+- **Separate entropy-order (bitstream) from apply-schedule (cache).** All color patches are kAdd
+  (commutative) so apply can be patch-centric/row-skipping/parallel while emission stays delta-
+  friendly. Byte-exact for output; changes internal scheduling only. Deferred (medium).
+
+## enc_fast_lossless.cc — deferred candidates (jul01, from the seams pass)
+
+Byte-exact wins already landed on branch `perf/enc-fast-lossless-seams-jul01-f7k3`
+(align/alloc, residual dead-store, palette lazy-alloc, TOC-copy elision). The
+following were identified but NOT taken; each needs a gate.
+
+- **Adaptive streaming batch depth** (replace `constexpr kMaxLocalGroups = 16` in
+  the streaming path with `min(total_groups, ~2·threads, mem_budget/worst_group_bytes)`).
+  Behavior-changing scheduling/memory heuristic — needs benchmark evidence per
+  CLAUDE.md (thread-count starvation vs 12 MiB RGBA16 batch reservation). Byte-exact
+  (output order preserved). Gate: streaming throughput bench on a many-core box +
+  peak-RSS measurement. Highest-value for JXL-as-video small frames.
+- **SIMD predictor split: `PredictPixelsAndCountZeroPrefix` vs `PredictPixelsOnly`.**
+  In `ProcessChunk` later vectors keep doing `Eq(0)`/`CountPrefix` after the run is
+  already broken. Split so only residuals are produced past the break. Byte-exact.
+  Wins NEON (2 vec/chunk), 16-bit AVX-512, MoreThan14Bits (multi 32-bit vec); ~neutral
+  for 8-bit AVX2. Gate: per-ISA SIMD A/B (do NOT force one impl across ISAs).
+- **Full-chunk vs tail-chunk packing fast path** (skip `ClipTo()`/`Skip()` dynamic
+  masks on the common n==kChunkSize, skip==0 route). Byte-exact. Gate: SIMD A/B; keep
+  general route for the last partial column + RLE-break chunks.
+- **AVX-512 register-resident token/Huffman/pack** (keep tokenise→Huffman→interleave→
+  Bits32 in registers instead of the ~5 stack round-trip arrays per vector batch).
+  AVX-512-only (AVX2 has too few vector regs — do not apply globally). Gate: AVX-512 A/B.
+- **Reuse Huffman DP workspace + copy baseline prefix code into unused channels.**
+  `ComputeCodeLengthsNonZeroImpl` allocates a fresh vector per code; grayscale/GA emit
+  4 codes but unused-channel histograms are identical after pseudo-count injection.
+  Byte-exact, small setup win. Gate: confirm identical code-lengths on real frames.
+- **Lifecycle/persistence (video):** per-worker row scratch reuse across frames;
+  `BitWriter` capacity/reset + per-batch arena/pool (also makes late DC-global padding
+  explicit rather than relying on the 100000-bit over-reserve); expose the integrated
+  seek-back streaming sink to the standalone/WASM path. Cross-function; needs a
+  sequence-state owner above this file.
+- **Fused colour-transform + predictor kernel** (deinterleave→YCoCg→predict in
+  registers, store only current-row state). 2nd-gen kernel; higher register pressure +
+  ISA divergence + left-neighbour complexity. Profile-gated: only if `FillRow*`+row-
+  scratch loads dominate the 8-bit RGB(A) profile after the lifecycle work.
+- **Temporal / JXL-as-video** (codebook inheritance with scene-change trigger; exact
+  unchanged-group compressed-byte reuse behind an exact byte compare, not a hash;
+  reference-frame coding). Architectural, above this file — see
+  [[project-jxl-video-codec-20260701]] and the RAW/JXL concurrency evidence memo.
+
+### UPDATE 2026-07-01b — deferred #1 WASM decode A/B done (byte-exact; timing unresolvable)
+Built NEW dec WASM from d5p2 (build.mjs LIBJXL_SRC_DIR + JXL_WASM_ONLY_KIND=dec --host-toolchain;
+needed sjpeg junctioned into worktree). Wrote node in-memory decode A/B (wasm_ab.mjs: createJxlModule
+{wasmBinary} -> _jxl_wasm_decode_rgba8) vs shipped baseline dec.simd.wasm (== e4fbf789).
+- **BYTE-EXACT on WASM confirmed**: base vs new decoded-pixel checksums identical, 15/15 residuals +
+  3/3 production photos, 0 mismatches (adds to native djxl 10/10).
+- **Timing: UNRESOLVABLE on this machine.** Built a video-residual corpus (consecutive Ghana video
+  frames diffed -> mostly-zero = degenerate-context-dense; compress 5-7x smaller than frames). WASM
+  residual aggregate NEW/OLD = 0.957 then 1.011 on re-run (straddles 1.0); large-photo per-file swings
+  0.799..1.306 with IDENTICAL output. Machine thermally throttled after hours of builds; per-file
+  variance +/-20-30% >> the ~3-5% effect. Only consistent signal: frame_000 (full frame, larger/more
+  stable decode) favored NEW ~15% in both residual runs (0.846/0.862) — hint the direction is
+  favorable on larger degenerate-dense decodes, but not statistically clean.
+- **KEPT** (branch d5p2 @bb187e74) per user rule: byte-exact + does-provably-less-work on degenerate
+  contexts + neutral-within-noise. NOT a demonstrated benchmark win — could not measure one cleanly.
+- **Definitive number needs**: cold machine + INTERLEAVED per-decode A/B (flipflopdom browser harness
+  with start-rotation cancels thermal drift; my node harness times OLD-block then NEW-block per file =
+  drift-biased). That's the proper follow-up if a hard number is required.
+
+---
+
+## enc_lz77.cc — deferred (analysis 2026-07-01, branch perf/enc-lz77-byteexact-jul01-lz9k)
+
+Deferred from the byte-exact perf pass because each changes the emitted bitstream or the cost
+model and needs a **compression-ratio A/B (cjxl size/Butteraugli)**, not the byte-exact SHA gate.
+Ordered by expected value.
+
+1. **Range-relaxed / cost-plateau optimal parser.** Kill the Θ(n²) blow-up on periodic non-RLE
+   input (`A B C D A B C D …`), where the current dense length loop relaxes ~every length at ~every
+   position and the `skip_lz77` RLE-run heuristic does not fire. Correct form: intersect length-cost
+   plateaus × distance-cost plateaus and issue one range-chmin per interval (segment tree). **Gate:**
+   must prove no ratio regression AND a real speedup on a periodic corpus; float costs won't be
+   byte-exact vs today (needs ratio gate + decode round-trip); fixed-point (1/16-bit) costs are
+   deterministic but themselves a codestream change.
+2. **Pareto match frontier** (drop `len + 2 >= best_len`, keep (length, distance-cost) non-dominated
+   candidates). Lets a shorter match with a much cheaper special distance win. **Gate:** cjxl ratio
+   A/B — expected small ratio gain, must not regress speed (frontier is ≤256 candidates).
+3. **SymbolCostEstimator unseen-symbol cost** (ragged per-context rows + pseudocount/Huffman-aware
+   default instead of the zero-filled matrix where an unseen symbol in a context reads cost 0). Add
+   bounds asserts on `Bits(ctx, sym)`. **Gate:** ratio A/B; also a peak-memory win (avoids
+   `num_contexts * max_alphabet_size_`).
+4. **Worker-owned LZ77 scratch** (reuse HashChain `data_/head/chain/val/zeros/headz/chainz` + the
+   special-dist table across streams/frames instead of reallocating per stream). Byte-exact if the
+   active-path behavior is preserved; win is allocator churn + peak memory under multithread/video.
+   Needs a lifecycle owner above ApplyLZ77 + careful reset. **Gate:** enc throughput + byte-exact A/B.
+5. **Conditional/detached zero-run accelerator** (skip `zeros/headz/chainz` maintenance when the
+   stream has no ≥3 zero runs). Byte-exact only if the when-active path is bit-identical; risky
+   because `numzeros` feeds FindMatches every position. **Gate:** byte-exact A/B on zero-dense +
+   textured corpora.
+6. **`val` array int→uint16_t** (15-bit hash + 0xFFFF sentinel): ~64KB/chain, byte-exact, low value.
+7. **Video/temporal regulation** (carry parse *policy* — chain depth, hash mode, zero-lane, entropy
+   priors — across frames, never raw dictionary state; sparse in-span insertion for fast modes;
+   special-distance geometric probe lane using `image_widths`). Architecture-level, belongs above
+   enc_lz77 with the frame-base/reference-region planner. Ties into
+   [[project-jxl-video-codec-20260701]]. **Gate:** full video encode ratio/throughput study.
+
+### FINAL 2026-07-02 — deferred #1 REJECTED (flipflopdom = measured wash)
+Ran the definitive flipflopdom (interleaved in-browser, drift-cancelled) A/B: residuals
+(best case) geomean −0.3%, photos floor-neutral. No win anywhere; the node harness's "15% win"
+was thermal-drift bias. Branch d5p2 DELETED (local+remote). Full write-up in
+`docs/1 rejected optimizations.md`. The other deferred items (#2 reverse_map uninit-resize —
+note: another agent landed reverse-map direct-expansion on branch r5m8; #3 ANSEncSymbolInfo split;
+#4 LZ77 window pool; #5 renorm per-arch) remain untouched.

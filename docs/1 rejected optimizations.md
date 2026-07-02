@@ -1501,3 +1501,126 @@ mostly from the accompanying ChatGPT analysis, were **rejected**:
   8-corner words give better locality on small CPUs; padding may help only at high core
   counts. No evidence either way here, and the atomic *count* (not layout) was the
   addressable cost — which the landed coalescing already halves. Not changed.
+
+## enc_patch_dictionary.cc pass — 2026-07-01 (branch perf/enc-patch-subtractfrom-jul01-p4d7)
+
+- **Connected-component "mark-on-discovery" (mark visited when pushed, not when popped).**
+  ChatGPT proposed this as a byte-exact stack-churn reduction. **REJECTED — it is NOT byte-exact.**
+  In the CC walk the patch's background reference (`reference`, line ~474/505) is the *first*
+  background neighbor encountered during traversal, and it is subtracted from every pixel of the
+  patch (`fval = opsin[c] - ref[c]`, line ~551). Mark-on-push vs mark-on-pop changes which
+  duplicates exist on the stack and therefore the LIFO pop order → changes which border pixel wins
+  `found_border`/`reference` → changes `ref[c]` → changes every quantized patch pixel AND the
+  too_big/too_small accept/reject decision → different codestream. The set of visited pixels is
+  order-independent (so bounding boxes are fine), but `reference` selection is not. Any span/CC
+  rewrite must preserve first-border-neighbor selection to stay byte-exact.
+- **"Fix" the int8_t narrowing before range-check (`int8_t qval = static_cast<int8_t>(val)`,
+  line ~554).** ChatGPT called the out-of-range cast implementation-defined and wanted a range test
+  first. **REJECTED — works as intended and changing it is a behavior risk.** The code deliberately
+  casts then detects overflow via `too_big |= (val != static_cast<int>(qval))` and rejects the
+  patch; wrap-around is fine because the value is thrown away. Reordering to "range-check first" is
+  a semantic rewrite of a correct guard, not a perf win. (Two's-complement narrowing is also
+  well-defined since C++20.)
+- **Note on atlas-width crop and the `ph-2 → ph-1` seed-scan "P0 fix":** both are real observations
+  but were moved to Questions_deferred.md, not rejected — they are legitimate ideas that simply are
+  NOT byte-exact (they change the encoded codestream) and need an A/B size gate + a decision on
+  diverging from upstream libjxl, so they don't belong in a byte-exact perf pass.
+
+## enc_fast_lossless.cc — fast-lossless "seams" pass (jul01, branch perf/enc-fast-lossless-seams-jul01-f7k3)
+
+- **Skip `sample_rows` when `num_rows == 0 || x_max == 0`** (proposed to avoid a
+  pointless input get/release round-trip at effort 0 and for tiny/narrow groups).
+  **REJECTED — NOT byte-exact.** The reference analysis claimed "the old path
+  contributed no samples," but the baseline `num_rows==0` path still runs the
+  predictor-warmup pass over the tiny group and its `CollectSamples` DOES feed the
+  histograms. Skipping it shifts the sampled distribution → different prefix codes →
+  different bitstream, and it can *worsen* ratio. **Verified by standalone fjxl A/B:**
+  9/10 cases were byte-identical but `rgba8 300x257 e2` grew **49200 → 49247 bytes**
+  (and the fnv hash changed). The same-geometry `rgb8 300x257 e7` stayed identical,
+  which is exactly why the skip is a silent, content-dependent codestream change
+  rather than a safe no-op. Reverted; the rest of the pass (align/alloc, residual
+  dead-store, palette lazy-alloc, TOC-copy elision) is byte-exact.
+- **CPU-detect OSXSAVE/XCR0 gate hardening** (require CPUID.1:ECX.OSXSAVE before
+  trusting leaf-7 AVX2/AVX-512 bits). Real latent correctness nit, but **out of
+  scope here:** it is not a perf change, it is shared upstream libjxl code
+  (divergence risk), and it is effectively unreachable on any modern OS (OSXSAVE is
+  always set when AVX is usable). Left untouched.
+- **Free `frame_state` on the standalone `*output` allocation-failure path.** A real
+  small leak, but it is in the `FJXL_STANDALONE` error path only — not the app's
+  integrated build — and is a correctness/leak fix, not a perf optimization. Not
+  taken in this byte-exact perf pass.
+
+---
+
+## enc_lz77.cc byte-exact perf pass — 2026-07-01 (branch perf/enc-lz77-byteexact-jul01-lz9k, capebio sub, off e4fbf789)
+
+`lib/jxl/enc_lz77.cc` is the **encoder** LZ77 planner. Gate = cjxl OLD/NEW SHA-identical
+(the emitted token stream must not change). The large ChatGPT/genetic analysis proposed
+many changes; the ones below alter the bitstream or the cost model and were **rejected for
+this pass** (they are compression/architecture changes needing their own quality gate, not
+perf-neutral byte-exact wins). Landed byte-exact set is in the commit message.
+
+- **Range-relaxed / cost-plateau optimal DP** (replace dense `dist_symbols` length expansion
+  with segment-tree range-chmin over length/distance cost plateaus). Attractive against the
+  Θ(n²) periodic-data case, but it explicitly recommends **fixed-point costs** and a different
+  relaxation order — both change float rounding and therefore which parse wins → **NOT
+  byte-exact**. The existing per-length loop + RLE-run skip (`skip_lz77`) already bounds the
+  common long-run case. Deferred, not rejected outright (see Questions_deferred.md).
+- **Pareto match frontier** (retain (length, distance-cost) non-dominated candidates instead of
+  the `len + 2 >= best_len` filter). Changes the candidate set fed to the parser → different
+  matches → **different bytes**. It is a compression-ratio change, not a perf change.
+- **SymbolCostEstimator "unseen symbol = 0 cost" repair** (ragged per-context rows / pseudocount
+  prior instead of the zero-filled `num_contexts * max_alphabet_size_` matrix). Even if the
+  current behavior is arguably a modelling weakness, changing any cost flips parser decisions →
+  **different bitstream**. Correctness/compression change, gated by cjxl ratio A/B, not this pass.
+- **Remove `sym_cost` prefix array in RLE and greedy LZ77** (as done in Optimal). Rejected there:
+  those two paths index `sym_cost[i + num_to_copy] - sym_cost[i]` and `sym_cost[i + len] - sym_cost[i]`
+  with **non-consecutive** indices, so the prefix array is load-bearing (random access). Only the
+  Optimal path uses strictly consecutive `[i+1] - [i]`, which is why the running-scalar fold is
+  byte-exact there and only there.
+- **Compute Optimal literal cost directly as `Bits + nbits`** (drop the running accumulator too).
+  **NOT byte-exact**: `(Bits+nbits+S) - S != Bits+nbits` in float once S is large. The subtraction
+  of two rounded cumulative values is exactly what must be preserved; hence the running-scalar
+  keeps both `next_sym_cost` and `running_sym_cost` and subtracts them.
+- **Move the stale-hash check (`val[hashpos] != hashval`) to the top of the FindMatches loop.**
+  The current code inspects the first chain candidate (`chain[wpos]`) without a val check and only
+  validates when advancing. Moving the check adds a guard on the first candidate → can terminate a
+  chain walk one step earlier → **different matches → different bytes**. The analysis itself flags
+  this as semantics-changing; left as-is.
+- **Sparse hash insertion inside matched spans; conditional/detached zero-run accelerator; hash
+  mixer; special-distance probe lane; co-evolution (re-price parse under its own histogram); video
+  policy/temporal regulation.** All change match selection or dictionary state → **different
+  bitstream**. Architecture/compression scope, deferred (Questions_deferred.md).
+- **`val` int→uint16_t (15-bit hash storage, 0xFFFF sentinel).** Byte-exact and saves ~64KB per
+  chain, but transient per-stream memory of marginal value; deferred to avoid touching the stale-hash
+  comparison path in a pass whose main wins are elsewhere.
+
+---
+
+## REJECTED: decoder degenerate-histogram fast path (dec_ans) — 2026-07-02
+
+Implemented + measured deferred item #1 (wire `ANSCode::degenerate_symbols` into
+`ANSSymbolReader::ReadSymbolANSWithoutRefill` as an early-return, + `IsSingleValueAndAdvance`
+via `fill_n`). **Byte-exact** (native djxl 10/10 + WASM 15/15 SHA-identical). **Dropped on
+timing evidence** (branch perf/dec-ans-degenerate-fastpath-jul01-d5p2 deleted local+remote).
+
+**Verdict: measured WASH — no win anywhere, best case included.** Definitive numbers from
+**flipflopdom** (interleaved in-browser A/B with start-rotation → cancels thermal drift; the
+node/native harnesses did OLD-block-then-NEW-block per file and were drift-biased):
+- Video-residual corpus (degenerate-context-dense = the designed best case): geomean
+  **−0.3%** (per-file −3.5%..+2.0%, no consistent direction).
+- Large real photos: geomean −4.9% median but noise-inflated (stdev ±15-20%, trust:low);
+  `min_ms` ~equal → floor-neutral.
+- Smoking gun: `frame_000` measured **−0.1%** interleaved vs a bogus **+15%** "win" from the
+  sequential node harness — every apparent win was thermal-drift bias, not the code.
+
+Why 0%: the fast path skips real work (alias lookup + state math + renorm + prefetch) on
+degenerate reads, but that saving is offset by the per-symbol `degenerate_symbols_[histo]`
+load + branch added to EVERY ANS read. On WASM (the ship target) it nets to zero even where
+degenerate contexts are densest; on mostly-non-degenerate real-photo decode it's a hair slower
+at the median. Net: adds a hot-loop check for no benefit → not worth carrying.
+
+★ Methodology lesson: sequential per-arm timing (time all OLD, then all NEW) is drift-biased and
+manufactured a phantom 15% win here. For sub-10% deltas use INTERLEAVED A/B (flipflop/flipflopdom
+with start-rotation). Test kept at .flipflop/dom-tests/dec-degenerate.mjs; journal in
+docs/outputs/timing tests/flipflop/flipflopdom-journal.toon.
