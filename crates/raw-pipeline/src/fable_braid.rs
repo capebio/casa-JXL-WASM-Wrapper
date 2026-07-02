@@ -698,8 +698,207 @@ mod kernels {
     }
 }
 
+// Shuffle-index plans shared by the wasm32 simd128 kernels and the native
+// model tests (compiled on every target; zero runtime cost). All plans feed
+// two-input 32-lane shuffles: index < 16 selects from the first operand,
+// 16..32 from the second.
+mod simd_plans {
+    /// Byte shift-left by `k` with zeros shifting in (operand b = zero vector):
+    /// the log-step of the mod-256 prefix sum, same schedule as `_mm_slli_si128`.
+    pub const fn shift_plan(k: usize) -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut l = 0;
+        while l < 16 {
+            m[l] = if l < k { 16 } else { (l - k) as u8 };
+            l += 1;
+        }
+        m
+    }
+    pub const SHIFT: [[u8; 16]; 4] =
+        [shift_plan(1), shift_plan(2), shift_plan(4), shift_plan(8)];
+
+    /// Interleave step 1 of output block `block`: t = shuffle(vr, vg); lanes
+    /// holding channel 2 are placeholders (index 0), overwritten by step 2.
+    pub const fn il_t(block: usize) -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut l = 0;
+        while l < 16 {
+            let j = 16 * block + l;
+            let (c, p) = (j % 3, j / 3);
+            if c == 0 {
+                m[l] = p as u8;
+            } else if c == 1 {
+                m[l] = 16 + p as u8;
+            }
+            l += 1;
+        }
+        m
+    }
+    /// Interleave step 2: out = shuffle(t, vb) — channel-2 lanes take vb.
+    pub const fn il_o(block: usize) -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut l = 0;
+        while l < 16 {
+            let j = 16 * block + l;
+            let (c, p) = (j % 3, j / 3);
+            m[l] = if c == 2 { 16 + p as u8 } else { l as u8 };
+            l += 1;
+        }
+        m
+    }
+    pub const IL_T: [[u8; 16]; 3] = [il_t(0), il_t(1), il_t(2)];
+    pub const IL_O: [[u8; 16]; 3] = [il_o(0), il_o(1), il_o(2)];
+
+    /// Deinterleave step 1 for channel `ch`: t = shuffle(v0, v1) — for global
+    /// byte j = 3l+ch < 32 the concat index IS j; the rest are placeholders.
+    pub const fn dei_t(ch: usize) -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut l = 0;
+        while l < 16 {
+            let j = 3 * l + ch;
+            if j < 32 {
+                m[l] = j as u8;
+            }
+            l += 1;
+        }
+        m
+    }
+    /// Deinterleave step 2: out = shuffle(t, v2) — bytes j >= 32 take v2.
+    pub const fn dei_o(ch: usize) -> [u8; 16] {
+        let mut m = [0u8; 16];
+        let mut l = 0;
+        while l < 16 {
+            let j = 3 * l + ch;
+            m[l] = if j >= 32 { (j - 32 + 16) as u8 } else { l as u8 };
+            l += 1;
+        }
+        m
+    }
+    pub const DEI_T: [[u8; 16]; 3] = [dei_t(0), dei_t(1), dei_t(2)];
+    pub const DEI_O: [[u8; 16]; 3] = [dei_o(0), dei_o(1), dei_o(2)];
+}
+
+// wasm32 simd128 ports of the hot kernels (the wasm build otherwise runs the
+// serial scalar fallbacks — the exact per-byte dependency FableBraid exists to
+// kill). The shuffle plans come from `simd_plans`, the same constants the
+// native model test verifies against the scalar references; mod-256 ring
+// arithmetic makes outputs bit-equal by construction.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+mod kernels_wasm {
+    use super::simd_plans::{DEI_O, DEI_T, IL_O, IL_T, SHIFT};
+    use core::arch::wasm32::*;
+
+    macro_rules! shuf {
+        ($a:expr, $b:expr, $m:expr) => {
+            i8x16_shuffle::<
+                { $m[0] as usize },
+                { $m[1] as usize },
+                { $m[2] as usize },
+                { $m[3] as usize },
+                { $m[4] as usize },
+                { $m[5] as usize },
+                { $m[6] as usize },
+                { $m[7] as usize },
+                { $m[8] as usize },
+                { $m[9] as usize },
+                { $m[10] as usize },
+                { $m[11] as usize },
+                { $m[12] as usize },
+                { $m[13] as usize },
+                { $m[14] as usize },
+                { $m[15] as usize },
+            >($a, $b)
+        };
+    }
+
+    /// Fused left-delta undo + prediction add (see the SSE2 twin): log-step
+    /// mod-256 prefix sum per 16-byte block, carry chained between blocks.
+    pub unsafe fn prefix_add_pred_from_simd128(out: &mut [u8], seg: &[u8], pred: &[u8]) {
+        let n = out.len();
+        debug_assert!(seg.len() == n && pred.len() == n);
+        let zero = u8x16_splat(0);
+        let mut carry = 0u8;
+        let mut i = 0;
+        while i + 16 <= n {
+            let mut x = v128_load(seg.as_ptr().add(i) as *const v128);
+            x = i8x16_add(x, shuf!(x, zero, SHIFT[0]));
+            x = i8x16_add(x, shuf!(x, zero, SHIFT[1]));
+            x = i8x16_add(x, shuf!(x, zero, SHIFT[2]));
+            x = i8x16_add(x, shuf!(x, zero, SHIFT[3]));
+            x = i8x16_add(x, u8x16_splat(carry));
+            // Running carry for the next block = last prefix byte.
+            carry = u8x16_extract_lane::<15>(x);
+            let p = v128_load(pred.as_ptr().add(i) as *const v128);
+            v128_store(out.as_mut_ptr().add(i) as *mut v128, i8x16_add(x, p));
+            i += 16;
+        }
+        while i < n {
+            carry = carry.wrapping_add(seg[i]);
+            out[i] = carry.wrapping_add(pred[i]);
+            i += 1;
+        }
+    }
+
+    /// Interleave with fused subtract-green undo (see the SSSE3 twin): two
+    /// shuffles per 16-byte output block instead of pshufb×3 + or×2.
+    pub unsafe fn interleave3_rct_undo_simd128(g: &[u8], r_sg: &[u8], b_sg: &[u8], out: &mut [u8]) {
+        let n = g.len();
+        debug_assert!(r_sg.len() == n && b_sg.len() == n && out.len() == n * 3);
+        let mut i = 0;
+        while i + 16 <= n {
+            let vg = v128_load(g.as_ptr().add(i) as *const v128);
+            let vr = i8x16_add(v128_load(r_sg.as_ptr().add(i) as *const v128), vg);
+            let vb = i8x16_add(v128_load(b_sg.as_ptr().add(i) as *const v128), vg);
+            let dst = out.as_mut_ptr().add(i * 3);
+            v128_store(dst as *mut v128, shuf!(shuf!(vr, vg, IL_T[0]), vb, IL_O[0]));
+            v128_store(dst.add(16) as *mut v128, shuf!(shuf!(vr, vg, IL_T[1]), vb, IL_O[1]));
+            v128_store(dst.add(32) as *mut v128, shuf!(shuf!(vr, vg, IL_T[2]), vb, IL_O[2]));
+            i += 16;
+        }
+        while i < n {
+            let gi = g[i];
+            out[3 * i] = r_sg[i].wrapping_add(gi);
+            out[3 * i + 1] = gi;
+            out[3 * i + 2] = b_sg[i].wrapping_add(gi);
+            i += 1;
+        }
+    }
+
+    /// Planar split of interleaved RGB: two shuffles per output vector.
+    pub unsafe fn deinterleave3_simd128(rgb: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8]) {
+        let n = r.len();
+        debug_assert!(g.len() == n && b.len() == n && rgb.len() == n * 3);
+        let mut i = 0;
+        while i + 16 <= n {
+            let src = rgb.as_ptr().add(i * 3);
+            let v0 = v128_load(src as *const v128);
+            let v1 = v128_load(src.add(16) as *const v128);
+            let v2 = v128_load(src.add(32) as *const v128);
+            v128_store(
+                r.as_mut_ptr().add(i) as *mut v128,
+                shuf!(shuf!(v0, v1, DEI_T[0]), v2, DEI_O[0]),
+            );
+            v128_store(
+                g.as_mut_ptr().add(i) as *mut v128,
+                shuf!(shuf!(v0, v1, DEI_T[1]), v2, DEI_O[1]),
+            );
+            v128_store(
+                b.as_mut_ptr().add(i) as *mut v128,
+                shuf!(shuf!(v0, v1, DEI_T[2]), v2, DEI_O[2]),
+            );
+            i += 16;
+        }
+        while i < n {
+            r[i] = rgb[3 * i];
+            g[i] = rgb[3 * i + 1];
+            b[i] = rgb[3 * i + 2];
+            i += 1;
+        }
+    }
+}
+
 /// Undo left-delta over `seg` and add prediction, writing into `out` (scalar
-/// reference; also the wasm path).
+/// reference; also the non-simd128 wasm path).
 #[inline]
 fn prefix_add_pred_from_scalar(out: &mut [u8], seg: &[u8], pred: &[u8]) {
     let n = out.len();
@@ -717,6 +916,11 @@ fn prefix_add_pred_from(out: &mut [u8], seg: &[u8], pred: &[u8]) {
     {
         // SSE2 is baseline on x86-64.
         unsafe { kernels::prefix_add_pred_from_sse2(out, seg, pred) };
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        unsafe { kernels_wasm::prefix_add_pred_from_simd128(out, seg, pred) };
         return;
     }
     #[allow(unreachable_code)]
@@ -745,12 +949,20 @@ fn deinterleave3(rgb: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut r = vec![0u8; n];
     let mut g = vec![0u8; n];
     let mut b = vec![0u8; n];
-    for i in 0..n {
-        r[i] = rgb[3 * i];
-        g[i] = rgb[3 * i + 1];
-        b[i] = rgb[3 * i + 2];
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        unsafe { kernels_wasm::deinterleave3_simd128(rgb, &mut r, &mut g, &mut b) };
+        return (r, g, b);
     }
-    (r, g, b)
+    #[allow(unreachable_code)]
+    {
+        for i in 0..n {
+            r[i] = rgb[3 * i];
+            g[i] = rgb[3 * i + 1];
+            b[i] = rgb[3 * i + 2];
+        }
+        (r, g, b)
+    }
 }
 
 /// Scalar reference for the fused RCT-undo interleave (also the wasm path).
@@ -779,8 +991,16 @@ fn interleave3_rct_undo(g: &[u8], r_sg: &[u8], b_sg: &[u8], n: usize) -> Vec<u8>
         unsafe { kernels::interleave3_rct_undo_ssse3(g, r_sg, b_sg, &mut rgb) };
         return rgb;
     }
-    interleave3_rct_undo_scalar(g, r_sg, b_sg, &mut rgb);
-    rgb
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        unsafe { kernels_wasm::interleave3_rct_undo_simd128(g, r_sg, b_sg, &mut rgb) };
+        return rgb;
+    }
+    #[allow(unreachable_code)]
+    {
+        interleave3_rct_undo_scalar(g, r_sg, b_sg, &mut rgb);
+        rgb
+    }
 }
 
 fn image_header(w: u32, h: u32, nplanes: u8, rct: u8) -> Vec<u8> {
@@ -1280,6 +1500,116 @@ mod tests {
                 assert_eq!(slow[3 * i + 1], g[i]);
                 assert_eq!(slow[3 * i + 2], bl[i].wrapping_add(g[i]));
             }
+        }
+    }
+
+    /// Software model of a two-input 32-lane byte shuffle — the exact
+    /// semantics of wasm `i8x16_shuffle` over `simd_plans` indices.
+    fn shuffle2_model(a: [u8; 16], b: [u8; 16], m: [u8; 16]) -> [u8; 16] {
+        let mut o = [0u8; 16];
+        for l in 0..16 {
+            let idx = m[l] as usize;
+            o[l] = if idx < 16 { a[idx] } else { b[idx - 16] };
+        }
+        o
+    }
+
+    /// Runs the wasm simd128 block algorithms natively through the shared
+    /// `simd_plans` constants and asserts byte-equality with the scalar
+    /// references — the wasm intrinsics apply the identical plans, so this
+    /// pins the lane arithmetic without a wasm runtime.
+    #[test]
+    fn wasm_simd128_plans_match_scalar() {
+        use super::simd_plans::*;
+        let mut rng = Rng(0xA5A5);
+        for n in [0usize, 1, 7, 15, 16, 17, 47, 48, 100, 854] {
+            // prefix_add_pred_from: log-step prefix + carry chain + pred add
+            let seg: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let pred: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let mut model = vec![0u8; n];
+            let mut carry = 0u8;
+            let mut i = 0;
+            while i + 16 <= n {
+                let mut x: [u8; 16] = seg[i..i + 16].try_into().unwrap();
+                for s in 0..4 {
+                    let sh = shuffle2_model(x, [0u8; 16], SHIFT[s]);
+                    for l in 0..16 {
+                        x[l] = x[l].wrapping_add(sh[l]);
+                    }
+                }
+                for l in 0..16 {
+                    x[l] = x[l].wrapping_add(carry);
+                }
+                carry = x[15];
+                for l in 0..16 {
+                    model[i + l] = x[l].wrapping_add(pred[i + l]);
+                }
+                i += 16;
+            }
+            while i < n {
+                carry = carry.wrapping_add(seg[i]);
+                model[i] = carry.wrapping_add(pred[i]);
+                i += 1;
+            }
+            let mut want = vec![0u8; n];
+            prefix_add_pred_from_scalar(&mut want, &seg, &pred);
+            assert_eq!(model, want, "wasm prefix_add_pred_from plan n={n}");
+
+            // interleave3_rct_undo: RCT add then two shuffles per block
+            let g: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let r: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let b: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+            let mut model = vec![0u8; n * 3];
+            let mut i = 0;
+            while i + 16 <= n {
+                let vg: [u8; 16] = g[i..i + 16].try_into().unwrap();
+                let mut vr: [u8; 16] = r[i..i + 16].try_into().unwrap();
+                let mut vb: [u8; 16] = b[i..i + 16].try_into().unwrap();
+                for l in 0..16 {
+                    vr[l] = vr[l].wrapping_add(vg[l]);
+                    vb[l] = vb[l].wrapping_add(vg[l]);
+                }
+                for k in 0..3 {
+                    let t = shuffle2_model(vr, vg, IL_T[k]);
+                    let o = shuffle2_model(t, vb, IL_O[k]);
+                    model[i * 3 + 16 * k..i * 3 + 16 * (k + 1)].copy_from_slice(&o);
+                }
+                i += 16;
+            }
+            while i < n {
+                let gi = g[i];
+                model[3 * i] = r[i].wrapping_add(gi);
+                model[3 * i + 1] = gi;
+                model[3 * i + 2] = b[i].wrapping_add(gi);
+                i += 1;
+            }
+            let mut want = vec![0u8; n * 3];
+            interleave3_rct_undo_scalar(&g, &r, &b, &mut want);
+            assert_eq!(model, want, "wasm interleave3_rct_undo plan n={n}");
+
+            // deinterleave3: two shuffles per output vector
+            let rgb: Vec<u8> = (0..n * 3).map(|_| rng.byte()).collect();
+            let (mut mr, mut mg, mut mb) = (vec![0u8; n], vec![0u8; n], vec![0u8; n]);
+            let mut i = 0;
+            while i + 16 <= n {
+                let v0: [u8; 16] = rgb[i * 3..i * 3 + 16].try_into().unwrap();
+                let v1: [u8; 16] = rgb[i * 3 + 16..i * 3 + 32].try_into().unwrap();
+                let v2: [u8; 16] = rgb[i * 3 + 32..i * 3 + 48].try_into().unwrap();
+                for (ch, dst) in [&mut mr, &mut mg, &mut mb].into_iter().enumerate() {
+                    let t = shuffle2_model(v0, v1, DEI_T[ch]);
+                    let o = shuffle2_model(t, v2, DEI_O[ch]);
+                    dst[i..i + 16].copy_from_slice(&o);
+                }
+                i += 16;
+            }
+            while i < n {
+                mr[i] = rgb[3 * i];
+                mg[i] = rgb[3 * i + 1];
+                mb[i] = rgb[3 * i + 2];
+                i += 1;
+            }
+            let (wr, wg, wb) = deinterleave3(&rgb, n);
+            assert_eq!((mr, mg, mb), (wr, wg, wb), "wasm deinterleave3 plan n={n}");
         }
     }
 
