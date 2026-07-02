@@ -197,34 +197,68 @@ pub fn encode_variants_cancellable(
     };
     let thumb_opts = ProgressiveOpts::default();
 
+    // Leaf coalescing: when no downscale happened (preview_src is the full-res
+    // buffer with identical dims) and the full tier uses the same quality (85:
+    // non-RAW, non-HQ), effort (EFFORT_PREVIEW == EFFORT_FULL == 3) and
+    // progressive opts (progressive_dc == 0 makes `opts` == `preview_opts`;
+    // group_order/center are shared), the preview and full encodes are the
+    // same encode. Do it once and share the bytes — byte-exact by
+    // construction, and drops one whole e3 encode for small/medium non-RAW
+    // uploads.
+    let coalesce_preview_full =
+        preview_rgba.is_none() && full_quality == 85 && opts.progressive_dc == 0;
+    debug_assert!(
+        !coalesce_preview_full || (EFFORT_PREVIEW == EFFORT_FULL && (pw, ph) == (width, height)),
+        "leaf-coalescing predicate drifted from the tier parameters"
+    );
+
     #[cfg(feature = "parallel")]
     let (thumb_300, preview_1080, full) = {
-        // Each rayon branch owns its own Encoder (owned-value semantics).
-        let (thumb_res, (preview_res, full_res)) = rayon::join(
-            || {
-                if cancel.load(Ordering::Acquire) {
-                    return Err(EncodeError::Cancelled);
-                }
-                encode_variant(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, has_alpha, width, height)
-            },
-            || {
-                rayon::join(
-                    || {
-                        if cancel.load(Ordering::Acquire) {
-                            return Err(EncodeError::Cancelled);
-                        }
-                        encode_variant(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, has_alpha, width, height)
-                    },
-                    || {
-                        if cancel.load(Ordering::Acquire) {
-                            return Err(EncodeError::Cancelled);
-                        }
-                        encode_variant(rgba, width, height, full_quality, EFFORT_FULL, opts, has_alpha, width, height)
-                    },
-                )
-            },
-        );
-        (thumb_res?, preview_res?, full_res?)
+        if coalesce_preview_full {
+            let (thumb_res, pf_res) = rayon::join(
+                || {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    encode_variant(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, has_alpha, width, height)
+                },
+                || {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    encode_variant(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, has_alpha, width, height)
+                },
+            );
+            let pf = pf_res?;
+            (thumb_res?, pf.clone(), pf)
+        } else {
+            // Each rayon branch owns its own Encoder (owned-value semantics).
+            let (thumb_res, (preview_res, full_res)) = rayon::join(
+                || {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    encode_variant(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, has_alpha, width, height)
+                },
+                || {
+                    rayon::join(
+                        || {
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(EncodeError::Cancelled);
+                            }
+                            encode_variant(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, has_alpha, width, height)
+                        },
+                        || {
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(EncodeError::Cancelled);
+                            }
+                            encode_variant(rgba, width, height, full_quality, EFFORT_FULL, opts, has_alpha, width, height)
+                        },
+                    )
+                },
+            );
+            (thumb_res?, preview_res?, full_res?)
+        }
     };
 
     #[cfg(not(feature = "parallel"))]
@@ -239,7 +273,11 @@ pub fn encode_variants_cancellable(
         if cancel.load(Ordering::Acquire) {
             return Err(EncodeError::Cancelled);
         }
-        let f = encode_into(&mut enc, rgba, width, height, full_quality, EFFORT_FULL, opts, has_alpha, width, height)?;
+        let f = if coalesce_preview_full {
+            p.clone()
+        } else {
+            encode_into(&mut enc, rgba, width, height, full_quality, EFFORT_FULL, opts, has_alpha, width, height)?
+        };
         (t, p, f)
     };
 
@@ -1016,6 +1054,43 @@ mod tests {
         let rgba = gradient(100, 100);
         let v = encode_variants(&rgba, 100, 100, SourceType::Raw, false).unwrap();
         assert_eq!(v.full_quality, 90);
+    }
+
+    #[test]
+    fn small_nonraw_coalesces_preview_and_full() {
+        // <=1080 long edge, non-RAW, non-HQ, progressive_dc==0: preview and
+        // full are the same encode (same pixels/dims/quality/effort/opts) —
+        // the coalesced path must hand back identical bytes.
+        let rgba = gradient(640, 480);
+        let v = encode_variants(&rgba, 640, 480, SourceType::Jpeg, false).unwrap();
+        assert_eq!(v.full_quality, 85);
+        assert_eq!((v.preview_w, v.preview_h), (640, 480));
+        assert_eq!(v.preview_1080, v.full, "coalesced tiers must be byte-identical");
+        assert!(!v.full.is_empty());
+    }
+
+    #[test]
+    fn coalescing_controls_still_diverge() {
+        // HQ override (q95 full vs q85 preview) must NOT coalesce.
+        let rgba = gradient(640, 480);
+        let v = encode_variants(&rgba, 640, 480, SourceType::Jpeg, true).unwrap();
+        assert_eq!(v.full_quality, 95);
+        assert_ne!(v.preview_1080, v.full, "q95 full must differ from q85 preview");
+
+        // RAW (q90 full) must NOT coalesce.
+        let v = encode_variants(&rgba, 640, 480, SourceType::Raw, false).unwrap();
+        assert_eq!(v.full_quality, 90);
+        assert_ne!(v.preview_1080, v.full);
+
+        // progressive_dc on the full tier must NOT coalesce.
+        let v = encode_variants_with_progressive(&rgba, 640, 480, SourceType::Jpeg, false, 2, 0).unwrap();
+        assert_ne!(v.preview_1080, v.full, "progressive full must differ");
+
+        // >1080 long edge downsizes the preview: dims differ, no coalescing.
+        let big = gradient(1600, 1200);
+        let v = encode_variants(&big, 1600, 1200, SourceType::Jpeg, false).unwrap();
+        assert_ne!((v.preview_w, v.preview_h), (1600, 1200));
+        assert_ne!(v.preview_1080, v.full);
     }
 
     #[test]
