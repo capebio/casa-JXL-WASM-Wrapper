@@ -2067,6 +2067,27 @@ function classifyJpegThumbSource(w, h) {
 // or RAW-pipeline thumb was there). Best-effort — failures stay silent.
 function repaintThumbFromJxl(card) {
     if (!card?._blobUrl) return;
+    // TTFP-6 (bounded cache-join): this decode runs at FULL resolution and was
+    // previously discarded after the 360px resize. If the card sits inside the
+    // lightbox prefetch neighbourhood (current ±PREFETCH_NEIGHBORS, wrap-around
+    // exactly like prefetchAroundCurrent's modulo), let it double as the
+    // prefetch cache write: prefetchJxl would otherwise decode the same URL
+    // again moments later and cache the same final frame ('onFinal'), so the
+    // memory cost equals existing prefetch policy while one full-res decode is
+    // saved (and a subsequent lightbox open paints instantly from the cache —
+    // same final pixels the progressive decode would converge to). Cards
+    // OUTSIDE the neighbourhood keep today's no-cache behaviour: a batch
+    // encode must not pin 4·W·H bytes per card (~80 MB at 20 MP).
+    let cacheOpts;
+    if (lightboxIndex >= 0 && cards.length > 0) {
+        const idx = cards.indexOf(card);
+        if (idx >= 0) {
+            const d = Math.abs(idx - lightboxIndex);
+            if (Math.min(d, cards.length - d) <= PREFETCH_NEIGHBORS) {
+                cacheOpts = { cachePolicy: 'onFinal', cacheTarget: card };
+            }
+        }
+    }
     pool.decodeJxl(card._blobUrl, (msg) => {
         if (msg.type === 'decode_error') {
             console.warn('JXL thumb decode error:', msg.error);
@@ -2098,7 +2119,7 @@ function repaintThumbFromJxl(card) {
             card.classList.remove('embedded-thumb');
             setThumbSource(card, 'jxl');
         }).catch(e => console.warn('JXL thumb bitmap failed:', e));
-    }, 'low');
+    }, 'low', cacheOpts);
 }
 
 // ---------------------------------------------------------------------------
