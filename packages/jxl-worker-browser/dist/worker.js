@@ -573,4 +573,17 @@ function resolvedWasmBuild() {
 }
 const ready = { type: "worker_ready", backend: "wasm", wasmBuild: resolvedWasmBuild() };
 self.postMessage(ready);
+// TTFP-3: kick the WASM fetch+compile at boot, AFTER worker_ready is posted
+// (spawn watchdog ordering preserved). Workers spawn only on demand, so a
+// spawned worker is about to decode/encode — starting the memoized getWasm()
+// here overlaps the multi-MB fetch+compile with scheduler dispatch instead of
+// serializing it behind the first decode_start. Cold-start chunk buffering is
+// unaffected: decode_start still awaits the same memoized promise. Must stay
+// on the dynamic loadWasmModule path (no static jxl-wasm import — see the
+// wasm-loader comment and the "no top-level bare jxl-wasm" guard).
+void getWasm().catch(() => {
+    // Best-effort: getWasm() resets wasmLoadPromise on failure, so the first
+    // real decode/encode start retries the load and surfaces the error to its
+    // own session instead of an orphan boot-time rejection.
+});
 //# sourceMappingURL=worker.js.map
