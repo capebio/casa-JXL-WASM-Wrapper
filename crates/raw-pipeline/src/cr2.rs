@@ -71,7 +71,12 @@ pub struct Cr2Timings {
     pub parse_ms: f64,
     /// LJPEG decode time (dominant stage).
     pub ljpeg_ms: f64,
-    /// In-place crop compaction time.
+    /// Slice reassembly time. Fused path (shipped): the single fused
+    /// reassemble+crop pass (crop_ms is then 0). Split path (bench-only): the
+    /// full-raster rebuild. 0 for single-slice files.
+    pub reassemble_ms: f64,
+    /// Crop/output-construction time (single-slice compaction, scratch row copy,
+    /// or split-path crop).
     pub crop_ms: f64,
     /// Bytes in full-frame decode buffer (before crop).
     pub raw_buf_bytes: usize,
@@ -277,18 +282,33 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
 // Decode entry points
 // ---------------------------------------------------------------------------
 
+/// Bench/parity-only selector for the slice-reassembly pipeline.
+/// Fused is the shipped path; Split* preserve the legacy two-pass pipeline
+/// (full-raster rebuild, then in-place crop) for A/B flips and parity tests.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReassemblyVariant { Fused, SplitBulk, SplitScatter }
+
 /// Decode CR2 from raw bytes. Single call, no second Vec allocation.
 pub fn decode_bytes(data: &[u8]) -> Result<Cr2Image> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, false, false).map(|(img, _, _)| img)
+    decode_impl(data, &mut buf, true, None, false, ReassemblyVariant::Fused)
+        .map(|(img, _, _)| img)
 }
 
-/// Decode forcing a specific slice-reassembly variant (bench only).
-/// `use_scatter=true` selects the pre-#1 scalar scatter; `false` the shipped bulk copy.
+/// Decode forcing a legacy split slice-reassembly variant (bench only).
+/// `use_scatter=true` selects the pre-#1 scalar scatter; `false` the split bulk copy.
 #[doc(hidden)]
 pub fn decode_bytes_variant(data: &[u8], use_scatter: bool) -> Result<Cr2Image> {
+    let v = if use_scatter { ReassemblyVariant::SplitScatter } else { ReassemblyVariant::SplitBulk };
+    decode_bytes_reassembly(data, v)
+}
+
+/// Decode with an explicit reassembly variant (bench/parity only).
+#[doc(hidden)]
+pub fn decode_bytes_reassembly(data: &[u8], v: ReassemblyVariant) -> Result<Cr2Image> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, false, use_scatter).map(|(img, _, _)| img)
+    decode_impl(data, &mut buf, true, None, false, v).map(|(img, _, _)| img)
 }
 
 /// Decode with per-phase timings for benchmarking (native — uses std::time::Instant).
@@ -296,7 +316,8 @@ pub fn decode_bytes_bench(data: &[u8]) -> Result<(Cr2Image, Cr2Timings)> {
     let mut buf = Vec::new();
     let base = std::time::Instant::now();
     let clock = move || base.elapsed().as_secs_f64() * 1000.0;
-    decode_impl(data, &mut buf, true, Some(&clock), false, false).map(|(img, t, _)| (img, t))
+    decode_impl(data, &mut buf, true, Some(&clock), false, ReassemblyVariant::Fused)
+        .map(|(img, t, _)| (img, t))
 }
 
 /// Decode with per-phase timings using a caller-supplied monotonic millisecond clock.
@@ -307,20 +328,22 @@ pub fn decode_bytes_with_clock(
     clock: &dyn Fn() -> f64,
 ) -> Result<(Cr2Image, Cr2Timings)> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, Some(clock), false, false).map(|(img, t, _)| (img, t))
+    decode_impl(data, &mut buf, true, Some(clock), false, ReassemblyVariant::Fused)
+        .map(|(img, t, _)| (img, t))
 }
 
 /// Decode with full LJPEG stage statistics (for profiling only — slightly slower due to counters).
 pub fn decode_bytes_with_ljpeg_stats(data: &[u8]) -> Result<(Cr2Image, ljpeg::LjpegStats)> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, true, false)
+    decode_impl(data, &mut buf, true, None, true, ReassemblyVariant::Fused)
         .map(|(img, _, stats)| (img, stats.expect("capture_stats=true always yields Some")))
 }
 
 /// Decode reusing scratch buffer to avoid per-call full-frame allocation (batch mode).
 /// The scratch.raw buffer grows to full-frame size on the first call and is reused thereafter.
 pub fn decode_with_scratch(data: &[u8], scratch: &mut ScratchBuffers) -> Result<Cr2Image> {
-    decode_impl(data, &mut scratch.raw, false, None, false, false).map(|(img, _, _)| img)
+    decode_impl(data, &mut scratch.raw, false, None, false, ReassemblyVariant::Fused)
+        .map(|(img, _, _)| img)
 }
 
 /// Reorder Canon multi-slice LJPEG output from stream-stacked vertical slices into
@@ -455,7 +478,7 @@ fn decode_impl(
     move_buf:       bool,
     clock:          Option<&dyn Fn() -> f64>,
     capture_stats:  bool,
-    use_scatter:    bool, // bench-only: force the pre-#1 scalar scatter reassembly
+    variant:        ReassemblyVariant, // Fused = shipped; Split* = bench/parity only
 ) -> Result<(Cr2Image, Cr2Timings, Option<ljpeg::LjpegStats>)> {
     // Phase timing is driven by an injected monotonic millisecond clock rather than
     // std::time::Instant, which is unavailable on wasm32-unknown-unknown (panics).
@@ -674,31 +697,6 @@ fn decode_impl(
     let ljpeg_ms = elapsed(t_ljpeg);
 
     // -----------------------------------------------------------------------
-    // CR2 slice reassembly (Canon multi-slice). The LJPEG decodes to a buffer where the N+1
-    // vertical slices are STACKED in stream order (slice 0's whole nw×sof_h block, then slice 1's,
-    // …); they must be reordered into a single side-by-side raster of width `decoded_width`.
-    // Without this, multi-slice CR2s (e.g. 5D-era, CR2Slices=[2,1728,1888], ncomp=4) decode to
-    // scrambled garbage. Single-slice files (have_slices=false) are already in raster order and
-    // skip this. Algorithm mirrors dcraw's lossless_jpeg slice distribution; components (ncomp) are
-    // absorbed into `stride` so they need no separate de-interleave.
-    if have_slices {
-        let n = cr2_slices[0] as usize;
-        let nw = cr2_slices[1] as usize;
-        let lw = cr2_slices[2] as usize;
-        // Overflow guard for nw*high (reassemble_slices uses saturating mul internally).
-        nw.checked_mul(sof_h).ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
-        let raster = if use_scatter {
-            reassemble_slices_scatter(raw_buf, stride, sof_h, n, nw, lw)
-        } else {
-            reassemble_slices(raw_buf, stride, sof_h, n, nw, lw)
-        };
-        // CRAWL E1: move the reassembled raster into raw_buf (O(1) pointer move) instead
-        // of clear()+extend_from_slice, which copied the whole frame back (~48MB @24MP).
-        // The old stacked-slice buffer is dropped here.
-        *raw_buf = raster;
-    }
-
-    // -----------------------------------------------------------------------
     // Black/white levels: IFD value overrides precision-table default (item 1)
     // -----------------------------------------------------------------------
     let (mut black, white) = match precision {
@@ -750,34 +748,100 @@ fn decode_impl(
     }
 
     // -----------------------------------------------------------------------
-    // In-place crop: compact rows within raw_buf — no second Vec (items 8,9)
+    // Output construction. Multi-slice: the LJPEG decodes to a buffer where the
+    // N+1 vertical slices are STACKED in stream order (slice 0's whole nw×sof_h
+    // block, then slice 1's, …); without reordering, multi-slice CR2s (e.g.
+    // 5D-era, CR2Slices=[2,1728,1888], ncomp=4) decode to scrambled garbage.
+    // Shipped Fused path: build the final crop directly from the stacked buffer
+    // (no full-raster temp, no zero-fill, no separate crop pass). Algorithm
+    // mirrors dcraw's lossless_jpeg slice distribution; components (ncomp) are
+    // absorbed into `stride` so they need no separate de-interleave.
+    // Single-slice files are already in raster order: owned path compacts rows
+    // in place (no second Vec); scratch path copies crop rows straight out.
     // -----------------------------------------------------------------------
-    let t_crop = mark();
-    let crop_needed = top != 0 || left != 0 || decoded_width != crop_w;
-    if crop_needed {
+    let crop_len = crop_w * crop_h;
+    let mut reassemble_ms = 0.0;
+    let mut crop_ms = 0.0;
+    let raw_out: Vec<u16>;
+
+    if have_slices {
+        let n  = cr2_slices[0] as usize;
+        let nw = cr2_slices[1] as usize;
+        let lw = cr2_slices[2] as usize;
+        // Overflow guard for nw*high (both paths derive block = nw*high).
+        nw.checked_mul(sof_h).ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
+        if variant == ReassemblyVariant::Fused {
+            // raw_buf keeps the full-length stacked decode → in scratch mode the
+            // next resize(total_pixels) is a no-op (no tail re-zero-fill).
+            let t = mark();
+            let out = reassemble_slices_crop(
+                raw_buf, stride, sof_h, n, nw, lw, left, top, crop_w, crop_h);
+            reassemble_ms = elapsed(t);
+            if out.len() != crop_len {
+                bail!("CR2: fused reassembly produced {} px, expected {}", out.len(), crop_len);
+            }
+            raw_out = out;
+        } else {
+            // Legacy split pipeline (bench/parity only): full raster, then crop.
+            let t = mark();
+            let raster = if variant == ReassemblyVariant::SplitScatter {
+                reassemble_slices_scatter(raw_buf, stride, sof_h, n, nw, lw)
+            } else {
+                reassemble_slices(raw_buf, stride, sof_h, n, nw, lw)
+            };
+            // CRAWL E1: O(1) pointer move; the old stacked-slice buffer drops here.
+            *raw_buf = raster;
+            reassemble_ms = elapsed(t);
+            let t_crop = mark();
+            let crop_needed = top != 0 || left != 0 || decoded_width != crop_w;
+            if crop_needed {
+                for row in 0..crop_h {
+                    let src = (top + row) * stride + left;
+                    raw_buf.copy_within(src..src + crop_w, row * crop_w);
+                }
+            }
+            raw_buf.truncate(crop_len);
+            crop_ms = elapsed(t_crop);
+            raw_out = if move_buf {
+                std::mem::take(raw_buf)     // zero-copy — raw_buf left empty
+            } else {
+                raw_buf[..crop_len].to_vec()   // batch mode: clone crop, retain capacity
+            };
+        }
+    } else if move_buf {
+        // Single-slice owned path: in-place compaction within raw_buf — no
+        // second Vec (items 8,9) — then move out.
+        let t_crop = mark();
+        let crop_needed = top != 0 || left != 0 || decoded_width != crop_w;
+        if crop_needed {
+            for row in 0..crop_h {
+                let src = (top + row) * stride + left;
+                raw_buf.copy_within(src..src + crop_w, row * crop_w);
+            }
+        }
+        raw_buf.truncate(crop_len);
+        crop_ms = elapsed(t_crop);
+        raw_out = std::mem::take(raw_buf);  // zero-copy — raw_buf left empty
+    } else {
+        // Single-slice scratch path: copy crop rows straight into the output —
+        // raw_buf is untouched and stays full-length, so the next decode's
+        // resize(total_pixels) is a no-op (kills the warm-path tail re-zero and
+        // the old crop-in-place + clone double copy).
+        let t_crop = mark();
+        let mut out = Vec::with_capacity(crop_len);
         for row in 0..crop_h {
             let src = (top + row) * stride + left;
-            let dst = row * crop_w;
-            raw_buf.copy_within(src..src + crop_w, dst);
+            out.extend_from_slice(&raw_buf[src..src + crop_w]);
         }
+        crop_ms = elapsed(t_crop);
+        raw_out = out;
     }
-    raw_buf.truncate(crop_w * crop_h);
-    let crop_ms        = elapsed(t_crop);
-    let crop_buf_bytes = crop_w * crop_h * 2;
 
-    // -----------------------------------------------------------------------
-    // Build return value
-    // -----------------------------------------------------------------------
-    let raw_out = if move_buf {
-        std::mem::take(raw_buf)     // zero-copy — raw_buf left empty
-    } else {
-        raw_buf[..crop_w * crop_h].to_vec()   // batch mode: clone crop, retain capacity
-    };
-
+    let crop_buf_bytes = crop_len * 2;
     let total_ms = elapsed(t_total);
 
     let timings = Cr2Timings {
-        total_ms, parse_ms, ljpeg_ms, crop_ms,
+        total_ms, parse_ms, ljpeg_ms, reassemble_ms, crop_ms,
         raw_buf_bytes, crop_buf_bytes,
         slices: if have_slices { cr2_slices } else { [0; 3] },
     };
@@ -964,6 +1028,48 @@ mod tests {
             let scalar = reassemble_slices_scatter(&src, stride, high, n, nw, lw);
             assert_eq!(bulk, scalar,
                 "mismatch for n={n} nw={nw} lw={lw} high={high}");
+        }
+    }
+
+    /// Real-fixture loader: CR2_FIXTURE_DIR override, default raw-converter tests dir.
+    /// Returns None (test skips) when the file is not present on this machine.
+    fn fixture(name: &str) -> Option<Vec<u8>> {
+        let dir = std::env::var("CR2_FIXTURE_DIR")
+            .unwrap_or_else(|_| r"C:\Foo\raw-converter\tests".into());
+        std::fs::read(std::path::Path::new(&dir).join(name)).ok()
+    }
+
+    #[test]
+    fn variants_byte_identical_on_real_files() {
+        // Fused (shipped) == SplitBulk == SplitScatter on one multi-slice and one
+        // single-slice body. The full 11-fixture sweep lives in the release
+        // example cr2_fused_flip / Task-7 verification.
+        for name in ["_MG_1744.CR2", "ADH 1234.CR2"] {
+            let Some(data) = fixture(name) else { continue };
+            let f = decode_bytes_reassembly(&data, ReassemblyVariant::Fused).expect("fused");
+            let b = decode_bytes_reassembly(&data, ReassemblyVariant::SplitBulk).expect("bulk");
+            let s = decode_bytes_reassembly(&data, ReassemblyVariant::SplitScatter).expect("scatter");
+            assert_eq!(f.raw, b.raw, "fused vs bulk: {name}");
+            assert_eq!(f.raw, s.raw, "fused vs scatter: {name}");
+            assert_eq!((f.width, f.height, f.black, f.white, f.cfa_phase),
+                       (b.width, b.height, b.black, b.white, b.cfa_phase), "{name}");
+            assert_eq!(f.wb_r.to_bits(), b.wb_r.to_bits(), "{name}");
+            assert_eq!(f.wb_b.to_bits(), b.wb_b.to_bits(), "{name}");
+        }
+    }
+
+    #[test]
+    fn scratch_warm_reuse_across_geometries() {
+        // multi → single → multi with ONE scratch: byte-identical to fresh decodes.
+        // Exercises the no-truncate warm path (stale tail must be fully overwritten
+        // by the next LJPEG decode — full-write invariant).
+        let (Some(m), Some(s)) = (fixture("_MG_1744.CR2"), fixture("ADH 1234.CR2")) else { return };
+        let mut sc = ScratchBuffers::default();
+        for (i, data) in [&m, &s, &m].into_iter().enumerate() {
+            let a = decode_with_scratch(data, &mut sc).expect("scratch decode");
+            let b = decode_bytes(data).expect("fresh decode");
+            assert_eq!(a.raw, b.raw, "call {i}");
+            assert_eq!((a.width, a.height, a.black, a.white), (b.width, b.height, b.black, b.white));
         }
     }
 
