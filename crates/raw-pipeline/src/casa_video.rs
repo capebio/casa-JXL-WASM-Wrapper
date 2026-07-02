@@ -61,6 +61,31 @@ pub const CASV_TILE_FLAG: u32 = 0x2000_0000;
 /// JXL's perceptual model correct (a residual would be misjudged).
 pub const CASV_REPLACE_FLAG: u32 = 0x1000_0000;
 
+// ── JOLT rate metadata (CasvHeader.flags layout) ──────────────────────────────
+// JOLT (JXL-Optimized Lossy Transport) is the lossy streaming profile of CASV.
+// The header `flags` word — previously always 0 — carries the rate signal so a
+// player can distinguish archival-lossless from JOLT files and read the encode
+// distance/effort without probing frames. Decoders ignore unknown bits, so v1
+// files (flags == 0) and v1 readers stay compatible.
+//
+//   bit 0       CASV_HDRFLAG_LOSSY — the file was encoded with VideoRate::Lossy
+//   bits 8..15  quantized butteraugli distance, round(distance * 10), 0..255
+//   bits 16..19 libjxl effort (1..10)
+/// Header flag bit 0: lossy (JOLT) file.
+pub const CASV_HDRFLAG_LOSSY: u32 = 1;
+
+/// Pack the JOLT rate signal into a CasvHeader `flags` word.
+pub fn casv_rate_flags(opts: &CasaVideoOptions) -> u32 {
+    match opts.rate {
+        VideoRate::Lossless => 0,
+        VideoRate::Lossy(d) => {
+            let d10 = (d * 10.0).round().clamp(0.0, 255.0) as u32;
+            let effort = (opts.effort as u32).min(15);
+            CASV_HDRFLAG_LOSSY | (d10 << 8) | (effort << 16)
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum VideoError {
     #[error("frame encode: {0}")]
@@ -86,6 +111,25 @@ pub struct CasvHeader {
     pub fps_num: u32,
     pub fps_den: u32,
     pub flags: u32,
+}
+
+impl CasvHeader {
+    /// True when the file carries the JOLT (lossy) rate flag.
+    pub fn is_lossy(&self) -> bool {
+        self.flags & CASV_HDRFLAG_LOSSY != 0
+    }
+    /// The encode's butteraugli distance (0.1 steps), if the file is lossy
+    /// and the encoder recorded it. `None` for lossless / legacy files.
+    pub fn lossy_distance(&self) -> Option<f32> {
+        if !self.is_lossy() {
+            return None;
+        }
+        Some(((self.flags >> 8) & 0xFF) as f32 / 10.0)
+    }
+    /// The recorded libjxl effort (1..10); 0 for lossless / legacy files.
+    pub fn rate_effort(&self) -> u8 {
+        ((self.flags >> 16) & 0xF) as u8
+    }
 }
 
 /// Serialize the 32-byte little-endian header.
@@ -242,6 +286,79 @@ impl CasaVideoOptions {
     pub fn streaming(distance: f32) -> Self {
         CasaVideoOptions { rate: VideoRate::Lossy(distance), gop_len: 24, skip: SkipMode::Tile, tile: 32, effort: 3, thresh: None }
     }
+    /// JOLT preset → options. See [`JoltPreset`].
+    pub fn jolt(preset: JoltPreset) -> Self {
+        match preset {
+            // Fastest wall-clock: e1 intra, coarser distance, tile skip. For
+            // live capture / screen share where encode speed rules.
+            JoltPreset::Realtime => CasaVideoOptions {
+                rate: VideoRate::Lossy(2.0),
+                gop_len: 24,
+                skip: SkipMode::Tile,
+                tile: 32,
+                effort: 1,
+                thresh: None,
+            },
+            // The measured sweet spot of the lossy tier (d1.0/e3, tile skip)
+            // — same as `streaming(1.0)`.
+            JoltPreset::Balanced => CasaVideoOptions::streaming(1.0),
+            // Visually-transparent tier: d0.5, effort 4, tighter auto
+            // threshold via the distance heuristic.
+            JoltPreset::Quality => CasaVideoOptions {
+                rate: VideoRate::Lossy(0.5),
+                gop_len: 24,
+                skip: SkipMode::Tile,
+                tile: 32,
+                effort: 4,
+                thresh: None,
+            },
+        }
+    }
+}
+
+// ── JOLT — JXL-Optimized Lossy Transport ──────────────────────────────────────
+// JOLT is the lossy streaming profile of the CASV container: JXL VarDCT
+// intra frames (chunked constant-peak encoder) + fresh-pixel REPLACE skip
+// P-frames (bbox or tile) with in-loop reconstruction, so encoder and decoder
+// never drift. Additive lossy residuals are proven NOT to work in JXL (the
+// perceptual model misjudges residual planes — see the design doc); coding
+// real pixels and replacing regions is the design that measured −94% size on
+// low-motion content at d1.0/t6. Rate metadata rides CasvHeader.flags
+// (header files) or the CASR rate box (footer/streamed files).
+
+/// JOLT encode presets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoltPreset {
+    /// Fastest encode (effort 1, distance 2.0) — live capture / screen share.
+    Realtime,
+    /// The measured default (distance 1.0, effort 3).
+    Balanced,
+    /// Visually transparent (distance 0.5, effort 4).
+    Quality,
+}
+
+/// One-call JOLT batch encode: all frames resident, returns a header-format
+/// `.casv` stamped with the JOLT rate flags. Decode with [`decode_casv_all_rgb8`].
+pub fn jolt_encode(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    preset: JoltPreset,
+) -> Result<Vec<u8>, VideoError> {
+    encode_casv_video(frames, width, height, fps_num, fps_den, &CasaVideoOptions::jolt(preset))
+}
+
+/// One-call JOLT streaming encode straight to a sink (footer format + CASR
+/// rate box): holds only prev+current frame. Decode with
+/// [`decode_casv_footer_all_rgb8`]; read the rate with [`parse_casv_rate_box`].
+pub fn jolt_encode_stream_to<W: std::io::Write>(
+    src: &mut dyn VideoFrameSource,
+    preset: JoltPreset,
+    sink: &mut W,
+) -> Result<(), VideoError> {
+    encode_casv_video_streaming_to(src, &CasaVideoOptions::jolt(preset), sink)
 }
 
 /// One ergonomic entry that dispatches to the right encoder for `opts`:
@@ -260,7 +377,7 @@ pub fn encode_casv_video(
     fps_den: u32,
     opts: &CasaVideoOptions,
 ) -> Result<Vec<u8>, VideoError> {
-    match opts.rate {
+    let mut out = match opts.rate {
         VideoRate::Lossless => {
             let enc = EncodeOptions::lossless().with_effort(opts.effort);
             match opts.skip {
@@ -279,7 +396,12 @@ pub fn encode_casv_video(
                 SkipMode::Tile => encode_casv_delta_lossy_tiled_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, opts.tile, distance, thresh),
             }
         }
-    }
+    }?;
+    // Stamp the JOLT rate signal into the header flags word (bytes 28..32).
+    // The low-level encoders write flags=0; stamping at the dispatcher covers
+    // every tier without threading opts through each of them.
+    out[28..32].copy_from_slice(&casv_rate_flags(opts).to_le_bytes());
+    Ok(out)
 }
 
 /// A pull source of RGB8 video frames (from disk, a decode pipeline, a camera…).
@@ -459,7 +581,14 @@ pub fn encode_casv_video_streaming(
         return Err(VideoError::Empty);
     }
 
-    let header = CasvHeader { width, height, frame_count: index.len() as u32, fps_num, fps_den, flags: 0 };
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: index.len() as u32,
+        fps_num,
+        fps_den,
+        flags: casv_rate_flags(opts),
+    };
     let data_start = CASV_HEADER_BYTES + index.len() * CASV_INDEX_ENTRY_BYTES;
     let mut out = Vec::with_capacity(data_start + data.len());
     out.extend_from_slice(&build_casv_header(&header));
@@ -517,6 +646,12 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
         sink.write_all(&off.to_le_bytes()).map_err(|_| VideoError::Io)?;
         sink.write_all(&lenf.to_le_bytes()).map_err(|_| VideoError::Io)?;
     }
+    // Optional JOLT rate box between index and footer: [CASR magic][flags].
+    // Legacy readers never look here (they walk index_offset + count from the
+    // footer), so old files without it and old parsers reading new files both
+    // keep working. See parse_casv_rate_box.
+    sink.write_all(&CASV_RATE_BOX_MAGIC.to_le_bytes()).map_err(|_| VideoError::Io)?;
+    sink.write_all(&casv_rate_flags(opts).to_le_bytes()).map_err(|_| VideoError::Io)?;
     let footer = build_casv_footer(&CasvFooter {
         index_offset,
         width,
@@ -527,6 +662,27 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
     });
     sink.write_all(&footer).map_err(|_| VideoError::Io)?;
     Ok(())
+}
+
+/// Magic of the optional 8-byte rate box a JOLT streaming-to-sink encode places
+/// between the index and the footer: `[u32 'CASR'][u32 flags]` with the same
+/// flags layout as [`casv_rate_flags`].
+pub const CASV_RATE_BOX_MAGIC: u32 = 0x5253_4143; // 'CASR' little-endian
+
+/// Read the rate flags of a footer-indexed streaming `.casv`, if the encoder
+/// wrote a rate box. `None` for legacy files (no box) or invalid data.
+pub fn parse_casv_rate_box(data: &[u8]) -> Option<u32> {
+    let f = parse_casv_footer(data)?;
+    let idx_end = f.index_offset as usize + f.frame_count as usize * CASV_INDEX_ENTRY_BYTES;
+    let box_end = idx_end.checked_add(8)?;
+    if box_end + CASV_FOOTER_BYTES > data.len() {
+        return None;
+    }
+    let rd4 = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+    if rd4(idx_end) != CASV_RATE_BOX_MAGIC {
+        return None;
+    }
+    Some(rd4(idx_end + 4))
 }
 
 /// Decode a footer-indexed streaming `.casv` (from [`encode_casv_video_streaming_to`])
@@ -2051,5 +2207,66 @@ mod tests {
             let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
             assert!(me < 8.0, "frame {i} mean err {me}");
         }
+    }
+
+    #[test]
+    fn jolt_rate_flags_ride_the_header() {
+        let (w, h) = (32u32, 24u32);
+        let f0 = gradient(w, h, 0);
+        let f1 = gradient(w, h, 60);
+        let frames: [&[u8]; 2] = [&f0, &f1];
+
+        // JOLT (lossy) files carry the rate signal in header flags.
+        let jolt = jolt_encode(&frames, w, h, 24, 1, JoltPreset::Balanced).unwrap();
+        let hdr = parse_casv_header(&jolt).unwrap();
+        assert!(hdr.is_lossy());
+        assert_eq!(hdr.lossy_distance(), Some(1.0));
+        assert_eq!(hdr.rate_effort(), 3);
+        // Still a plain CASV stream for the decoder.
+        assert_eq!(decode_casv_all_rgb8(&jolt).unwrap().len(), 2);
+
+        // Lossless files keep flags == 0 (legacy shape).
+        let lossless =
+            encode_casv_video(&frames, w, h, 24, 1, &CasaVideoOptions::lossless_archive()).unwrap();
+        let lhdr = parse_casv_header(&lossless).unwrap();
+        assert_eq!(lhdr.flags, 0);
+        assert!(!lhdr.is_lossy());
+        assert_eq!(lhdr.lossy_distance(), None);
+
+        // Preset knobs are what the docs promise.
+        let rt = CasaVideoOptions::jolt(JoltPreset::Realtime);
+        assert!(matches!(rt.rate, VideoRate::Lossy(d) if d == 2.0));
+        assert_eq!(rt.effort, 1);
+        let q = CasaVideoOptions::jolt(JoltPreset::Quality);
+        assert!(matches!(q.rate, VideoRate::Lossy(d) if d == 0.5));
+        assert_eq!(q.effort, 4);
+    }
+
+    #[test]
+    fn jolt_stream_to_sink_writes_rate_box() {
+        let (w, h) = (48u32, 48u32);
+        let frames = low_motion(w, h, 6);
+        let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let mut sink: Vec<u8> = Vec::new();
+        jolt_encode_stream_to(&mut fs, JoltPreset::Balanced, &mut sink).unwrap();
+
+        // Rate box parses and matches the preset.
+        let flags = parse_casv_rate_box(&sink).expect("rate box present");
+        assert_ne!(flags & CASV_HDRFLAG_LOSSY, 0);
+        assert_eq!((flags >> 8) & 0xFF, 10, "distance 1.0 -> q10");
+        assert_eq!((flags >> 16) & 0xF, 3, "effort 3");
+
+        // Legacy reader path unaffected: footer parses, frames decode.
+        let f = parse_casv_footer(&sink).unwrap();
+        assert_eq!(f.frame_count, 6);
+        assert_eq!(decode_casv_footer_all_rgb8(&sink).unwrap().len(), 6);
+
+        // Legacy files (no rate box) read as None: splice the 8-byte box out.
+        let idx_end = f.index_offset as usize + 6 * CASV_INDEX_ENTRY_BYTES;
+        let mut legacy = sink[..idx_end].to_vec();
+        legacy.extend_from_slice(&sink[idx_end + 8..]);
+        assert!(parse_casv_footer(&legacy).is_some(), "footer still valid");
+        assert_eq!(parse_casv_rate_box(&legacy), None);
+        assert_eq!(decode_casv_footer_all_rgb8(&legacy).unwrap().len(), 6);
     }
 }
