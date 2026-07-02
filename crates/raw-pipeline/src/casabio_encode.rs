@@ -432,6 +432,33 @@ pub fn encode_variants_from_rgb16_with_progressive(
     encode_variants_with_progressive(&rgba, width, height, source, hq_override, progressive_dc, group_order)
 }
 
+/// Owned-input twin of [`encode_variants_from_rgb16_with_progressive`] (deferred
+/// CASA-ENC-D4a). Takes the rgb16 master **by value** so the texture/clarity (unsharp)
+/// path mutates it in place instead of cloning the entire full-res buffer (−W·H·6 bytes
+/// at the pipeline's widest point: rgb16 + clone + 8-bit output no longer coexist), and
+/// the master is dropped as soon as the 8-bit buffer exists — before the encode fan-out.
+/// Byte-identical output to the borrowing entry for all inputs (locked by
+/// `owned_rgb16_entry_matches_borrowed`). Callers that keep their buffer stay on the
+/// borrowing entry.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_variants_from_rgb16_owned(
+    mut rgb16: Vec<u16>,
+    params: &crate::pipeline::PipelineParams,
+    width: u32,
+    height: u32,
+    source: SourceType,
+    hq_override: bool,
+    progressive_dc: u32,
+    group_order: u32,
+) -> Result<VariantSet, EncodeError> {
+    if params.texture != 0.0 || params.clarity != 0.0 {
+        crate::pipeline::apply_unsharp_masks(&mut rgb16, width as usize, height as usize, params);
+    }
+    let rgba = crate::pipeline::process_rgba(&rgb16, params);
+    drop(rgb16); // free the 16-bit master before the encode fan-out
+    encode_variants_with_progressive(&rgba, width, height, source, hq_override, progressive_dc, group_order)
+}
+
 // PR-6b: native sidecar pyramid encoder (v2 per-level distances, no 1.5 floor, box cascade).
 #[derive(Debug, Clone)]
 pub struct PyramidLevel {
@@ -1109,6 +1136,41 @@ mod tests {
         assert_eq!(v.height, 2);
         assert!(!v.full.is_empty());
         assert_eq!(v.full_quality, 90);
+    }
+
+    /// AE-2: the owned entry must be byte-identical to the borrowing entry on both the
+    /// texture/clarity (in-place unsharp) path and the plain path.
+    #[test]
+    fn owned_rgb16_entry_matches_borrowed() {
+        let (w, h) = (64u32, 48u32);
+        let mut s: u32 = 0xA5A5_1234;
+        let rgb16: Vec<u16> = (0..(w * h * 3))
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 16) as u16
+            })
+            .collect();
+        let mut params = crate::pipeline::PipelineParams::default_olympus();
+        for (t, c) in [(0.0f32, 0.0f32), (0.35, 0.2)] {
+            params.texture = t;
+            params.clarity = c;
+            let a = encode_variants_from_rgb16_with_progressive(
+                &rgb16, &params, w, h, SourceType::Raw, false, 0, 0,
+            )
+            .unwrap();
+            let b = encode_variants_from_rgb16_owned(
+                rgb16.clone(), &params, w, h, SourceType::Raw, false, 0, 0,
+            )
+            .unwrap();
+            assert_eq!(a.thumb_300, b.thumb_300, "thumb t={t} c={c}");
+            assert_eq!(a.preview_1080, b.preview_1080, "preview t={t} c={c}");
+            assert_eq!(a.full, b.full, "full t={t} c={c}");
+            assert_eq!(a.has_alpha, b.has_alpha);
+            assert_eq!(
+                (a.thumb_w, a.thumb_h, a.preview_w, a.preview_h, a.full_quality),
+                (b.thumb_w, b.thumb_h, b.preview_w, b.preview_h, b.full_quality)
+            );
+        }
     }
 
     #[test]
