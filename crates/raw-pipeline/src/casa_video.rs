@@ -60,6 +60,11 @@ pub const CASV_TILE_FLAG: u32 = 0x2000_0000;
 /// (not a residual to add). Used by the lossy tier — coding real pixels keeps
 /// JXL's perceptual model correct (a residual would be misjudged).
 pub const CASV_REPLACE_FLAG: u32 = 0x1000_0000;
+/// Header-level flag (CasvHeader.flags bit 0): every frame codestream in this
+/// file is FableBraid (crate::fable_braid), not JXL. I-frames are intra images;
+/// P-frames are temporal mod-256 deltas against the previous frame (COPY rows
+/// make unchanged rows near-free, subsuming the bbox/tile machinery).
+pub const CASV_HDR_FABLE_FLAG: u32 = 0x0000_0001;
 
 #[derive(thiserror::Error, Debug)]
 pub enum VideoError {
@@ -1267,6 +1272,67 @@ pub fn encode_casv_delta_bbox_rgb8(
     Ok(out)
 }
 
+/// Encode RGB8 frames as a FableBraid `.casv` (lossless, drift-free): I-frames
+/// every `gop_len`, P-frames as full-frame mod-256 temporal deltas against the
+/// previous *source* frame (lossless ⇒ reconstruction equals source, no in-loop
+/// decode). Decode side is the SIMD-rate FableBraid path — this is the tier
+/// that answers the Huffman challenge.
+pub fn encode_casv_fable_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    gop_len: u32,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+    let gop = gop_len.max(1) as usize;
+
+    let streams: Vec<(u32, Vec<u8>)> = (0..frames.len())
+        .into_par_iter()
+        .map(|idx| {
+            let px = frames[idx];
+            if px.len() != expected {
+                return Err(VideoError::FrameSize { idx, expected, got: px.len() });
+            }
+            if idx % gop == 0 {
+                Ok((0u32, crate::fable_braid::encode_rgb8(px, width, height)))
+            } else {
+                let delta =
+                    crate::fable_braid::encode_rgb8_delta(px, frames[idx - 1], width, height);
+                Ok((CASV_PFRAME_FLAG, delta))
+            }
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
+
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: frames.len() as u32,
+        fps_num,
+        fps_den,
+        flags: CASV_HDR_FABLE_FLAG,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for (flags, s) in &streams {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
+        offset += s.len();
+    }
+    for (_, s) in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
 /// Reconstruct a P-frame in place: `prev` holds the previous reconstructed frame
 /// and is mutated into the current frame. Handles both full-residual and
 /// bounding-box P-frames. `None` on malformed payloads.
@@ -1386,15 +1452,24 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
     let start = preceding_iframe(data, index)?;
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
+    let fable = hdr.flags & CASV_HDR_FABLE_FLAG != 0;
     let mut cur: Option<Vec<u8>> = None;
     for i in start..=index {
         let (is_p, slice) = casv_frame_info(data, i)?;
         if is_p {
             let mut prev = cur.take()?;
-            apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
+            if fable {
+                prev = crate::fable_braid::decode_rgb8_delta(slice, &prev, w, h)?;
+            } else {
+                apply_pframe(&mut prev, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
+            }
             cur = Some(prev);
         } else {
-            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
+            let (px, dw, dh) = if fable {
+                crate::fable_braid::decode_rgb8(slice)?
+            } else {
+                decode_interleaved::<u8>(slice, 3)?
+            };
             if (dw, dh) != (w, h) {
                 return None;
             }
@@ -1409,16 +1484,25 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
+    let fable = hdr.flags & CASV_HDR_FABLE_FLAG != 0;
     let mut out = Vec::with_capacity(hdr.frame_count as usize);
     let mut prev: Option<Vec<u8>> = None;
     for i in 0..hdr.frame_count as usize {
         let (is_p, slice) = casv_frame_info(data, i)?;
         let recon = if is_p {
             let mut base = prev.take()?;
-            apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
+            if fable {
+                base = crate::fable_braid::decode_rgb8_delta(slice, &base, w, h)?;
+            } else {
+                apply_pframe(&mut base, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
+            }
             base
         } else {
-            let (px, dw, dh) = decode_interleaved::<u8>(slice, 3)?;
+            let (px, dw, dh) = if fable {
+                crate::fable_braid::decode_rgb8(slice)?
+            } else {
+                decode_interleaved::<u8>(slice, 3)?
+            };
             if (dw, dh) != (w, h) {
                 return None;
             }
@@ -1503,6 +1587,41 @@ mod tests {
         for (i, (px, dw, dh)) in all.iter().enumerate() {
             assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
             assert_eq!(px, &src[i], "frame {i} must be byte-exact (lossless)");
+        }
+    }
+
+    #[test]
+    fn fable_roundtrip_is_byte_exact_with_gop_and_random_access() {
+        let (w, h) = (30u32, 22u32);
+        // 9 frames, GOP 4 → I at 0/4/8; includes identical consecutive frames
+        // (all-COPY deltas) and motion.
+        let mut src: Vec<Vec<u8>> = Vec::new();
+        for i in 0..9u32 {
+            let mut f = gradient(w, h, (i * 17) as u8);
+            if i == 3 {
+                f = src[2].clone(); // identical frame → pure-COPY P-frame
+            }
+            src.push(f);
+        }
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_fable_rgb8(&refs, w, h, 24, 1, 4).unwrap();
+
+        let hdr = parse_casv_header(&bytes).unwrap();
+        assert_eq!(hdr.flags & CASV_HDR_FABLE_FLAG, CASV_HDR_FABLE_FLAG);
+        assert!(!casv_frame_info(&bytes, 0).unwrap().0, "frame 0 is I");
+        assert!(casv_frame_info(&bytes, 1).unwrap().0, "frame 1 is P");
+        assert!(!casv_frame_info(&bytes, 4).unwrap().0, "frame 4 is I (GOP)");
+
+        let all = decode_casv_all_rgb8(&bytes).expect("decode all");
+        assert_eq!(all.len(), 9);
+        for (i, (px, dw, dh)) in all.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
+            assert_eq!(px, &src[i], "frame {i} byte-exact");
+        }
+        // Random access decodes forward from the preceding I-frame.
+        for i in [0usize, 3, 5, 8] {
+            let (px, _, _) = decode_casv_frame_rgb8(&bytes, i).expect("random access");
+            assert_eq!(px, src[i], "random access frame {i}");
         }
     }
 
