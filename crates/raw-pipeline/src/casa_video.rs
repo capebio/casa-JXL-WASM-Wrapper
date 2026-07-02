@@ -261,8 +261,8 @@ pub struct CasaVideoOptions {
     pub skip: SkipMode,
     /// Tile size for [`SkipMode::Tile`].
     pub tile: u32,
-    /// libjxl effort for the lossless / all-intra paths (lossy skip tiers use the
-    /// production default effort 3).
+    /// libjxl effort (1..=10), applied to every tier (lossless, all-intra lossy,
+    /// and the lossy bbox/tile skip tiers — batch and streaming alike).
     pub effort: u8,
     /// Change-detection threshold; `None` = auto from the lossy distance
     /// ([`default_thresh_for_distance`]). Lossless skipping is always exact.
@@ -389,12 +389,13 @@ pub fn encode_casv_video(
         }
         VideoRate::Lossy(distance) => {
             let thresh = opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance));
+            let enc = EncodeOptions::distance(distance).with_effort(opts.effort);
             match opts.skip {
                 SkipMode::None => {
-                    encode_casv_rgb8(frames, width, height, fps_num, fps_den, EncodeOptions::distance(distance).with_effort(opts.effort))
+                    encode_casv_rgb8(frames, width, height, fps_num, fps_den, enc)
                 }
-                SkipMode::Bbox => encode_casv_delta_lossy_bbox_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, distance, thresh),
-                SkipMode::Tile => encode_casv_delta_lossy_tiled_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, opts.tile, distance, thresh),
+                SkipMode::Bbox => encode_casv_delta_lossy_bbox_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, enc, thresh),
+                SkipMode::Tile => encode_casv_delta_lossy_tiled_rgb8(frames, width, height, fps_num, fps_den, opts.gop_len, opts.tile, enc, thresh),
             }
         }
     }?;
@@ -879,6 +880,9 @@ fn blit_into(dst: &mut [u8], width: u32, x: u32, y: u32, bw: u32, bh: u32, crop:
 /// unchanged regions, `distance`-level in changed ones) and does not accumulate;
 /// change detection runs on *source* frames, so the encoder never decodes its
 /// own output. Emits `PFRAME|BBOX|REPLACE` frames.
+///
+/// `opts` (typically `EncodeOptions::distance(d).with_effort(e)`) is applied to
+/// I-frames and P-frame crops alike; `thresh` is the change-detection threshold.
 pub fn encode_casv_delta_lossy_bbox_rgb8(
     frames: &[&[u8]],
     width: u32,
@@ -886,7 +890,7 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
     fps_num: u32,
     fps_den: u32,
     gop_len: u32,
-    distance: f32,
+    opts: EncodeOptions,
     thresh: u8,
 ) -> Result<Vec<u8>, VideoError> {
     if frames.is_empty() {
@@ -894,7 +898,6 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
     }
     let expected = (width as usize) * (height as usize) * 3;
     let gop = gop_len.max(1) as usize;
-    let opts = EncodeOptions::distance(distance);
 
     let mut streams: Vec<(u32, Vec<u8>)> = Vec::with_capacity(frames.len());
     for (idx, px) in frames.iter().enumerate() {
@@ -953,6 +956,9 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
 /// but codes each *changed tile*'s fresh pixels into an atlas and REPLACEs those
 /// tiles on decode — for scattered / multi-region motion. Emits
 /// `PFRAME|TILE|REPLACE` frames. Changed tiles detected vs the previous source.
+///
+/// `opts` (typically `EncodeOptions::distance(d).with_effort(e)`) is applied to
+/// I-frames and P-frame atlases alike; `thresh` is the change-detection threshold.
 pub fn encode_casv_delta_lossy_tiled_rgb8(
     frames: &[&[u8]],
     width: u32,
@@ -961,7 +967,7 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
     fps_den: u32,
     gop_len: u32,
     tile: u32,
-    distance: f32,
+    opts: EncodeOptions,
     thresh: u8,
 ) -> Result<Vec<u8>, VideoError> {
     if frames.is_empty() {
@@ -972,7 +978,6 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
     let t = tile.max(1);
     let (txn, _tyn) = tile_grid(width, height, t);
     let (w, ts) = (width as usize, t as usize);
-    let opts = EncodeOptions::distance(distance);
 
     let mut streams: Vec<(u32, Vec<u8>)> = Vec::with_capacity(frames.len());
     for (idx, px) in frames.iter().enumerate() {
@@ -1917,7 +1922,7 @@ mod tests {
         let src = low_motion(w, h, 8);
         let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
         let d = 1.0f32;
-        let skip = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, d, 0).unwrap();
+        let skip = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, EncodeOptions::distance(d), 0).unwrap();
         let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(d)).unwrap();
         assert!(
             skip.len() < intra.len(),
@@ -1992,8 +1997,8 @@ mod tests {
             })
             .collect();
         let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
-        let exact = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 6, 1.0, 0).unwrap();
-        let thr = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 6, 1.0, 4).unwrap();
+        let exact = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 6, EncodeOptions::distance(1.0), 0).unwrap();
+        let thr = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 6, EncodeOptions::distance(1.0), 4).unwrap();
         assert!(
             thr.len() < exact.len(),
             "threshold ({}) should skip noise vs exact ({})",
@@ -2009,7 +2014,7 @@ mod tests {
         let src = two_region_motion(w, h, 8);
         let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
         let d = 1.0f32;
-        let skip = encode_casv_delta_lossy_tiled_rgb8(&refs, w, h, 24, 1, 8, 16, d, 0).unwrap();
+        let skip = encode_casv_delta_lossy_tiled_rgb8(&refs, w, h, 24, 1, 8, 16, EncodeOptions::distance(d), 0).unwrap();
         let intra = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(d)).unwrap();
         assert!(
             skip.len() < intra.len(),
@@ -2205,6 +2210,54 @@ mod tests {
         let q = CasaVideoOptions::jolt(JoltPreset::Quality);
         assert!(matches!(q.rate, VideoRate::Lossy(d) if d == 0.5));
         assert_eq!(q.effort, 4);
+    }
+
+    #[test]
+    fn batch_lossy_paths_honor_effort() {
+        // The batch lossy skip encoders must apply `opts.effort` — the header's
+        // rate_effort metadata promises the effort that was actually used, and
+        // the streaming path already honors it. Proof: every batch P-frame
+        // payload must be byte-identical to the streaming one (identical encoder
+        // settings), for the presets whose effort differs from the old
+        // hard-coded default (Realtime e1, Quality e4).
+        let (w, h) = (64u32, 64u32);
+        let frames = low_motion(w, h, 6);
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+
+        for preset in [JoltPreset::Realtime, JoltPreset::Quality] {
+            for skip in [SkipMode::Tile, SkipMode::Bbox] {
+                let opts = CasaVideoOptions {
+                    gop_len: 6,
+                    skip,
+                    thresh: Some(0),
+                    ..CasaVideoOptions::jolt(preset)
+                };
+                let batch = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();
+                let hdr = parse_casv_header(&batch).unwrap();
+                assert_eq!(hdr.rate_effort(), opts.effort, "header records the applied effort");
+
+                let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+                let stream = encode_casv_video_streaming(&mut src, &opts).unwrap();
+                for i in 1..6 {
+                    assert_eq!(
+                        casv_frame_slice(&batch, i).unwrap(),
+                        casv_frame_slice(&stream, i).unwrap(),
+                        "batch vs streaming P-frame {i} must use the same effort ({preset:?}, {skip:?})"
+                    );
+                }
+            }
+        }
+
+        // And the knob is live: a different effort changes the P-frame bitstream.
+        let e1 = encode_casv_delta_lossy_tiled_rgb8(
+            &refs, w, h, 24, 1, 6, 16, EncodeOptions::distance(1.0).with_effort(1), 0,
+        )
+        .unwrap();
+        let e3 = encode_casv_delta_lossy_tiled_rgb8(
+            &refs, w, h, 24, 1, 6, 16, EncodeOptions::distance(1.0).with_effort(3), 0,
+        )
+        .unwrap();
+        assert_ne!(e1, e3, "effort must change the encoded stream");
     }
 
     #[test]
