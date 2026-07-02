@@ -8,6 +8,7 @@ const KNOWN_JXL_ERROR_CODES = new Set([
     "MalformedCodestream", "TruncatedStream", "UnsupportedFeature", "OutOfMemory",
     "BudgetExceeded", "Cancelled", "WorkerCrashed", "CapabilityMissing", "ConfigError",
     "QueueOverflow", "Internal",
+    "DuplicateSession", "UnhandledError", "UnhandledRejection", "WorkerError", "MessageDeserializeError",
 ]);
 // Typed literals for JxlError ctor sites (ensures assignability to JxlErrorCode param
 // under all tsconfigs; also provides compile-time check if union removes a code).
@@ -17,6 +18,21 @@ const BUDGET_EXCEEDED = "BudgetExceeded";
 const CONFIG_ERROR = "ConfigError";
 function isPromiseLike(value) {
     return typeof value?.then === "function";
+}
+export function computeDecodeWeight(opts) {
+    const explicit = opts.expectedOutputBytes;
+    if (typeof explicit === "number" && Number.isFinite(explicit) && explicit > 0)
+        return explicit;
+    const w = opts.targetWidth;
+    const h = opts.targetHeight;
+    if (typeof w === "number" && typeof h === "number" && w > 0 && h > 0) {
+        // Use the requested output format's bytes-per-pixel; default to 4 (rgba8) for unknown.
+        const bpp = opts.format === "rgba16" ? 8 : opts.format === "rgbaf32" ? 16 : opts.format === "rgb8" ? 3 : 4;
+        const bytes = w * h * bpp;
+        if (Number.isFinite(bytes) && bytes <= Number.MAX_SAFE_INTEGER)
+            return bytes;
+    }
+    return undefined;
 }
 export class DecodeSessionImpl {
     id;
@@ -76,12 +92,14 @@ export class DecodeSessionImpl {
             // Register the message handler BEFORE acquireSlot sends decode_start,
             // so decode_header is never missed.
             scheduler.onMessage(this.id, (msg) => this.handleMessage(msg));
+            const weight = computeDecodeWeight(opts);
             return scheduler.acquireSlot({
                 sessionId: this.id,
                 priority: startMsg.priority,
                 startMsg,
                 sourceKey: null,
                 signal: opts.signal ?? null,
+                ...(weight !== undefined ? { weight } : {}),
             });
         };
         this.acquirePromise = (isPromiseLike(schedulerOrPromise)
@@ -188,14 +206,39 @@ export class DecodeSessionImpl {
     // Each field is optional; absent fields (e.g. a Node worker that posts metrics the
     // old way, or a zero-copy frame) emit nothing — additive, never double-counts.
     makeFrame(stage, msg) {
-        return {
+        // Guard-assign onto one result object rather than conditional-spreading. Each
+        // `...(cond ? { X } : {})` allocated a throwaway intermediate object (or {}) that was
+        // immediately copied and garbaged — up to 11 per frame, on the per-pass/per-animation-
+        // frame path. Direct assignment under exactOptionalPropertyTypes is byte-identical (only
+        // present fields are set) and mirrors toFrameMeta() in jxl-worker-browser/decode-handler.
+        const ev = {
             stage,
             info: msg.info,
             pixels: msg.pixels,
             format: msg.format,
             pixelStride: msg.pixelStride,
-            ...(msg.region !== undefined ? { region: msg.region } : {}),
         };
+        if (msg.region !== undefined)
+            ev.region = msg.region;
+        if (msg.sourceScale !== undefined)
+            ev.sourceScale = msg.sourceScale;
+        if (msg.progressiveRegion !== undefined)
+            ev.progressiveRegion = msg.progressiveRegion;
+        if (msg.regionFallback !== undefined)
+            ev.regionFallback = msg.regionFallback;
+        if (msg.progressiveSequence !== undefined)
+            ev.progressiveSequence = msg.progressiveSequence;
+        if (msg.passOrdinal !== undefined)
+            ev.passOrdinal = msg.passOrdinal;
+        if (msg.frameIndex !== undefined)
+            ev.frameIndex = msg.frameIndex;
+        if (msg.frameDuration !== undefined)
+            ev.frameDuration = msg.frameDuration;
+        if (msg.frameName !== undefined)
+            ev.frameName = msg.frameName;
+        if (msg.animTicksPerSecond !== undefined)
+            ev.animTicksPerSecond = msg.animTicksPerSecond;
+        return ev;
     }
     emitFoldedMetrics(m) {
         const cb = this.opts.onMetric;
@@ -235,8 +278,9 @@ export class DecodeSessionImpl {
                 }
                 // progressionTarget "header" stops the worker right after the header — it
                 // sends no decode_final — so complete here, otherwise done() hangs forever.
+                // localEarlyFinish=true: no terminal ack arrives, release the scheduler slot now.
                 if ((this.opts.progressionTarget ?? "final") === "header") {
-                    this.finish(msg.info);
+                    this.finish(msg.info, true);
                 }
                 break;
             case "decode_progress": {
@@ -249,9 +293,10 @@ export class DecodeSessionImpl {
                 // Mirror the worker's early-finish: for a non-"final" target with
                 // emitEveryPass disabled, the worker stops after the first progress and
                 // sends no decode_final, so complete here or done() would hang.
+                // localEarlyFinish=true: no terminal ack arrives, release the scheduler slot now.
                 if ((this.opts.progressionTarget ?? "final") !== "final" &&
                     (this.opts.emitEveryPass ?? true) === false) {
-                    this.finish(msg.info);
+                    this.finish(msg.info, true);
                 }
                 break;
             }
@@ -274,7 +319,7 @@ export class DecodeSessionImpl {
                 break;
             }
             case "decode_error": {
-                const code = this.normalizeCode(msg.code);
+                const { code, originalCode } = this.normalizeCode(msg.code);
                 let partial;
                 if (code === "TruncatedStream" && msg.partialPixels !== undefined && msg.partialInfo !== undefined) {
                     // partialPixelStride is required whenever partialPixels is present; a
@@ -293,7 +338,18 @@ export class DecodeSessionImpl {
                 }
                 // Truncate worker-supplied message to prevent unbounded strings in
                 // error objects (task 007-security-i9j0k1l2).
-                const safeMessage = String(msg.message).slice(0, 512);
+                // Guard String() coercion — msg.message may be an odd object whose toString() throws.
+                let safeMessage;
+                try {
+                    safeMessage = String(msg.message).slice(0, 512);
+                }
+                catch {
+                    safeMessage = "(non-stringifiable message)";
+                }
+                // When the wire code was unrecognised, append it so the real cause isn't lost.
+                if (originalCode !== undefined) {
+                    safeMessage = `[wire code: ${originalCode}] ${safeMessage}`.slice(0, 512);
+                }
                 const err = new JxlError(code, safeMessage, {
                     sessionId: this.id,
                     ...(partial !== undefined ? { partial } : {}),
@@ -334,11 +390,24 @@ export class DecodeSessionImpl {
             this.abortSignal.removeEventListener("abort", this.abortHandler);
         }
     }
-    finish(info) {
+    /**
+     * @param localEarlyFinish - true when the session completes locally without a terminal
+     *   worker message (progressionTarget="header" or emitEveryPass=false non-final target).
+     *   In those cases no decode_final/decode_cancelled ack arrives, so the scheduler slot
+     *   and onMessage handler are never released by the normal terminal path — we must
+     *   release them here via completeSession().
+     *   False/absent on the normal decode_final path where the scheduler cleans up itself.
+     */
+    finish(info, localEarlyFinish = false) {
         if (this.terminated)
             return;
         this.terminated = true;
         this.cleanup();
+        // Release the scheduler slot when we finished locally (no worker terminal ack coming).
+        // completeSession() is idempotent on unknown sessionIds — safe to call once here.
+        if (localEarlyFinish) {
+            this.scheduler?.completeSession(this.id);
+        }
         this.frameStream.end();
         if (!this.doneDeferred.settled) {
             this.doneDeferred.resolve(info);
@@ -380,8 +449,9 @@ export class DecodeSessionImpl {
     }
     normalizeCode(code) {
         if (KNOWN_JXL_ERROR_CODES.has(code))
-            return code;
-        return "Internal";
+            return { code: code, originalCode: undefined };
+        // Unknown wire code: map to Internal but preserve original so it isn't silently lost.
+        return { code: "Internal", originalCode: code };
     }
 }
 // stage union verified in jxl-core/src/types.ts: DecodeStage = "header" | "dc" | "pass" | "final"

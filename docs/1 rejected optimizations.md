@@ -1686,3 +1686,16 @@ runs), and complicates correctness for the remainder slice. The shipped alternat
 (fused reassemble+crop straight into the output Vec, branch c2f8) removes the full-raster
 temp AND the separate crop pass while keeping contiguous row-run copies; measured −6.3%
 whole-decode (owned) / −11.3% (warm scratch) on _MG_1750 with byte-exact parity.
+### G2-F6 follow-up (2026-07-02): memory-weighted admission gate IMPLEMENTED
+The concurrency-shape concern is now benchmark-justified (project-preview-concurrency-evidence:
+pyramid decode ~80MB-flat scales past core count; full-res decode ~250MB/worker, flat cap of ~4
+justified there but starves the cheap/thumbnail path ~2×). Shipped opt-in
+`MemoryWeightedAdmissionGate` (jxl-scheduler): admission weight ∝ output bytes (decode:
+expectedOutputBytes hint or targetW*targetH*4; encode: width*height*bpp), a shared byte-budget
+weighted semaphore replaces the flat count cap as the concurrency limiter, and the worker
+ceiling is raised (2*HWC) when the gate is on so the budget is the effective limiter. Opt-in via
+`ContextOptions.memoryGate` (+ `memoryCapBytes` budget); default off = unchanged behavior.
+This is DISTINCT from the still-rejected MT-routing work-class hint in G2-F6 (that concerned
+`router.pick`/`shouldUseMtImmediately`, not admission). Spec:
+docs/superpowers/specs/2026-07-02-memory-admission-gate-design.md; plan:
+docs/superpowers/plans/2026-07-02-memory-admission-gate.md.

@@ -79,6 +79,8 @@ export interface DecodeOptions {
   priority?: "visible" | "near" | "background";
   budgetMs?: number;
   signal?: AbortSignal;
+  /** Estimated decoded output size in bytes; used as the scheduler admission weight. */
+  expectedOutputBytes?: number;
   // Telemetry
   onMetric?: (m: CodecMetric) => void;
 }
@@ -358,6 +360,11 @@ export interface Capabilities {
 // Context options (spec Section 5 prose)
 export interface ContextOptions {
   poolSize?: number;
+  /** Enable the memory-weighted admission gate: decode/encode concurrency is bounded by a byte
+   *  budget (sum of per-task output-byte weights) instead of a flat worker count, and the worker
+   *  ceiling is raised so the budget is the effective limiter. Opt-in; default off. */
+  memoryGate?: boolean;
+  /** Byte budget for the memory gate (used when memoryGate is true). Default 512 MB. */
   memoryCapBytes?: number;
   idleTimeoutMs?: number;
   pushHwm?: number;

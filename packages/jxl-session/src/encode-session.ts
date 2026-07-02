@@ -86,6 +86,18 @@ function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
   return typeof (value as Promise<T>)?.then === "function";
 }
 
+/** Estimated encode input footprint (width*height*bpp) used as the scheduler admission
+ *  weight. Returns undefined for hostile/overflowing dims so the gate applies its default. */
+export function computeEncodeWeight(opts: {
+  width: number;
+  height: number;
+  format: string;
+}): number | undefined {
+  const bpp = opts.format === "rgba8" ? 4 : opts.format === "rgba16" ? 8 : opts.format === "rgb8" ? 3 : 16;
+  const bytes = opts.width * opts.height * bpp;
+  return Number.isFinite(bytes) && bytes > 0 && bytes <= Number.MAX_SAFE_INTEGER ? bytes : undefined;
+}
+
 export class EncodeSessionImpl implements EncodeSession {
   readonly id: string;
 
@@ -127,12 +139,14 @@ export class EncodeSessionImpl implements EncodeSession {
       if (this.terminated) return Promise.resolve();
       this.scheduler = scheduler;
       scheduler.onMessage(this.id, (msg) => this.handleMessage(msg));
+      const weight = computeEncodeWeight(opts);
       return scheduler.acquireSlot({
         sessionId: this.id,
         priority: startMsg.priority,
         startMsg,
         sourceKey: null,
         signal: opts.signal ?? null,
+        ...(weight !== undefined ? { weight } : {}),
       });
     };
 

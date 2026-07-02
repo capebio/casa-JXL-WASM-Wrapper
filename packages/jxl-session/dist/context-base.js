@@ -1,6 +1,6 @@
 // Shared JxlContext implementation. Environment-specific entry points live in
 // context.ts and browser.ts so browser bundlers never see node worker imports.
-import { Scheduler, globalCoreBudget, defaultCoreBudgetCapacity, } from "@casabio/jxl-scheduler";
+import { Scheduler, globalCoreBudget, defaultCoreBudgetCapacity, MemoryWeightedAdmissionGate, } from "@casabio/jxl-scheduler";
 import { DecodeSessionImpl } from "./decode-session.js";
 import { EncodeSessionImpl } from "./encode-session.js";
 import { shouldUseMtImmediately } from "./tier-routing.js";
@@ -71,14 +71,34 @@ export function computeWorkerCostForWasmUrl(url) {
     }
     return 1;
 }
+// Shared across every scheduler/context (like globalCoreBudget) so the byte budget bounds
+// total concurrent decode/encode memory, not per-scheduler memory. Lazily created on first
+// opt-in; the first budget wins (subsequent budgets are ignored, mirroring globalCoreBudget).
+const DEFAULT_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024;
+let globalMemoryGate;
+function getGlobalMemoryGate(budgetBytes) {
+    if (globalMemoryGate === undefined) {
+        globalMemoryGate = new MemoryWeightedAdmissionGate({
+            budgetBytes: budgetBytes ?? DEFAULT_MEMORY_BUDGET_BYTES,
+        });
+    }
+    return globalMemoryGate;
+}
 function createScheduler(factory, opts, maxWorkers, workerCost) {
+    const useMemoryGate = opts?.memoryGate === true;
+    // With the memory gate, the byte budget is the concurrency limiter, so raise the worker
+    // ceiling past the flat default; without it, keep the caller's maxWorkers unchanged.
+    const effectiveMaxWorkers = useMemoryGate
+        ? Math.max(maxWorkers, 2 * hardwareConcurrency())
+        : maxWorkers;
     return new Scheduler({
         factory,
-        maxWorkers,
+        maxWorkers: effectiveMaxWorkers,
         idleTimeoutMs: opts?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS,
         ...(opts?.pushHwm !== undefined ? { pushHwm: opts.pushHwm } : {}),
         coreBudget: globalCoreBudget,
         workerCost,
+        ...(useMemoryGate ? { admissionGate: getGlobalMemoryGate(opts?.memoryCapBytes) } : {}),
     });
 }
 class CapabilityAwareContext {
@@ -95,8 +115,9 @@ class CapabilityAwareContext {
                     this.caps = validated;
                 }
             }
-            catch {
+            catch (e) {
                 // Probe unavailable - keep the conservative default.
+                console.warn("[jxl-session] probeCapabilities failed (using defaults):", e);
             }
             finally {
                 this.probeSettled = true;
