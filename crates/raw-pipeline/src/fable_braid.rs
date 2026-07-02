@@ -957,7 +957,8 @@ pub struct DeltaDecodeSession {
     planes: [Vec<u8>; 3],
     /// Decode destination for the next frame (last frame's discarded planes).
     spare: [Vec<u8>; 3],
-    scratch: DecodeScratch,
+    /// One scratch per plane so the planes can decode in parallel.
+    scratch: [DecodeScratch; 3],
     /// Dimensions the cached `planes` describe; None until the first decode.
     dims: Option<(u32, u32)>,
 }
@@ -973,7 +974,7 @@ impl DeltaDecodeSession {
         DeltaDecodeSession {
             planes: [Vec::new(), Vec::new(), Vec::new()],
             spare: [Vec::new(), Vec::new(), Vec::new()],
-            scratch: DecodeScratch::default(),
+            scratch: [DecodeScratch::default(), DecodeScratch::default(), DecodeScratch::default()],
             dims: None,
         }
     }
@@ -984,14 +985,46 @@ impl DeltaDecodeSession {
     fn decode_planes_into(&mut self, pb: &PlaneBlobs, ext: bool) -> Option<Vec<u8>> {
         let (w, h) = (pb.w as usize, pb.h as usize);
         let planes = &self.planes;
-        let spare = &mut self.spare;
-        let scratch = &mut self.scratch;
-        for i in 0..3 {
+        let [s0, s1, s2] = &mut self.spare;
+        let [c0, c1, c2] = &mut self.scratch;
+        // Shared by the serial and plane-parallel arms; disjoint &mut are
+        // passed in, everything captured is shared/immutable.
+        let decode_one = |i: usize, sc: &mut DecodeScratch, out: &mut Vec<u8>| -> Option<()> {
             let mut pr = Reader { b: pb.blobs[i], p: 0 };
             let e = if ext { Some(planes[i].as_slice()) } else { None };
-            decode_plane_into(&mut pr, w, h, e, &mut scratch.tab, &mut scratch.res, &mut spare[i])?;
+            decode_plane_into(&mut pr, w, h, e, &mut sc.tab, &mut sc.res, out)
+        };
+        // Plane-parallel gate: measured on the ghana corpus (48f, interleaved
+        // binary flipflop, floors): 1280x720 −41%, 480x270 −13%, 160x90 +17%
+        // (rayon join dispatch ~25µs/frame dominates tiny planes). 64K px sits
+        // between the measured loss (14.4K px) and win (129.6K px) points.
+        #[cfg(feature = "parallel")]
+        const PARALLEL_MIN_PIXELS: usize = 64 * 1024;
+        #[cfg(feature = "parallel")]
+        if w * h >= PARALLEL_MIN_PIXELS {
+            // The three plane blobs are fully independent at decode time
+            // (External predictors are the cached planes, Top only needs the
+            // plane's own rows) — identical per-plane computation, no shared
+            // mutable state, so output is byte-exact by construction.
+            let (r0, (r1, r2)) = rayon::join(
+                || decode_one(0, c0, s0),
+                || rayon::join(|| decode_one(1, c1, s1), || decode_one(2, c2, s2)),
+            );
+            r0?;
+            r1?;
+            r2?;
+        } else {
+            decode_one(0, c0, s0)?;
+            decode_one(1, c1, s1)?;
+            decode_one(2, c2, s2)?;
         }
-        let out = interleave3_rct_undo(&spare[0], &spare[1], &spare[2], w * h);
+        #[cfg(not(feature = "parallel"))]
+        {
+            decode_one(0, c0, s0)?;
+            decode_one(1, c1, s1)?;
+            decode_one(2, c2, s2)?;
+        }
+        let out = interleave3_rct_undo(&self.spare[0], &self.spare[1], &self.spare[2], w * h);
         std::mem::swap(&mut self.planes, &mut self.spare);
         self.dims = Some((pb.w, pb.h));
         Some(out)
