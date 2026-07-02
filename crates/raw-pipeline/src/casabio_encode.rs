@@ -148,6 +148,16 @@ pub fn encode_variants_cancellable(
     // nothing. has_meaningful_alpha does the same early-out alpha scan with zero allocation.
     let has_alpha = has_meaningful_alpha(rgba);
 
+    // Meta-seam cut (variant half of landed d1x9): opaque input → strip alpha ONCE and run
+    // the whole cascade + all three encodes RGB-native. The image-crate samplers are
+    // per-channel independent (`image_resize_rgb_matches_rgba_then_strip`), so
+    // resize_rgb ∘ strip == strip ∘ resize_rgba and the VariantSet bytes are identical
+    // to the old RGBA-resize-then-strip-per-tier path. Alpha inputs keep the RGBA path.
+    if !has_alpha {
+        let rgb = strip_rgba_to_rgb(rgba);
+        return encode_variants_rgb_cancellable(&rgb, width, height, source, hq_override, opts, cancel);
+    }
+
     let full_quality: u8 = if hq_override {
         95
     } else if source == SourceType::Raw {
@@ -296,6 +306,175 @@ pub fn encode_variants_cancellable(
     })
 }
 
+/// RGB-native variant core (opaque inputs only): the entire cascade (Lanczos3 preview,
+/// Triangle thumb) and all three encodes run on 3-channel buffers — no alpha plane is
+/// ever created, scanned, resized, or stripped. Mirrors `encode_variants_cancellable`
+/// stage-for-stage (same quality ladder, cancel points, and leaf-coalescing predicate);
+/// byte-identical to the RGBA path with `has_alpha == false` because the samplers are
+/// per-channel independent (`image_resize_rgb_matches_rgba_then_strip`) and
+/// `process_rgb == strip(process_rgba)` (both test-locked).
+fn encode_variants_rgb_cancellable(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    source: SourceType,
+    hq_override: bool,
+    opts: ProgressiveOpts,
+    cancel: &AtomicBool,
+) -> Result<VariantSet, EncodeError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(EncodeError::Cancelled);
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(3));
+    if width == 0 || height == 0 || expected != Some(rgb.len()) {
+        return Err(EncodeError::Input {
+            expected: expected.unwrap_or(usize::MAX),
+            got: rgb.len(),
+        });
+    }
+
+    let full_quality: u8 = if hq_override {
+        95
+    } else if source == SourceType::Raw {
+        90 // Pixel 9 DNG optimized: Q90/E3 balance speed + quality
+    } else {
+        85
+    };
+
+    let max_dim = width.max(height);
+
+    // Cascade resizing: full -> preview (1080) -> thumb (300), all 3-channel.
+    let (preview_rgb, pw, ph) = if max_dim > 1080 {
+        let scale = 1080.0 / max_dim as f32;
+        let dw = (width as f32 * scale).round().max(1.0) as u32;
+        let dh = (height as f32 * scale).round().max(1.0) as u32;
+        (Some(resize_rgb(rgb, width, height, dw, dh)?), dw, dh)
+    } else {
+        (None, width, height)
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Err(EncodeError::Cancelled);
+    }
+
+    let preview_src: &[u8] = preview_rgb.as_deref().unwrap_or(rgb);
+
+    let preview_long = pw.max(ph);
+    let (thumb_rgb, tw, th) = if preview_long > 300 {
+        let scale = 300.0 / preview_long as f32;
+        let dw = (pw as f32 * scale).round().max(1.0) as u32;
+        let dh = (ph as f32 * scale).round().max(1.0) as u32;
+        // Thumbnail (≤300px): Triangle filter, same as the RGBA path.
+        (Some(resize_rgb_fast(preview_src, pw, ph, dw, dh)?), dw, dh)
+    } else {
+        (None, pw, ph)
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Err(EncodeError::Cancelled);
+    }
+
+    let thumb_src: &[u8] = thumb_rgb.as_deref().unwrap_or(preview_src);
+
+    let preview_opts = ProgressiveOpts {
+        progressive_dc: 0,
+        group_order: opts.group_order,
+        center: opts.center,
+    };
+    let thumb_opts = ProgressiveOpts::default();
+
+    // Leaf coalescing: identical predicate to the RGBA path (see the comment there).
+    let coalesce_preview_full =
+        preview_rgb.is_none() && full_quality == 85 && opts.progressive_dc == 0;
+    debug_assert!(
+        !coalesce_preview_full || (EFFORT_PREVIEW == EFFORT_FULL && (pw, ph) == (width, height)),
+        "leaf-coalescing predicate drifted from the tier parameters"
+    );
+
+    #[cfg(feature = "parallel")]
+    let (thumb_300, preview_1080, full) = {
+        if coalesce_preview_full {
+            let (thumb_res, pf_res) = rayon::join(
+                || {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    encode_variant_rgb(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, width, height)
+                },
+                || {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    encode_variant_rgb(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, width, height)
+                },
+            );
+            let pf = pf_res?;
+            (thumb_res?, pf.clone(), pf)
+        } else {
+            // Each rayon branch owns its own Encoder (owned-value semantics).
+            let (thumb_res, (preview_res, full_res)) = rayon::join(
+                || {
+                    if cancel.load(Ordering::Acquire) {
+                        return Err(EncodeError::Cancelled);
+                    }
+                    encode_variant_rgb(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, width, height)
+                },
+                || {
+                    rayon::join(
+                        || {
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(EncodeError::Cancelled);
+                            }
+                            encode_variant_rgb(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, width, height)
+                        },
+                        || {
+                            if cancel.load(Ordering::Acquire) {
+                                return Err(EncodeError::Cancelled);
+                            }
+                            encode_variant_rgb(rgb, width, height, full_quality, EFFORT_FULL, opts, width, height)
+                        },
+                    )
+                },
+            );
+            (thumb_res?, preview_res?, full_res?)
+        }
+    };
+
+    #[cfg(not(feature = "parallel"))]
+    let (thumb_300, preview_1080, full) = {
+        // One held Encoder, reused across the whole variant set.
+        let mut enc = Encoder::new(EncodeOptions::default())?;
+        let t = encode_rgb_into(&mut enc, thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, width, height)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(EncodeError::Cancelled);
+        }
+        let p = encode_rgb_into(&mut enc, preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, width, height)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(EncodeError::Cancelled);
+        }
+        let f = if coalesce_preview_full {
+            p.clone()
+        } else {
+            encode_rgb_into(&mut enc, rgb, width, height, full_quality, EFFORT_FULL, opts, width, height)?
+        };
+        (t, p, f)
+    };
+
+    Ok(VariantSet {
+        thumb_300,
+        preview_1080,
+        full,
+        width,
+        height,
+        thumb_w: tw,
+        thumb_h: th,
+        preview_w: pw,
+        preview_h: ph,
+        full_quality,
+        has_alpha: false,
+    })
+}
+
 /// Build encode options for one variant level (quality + effort + progressive).
 /// Group-order center is scaled from full-res coords into this level's coords.
 fn build_opts(
@@ -380,6 +559,51 @@ fn encode_variant(
     encode_into(&mut enc, pixels, w, h, quality, effort, prog, has_alpha, orig_w, orig_h)
 }
 
+/// Encode one variant from an **already-RGB** (3ch) buffer, reusing a held [`Encoder`].
+/// Opaque path only — no strip, no alpha. Output byte-identical to
+/// `encode_into(.., has_alpha = false)` fed the matching RGBA buffer.
+#[allow(clippy::too_many_arguments)]
+fn encode_rgb_into(
+    enc: &mut Encoder,
+    rgb: &[u8], // RGB8, w*h*3
+    w: u32,
+    h: u32,
+    quality: u8,
+    effort: u8,
+    prog: ProgressiveOpts,
+    orig_w: u32,
+    orig_h: u32,
+) -> Result<Vec<u8>, EncodeError> {
+    // Same shape contract as encode_into, for the 3-channel buffer.
+    let expected = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|wh| wh.checked_mul(3));
+    if expected != Some(rgb.len()) {
+        return Err(EncodeError::Input {
+            expected: expected.unwrap_or(usize::MAX),
+            got: rgb.len(),
+        });
+    }
+    enc.set_options(build_opts(quality, effort, prog, w, h, orig_w, orig_h));
+    Ok(enc.encode(&Frame::rgb(rgb, w, h))?)
+}
+
+/// RGB twin of [`encode_variant`] (fresh one-shot [`Encoder`], rayon branch).
+#[allow(clippy::too_many_arguments)]
+fn encode_variant_rgb(
+    rgb: &[u8],
+    w: u32,
+    h: u32,
+    quality: u8,
+    effort: u8,
+    prog: ProgressiveOpts,
+    orig_w: u32,
+    orig_h: u32,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut enc = Encoder::new(EncodeOptions::default())?;
+    encode_rgb_into(&mut enc, rgb, w, h, quality, effort, prog, orig_w, orig_h)
+}
+
 fn resize_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, EncodeError> {
     use image::{imageops, ImageBuffer, Rgba};
     let img: ImageBuffer<Rgba<u8>, &[u8]> =
@@ -393,6 +617,29 @@ fn resize_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>
 fn resize_rgba_fast(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, EncodeError> {
     use image::{imageops, ImageBuffer, Rgba};
     let img: ImageBuffer<Rgba<u8>, &[u8]> =
+        ImageBuffer::from_raw(sw, sh, src).ok_or(EncodeError::Resize)?;
+    let resized = imageops::resize(&img, dw, dh, imageops::FilterType::Triangle);
+    Ok(resized.into_raw())
+}
+
+/// 3-channel twin of [`resize_rgba`] (Lanczos3). The image-crate samplers filter each
+/// channel independently with geometry-only weights (locked by
+/// `image_resize_rgb_matches_rgba_then_strip`), so `resize_rgb(strip(x)) ==
+/// strip(resize_rgba(x))` — dropping the constant-α plane saves 25% of the filter
+/// arithmetic and the sw×dh 4th-channel intermediate without perturbing r/g/b bytes.
+fn resize_rgb(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, EncodeError> {
+    use image::{imageops, ImageBuffer, Rgb};
+    let img: ImageBuffer<Rgb<u8>, &[u8]> =
+        ImageBuffer::from_raw(sw, sh, src).ok_or(EncodeError::Resize)?;
+    let resized = imageops::resize(&img, dw, dh, imageops::FilterType::Lanczos3);
+    Ok(resized.into_raw())
+}
+
+/// 3-channel twin of [`resize_rgba_fast`] (Triangle). Same parity argument as
+/// [`resize_rgb`].
+fn resize_rgb_fast(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, EncodeError> {
+    use image::{imageops, ImageBuffer, Rgb};
+    let img: ImageBuffer<Rgb<u8>, &[u8]> =
         ImageBuffer::from_raw(sw, sh, src).ok_or(EncodeError::Resize)?;
     let resized = imageops::resize(&img, dw, dh, imageops::FilterType::Triangle);
     Ok(resized.into_raw())
@@ -422,14 +669,26 @@ pub fn encode_variants_from_rgb16_with_progressive(
     progressive_dc: u32,
     group_order: u32,
 ) -> Result<VariantSet, EncodeError> {
-    let rgba = if params.texture != 0.0 || params.clarity != 0.0 {
+    // RAW source → opaque by construction. Tone-map straight to RGB (process_rgb is the
+    // byte-exact 3ch twin of process_rgba — α was a hardcoded 255) and run the RGB-native
+    // variant core: no alpha plane, no full-frame alpha scan, no per-tier strips. Same
+    // meta-seam cut the pyramid from_rgb16 entry already ships.
+    let rgb = if params.texture != 0.0 || params.clarity != 0.0 {
         let mut rgb16_mut = rgb16.to_vec();
         crate::pipeline::apply_unsharp_masks(&mut rgb16_mut, width as usize, height as usize, params);
-        crate::pipeline::process_rgba(&rgb16_mut, params)
+        crate::pipeline::process_rgb(&rgb16_mut, params)
     } else {
-        crate::pipeline::process_rgba(rgb16, params)
+        crate::pipeline::process_rgb(rgb16, params)
     };
-    encode_variants_with_progressive(&rgba, width, height, source, hq_override, progressive_dc, group_order)
+    encode_variants_rgb_cancellable(
+        &rgb,
+        width,
+        height,
+        source,
+        hq_override,
+        ProgressiveOpts { progressive_dc, group_order, center: None },
+        &AtomicBool::new(false),
+    )
 }
 
 /// Owned-input twin of [`encode_variants_from_rgb16_with_progressive`] (deferred
@@ -454,9 +713,18 @@ pub fn encode_variants_from_rgb16_owned(
     if params.texture != 0.0 || params.clarity != 0.0 {
         crate::pipeline::apply_unsharp_masks(&mut rgb16, width as usize, height as usize, params);
     }
-    let rgba = crate::pipeline::process_rgba(&rgb16, params);
+    // RGB-native like the borrowing entry: process_rgb + the 3-channel core.
+    let rgb = crate::pipeline::process_rgb(&rgb16, params);
     drop(rgb16); // free the 16-bit master before the encode fan-out
-    encode_variants_with_progressive(&rgba, width, height, source, hq_override, progressive_dc, group_order)
+    encode_variants_rgb_cancellable(
+        &rgb,
+        width,
+        height,
+        source,
+        hq_override,
+        ProgressiveOpts { progressive_dc, group_order, center: None },
+        &AtomicBool::new(false),
+    )
 }
 
 // PR-6b: native sidecar pyramid encoder (v2 per-level distances, no 1.5 floor, box cascade).
@@ -1338,6 +1606,45 @@ mod tests {
                 stripped, dst_rgb,
                 "rgb8 downscale != rgba8+strip at {sw}x{sh}->{dw}x{dh}"
             );
+        }
+    }
+
+    /// AE-3 gate (written FIRST, per the floor-boundary-counterexample lesson): the
+    /// image-crate samplers must be per-channel independent so the RGB-native variant
+    /// cascade is byte-identical to RGBA-resize-then-strip, for BOTH production filters
+    /// (Lanczos3 preview, Triangle thumb). Covers exact + non-exact ratios, odd dims,
+    /// the production >1080→1080 preview shape (incl. the .round() dims), and the
+    /// 300-long-edge thumb shape.
+    #[test]
+    fn image_resize_rgb_matches_rgba_then_strip() {
+        use image::{imageops, ImageBuffer, Rgb, Rgba};
+        let cases = [
+            (160u32, 120u32, 108u32, 81u32), // non-divisor downscale
+            (97, 61, 30, 19),                // odd dims
+            (640, 480, 300, 225),            // thumb-ish exact
+            (1359, 2043, 718, 1080),         // production portrait preview (rounded dims)
+            (300, 200, 111, 74),             // general
+            (13, 11, 5, 4),                  // tiny non-divisor
+        ];
+        for (sw, sh, dw, dh) in cases {
+            let rgba = rand_rgba(sw, sh);
+            let rgb = strip_rgba_to_rgb(&rgba);
+            for (fname, filter) in [
+                ("lanczos3", imageops::FilterType::Lanczos3),
+                ("triangle", imageops::FilterType::Triangle),
+            ] {
+                let ia: ImageBuffer<Rgba<u8>, &[u8]> =
+                    ImageBuffer::from_raw(sw, sh, &rgba[..]).unwrap();
+                let ib: ImageBuffer<Rgb<u8>, &[u8]> =
+                    ImageBuffer::from_raw(sw, sh, &rgb[..]).unwrap();
+                let ra = imageops::resize(&ia, dw, dh, filter).into_raw();
+                let rb = imageops::resize(&ib, dw, dh, filter).into_raw();
+                assert_eq!(
+                    strip_rgba_to_rgb(&ra),
+                    rb,
+                    "{fname} {sw}x{sh}->{dw}x{dh}: rgb resize != rgba resize + strip"
+                );
+            }
         }
     }
 
