@@ -1600,68 +1600,115 @@ fn apply_pframe(
 /// persistent decoder + reused scratch serve the whole chain.
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
     let start = preceding_iframe(data, index)?;
+    let end = index.checked_add(1)?;
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
     let mut sess = CasvDecodeSession::new()?;
     let mut cur: Vec<u8> = Vec::new();
-    for i in start..=index {
-        let (is_p, slice) = casv_frame_info(data, i)?;
-        if is_p {
-            // A P-frame needs a full previous reconstruction (`cur` is non-empty
-            // exactly when a prior I-frame decoded with validated dims).
-            if cur.is_empty() {
-                return None;
-            }
-            apply_pframe(&mut sess, &mut cur, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-        } else {
-            let (dw, dh) = sess.decode_frame_into(slice, &mut cur)?;
-            if (dw, dh) != (w, h) {
-                return None;
-            }
-        }
-    }
+    decode_casv_range(data, w, h, start..end, &mut sess, &mut cur, &mut |_, _| {})?;
     if cur.is_empty() {
         return None;
     }
     Some((cur, w, h))
 }
 
-/// Sequential decode loop shared by the ST and MT batch entry points: one
-/// session, one running reconstruction buffer, one owned clone per frame out.
+/// Core sequential reconstruct loop: decode frames `range` in order, lending
+/// each reconstructed frame to `sink` as `(frame_index, pixels)`. `range.start`
+/// must be an I-frame unless `recon` already holds the prior reconstruction
+/// (`recon` is non-empty exactly when a frame with validated dims is resident).
+fn decode_casv_range(
+    data: &[u8],
+    w: u32,
+    h: u32,
+    range: std::ops::Range<usize>,
+    sess: &mut CasvDecodeSession,
+    recon: &mut Vec<u8>,
+    sink: &mut impl FnMut(usize, &[u8]),
+) -> Option<()> {
+    for i in range {
+        let (is_p, slice) = casv_frame_info(data, i)?;
+        if is_p {
+            // A P-frame needs a full previous reconstruction.
+            if recon.is_empty() {
+                return None;
+            }
+            apply_pframe(sess, recon, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
+        } else {
+            let (dw, dh) = sess.decode_frame_into(slice, recon)?;
+            if (dw, dh) != (w, h) {
+                return None;
+            }
+        }
+        sink(i, recon);
+    }
+    Some(())
+}
+
+/// Sequential decode loop shared by the MT batch entry point and single-GOP
+/// files: one session, one running reconstruction, one owned clone per frame.
 fn decode_casv_all_rgb8_with(
     data: &[u8],
     mut sess: CasvDecodeSession,
 ) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
-    let mut out = Vec::with_capacity(hdr.frame_count as usize);
+    let n = hdr.frame_count as usize;
+    let mut out = Vec::with_capacity(n);
     let mut recon: Vec<u8> = Vec::new();
-    for i in 0..hdr.frame_count as usize {
-        let (is_p, slice) = casv_frame_info(data, i)?;
-        if is_p {
-            // A P-frame needs a full previous reconstruction (`recon` is
-            // non-empty exactly when a prior I-frame decoded with valid dims).
-            if recon.is_empty() {
-                return None;
-            }
-            apply_pframe(&mut sess, &mut recon, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
-        } else {
-            let (dw, dh) = sess.decode_frame_into(slice, &mut recon)?;
-            if (dw, dh) != (w, h) {
-                return None;
-            }
-        }
-        out.push((recon.clone(), w, h));
-    }
+    decode_casv_range(data, w, h, 0..n, &mut sess, &mut recon, &mut |_, px| {
+        out.push((px.to_vec(), w, h))
+    })?;
     Some(out)
 }
 
 /// Decode every frame in order, reconstructing P-frames against the running
-/// previous frame. `None` if any frame fails to decode. One persistent decoder
-/// + reused reconstruction/scratch buffers serve the whole video (no per-frame
-/// `JxlDecoderCreate`/`Destroy`, no per-frame region mallocs).
+/// previous frame. `None` if any frame fails to decode.
+///
+/// Batch decode is **GOP-parallel**: reconstruction chains only run
+/// I-frame→P…P within a GOP, and each GOP starts at its own I-frame, so GOPs
+/// are mutually independent by construction. Each GOP decodes serially on its
+/// own worker (persistent decoder + reused buffers per worker, single-threaded
+/// inner decode — no oversubscription); ordered collect preserves frame order,
+/// so the output is byte-identical to the serial loop. Playback consumers that
+/// need frame-at-a-time latency instead of batch throughput want
+/// [`decode_casv_all_rgb8_threaded`].
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    decode_casv_all_rgb8_with(data, CasvDecodeSession::new()?)
+    let hdr = parse_casv_header(data)?;
+    let (w, h) = (hdr.width, hdr.height);
+    let n = hdr.frame_count as usize;
+    // GOP boundaries = I-frame positions. The scan also validates every index
+    // entry up front (any malformed entry fails the whole decode, exactly as
+    // the serial loop's lazy `casv_frame_info(..)?` would).
+    let mut starts: Vec<usize> = Vec::new();
+    for i in 0..n {
+        let (is_p, _) = casv_frame_info(data, i)?;
+        if !is_p {
+            starts.push(i);
+        }
+    }
+    // A leading P-frame has no reference — fail as the serial loop does.
+    if starts.first() != Some(&0) {
+        return None;
+    }
+    if starts.len() == 1 {
+        // Single GOP: nothing to fan out.
+        return decode_casv_all_rgb8_with(data, CasvDecodeSession::new()?);
+    }
+    let gops: Vec<Vec<(Vec<u8>, u32, u32)>> = starts
+        .par_iter()
+        .enumerate()
+        .map(|(k, &s)| {
+            let e = starts.get(k + 1).copied().unwrap_or(n);
+            let mut sess = CasvDecodeSession::new()?;
+            let mut recon: Vec<u8> = Vec::new();
+            let mut out = Vec::with_capacity(e - s);
+            decode_casv_range(data, w, h, s..e, &mut sess, &mut recon, &mut |_, px| {
+                out.push((px.to_vec(), w, h))
+            })?;
+            Some(out)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(gops.into_iter().flatten().collect())
 }
 
 /// [`decode_casv_all_rgb8`] with a persistent **multi-threaded** libjxl decoder:
