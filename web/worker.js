@@ -397,6 +397,16 @@ function applyLookToState(state, look) {
 }
 
 self.addEventListener('message', async (ev) => {
+    // --- prewarm: run ensureWasm before the first file task (TTFP-1) ---
+    // Fire-and-forget: on failure ensureWasm resets wasmReady=null, so the
+    // first real task simply retries the load — prewarm failure self-heals.
+    if (ev.data.type === WorkerMsg.PRELOAD) {
+        ensureWasm().catch((err) => {
+            console.warn('[worker] wasm prewarm failed (will retry on first task):', err?.message || err);
+        });
+        return;
+    }
+
     // --- release cached LookRenderer state for a re-submitted task ---
     if (ev.data.type === WorkerMsg.RELEASE_STATE) {
         const lbState = liveStateMap.get(ev.data.id);

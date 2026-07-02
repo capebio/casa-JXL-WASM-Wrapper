@@ -650,6 +650,16 @@ class WorkerPool {
         for (let i = 0; i < this.size; i++) {
             this._spawnWorker();
         }
+        // TTFP-1: prewarm the RAW-pipeline WASM in the workers the next submits
+        // will actually receive. `_dispatch` pops from the TAIL of `free`, so
+        // warm the last two spawned workers — the first 1-2 files then skip the
+        // fetch+compile+instantiate+rayon-init leg entirely. Only two (not all
+        // `size`) so a user who never drops a file doesn't pay `size` WASM
+        // instances + rayon pools; the rest warm lazily on their first task.
+        const PREWARM_COUNT = Math.min(2, this.free.length);
+        for (let i = 0; i < PREWARM_COUNT; i++) {
+            this.free[this.free.length - 1 - i].postMessage({ type: WorkerMsg.PRELOAD });
+        }
     }
 
     _spawnWorker() {
