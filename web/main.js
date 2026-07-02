@@ -2332,9 +2332,18 @@ function drawLightboxForCard(card) {
             lightboxCanvas.width  = w;
             lightboxCanvas.height = h;
             const ctx = lightboxCanvas.getContext('2d');
-            ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+            // TTFP-2: hand the ImageData we just painted straight to the
+            // snapshot instead of reading the whole canvas back. The put fills
+            // the full canvas at (0,0) with opaque (alpha=255) pixels, so
+            // getImageData would return byte-identical data — the readback +
+            // its fresh 4·W·H allocation are pure waste. Consumers of
+            // cleanSnapshot (applyLens, setCleanCanvas, feedTauriParityBaseline,
+            // ensureLabBuf) are all read-only or deep-copy, so aliasing the
+            // cached rgba buffer is safe.
+            const frame = new ImageData(rgba, w, h);
+            ctx.putImageData(frame, 0, 0);
             if (lightboxCanvas.width > 0) {
-                captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+                captureCleanAndApplyLens(frame);
             }
             setPaintedSourceBadge('jxl');
             lbLoadingBadge.hidden = true;
@@ -2356,9 +2365,21 @@ function drawLightboxForCard(card) {
                 lightboxCanvas.width  = msg.w;
                 lightboxCanvas.height = msg.h;
                 const ctx = lightboxCanvas.getContext('2d');
-                ctx.putImageData(new ImageData(msg.rgba, msg.w, msg.h), 0, 0);
+                // TTFP-2: this runs on EVERY progressive pass at full decoded
+                // resolution. Reuse the ImageData we just painted as the clean
+                // snapshot rather than reading the full canvas back — the put
+                // covers the whole canvas at (0,0) with opaque pixels, so the
+                // readback returned byte-identical data at the cost of a full
+                // GPU→CPU sync + a fresh 4·W·H allocation per pass (~80 MB at
+                // 20 MP). NOTE: the putImageData inside applyPerceptualLens is
+                // NOT redundant and must stay — feedTauriParityBaseline →
+                // onBaseFramePainted → paintFromBaseline paints the M2-adjusted
+                // baseline onto this same canvas in between, and the lens-off
+                // re-put is what restores clean pixels on top of it.
+                const frame = new ImageData(msg.rgba, msg.w, msg.h);
+                ctx.putImageData(frame, 0, 0);
                 if (lightboxCanvas.width > 0) {
-                    captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+                    captureCleanAndApplyLens(frame);
                 }
                 setPaintedSourceBadge('jxl');
                 lbLoadingBadge.hidden = true;
