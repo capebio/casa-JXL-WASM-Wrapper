@@ -1746,3 +1746,24 @@ The broader "defer set_len entirely in the loop" is NOT needed — that was the 
 restructure; the exposure is fully closed at the wrapper. Remaining deferred unchanged:
 strip-staging (peak-RSS unmeasurable in unit test), extra-channel completeness contract
 (API decision), animation policy (doc-only), wall-clock pan bench (needs Tauri pan-loop).
+  **UPDATE (landed):** the SIMD `box_blur` shipped — `simd::avx2::box_blur_avx2`
+  (8-wide vertical pass), dispatched via `blur_mask`. Bit-exact; flip +13.7/11.3/30.1%
+  at 1/6/24 MP; aggregate ref-build now +27/20/26% (from +4–10%). Remaining ref-build
+  follow-ups below.
+
+- **`ref_moments` → reuse `ssim_moments_avx2_cal(b, b, np)`. LANDED.**
+  `ref_moments_dispatch` (mod.rs) uses the channel-as-lane SSIM kernel for Avx2/Avx512:
+  its `(sa, saa)` equals `(sb, sbb)` integer-exact (`sab = Σy² discarded`). Test
+  `ref_moments_via_cal_matches_scalar`; scalar/wasm keep `ssim::ref_moments`.
+
+- **`box_blur_avx2` uninit tmp/dst. LANDED.** `Vec::with_capacity`+`set_len` instead of
+  `vec![0f32; n]` — both fully overwritten before read; f32 has no invalid bit patterns /
+  no Drop → sound; output bit-identical. Saves the 2·n·4 B (192 MB @24MP) zero-init.
+  **Still open:** the scalar `blur::box_blur` keeps `vec![0f32; n]` (adding `unsafe` to a
+  safe fn), and the pyramid downsample targets `nx/ny/nb` in Comparer::new are also
+  zeroed-then-fully-written — same wasted memset, same uninit opportunity.
+
+- **Parallelise / widen box_blur (NOT cheap — deferred).** (a) H rows and V column-tiles
+  are independent → rayon over `y` (H) and the `x` tile stride (V), gated on `parallel`.
+  (b) AVX-512 / wasm-SIMD `box_blur` (currently fall back to scalar V). (c) Fold the
+  3-level mask blur into the pyramid walk to avoid re-blurring re-read planes.

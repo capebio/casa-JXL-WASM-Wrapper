@@ -126,7 +126,7 @@ impl Comparer {
         let (mut cx, mut cy, mut cb) = (rx, ry, rb);
         for s in 0..3 {
             let blur_r = ((w >> 6).max(1)).min(8);
-            let mask = blur::box_blur(&cy, w, h, blur_r);
+            let mask = blur_mask(backend, &cy, w, h, blur_r);
             if s < 2 && w > 1 && h > 1 {
                 let dw = (w >> 1).max(1);
                 let dh = (h >> 1).max(1);
@@ -155,7 +155,7 @@ impl Comparer {
                 break;
             }
         }
-        let (ssim_sb, ssim_sbb) = ssim::ref_moments(&ref_rgba, n, 4);
+        let (ssim_sb, ssim_sbb) = ref_moments_dispatch(backend, &ref_rgba, n);
         // `backend` was resolved above (before the reference XYB build) via
         // resolve_backend(&opts).
         Comparer {
@@ -472,6 +472,44 @@ fn convert_xyb(backend: Backend, px: &[u8], n: usize, x: &mut [f32], y: &mut [f3
         #[cfg(target_arch = "wasm32")]
         Backend::WasmSimd => simd::wasm::pixels_to_xyb_wasm(px, n, xyb::sqrt_lin_lut(), x, y, b),
         _ => xyb::pixels_to_xyb(px, n, x, y, b),
+    }
+}
+
+/// Reference per-channel moments (Σy, Σy²) over RGBA, dispatched by backend.
+/// The channel-as-lane SSIM kernel already computes exactly this: for `(b, b)`
+/// its `sa = Σy`, `saa = Σy²` (and `sab = Σy·y = Σy²`, discarded), so
+/// `(sa, saa) == (sb, sbb)` — INTEGER-EXACT, no output change. Reuses the
+/// flip-proven kernel instead of the scalar pass; stride 4 (RGBA), 3 channels.
+/// Reference-build-only (Comparer::new).
+fn ref_moments_dispatch(backend: Backend, b: &[u8], np: usize) -> ([u64; 3], [u64; 3]) {
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2Strict | Backend::Avx2Rsqrt => {
+            let (sa, saa, _sab) = unsafe { simd::avx2::ssim_moments_avx2_cal(b, b, np) };
+            (sa, saa)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512Strict | Backend::Avx512Rsqrt => {
+            let (sa, saa, _sab) = unsafe { simd::avx512::ssim_moments_avx512(b, b, np) };
+            (sa, saa)
+        }
+        _ => ssim::ref_moments(b, np, 4),
+    }
+}
+
+/// Box-blur the reference luma plane into the per-level mask, dispatched by
+/// backend. AVX2/AVX-512 CPUs (avx512 implies avx2) use the 8-wide vertical
+/// kernel `box_blur_avx2`; wasm + scalar use the scalar `blur::box_blur`. The
+/// AVX2 path is bit-identical to the scalar oracle. This is the dominant
+/// reference-build cost (examples/ref_build_effect.rs); the mask is built once
+/// per Comparer, never on the per-compare test path.
+fn blur_mask(backend: Backend, src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    match backend {
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2Strict | Backend::Avx2Rsqrt | Backend::Avx512Strict | Backend::Avx512Rsqrt => unsafe {
+            simd::avx2::box_blur_avx2(src, w, h, r)
+        },
+        _ => blur::box_blur(src, w, h, r),
     }
 }
 

@@ -6,6 +6,7 @@
 
 use core::arch::x86_64::*;
 use super::scalar::{scale_err_tail, xyb_tail, downsample_row_tail};
+use crate::perceptual::blur::box_blur_h;
 
 #[inline]
 unsafe fn hsum256(v: __m256) -> f32 {
@@ -519,6 +520,83 @@ pub unsafe fn downsample_avx2(
     }
 }
 
+/// AVX2 separable box blur (radius `r`, clamp-to-edge) → fresh Vec. Same result
+/// as `blur::box_blur` — BIT-IDENTICAL by construction: the horizontal pass is
+/// the shared scalar `box_blur_h`, and the vertical pass runs the exact same
+/// per-column float ops (`sums = tmp*(r+1)`, `+= tmp[row]`, store `sums*inv`,
+/// `sums += add - sub`) 8 columns at a time in one `__m256` instead of a scalar
+/// `for t in 0..8`. The column-tile boundary (`while x+8<=w`) and the `x..w`
+/// scalar remainder match `box_blur` exactly, so which columns are vectorised is
+/// identical. Wins because the crate's baseline codegen is SSE2 (4-wide) — the
+/// scalar tile only auto-vectorises to 128-bit; this forces 256-bit.
+///
+/// The mask blur is reference-build-only (Comparer::new), the dominant ref-build
+/// cost measured in examples/ref_build_effect.rs.
+#[target_feature(enable = "avx2")]
+pub unsafe fn box_blur_avx2(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let n = w * h;
+    if n == 0 {
+        return Vec::new();
+    }
+    // tmp and dst are FULLY overwritten before any read: box_blur_h writes every
+    // tmp element (and only reads src), then the vertical pass + scalar remainder
+    // write every dst element (and only read tmp). So the `vec![0f32; n]` zero-init
+    // would be 2·n·4 B of wasted memset (192 MB at 24 MP). Allocate uninitialised.
+    // SAFETY: f32 has no invalid bit patterns; the n slots exposed by set_len are
+    // each written before they are ever read (H fills all of tmp, V + remainder
+    // fill all of dst), and f32 has no Drop, so leaking uninit on panic is sound.
+    let mut tmp: Vec<f32> = Vec::with_capacity(n);
+    let mut dst: Vec<f32> = Vec::with_capacity(n);
+    unsafe {
+        tmp.set_len(n);
+        dst.set_len(n);
+    }
+    let inv = 1.0 / (2 * r + 1) as f32;
+
+    // Horizontal pass: shared scalar recurrence (identical to box_blur).
+    box_blur_h(src, &mut tmp, w, h, r, inv);
+
+    // Vertical pass: 8 columns per iteration in one 256-bit lane group.
+    let rp1 = _mm256_set1_ps(r as f32 + 1.0);
+    let inv_v = _mm256_set1_ps(inv);
+    let h_max = h - 1;
+    let tp = tmp.as_ptr();
+    let dp = dst.as_mut_ptr();
+    let mut x = 0usize;
+    while x + 8 <= w {
+        // seed the window: tmp[x..x+8]*(r+1) + Σ_{k=1..=r} tmp[k.min(h_max)*w + x..]
+        let mut sums = _mm256_mul_ps(_mm256_loadu_ps(tp.add(x)), rp1);
+        for k in 1..=r {
+            let row = k.min(h_max) * w;
+            sums = _mm256_add_ps(sums, _mm256_loadu_ps(tp.add(row + x)));
+        }
+        for y in 0..h {
+            let drow = y * w;
+            _mm256_storeu_ps(dp.add(drow + x), _mm256_mul_ps(sums, inv_v));
+            let add_row = (y + r + 1).min(h_max) * w;
+            let sub_row = y.saturating_sub(r) * w;
+            let add = _mm256_loadu_ps(tp.add(add_row + x));
+            let sub = _mm256_loadu_ps(tp.add(sub_row + x));
+            sums = _mm256_add_ps(sums, _mm256_sub_ps(add, sub));
+        }
+        x += 8;
+    }
+    // Scalar remainder for the < 8 trailing columns — identical to box_blur.
+    for col in x..w {
+        let mut sum = tmp[col] * (r as f32 + 1.0);
+        for k in 1..=r {
+            sum += tmp[k.min(h_max) * w + col];
+        }
+        for y in 0..h {
+            dst[y * w + col] = sum * inv;
+            let add = tmp[(y + r + 1).min(h_max) * w + col];
+            let sub = tmp[y.saturating_sub(r) * w + col];
+            sum += add - sub;
+        }
+    }
+    dst
+}
+
 #[cfg(test)]
 mod xyb_tests {
     use super::*;
@@ -572,6 +650,40 @@ mod xyb_tests {
             assert_eq!(gx[i].to_bits(), sx[i].to_bits(), "scalar_lut x[{i}]");
             assert_eq!(gy[i].to_bits(), sy[i].to_bits(), "scalar_lut y[{i}]");
             assert_eq!(gb[i].to_bits(), sb[i].to_bits(), "scalar_lut b[{i}]");
+        }
+    }
+}
+
+#[cfg(test)]
+mod blur_tests {
+    use super::*;
+    use crate::perceptual::blur::box_blur;
+
+    /// box_blur_avx2 must be BIT-IDENTICAL to the scalar box_blur across radii and
+    /// dimensions — including widths that leave a < 8-column scalar remainder and
+    /// short heights that clamp the vertical window.
+    #[test]
+    fn box_blur_avx2_bit_identical_to_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for (w, h) in [(64usize, 48usize), (65, 49), (17, 5), (8, 8), (3, 33), (100, 1)] {
+            for r in [1usize, 2, 4, 8] {
+                let src: Vec<f32> =
+                    (0..w * h).map(|i| ((i * 37 % 251) as f32 * 0.013).sin() * 4.2).collect();
+                let want = box_blur(&src, w, h, r);
+                let got = unsafe { box_blur_avx2(&src, w, h, r) };
+                assert_eq!(want.len(), got.len(), "{w}x{h} r{r} len");
+                for i in 0..want.len() {
+                    assert_eq!(
+                        want[i].to_bits(),
+                        got[i].to_bits(),
+                        "{w}x{h} r{r} [{i}] {} vs {}",
+                        want[i],
+                        got[i]
+                    );
+                }
+            }
         }
     }
 }
@@ -674,5 +786,18 @@ mod reduction_tests {
         let want = unsafe { ssim_moments_avx2(&a, &b, np) };
         let got = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
         assert_eq!(want, got);
+    }
+
+    /// ref_moments_dispatch reuses ssim_moments_avx2_cal(b, b): its (sa, saa) must
+    /// equal the scalar ref_moments (sb, sbb) exactly (Σy, Σy² — integer, sab
+    /// discarded). Odd np exercises the 2-px-group scalar tail.
+    #[test]
+    fn ref_moments_via_cal_matches_scalar() {
+        if !std::is_x86_feature_detected!("avx2") { return; }
+        let np = 1000usize + 1;
+        let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
+        let (sb, sbb) = ssim::ref_moments(&b, np, 4);
+        let (sa, saa, _sab) = unsafe { ssim_moments_avx2_cal(&b, &b, np) };
+        assert_eq!((sb, sbb), (sa, saa));
     }
 }
