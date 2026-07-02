@@ -61,6 +61,10 @@ pub const CASV_TILE_FLAG: u32 = 0x2000_0000;
 /// JXL's perceptual model correct (a residual would be misjudged).
 pub const CASV_REPLACE_FLAG: u32 = 0x1000_0000;
 
+/// All index-entry flag bits (the `len` field's payload mask is the complement).
+const CASV_FLAG_BITS: u32 =
+    CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG;
+
 // ── JOLT rate metadata (CasvHeader.flags layout) ──────────────────────────────
 // JOLT (JXL-Optimized Lossy Transport) is the lossy streaming profile of CASV.
 // The header `flags` word — previously always 0 — carries the rate signal so a
@@ -686,33 +690,14 @@ pub fn parse_casv_rate_box(data: &[u8]) -> Option<u32> {
 }
 
 /// Decode a footer-indexed streaming `.casv` (from [`encode_casv_video_streaming_to`])
-/// by re-framing it into the header format and decoding with [`decode_casv_all_rgb8`].
+/// **in place**, straight off the trailing index — no re-framing copy of the
+/// compressed stream (the old path memcpy'd the entire file into a rebuilt
+/// header-format Vec first: ~file-size peak memory + an O(file) copy before the
+/// first frame decoded). Byte-identical output; GOP-parallel like
+/// [`decode_casv_all_rgb8`]. Streaming consumers that don't need all frames
+/// resident want [`decode_casv_footer_for_each_rgb8`].
 pub fn decode_casv_footer_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    let f = parse_casv_footer(data)?;
-    let n = f.frame_count as usize;
-    let idx_start = f.index_offset as usize; // frame codestreams occupy [0, idx_start)
-    let new_data_start = CASV_HEADER_BYTES + n * CASV_INDEX_ENTRY_BYTES;
-    let delta = new_data_start as u32;
-
-    let hdr = CasvHeader {
-        width: f.width,
-        height: f.height,
-        frame_count: f.frame_count,
-        fps_num: f.fps_num,
-        fps_den: f.fps_den,
-        flags: 0,
-    };
-    let mut out = Vec::with_capacity(new_data_start + idx_start);
-    out.extend_from_slice(&build_casv_header(&hdr));
-    for i in 0..n {
-        let e = idx_start + i * CASV_INDEX_ENTRY_BYTES;
-        let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
-        let lenf = u32::from_le_bytes(data[e + 4..e + 8].try_into().ok()?);
-        out.extend_from_slice(&off.checked_add(delta)?.to_le_bytes());
-        out.extend_from_slice(&lenf.to_le_bytes());
-    }
-    out.extend_from_slice(&data[0..idx_start]);
-    decode_casv_all_rgb8(&out)
+    decode_casv_view_all_rgb8(&CasvView::from_footer(data)?)
 }
 
 /// Encode a sequence of interleaved RGB8 frames into a `.casv` byte vector.
@@ -1423,6 +1408,86 @@ pub fn encode_casv_delta_bbox_rgb8(
     Ok(out)
 }
 
+/// Zero-copy view over a parsed CASV container, header-indexed or
+/// footer-indexed (streamed). Carries the geometry plus an index accessor that
+/// parses and validates one entry **once** per frame — `(flags, codestream)` —
+/// which is what lets footer files decode **in place** (no re-framing memcpy of
+/// the whole compressed stream) and spares the decode loops the four
+/// header/index re-parses per frame the public flag helpers would cost.
+struct CasvView<'a> {
+    data: &'a [u8],
+    width: u32,
+    height: u32,
+    frame_count: usize,
+    /// Byte offset of the index table.
+    index_pos: usize,
+    /// Frame offsets below this are invalid (header layout: the header itself).
+    min_offset: usize,
+    /// Frame slices must end at or before this (footer layout: the index start).
+    max_end: usize,
+}
+
+impl<'a> CasvView<'a> {
+    fn from_header(data: &'a [u8]) -> Option<Self> {
+        let hdr = parse_casv_header(data)?;
+        Some(CasvView {
+            data,
+            width: hdr.width,
+            height: hdr.height,
+            frame_count: hdr.frame_count as usize,
+            index_pos: CASV_HEADER_BYTES,
+            min_offset: CASV_HEADER_BYTES,
+            max_end: data.len(),
+        })
+    }
+
+    fn from_footer(data: &'a [u8]) -> Option<Self> {
+        let f = parse_casv_footer(data)?;
+        let n = f.frame_count as usize;
+        let idx_start = f.index_offset as usize;
+        // Replicate the retired re-framing decoder's per-entry
+        // `offset + delta` u32-overflow refusal so in-place decode accepts and
+        // rejects the exact same files (the case is only reachable with
+        // pathological >4 GB in-memory streams, but parity is parity).
+        let delta = (CASV_HEADER_BYTES + n * CASV_INDEX_ENTRY_BYTES) as u32;
+        for i in 0..n {
+            let e = idx_start + i * CASV_INDEX_ENTRY_BYTES;
+            let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
+            off.checked_add(delta)?;
+        }
+        Some(CasvView {
+            data,
+            width: f.width,
+            height: f.height,
+            frame_count: n,
+            index_pos: idx_start,
+            min_offset: 0,
+            max_end: idx_start,
+        })
+    }
+
+    /// `(flags, codestream slice)` for frame `index`: one parse, one validation
+    /// (the same bounds checks `casv_frame_info` performs, generalized over the
+    /// two layouts).
+    fn entry(&self, index: usize) -> Option<(u32, &'a [u8])> {
+        if index >= self.frame_count {
+            return None;
+        }
+        let e = self.index_pos + index * CASV_INDEX_ENTRY_BYTES;
+        if self.data.len() < e + CASV_INDEX_ENTRY_BYTES {
+            return None;
+        }
+        let offset = u32::from_le_bytes(self.data[e..e + 4].try_into().ok()?) as usize;
+        let len_field = u32::from_le_bytes(self.data[e + 4..e + 8].try_into().ok()?);
+        let len = (len_field & !CASV_FLAG_BITS) as usize;
+        let end = offset.checked_add(len)?;
+        if offset < self.min_offset || end > self.max_end {
+            return None;
+        }
+        Some((len_field & CASV_FLAG_BITS, &self.data[offset..end]))
+    }
+}
+
 /// Persistent per-loop decode state for the CASV decode paths: one reusable
 /// [`Decoder`] (a single `JxlDecoderCreate` for the whole video instead of one
 /// per frame) plus u8/u16 scratch buffers reused across frames (region payloads
@@ -1601,11 +1666,11 @@ fn apply_pframe(
 pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32, u32)> {
     let start = preceding_iframe(data, index)?;
     let end = index.checked_add(1)?;
-    let hdr = parse_casv_header(data)?;
-    let (w, h) = (hdr.width, hdr.height);
+    let view = CasvView::from_header(data)?;
+    let (w, h) = (view.width, view.height);
     let mut sess = CasvDecodeSession::new()?;
     let mut cur: Vec<u8> = Vec::new();
-    decode_casv_range(data, w, h, start..end, &mut sess, &mut cur, &mut |_, _| {})?;
+    decode_casv_range(&view, start..end, &mut sess, &mut cur, &mut |_, _| {})?;
     if cur.is_empty() {
         return None;
     }
@@ -1617,22 +1682,30 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
 /// must be an I-frame unless `recon` already holds the prior reconstruction
 /// (`recon` is non-empty exactly when a frame with validated dims is resident).
 fn decode_casv_range(
-    data: &[u8],
-    w: u32,
-    h: u32,
+    view: &CasvView,
     range: std::ops::Range<usize>,
     sess: &mut CasvDecodeSession,
     recon: &mut Vec<u8>,
     sink: &mut impl FnMut(usize, &[u8]),
 ) -> Option<()> {
+    let (w, h) = (view.width, view.height);
     for i in range {
-        let (is_p, slice) = casv_frame_info(data, i)?;
-        if is_p {
+        let (flags, slice) = view.entry(i)?;
+        if flags & CASV_PFRAME_FLAG != 0 {
             // A P-frame needs a full previous reconstruction.
             if recon.is_empty() {
                 return None;
             }
-            apply_pframe(sess, recon, casv_frame_is_bbox(data, i)?, casv_frame_is_tile(data, i)?, casv_frame_is_replace(data, i)?, slice, w, h)?;
+            apply_pframe(
+                sess,
+                recon,
+                flags & CASV_BBOX_FLAG != 0,
+                flags & CASV_TILE_FLAG != 0,
+                flags & CASV_REPLACE_FLAG != 0,
+                slice,
+                w,
+                h,
+            )?;
         } else {
             let (dw, dh) = sess.decode_frame_into(slice, recon)?;
             if (dw, dh) != (w, h) {
@@ -1647,15 +1720,13 @@ fn decode_casv_range(
 /// Sequential decode loop shared by the MT batch entry point and single-GOP
 /// files: one session, one running reconstruction, one owned clone per frame.
 fn decode_casv_all_rgb8_with(
-    data: &[u8],
+    view: &CasvView,
     mut sess: CasvDecodeSession,
 ) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    let hdr = parse_casv_header(data)?;
-    let (w, h) = (hdr.width, hdr.height);
-    let n = hdr.frame_count as usize;
-    let mut out = Vec::with_capacity(n);
+    let (w, h) = (view.width, view.height);
+    let mut out = Vec::with_capacity(view.frame_count);
     let mut recon: Vec<u8> = Vec::new();
-    decode_casv_range(data, w, h, 0..n, &mut sess, &mut recon, &mut |_, px| {
+    decode_casv_range(view, 0..view.frame_count, &mut sess, &mut recon, &mut |_, px| {
         out.push((px.to_vec(), w, h))
     })?;
     Some(out)
@@ -1673,16 +1744,21 @@ fn decode_casv_all_rgb8_with(
 /// need frame-at-a-time latency instead of batch throughput want
 /// [`decode_casv_all_rgb8_threaded`].
 pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    let hdr = parse_casv_header(data)?;
-    let (w, h) = (hdr.width, hdr.height);
-    let n = hdr.frame_count as usize;
+    decode_casv_view_all_rgb8(&CasvView::from_header(data)?)
+}
+
+/// GOP-parallel batch decode over either container layout (see
+/// [`decode_casv_all_rgb8`] for the parallelism contract).
+fn decode_casv_view_all_rgb8(view: &CasvView) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    let (w, h) = (view.width, view.height);
+    let n = view.frame_count;
     // GOP boundaries = I-frame positions. The scan also validates every index
     // entry up front (any malformed entry fails the whole decode, exactly as
-    // the serial loop's lazy `casv_frame_info(..)?` would).
+    // the serial loop's lazy per-frame parse would).
     let mut starts: Vec<usize> = Vec::new();
     for i in 0..n {
-        let (is_p, _) = casv_frame_info(data, i)?;
-        if !is_p {
+        let (flags, _) = view.entry(i)?;
+        if flags & CASV_PFRAME_FLAG == 0 {
             starts.push(i);
         }
     }
@@ -1692,7 +1768,7 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     }
     if starts.len() == 1 {
         // Single GOP: nothing to fan out.
-        return decode_casv_all_rgb8_with(data, CasvDecodeSession::new()?);
+        return decode_casv_all_rgb8_with(view, CasvDecodeSession::new()?);
     }
     let gops: Vec<Vec<(Vec<u8>, u32, u32)>> = starts
         .par_iter()
@@ -1702,7 +1778,7 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
             let mut sess = CasvDecodeSession::new()?;
             let mut recon: Vec<u8> = Vec::new();
             let mut out = Vec::with_capacity(e - s);
-            decode_casv_range(data, w, h, s..e, &mut sess, &mut recon, &mut |_, px| {
+            decode_casv_range(view, s..e, &mut sess, &mut recon, &mut |_, px| {
                 out.push((px.to_vec(), w, h))
             })?;
             Some(out)
@@ -1734,15 +1810,43 @@ pub fn decode_casv_for_each_rgb8(
 pub fn decode_casv_for_each_rgb8_threaded(
     data: &[u8],
     num_threads: usize,
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_view_for_each(&CasvView::from_header(data)?, num_threads, f)
+}
+
+/// Streaming decode of a **footer-indexed** (streamed/JOLT) `.casv`, straight
+/// off the index — no re-framing copy, no batch buffering. Same contract as
+/// [`decode_casv_for_each_rgb8`].
+pub fn decode_casv_footer_for_each_rgb8(
+    data: &[u8],
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_view_for_each(&CasvView::from_footer(data)?, 1, f)
+}
+
+/// [`decode_casv_footer_for_each_rgb8`] with a persistent multi-threaded inner
+/// libjxl decoder (`num_threads <= 1` = single-threaded, byte-identical).
+pub fn decode_casv_footer_for_each_rgb8_threaded(
+    data: &[u8],
+    num_threads: usize,
+    f: impl FnMut(usize, &[u8], u32, u32),
+) -> Option<usize> {
+    decode_casv_view_for_each(&CasvView::from_footer(data)?, num_threads, f)
+}
+
+fn decode_casv_view_for_each(
+    view: &CasvView,
+    num_threads: usize,
     mut f: impl FnMut(usize, &[u8], u32, u32),
 ) -> Option<usize> {
-    let hdr = parse_casv_header(data)?;
-    let (w, h) = (hdr.width, hdr.height);
-    let n = hdr.frame_count as usize;
+    let (w, h) = (view.width, view.height);
     let mut sess = CasvDecodeSession::with_threads(num_threads)?;
     let mut recon: Vec<u8> = Vec::new();
-    decode_casv_range(data, w, h, 0..n, &mut sess, &mut recon, &mut |i, px| f(i, px, w, h))?;
-    Some(n)
+    decode_casv_range(view, 0..view.frame_count, &mut sess, &mut recon, &mut |i, px| {
+        f(i, px, w, h)
+    })?;
+    Some(view.frame_count)
 }
 
 /// [`decode_casv_all_rgb8`] with a persistent **multi-threaded** libjxl decoder:
@@ -1757,7 +1861,7 @@ pub fn decode_casv_all_rgb8_threaded(
     data: &[u8],
     num_threads: usize,
 ) -> Option<Vec<(Vec<u8>, u32, u32)>> {
-    decode_casv_all_rgb8_with(data, CasvDecodeSession::with_threads(num_threads)?)
+    decode_casv_all_rgb8_with(&CasvView::from_header(data)?, CasvDecodeSession::with_threads(num_threads)?)
 }
 
 #[cfg(test)]
@@ -2381,6 +2485,23 @@ mod tests {
             let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
             assert!(me < 8.0, "frame {i} mean err {me}");
         }
+
+        // Footer streaming for-each delivers the same frames in order (ST + MT).
+        let mut k = 0usize;
+        let n = decode_casv_footer_for_each_rgb8(&sink, |i, px, dw, dh| {
+            assert_eq!((i, dw, dh), (k, w, h), "footer for_each frame {k} meta");
+            assert_eq!(px, via_footer[k].0.as_slice(), "footer for_each frame {k}");
+            k += 1;
+        })
+        .unwrap();
+        assert_eq!((n, k), (8, 8));
+        let mut k = 0usize;
+        decode_casv_footer_for_each_rgb8_threaded(&sink, 4, |_, px, _, _| {
+            assert_eq!(px, via_footer[k].0.as_slice(), "footer MT for_each frame {k}");
+            k += 1;
+        })
+        .unwrap();
+        assert_eq!(k, 8);
     }
 
     #[test]

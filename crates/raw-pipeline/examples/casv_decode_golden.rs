@@ -144,18 +144,26 @@ fn main() {
         for p in &names {
             let data = std::fs::read(p).unwrap();
             let name = p.file_name().unwrap().to_string_lossy();
-            if parse_casv_header(&data).is_none() {
-                continue; // footer format handled by its own entry points
-            }
-            let batch = decode_casv_all_rgb8(&data).expect("batch decode");
+            let is_footer = parse_casv_header(&data).is_none();
+            let batch = if is_footer {
+                decode_casv_footer_all_rgb8(&data).expect("footer batch decode")
+            } else {
+                decode_casv_all_rgb8(&data).expect("batch decode")
+            };
             let mut k = 0usize;
-            let n = decode_casv_for_each_rgb8(&data, |i, px, dw, dh| {
-                assert_eq!(i, k, "{name}: order");
-                assert_eq!((dw, dh), (batch[k].1, batch[k].2), "{name}: dims {k}");
-                assert_eq!(px, batch[k].0.as_slice(), "{name}: frame {k} bytes");
-                k += 1;
-            })
-            .expect("for_each decode");
+            let check = |i: usize, px: &[u8], dw: u32, dh: u32, k: &mut usize| {
+                assert_eq!(i, *k, "{name}: order");
+                assert_eq!((dw, dh), (batch[*k].1, batch[*k].2), "{name}: dims {k}");
+                assert_eq!(px, batch[*k].0.as_slice(), "{name}: frame {k} bytes");
+                *k += 1;
+            };
+            let n = if is_footer {
+                decode_casv_footer_for_each_rgb8(&data, |i, px, dw, dh| check(i, px, dw, dh, &mut k))
+                    .expect("footer for_each decode")
+            } else {
+                decode_casv_for_each_rgb8(&data, |i, px, dw, dh| check(i, px, dw, dh, &mut k))
+                    .expect("for_each decode")
+            };
             assert_eq!((n, k), (batch.len(), batch.len()), "{name}: count");
             println!("{name:<24} for_each == batch, {n} frames byte-equal");
         }

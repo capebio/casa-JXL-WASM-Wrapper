@@ -41,7 +41,10 @@ mod winmem {
 
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn main() {
-    use raw_pipeline::casa_video::{decode_casv_all_rgb8, decode_casv_for_each_rgb8};
+    use raw_pipeline::casa_video::{
+        decode_casv_all_rgb8, decode_casv_footer_all_rgb8, decode_casv_footer_for_each_rgb8,
+        decode_casv_for_each_rgb8, parse_casv_header,
+    };
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
 
@@ -49,10 +52,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| r"C:\Tmp\jf-cvdec-golden\arch_bbox_g24.casv".to_string());
     let data = std::fs::read(&path).unwrap();
-    if raw_pipeline::casa_video::parse_casv_header(&data).is_none() {
-        eprintln!("{path}: not header-format (footer-indexed files use their own entry points)");
-        return;
-    }
+    let is_footer = parse_casv_header(&data).is_none();
 
     let peak = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -85,15 +85,23 @@ fn main() {
     run("streaming for_each", &|| {
         let mut hsh = 0xcbf29ce484222325u64;
         let mut n = 0usize;
-        decode_casv_for_each_rgb8(&data, |_, px, _, _| {
+        let mut cb = |_: usize, px: &[u8], _: u32, _: u32| {
             hsh = fnv(hsh, px);
             n += 1;
-        })
-        .unwrap();
+        };
+        if is_footer {
+            decode_casv_footer_for_each_rgb8(&data, &mut cb).unwrap();
+        } else {
+            decode_casv_for_each_rgb8(&data, &mut cb).unwrap();
+        }
         (n, hsh)
     });
     run("batch decode_casv_all", &|| {
-        let frames = decode_casv_all_rgb8(&data).unwrap();
+        let frames = if is_footer {
+            decode_casv_footer_all_rgb8(&data).unwrap()
+        } else {
+            decode_casv_all_rgb8(&data).unwrap()
+        };
         let mut hsh = 0xcbf29ce484222325u64;
         for (px, _, _) in &frames {
             hsh = fnv(hsh, px);
