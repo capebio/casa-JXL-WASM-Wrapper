@@ -174,7 +174,11 @@ export function estimateLightnessStats(rgbaU8, w, h) {
     const r = srgbU8ToLinear(rgbaU8[i * 4]), g = srgbU8ToLinear(rgbaU8[i * 4 + 1]), b = srgbU8ToLinear(rgbaU8[i * 4 + 2]);
     Ls[i] = xyzToLab(linearRgbToXyz([r, g, b]))[0];
   }
-  const sorted = Array.from(Ls).sort((a, b) => a - b);
+  // TypedArray sort is numeric-ascending by default — no boxed JS array, no
+  // comparator calls. Ordering matches Array.from(...).sort((a,b)=>a-b) for
+  // the finite L values here (ties are equal values), so the percentile picks
+  // are value-identical.
+  const sorted = Ls.slice().sort();
   const pct = (p) => sorted[Math.min(n - 1, Math.floor(p * n))];
   return { Lmid: pct(0.5), Lshoulder: pct(0.85), k: 0.3 };
 }
