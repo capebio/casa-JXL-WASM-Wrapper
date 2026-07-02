@@ -1624,3 +1624,46 @@ at the median. Net: adds a hot-loop check for no benefit → not worth carrying.
 manufactured a phantom 15% win here. For sub-10% deltas use INTERLEAVED A/B (flipflop/flipflopdom
 with start-rotation). Test kept at .flipflop/dom-tests/dec-degenerate.mjs; journal in
 docs/outputs/timing tests/flipflop/flipflopdom-journal.toon.
+
+---
+
+## DS-HADD: downsample_avx2 shuffle-network → hadd rewrite — measured WASH (2026-07-02)
+
+**Target:** `crates/raw-pipeline/src/perceptual/simd/avx2.rs` `downsample_avx2` (2× box downsample, per-pyramid-level in the butteraugli comparer).
+**Proposed (Questions_deferred):** replace the 8× `permutevar8x32` + 4× `permute2f128` even/odd deinterleave with 2× `hadd_ps` + 1× `permute4x64(0xD8)` per 8 output px (~12 shuffle uops → ~5).
+**Implemented + verified bit-exact** (same adds, same association; 11 shapes incl. odd widths/heights, degenerate 1–2 px planes) — then **rejected on the interleaved flipflop**: +2.8% / +0.7% / **−3.6%** / +4.4% / −0.1% across 0.4–24 MP planes. The kernel is memory-bound (2 rows in, 1 row out per output row), so shuffle-port pressure is not the limiter, and the largest (24 MP) case regresses. Production keeps the shuffle network.
+**Harness:** `crates/raw-pipeline/examples/downsample_hadd_flip.rs` (carries both variants + verdict).
+
+---
+
+## DC-XZERO: compressed_dc DequantDC 4:4:4 X-CfL-zero specialization — measured REGRESSION (2026-07-02)
+
+**Target:** `external/libjxl-012/lib/jxl/compressed_dc.cc` `DequantDC`, 4:4:4 branch (X store `MulAdd(in_y, cfl_fac_x, in_x)`).
+**Proposed (Questions_deferred, "CfL X-zero family #1"):** branch on `cfl_factors[0] == 0.0f` (the XYB default) and store `in_x` directly, dropping one FMA per X vector — sibling of the LANDED dec_group X-zero dequant.
+**Implemented + proven bit-identical** (0/3.1M mismatches across cfl_x = +0 / −0 / 0.254, zero-heavy X quants; `in_x` is an int32 quant × positive factor so never −0.0) — then **rejected**: consistently −1.8% / −4.9% / −6.8% / −7.4% across interleaved runs. The DC loop is load/store-bound (3 int loads + 3 float stores per vector); the saved FMA buys nothing and the duplicated loop body costs code layout. The dec_group sibling won because the AC path is compute-denser per byte — that reasoning does NOT transfer to the DC loop.
+**Record:** submodule branch `perf/compressed-dc-xzero-jul02-d8q3` (capebio) carries only `tools/dc_dequant_xzero_ab.cc` + verdict; `compressed_dc.cc` unchanged.
+
+---
+
+## STALE-JUL02: deferred items verified already-resolved in trunk (2026-07-02)
+
+Closed while working the 2026-07-02 deferred batch — each was re-verified against live code and found already landed / not a bug. Future passes: skip these.
+
+- **facade rgb8 progressive `pixelStride` (WS4-B6)** — NOT a bug: decode never produces rgb8 (`facade.ts:1` — rgb8 is encode-only, bridge fmt=3); `4*bpc` is correct on every decode path.
+- **SSIM `channel_moments` fusion (perceptual perf-2)** — already landed: `Comparer::all()` derives mus/vars from the SSIM sums bit-identically (`perceptual/mod.rs:366-371`, parity test at `:629-633`).
+- **LookRenderer::render per-slider-tick clone (hacker-010)** — already landed as M8: thread-local `RENDER_SCRATCH` reuse (`src/lib.rs:2256-2263`); remaining `rgb16.clone()`s are documented rare-path snapshots (full16 + unsharp only).
+- **facade 6 dropped encoder options (WS4-B2)** — already wired via the `enc_create_image_z` needsZ path (`facade.ts:2150-2176`: orientation, intrinsic size, disablePerceptualHeuristics, codestreamLevel, centerX/Y).
+- **Progressive manifest double-fetch race / DC byteEnd cap / tick() dirty-flag (WS5 B2/B3, C1)** — all landed (`inFlightManifestFetches` + `manifestChecked`; byteEnd from real progression events; `candidatesDirty`).
+- Additional already-landed items verified by the same audit: `findValidJpegEnd` SOS walk, encode-session progressive settings forwarding, tiled-decode-worker v1 protocol, `MsgDecodeBudgetExceeded extends DecodeFrameMeta`, pipeline.rs perf-4/5/19 (clarity/NR/downscale parallelization), `f32_linear_to_srgb8` LUT, perceptual downsample ping-pong swap, `estimateSceneWhiteLms` quickselect.
+
+---
+
+## NOWIN-JUL02: deferred items rejected without implementation (obviously negative-EV) (2026-07-02)
+
+Per the deferred docs' own analysis these cannot pay for their risk/effort; moved here so they stop resurfacing:
+
+- **`ans_common` CreateFlatHistogram write-count tweak** — the doc's own verdict: "truly negligible", off every hot path; a branch + second construction path to save ≤ len/2 integer increments.
+- **quantizer-inl `AdjustQuantBias` source-level reschedule** — compiler already reorders independent ops at -O2/-O3; chasing it is negative-EV; the only meaningful gate is a per-target assembly diff.
+- **chroma_from_luma micro-cleanups (transactional DecodeDC, u32 GetColorFactor)** — header-decode cold path, not ms-level.
+- **dec_group `RatioJPEG` hoist + compressed_dc #6 vertical chroma reuse** — JPEG-reconstruction / subsampled paths only; the RAW→XYB app pipeline is 4:4:4 and never executes them.
+- **enc_modular subsampled `AddVarDCTDC` exact allocation** — 4:2:0/4:2:2 only; the app path is 4:4:4, the branch never runs.

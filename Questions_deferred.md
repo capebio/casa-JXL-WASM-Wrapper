@@ -2,6 +2,21 @@
 
 **From:** QUESTIONS.md breakdown + Mr. Smith comptroller (2026-06-19)
 
+> **2026-07-02 batch resolution** (full detail: `docs/implemented improvements.md`
+> §2026-07-02, `docs/1 rejected optimizations.md` DS-HADD/DC-XZERO/NOWIN-JUL02):
+> - **LANDED:** dec_ans alphabet-size uint16 wrap fix (TTFP #6, branch a7f2); conv5
+>   pool-Status propagation (leftovers #5, branch s3v1); box_blur H-pass row-parallel +
+>   uninit pyramid allocs (+77–79%, 4.4–4.8×); casabio preview+full leaf coalescing
+>   (CASA-ENC D3, byte-exact, drops one e3 encode); perceptual-color percentile
+>   typed-array sort (+78–84%); **JOLT** lossy-video profile (rate metadata + presets,
+>   `docs/jolt-lossy-video.md`).
+> - **REJECTED (measured):** compressed_dc DC X-zero dequant (regression −1.8..−7.4%,
+>   DC-XZERO); downsample_avx2 hadd rewrite (wash, DS-HADD).
+> - **REJECTED (no implementation needed):** ans_common CreateFlatHistogram tweak,
+>   AdjustQuantBias reschedule, chroma_from_luma micro-cleanups, RatioJPEG hoist +
+>   compressed_dc #6 (app-dead JPEG-recon paths), enc_modular subsampled alloc
+>   (app is 4:4:4) — see NOWIN-JUL02.
+
 ---
 
 ## butteraugli SpeedCodeReview — deferred items (2026-07-02)

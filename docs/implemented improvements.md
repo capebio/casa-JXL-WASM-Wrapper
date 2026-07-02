@@ -350,3 +350,35 @@ This section provides a complete review of all JXL pipeline source files and the
 - `web/jxl-wrapper-lab.test.js`
 - `web/jxl-wrapper-performance.test.js`
 - `web/jxl-wrapper-timing.test.js`
+
+---
+
+## 2026-07-02 — Deferred-items implementation batch (QUESTIONS.md / Questions_deferred.md sweep)
+
+Ten deferred items attempted + JOLT lossy video. Winners below; the losers (downsample hadd rewrite, compressed_dc DC X-zero) and the verified-stale items are recorded in `docs/1 rejected optimizations.md` (DS-HADD, DC-XZERO, STALE-JUL02, NOWIN-JUL02).
+
+| Item | Where | Result | Evidence |
+|:---|:---|:---|:---|
+| **Metadata encode arg-shift** (WS4-B1) | `packages/jxl-wasm/src/facade.ts` | **Two live HIGH bugs fixed.** (1) Bridge `encode_rgba8_with_metadata` takes 19 params (`..., buffering, group_order, resampling, icc...`, verified arity 19 in shipped dist wasm); facade passed 17 → every ICC/EXIF/XMP pointer shifted 2 slots (ICC landed in group_order, XMP dropped). Plain rgba8/16/f32 calls likewise dropped groupOrder/resampling. (2) `chunks()` branched on `caps.streamingEncode` *before* the metadata path → metadata encodes routed through `enc_push_pixels` (no metadata params) and boxes were silently dropped. | `test/metadata-argshift.test.ts` pins arities 19/12 + XMP marker round-trip vs real scalar dist; facade ICC test now uses a real sRGB2014.icc (the old 4-byte dummy only "worked" because it was dropped). Commit on main. |
+| **Progressive decoder leak on pre-alloc OOM** (WS4-B5) | `facade.ts` eventsProgressive | expectedBytes malloc ran before the try/finally that frees the decoder → OOM leaked the native decoder. Moved inside the try. | `test/progressive-dec-leak.test.ts` — red on the previous revision, green now (exactly one `dec_free` + error event). |
+| **dec_ans alphabet-size uint16 wrap** (dec_ans TTFP #6) | `external/libjxl-012 lib/jxl/dec_ans.cc` | `DecodeVarLenUint16()+1` = 65536 wrapped to 0 in `uint16_t` BEFORE the max_alphabet_size check → bogus 65536-symbol alphabet passed validation as empty. Widened to u32 before the check; byte-exact for valid streams. | Harness `tools/dec_ans_alphabet_wrap_ab.cc`: OLD accepts the wrap stream, NEW rejects; 4097>4096 rejected and 1-symbol accepted by both. Branch `fix/dec-ans-alphabet-size-wrap-jul02-a7f2` (capebio, parked remote like other sub branches). |
+| **dng.rs read_ascii OOB panic** (000-security) | `crates/raw-pipeline/src/dng.rs` | Inline `cnt<=4` branch sliced unchecked (crafted IFD near EOF panicked); pointer branch's `p + cnt` could wrap usize on wasm32 and bypass its guard. Both now checked_add + get(), "" on OOB; valid files identical. | Unit test covers in-bounds / inline-EOF / pointer-EOF / usize-wrap. 13 dng tests pass (MSVC). |
+| **box_blur H-pass row-parallel + alloc elision** (box_blur follow-ups a–c) | `perceptual/blur.rs`, `perceptual/mod.rs` | `box_blur_h` (shared by scalar + AVX2 blur — the ref-build dominator) now row-parallel under `parallel`; scalar `box_blur` tmp/dst and the Comparer::new pyramid buffers (rx/ry/rb, nx/ny/nb) allocate uninit (all fully overwritten before read; same pattern as box_blur_avx2). WASM keeps serial. | Interleaved flipflop `examples/box_blur_h_par_flip.rs` (12 threads): **+79.2% @1MP, +79.3% @6MP, +77.2% @24MP (4.4–4.8×), bit-exact**. 31 perceptual tests pass; wasm32 check clean. |
+| **casabio preview+full leaf coalescing** (CASA-ENC D3) | `crates/raw-pipeline/src/casabio_encode.rs` | When long edge ≤1080, quality 85 (non-RAW/non-HQ) and progressive_dc==0, preview and full are the identical encode (EFFORT_PREVIEW==EFFORT_FULL==3, same opts) → encode once, share bytes. Drops one whole e3 encode (~halves encode work) for small/medium non-RAW uploads; byte-exact by construction; debug_assert pins the predicate. | Tests: coalesced tiers byte-identical + controls (HQ q95 / RAW q90 / progressive / >1080) stay separate. 16 casabio tests pass (MSVC). |
+| **estimateLightnessStats percentile sort** (perceptual-color batch a) | `web/perceptual-color.mjs` | `Array.from(Float32Array).sort(comparator)` → `Float32Array.slice().sort()` (typed numeric sort, no boxing/comparator). Value-identical percentiles. | Node flipflop `web/test/perceptual-color-sort-flip.mjs`: **+78.0% @1MP (4.55×), +84.5% @6MP (6.47×)**; percentile identity asserted incl. n=1. 22 perceptual-color tests pass. |
+| **conv5 pool-Status propagation** (conv5 leftovers #5) | `external/libjxl-012 lib/jxl/enc_convolve_separable5.cc` | `RunInteriorRows` DASSERTed then discarded the RunOnPool Status (runner failure reported as success). Status now threads RunInteriorRows → RunRows → Run(). No data-path change. | clang++ -fsyntax-only clean. Branch `fix/conv5-status-propagation-jul02-s3v1` (capebio). |
+
+### JOLT — JXL-Optimized Lossy Transport (new)
+
+The lossy CASV tier is now a branded codec profile (`docs/jolt-lossy-video.md`): JXL VarDCT intra (chunked constant-peak encoder) + fresh-pixel REPLACE-skip P-frames with in-loop reconstruct. New in this batch: **rate metadata in the container** (CasvHeader.flags bit0=lossy, distance q0.1 in bits 8..15, effort in 16..19 + accessors; CASR rate box for footer/streamed files with legacy-safe parsing), **presets** (`JoltPreset::{Realtime, Balanced, Quality}`), one-call `jolt_encode` / `jolt_encode_stream_to`, and `examples/jolt_bench.rs`.
+
+Measured on 48 real dashcam frames @1280×720 (single-threaded decode, 24 fps budget):
+
+| tier | size vs raw | dec ms/f | dec fps | real-time? |
+|---|---|---|---|---|
+| JOLT Realtime (d2.0/e1) | **3.0%** | 18.1 | 55 | PASS |
+| JOLT Balanced (d1.0/e3) | 5.2% | 23.8 | 42 | PASS |
+| JOLT Quality (d0.5/e4) | 8.1% | 18.8 | 53 | PASS |
+| lossless archive | 13.3% | 109.7 | 9 | over |
+
+Every JOLT preset decodes 720p in real time; the lossless tier does not — that gap is what JOLT fills. 27 casa_video tests pass (2 new: header rate flags + CASR box incl. legacy splice compatibility).

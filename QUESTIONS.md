@@ -2,6 +2,17 @@
 
 Run: `epiccodereview/20260617T202430Z` (core decode chain, modelswitching)
 
+> **2026-07-02 batch resolution** (see `docs/implemented improvements.md` §2026-07-02 and
+> `docs/1 rejected optimizations.md` STALE-JUL02/NOWIN-JUL02 for full detail):
+> - **LANDED:** facade metadata arg-shift + streaming-path metadata drop (WS4-B1);
+>   progressive-decoder leak on expectedBytes OOM (WS4-B5); dng.rs read_ascii OOB guard.
+> - **REJECTED (measured):** downsample_avx2 hadd rewrite (wash, DS-HADD).
+> - **VERIFIED ALREADY RESOLVED — close on sight:** rgb8 progressive pixelStride (decode
+>   never produces rgb8), facade B2 six encoder options (needsZ path), findValidJpegEnd,
+>   tiled-decode-worker protocol, progressive-profile DC byteEnd, tick() dirty-flag,
+>   manifest fetch dedup, pipeline.rs perf-4/5/19, f32_linear_to_srgb8 LUT,
+>   LookRenderer clone (M8), SSIM channel_moments fusion.
+
 ---
 
 ## Section 002 — jxl-core (contract package)
