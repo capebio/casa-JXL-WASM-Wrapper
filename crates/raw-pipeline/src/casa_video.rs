@@ -42,7 +42,7 @@
 use crate::jxl_casaencoder::{
     encode_chunked, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame, WholeImageSource,
 };
-use crate::jxl_casadecoder::{decode_interleaved, Channels, DecodeOptions, Decoder};
+use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
 use rayon::prelude::*;
 
 pub const CASV_MAGIC: u32 = 0x5641_5343; // 'CASV' little-endian
@@ -2532,7 +2532,8 @@ mod tests {
             encode_casv_delta_rgb8(&refs, w, h, 24, 1, 3, EncodeOptions::lossless()).unwrap(),
             encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, 3, 16, EncodeOptions::lossless())
                 .unwrap(),
-            encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, 1.0, 0).unwrap(),
+            encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, EncodeOptions::distance(1.0), 0)
+                .unwrap(),
         ];
         for bytes in &files {
             let batch = decode_casv_all_rgb8(bytes).unwrap();
@@ -2568,7 +2569,9 @@ mod tests {
         let tile =
             encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, 3, 16, EncodeOptions::lossless())
                 .unwrap();
-        let lossy = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, 1.0, 0).unwrap();
+        let lossy =
+            encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, EncodeOptions::distance(1.0), 0)
+                .unwrap();
         for bytes in [&tile, &lossy] {
             let st = decode_casv_all_rgb8(bytes).unwrap();
             let mt = decode_casv_all_rgb8_threaded(bytes, 4).unwrap();
