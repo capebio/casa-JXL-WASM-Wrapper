@@ -436,7 +436,11 @@ struct StreamCtx {
     skip: SkipMode,
     tile: u32,
     thresh: u8,
-    crop_opts: EncodeOptions,
+    /// One `JxlEncoder` handle reused for every P-frame crop/atlas encode
+    /// (`encode_into` Resets it between encodes) — kills the per-frame
+    /// create/destroy + settings resend and appends compressed bytes straight
+    /// into `payload` (no intermediate Vec + memcpy).
+    enc: Encoder,
 }
 
 fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<StreamCtx, VideoError> {
@@ -455,7 +459,7 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
         skip: opts.skip,
         tile: opts.tile,
         thresh: opts.thresh.unwrap_or_else(|| default_thresh_for_distance(distance)),
-        crop_opts: EncodeOptions::distance(distance).with_effort(opts.effort),
+        enc: Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?,
     })
 }
 
@@ -470,7 +474,7 @@ fn encode_stream_frame(
     px: &[u8],
     prev_src: &[u8],
     is_iframe: bool,
-    ctx: &StreamCtx,
+    ctx: &mut StreamCtx,
     payload: &mut Vec<u8>,
 ) -> Result<u32, VideoError> {
     let (width, height) = (ctx.width, ctx.height);
@@ -505,8 +509,8 @@ fn encode_stream_frame(
                     atlas[d..d + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
                 }
             }
-            let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, ctx.crop_opts.clone())?;
-            payload.extend_from_slice(&jxl);
+            ctx.enc
+                .encode_into(&Frame::rgb(atlas.as_slice(), t, t * changed.len() as u32), payload)?;
         }
         return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
     }
@@ -518,12 +522,11 @@ fn encode_stream_frame(
         }
         Some((x, y, bw, bh)) => {
             let crop = crop_rgb(px, width, x, y, bw, bh);
-            let jxl = encode_rgb8(&crop, bw, bh, ctx.crop_opts.clone())?;
             payload.extend_from_slice(&(x as u16).to_le_bytes());
             payload.extend_from_slice(&(y as u16).to_le_bytes());
             payload.extend_from_slice(&(bw as u16).to_le_bytes());
             payload.extend_from_slice(&(bh as u16).to_le_bytes());
-            payload.extend_from_slice(&jxl);
+            ctx.enc.encode_into(&Frame::rgb(crop.as_slice(), bw, bh), payload)?;
         }
     }
     Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG)
@@ -543,7 +546,7 @@ pub fn encode_casv_video_streaming(
 ) -> Result<Vec<u8>, VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
-    let ctx = stream_ctx(width, height, opts)?;
+    let mut ctx = stream_ctx(width, height, opts)?;
     let gop = opts.gop_len.max(1) as usize;
     let expected = (width as usize) * (height as usize) * 3;
 
@@ -558,7 +561,7 @@ pub fn encode_casv_video_streaming(
             return Err(VideoError::FrameSize { idx, expected, got: px.len() });
         }
         payload.clear();
-        let flags = encode_stream_frame(&px, &prev_src, idx % gop == 0, &ctx, &mut payload)?;
+        let flags = encode_stream_frame(&px, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
         index.push((flags, payload.len() as u32));
         data.extend_from_slice(&payload);
         prev_src = px;
@@ -601,7 +604,7 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
 ) -> Result<(), VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
-    let ctx = stream_ctx(width, height, opts)?;
+    let mut ctx = stream_ctx(width, height, opts)?;
     let gop = opts.gop_len.max(1) as usize;
     let expected = (width as usize) * (height as usize) * 3;
 
@@ -616,7 +619,7 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
             return Err(VideoError::FrameSize { idx, expected, got: px.len() });
         }
         payload.clear();
-        let flags = encode_stream_frame(&px, &prev_src, idx % gop == 0, &ctx, &mut payload)?;
+        let flags = encode_stream_frame(&px, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
         sink.write_all(&payload).map_err(|_| VideoError::Io)?;
         index.push((offset as u32, (payload.len() as u32) | flags));
         offset += payload.len() as u64;
