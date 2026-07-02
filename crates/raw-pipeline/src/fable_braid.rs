@@ -149,15 +149,30 @@ fn cum_table(freqs: &[u16; 256]) -> [u32; 257] {
 }
 
 /// Encode `syms` (forward order, lane = index & 7) into a braided rANS stream.
-/// Returns (states after encoding = decoder's initial states, byte stream with
-/// `RANS_PAD` trailing pad).
-fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>) {
+/// Returns (states after encoding = decoder's initial states, buffer, start):
+/// the stream (with `RANS_PAD` trailing pad) is `buf[start..]`.
+///
+/// Emissions are produced in reverse decode order, so the buffer is filled
+/// BACKWARD from a worst-case-exact allocation (each symbol flushes at most
+/// one u16): no realloc-and-copy on dense planes, no whole-stream reverse
+/// pass. Byte order per emission is lo,hi — identical to the old
+/// push-hi-lo-then-reverse scheme (little-endian u16s read forward).
+fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>, usize) {
     let cum = cum_table(freqs);
     let mut x = [RANS_L; LANES];
-    // Emissions are produced in reverse decode order; push hi-then-lo and
-    // reverse the buffer at the end so the decoder reads little-endian u16s
-    // forward.
-    let mut rev = Vec::with_capacity(syms.len() / 2 + 16);
+    let cap = syms.len() * 2 + RANS_PAD;
+    // No zero-fill: the pad is written explicitly below and emissions fill
+    // strictly backward from it; only buf[pos..] is ever read (the caller
+    // copies buf[start..]). Initialization-order proof: every byte at index
+    // >= pos was written when pos moved past it; bytes below the final pos
+    // are never read. u8 has no drop glue.
+    let mut buf: Vec<u8> = Vec::with_capacity(cap);
+    unsafe { buf.set_len(cap) };
+    let mut pos = cap - RANS_PAD;
+    // Trailing pad (branchless renorm may overread past the payload).
+    for b in &mut buf[pos..] {
+        *b = 0;
+    }
     for i in (0..syms.len()).rev() {
         let lane = i & (LANES - 1);
         let s = syms[i] as usize;
@@ -165,15 +180,14 @@ fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>) {
         debug_assert!(f > 0);
         let xl = &mut x[lane];
         if *xl >= (f << 20) {
-            rev.push((*xl >> 8) as u8);
-            rev.push(*xl as u8);
+            pos -= 2;
+            buf[pos] = *xl as u8;
+            buf[pos + 1] = (*xl >> 8) as u8;
             *xl >>= 16;
         }
         *xl = ((*xl / f) << PREC) + (*xl % f) + cum[s];
     }
-    rev.reverse();
-    rev.extend_from_slice(&[0u8; RANS_PAD]);
-    (x, rev)
+    (x, buf, pos)
 }
 
 /// slot → freq(12b) << 20 | offset-within-symbol(12b) << 8 | sym(8b)
@@ -330,21 +344,36 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Compute one residual row and return the OR of its bytes (zero ⇔ the row is
+/// a COPY row) — the all-zero check fused into the residual pass.
 #[inline]
-fn residual_row(res: &mut [u8], cur: &[u8], pred: &[u8]) {
-    for i in 0..res.len() {
-        res[i] = cur[i].wrapping_sub(pred[i]);
+fn residual_row_or(res: &mut [u8], cur: &[u8], pred: &[u8]) -> u8 {
+    let n = res.len();
+    let (cur, pred) = (&cur[..n], &pred[..n]);
+    let mut orv = 0u8;
+    for i in 0..n {
+        let d = cur[i].wrapping_sub(pred[i]);
+        res[i] = d;
+        orv |= d;
     }
+    orv
 }
 
 /// Shannon cost in bits of a histogram (encoder-side model selection only).
 fn shannon_bits(hist: &[u64; 256]) -> f64 {
-    let total: u64 = hist.iter().sum();
+    shannon_bits_extra0(hist, 0)
+}
+
+/// `shannon_bits` with `extra0` added to bin 0 — same accumulation order, so
+/// the result is bit-identical to running `shannon_bits` on an adjusted copy.
+fn shannon_bits_extra0(hist: &[u64; 256], extra0: u64) -> f64 {
+    let total: u64 = hist.iter().sum::<u64>() + extra0;
     if total == 0 {
         return 0.0;
     }
     let mut bits = 0.0f64;
-    for &c in hist {
+    for (i, &c) in hist.iter().enumerate() {
+        let c = if i == 0 { c + extra0 } else { c };
         if c > 0 {
             bits += c as f64 * (total as f64 / c as f64).log2();
         }
@@ -352,62 +381,109 @@ fn shannon_bits(hist: &[u64; 256]) -> f64 {
     bits
 }
 
-/// Encode one w×h plane. `plane.len()` must be `w*h`.
-fn encode_plane(plane: &[u8], w: usize, h: usize, pred: Predictor, out: &mut Vec<u8>) {
+/// One-pass predictor scan over a plane: row-major residual buffer (all rows,
+/// COPY rows included as zeros), per-row COPY modes, the COPY-excluded
+/// residual histogram, and the full-plane Shannon cost used to rank
+/// predictors. One scan serves both predictor selection and the encode itself
+/// (the histogram is cached, not recomputed — COPY rows contribute exactly
+/// `w` to bin 0 each, so the full-plane ranking histogram is recovered by an
+/// exact bin-0 adjustment in `shannon_bits_extra0`).
+struct PredScan {
+    residuals: Vec<u8>,
+    modes: Vec<u8>,
+    hist: [u64; 256],
+    copy_rows: usize,
+    cost_bits: f64,
+}
+
+impl Default for PredScan {
+    fn default() -> Self {
+        PredScan {
+            residuals: Vec::new(),
+            modes: Vec::new(),
+            hist: [0u64; 256],
+            copy_rows: 0,
+            cost_bits: 0.0,
+        }
+    }
+}
+
+fn scan_predictor_into(plane: &[u8], w: usize, h: usize, pred: Predictor, s: &mut PredScan) {
     assert_eq!(plane.len(), w * h, "plane size");
     if let Predictor::External(p) = pred {
         assert_eq!(p.len(), w * h, "external predictor size");
     }
+    let zero_row = vec![0u8; w];
+    if s.residuals.len() != w * h {
+        s.residuals.resize(w * h, 0);
+    }
+    s.modes.clear();
+    s.modes.resize(h, MODE_RANS);
+    s.hist = [0u64; 256];
+    s.copy_rows = 0;
+    for y in 0..h {
+        let cur = &plane[y * w..(y + 1) * w];
+        let pr: &[u8] = match pred {
+            Predictor::Zero => &zero_row,
+            Predictor::Top => {
+                if y == 0 {
+                    &zero_row
+                } else {
+                    &plane[(y - 1) * w..y * w]
+                }
+            }
+            Predictor::External(p) => &p[y * w..(y + 1) * w],
+        };
+        let row = &mut s.residuals[y * w..(y + 1) * w];
+        if residual_row_or(row, cur, pr) == 0 {
+            s.modes[y] = MODE_COPY;
+            s.copy_rows += 1;
+        } else {
+            for &b in row.iter() {
+                s.hist[b as usize] += 1;
+            }
+        }
+    }
+    // Full-plane ranking cost: COPY rows are all-zero residuals.
+    s.cost_bits = shannon_bits_extra0(&s.hist, (s.copy_rows * w) as u64);
+}
+
+/// Encode one plane from its predictor scan (residuals/modes/histogram are
+/// consumed from `s`; `s.modes` is updated in place by RAW demotion).
+fn encode_plane_from_scan(w: usize, h: usize, pred: Predictor, s: &mut PredScan, out: &mut Vec<u8>) {
     out.push(pred.id());
 
-    let zero_row = vec![0u8; w];
-    let mut residuals: Vec<u8> = Vec::with_capacity(w * h);
-    let mut modes = vec![MODE_RANS; h];
-    let mut hist = [0u64; 256]; // plain residuals
-    let mut hist_ld = [0u64; 256]; // left-delta of residuals
-    // Pass A: residuals + COPY detection + both candidate histograms.
-    {
-        let mut res = vec![0u8; w];
-        for y in 0..h {
-            let cur = &plane[y * w..(y + 1) * w];
-            let pr: &[u8] = match pred {
-                Predictor::Zero => &zero_row,
-                Predictor::Top => {
-                    if y == 0 {
-                        &zero_row
-                    } else {
-                        &plane[(y - 1) * w..y * w]
-                    }
-                }
-                Predictor::External(p) => &p[y * w..(y + 1) * w],
-            };
-            residual_row(&mut res, cur, pr);
-            if res.iter().all(|&b| b == 0) {
-                modes[y] = MODE_COPY;
-            } else {
-                let mut prev = 0u8;
-                for &b in &res {
-                    hist[b as usize] += 1;
-                    hist_ld[b.wrapping_sub(prev) as usize] += 1;
-                    prev = b;
-                }
-                residuals.extend_from_slice(&res);
-            }
+    // Left-delta candidate histogram over the non-COPY rows (the scan already
+    // paid for the plain histogram; this is the only second walk).
+    let mut hist_ld = [0u64; 256];
+    for y in 0..h {
+        if s.modes[y] != MODE_RANS {
+            continue;
+        }
+        let row = &s.residuals[y * w..(y + 1) * w];
+        let mut prev = 0u8;
+        for &b in row {
+            hist_ld[b.wrapping_sub(prev) as usize] += 1;
+            prev = b;
         }
     }
 
     // Model selection: left-delta wins when its entropy is clearly lower (the
     // margin guards against paying a prefix-sum decode pass for noise-level wins).
-    let transform = if shannon_bits(&hist_ld) < shannon_bits(&hist) * 0.995 {
+    let transform = if shannon_bits(&hist_ld) < shannon_bits(&s.hist) * 0.995 {
         TRANSFORM_LEFT_DELTA
     } else {
         TRANSFORM_NONE
     };
     out.push(transform);
-    if transform == TRANSFORM_LEFT_DELTA {
-        hist = hist_ld;
-        // Rewrite stored residual rows in place as their left-delta.
-        for row in residuals.chunks_exact_mut(w) {
+    let hist: &[u64; 256] = if transform == TRANSFORM_LEFT_DELTA {
+        // Rewrite stored residual rows in place as their left-delta (COPY
+        // rows stay untouched — they are never emitted).
+        for y in 0..h {
+            if s.modes[y] != MODE_RANS {
+                continue;
+            }
+            let row = &mut s.residuals[y * w..(y + 1) * w];
             let mut prev = 0u8;
             for b in row.iter_mut() {
                 let d = b.wrapping_sub(prev);
@@ -415,11 +491,14 @@ fn encode_plane(plane: &[u8], w: usize, h: usize, pred: Predictor, out: &mut Vec
                 *b = d;
             }
         }
-    }
+        &hist_ld
+    } else {
+        &s.hist
+    };
 
-    let freqs = normalize_freqs(&hist);
+    let freqs = normalize_freqs(hist);
     // Pass B: RAW demotion by estimated cost under the global table.
-    let mut syms: Vec<u8> = Vec::with_capacity(residuals.len());
+    let mut syms: Vec<u8> = Vec::with_capacity((h - s.copy_rows) * w);
     let mut raw: Vec<u8> = Vec::new();
     if let Some(fr) = &freqs {
         let mut bits = [0f32; 256];
@@ -428,16 +507,14 @@ fn encode_plane(plane: &[u8], w: usize, h: usize, pred: Predictor, out: &mut Vec
                 bits[i] = (TAB_SIZE as f32 / fr[i] as f32).log2();
             }
         }
-        let mut off = 0usize;
         for y in 0..h {
-            if modes[y] != MODE_RANS {
+            if s.modes[y] != MODE_RANS {
                 continue;
             }
-            let row = &residuals[off..off + w];
-            off += w;
+            let row = &s.residuals[y * w..(y + 1) * w];
             let cost: f32 = row.iter().map(|&b| bits[b as usize]).sum();
             if cost > RAW_THRESHOLD_BITS_PER_BYTE * w as f32 {
-                modes[y] = MODE_RAW;
+                s.modes[y] = MODE_RAW;
                 raw.extend_from_slice(row);
             } else {
                 syms.extend_from_slice(row);
@@ -445,19 +522,19 @@ fn encode_plane(plane: &[u8], w: usize, h: usize, pred: Predictor, out: &mut Vec
         }
     }
 
-    out.extend_from_slice(&modes);
+    out.extend_from_slice(&s.modes);
     put_u32(out, syms.len() as u32);
     if !syms.is_empty() {
         let fr = freqs.expect("non-empty syms implies a table");
         for f in fr {
             out.extend_from_slice(&f.to_le_bytes());
         }
-        let (states, stream) = rans_encode(&syms, &fr);
-        for s in states {
-            put_u32(out, s);
+        let (states, stream, start) = rans_encode(&syms, &fr);
+        for st in states {
+            put_u32(out, st);
         }
-        put_u32(out, stream.len() as u32);
-        out.extend_from_slice(&stream);
+        put_u32(out, (stream.len() - start) as u32);
+        out.extend_from_slice(&stream[start..]);
     }
     put_u32(out, raw.len() as u32);
     out.extend_from_slice(&raw);
@@ -1013,10 +1090,16 @@ fn image_header(w: u32, h: u32, nplanes: u8, rct: u8) -> Vec<u8> {
     out
 }
 
-fn push_plane(out: &mut Vec<u8>, plane: &[u8], w: usize, h: usize, pred: Predictor) {
+fn push_plane_from_scan(
+    out: &mut Vec<u8>,
+    w: usize,
+    h: usize,
+    pred: Predictor,
+    scan: &mut PredScan,
+) {
     let at = out.len();
     put_u32(out, 0);
-    encode_plane(plane, w, h, pred, out);
+    encode_plane_from_scan(w, h, pred, scan, out);
     let len = (out.len() - at - 4) as u32;
     out[at..at + 4].copy_from_slice(&len.to_le_bytes());
 }
@@ -1031,35 +1114,12 @@ pub fn encode_rgb8(rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
         b[i] = b[i].wrapping_sub(g[i]);
     }
     let mut out = image_header(w, h, 3, RCT_SUBTRACT_GREEN);
+    let mut scan = PredScan::default();
     for plane in [&g, &r, &b] {
-        push_plane(&mut out, plane, w as usize, h as usize, Predictor::Top);
+        scan_predictor_into(plane, w as usize, h as usize, Predictor::Top, &mut scan);
+        push_plane_from_scan(&mut out, w as usize, h as usize, Predictor::Top, &mut scan);
     }
     out
-}
-
-/// Rough Shannon cost (bits) of a plane under a predictor: histogram of the
-/// mod-256 residuals, ignoring row modes. Good enough to rank predictors.
-fn predictor_cost(plane: &[u8], w: usize, h: usize, pred: Predictor) -> f64 {
-    let mut hist = [0u64; 256];
-    let zero_row = vec![0u8; w];
-    for y in 0..h {
-        let cur = &plane[y * w..(y + 1) * w];
-        let pr: &[u8] = match pred {
-            Predictor::Zero => &zero_row,
-            Predictor::Top => {
-                if y == 0 {
-                    &zero_row
-                } else {
-                    &plane[(y - 1) * w..y * w]
-                }
-            }
-            Predictor::External(p) => &p[y * w..(y + 1) * w],
-        };
-        for i in 0..w {
-            hist[cur[i].wrapping_sub(pr[i]) as usize] += 1;
-        }
-    }
-    shannon_bits(&hist)
 }
 
 /// Lossless temporal-delta encode of interleaved RGB8 against the previous
@@ -1067,6 +1127,8 @@ fn predictor_cost(plane: &[u8], w: usize, h: usize, pred: Predictor) -> f64 {
 /// subtract-green space like the intra path; each plane independently picks
 /// the cheaper of {External (temporal), Top (spatial)} — high-motion planes
 /// fall back to intra-style prediction instead of coding a noisy delta.
+/// Predictor ranking and the encode share one scan per candidate: the ranking
+/// histogram is reused for the encode instead of being rebuilt.
 pub fn encode_rgb8_delta(cur: &[u8], prev: &[u8], w: u32, h: u32) -> Vec<u8> {
     let n = w as usize * h as usize;
     assert_eq!(cur.len(), n * 3, "cur size");
@@ -1081,15 +1143,17 @@ pub fn encode_rgb8_delta(cur: &[u8], prev: &[u8], w: u32, h: u32) -> Vec<u8> {
     }
     let (wu, hu) = (w as usize, h as usize);
     let mut out = image_header(w, h, 3, RCT_SUBTRACT_GREEN);
+    let mut scan_ext = PredScan::default();
+    let mut scan_top = PredScan::default();
     for (c, p) in [(&cg, &pg), (&cr, &pr), (&cb, &pb)] {
         let ext = Predictor::External(p);
-        let pred = if predictor_cost(c, wu, hu, ext) <= predictor_cost(c, wu, hu, Predictor::Top)
-        {
-            ext
+        scan_predictor_into(c, wu, hu, ext, &mut scan_ext);
+        scan_predictor_into(c, wu, hu, Predictor::Top, &mut scan_top);
+        if scan_ext.cost_bits <= scan_top.cost_bits {
+            push_plane_from_scan(&mut out, wu, hu, ext, &mut scan_ext);
         } else {
-            Predictor::Top
-        };
-        push_plane(&mut out, c, wu, hu, pred);
+            push_plane_from_scan(&mut out, wu, hu, Predictor::Top, &mut scan_top);
+        }
     }
     out
 }
@@ -1389,10 +1453,10 @@ mod tests {
             hist[s as usize] += 1;
         }
         let freqs = normalize_freqs(&hist).unwrap();
-        let (states, stream) = rans_encode(&syms, &freqs);
+        let (states, buf, start) = rans_encode(&syms, &freqs);
         let mut tab = Vec::new();
         build_decode_table_into(&freqs, &mut tab);
-        let mut dec = RansDecoder::new(states, &stream, &tab).unwrap();
+        let mut dec = RansDecoder::new(states, &buf[start..], &tab).unwrap();
         let mut out = vec![0u8; syms.len()];
         dec.decode_all(&mut out);
         assert!(dec.finish(), "final state check");
@@ -1405,10 +1469,10 @@ mod tests {
         let mut hist = [0u64; 256];
         hist[7] = 999;
         let freqs = normalize_freqs(&hist).unwrap();
-        let (states, stream) = rans_encode(&syms, &freqs);
+        let (states, buf, start) = rans_encode(&syms, &freqs);
         let mut tab = Vec::new();
         build_decode_table_into(&freqs, &mut tab);
-        let mut dec = RansDecoder::new(states, &stream, &tab).unwrap();
+        let mut dec = RansDecoder::new(states, &buf[start..], &tab).unwrap();
         let mut out = vec![0u8; 999];
         dec.decode_all(&mut out);
         assert!(dec.finish());
