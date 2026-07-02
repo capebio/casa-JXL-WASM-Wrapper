@@ -1626,14 +1626,14 @@ pub fn decode_casv_frame_rgb8(data: &[u8], index: usize) -> Option<(Vec<u8>, u32
     Some((cur, w, h))
 }
 
-/// Decode every frame in order, reconstructing P-frames against the running
-/// previous frame. `None` if any frame fails to decode. One persistent decoder
-/// + reused reconstruction/scratch buffers serve the whole video (no per-frame
-/// `JxlDecoderCreate`/`Destroy`, no per-frame region mallocs).
-pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+/// Sequential decode loop shared by the ST and MT batch entry points: one
+/// session, one running reconstruction buffer, one owned clone per frame out.
+fn decode_casv_all_rgb8_with(
+    data: &[u8],
+    mut sess: CasvDecodeSession,
+) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let hdr = parse_casv_header(data)?;
     let (w, h) = (hdr.width, hdr.height);
-    let mut sess = CasvDecodeSession::new()?;
     let mut out = Vec::with_capacity(hdr.frame_count as usize);
     let mut recon: Vec<u8> = Vec::new();
     for i in 0..hdr.frame_count as usize {
@@ -1654,6 +1654,29 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
         out.push((recon.clone(), w, h));
     }
     Some(out)
+}
+
+/// Decode every frame in order, reconstructing P-frames against the running
+/// previous frame. `None` if any frame fails to decode. One persistent decoder
+/// + reused reconstruction/scratch buffers serve the whole video (no per-frame
+/// `JxlDecoderCreate`/`Destroy`, no per-frame region mallocs).
+pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    decode_casv_all_rgb8_with(data, CasvDecodeSession::new()?)
+}
+
+/// [`decode_casv_all_rgb8`] with a persistent **multi-threaded** libjxl decoder:
+/// the sequential-playback latency lever. Each frame's JXL decode fans out over
+/// `num_threads` libjxl worker threads (one runner held across all frames);
+/// `num_threads <= 1` is single-threaded and identical to
+/// [`decode_casv_all_rgb8`]. libjxl MT decode is deterministic and
+/// byte-identical to ST, so the output is byte-exact either way — use this
+/// where per-frame latency (not batch throughput) is the budget, e.g. the
+/// lossless-archive tier whose I/P frames are whole-image lossless decodes.
+pub fn decode_casv_all_rgb8_threaded(
+    data: &[u8],
+    num_threads: usize,
+) -> Option<Vec<(Vec<u8>, u32, u32)>> {
+    decode_casv_all_rgb8_with(data, CasvDecodeSession::with_threads(num_threads)?)
 }
 
 #[cfg(test)]
@@ -2277,6 +2300,26 @@ mod tests {
             let me = px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>() / px.len() as f64;
             assert!(me < 8.0, "frame {i} mean err {me}");
         }
+    }
+
+    #[test]
+    fn threaded_decode_is_byte_identical_to_st() {
+        let (w, h) = (64u32, 48u32);
+        let src = low_motion(w, h, 6);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        // Lossless tile (residual P) + lossy bbox (REPLACE P) cover both
+        // P-frame decode kinds plus whole-frame I decodes.
+        let tile =
+            encode_casv_delta_tiled_rgb8(&refs, w, h, 24, 1, 3, 16, EncodeOptions::lossless())
+                .unwrap();
+        let lossy = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 3, 1.0, 0).unwrap();
+        for bytes in [&tile, &lossy] {
+            let st = decode_casv_all_rgb8(bytes).unwrap();
+            let mt = decode_casv_all_rgb8_threaded(bytes, 4).unwrap();
+            assert_eq!(st, mt, "MT decode must be byte-identical to ST");
+        }
+        // num_threads <= 1 is the ST shape.
+        assert_eq!(decode_casv_all_rgb8_threaded(&tile, 1).unwrap(), decode_casv_all_rgb8(&tile).unwrap());
     }
 
     #[test]

@@ -132,6 +132,44 @@ fn main() {
         return;
     }
 
+    if mode == "mt" {
+        // Verify MT == ST bytes on the whole corpus (header-format files) and
+        // report sequential-playback decode times per thread width.
+        let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read corpus dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "casv"))
+            .collect();
+        names.sort();
+        for p in &names {
+            let data = std::fs::read(p).unwrap();
+            let name = p.file_name().unwrap().to_string_lossy();
+            if parse_casv_header(&data).is_none() {
+                continue; // footer format: covered once the view lands (CV-D5)
+            }
+            let t0 = std::time::Instant::now();
+            let st = decode_casv_all_rgb8(&data).expect("st decode");
+            let st_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = std::time::Instant::now();
+            let mt = decode_casv_all_rgb8_threaded(&data, n_threads).expect("mt decode");
+            let mt_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(st.len(), mt.len(), "{name}: frame count");
+            for (i, (a, b)) in st.iter().zip(mt.iter()).enumerate() {
+                assert_eq!(a, b, "{name}: frame {i} MT != ST");
+            }
+            let n = st.len() as f64;
+            println!(
+                "{name:<24} ST {:>7.1} ms/f ({:>5.1} fps)  MT{n_threads} {:>7.1} ms/f ({:>5.1} fps)  MT==ST bytes OK",
+                st_ms / n,
+                1000.0 / (st_ms / n),
+                mt_ms / n,
+                1000.0 / (mt_ms / n)
+            );
+        }
+        return;
+    }
+
     assert_eq!(mode, "decode");
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .expect("read corpus dir")
