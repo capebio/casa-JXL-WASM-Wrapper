@@ -1624,3 +1624,19 @@ at the median. Net: adds a hot-loop check for no benefit → not worth carrying.
 manufactured a phantom 15% win here. For sub-10% deltas use INTERLEAVED A/B (flipflop/flipflopdom
 with start-rotation). Test kept at .flipflop/dom-tests/dec-degenerate.mjs; journal in
 docs/outputs/timing tests/flipflop/flipflopdom-journal.toon.
+
+---
+
+### G2-F6 follow-up (2026-07-02): memory-weighted admission gate IMPLEMENTED
+The concurrency-shape concern is now benchmark-justified (project-preview-concurrency-evidence:
+pyramid decode ~80MB-flat scales past core count; full-res decode ~250MB/worker, flat cap of ~4
+justified there but starves the cheap/thumbnail path ~2×). Shipped opt-in
+`MemoryWeightedAdmissionGate` (jxl-scheduler): admission weight ∝ output bytes (decode:
+expectedOutputBytes hint or targetW*targetH*4; encode: width*height*bpp), a shared byte-budget
+weighted semaphore replaces the flat count cap as the concurrency limiter, and the worker
+ceiling is raised (2*HWC) when the gate is on so the budget is the effective limiter. Opt-in via
+`ContextOptions.memoryGate` (+ `memoryCapBytes` budget); default off = unchanged behavior.
+This is DISTINCT from the still-rejected MT-routing work-class hint in G2-F6 (that concerned
+`router.pick`/`shouldUseMtImmediately`, not admission). Spec:
+docs/superpowers/specs/2026-07-02-memory-admission-gate-design.md; plan:
+docs/superpowers/plans/2026-07-02-memory-admission-gate.md.
