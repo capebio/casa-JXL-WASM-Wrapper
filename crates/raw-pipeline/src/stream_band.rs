@@ -43,6 +43,26 @@ pub struct StreamingBandSource<S: RawRowSource> {
     rgb8: Vec<u8>,
     win_first: usize,
     produced: usize,
+    // Reused scratch (contents are per-chunk transients): raw row decode buffer,
+    // clamped-chunk demosaic context, and the rgb16 demosaic/tone transient. Hoisted
+    // from per-call/per-chunk allocations — strictly less allocator traffic (rule #10).
+    rowbuf: Vec<u16>,
+    ctx: Vec<u16>,
+    rgb16: Vec<u16>,
+}
+
+/// Append `n` bytes of *unzeroed* tail to `v`, skipping the `resize(.., 0)` memset.
+/// Caller contract: the appended region is fully overwritten before any read —
+/// `process_into_auto` asserts exact output length and stores every byte. Same
+/// reserve-then-commit shape as the encoder output drain (`jxl_casaencoder.rs`),
+/// which also hands out spare capacity and commits `len` after the write.
+#[inline]
+fn extend_for_overwrite(v: &mut Vec<u8>, n: usize) {
+    v.reserve(n);
+    // SAFETY: capacity ≥ len+n after reserve; u8 has no invalid bit patterns and the
+    // new tail is fully overwritten by the immediately following process_into_auto
+    // before any byte of it is read.
+    unsafe { v.set_len(v.len() + n) };
 }
 
 impl<S: RawRowSource> StreamingBandSource<S> {
@@ -53,6 +73,7 @@ impl<S: RawRowSource> StreamingBandSource<S> {
             src, w, h, params, nr_strength, phase,
             raw_win: Vec::new(), raw_first: 0, raw_decoded: 0,
             rgb8: Vec::new(), win_first: 0, produced: 0,
+            rowbuf: Vec::new(), ctx: Vec::new(), rgb16: Vec::new(),
         }
     }
 
@@ -82,12 +103,6 @@ impl<S: RawRowSource> StreamingBandSource<S> {
         self.nr_strength > 0.0 || self.params.texture != 0.0 || self.params.clarity != 0.0
     }
 
-    #[inline]
-    fn raw_row(&self, g_clamped: usize) -> &[u16] {
-        let li = g_clamped - self.raw_first;
-        &self.raw_win[li * self.w..li * self.w + self.w]
-    }
-
     /// Materialize toned RGB8 rows forward until `produced >= target` (clamped to h).
     /// Tone-only when no spatial look op is active (2-row halo, byte-exact); otherwise the
     /// deep-halo band path that also runs luminance-NR + unsharp (still byte-exact).
@@ -108,18 +123,17 @@ impl<S: RawRowSource> StreamingBandSource<S> {
 
         // 1) decode raw forward to target+2 (bottom halo), clamped at image end.
         let need_raw = (target + 2).min(h);
-        let mut rowbuf = vec![0u16; w];
+        self.rowbuf.resize(w, 0);
         while self.raw_decoded < need_raw {
-            if !self.src.next_row_into(&mut rowbuf)? {
+            if !self.src.next_row_into(&mut self.rowbuf)? {
                 break;
             }
-            self.raw_win.extend_from_slice(&rowbuf);
+            self.raw_win.extend_from_slice(&self.rowbuf);
             self.raw_decoded += 1;
         }
 
         // 2) demosaic+tone in 256-row sub-chunks (each with its own 2-row halo from the
         //    rolling raw window → chunking-independent, byte-exact with the whole demosaic).
-        let mut rgb16: Vec<u16> = Vec::new();
         let mut s0 = self.produced;
         while s0 < target {
             let s1 = (s0 + SUB_ROWS).min(target);
@@ -129,16 +143,29 @@ impl<S: RawRowSource> StreamingBandSource<S> {
             // multiples of 8 and sub-chunks step by 256, so s0 is always even.
             debug_assert_eq!(s0 % 2, 0, "sub-chunk start must be even for correct CFA phase");
             let ctx_h = ns + 4; // 2 halo above + ns band + 2 halo below
-            let mut ctx = vec![0u16; ctx_h * w];
-            for i in 0..ctx_h {
-                let g = (s0 as isize - 2 + i as isize).clamp(0, h as isize - 1) as usize;
-                ctx[i * w..i * w + w].copy_from_slice(self.raw_row(g));
+            self.rgb16.resize(ns * w * 3, 0);
+            if s0 >= 2 && s1 + 2 <= h {
+                // Interior chunk: rows [s0-2, s1+2) are bit-identical to a CONTIGUOUS
+                // window of raw_win — hand the borrow straight to the demosaic (no ctx
+                // alloc + memset + row-copy). The band demosaic reads exactly ctx_h*w
+                // elements and derives the same local parity, so bytes are unchanged.
+                let a = (s0 - 2 - self.raw_first) * w;
+                let b = (s1 + 2 - self.raw_first) * w;
+                demosaic_bayer_mhc_band(&self.raw_win[a..b], w, ctx_h, 2, self.phase, 0, ns, &mut self.rgb16)?;
+            } else {
+                // Top/bottom clamp: build the halo context row-by-row (reused scratch).
+                self.ctx.resize(ctx_h * w, 0);
+                for i in 0..ctx_h {
+                    let g = (s0 as isize - 2 + i as isize).clamp(0, h as isize - 1) as usize;
+                    let li = g - self.raw_first;
+                    self.ctx[i * w..i * w + w].copy_from_slice(&self.raw_win[li * w..li * w + w]);
+                }
+                demosaic_bayer_mhc_band(&self.ctx, w, ctx_h, 2, self.phase, 0, ns, &mut self.rgb16)?;
             }
-            rgb16.resize(ns * w * 3, 0);
-            demosaic_bayer_mhc_band(&ctx, w, ctx_h, 2, self.phase, 0, ns, &mut rgb16)?;
             let start = self.rgb8.len();
-            self.rgb8.resize(start + ns * w * 3, 0);
-            pipeline::process_into_auto(&rgb16, &self.params, &mut self.rgb8[start..]);
+            // No dead zero-fill: process_into_auto fully overwrites the appended tail.
+            extend_for_overwrite(&mut self.rgb8, ns * w * 3);
+            pipeline::process_into_auto(&self.rgb16, &self.params, &mut self.rgb8[start..]);
             s0 = s1;
         }
         self.produced = target;
@@ -163,18 +190,17 @@ impl<S: RawRowSource> StreamingBandSource<S> {
 
         // 1) decode raw forward to target + spatial halo + demosaic halo, clamped at image end.
         let need_raw = (target + SPATIAL_HALO + 2).min(h);
-        let mut rowbuf = vec![0u16; w];
+        self.rowbuf.resize(w, 0);
         while self.raw_decoded < need_raw {
-            if !self.src.next_row_into(&mut rowbuf)? {
+            if !self.src.next_row_into(&mut self.rowbuf)? {
                 break;
             }
-            self.raw_win.extend_from_slice(&rowbuf);
+            self.raw_win.extend_from_slice(&self.rowbuf);
             self.raw_decoded += 1;
         }
 
         // 2) per 256-row sub-chunk: demosaic a band padded by SPATIAL_HALO real rows each side,
         //    apply NR + unsharp on the padded band, then crop the inner rows and tone them.
-        let mut rgb16: Vec<u16> = Vec::new();
         let mut s0 = self.produced;
         while s0 < target {
             let s1 = (s0 + SUB_ROWS).min(target);
@@ -189,24 +215,34 @@ impl<S: RawRowSource> StreamingBandSource<S> {
             debug_assert_eq!(b_lo % 2, 0, "band start must be even for correct CFA phase");
             // Demosaic the padded band (its own 2-row halo read from the rolling raw window).
             let ctx_h = b_h + 4;
-            let mut ctx = vec![0u16; ctx_h * w];
-            for i in 0..ctx_h {
-                let g = (b_lo as isize - 2 + i as isize).clamp(0, h as isize - 1) as usize;
-                ctx[i * w..i * w + w].copy_from_slice(self.raw_row(g));
+            self.rgb16.resize(b_h * w * 3, 0);
+            if b_lo >= 2 && b_hi + 2 <= h {
+                // Interior band: rows [b_lo-2, b_hi+2) are a contiguous raw_win window —
+                // borrow it directly (same bytes the copy loop below would assemble).
+                let a = (b_lo - 2 - self.raw_first) * w;
+                let b = (b_hi + 2 - self.raw_first) * w;
+                demosaic_bayer_mhc_band(&self.raw_win[a..b], w, ctx_h, 2, self.phase, 0, b_h, &mut self.rgb16)?;
+            } else {
+                self.ctx.resize(ctx_h * w, 0);
+                for i in 0..ctx_h {
+                    let g = (b_lo as isize - 2 + i as isize).clamp(0, h as isize - 1) as usize;
+                    let li = g - self.raw_first;
+                    self.ctx[i * w..i * w + w].copy_from_slice(&self.raw_win[li * w..li * w + w]);
+                }
+                demosaic_bayer_mhc_band(&self.ctx, w, ctx_h, 2, self.phase, 0, b_h, &mut self.rgb16)?;
             }
-            rgb16.resize(b_h * w * 3, 0);
-            demosaic_bayer_mhc_band(&ctx, w, ctx_h, 2, self.phase, 0, b_h, &mut rgb16)?;
             // Spatial look ops in place on the padded band (matches app order: NR → unsharp).
             if self.nr_strength > 0.0 {
-                pipeline::apply_luminance_nr(&mut rgb16, w, b_h, self.nr_strength);
+                pipeline::apply_luminance_nr(&mut self.rgb16, w, b_h, self.nr_strength);
             }
-            pipeline::apply_unsharp_masks(&mut rgb16, w, b_h, &self.params);
+            pipeline::apply_unsharp_masks(&mut self.rgb16, w, b_h, &self.params);
             // Crop the inner rows [s0, s1) out of the padded band and tone them into the window.
             let src_off = (s0 - b_lo) * w * 3;
             let start = self.rgb8.len();
-            self.rgb8.resize(start + ns * w * 3, 0);
+            // No dead zero-fill: process_into_auto fully overwrites the appended tail.
+            extend_for_overwrite(&mut self.rgb8, ns * w * 3);
             pipeline::process_into_auto(
-                &rgb16[src_off..src_off + ns * w * 3], &self.params, &mut self.rgb8[start..],
+                &self.rgb16[src_off..src_off + ns * w * 3], &self.params, &mut self.rgb8[start..],
             );
             s0 = s1;
         }
@@ -307,6 +343,41 @@ mod tests {
                 y += band;
             }
             assert_eq!(got, want, "{}x{}", w, h);
+        }
+    }
+
+    #[test]
+    fn streaming_source_matches_whole_bigband() {
+        // Pull bands >256 rows so one extend spans multiple 256-row sub-chunks:
+        // exercises the interior borrowed-window fast path, the 256-crossing split,
+        // the clamped top/bottom copy fallback, a tiny-h frame, and an h just past a
+        // chunk boundary (both final chunks bottom-clamped).
+        for (w, h) in [(64usize, 96usize), (48, 258), (32, 16), (40, 700)] {
+            let strip = decompress::tests_synth_payload(w, h, 0xB16B);
+            let raw = decompress::decompress(&strip, w, h).unwrap();
+            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let params = pipeline::PipelineParams::default_olympus();
+            let mut want = vec![0u8; w * h * 3];
+            pipeline::process_into_auto(&rgb16, &params, &mut want);
+
+            let src = OrfRowDecoder::new(&strip, w, h).unwrap();
+            let mut ss = StreamingBandSource::new(src, w, h, params.clone(), 0.0, (0, 0));
+            let mut got = vec![0u8; w * h * 3];
+            let band = 300usize;
+            let mut y = 0usize;
+            while y < h {
+                let ys = band.min(h - y);
+                let (p, stride) = ss.band(0, y, w, ys);
+                for r in 0..ys {
+                    let gy = y + r;
+                    unsafe {
+                        let srow = std::slice::from_raw_parts(p.add(r * stride), w * 3);
+                        got[gy * w * 3..gy * w * 3 + w * 3].copy_from_slice(srow);
+                    }
+                }
+                y += band;
+            }
+            assert_eq!(got, want, "bigband {}x{}", w, h);
         }
     }
 
