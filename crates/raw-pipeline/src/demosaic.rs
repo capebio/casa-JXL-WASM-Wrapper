@@ -883,6 +883,13 @@ pub fn demosaic_bayer_mhc(
     let h_max = (height - 1) as isize;
     let phase = (phase.0 as usize, phase.1 as usize);
 
+    // ADR-4 remainder (Lens 22/25): AVX2 interior kernel. Rows [2, h-2) with an
+    // 8-wide interior span use mhc_row_interior_avx2 for cols [2, w-2); border
+    // columns and edge rows keep the scalar path. Bit-identical (see the kernel
+    // doc + demosaic_bayer_mhc_avx2_bit_identical test).
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = width >= 20 && height >= 5 && std::is_x86_feature_detected!("avx2");
+
     let do_row = |row: usize, out_row: &mut [u16]| {
         let r = row as isize;
         let r_n = clamp(r - 1, 0, h_max);
@@ -905,7 +912,17 @@ pub fn demosaic_bayer_mhc(
             out_row[o + 1] = gg as u16;
             out_row[o + 2] = bb as u16;
         }
-        for col in int_start..int_end {
+        let mut scalar_start = int_start;
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 && row >= 2 && row + 2 <= h_max as usize && int_end > int_start {
+            // SAFETY: avx2 detected; rows r±1, r±2 unclamped (row in [2, h-2]);
+            // the kernel only reads cols [col-2, col+9] for col chunks that
+            // satisfy col + 10 <= width, enforced by its loop bound.
+            scalar_start = unsafe {
+                mhc_row_interior_avx2(raw, width, row, int_start, int_end, phase, out_row)
+            };
+        }
+        for col in scalar_start..int_end {
             let (rr, gg, bb) = mhc_pixel_phased(
                 raw, width, row, r_n, r_s, r_n2, r_s2, col,
                 col - 1, col + 1, col - 2, col + 2, phase,
@@ -935,6 +952,141 @@ pub fn demosaic_bayer_mhc(
     rgb.chunks_mut(width * 3).enumerate().for_each(|(row, out_row)| do_row(row, out_row));
 
     Ok(rgb)
+}
+
+/// AVX2 MHC interior-row kernel (ADR-4 remainder). Processes cols
+/// [int_start, …) in 8-px chunks while `col + 10 <= width` (the widest tap is
+/// col+2 for lane 7 = col+9); returns the first unprocessed column.
+///
+/// Within one row the row-parity of the phase is fixed, so only two of the
+/// four `mhc_pixel_phased` arms alternate along the columns. Both arms are
+/// computed for all 8 lanes from 13 widening row loads (no gathers — every
+/// tap is a contiguous `u16x8` load at a column offset), then selected with a
+/// constant alternating blend mask. Arithmetic uses the same i32 operations,
+/// `>>` = arithmetic shift (`_mm256_srai_epi32`), and the same clamps as the
+/// scalar arms — bit-identical by construction, pinned by
+/// `demosaic_bayer_mhc_avx2_bit_identical`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mhc_row_interior_avx2(
+    raw: &[u16],
+    width: usize,
+    row: usize,
+    int_start: usize,
+    int_end: usize,
+    phase: (usize, usize),
+    out_row: &mut [u16],
+) -> usize {
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    unsafe fn ld(raw: &[u16], base: usize) -> __m256i {
+        // 8 u16 -> 8 i32 (zero-extend).
+        _mm256_cvtepu16_epi32(_mm_loadu_si128(raw.as_ptr().add(base) as *const __m128i))
+    }
+
+    let zero = _mm256_setzero_si256();
+    let vmax = _mm256_set1_epi32(65535);
+    let clamp16 = |v: __m256i| _mm256_min_epi32(_mm256_max_epi32(v, zero), vmax);
+
+    let row_q = (row + phase.0) & 1;
+    let rn = (row - 1) * width;
+    let rs = (row + 1) * width;
+    let rn2 = (row - 2) * width;
+    let rs2 = (row + 2) * width;
+    let rc = row * width;
+
+    let mut col = int_start;
+    while col + 10 <= width && col < int_end.saturating_sub(7) {
+        // 13 widening loads cover every tap of both arms for lanes col..col+7.
+        let c_m2 = ld(raw, rc + col - 2);
+        let c_m1 = ld(raw, rc + col - 1);
+        let c_0 = ld(raw, rc + col);
+        let c_p1 = ld(raw, rc + col + 1);
+        let c_p2 = ld(raw, rc + col + 2);
+        let n_m1 = ld(raw, rn + col - 1);
+        let n_0 = ld(raw, rn + col);
+        let n_p1 = ld(raw, rn + col + 1);
+        let s_m1 = ld(raw, rs + col - 1);
+        let s_0 = ld(raw, rs + col);
+        let s_p1 = ld(raw, rs + col + 1);
+        let n2_0 = ld(raw, rn2 + col);
+        let s2_0 = ld(raw, rs2 + col);
+
+        let add = |a, b| _mm256_add_epi32(a, b);
+        let sub = |a, b| _mm256_sub_epi32(a, b);
+        let sll1 = |a| _mm256_slli_epi32::<1>(a);
+        let sll2 = |a| _mm256_slli_epi32::<2>(a);
+
+        // Shared cross/diagonal sums (same association as the scalar arms).
+        let sum_g4 = add(add(n_0, c_p1), add(s_0, c_m1)); // gn+ge+gs+gw
+        let sum_h2 = add(c_p1, c_m1); // e+w
+        let sum_v2 = add(n_0, s_0); // n+s
+        let sum_hd2 = add(c_p2, c_m2); // e2+w2
+        let sum_vd2 = add(n2_0, s2_0); // n2+s2
+        let sum_d4 = add(sum_vd2, sum_hd2); // n2+e2+s2+w2
+        let sum_x4 = add(add(n_m1, n_p1), add(s_m1, s_p1)); // 4 diagonals
+
+        let (r_even, g_even, b_even, r_odd, g_odd, b_odd);
+        if row_q == 0 {
+            // Even arm (0,0) — R site: r=c0; g=(2*Σg4 + 4*c0 − Σd4)>>3; b=Σdiag>>2.
+            let g00 = _mm256_srai_epi32::<3>(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
+            let b00 = _mm256_srai_epi32::<2>(sum_x4);
+            // Odd arm (0,1) — G site on R row: r=(2*(e+w)+2*c0−e2−w2)>>2; b=(2*(n+s)+2*c0−n2−s2)>>2.
+            let r01 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
+            let b01 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
+            r_even = c_0;
+            g_even = clamp16(g00);
+            b_even = clamp16(b00);
+            r_odd = clamp16(r01);
+            g_odd = c_0;
+            b_odd = clamp16(b01);
+        } else {
+            // Even arm (1,0) — G site on B row: r=(2*(n+s)+2*c0−n2−s2)>>2; b=(2*(e+w)+2*c0−e2−w2)>>2.
+            let r10 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
+            let b10 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
+            // Odd arm (1,1) — B site: g=(2*Σg4+4*c0−Σd4)>>3; r=(2*Σdiag+4*c0−Σd4)>>3.
+            let g11 = _mm256_srai_epi32::<3>(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
+            let r11 = _mm256_srai_epi32::<3>(sub(add(sll1(sum_x4), sll2(c_0)), sum_d4));
+            r_even = clamp16(r10);
+            g_even = c_0;
+            b_even = clamp16(b10);
+            r_odd = clamp16(r11);
+            g_odd = clamp16(g11);
+            b_odd = c_0;
+        }
+
+        // Column-parity blend: lane k is "even-arm" when (col+k+phase.1) is even.
+        // col chunks advance by 8, so the alternating mask depends only on
+        // (col + phase.1) & 1 — constant across the row.
+        let start_odd = ((col + phase.1) & 1) == 1;
+        let lane_mask = if start_odd {
+            _mm256_setr_epi32(-1, 0, -1, 0, -1, 0, -1, 0) // lane even => odd arm
+        } else {
+            _mm256_setr_epi32(0, -1, 0, -1, 0, -1, 0, -1)
+        };
+        let pick = |even: __m256i, odd: __m256i| _mm256_blendv_epi8(even, odd, lane_mask);
+        let r_v = pick(r_even, r_odd);
+        let g_v = pick(g_even, g_odd);
+        let b_v = pick(b_even, b_odd);
+
+        // Interleaved RGB store via stack staging (compute dominates; the
+        // 24 u16 stores are cheap relative to the two 13-load arm evaluations).
+        let mut rs_ = [0i32; 8];
+        let mut gs_ = [0i32; 8];
+        let mut bs_ = [0i32; 8];
+        _mm256_storeu_si256(rs_.as_mut_ptr() as *mut __m256i, r_v);
+        _mm256_storeu_si256(gs_.as_mut_ptr() as *mut __m256i, g_v);
+        _mm256_storeu_si256(bs_.as_mut_ptr() as *mut __m256i, b_v);
+        for k in 0..8 {
+            let o = (col + k) * 3;
+            out_row[o] = rs_[k] as u16;
+            out_row[o + 1] = gs_[k] as u16;
+            out_row[o + 2] = bs_[k] as u16;
+        }
+        col += 8;
+    }
+    col
 }
 
 /// Pre-optimization all-clamped reference (clamps every pixel's c±1/c±2). Retained for
@@ -1707,6 +1859,37 @@ mod tests {
                 let fast = demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
                 let refr = demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
                 assert_eq!(fast, refr, "mismatch w={w} h={h} phase={phase:?}");
+            }
+        }
+    }
+
+    /// The AVX2 interior kernel (dispatched inside demosaic_bayer_mhc on wide
+    /// rows) must be bit-identical to the all-clamped scalar reference for
+    /// every CFA phase — full-range values stress the negative-intermediate
+    /// clamps; widths cover 8-chunk remainders (0..7 leftover interior cols)
+    /// and heights cover the edge-row/scalar handoff.
+    #[test]
+    fn bayer_mhc_avx2_bit_identical_to_clamped_reference() {
+        for &(w, h) in &[
+            (20usize, 5usize),
+            (21, 6),
+            (24, 9),
+            (29, 8),
+            (33, 12),
+            (40, 7),
+            (67, 13),
+        ] {
+            let mut s: u32 = 0x5EED ^ (w * 977 + h * 31) as u32;
+            let raw: Vec<u16> = (0..w * h)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (s >> 16) as u16 // full 16-bit range
+                })
+                .collect();
+            for &phase in &[(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
+                let fast = demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
+                let refr = demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
+                assert_eq!(fast, refr, "avx2 mismatch w={w} h={h} phase={phase:?}");
             }
         }
     }

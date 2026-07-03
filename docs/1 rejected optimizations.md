@@ -1755,3 +1755,32 @@ demosaic-in-place) that provably reuses the block at the peak.
 **Rejected (proven by A/B):** DNG's MONOLITHIC previews are downscaled from the full-res MHC demosaic (`process_dng_impl` has no superpixel preview path — `downscale_rgb16_impl(&rgb16 /* MHC */, ...)` at lib.rs:2580), while the previews-only twin streams a 2×2 superpixel demosaic. Different demosaic source ⇒ different preview bytes. `web/two-phase-raw.test.js` pins this: thumb/lightbox SHAs diverge on the real DNG fixture while the full-res encode output stays identical. ORF does NOT have this problem because its monolithic preview build already uses the same superpixel path (`demosaic_rggb_half`) the streaming gate uses — proven byte-identical on real ORFs in the same test.
 **Re-open only if** lib.rs unifies the DNG preview sources (superpixel previews in the monolithic path, a deliberate pixel change needing its own quality sign-off) — the guard test flips and the split can be extended by changing one gate in worker.js (`canSplit`).
 **CR2:** also excluded, different reason — `decode_cr2_raw` ignores output flags at decode time (no streaming twin), so a split doubles the full decode+demosaic for zero preview speedup.
+
+---
+
+## AQ-RIDERS: enc_adaptive_quantization tile_distmap reuse + score/ScaleImage gating — negligible/dead (2026-07-03)
+
+**Target:** `external/libjxl-012/lib/jxl/enc_adaptive_quantization.cc:835` (`TileDistMap`), `:1093-1100` (score negation + `ScaleImage(-1)`).
+**Deferred items enc_aq #9/#10** — rejected without implementation after reading live code:
+- **#10 score / ScaleImage(-1) release-gating** — the `if (!lower_is_better)` branch (:1096) is already **dead for butteraugli**: `lower_is_better` is true for the butteraugli comparator, so `ScaleImage(-1)` and the score negation never run at runtime. Zero cost to eliminate; #if-guarding it changes nothing observable.
+- **#9 tile_distmap alloc reuse** — `TileDistMap` returns a fresh `ImageF` per FindBestQuantization iteration (2–5×/frame), sized `ceil(w/64) × ceil(h/64)` floats ≈ a few tens of KB. Against the per-iteration Butteraugli `CompareWith` + full `RoundtripImage` (multi-ms), a per-iteration few-KB alloc is noise — the doc's own note calls it "marginal now that the terminal-iteration skip landed." Not worth a submodule branch + A/B build. Revisit only if a profile ever flags AQ allocation.
+
+## ENT-D1: enc_entropy_coder quantizer-emitted nonzero counts — IMPLEMENTED then REJECTED (measured wash/regression) (2026-07-03)
+
+**Target:** `enc_entropy_coder.cc` (`TokenizeCoefficients` count pass), `enc_group.cc ComputeCoefficients`, `enc_cache.{h,cc}`, `enc_frame.cc`.
+
+Update: user asked to attempt it anyway. The filed placement was wrong but a byte-exact version IS buildable — `SplitACCoefficients` at `num_passes==1` is a plain `memcpy` (`enc_progressive_split.cc:31-34`), so the pass-0 coeffs equal the quantized block (the per-pass invalidation only bites `num_passes>1`). Built it: a per-frame `Image3I ac_nzeros_pre` filled by `ComputeCoefficients` from the cache-hot quantized block (scalar count matching `NumNonZero*ExceptLLF` exactly), consumed by `TokenizeCoefficients` which skips its count scan but still writes the prediction plane. Gated to `num_passes==1 && 4:4:4 && !streaming` (the default cjxl lossy path); everything else recounts.
+
+**Verified byte-exact:** native cjxl OLD (2e5cb035) vs NEW, **7/7 SHA256-identical** across `-d {0.5,1.0,2.0} -e {1,3,5,7,9}` and `-q 90`. The transform is correct.
+
+**Rejected — no net win (slight regression).** The count is memory-bound and small; moving it from the cache-cold tokenize site to the cache-hot quantize site does not pay for the added `ComputeCoefficients` work + per-frame plane alloc/writes. Isolated `JXL_STAGE_TIMERS` (t1, e3, 4.1 MP, interleaved, min-of-11): TokenizeAllCoefficients −2.2%..+6.4% run-to-run (noise — the "ComputeVarDCT 7% faster" reading is impossible from *added* work, proving the per-stage noise floor >6%); VarDCT+Tokenize sum +1.2% (noise). Whole-encode wall clock (min-of-13 interleaved): NEW −1.8% min / −3.4% median = a hair **slower**. Branch reverted to baseline and deleted; nothing shipped. Native cjxl OLD/NEW build recipe = [[project-enc-patch-lossless-decode-skip-20260703]]. Confirms the pre-attempt call: cross-file encoder-state plumbing for a memory-bound count that nets zero.
+
+## STALE-JUL03: batch-2 items verified already-resolved or not-a-bug (2026-07-03)
+
+- **WS2 A1/A2/A3 protocol wiring** — all LANDED: `encodeOptionsToStartMsg` mapper (encode-session.ts:30), MsgEncodeStart wire fields (protocol.ts:236-280), worker error codes in `JxlErrorCode` + `KNOWN_JXL_ERROR_CODES` (errors.ts:21-47), `MsgWorkerError.sessionId` end-to-end (worker.ts:592-620 → scheduler.ts:1268). A4/A5 (`MsgDecodeBudgetExceeded`/`decode_final` full `DecodeFrameMeta`) pinned by handlers.test.ts:447/:534.
+- **frame_stats zero-pad (000-contracts-14 / 000-performance-1)** — resolved: `analyze()` clamps to `pixels.len()/4` and drops the zero-padded heap copy (frame_stats.rs:254-281). Contract decided: analyze counts only complete pixels.
+- **WS4 C7 Butteraugli ref deep-copy** — resolved via the ref-cached comparator (`jxl_wasm_butteraugli_ref_create/_compare`, bridge.cpp:3767-3855): reference decomposition computed once, no per-compare copy.
+- **012 node abort parity (E1/D1)** — node.ts rewritten (sequenced idempotent teardown, no-error destroy, abort-check-before-await, resolve-with-`delivered`), matching browser.ts. Only cross-impl parity *test table* D2–D6 partially unwritten.
+- **CASA-ENC D1 variant-half / D4(a) / full-res chunked tier + 000-performance-16 (rgb16 clone)** — all landed in the jul02 campaign (commits 0420a240 / 73cd1858 / 8da8e736).
+- **GLUE-003 tiled-decode worker protocol (003.B1-B3)** — NOT dead: `web/lightbox/tiled-decode-worker.js` already speaks the v1 pool protocol (ready/load/decode-reply, bytesId + SAB, `format` param). No rewrite needed.
+- **Scheduler earlyCompleteSession (DS-SINGLEPASS-SLOT-01)** — verified stale: the worker self-stops on header/non-final targets (decode-handler finishSession), so `finish(localEarlyFinish)` frees an idle worker's slot; `completeSession()` (not `cancelSession()`) is correct — a decode_cancel for an already-ended session is dropped by the worker with no ack and would hang the record in "cancelling". Doc comment added; no code change.

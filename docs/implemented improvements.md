@@ -382,3 +382,25 @@ Measured on 48 real dashcam frames @1280×720 (single-threaded decode, 24 fps bu
 | lossless archive | 13.3% | 109.7 | 9 | over |
 
 Every JOLT preset decodes 720p in real time; the lossless tier does not — that gap is what JOLT fills. 27 casa_video tests pass (2 new: header rate flags + CASR box incl. legacy splice compatibility).
+
+---
+
+## 2026-07-03 — Deferred batch 2 (moonshots) — branch feat/deferred-batch2-jul03-m8x4
+
+Off super main b15c3cb4. Video moonshots first, then perf/hardening. Losers → `docs/1 rejected optimizations.md` (AQ-RIDERS, ENT-D1-DEFER, STALE-JUL03).
+
+### CASAVA / JOLT video (3 moonshots)
+
+| Item | Where | Result |
+|:---|:---|:---|
+| **JE-8 square atlas** | `casa_video.rs` tile P-frames | The lossy-tile REPLACE atlas packed changed tiles into a t-wide sliver — the shape that made MT encode SLOWER (CV-E6). Now a ~square `ceil(sqrt(n))`-column grid, signalled by the tile-size u16 high bit (`CASV_TILE_V2_BIT`); v1 payloads + lossless residual tier stay v1. Ghana 720p A/B (`examples/atlas_v2_flip.rs`): **t16 size −6.5% / enc −61.1% / dec −41.8%; t32 size −4.6% / enc −40.9% / dec −24.7%**, reconstruction mean-err unchanged. Batch/stream byte-parity held; v1 back-compat + v2 square-dims tests. |
+| **JOLT rate control** | `casa_video.rs` streaming encoders | Spec §3.5 delivered as closed-loop feedback (not per-GOP probe searches — zero extra encode work). New `RateControl{target_bytes_per_sec,min/max_distance,vbv_seconds}` + `CasaVideoOptions::streaming_bitrate`. Per-GOP leaky-bucket VBV + damped multiplicative distance update (`d*=sqrt(actual/target)` × bucket term, clamped). Hook `StreamCtx::set_distance` rebuilds the reused Encoder + re-derives auto thresh. Real 720p (`examples/jolt_rc_demo.rs`, GOP12): **1× target lands +0.5%**; 0.5× walks 3245k→1392k B/s, 2× walks 3245k→6226k B/s, converging by GOP 3–4. Streaming-only; fixed-distance default bit-identical. Tests: both-direction steering + clamps/extremes. |
+| **casv-web browser playback** | new `packages/casv-web` | CASAVA was native-only. New TS package parses header+footer+index+rate-box, decodes I-frames via any injected JXL decoder (pairs with `@casabio/jxl-wasm createDecoder`, zero hard deps), composites REPLACE bbox + tile (v1 sliver + v2 square) P-frames into running RGBA. Lossless-residual + Fable tiers guarded with clear errors. Fixtures generated natively (`examples/casv_web_fixtures.rs`); **8 bun tests** compare browser output vs native decode (RGB max-diff ≤3 / mean ≤1.0 — wasm-scalar vs native-SIMD JXL decode is not bit-specified — alpha exactly 255), rate metadata exact, reuseBuffer pixel-identical, reject paths covered. tsc clean. |
+
+### Perf / hardening
+
+| Item | Where | Result |
+|:---|:---|:---|
+| **wasm128 downscale_rgba** | `src/lib.rs` | Integer-multiple thumbnail box filter: RGBA lanes stay 4-byte-aligned, so u8x16→u16x8 accumulate with zero deinterleave, fold to u32x4 [R,G,B,A]. Pixel-identical (integer sums order-independent); xstep 2..512 takes SIMD. Two-module Node flipflop (`web/test/downscale-rgba-simd-flip.mjs`): **2×+14.8%, 4×+53.5%, 8×+62.8%, 6×+42.2%**. (Planar-rgb16 sibling dropped: private fn, arbitrary-fit callers, unmeasurable.) |
+| **MHC demosaic AVX2** | `crates/raw-pipeline/src/demosaic.rs` | The quality-demosaic dominator ran scalar. New `mhc_row_interior_avx2` vectorizes interior rows: fixed row-parity means only two of four arms alternate per column — both evaluated from 13 widening contiguous loads (no gathers), blended by a constant column-parity mask. Same i32 ops/shifts/clamps → bit-identical (7 sizes × 4 phases, full-range). Flipflop (`examples/demosaic_mhc_avx2_flip.rs`): **+52.2/+51.4/+54.2% (2.1×) @1.9/6/24 MP**, beating the +22% estimate. |
+| **decode-handler test gaps** | `jxl-worker-browser/test/handlers.test.ts` | Closed all 4 CLAUDE.md gaps: cancel-while-paused (dispose+decode_cancelled), cancel-during-active-push (safe dispose, no resurrection), worker_drain byte-HWM coalescing, DRAIN_MIN_INTERVAL_MS spam gate (frozen-clock). 20 handler tests pass. |

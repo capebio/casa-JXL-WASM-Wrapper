@@ -73,6 +73,21 @@ pub const CASV_HDR_FABLE_FLAG: u32 = 0x0000_0002;
 const CASV_FLAG_BITS: u32 =
     CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG;
 
+/// JE-8: high bit of the tile payload's leading `tile_size` u16 selects the v2
+/// **square atlas** layout (changed tiles packed into a ceil(sqrt(n))-column
+/// grid) instead of the v1 t-wide sliver. Tile sizes are far below 0x8000, so
+/// the bit is free; v1 payloads (bit clear) keep decoding unchanged.
+pub const CASV_TILE_V2_BIT: u16 = 0x8000;
+
+/// v2 atlas grid for `n` changed tiles: ~square, ceil(sqrt(n)) columns.
+#[inline]
+fn atlas_grid_v2(n: usize) -> (usize, usize) {
+    debug_assert!(n > 0);
+    let cols = (n as f64).sqrt().ceil() as usize;
+    let rows = n.div_ceil(cols);
+    (cols, rows)
+}
+
 // ── JOLT rate metadata (CasvHeader.flags layout) ──────────────────────────────
 // JOLT (JXL-Optimized Lossy Transport) is the lossy streaming profile of CASV.
 // The header `flags` word — previously always 0 — carries the rate signal so a
@@ -264,6 +279,36 @@ pub enum VideoRate {
     Lossy(f32),
 }
 
+/// JOLT rate control (spec §3.5, feedback form): a per-GOP leaky-bucket (VBV)
+/// controller that adjusts the encode distance toward a byte-rate target.
+///
+/// JXL is quality-targeted; this thin outer loop makes the streaming encoders
+/// bitrate-targeted. Implementation note vs the spec: instead of a per-GOP
+/// 1-D *search* with probe encodes (extra encode work per GOP), the controller
+/// uses closed-loop feedback — measured bytes of the finished GOP steer the
+/// next GOP's distance (damped multiplicative update) with a VBV term that
+/// corrects accumulated over/undershoot. Converges within a few GOPs at zero
+/// probe cost; the initial `VideoRate::Lossy(d)` is the starting distance.
+#[derive(Clone, Copy, Debug)]
+pub struct RateControl {
+    /// Target encoded bytes per second (bitrate / 8).
+    pub target_bytes_per_sec: u32,
+    /// Quality ceiling: distance never drops below this (bits stop improving).
+    pub min_distance: f32,
+    /// Quality floor: distance never rises above this (rate may overshoot).
+    pub max_distance: f32,
+    /// Leaky-bucket capacity in seconds of target rate (burst tolerance).
+    pub vbv_seconds: f32,
+}
+
+impl RateControl {
+    /// A sensible default envelope for a byte-rate target: distance free to
+    /// move in [0.3, 8.0], 2-second VBV.
+    pub fn targeting(target_bytes_per_sec: u32) -> Self {
+        RateControl { target_bytes_per_sec, min_distance: 0.3, max_distance: 8.0, vbv_seconds: 2.0 }
+    }
+}
+
 /// One coherent knob-set for [`encode_casv_video`].
 #[derive(Clone, Copy, Debug)]
 pub struct CasaVideoOptions {
@@ -279,6 +324,10 @@ pub struct CasaVideoOptions {
     /// Change-detection threshold; `None` = auto from the lossy distance
     /// ([`default_thresh_for_distance`]). Lossless skipping is always exact.
     pub thresh: Option<u8>,
+    /// Optional bitrate targeting for the STREAMING lossy encoders
+    /// ([`encode_casv_video_streaming`] / [`encode_casv_video_streaming_to`]).
+    /// `None` = fixed distance (the batch encoders ignore this field).
+    pub rate_control: Option<RateControl>,
 }
 
 impl Default for CasaVideoOptions {
@@ -290,11 +339,19 @@ impl Default for CasaVideoOptions {
 impl CasaVideoOptions {
     /// Byte-exact archival: lossless, bbox skip, GOP 24.
     pub fn lossless_archive() -> Self {
-        CasaVideoOptions { rate: VideoRate::Lossless, gop_len: 24, skip: SkipMode::Bbox, tile: 32, effort: 3, thresh: Some(0) }
+        CasaVideoOptions { rate: VideoRate::Lossless, gop_len: 24, skip: SkipMode::Bbox, tile: 32, effort: 3, thresh: Some(0), rate_control: None }
     }
     /// Streaming: lossy at `distance`, tile replace-skip, GOP 24, auto threshold.
     pub fn streaming(distance: f32) -> Self {
-        CasaVideoOptions { rate: VideoRate::Lossy(distance), gop_len: 24, skip: SkipMode::Tile, tile: 32, effort: 3, thresh: None }
+        CasaVideoOptions { rate: VideoRate::Lossy(distance), gop_len: 24, skip: SkipMode::Tile, tile: 32, effort: 3, thresh: None, rate_control: None }
+    }
+    /// Bitrate-targeted streaming (JOLT rate control): starts at `distance`
+    /// and steers toward `target_bytes_per_sec` per GOP. See [`RateControl`].
+    pub fn streaming_bitrate(start_distance: f32, target_bytes_per_sec: u32) -> Self {
+        CasaVideoOptions {
+            rate_control: Some(RateControl::targeting(target_bytes_per_sec)),
+            ..Self::streaming(start_distance)
+        }
     }
     /// JOLT preset → options. See [`JoltPreset`].
     pub fn jolt(preset: JoltPreset) -> Self {
@@ -308,6 +365,7 @@ impl CasaVideoOptions {
                 tile: 32,
                 effort: 1,
                 thresh: None,
+                rate_control: None,
             },
             // The measured sweet spot of the lossy tier (d1.0/e3, tile skip)
             // — same as `streaming(1.0)`.
@@ -321,6 +379,7 @@ impl CasaVideoOptions {
                 tile: 32,
                 effort: 4,
                 thresh: None,
+                rate_control: None,
             },
         }
     }
@@ -498,6 +557,76 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
     })
 }
 
+impl StreamCtx {
+    /// Rate-control hook: retarget the encoder to a new distance at a GOP
+    /// boundary. Rebuilds the reused Encoder handle (cheap: JxlEncoderCreate is
+    /// malloc + struct init) and re-derives the auto change threshold so
+    /// detection stays matched to the quantization error.
+    fn set_distance(&mut self, d: f32, opts: &CasaVideoOptions) -> Result<(), VideoError> {
+        if d == self.distance {
+            return Ok(());
+        }
+        self.distance = d;
+        self.enc = Encoder::new(EncodeOptions::distance(d).with_effort(opts.effort))?;
+        if opts.thresh.is_none() {
+            self.thresh = default_thresh_for_distance(d);
+        }
+        Ok(())
+    }
+}
+
+/// Leaky-bucket rate controller state (see [`RateControl`]).
+struct RateState {
+    ctrl: RateControl,
+    /// Target bytes per frame (target_bytes_per_sec × fps_den / fps_num).
+    frame_budget: f64,
+    /// Bucket capacity in bytes (target rate × vbv_seconds).
+    cap: f64,
+    /// Signed fullness: positive = under budget (credit), negative = debt.
+    bucket: f64,
+    gop_bytes: f64,
+    gop_frames: u32,
+}
+
+impl RateState {
+    fn new(ctrl: RateControl, fps_num: u32, fps_den: u32) -> Self {
+        let fps = fps_num.max(1) as f64 / fps_den.max(1) as f64;
+        let frame_budget = ctrl.target_bytes_per_sec as f64 / fps;
+        RateState {
+            ctrl,
+            frame_budget,
+            cap: (ctrl.target_bytes_per_sec as f64 * ctrl.vbv_seconds as f64).max(frame_budget),
+            bucket: 0.0,
+            gop_bytes: 0.0,
+            gop_frames: 0,
+        }
+    }
+
+    /// Account one encoded frame's bytes.
+    fn on_frame(&mut self, bytes: usize) {
+        self.bucket = (self.bucket + self.frame_budget - bytes as f64).clamp(-self.cap, self.cap);
+        self.gop_bytes += bytes as f64;
+        self.gop_frames += 1;
+    }
+
+    /// Distance for the next GOP, from the finished GOP's measured rate plus
+    /// the VBV term. Damped multiplicative update: distance ∝ size is roughly
+    /// inverse-monotone, so ratio^0.5 halves the log-domain step; the bucket
+    /// term (±50% at full debt/credit) corrects accumulated drift.
+    fn next_gop_distance(&mut self, cur: f32) -> f32 {
+        if self.gop_frames == 0 {
+            return cur;
+        }
+        let actual_per_frame = self.gop_bytes / self.gop_frames as f64;
+        let ratio = (actual_per_frame / self.frame_budget).max(1e-6);
+        let mut d = cur as f64 * ratio.sqrt();
+        d *= 1.0 - 0.5 * (self.bucket / self.cap);
+        self.gop_bytes = 0.0;
+        self.gop_frames = 0;
+        d.clamp(self.ctrl.min_distance as f64, self.ctrl.max_distance as f64) as f32
+    }
+}
+
 /// Encode one streaming frame into `payload` (cleared by the caller). I-frame via
 /// the chunked constant-peak encoder, P-frame via bbox/tile replace-skip. Returns
 /// the index flag bits. Shared by the buffered and stream-to-sink encoders.
@@ -525,7 +654,12 @@ fn encode_stream_frame(
         let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
         ctx.changed.clear();
         ctx.changed.extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
-        payload.extend_from_slice(&(t as u16).to_le_bytes());
+        // JE-8: square-atlas (v2) layout, signalled by the tile-size high bit.
+        // The old t-wide sliver atlas (one t×t slot per row) is the shape that
+        // made multi-threaded encode SLOWER (CV-E6: 32px-wide strips starve
+        // libjxl's 256px group parallelism and its 2-D context modelling); a
+        // ~square atlas of ceil(sqrt(n)) columns fixes both.
+        payload.extend_from_slice(&((t as u16) | CASV_TILE_V2_BIT).to_le_bytes());
         let bitmap_len = map.len().div_ceil(8);
         ctx.bitmap.clear();
         ctx.bitmap.resize(bitmap_len, 0);
@@ -534,24 +668,27 @@ fn encode_stream_frame(
         }
         payload.extend_from_slice(&ctx.bitmap);
         if !ctx.changed.is_empty() {
-            // Zero-filled from empty every frame: edge-tile padding bytes are
-            // load-bearing (they are encoded), so a reused buffer must never
-            // leak a previous frame's pixels into the padding.
+            let (cols, rows) = atlas_grid_v2(ctx.changed.len());
+            let (aw, ah) = (cols * ts, rows * ts);
+            // Zero-filled from empty every frame: edge-tile padding bytes and
+            // trailing empty slots are load-bearing (they are encoded), so a
+            // reused buffer must never leak a previous frame's pixels.
             ctx.atlas.clear();
-            ctx.atlas.resize(ts * ts * 3 * ctx.changed.len(), 0);
+            ctx.atlas.resize(aw * ah * 3, 0);
             for (slot, &i) in ctx.changed.iter().enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(wus - tx * ts);
                 let bh = ts.min(height as usize - ty * ts);
+                let (sx, sy) = (slot % cols, slot / cols);
                 for row in 0..bh {
                     let s = ((ty * ts + row) * wus + tx * ts) * 3;
-                    let d = ((slot * ts + row) * ts) * 3;
+                    let d = ((sy * ts + row) * aw + sx * ts) * 3;
                     ctx.atlas[d..d + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
                 }
             }
-            let ah = t * ctx.changed.len() as u32;
-            ctx.enc.encode_into(&Frame::rgb(ctx.atlas.as_slice(), t, ah), payload)?;
+            ctx.enc
+                .encode_into(&Frame::rgb(ctx.atlas.as_slice(), aw as u32, ah as u32), payload)?;
         }
         return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
     }
@@ -600,6 +737,7 @@ pub fn encode_casv_video_streaming(
     let mut prev_src: Vec<u8> = Vec::new();
     let mut idx = 0usize;
     let mut payload = Vec::new();
+    let mut rc = opts.rate_control.map(|c| RateState::new(c, fps_num, fps_den));
 
     loop {
         std::mem::swap(&mut cur, &mut prev_src);
@@ -609,8 +747,18 @@ pub fn encode_casv_video_streaming(
         if cur.len() != expected {
             return Err(VideoError::FrameSize { idx, expected, got: cur.len() });
         }
+        let is_iframe = idx % gop == 0;
+        if is_iframe && idx > 0 {
+            if let Some(rc) = rc.as_mut() {
+                let d = rc.next_gop_distance(ctx.distance);
+                ctx.set_distance(d, opts)?;
+            }
+        }
         payload.clear();
-        let flags = encode_stream_frame(&cur, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
+        let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
+        if let Some(rc) = rc.as_mut() {
+            rc.on_frame(payload.len());
+        }
         index.push((flags, payload.len() as u32));
         data.extend_from_slice(&payload);
         idx += 1;
@@ -663,6 +811,7 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
     let mut idx = 0usize;
     let mut offset: u64 = 0;
     let mut payload = Vec::new();
+    let mut rc = opts.rate_control.map(|c| RateState::new(c, fps_num, fps_den));
 
     loop {
         std::mem::swap(&mut cur, &mut prev_src);
@@ -672,8 +821,18 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
         if cur.len() != expected {
             return Err(VideoError::FrameSize { idx, expected, got: cur.len() });
         }
+        let is_iframe = idx % gop == 0;
+        if is_iframe && idx > 0 {
+            if let Some(rc) = rc.as_mut() {
+                let d = rc.next_gop_distance(ctx.distance);
+                ctx.set_distance(d, opts)?;
+            }
+        }
         payload.clear();
-        let flags = encode_stream_frame(&cur, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
+        let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
+        if let Some(rc) = rc.as_mut() {
+            rc.on_frame(payload.len());
+        }
         sink.write_all(&payload).map_err(|_| VideoError::Io)?;
         index.push((offset as u32, (payload.len() as u32) | flags));
         offset += payload.len() as u64;
@@ -1039,7 +1198,9 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
                 map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
 
             let mut payload = Vec::new();
-            payload.extend_from_slice(&(t as u16).to_le_bytes());
+            // JE-8: square-atlas v2 (see encode_stream_frame — layouts must stay
+            // byte-identical between the batch and streaming paths).
+            payload.extend_from_slice(&((t as u16) | CASV_TILE_V2_BIT).to_le_bytes());
             let bitmap_len = map.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             for &i in &changed {
@@ -1048,20 +1209,24 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
             payload.extend_from_slice(&bitmap);
 
             if !changed.is_empty() {
-                // atlas of FRESH pixels (not residuals), zero-padded edge tiles.
-                let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+                // atlas of FRESH pixels (not residuals), zero-padded edge tiles
+                // + trailing empty slots.
+                let (cols, rows) = atlas_grid_v2(changed.len());
+                let (aw, ah) = (cols * ts, rows * ts);
+                let mut atlas = vec![0u8; aw * ah * 3];
                 for (slot, &i) in changed.iter().enumerate() {
                     let tx = (i as u32 % txn) as usize;
                     let ty = (i as u32 / txn) as usize;
                     let bw = ts.min(w - tx * ts);
                     let bh = ts.min(height as usize - ty * ts);
+                    let (sx, sy) = (slot % cols, slot / cols);
                     for row in 0..bh {
                         let src = ((ty * ts + row) * w + tx * ts) * 3;
-                        let dst = ((slot * ts + row) * ts) * 3;
+                        let dst = ((sy * ts + row) * aw + sx * ts) * 3;
                         atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
                     }
                 }
-                let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone())?;
+                let jxl = encode_rgb8(&atlas, aw as u32, ah as u32, opts.clone())?;
                 payload.extend_from_slice(&jxl);
             }
             Ok((CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG, payload))
@@ -1645,7 +1810,10 @@ fn apply_pframe(
         if slice.len() < 2 {
             return None;
         }
-        let t = u16::from_le_bytes(slice[0..2].try_into().unwrap()) as u32;
+        let t_field = u16::from_le_bytes(slice[0..2].try_into().unwrap());
+        // JE-8: high bit selects the v2 square-atlas layout.
+        let v2 = t_field & CASV_TILE_V2_BIT != 0;
+        let t = (t_field & !CASV_TILE_V2_BIT) as u32;
         if t == 0 {
             return None;
         }
@@ -1667,22 +1835,31 @@ fn apply_pframe(
         if is_replace {
             // lossy tier: atlas holds fresh pixels — replace each tile.
             let (aw, ah) = sess.decode_u8(&slice[2 + bitmap_len..])?;
-            if aw != t || ah != t * changed_count as u32 {
+            // Atlas geometry: v2 = ceil(sqrt(n)) columns; v1 = one-column sliver.
+            let (cols, rows) = if v2 { atlas_grid_v2(changed_count) } else { (1, changed_count) };
+            if aw != (cols * ts) as u32 || ah != (rows * ts) as u32 {
                 return None;
             }
+            let awus = aw as usize;
             let atlas = &sess.px8;
             for (slot, i) in (0..n).filter(|&i| tile_set(i)).enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(w - tx * ts);
                 let bh = ts.min(height as usize - ty * ts);
+                let (sx, sy) = (slot % cols, slot / cols);
                 for row in 0..bh {
                     let d = ((ty * ts + row) * w + tx * ts) * 3;
-                    let s = ((slot * ts + row) * ts) * 3;
+                    let s = ((sy * ts + row) * awus + sx * ts) * 3;
                     prev[d..d + bw * 3].copy_from_slice(&atlas[s..s + bw * 3]);
                 }
             }
             return Some(());
+        }
+        if v2 {
+            // v2 exists only on the lossy REPLACE tier; a residual payload
+            // claiming v2 is malformed.
+            return None;
         }
         let (aw, ah) = sess.decode_u16(&slice[2 + bitmap_len..])?;
         if aw != t || ah != t * changed_count as u32 {
@@ -2205,6 +2382,117 @@ mod tests {
             .collect()
     }
 
+    /// Noise-textured base + a moving noise block: lossy size responds strongly
+    /// to distance (flat gradients don't), which the rate-control tests need.
+    fn textured_motion(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
+        let mut s: u32 = 0x1234_5678;
+        let mut rnd = move || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        };
+        let base: Vec<u8> = (0..(w * h * 3) as usize).map(|_| rnd()).collect();
+        (0..n)
+            .map(|f| {
+                let mut v = base.clone();
+                // Moving 24x24 block of fresh noise (per-frame deterministic seed).
+                let mut bs: u32 = 0x9e37_79b9 ^ (f as u32).wrapping_mul(0x85eb_ca6b);
+                let mut brnd = move || {
+                    bs = bs.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (bs >> 24) as u8
+                };
+                let bx = (4 * f as u32) % (w - 24);
+                let by = (3 * f as u32) % (h - 24);
+                for yy in by..by + 24 {
+                    for xx in bx..bx + 24 {
+                        let o = ((yy * w + xx) * 3) as usize;
+                        v[o] = brnd();
+                        v[o + 1] = brnd();
+                        v[o + 2] = brnd();
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// JOLT rate control: bytes steer toward the target across GOPs, in both
+    /// directions, without leaving the distance clamps or breaking decode.
+    #[test]
+    fn rate_control_steers_toward_target() {
+        let (w, h) = (128u32, 128u32);
+        let frames = textured_motion(w, h, 72); // 3 s @ 24fps, 6 GOPs of 12
+        let gop = 12u32;
+        let run = |opts: &CasaVideoOptions| -> Vec<u8> {
+            let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+            encode_casv_video_streaming(&mut fs, opts).unwrap()
+        };
+
+        let mut fixed = CasaVideoOptions::streaming(1.5);
+        fixed.gop_len = gop;
+        let fixed_bytes = run(&fixed).len();
+        let fixed_rate = fixed_bytes as f64 / 3.0; // bytes/s over the 3 s clip
+
+        // Downward: target half the fixed rate — controller must raise distance
+        // and land materially below the fixed size.
+        let mut down = CasaVideoOptions::streaming_bitrate(1.5, (fixed_rate * 0.5) as u32);
+        down.gop_len = gop;
+        let down_out = run(&down);
+        assert!(
+            (down_out.len() as f64) < 0.8 * fixed_bytes as f64,
+            "rate control must cut bytes toward a lower target: {} vs fixed {}",
+            down_out.len(),
+            fixed_bytes
+        );
+        let decoded = decode_casv_all_rgb8(&down_out).expect("rate-controlled stream decodes");
+        assert_eq!(decoded.len(), 72);
+
+        // Upward: target double the fixed rate — distance drops toward
+        // min_distance and bytes must rise.
+        let mut up = CasaVideoOptions::streaming_bitrate(1.5, (fixed_rate * 2.0) as u32);
+        up.gop_len = gop;
+        let up_out = run(&up);
+        assert!(
+            up_out.len() > fixed_bytes,
+            "rate control must spend more bytes toward a higher target: {} vs fixed {}",
+            up_out.len(),
+            fixed_bytes
+        );
+
+        // Convergence quality (downward run): the LAST two GOPs should sit
+        // near the per-GOP byte budget once feedback has settled. Loose band —
+        // lossy size vs distance is steppy at this resolution.
+        let target_gop_bytes = fixed_rate * 0.5 * (gop as f64 / 24.0);
+        let mut gop_sizes = [0usize; 6];
+        for i in 0..72 {
+            gop_sizes[i / 12] += casv_frame_slice(&down_out, i).unwrap().len();
+        }
+        for (g, &sz) in gop_sizes.iter().enumerate().skip(4) {
+            let ratio = sz as f64 / target_gop_bytes;
+            assert!(
+                (0.4..=2.0).contains(&ratio),
+                "late GOP {g} rate ratio {ratio:.2} out of band (size {sz}, target {target_gop_bytes:.0})"
+            );
+        }
+    }
+
+    /// Extreme targets stay inside the distance clamps and keep the stream valid.
+    #[test]
+    fn rate_control_clamps_and_survives_extremes() {
+        let (w, h) = (96u32, 96u32);
+        let frames = textured_motion(w, h, 36);
+        let run = |target: u32| -> Vec<u8> {
+            let mut o = CasaVideoOptions::streaming_bitrate(1.0, target);
+            o.gop_len = 6;
+            let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+            encode_casv_video_streaming(&mut fs, &o).unwrap()
+        };
+        let starved = run(1); // 1 byte/s — pinned at max_distance
+        let flooded = run(1_000_000_000); // 1 GB/s — pinned at min_distance
+        assert!(starved.len() < flooded.len(), "starved must be smaller than flooded");
+        assert_eq!(decode_casv_all_rgb8(&starved).unwrap().len(), 36);
+        assert_eq!(decode_casv_all_rgb8(&flooded).unwrap().len(), 36);
+    }
+
     #[test]
     fn delta_beats_intra_on_low_motion() {
         let (w, h) = (64u32, 64u32);
@@ -2392,6 +2680,113 @@ mod tests {
         assert_eq!(px8, src[8]);
     }
 
+    /// JE-8 back-compat: a hand-built v1 sliver-atlas REPLACE payload (tile_size
+    /// high bit clear) must still decode — the v2 square atlas is opt-in via the
+    /// bit, not a breaking change.
+    #[test]
+    fn v1_sliver_tile_payload_still_decodes() {
+        let (w, h) = (64u32, 64u32);
+        let t = 16u32;
+        let f0 = gradient(w, h, 0);
+        let mut f1 = f0.clone();
+        // Mutate tiles 5 (tx=1,ty=1) and 10 (tx=2,ty=2) of the 4×4 grid.
+        let changed = [5usize, 10usize];
+        for &i in &changed {
+            let (tx, ty) = (i % 4, i / 4);
+            for row in 0..16 {
+                for col in 0..16 {
+                    let o = ((ty * 16 + row) * 64 + tx * 16 + col) * 3;
+                    f1[o] = 255 - f1[o];
+                }
+            }
+        }
+
+        let iframe = encode_rgb8(&f0, w, h, EncodeOptions::distance(1.0)).unwrap();
+
+        // v1 payload: [t u16, bit clear][bitmap][16-wide sliver atlas].
+        let mut p = Vec::new();
+        p.extend_from_slice(&(t as u16).to_le_bytes());
+        let mut bitmap = [0u8; 2];
+        for &i in &changed {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+        p.extend_from_slice(&bitmap);
+        let mut atlas = vec![0u8; 16 * 16 * 3 * changed.len()];
+        for (slot, &i) in changed.iter().enumerate() {
+            let (tx, ty) = (i % 4, i / 4);
+            for row in 0..16 {
+                let s = ((ty * 16 + row) * 64 + tx * 16) * 3;
+                let d = ((slot * 16 + row) * 16) * 3;
+                atlas[d..d + 48].copy_from_slice(&f1[s..s + 48]);
+            }
+        }
+        let atlas_jxl = encode_rgb8(&atlas, 16, 32, EncodeOptions::distance(1.0)).unwrap();
+        p.extend_from_slice(&atlas_jxl);
+
+        // Assemble a 2-frame container by hand.
+        let header = CasvHeader { width: w, height: h, frame_count: 2, fps_num: 24, fps_den: 1, flags: 0 };
+        let data_start = CASV_HEADER_BYTES + 2 * CASV_INDEX_ENTRY_BYTES;
+        let mut file = Vec::new();
+        file.extend_from_slice(&build_casv_header(&header));
+        file.extend_from_slice(&(data_start as u32).to_le_bytes());
+        file.extend_from_slice(&(iframe.len() as u32).to_le_bytes());
+        file.extend_from_slice(&((data_start + iframe.len()) as u32).to_le_bytes());
+        file.extend_from_slice(
+            &((p.len() as u32) | CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG).to_le_bytes(),
+        );
+        file.extend_from_slice(&iframe);
+        file.extend_from_slice(&p);
+
+        let out = decode_casv_all_rgb8(&file).expect("v1 payload decodes");
+        assert_eq!(out.len(), 2);
+        let (d0, d1) = (&out[0].0, &out[1].0);
+        // Changed tiles ≈ f1 (lossy); unchanged pixels identical to frame 0's decode.
+        let mut err_sum = 0f64;
+        let mut err_n = 0usize;
+        for row in 0..64usize {
+            for col in 0..64usize {
+                let i = (row / 16) * 4 + col / 16;
+                let o = (row * 64 + col) * 3;
+                if changed.contains(&i) {
+                    for c in 0..3 {
+                        err_sum += (d1[o + c] as i32 - f1[o + c] as i32).unsigned_abs() as f64;
+                        err_n += 3;
+                    }
+                } else {
+                    assert_eq!(&d1[o..o + 3], &d0[o..o + 3], "unchanged px ({col},{row})");
+                }
+            }
+        }
+        let mean_err = err_sum / err_n as f64;
+        assert!(mean_err < 8.0, "changed-tile mean err too high: {mean_err}");
+    }
+
+    /// JE-8: the v2 payload signals the high bit and carries a ~square atlas
+    /// (ceil(sqrt(n)) columns), not the t-wide sliver.
+    #[test]
+    fn v2_tile_payload_atlas_is_square() {
+        let (w, h) = (64u32, 64u32);
+        let src = two_region_motion(w, h, 2);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_delta_lossy_tiled_rgb8(
+            &refs, w, h, 24, 1, 8, 16, EncodeOptions::distance(1.0), 0,
+        )
+        .unwrap();
+        let slice = casv_frame_slice(&bytes, 1).unwrap();
+        let t_field = u16::from_le_bytes(slice[0..2].try_into().unwrap());
+        assert_ne!(t_field & CASV_TILE_V2_BIT, 0, "v2 bit set");
+        let t = (t_field & !CASV_TILE_V2_BIT) as u32;
+        assert_eq!(t, 16);
+        let bitmap = &slice[2..4]; // 16 tiles -> 2 bytes
+        let cc = bitmap.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+        assert!(cc > 1, "test needs multiple changed tiles, got {cc}");
+        let (cols, rows) = atlas_grid_v2(cc);
+        let (apx, aw, ah) =
+            crate::jxl_casadecoder::decode_interleaved::<u8>(&slice[4..], 3).expect("atlas decodes");
+        assert_eq!((aw, ah), ((cols as u32) * t, (rows as u32) * t), "square grid dims");
+        assert_eq!(apx.len(), (aw * ah * 3) as usize);
+    }
+
     // The lossy tier: fresh-pixel REPLACE skip. Unlike the residual approach (which
     // gave ~20 mean-err and accumulated), coding real pixels is perceptually correct
     // → small error, no accumulation — and it beats lossy all-intra by skipping
@@ -2544,6 +2939,7 @@ mod tests {
             tile: 16,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
         let tv = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();
         for (i, (px, _, _)) in decode_casv_all_rgb8(&tv).unwrap().iter().enumerate() {
@@ -2586,6 +2982,7 @@ mod tests {
             tile: 32,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
         let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
         let casv = encode_casv_video_streaming(&mut fs, &opts).unwrap();
@@ -2635,6 +3032,7 @@ mod tests {
             tile: 32,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
 
         // Stream to an in-memory sink (footer-indexed format).
@@ -2854,6 +3252,7 @@ mod tests {
             tile: 16,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
         let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
         let batch = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();

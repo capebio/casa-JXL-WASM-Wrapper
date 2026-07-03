@@ -82,12 +82,51 @@ streaming enc ms/f min-of-arms Realtime 57.8→42.6, Balanced 75.6→53.9, Quali
 79.6→66.2. A default multi-threaded libjxl runner for streaming was measured a
 regression/wash and rejected — see `docs/1 rejected optimizations.md` (CV-E6).
 
+## Rate control (2026-07-03, landed)
+
+JOLT can now target a **byte rate** instead of a fixed distance —
+`CasaVideoOptions::streaming_bitrate(start_distance, target_bytes_per_sec)`
+(or set `rate_control: Some(RateControl { .. })`). Streaming encoders only;
+batch stays fixed-distance and the `None` default is bit-identical to before.
+
+Implementation vs the spec §3.5 (which describes a per-GOP 1-D distance
+*search* with probe encodes): the controller uses **closed-loop feedback**
+instead — the finished GOP's measured bytes steer the next GOP's distance
+(`d *= sqrt(actual/target)`, scaled by a leaky-bucket VBV term, clamped to
+`[min_distance, max_distance]`), at **zero extra encode cost**. Converges
+within a few GOPs. `StreamCtx::set_distance` rebuilds the reused encoder and
+re-derives the auto change threshold at each GOP boundary.
+
+Real 720p dashcam (`examples/jolt_rc_demo.rs`, GOP 12): a 1× target lands
++0.5%; a 0.5× target walks per-GOP rate 3245k→2211k→1850k→1392k B/s; a 2×
+target walks 3245k→6226k B/s (94% of target by GOP 4).
+
+## Square-atlas tile P-frames (JE-8, 2026-07-03, landed)
+
+Lossy tile REPLACE payloads pack changed tiles into a ~square
+`ceil(sqrt(n))`-column atlas (v2) instead of the old `t`-wide sliver (v1),
+signalled by the high bit of the payload's leading `tile_size` u16
+(`CASV_TILE_V2_BIT`). v1 payloads and the lossless residual tier stay v1
+(fully back-compatible). Ghana 720p A/B (`examples/atlas_v2_flip.rs`):
+t=16 size −6.5% / enc −61.1% / dec −41.8%; t=32 size −4.6% / enc −40.9% /
+dec −24.7%; reconstruction unchanged. This also removes the CV-E6 blocker
+(the sliver shape starved libjxl group parallelism).
+
+## Browser playback (2026-07-03, landed)
+
+`packages/casv-web` (`@casabio/casv-web`) decodes `.casv` in the browser
+via any injected single-frame JXL decoder (pairs with `@casabio/jxl-wasm`
+`createDecoder`): parses header/footer/index/rate-box, decodes I-frames,
+and composites REPLACE bbox + tile (v1 sliver + v2 square) P-frames into a
+running RGBA buffer. Lossless-residual and Fable tiers are guarded with
+clear errors. See `packages/casv-web/src/index.ts` (`playCasv`,
+`decodeCasvAll`, `CasvReader`).
+
 ## Not in scope yet
 
-- **Rate control** (target-bytes/VBV → distance search) — designed in the
-  video-codec spec §3.5, not built. JOLT is quality-targeted (distance).
 - **Motion models / temporal prediction** beyond replace-skip — block-MC
   measured worse on real content; parked.
-- **Browser playback** — CASAVA/JOLT is native-only (`not(target_arch =
-  "wasm32")`); the browser side has Motion-JXL `EncodeAnimation` only.
+- **Browser playback of the lossless residual + Fable tiers** — the JOLT
+  lossy profile plays in the browser (above); residual tiers need RGBA16
+  add-compositing and Fable needs a wasm braided-rANS decode.
 - **Mux** (audio, seek tables beyond the frame index, MP4/WebM wrapping).

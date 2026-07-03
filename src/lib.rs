@@ -1510,6 +1510,77 @@ pub fn downscale_rgb(
     Ok(out)
 }
 
+/// wasm simd128 integer-path RGBA downscale (deferred DS-SIMD item).
+///
+/// RGBA channels stay lane-aligned every 4 bytes, so a row segment of the
+/// box window accumulates without any deinterleave:
+///   - 16-byte chunk (4 px): widen u8x16 -> two u16x8 halves and add into a
+///     u16x8 row accumulator whose lanes are [r,g,b,a, r,g,b,a] (even/odd
+///     pixel positions) — one u8 lands per lane per half, so a lane holds at
+///     most 255 * xstep/2 and xstep <= 512 cannot wrap.
+///   - fold: widen the two u16x8 halves to u32x4 and add -> [Σr,Σg,Σb,Σa],
+///     accumulated into a u32x4 across the window's rows.
+/// The <4 px row tail accumulates scalar into a separate [u32;4], added at
+/// the end. All sums are exact integers in any order — pixel-identical to
+/// the scalar loop (asserted by the bench harness and a wasm parity test).
+#[cfg(target_arch = "wasm32")]
+fn downscale_rgba_int_simd(
+    src: &[u8],
+    sw: usize,
+    dw: usize,
+    dh: usize,
+    xstep: usize,
+    ystep: usize,
+    out: &mut [u8],
+) {
+    use core::arch::wasm32::*;
+    let pixel_count = (xstep * ystep) as u32;
+    let chunks = xstep / 4; // 16-byte chunks per row segment
+    let tail = xstep % 4;
+    let mut o = 0usize;
+    for dy in 0..dh {
+        for dx in 0..dw {
+            let x_base = dx * xstep;
+            let mut row_base = dy * ystep * sw;
+            let mut acc32 = u32x4_splat(0);
+            let mut tacc = [0u32; 4];
+            for _yy in 0..ystep {
+                let row_off = (row_base + x_base) * 4;
+                let mut acc16 = u16x8_splat(0);
+                for c in 0..chunks {
+                    // SAFETY: row segment [row_off, row_off + xstep*4) is in
+                    // bounds (len == sw*sh*4 checked by the caller; the window
+                    // never crosses a row edge because sw % dw == 0).
+                    let v = unsafe { v128_load(src.as_ptr().add(row_off + c * 16) as *const v128) };
+                    acc16 = u16x8_add(acc16, u16x8_extend_low_u8x16(v));
+                    acc16 = u16x8_add(acc16, u16x8_extend_high_u8x16(v));
+                }
+                let lo = u32x4_extend_low_u16x8(acc16);
+                let hi = u32x4_extend_high_u16x8(acc16);
+                acc32 = u32x4_add(acc32, u32x4_add(lo, hi));
+                let mut i = row_off + chunks * 16;
+                for _ in 0..tail {
+                    tacc[0] += src[i] as u32;
+                    tacc[1] += src[i + 1] as u32;
+                    tacc[2] += src[i + 2] as u32;
+                    tacc[3] += src[i + 3] as u32;
+                    i += 4;
+                }
+                row_base += sw;
+            }
+            let rr = u32x4_extract_lane::<0>(acc32) + tacc[0];
+            let gg = u32x4_extract_lane::<1>(acc32) + tacc[1];
+            let bb = u32x4_extract_lane::<2>(acc32) + tacc[2];
+            let aa = u32x4_extract_lane::<3>(acc32) + tacc[3];
+            out[o] = (rr / pixel_count) as u8;
+            out[o + 1] = (gg / pixel_count) as u8;
+            out[o + 2] = (bb / pixel_count) as u8;
+            out[o + 3] = (aa / pixel_count) as u8;
+            o += 4;
+        }
+    }
+}
+
 /// Planar SoA downscale (hypercar layer): 3 separate contiguous planes in (R/G/B from demosaic_planar).
 /// Zero interleave cost. Sequential per-channel box filter = massive cache win vs interleaved scatter.
 /// Outputs packed LE u8 6B/px (same as before) for drop-in use in lb/thumb paths. Integer fast path per plane.
@@ -1583,6 +1654,15 @@ pub fn downscale_rgba(
     if (sw % dw == 0) && (sh % dh == 0) {
         let xstep = sw / dw;
         let ystep = sh / dh;
+        // wasm simd128: channel-lane-aligned RGBA accumulation (see the kernel
+        // doc). Integer sums are order-independent, so output is pixel-identical
+        // to the scalar loop below. xstep <= 512 keeps the u16 row lanes from
+        // wrapping; larger factors (absurd for thumbnails) take the scalar loop.
+        #[cfg(target_arch = "wasm32")]
+        if xstep >= 2 && xstep <= 512 {
+            downscale_rgba_int_simd(src, sw, dw, dh, xstep, ystep, &mut out);
+            return Ok(out);
+        }
         let pixel_count = (xstep * ystep) as u32;
         let mut o = 0usize;
         for dy in 0..dh {

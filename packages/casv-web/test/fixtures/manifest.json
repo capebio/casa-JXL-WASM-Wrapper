@@ -1,0 +1,6 @@
+{
+  "tile_v2": { "width": 80, "height": 56, "frames": 7 },
+  "bbox": { "width": 80, "height": 56, "frames": 7 },
+  "sink_ratebox": { "width": 80, "height": 56, "frames": 7 },
+  "intra": { "width": 80, "height": 56, "frames": 7 }
+}

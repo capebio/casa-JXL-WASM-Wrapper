@@ -899,6 +899,189 @@ describe("browser codec handlers", () => {
 
     expect(ended).toEqual(["deferred-release-test"]);
   });
+
+  // ── CLAUDE.md decode-handler test gaps ────────────────────────────────────
+
+  /** Controllable fake decoder: push resolution and event stream are gated by
+   * the test; dispose is tracked. events() emits a header then parks forever
+   * (the handler's terminal paths must not depend on the stream ending). */
+  function makeGatedCodec() {
+    const state = {
+      pushes: 0,
+      disposed: 0,
+      pendingPush: null as null | (() => void),
+      autoResolvePush: true,
+    };
+    const codec = {
+      createDecoder() {
+        return {
+          push() {
+            state.pushes++;
+            if (state.autoResolvePush) return Promise.resolve();
+            return new Promise<void>((resolve) => {
+              state.pendingPush = resolve;
+            });
+          },
+          close() {},
+          cancel() {},
+          dispose() {
+            state.disposed++;
+          },
+          async *events() {
+            yield {
+              type: "header",
+              info: {
+                width: 1,
+                height: 1,
+                bitsPerSample: 8,
+                hasAlpha: true,
+                hasAnimation: false,
+                jpegReconstructionAvailable: false,
+              },
+            };
+            await new Promise(() => undefined); // park forever
+          },
+        };
+      },
+    };
+    return { codec, state };
+  }
+
+  test("cancel while paused disposes the decoder and posts decode_cancelled", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    installWorkerPostMessage(messages);
+    const { codec, state } = makeGatedCodec();
+
+    const handler = new DecodeHandler(
+      { ...baseDecodeStart, sessionId: "cancel-paused" },
+      codec as never,
+      { onSessionEnd: (sessionId) => ended.push(sessionId) },
+    );
+    handler.onChunk(new Uint8Array([1, 2, 3]).buffer);
+    await waitFor(() => state.pushes === 1);
+
+    handler.onPause();
+    await waitFor(() => messages.some((m) => m.type === "decode_paused"));
+
+    await handler.onCancel();
+    await waitFor(() => ended.length === 1 && state.disposed === 1);
+
+    expect(messages.some((m) => m.type === "decode_cancelled")).toBe(true);
+    expect(state.disposed).toBe(1);
+    // No decode_final may follow a cancel.
+    expect(messages.some((m) => m.type === "decode_final")).toBe(false);
+    expect(ended).toEqual(["cancel-paused"]);
+  });
+
+  test("cancel during an active push() disposes safely and stays terminal", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    installWorkerPostMessage(messages);
+    const { codec, state } = makeGatedCodec();
+    state.autoResolvePush = false; // park the first push mid-flight
+
+    const handler = new DecodeHandler(
+      { ...baseDecodeStart, sessionId: "cancel-midpush" },
+      codec as never,
+      { onSessionEnd: (sessionId) => ended.push(sessionId) },
+    );
+    handler.onChunk(new Uint8Array(64).buffer);
+    await waitFor(() => state.pushes === 1); // decoder.push is now pending
+
+    await handler.onCancel();
+    await waitFor(() => ended.length === 1 && state.disposed === 1);
+    expect(messages.some((m) => m.type === "decode_cancelled")).toBe(true);
+
+    // Late completion of the in-flight push must not resurrect the session.
+    const decodeMsgsBefore = messages.filter((m) => m.type.startsWith("decode_")).length;
+    state.pendingPush?.();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(state.pushes).toBe(1); // queued chunks are not fed after cancel
+    // No decode_* traffic after cancel (a trailing worker_drain/metric is benign).
+    expect(messages.filter((m) => m.type.startsWith("decode_")).length).toBe(decodeMsgsBefore);
+    expect(messages.some((m) => m.type === "decode_final")).toBe(false);
+  });
+
+  test("worker_drain is coalesced: none while the queue is over the byte HWM, one on crossing into drain", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    installWorkerPostMessage(messages);
+    const { codec, state } = makeGatedCodec();
+    state.autoResolvePush = false;
+
+    // Freeze the clock: interval-based drains are impossible; only the
+    // crossed-into-drain edge may post.
+    const restoreNow = mockPerformanceNow(() => 1000);
+    try {
+      const handler = new DecodeHandler(
+        { ...baseDecodeStart, sessionId: "drain-coalesce" },
+        codec as never,
+        { onSessionEnd: (sessionId) => ended.push(sessionId) },
+      );
+      // Queue 3 MiB in 256 KiB chunks — over the 2 MiB byte HWM once the
+      // first chunk is in flight.
+      const chunkBytes = 256 * 1024;
+      for (let i = 0; i < 12; i++) {
+        handler.onChunk(new ArrayBuffer(chunkBytes));
+      }
+      await waitFor(() => state.pushes === 1);
+
+      // Drain the queue one push at a time; while queuedBytes >= 2 MiB no
+      // worker_drain may be posted.
+      for (let i = 0; i < 11; i++) {
+        const target = state.pushes + 1;
+        state.pendingPush!();
+        await waitFor(() => state.pushes === target);
+      }
+      state.pendingPush!();
+      await waitFor(() => state.pushes === 12 && state.pendingPush !== null || state.pushes === 12);
+
+      const drains = messages.filter((m) => m.type === "worker_drain") as Array<{
+        type: "worker_drain";
+        queuedBytes: number;
+      }>;
+      // Exactly one crossing edge (frozen clock blocks interval reposts).
+      expect(drains.length).toBe(1);
+      for (const d of drains) {
+        expect(d.queuedBytes < 2 * 1024 * 1024).toBe(true);
+      }
+    } finally {
+      restoreNow();
+    }
+  });
+
+  test("DRAIN_MIN_INTERVAL_MS gates drain spam during a burst of small chunks", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    installWorkerPostMessage(messages);
+    const { codec, state } = makeGatedCodec();
+
+    let now = 0;
+    const restoreNow = mockPerformanceNow(() => now);
+    try {
+      const handler = new DecodeHandler(
+        { ...baseDecodeStart, sessionId: "drain-interval" },
+        codec as never,
+        { onSessionEnd: (sessionId) => ended.push(sessionId) },
+      );
+      // Burst 1: 10 tiny chunks at t=0. Pushes resolve instantly; the queue
+      // stays in the drain-allowed regime, so only the first crossing posts.
+      for (let i = 0; i < 10; i++) handler.onChunk(new Uint8Array([i + 1]).buffer);
+      await waitFor(() => state.pushes === 10);
+      const drainsAtT0 = messages.filter((m) => m.type === "worker_drain").length;
+      expect(drainsAtT0).toBe(1);
+
+      // Advance past the 8 ms minimum interval: the next push may post again.
+      now = 9;
+      for (let i = 0; i < 10; i++) handler.onChunk(new Uint8Array([i + 1]).buffer);
+      await waitFor(() => state.pushes === 20);
+      const drainsAtT9 = messages.filter((m) => m.type === "worker_drain").length;
+      expect(drainsAtT9).toBe(2);
+    } finally {
+      restoreNow();
+    }
+  });
 });
 
 function installWorkerPostMessage(messages: WorkerToMainMessage[]): void {
