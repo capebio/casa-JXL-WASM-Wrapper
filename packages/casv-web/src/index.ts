@@ -19,6 +19,13 @@ export const CASV_INDEX_ENTRY_BYTES = 8;
 export const CASV_FOOTER_MAGIC = 0x4653_4143;
 export const CASV_FOOTER_BYTES = 32;
 export const CASV_RATE_BOX_MAGIC = 0x5253_4143;
+export const CASV_AUDIO_BOX_MAGIC = 0x5541_5343;
+
+/** An Ogg/Opus audio stream embedded in a footer-format .casv via the CSAU box. */
+export interface CasvAudio {
+  /** Raw Ogg/Opus bytes, ready for AudioContext.decodeAudioData(). */
+  bytes: Uint8Array;
+}
 
 /** Index-entry flag bits (top nibble of the len field). */
 export const CASV_PFRAME_FLAG = 0x8000_0000;
@@ -140,6 +147,30 @@ export function parseCasvRateBox(bytes: Uint8Array): number | null {
 }
 
 /**
+ * Extract the Ogg/Opus payload from a footer-format .casv that contains a CSAU box.
+ * Returns null if absent, file too short, or magic mismatch.
+ */
+export function parseCasvAudioBox(bytes: Uint8Array): Uint8Array | null {
+  const f = parseCasvFooter(bytes);
+  if (f === null) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const idxEnd = f.indexOffset + f.frameCount * CASV_INDEX_ENTRY_BYTES;
+  const footerStart = bytes.byteLength - CASV_FOOTER_BYTES;
+  let pos = idxEnd;
+  // Skip optional CASR box.
+  if (pos + 8 <= footerStart && u32(dv, pos) === CASV_RATE_BOX_MAGIC) {
+    pos += 8;
+  }
+  // Check for CSAU.
+  if (pos + 8 > footerStart) return null;
+  if (u32(dv, pos) !== CASV_AUDIO_BOX_MAGIC) return null;
+  const len = u32(dv, pos + 4);
+  const start = pos + 8;
+  if (start + len > footerStart) return null;
+  return bytes.slice(start, start + len);
+}
+
+/**
  * A parsed .casv: header info + frame index, over either container shape.
  * Header-format files use absolute payload offsets; footer-format files use
  * offsets relative to byte 0 of the file (payloads come first) — both resolve
@@ -148,12 +179,14 @@ export function parseCasvRateBox(bytes: Uint8Array): number | null {
 export class CasvReader {
   readonly header: CasvHeader;
   readonly rate: CasvRate;
+  readonly audio: CasvAudio | null;
   private readonly entries: CasvFrameEntry[];
 
-  private constructor(header: CasvHeader, rate: CasvRate, entries: CasvFrameEntry[]) {
+  private constructor(header: CasvHeader, rate: CasvRate, entries: CasvFrameEntry[], audio: CasvAudio | null) {
     this.header = header;
     this.rate = rate;
     this.entries = entries;
+    this.audio = audio;
   }
 
   get frameCount(): number {
@@ -178,7 +211,7 @@ export class CasvReader {
         header.frameCount,
         0
       );
-      return new CasvReader(header, rateFromFlags(header.flags), entries);
+      return new CasvReader(header, rateFromFlags(header.flags), entries, null);
     }
     const footer = parseCasvFooter(bytes);
     if (footer !== null) {
@@ -198,7 +231,9 @@ export class CasvReader {
         fpsDen: footer.fpsDen,
         flags,
       };
-      return new CasvReader(h, rateFromFlags(flags), entries);
+      const audioBytes = parseCasvAudioBox(bytes);
+      const audio: CasvAudio | null = audioBytes ? { bytes: audioBytes } : null;
+      return new CasvReader(h, rateFromFlags(flags), entries, audio);
     }
     throw new Error("not a .casv file (no valid header or footer)");
   }

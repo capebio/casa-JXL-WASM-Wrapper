@@ -200,6 +200,112 @@ pub fn parse_casv_header(data: &[u8]) -> Option<CasvHeader> {
 pub const CASV_FOOTER_MAGIC: u32 = 0x4653_4143; // 'CASF' little-endian
 pub const CASV_FOOTER_BYTES: usize = 32;
 
+/// Magic for the audio box: 'CSAU' little-endian (bytes C S A U on disk).
+pub const CASV_AUDIO_BOX_MAGIC: u32 = 0x5541_5343;
+/// Byte count of the CSAU box header (magic + payload length field).
+pub const CASV_AUDIO_BOX_HDR: usize = 8;
+
+/// Append a CSAU box (8-byte header + Ogg/Opus payload) to a buffer.
+/// Call this after the CASR box and before the CASV footer.
+pub fn write_csau_box(out: &mut Vec<u8>, ogg_opus: &[u8]) {
+    out.extend_from_slice(&CASV_AUDIO_BOX_MAGIC.to_le_bytes());
+    out.extend_from_slice(&(ogg_opus.len() as u32).to_le_bytes());
+    out.extend_from_slice(ogg_opus);
+}
+
+/// Extract the Ogg/Opus payload from a footer-format `.casv` that contains a CSAU box.
+/// Returns `None` if absent, file too short, or magic mismatch.
+pub fn parse_casv_audio_box(data: &[u8]) -> Option<&[u8]> {
+    let f = parse_casv_footer(data)?;
+    let idx_end = f.index_offset as usize
+        + f.frame_count as usize * CASV_INDEX_ENTRY_BYTES;
+    let footer_start = data.len() - CASV_FOOTER_BYTES;
+    let mut pos = idx_end;
+    // Skip optional CASR box.
+    if pos + 8 <= footer_start {
+        let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+        if magic == CASV_RATE_BOX_MAGIC {
+            pos += 8;
+        }
+    }
+    // Check for CSAU.
+    if pos + CASV_AUDIO_BOX_HDR > footer_start {
+        return None;
+    }
+    let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().ok()?);
+    if magic != CASV_AUDIO_BOX_MAGIC {
+        return None;
+    }
+    let len = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().ok()?) as usize;
+    let start = pos + CASV_AUDIO_BOX_HDR;
+    if start + len > footer_start {
+        return None;
+    }
+    Some(&data[start..start + len])
+}
+
+/// Private: pull frames from a `&[Vec<u8>]` slice for use with the streaming encoder.
+struct SliceFrameSource<'a> {
+    frames: &'a [Vec<u8>],
+    i: usize,
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+}
+
+impl<'a> VideoFrameSource for SliceFrameSource<'a> {
+    fn dims(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+    fn fps(&self) -> (u32, u32) {
+        (self.fps_num, self.fps_den)
+    }
+    fn next_frame(&mut self) -> Option<Vec<u8>> {
+        if self.i < self.frames.len() {
+            let f = self.frames[self.i].clone();
+            self.i += 1;
+            Some(f)
+        } else {
+            None
+        }
+    }
+}
+
+/// Encode frames to footer-format `.casv` with an optional Ogg/Opus audio track
+/// embedded as a `CSAU` box between the CASR box and the CASV footer.
+///
+/// `frames` — interleaved RGB8 pixel data (`len == width * height * 3`) for each frame.
+/// `ogg_opus` — full Ogg/Opus stream, or `None` for silent output.
+pub fn encode_casv_video_with_audio(
+    frames: &[Vec<u8>],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    opts: &CasaVideoOptions,
+    ogg_opus: Option<&[u8]>,
+) -> Result<Vec<u8>, VideoError> {
+    let mut src = SliceFrameSource {
+        frames,
+        i: 0,
+        width,
+        height,
+        fps_num,
+        fps_den,
+    };
+    let mut buf = Vec::new();
+    // Use the footer-format sink encoder: writes [frames][index][CASR][footer].
+    encode_casv_video_streaming_to(&mut src, opts, &mut buf)?;
+    if let Some(audio) = ogg_opus {
+        // Insert CSAU between the CASR box and the 32-byte footer.
+        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
+        write_csau_box(&mut buf, audio);
+        buf.extend_from_slice(&footer);
+    }
+    Ok(buf)
+}
+
 /// Trailing footer of a streaming `.casv`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CasvFooter {
@@ -3294,5 +3400,48 @@ mod tests {
         assert!(parse_casv_footer(&legacy).is_some(), "footer still valid");
         assert_eq!(parse_casv_rate_box(&legacy), None);
         assert_eq!(decode_casv_footer_all_rgb8(&legacy).unwrap().len(), 6);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "jxl-codec")]
+mod csau_tests {
+    use super::*;
+
+    #[test]
+    fn csau_write_parse_roundtrip() {
+        let fake_ogg = b"OggS\x00fake_audio_bytes";
+        let frame = vec![128u8; 64 * 64 * 3];
+        let frames = vec![frame.clone(), frame];
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 2,
+            skip: SkipMode::Tile,
+            tile: 16,
+            effort: 1,
+            thresh: Some(4),
+            rate_control: None,
+        };
+        let casv = encode_casv_video_with_audio(&frames, 64, 64, 24, 1, &opts, Some(fake_ogg))
+            .unwrap();
+        let audio = parse_casv_audio_box(&casv).expect("CSAU box not found in output");
+        assert_eq!(audio, fake_ogg.as_slice());
+    }
+
+    #[test]
+    fn csau_absent_when_no_audio_given() {
+        let frame = vec![128u8; 64 * 64 * 3];
+        let frames = vec![frame.clone(), frame];
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 2,
+            skip: SkipMode::Tile,
+            tile: 16,
+            effort: 1,
+            thresh: Some(4),
+            rate_control: None,
+        };
+        let casv = encode_casv_video_with_audio(&frames, 64, 64, 24, 1, &opts, None).unwrap();
+        assert!(parse_casv_audio_box(&casv).is_none(), "no CSAU box expected when ogg=None");
     }
 }

@@ -100,8 +100,8 @@ fn main() {
     );
     let dist = 1.0f32;
     let li = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(dist)).expect("lossy intra");
-    let lr0 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, dist, 0).expect("replace t0");
-    let lr6 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, dist, 6).expect("replace t6");
+    let lr0 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, EncodeOptions::distance(dist), 0).expect("replace t0");
+    let lr6 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, EncodeOptions::distance(dist), 6).expect("replace t6");
     let li_sz = li.len() as f64;
     let showl = |label: String, casv: &[u8]| {
         let t = Instant::now();

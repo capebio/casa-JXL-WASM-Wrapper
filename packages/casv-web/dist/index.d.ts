@@ -6,6 +6,12 @@ export declare const CASV_INDEX_ENTRY_BYTES = 8;
 export declare const CASV_FOOTER_MAGIC = 1179861315;
 export declare const CASV_FOOTER_BYTES = 32;
 export declare const CASV_RATE_BOX_MAGIC = 1381187907;
+export declare const CASV_AUDIO_BOX_MAGIC = 1430344515;
+/** An Ogg/Opus audio stream embedded in a footer-format .casv via the CSAU box. */
+export interface CasvAudio {
+    /** Raw Ogg/Opus bytes, ready for AudioContext.decodeAudioData(). */
+    bytes: Uint8Array;
+}
 /** Index-entry flag bits (top nibble of the len field). */
 export declare const CASV_PFRAME_FLAG = 2147483648;
 export declare const CASV_BBOX_FLAG = 1073741824;
@@ -63,6 +69,11 @@ export declare function parseCasvFooter(bytes: Uint8Array): CasvFooter | null;
 /** Rate flags of a streamed file's optional CASR box; null for legacy files. */
 export declare function parseCasvRateBox(bytes: Uint8Array): number | null;
 /**
+ * Extract the Ogg/Opus payload from a footer-format .casv that contains a CSAU box.
+ * Returns null if absent, file too short, or magic mismatch.
+ */
+export declare function parseCasvAudioBox(bytes: Uint8Array): Uint8Array | null;
+/**
  * A parsed .casv: header info + frame index, over either container shape.
  * Header-format files use absolute payload offsets; footer-format files use
  * offsets relative to byte 0 of the file (payloads come first) — both resolve
@@ -71,6 +82,7 @@ export declare function parseCasvRateBox(bytes: Uint8Array): number | null;
 export declare class CasvReader {
     readonly header: CasvHeader;
     readonly rate: CasvRate;
+    readonly audio: CasvAudio | null;
     private readonly entries;
     private constructor();
     get frameCount(): number;
