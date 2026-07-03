@@ -387,11 +387,44 @@ u32 raw_len | raw_residual_bytes</pre>
 <div id="t2" class="tab">
   <h2>Perceptual Metrics</h2>
 
-  <p>A shared Rust SIMD kernel that replaces the JS <code class="path">web/jxl-butteraugli.js</code> approximation. Compiled from one source two ways: <b>WASM v128</b> for the browser byte-cutoff worker, and <b>AVX2+FMA</b> (+ optional AVX-512) for native Tauri/server ingest. Designed for throughput at scale — millions of progressive-pass comparisons per session.</p>
+  <p><b>PerSee</b> (Perceptual Seeing) is our fast perceptual metric — a Rust SIMD approximation of Butteraugli, compiled from one source two ways: <b>WASM v128</b> for the browser byte-cutoff worker, and <b>AVX2+FMA</b> (+ optional AVX-512) for native Tauri/server ingest. It replaces the earlier JS <code class="path">web/jxl-butteraugli.js</code> scorer. Designed for throughput at scale — millions of progressive-pass comparisons per session.</p>
 
   <div class="box box-blue">
-    <div class="box-title">Scope</div>
-    This is a <b>fast heuristic approximation</b>, not libjxl ground truth. The real <code>jxl_wasm_butteraugli_compare</code> (libjxl <code>ButteraugliInterfaceInPlace</code>, exported from bridge.cpp) exists for calibration — it is a fidelity tool, slower per call, out of scope here.
+    <div class="box-title">PerSee vs libjxl Butteraugli</div>
+    PerSee is a <b>fast heuristic approximation</b>, not libjxl ground truth. libjxl's <code>ButteraugliInterfaceInPlace</code> (exported from <code>bridge.cpp</code> as <code>jxl_wasm_butteraugli_compare</code>) is the gold standard — a full Laplacian pyramid + XYB + masking model. It is a fidelity/calibration tool only; at 14–15 seconds per 20.5 MP image it is entirely off the table for real-time or per-frame use. PerSee is what ships.
+  </div>
+
+  <h3>PerSee Two-Phase Cost</h3>
+  <p>PerSee separates reference build (paid once per reference image) from per-comparison query (paid per test image):</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Phase</th><th>Rust API</th><th>What it does</th><th>Cost @ 20.5 MP (i7-10850H)</th></tr></thead>
+    <tbody>
+      <tr><td><b>Reference build</b> <span class="dim">(Perc bld)</span></td><td><code>Comparer::new(ref_rgba, w, h, opts)</code></td><td>RGBA→XYB, build 3-scale box-downsample pyramid, precompute moment maps</td><td><b>402–626 ms</b> (one-time per reference)</td></tr>
+      <tr><td><b>Per-comparison query</b> <span class="dim">(Perc ms)</span></td><td><code>cmp.butteraugli(test_rgba)</code></td><td>XYB-convert test, diff against prebuilt pyramid, compute weighted p-norm at 3 octaves</td><td><b>116–134 ms</b> (per test image)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="dim" style="font-size:12px">Measured 2026-07-03 via <code>crates/raw-pipeline/examples/orf_metric_bench.rs</code> on 6 Olympus ORF pairs (Gobabeb field trip). 7-rep median. Release build, parallel feature (rayon row-parallel H-pass active).</p>
+
+  <h3>PerSee vs libjxl Butteraugli — Measured Speedup</h3>
+  <p>Benchmark: 5 consecutive pairs from 6 real ORF files, all 5240×3912 (20.5 MP). libjxl measured via <code>bench/butter_time.exe</code> (static <code>ButteraugliInterfaceInPlace</code>, 7-rep median). PerSee uses <code>Comparer::butteraugli</code> query cost only (reference build is amortised over many queries in production).</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Pair</th><th>MP</th><th>Perc bld</th><th>Perc ms</th><th>Butter ms</th><th>Butter min</th><th>Score</th><th>Speedup</th></tr>
+    <tr class="dim" style="font-size:11px"><th></th><th></th><th>(Cmp::new)</th><th>(median)</th><th>(median)</th><th>(min)</th><th>(libjxl)</th><th>(B/P)</th></tr></thead>
+    <tbody>
+      <tr><td>P2200717 | P2200493 Grielum sinuatum</td><td>20.5</td><td>626 ms</td><td>134 ms</td><td>15 524 ms</td><td>15 183 ms</td><td>100.6</td><td><b>115.5×</b></td></tr>
+      <tr><td>P2200493 Grielum sinuatum | P2200571</td><td>20.5</td><td>422 ms</td><td>130 ms</td><td>15 129 ms</td><td>14 771 ms</td><td>126.1</td><td><b>116.1×</b></td></tr>
+      <tr><td>P2200571 | P2200615 Jamesbrittenia fleckii</td><td>20.5</td><td>427 ms</td><td>128 ms</td><td>14 798 ms</td><td>13 724 ms</td><td>111.4</td><td><b>115.7×</b></td></tr>
+      <tr><td>P2200615 Jamesbrittenia fleckii | P2200637 Hermannia atrosanguinea</td><td>20.5</td><td>451 ms</td><td>130 ms</td><td>14 723 ms</td><td>14 236 ms</td><td>156.1</td><td><b>113.2×</b></td></tr>
+      <tr><td>P2200637 Hermannia atrosanguinea | P2200629 Aptosimum arenarium</td><td>20.5</td><td>402 ms</td><td>116 ms</td><td>14 380 ms</td><td>13 984 ms</td><td>120.0</td><td><b>124.5×</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="box box-green">
+    <div class="box-title">Key result</div>
+    PerSee is <b>113–125× faster</b> than libjxl Butteraugli on 20.5 MP Olympus ORFs. libjxl at 14–15 s/image is off the table for any real-time or per-frame use. PerSee at 116–134 ms per query (with a once-per-reference 400–630 ms build) is the only viable path. The Butteraugli scores (100–156) reflect cross-scene pairs — different flower subjects, extreme perceptual distance; both metrics agree correctly.
   </div>
 
   <h3>Module Layout</h3>
@@ -596,6 +629,10 @@ u32 raw_len | raw_residual_bytes</pre>
   <h3>JOLT Performance (cross-reference)</h3>
   <p>Measured 2026-07-02 via <code>examples/jolt_bench.rs</code>, Ghana dashcam 48 frames @ 1280×720, i7-10850H single-thread. See CASAVA tab for full table. Key result: every JOLT preset decodes 720p in real time (≥42fps) single-threaded; lossless archive does not (9fps). That gap is JOLT's reason to exist.</p>
 
+  <hr class="section-sep"/>
+  <h3>PerSee Performance (cross-reference)</h3>
+  <p>Measured 2026-07-03 via <code>crates/raw-pipeline/examples/orf_metric_bench.rs</code> + <code>bench/butter_time.exe</code>, 6 Olympus ORFs @ 5240×3912 (20.5 MP), i7-10850H, 7-rep median, release+parallel. See Perceptual Metrics tab for full table. Key result: <b>113–125× faster</b> than libjxl <code>ButteraugliInterfaceInPlace</code>. PerSee query = 116–134 ms; libjxl = 14–15 s. Reference build (<code>Comparer::new</code>) = 402–626 ms, amortised over many queries per image. The box_blur H-pass parallel win (Jul 02, +77–79%) is the dominant factor in the query cost.</p>
+
   <h3>Measurement Recipes</h3>
   <div class="tbl-wrap">
   <table>
@@ -618,6 +655,7 @@ u32 raw_len | raw_residual_bytes</pre>
       <tr><td>enc_ans serial island</td><td>EncodeGroups <b>1.22×</b></td><td>P1 parallel histo build + table builds + stack bins (byte-exact)</td></tr>
       <tr><td>Butteraugli SIMD</td><td>native −48..53% / WASM −33..48%</td><td>AVX2 + wasm32 v128 hot-path pass</td></tr>
       <tr><td>Upsampling load-hoist</td><td>25 input taps hoisted out of inner loop</td><td>stage_upsampling.cc, byte-exact</td></tr>
+      <tr><td>PerSee vs libjxl Butteraugli</td><td><b>113–125× faster</b> query (116–134 ms vs 14–15 s at 20.5 MP)</td><td>XYB p-norm approx; skips Laplacian pyramid + masking model</td></tr>
       <tr><td>box_blur H-pass</td><td>+77–79% (4.4–4.8×)</td><td>Row-parallel execution</td></tr>
       <tr><td>downscale_rgba WASM</td><td>+14.8–62.8%</td><td>wasm128 SIMD path, pixel-exact</td></tr>
       <tr><td>MHC demosaic AVX2</td><td>+51–54%</td><td>AVX2 demosaic path, bit-exact</td></tr>
