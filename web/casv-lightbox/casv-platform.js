@@ -90,7 +90,7 @@ export async function pickImagesToEncode() {
         filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'ppm', 'jxl'] }],
       });
     } else {
-      paths = await tauriInvoke('pick_image_paths', {});
+      paths = await tauriInvoke('casv_pick_images', {});
     }
     const arr = Array.isArray(paths) ? paths : paths ? [paths] : [];
     return { native: true, paths: arr };

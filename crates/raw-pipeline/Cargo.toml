@@ -34,6 +34,11 @@ name = "djxl"
 path = "src/bin/djxl.rs"
 required-features = ["jxl-codec"]
 
+[[bin]]
+name = "casv_encode"
+path = "src/bin/casv_encode.rs"
+required-features = ["jxl-codec"]
+
 [dev-dependencies]
 jxl-oxide = "0.11"
 # golden-corpus hashing for the casa_video decode harnesses (examples only)
