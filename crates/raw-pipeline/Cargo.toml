@@ -39,6 +39,10 @@ name = "casv_encode"
 path = "src/bin/casv_encode.rs"
 required-features = ["jxl-codec"]
 
+[[example]]
+name = "orf_metric_bench"
+required-features = ["parallel"]
+
 [dev-dependencies]
 jxl-oxide = "0.11"
 # golden-corpus hashing for the casa_video decode harnesses (examples only)

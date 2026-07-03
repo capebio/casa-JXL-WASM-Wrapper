@@ -1033,6 +1033,30 @@ pub fn bench_tone_split_orf(data: &[u8]) -> Result<(f64, f64)> {
     Ok(crate::pipeline::bench_tone_split(&rgb16, &params))
 }
 
+/// Decode an ORF to RGBA8 via the full native pipeline (decompress → demosaic → tone).
+/// Returns `(rgba8, width, height)`.  The decode is NOT parallelised here; the caller
+/// is responsible for multi-image parallelism if needed.
+pub fn decode_orf_rgba8(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
+    let info = parse(data)?;
+    if info.compression != 1 {
+        bail!("unsupported compression {} (only ljpeg compression=1 supported)", info.compression);
+    }
+    let w = info.width as usize;
+    let h = info.height as usize;
+    let strip_start = info.strip_offset as usize;
+    let strip_end = strip_start
+        .checked_add(info.strip_byte_count as usize)
+        .ok_or_else(|| anyhow!("strip range overflow"))?;
+    let strip = data
+        .get(strip_start..strip_end)
+        .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
+    let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
+    let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
+    let params = crate::pipeline::PipelineParams::default_olympus();
+    let rgba8 = crate::pipeline::process_rgba(&rgb16, &params);
+    Ok((rgba8, info.width, info.height))
+}
+
 /// End-to-end tone comparison on a real ORF: times scalar `process_into` vs SIMD
 /// `process_into_simd` (full tone+LUT, parallel) AND checks output parity.
 /// Returns (scalar_ms, simd_ms, max_byte_diff, num_pixels_differing).

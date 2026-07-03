@@ -33,7 +33,7 @@ pub mod stream_band;
 pub mod stream_export;
 
 // Re-export the stable B4 metadata-only public API for convenience
-pub use tiff::{parse_orf_metadata, bench_decode_orf, OrfMetadata, DecodeBench};
+pub use tiff::{parse_orf_metadata, bench_decode_orf, decode_orf_rgba8, OrfMetadata, DecodeBench};
 pub use pipeline::apply_perceptual_constancy;  // Layer 5: exposed for post-JXL / progressive pixel constancy (ties to benchmark postDecodeTransform + Cursor for early layers). Positive for vision use cases. Now takes layer for progressive awareness.
 
 #[cfg(test)]
