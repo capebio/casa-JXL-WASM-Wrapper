@@ -34,7 +34,7 @@ fn fail(msg: impl std::fmt::Display) -> ! {
 
 // ── video-mode helpers ────────────────────────────────────────────────────────
 
-fn probe_fps(video: &str) -> u32 {
+fn probe_fps(video: &str) -> (u32, u32) {
     let out = match std::process::Command::new("ffprobe")
         .args([
             "-v",
@@ -50,14 +50,16 @@ fn probe_fps(video: &str) -> u32 {
         .output()
     {
         Ok(o) => o,
-        Err(_) => return 30,
+        Err(_) => return (30, 1),
     };
     let s = String::from_utf8_lossy(&out.stdout);
     let s = s.trim();
-    if let Some((n, _)) = s.split_once('/') {
-        n.parse().unwrap_or(30)
+    if let Some((n, d)) = s.split_once('/') {
+        let num = n.parse().unwrap_or(30);
+        let den = d.parse().unwrap_or(1);
+        (num.max(1), den.max(1))
     } else {
-        s.parse().unwrap_or(30)
+        (s.parse().unwrap_or(30), 1)
     }
 }
 
@@ -122,7 +124,7 @@ fn run_video_mode(args: &[String]) -> ! {
     let in_video = &args[1];
     let out_casv = &args[2];
     let mut fps_num: u32 = args[3].parse().unwrap_or_else(|_| fail("bad fps_num"));
-    let fps_den: u32 = args[4].parse().unwrap_or_else(|_| fail("bad fps_den"));
+    let mut fps_den: u32 = args[4].parse().unwrap_or_else(|_| fail("bad fps_den"));
     let distance: f32 = args[6].parse().unwrap_or_else(|_| fail("bad distance"));
     let effort: u8 = args[7].parse().unwrap_or_else(|_| fail("bad effort"));
     let gop: u32 = args[8].parse().unwrap_or_else(|_| fail("bad gop"));
@@ -141,7 +143,9 @@ fn run_video_mode(args: &[String]) -> ! {
     let dim_str = args[12].as_str();
 
     if fps_num == 0 {
-        fps_num = probe_fps(in_video);
+        let (pn, pd) = probe_fps(in_video);
+        fps_num = pn;
+        fps_den = pd;
     }
 
     // Extract audio as Ogg/Opus
@@ -160,7 +164,7 @@ fn run_video_mode(args: &[String]) -> ! {
             "-ac",
             "2",
             "-y",
-            audio_tmp.to_str().unwrap(),
+            audio_tmp.to_str().unwrap_or_else(|| fail("temp dir path not UTF-8")),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
