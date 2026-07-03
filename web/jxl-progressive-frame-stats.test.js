@@ -51,3 +51,25 @@ test('analyzeProgressiveFrame hash differs on content, stable on same', () => {
     expect(a).not.toBe(b);
     expect(analyzeProgressiveFrame(new Uint8Array([1,2,3,4]), 1, 1).frameHash).toBe(a);
 });
+
+test('lumaVariance is exactly zero for a constant-colour image', () => {
+    // 500×500 = 250 000 pixels all white. Zero variance by definition.
+    const N = 250_000;
+    const data = new Uint8Array(N * 4).fill(255);
+    const stats = analyzeProgressiveFrame(data, 500, 500);
+    expect(stats.lumaVariance).toBe(0);
+});
+
+test('lumaVariance matches analytic value for two-value distribution', () => {
+    // Alternating black (lumaInt=0) / white (lumaInt=65025) pixels, even count.
+    // Population variance = (65025/2)² = 1 057 066 890.0625; normalised /65536 ≈ 16128.117
+    const N = 2000;
+    const data = new Uint8Array(N * 4);
+    for (let i = 0; i < N; i++) {
+        const v = (i % 2 === 0) ? 255 : 0;
+        data[i * 4] = v; data[i * 4 + 1] = v; data[i * 4 + 2] = v; data[i * 4 + 3] = 255;
+    }
+    const stats = analyzeProgressiveFrame(data, 40, 50); // 40×50 = 2000 px
+    const expected = (65025 * 65025 / 4) / 65536; // ≈ 16128.117
+    expect(Math.abs(stats.lumaVariance - expected)).toBeLessThan(0.01);
+});
