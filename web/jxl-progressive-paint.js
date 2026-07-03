@@ -1833,12 +1833,12 @@ function markdownCell(value) {
     return String(value ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
-function buildMeasurementsMarkdown() {
-    let out = '# Progressive Paint Measurements\n\n';
-    out += '| Source | Paints | First ms | Final ms | One-shot ms | Encode ms | File KB | Final PSNR |\n';
-    out += '|---|---:|---:|---:|---:|---:|---:|---:|\n';
+export function buildMeasurementsMarkdown() {
+    const parts = ['# Progressive Paint Measurements\n\n'];
+    parts.push('| Source | Paints | First ms | Final ms | One-shot ms | Encode ms | File KB | Final PSNR |\n');
+    parts.push('|---|---:|---:|---:|---:|---:|---:|---:|\n');
     for (const m of runMeasurements) {
-        out += [
+        parts.push([
             markdownCell(m.source),
             m.paintsReceived ?? m.passesReceived ?? '',
             m.first_ms ?? '',
@@ -1847,17 +1847,17 @@ function buildMeasurementsMarkdown() {
             m.encode_ms ?? '',
             m.fileSizeKB ?? '',
             m.final_psnr_vs_source ?? ''
-        ].join(' | ');
-        out += '\n';
+        ].join(' | '));
+        parts.push('\n');
     }
 
     for (const m of runMeasurements) {
-        out += `\n## ${markdownCell(m.source)}\n\n`;
-        out += '| Pass | t ms | Final | alphaMin | alphaMax | alphaZeroPct | rgbNonzeroCount | lumaVariance | frameHash |\n';
-        out += '|---:|---:|---|---:|---:|---:|---:|---:|---|\n';
+        parts.push(`\n## ${markdownCell(m.source)}\n\n`);
+        parts.push('| Pass | t ms | Final | alphaMin | alphaMax | alphaZeroPct | rgbNonzeroCount | lumaVariance | frameHash |\n');
+        parts.push('|---:|---:|---|---:|---:|---:|---:|---:|---|\n');
         for (const p of m.perPass || []) {
             const stats = p.stats || {};
-            out += [
+            parts.push([
                 p.pass,
                 p.t_ms,
                 p.isFinal ? 'true' : 'false',
@@ -1867,11 +1867,11 @@ function buildMeasurementsMarkdown() {
                 stats.rgbNonzeroCount ?? '',
                 stats.lumaVariance ?? '',
                 markdownCell(stats.frameHash ?? '')
-            ].join(' | ');
-            out += '\n';
+            ].join(' | '));
+            parts.push('\n');
         }
     }
-    return out;
+    return parts.join('');
 }
 
 async function copyMeasurementsMarkdown() {
