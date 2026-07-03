@@ -405,6 +405,7 @@ async function startGallery(selectedFiles, { encodeOnTheFly = false } = {}) {
 
   // Build per-file row elements
   const stripEls = new Map(); // fileId → <div class="thumb-strip">
+  const cellMaps = new Map(); // fileId → Map<frameIndex, HTMLElement>
   for (const file of selectedFiles) {
     const fileId = slotId(file);
     const rowEl = document.createElement('div');
@@ -421,6 +422,7 @@ async function startGallery(selectedFiles, { encodeOnTheFly = false } = {}) {
     rowEl.append(labelEl, stripEl);
     galleryRowsEl.appendChild(rowEl);
     stripEls.set(fileId, stripEl);
+    cellMaps.set(fileId, new Map());
   }
 
   // round-robin coordinator controls when each frame becomes visible
@@ -486,15 +488,29 @@ async function startGallery(selectedFiles, { encodeOnTheFly = false } = {}) {
   }
 
   function syncStrip(stripEl, fileId, frames) {
-    const existing = new Map(
-      [...stripEl.querySelectorAll('.thumb-cell')].map(el => [+el.dataset.frameIndex, el])
-    );
+    if (!cellMaps.has(fileId)) {
+      cellMaps.set(fileId, new Map());
+    }
+    const cellMap = cellMaps.get(fileId);
+
+    const wantedIndices = new Set(frames.map(f => f.frameIndex));
+
+    // Remove cells no longer visible
+    for (const [idx, el] of cellMap) {
+      if (!wantedIndices.has(idx)) {
+        el.remove();
+        cellMap.delete(idx);
+      }
+    }
+
+    // Add or update cells
     for (const frame of frames) {
-      if (existing.has(frame.frameIndex)) {
-        updateThumbCell(existing.get(frame.frameIndex), frame);
+      if (cellMap.has(frame.frameIndex)) {
+        updateThumbCell(cellMap.get(frame.frameIndex), frame);
       } else {
         const cell = createThumbCell(fileId, frame);
         stripEl.appendChild(cell);
+        cellMap.set(frame.frameIndex, cell);
       }
     }
   }
