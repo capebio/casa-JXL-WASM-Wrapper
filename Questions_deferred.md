@@ -16,6 +16,19 @@
 >   AdjustQuantBias reschedule, chroma_from_luma micro-cleanups, RatioJPEG hoist +
 >   compressed_dc #6 (app-dead JPEG-recon paths), enc_modular subsampled alloc
 >   (app is 4:4:4) — see NOWIN-JUL02.
+>
+> **2026-07-03 batch-2 resolution** (branch feat/deferred-batch2-jul03-m8x4; detail in
+> `docs/implemented improvements.md` §2026-07-03 + `docs/1 rejected optimizations.md`
+> AQ-RIDERS/ENT-D1-DEFER/STALE-JUL03):
+> - **LANDED (video moonshots):** JE-8 square atlas (enc −41..61%, dec −25..42%, byte-parity
+>   batch/stream, v1 back-compat); JOLT rate control (per-GOP VBV → distance, spec §3.5);
+>   `packages/casv-web` browser playback (new package, 8 tests vs native).
+> - **LANDED (perf):** wasm128 downscale_rgba (+14.8..62.8%, pixel-exact); MHC demosaic
+>   AVX2 (+51..54%, bit-exact); decode-handler 4 CLAUDE.md test gaps.
+> - **REJECTED:** enc_aq #9 tile_distmap-reuse (negligible), #10 score/ScaleImage-gating
+>   (dead for butteraugli) — AQ-RIDERS.
+> - **DEFERRED w/ corrected design:** enc_entropy_coder D1 quantizer-emitted nonzero counts —
+>   filed placement wrong (TokenizeCoefficients runs per-pass on split output); ENT-D1-DEFER.
 
 ---
 
