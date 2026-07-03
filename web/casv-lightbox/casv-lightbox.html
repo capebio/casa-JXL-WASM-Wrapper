@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="icon" href="data:," />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CASAVA Video Lightbox</title>
+  <!-- Import map resolves the bare package specifiers to their built dist,
+       exactly like jxl-progressive-gallery.html. casv-web is added here. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "@casabio/jxl-core":           "../../packages/jxl-core/dist/index.js",
+      "@casabio/jxl-core/errors":    "../../packages/jxl-core/dist/errors.js",
+      "@casabio/jxl-core/protocol":  "../../packages/jxl-core/dist/protocol.js",
+      "@casabio/jxl-core/types":     "../../packages/jxl-core/dist/types.js",
+      "@casabio/jxl-wasm":           "../../packages/jxl-wasm/dist/index.js",
+      "@casabio/jxl-worker-browser": "../../packages/jxl-worker-browser/dist/index.js",
+      "@casabio/jxl-session":        "../../packages/jxl-session/dist/index.js",
+      "@casabio/jxl-scheduler":      "../../packages/jxl-scheduler/dist/index.js",
+      "@casabio/jxl-capabilities":   "../../packages/jxl-capabilities/dist/index.js",
+      "@casabio/jxl-policy":         "../../packages/jxl-policy/dist/index.js",
+      "@casabio/casv-web":           "../../packages/casv-web/dist/index.js"
+    }
+  }
+  </script>
+  <link rel="stylesheet" href="./casv-lightbox.css" />
+  <style>
+    body { margin: 0; background: #0c0d0a; color: #eef1e6;
+      font-family: system-ui, sans-serif; padding: 24px 16px 60px; }
+    .page { max-width: 1000px; margin: 0 auto; }
+    h1 { font-size: 1.5rem; margin: 0 0 4px; color: #cfe3c9; }
+    p.lede { color: #9aa694; font-size: .92rem; margin: 0 0 18px; max-width: 62ch; }
+    a { color: #6ba9e0; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>CASAVA Video Lightbox</h1>
+    <p class="lede">
+      Showcase and inspect CASAVA (<code>.casv</code>) citizen-science video —
+      JPEG&nbsp;XL intra frames plus JOLT REPLACE bbox/tile P-frames. Decode,
+      playback and export run in any browser; native encode and save-to-disk
+      light up in the desktop (Tauri) build. FableBraid (lossless) files show
+      metadata only in the browser — their braided-rANS codec is native-only.
+    </p>
+    <div id="root"></div>
+  </div>
+  <script type="module">
+    import { CasvLightbox } from './casv-lightbox.js';
+    const lb = new CasvLightbox(document.getElementById('root'));
+    lb.mount();
+    // Convenience: allow ?src=… to auto-load a same-origin .casv for demos.
+    const src = new URLSearchParams(location.search).get('src');
+    if (src) {
+      fetch(src).then(r => r.arrayBuffer())
+        .then(b => lb.loadBytes(new Uint8Array(b), src.split('/').pop()))
+        .catch(e => console.warn('auto-load failed:', e));
+    }
+    window.casvLightbox = lb;
+  </script>
+</body>
+</html>

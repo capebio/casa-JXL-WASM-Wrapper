@@ -1,0 +1,82 @@
+/* casv-lightbox — dark, JOSE-ish video lightbox. Self-contained. */
+.casv-lb {
+  --bg: #12140f; --panel: #1b1e17; --line: #2c3126; --ink: #eef1e6;
+  --muted: #9aa694; --leaf: #5c9e49; --green: #2b6b48; --sky: #3674b5;
+  --warn: #c98a2b; --err: #c0492f; --ok: #4e9a4e;
+  font-family: system-ui, sans-serif; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
+  padding: 12px; max-width: 1000px; margin: 0 auto; outline: none;
+}
+.casv-lb__bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.casv-lb__btn {
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 13px; font-size: .9rem; cursor: pointer;
+}
+.casv-lb__btn:hover:not(:disabled) { border-color: var(--leaf); }
+.casv-lb__btn:disabled { opacity: .45; cursor: not-allowed; }
+.casv-lb__btn--primary { background: var(--green); border-color: var(--green); }
+.casv-lb__btn--primary:hover:not(:disabled) { background: #327a53; }
+.casv-lb__host {
+  margin-left: auto; font-size: .78rem; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 20px; padding: 3px 11px;
+}
+.casv-lb__host[data-host="tauri"] { color: #cfe3c9; border-color: var(--green); }
+
+.casv-lb__stage {
+  background: repeating-conic-gradient(#0c0d0a 0% 25%, #16180f 0% 50%) 50% / 22px 22px;
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center; min-height: 240px;
+}
+.casv-lb__canvas { max-width: 100%; max-height: 68vh; display: block; image-rendering: auto; }
+
+.casv-lb__transport {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  margin-top: 10px; padding: 8px 4px;
+}
+.casv-lb__t {
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 6px; min-width: 38px; height: 34px; font-size: 1rem; cursor: pointer;
+}
+.casv-lb__t--play { min-width: 48px; background: var(--green); border-color: var(--green); }
+.casv-lb__t:disabled { opacity: .4; cursor: not-allowed; }
+.casv-lb__scrub { flex: 1; min-width: 140px; accent-color: var(--leaf); }
+.casv-lb__counter, .casv-lb__tc { font-variant-numeric: tabular-nums; font-size: .85rem; color: var(--muted); }
+.casv-lb__tc { min-width: 78px; }
+.casv-lb__kind {
+  font-size: .74rem; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line);
+  color: var(--muted);
+}
+.casv-lb__kind[data-kind="i"] { color: #cfe3c9; border-color: var(--green); }
+.casv-lb__kind[data-kind="p"] { color: #bcd3e8; border-color: var(--sky); }
+.casv-lb__speed, .casv-lb__loop { font-size: .82rem; color: var(--muted); display: flex; gap: 5px; align-items: center; }
+.casv-lb__speed select { background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 5px; padding: 3px; }
+
+.casv-lb__status {
+  min-height: 1.4em; font-size: .85rem; padding: 6px 4px; color: var(--muted);
+}
+.casv-lb__status[data-tone="ok"] { color: var(--ok); }
+.casv-lb__status[data-tone="warn"] { color: var(--warn); }
+.casv-lb__status[data-tone="error"] { color: var(--err); }
+
+.casv-lb__meta {
+  display: grid; grid-template-columns: max-content 1fr; gap: 3px 16px;
+  margin: 6px 0; padding: 10px 12px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; font-size: .84rem;
+}
+.casv-lb__meta dt { color: var(--muted); }
+.casv-lb__meta dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.casv-lb__encode {
+  margin-top: 12px; padding: 12px 14px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px;
+}
+.casv-lb__encode h3 { margin: 0 0 10px; font-size: 1rem; color: #cfe3c9; }
+.casv-lb__encode h3 small { color: var(--muted); font-weight: normal; }
+.casv-lb__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; }
+.casv-lb__grid label { display: flex; flex-direction: column; gap: 4px; font-size: .78rem; color: var(--muted); }
+.casv-lb__grid input, .casv-lb__grid select {
+  background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 5px; padding: 5px 7px; font-size: .86rem;
+}
+.casv-lb__encode-actions { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+.casv-lb__inputs { font-size: .8rem; color: var(--muted); }
