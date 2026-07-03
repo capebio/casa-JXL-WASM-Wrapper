@@ -15,13 +15,14 @@ Run: `epiccodereview/20260617T202430Z` (core decode chain, modelswitching)
 >
 > **2026-07-03 batch-2 resolution** (branch feat/deferred-batch2-jul03-m8x4; detail in
 > `docs/implemented improvements.md` §2026-07-03 + `docs/1 rejected optimizations.md`
-> AQ-RIDERS/ENT-D1-DEFER/STALE-JUL03):
+> AQ-RIDERS/ENT-D1/STALE-JUL03):
 > - **LANDED:** wasm128 downscale_rgba (+14.8..62.8%); MHC demosaic AVX2 (+51..54%,
 >   bit-exact); decode-handler 4 test gaps closed.
 > - **VIDEO MOONSHOTS LANDED:** JE-8 square atlas (enc −41..61%); JOLT rate control
 >   (target-bytes/VBV, spec §3.5); `packages/casv-web` browser playback.
-> - **REJECTED/DEFERRED:** enc_aq #9/#10 (dead/negligible, AQ-RIDERS); ENT-D1 filed
->   design wrong — deferred with corrected placement (ENT-D1-DEFER).
+> - **REJECTED:** enc_aq #9/#10 (dead/negligible, AQ-RIDERS); ENT-D1 quantizer-emitted
+>   nonzero counts — BUILT + byte-exact (7/7 cjxl SHA) but whole-encode −1.8..−3.4%
+>   (memory-bound wash); reverted+deleted (ENT-D1).
 > - **VERIFIED ALREADY RESOLVED:** WS2 A1-A5 protocol wiring, frame_stats zero-pad,
 >   WS4 C7 ref deep-copy, 012 node abort parity, GLUE-003 tiled-worker protocol,
 >   scheduler earlyCompleteSession (completeSession correct — worker self-stops).
