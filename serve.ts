@@ -492,5 +492,9 @@ serve({
     },
 });
 
+// Guard unhandled rejections from worker-based prewarm so the server stays up.
+process.on('unhandledRejection', (err) => {
+    console.warn('[serve] unhandled rejection (non-fatal):', err);
+});
 console.log(`Serving http://localhost:${PORT}`);
 warmUpCodec();
