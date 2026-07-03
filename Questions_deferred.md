@@ -16,19 +16,6 @@
 >   AdjustQuantBias reschedule, chroma_from_luma micro-cleanups, RatioJPEG hoist +
 >   compressed_dc #6 (app-dead JPEG-recon paths), enc_modular subsampled alloc
 >   (app is 4:4:4) — see NOWIN-JUL02.
->
-> **2026-07-03 batch-2 resolution** (branch feat/deferred-batch2-jul03-m8x4; detail in
-> `docs/implemented improvements.md` §2026-07-03 + `docs/1 rejected optimizations.md`
-> AQ-RIDERS/ENT-D1/STALE-JUL03):
-> - **LANDED (video moonshots):** JE-8 square atlas (enc −41..61%, dec −25..42%, byte-parity
->   batch/stream, v1 back-compat); JOLT rate control (per-GOP VBV → distance, spec §3.5);
->   `packages/casv-web` browser playback (new package, 8 tests vs native).
-> - **LANDED (perf):** wasm128 downscale_rgba (+14.8..62.8%, pixel-exact); MHC demosaic
->   AVX2 (+51..54%, bit-exact); decode-handler 4 CLAUDE.md test gaps.
-> - **REJECTED:** enc_aq #9 tile_distmap-reuse (negligible), #10 score/ScaleImage-gating
->   (dead for butteraugli) — AQ-RIDERS. enc_entropy_coder D1 quantizer-emitted nonzero
->   counts — BUILT + byte-exact (7/7 cjxl SHA) but whole-encode −1.8..−3.4% (memory-bound
->   count, hot→cold nets zero); reverted+deleted — ENT-D1.
 
 ---
 
@@ -1653,6 +1640,42 @@ its own gate before landing.
   (commutative) so apply can be patch-centric/row-skipping/parallel while emission stays delta-
   friendly. Byte-exact for output; changes internal scheduling only. Deferred (medium).
 
+### UPDATE 2026-07-03 — investigated the two "big video" items; DONE the one tractable piece
+Investigated (2 read-only Explore passes) the two items I'd predicted as order-of-magnitude video
+wins. Both are SMALLER or more BLOCKED than predicted — correcting the earlier over-optimism:
+
+- **Encoder-owned reconstruction (drop internal DecodeFrame): my "-30–50% roundtrip" was WRONG.**
+  The JXL encoder is not inter-predictive — it never computes decoder-exact float reconstruction;
+  `ModularFrameEncoder::stream_images_` (enc_modular.h:115) is transformed-domain integers freed
+  early by ReleaseImage. The XYB atlas is ALWAYS lossy (ModularPartIsLossless() false for XYB,
+  enc_params.h:127-139), so the lossy decode is genuinely required. Only the **lossless** atlas
+  case was a free win → **LANDED** (see below). Option B (retain stream_images_ + decoder
+  inverse-modular) would save only entropy-decode+header-parse (inverse transform still runs =
+  the bulk for a small atlas), adds decoder-logic drift hazard + a memory-lifetime change =
+  Med-risk/modest-reward → **still deferred**.
+- **Persistent inter-frame patch-atlas cache: architecturally BLOCKED + off-roadmap.** Decode-side
+  reference persistence exists (dec_frame.cc:933) but the ENCODER reference array is per-EncodeFrame
+  (enc_frame.cc:2073/2345, destroyed at return); the only cross-frame libjxl object (JxlEncoder)
+  holds no reference pixels. The native sequence path (crates/raw-pipeline/src/casa_video.rs, CASV/
+  JOLT) is Architecture-A = **independent codestreams** → cannot share a reference slot at all. The
+  design doc (docs/superpowers/specs/2026-07-01-jxl-video-codec-design.md:340-345,489-490) EXPLICITLY
+  parks multi-reference/background-modelling ("single previous frame is the best reference … not a
+  lever here"); chosen mechanism is Rust-side REPLACE-skip, not JXL slots. Re-evaluate ONLY if the
+  pipeline agent moves to single-codestream animation with save_as_reference. Slot-allocator
+  groundwork (replace kPatchFrameReferenceId=3 + encode.cc:1019 cap; kMaxNumReferenceFrames=4) is
+  mechanically easy but has NO consumer today → still deferred.
+
+- **DONE — lossless decode-skip (Item 2 Option A).** Branch `perf/enc-patch-lossless-decode-skip-
+  jul03-q2r8` @9d12b019 off sub main **2e5cb035** (capebio, PUSHED not-merged). RoundtripPatchFrame:
+  when `cparams.IsLossless()`, install the source ImageBundle directly and skip the encode->decode
+  round-trip (decoder reproduces it bit-for-bit); lossy + subtract==false paths untouched.
+  **A/B PROVEN** (native clang-cl static cjxl/djxl OLD-vs-NEW on a lossless screenshot with patches,
+  fixture tools/enc_patch_lossless_ab_gen.cc): bitstream byte-identical (SHA256), decoded pixels
+  identical OLD==NEW==original (lossless), branch-probe shows PATCH_LOSSLESS_SKIP taken and
+  PATCH_DECODE_PATH never → DecodeFrame on the patch atlas skipped (count 0), path exercised.
+  Removes a full frame decode per lossless patch-dictionary encode. App-cold for RAW; helps lossless
+  screenshot/UI encodes.
+
 ## enc_fast_lossless.cc — deferred candidates (jul01, from the seams pass)
 
 Byte-exact wins already landed on branch `perf/enc-fast-lossless-seams-jul01-f7k3`
@@ -1835,4 +1858,30 @@ strip-staging (peak-RSS unmeasurable in unit test), extra-channel completeness c
   predictor rows and emit active-area stripes directly to demosaic/JXL (kills the
   full-frame raw buffer for raster CR2s; multi-slice needs stripe-aware scheduling since
   the stream is slice-major). Research-grade; mirrors the ORF streaming-preview pipeline
+
+## EMU256 A/B — 2026-07-03 RESOLVED
+
+**Question:** Does `relaxed-simd-mt` (HWY_WASM_EMU256, 8-lane) produce byte-identical JXL vs
+`simd-mt` (4-lane)? Is the facade.ts `probeRelaxedSimd()` gate vestigial?
+
+**A/B results** (512×384 synthetic gradient, headless Chrome, `_emu256_ab.mjs`):
+
+Enc byte-exactness — **IDENTICAL at e3/5/7** (same SHA, same byte count both lanes).
+Lane-width reductions in enc_cluster/enc_adaptive_quantization are data-parallel only;
+no decision-making differs between 4-lane and 8-lane.
+
+Enc timing (median):
+- e3: relaxed 38ms / simd 37ms → within noise
+- e7: relaxed 165ms / simd 183ms → **relaxed-simd-mt +11% faster**
+
+Dec parity: tested with monolithic builds (not dec-only splits — those pthread-deadlock in
+`_jxl_wasm_decode_rgba8` in headless Chrome, likely a headless-pthread interaction, not a
+production issue). Monolithic SHA differed (different code paths in enc+dec combined builds;
+not a valid apples-to-apples decode comparison). Production decode uses session API, not
+C shim.
+
+**Decision:** Facade gate removed. `relaxed-simd-mt` is now the default threaded tier for
+ALL browsers with SAB+Worker (not just those passing `probeRelaxedSimd()`). The
+`assert-no-relaxed-simd.mjs` build gate enforces 0 relaxed opcodes in the artifact,
+making it safe on Firefox/Safari. Change landed in facade.ts + dist/facade.js.
   (decompress.rs q8z) which proved the pattern byte-exact there.

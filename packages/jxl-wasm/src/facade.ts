@@ -601,9 +601,10 @@ export function detectTier(): Tier {
         (typeof crossOriginIsolated === "undefined" || crossOriginIsolated === true);
       const hasWorker = typeof Worker !== "undefined";
       const hasThreads = hasSab && hasWorker;
-      const hasRelaxedSimd = probeRelaxedSimd();
-      if (hasThreads && hasRelaxedSimd) tier = "relaxed-simd-mt";
-      else if (hasThreads) tier = "simd-mt";
+      // relaxed-simd-mt is built with HWY_WANT_WASM2 (8-lane EMU256), NOT relaxed-SIMD opcodes.
+      // The build gate (assert-no-relaxed-simd.mjs) enforces 0 relaxed opcodes; enc SHA is
+      // byte-identical to simd-mt (A/B confirmed 2026-07-03). Safe on all browsers with SAB+Worker.
+      if (hasThreads) tier = "relaxed-simd-mt";
       else tier = "simd";
     }
   }
