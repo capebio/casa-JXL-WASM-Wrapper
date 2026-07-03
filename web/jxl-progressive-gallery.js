@@ -51,6 +51,7 @@ const CHUNK_SIZE = 65536; // 64 KiB per chunk
 // Keep this comfortably above the scheduler drain HWM so the worker can
 // actually consume enough bytes to emit drain on large codestreams.
 const WINDOW_SIZE = 32;
+const MAX_LOG_ENTRIES = 200;
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 
@@ -841,5 +842,8 @@ function log(msg, level = 'info') {
   if (level === 'error') line.style.color = '#f66';
   if (level === 'warn')  line.style.color = '#fa0';
   logEl.appendChild(line);
+  while (logEl.childElementCount > MAX_LOG_ENTRIES) {
+    logEl.firstElementChild.remove();
+  }
   logEl.scrollTop = logEl.scrollHeight;
 }
