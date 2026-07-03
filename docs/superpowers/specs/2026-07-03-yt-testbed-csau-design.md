@@ -1,4 +1,4 @@
-# yt-dlp Testbed + CSAU Audio — Design
+# Video Testbed + CSAU Audio — Design
 
 **Date:** 2026-07-03  
 **Status:** Approved — ready for implementation  
@@ -9,7 +9,7 @@
 
 ## 1. Goal, Constraints, Success Criteria
 
-**Goal:** Build a sweep harness that downloads a YouTube video via yt-dlp, encodes it in CASAVA format at every combination of quality × effort × dimension, and produces an HTML comparison report. Audio (Ogg/Opus via CSAU box) is included in every encode.
+**Goal:** Build a sweep harness that accepts YouTube URLs **or local video file paths**, encodes each in CASAVA format at every combination of quality × effort × dimension, and produces an HTML comparison report. Audio (Ogg/Opus via CSAU box) is included in every encode.
 
 **Constraints:**
 - `yt-dlp`, `ffmpeg`, and `casv_encode` must be on PATH.
@@ -18,13 +18,25 @@
 - Testbed is a developer tool, not user-facing — rough edges OK, no installer.
 - CSAU implementation is part of this spec (not a prior dependency).
 - Backward compat: existing `.casv` files without CSAU still play silently.
+- Local file paths must work on Windows (spaces in paths, backslash separators).
+
+**Input detection:**
+- Argument starts with `http://` or `https://` → YouTube mode (yt-dlp download).
+- Otherwise → local file mode (use path directly as source video; skip download).
+- Video ID for local files: basename without extension, sanitized (spaces → `_`, strip non-alphanumeric except `_-`).
+
+**Known test inputs:**
+- YouTube URL (any public video)
+- `C:\995\Videos Ghana\20260602122032_074957AA Explosives front.MP4`
+- `C:\995\2026-05-15 Timber Nigeria\videos\PXL_20260503_061731369 Timber Nigeria.mp4`
 
 **Success criteria:**
-1. `bun tools/yt-testbed.mjs <url>` → downloads, encodes 27 `.casv` files, writes `report.html`.
-2. Each `.casv` contains a CSAU box (verified by `casv-web` unit test).
-3. `report.html` opens in browser, shows frame grabs + file sizes + encode times in a grid.
-4. Existing `casv-web` tests still pass (backward compat).
-5. `casv_encode --video` with no audio track produces silent `.casv` (no crash).
+1. `bun tools/yt-testbed.mjs <url-or-path>` → encodes 27 `.casv` files, writes `report.html`.
+2. Local file paths with spaces work correctly (shell-quoting, no path errors).
+3. Each `.casv` contains a CSAU box when audio track present (verified by `casv-web` unit test).
+4. `report.html` opens in browser, shows frame grabs + file sizes + encode times in a grid.
+5. Existing `casv-web` tests still pass (backward compat).
+6. `casv_encode --video` with no audio track produces silent `.casv` (no crash).
 
 ---
 
@@ -50,7 +62,10 @@ Example: `abc123_d2_e1_dim256.casv`
 ## 3. CLI
 
 ```
-bun tools/yt-testbed.mjs <youtube-url> [options]
+bun tools/yt-testbed.mjs <url-or-path> [options]
+
+Positional:
+  <url-or-path>   YouTube URL (https://...) or local video file path
 
 Options:
   --out <dir>     Output directory (default: ./testbed-out)
@@ -59,6 +74,8 @@ Options:
 ```
 
 Dimension and quality/effort axes are not exposed as CLI flags — run the full sweep always. This keeps the report grid consistent across runs.
+
+**Multiple inputs:** Pass multiple positional args to sweep all in one run and produce a combined report. Each input gets its own subdirectory; the top-level `report.html` links to per-video reports.
 
 ---
 
@@ -92,17 +109,24 @@ Existing image-sequence form (`casv_encode <out> <fps_num> <fps_den> ...`) uncha
 
 ## 5. Pipeline (tools/yt-testbed.mjs)
 
-All output files live in `$out/<video-id>/`.
+All output files live in `$out/<video-id>/`. For multiple inputs, repeat steps 1–7 per input; write a top-level `$out/index.html` linking all per-video reports.
+
+**Input handling (step 2 detail):**
+- YouTube URL → `yt-dlp <url> -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "source.%(ext)s" -P workDir`; locate resulting file as `sourceFile`.
+- Local path → `sourceFile = path` (no copy; use directly). Video ID = `basename(path, ext)` with spaces→`_` and non-`[a-zA-Z0-9_-]` stripped.
 
 ```
-1. Parse args; workDir = $out/<video-id>/; mkdir -p workDir
-2. yt-dlp <url> -o source.%(ext)s -P workDir → workDir/source.mp4
-3. ffprobe: get fps (r_frame_rate), duration, width, height
+1. Parse args; for each input:
+   workDir = $out/<video-id>/; mkdir -p workDir
+2. If YouTube URL: yt-dlp download → workDir/source.{ext}; sourceFile = that path
+   If local path: sourceFile = input path (must exist)
+3. ffprobe sourceFile: get fps (r_frame_rate), duration, width, height
 4. For each (dim, d, e) in sweep:
    a. stem    = <id>_d<d>_e<e>_dim<dim>
    b. outFile = workDir/<stem>.casv
    c. t0 = Date.now()
-   d. spawn: casv_encode --video workDir/source.mp4 outFile 0 1 auto <d> <e> <gop> 0 0 auto <dim>
+   d. spawn: casv_encode --video <sourceFile> outFile 0 1 auto <d> <e> <gop> 0 0 auto <dim>
+      (quote sourceFile — may contain spaces)
    e. encMs = Date.now() - t0
    f. fileBytes = statSync(outFile).size
    g. record {dim, d, e, stem, encMs, fileBytes}
