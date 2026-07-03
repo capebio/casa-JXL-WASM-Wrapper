@@ -95,6 +95,13 @@ export interface DecoderOptions {
      */
     progressivePaintTarget?: number;
     /**
+     * Maximum progressive pixel frames to materialize, including the final frame.
+     * When set on a final-target decode, extra non-final flushes are still
+     * consumed from the bridge but skipped before JS copy/resize/transfer work.
+     * Undefined keeps existing behavior.
+     */
+    maxProgressiveFrames?: number;
+    /**
      * Allow progressive pausing for VarDCT images with alpha (or other extra
      * channels). libjxl disables progressive pausing whenever an extra channel is
      * present; this opt-in lifts that — intermediate flushes are valid and the
@@ -629,6 +636,7 @@ export interface DecodeViewportOptions {
     emitEveryPass?: boolean;
     progressiveDetail?: ProgressiveDetail;
     progressivePaintTarget?: number;
+    maxProgressiveFrames?: number;
 }
 export declare function decodeViewport(options: DecodeViewportOptions): JxlDecoder;
 export interface DecodeRegionLodOptions {

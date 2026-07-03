@@ -102,6 +102,13 @@ export interface DecoderOptions {
    */
   progressivePaintTarget?: number;
   /**
+   * Maximum progressive pixel frames to materialize, including the final frame.
+   * When set on a final-target decode, extra non-final flushes are still
+   * consumed from the bridge but skipped before JS copy/resize/transfer work.
+   * Undefined keeps existing behavior.
+   */
+  maxProgressiveFrames?: number;
+  /**
    * Allow progressive pausing for VarDCT images with alpha (or other extra
    * channels). libjxl disables progressive pausing whenever an extra channel is
    * present; this opt-in lifts that — intermediate flushes are valid and the
@@ -534,6 +541,13 @@ function resolveDecoderProgressiveDetail(options: DecoderOptions): 0 | 1 | 2 | 3
     default:
       return 1;
   }
+}
+
+function resolveProgressFrameBudget(options: DecoderOptions): number {
+  const maxFrames = options.maxProgressiveFrames;
+  if (maxFrames == null) return Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(maxFrames)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, Math.trunc(maxFrames) - 1);
 }
 
 function resolveEncoderBridgeSettings(options: EncoderOptions) {
@@ -1321,6 +1335,7 @@ export interface DecodeViewportOptions {
   emitEveryPass?: boolean;
   progressiveDetail?: ProgressiveDetail;
   progressivePaintTarget?: number;
+  maxProgressiveFrames?: number;
 }
 
 export function decodeViewport(options: DecodeViewportOptions): JxlDecoder {
@@ -1337,6 +1352,7 @@ export function decodeViewport(options: DecodeViewportOptions): JxlDecoder {
     fitMode: options.fitMode ?? null,
     ...(options.progressiveDetail !== undefined ? { progressiveDetail: options.progressiveDetail } : {}),
     ...(options.progressivePaintTarget !== undefined ? { progressivePaintTarget: options.progressivePaintTarget } : {}),
+    ...(options.maxProgressiveFrames !== undefined ? { maxProgressiveFrames: options.maxProgressiveFrames } : {}),
   });
 }
 
@@ -1550,6 +1566,8 @@ class LibjxlDecoder implements JxlDecoder {
       let progressiveSequence = 0;
       let progFramePrepMs = 0;
       let progFrameCount = 0;
+      const progressFrameBudget = resolveProgressFrameBudget(this.options);
+      let emittedProgressFrames = 0;
       // P0 probe (docs/Boundaries and Pipelines/traversal-report.md #2): isolate the
       // region-crop + downsample cost (a subset of take_frame_ms) and the resize cost
       // out of the aggregate prog_frame_prep_ms. Sizes the "move progressive crop to C++"
@@ -1718,7 +1736,12 @@ class LibjxlDecoder implements JxlDecoder {
           // Must still consume the WASM buffer handle to unblock the decoder.
           if (!this.options.emitEveryPass && this.options.progressionTarget === "final") {
             const h = decTakeFlushed(dec);
-            if (h !== 0) { retainBufferView(module, h, "decode").release(); }
+            if (h !== 0) module._jxl_wasm_buffer_free(h);
+            continue;
+          }
+          if (this.options.progressionTarget === "final" && emittedProgressFrames >= progressFrameBudget) {
+            const h = decTakeFlushed(dec);
+            if (h !== 0) module._jxl_wasm_buffer_free(h);
             continue;
           }
           const tFramePrep0 = performance.now();
@@ -1766,6 +1789,7 @@ class LibjxlDecoder implements JxlDecoder {
             };
             if (hasRegion) ev.regionFallback = "full-frame-then-crop";
             if (outPixels.region !== undefined) ev.region = outPixels.region;
+            emittedProgressFrames++;
             yield ev;
             if (this.options.progressionTarget !== "final" && !this.options.emitEveryPass) return;
           }

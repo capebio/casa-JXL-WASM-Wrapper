@@ -560,6 +560,32 @@ describe("@casabio/jxl-wasm facade", () => {
     await decoder.dispose();
   });
 
+  test("progressive frame budget consumes skipped flushes without materializing pixels", async () => {
+    const module = createFakeDrainingProgressiveLibjxlModule() as any;
+    let dataReads = 0;
+    const originalBufferData = module._jxl_wasm_buffer_data;
+    module._jxl_wasm_buffer_data = (handle: number) => {
+      dataReads++;
+      return originalBufferData(handle);
+    };
+    setJxlModuleFactoryForTesting(async () => module);
+
+    const decoder = createDecoder({
+      ...decodeOptions,
+      emitEveryPass: true,
+      maxProgressiveFrames: 2,
+    });
+    decoder.push(new Uint8Array([1, 2, 3, 4]).buffer);
+    decoder.close();
+
+    const events = [];
+    for await (const event of decoder.events()) events.push(event);
+
+    expect(events.map((event) => event.type)).toEqual(["header", "progress", "final"]);
+    expect(dataReads).toBe(2);
+    await decoder.dispose();
+  });
+
   test("progressive decoder copies flushed pixels before freeing WASM handle", async () => {
     setJxlModuleFactoryForTesting(async () => createFakeFreedViewProgressiveLibjxlModule());
 

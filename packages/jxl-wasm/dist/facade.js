@@ -53,6 +53,14 @@ function resolveDecoderProgressiveDetail(options) {
             return 1;
     }
 }
+function resolveProgressFrameBudget(options) {
+    const maxFrames = options.maxProgressiveFrames;
+    if (maxFrames == null)
+        return Number.POSITIVE_INFINITY;
+    if (!Number.isFinite(maxFrames))
+        return Number.POSITIVE_INFINITY;
+    return Math.max(0, Math.trunc(maxFrames) - 1);
+}
 function resolveEncoderBridgeSettings(options) {
     const groupOrder = options.groupOrder ?? 0;
     if (!options.progressive) {
@@ -100,8 +108,9 @@ export function detectTier() {
                 (typeof crossOriginIsolated === "undefined" || crossOriginIsolated === true);
             const hasWorker = typeof Worker !== "undefined";
             const hasThreads = hasSab && hasWorker;
-            // relaxed-simd-mt = HWY_WASM_EMU256 (8-lane), 0 relaxed opcodes (build-gated).
-            // Byte-identical enc output vs simd-mt (A/B 2026-07-03). Safe on all SAB+Worker browsers.
+            // relaxed-simd-mt is built with HWY_WANT_WASM2 (8-lane EMU256), NOT relaxed-SIMD opcodes.
+            // The build gate (assert-no-relaxed-simd.mjs) enforces 0 relaxed opcodes; enc SHA is
+            // byte-identical to simd-mt (A/B confirmed 2026-07-03). Safe on all browsers with SAB+Worker.
             if (hasThreads)
                 tier = "relaxed-simd-mt";
             else
@@ -739,6 +748,7 @@ export function decodeViewport(options) {
         fitMode: options.fitMode ?? null,
         ...(options.progressiveDetail !== undefined ? { progressiveDetail: options.progressiveDetail } : {}),
         ...(options.progressivePaintTarget !== undefined ? { progressivePaintTarget: options.progressivePaintTarget } : {}),
+        ...(options.maxProgressiveFrames !== undefined ? { maxProgressiveFrames: options.maxProgressiveFrames } : {}),
     });
 }
 export function decodeRegionLod(options) {
@@ -935,6 +945,8 @@ class LibjxlDecoder {
             let progressiveSequence = 0;
             let progFramePrepMs = 0;
             let progFrameCount = 0;
+            const progressFrameBudget = resolveProgressFrameBudget(this.options);
+            let emittedProgressFrames = 0;
             // P0 probe (docs/Boundaries and Pipelines/traversal-report.md #2): isolate the
             // region-crop + downsample cost (a subset of take_frame_ms) and the resize cost
             // out of the aggregate prog_frame_prep_ms. Sizes the "move progressive crop to C++"
@@ -1108,9 +1120,14 @@ class LibjxlDecoder {
                     // Must still consume the WASM buffer handle to unblock the decoder.
                     if (!this.options.emitEveryPass && this.options.progressionTarget === "final") {
                         const h = decTakeFlushed(dec);
-                        if (h !== 0) {
-                            retainBufferView(module, h, "decode").release();
-                        }
+                        if (h !== 0)
+                            module._jxl_wasm_buffer_free(h);
+                        continue;
+                    }
+                    if (this.options.progressionTarget === "final" && emittedProgressFrames >= progressFrameBudget) {
+                        const h = decTakeFlushed(dec);
+                        if (h !== 0)
+                            module._jxl_wasm_buffer_free(h);
                         continue;
                     }
                     const tFramePrep0 = performance.now();
@@ -1156,6 +1173,7 @@ class LibjxlDecoder {
                             ev.regionFallback = "full-frame-then-crop";
                         if (outPixels.region !== undefined)
                             ev.region = outPixels.region;
+                        emittedProgressFrames++;
                         yield ev;
                         if (this.options.progressionTarget !== "final" && !this.options.emitEveryPass)
                             return;
