@@ -26,7 +26,11 @@ function accumulateFull(data, expected) {
     let alphaZeroCount = 0;
     let rgbNonzeroCount = 0;
     let lumaSum = 0;
-    let lumaSqSum = 0;
+    // Welford online variance: M2/n = population variance.
+    // Eliminates float64 precision loss from lumaSqSum at >2MP.
+    let lumaM2 = 0;
+    let lumaMean = 0;
+    let lumaCount = 0;
     let hash = FNV_OFFSET;
 
     for (let i = 0; i < expected; i += 4) {
@@ -44,10 +48,13 @@ function accumulateFull(data, expected) {
         if (a === 0) alphaZeroCount++;
         const lumaInt = 54 * r + 183 * g + 18 * b;
         lumaSum += lumaInt;
-        lumaSqSum += lumaInt * lumaInt;
+        lumaCount++;
+        const delta = lumaInt - lumaMean;
+        lumaMean += delta / lumaCount;
+        lumaM2 += delta * (lumaInt - lumaMean);
     }
 
-    return { alphaMin, alphaMax, alphaZeroCount, rgbNonzeroCount, lumaSum, lumaSqSum, hash };
+    return { alphaMin, alphaMax, alphaZeroCount, rgbNonzeroCount, lumaSum, lumaM2, hash };
 }
 
 // Truncated path: zero-fill bytes past `limit` (matches original behaviour).
@@ -58,7 +65,9 @@ function accumulateTruncated(data, pixelCount, limit) {
     let alphaZeroCount = 0;
     let rgbNonzeroCount = 0;
     let lumaSum = 0;
-    let lumaSqSum = 0;
+    let lumaM2 = 0;
+    let lumaMean = 0;
+    let lumaCount = 0;
     let hash = FNV_OFFSET;
 
     let i = 0;
@@ -77,10 +86,13 @@ function accumulateTruncated(data, pixelCount, limit) {
         if (a === 0) alphaZeroCount++;
         const lumaInt = 54 * r + 183 * g + 18 * b;
         lumaSum += lumaInt;
-        lumaSqSum += lumaInt * lumaInt;
+        lumaCount++;
+        const delta = lumaInt - lumaMean;
+        lumaMean += delta / lumaCount;
+        lumaM2 += delta * (lumaInt - lumaMean);
     }
 
-    return { alphaMin, alphaMax, alphaZeroCount, rgbNonzeroCount, lumaSum, lumaSqSum, hash };
+    return { alphaMin, alphaMax, alphaZeroCount, rgbNonzeroCount, lumaSum, lumaM2, hash };
 }
 
 export function formatFrameHash(hash) {
@@ -144,8 +156,9 @@ export function analyzeProgressiveFrame(pixels, width, height) {
     }
 
     const meanInt = pixelCount ? raw.lumaSum / pixelCount : 0;
+    // Welford M2/n = population variance of lumaInt; same semantics as old E[X²]-E[X]².
     const lumaVariance = pixelCount
-        ? Math.max(0, (raw.lumaSqSum / pixelCount) - meanInt * meanInt) / 65536
+        ? Math.max(0, raw.lumaM2 / pixelCount) / 65536
         : 0;
 
     return {

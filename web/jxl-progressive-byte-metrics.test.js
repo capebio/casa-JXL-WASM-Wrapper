@@ -227,3 +227,14 @@ test('summarize handles null butter entries from adaptive skip without throwing'
   expect(s.firstPerceptuallyGoodBytes).toBe(3000);
   expect(() => s.butterMonotone).not.toThrow();
 });
+
+test('buildSeries always creates a measure entry (no orphan marks)', () => {
+  if (typeof performance?.getEntriesByType !== 'function') {
+    return; // skip if performance API not available
+  }
+  const before = performance.getEntriesByType('measure').filter(e => e.name === 'buildSeries').length;
+  // Empty matching arrays still fire mark+measure (loop skipped, finally always runs)
+  buildSeries(new Uint8Array(4), [], [], 1, 1);
+  const after = performance.getEntriesByType('measure').filter(e => e.name === 'buildSeries').length;
+  expect(after).toBe(before + 1);
+});

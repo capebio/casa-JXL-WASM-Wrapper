@@ -24,7 +24,8 @@ let lastSettings = null; // {quality, passes, detail, size, previewFirst, ...}
 let lastExportedJxls = []; // [{name, bytes: Uint8Array, settings}]
 
 // Structured measurement history (one entry per "Run Progressive Paint")
-const runMeasurements = [];
+const MAX_MEASUREMENTS = 200;
+let runMeasurements = [];
 
 // rAF coalescing state — one-slot pending frame queue; newer replaces older
 let pendingFrame = null;   // { pixels, info, t, passIdx, isFinal, _passes } — one-slot queue; newer replaces older
@@ -1374,7 +1375,7 @@ async function runProgressivePaintTest() {
                 final_psnr_vs_source: finalPsnrVsSource != null ? Number(finalPsnrVsSource.toFixed(2)) : null,
             };
             runMeasurements.push(measurement);
-            if (runMeasurements.length > 200) runMeasurements.splice(0, runMeasurements.length - 200);
+            if (runMeasurements.length > MAX_MEASUREMENTS) runMeasurements = runMeasurements.slice(-MAX_MEASUREMENTS);
 
             if (isLast) {
                 renderProgressiveComparison({
@@ -1833,7 +1834,7 @@ function markdownCell(value) {
     return String(value ?? '').replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
-function buildMeasurementsMarkdown() {
+export function buildMeasurementsMarkdown() {
     let out = '# Progressive Paint Measurements\n\n';
     out += '| Source | Paints | First ms | Final ms | One-shot ms | Encode ms | File KB | Final PSNR |\n';
     out += '|---|---:|---:|---:|---:|---:|---:|---:|\n';

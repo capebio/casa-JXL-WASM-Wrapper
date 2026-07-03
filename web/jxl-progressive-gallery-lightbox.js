@@ -26,19 +26,17 @@ export function createGalleryLightbox({ framesByFile }) {
       const cur = state.frameIndex;
       let fileChanged = false;
 
-      if (ev.ctrlKey && ev.key === 'ArrowRight') {
+      if (ev.ctrlKey && (ev.key === 'ArrowRight' || ev.key === 'ArrowLeft')) {
         const ids = [...framesByFile.keys()];
-        const nextFile = ids[(ids.indexOf(state.fileId) + 1) % ids.length];
-        const nextFrames = framesByFile.get(nextFile) ?? [];
-        const cap = Math.min(maxFrameIndexVisited, Math.max(0, nextFrames.length - 1));
-        state = { fileId: nextFile, frameIndex: cap };
-        fileChanged = true;
-        return { navigated: true, fileChanged, state };
-      }
+        const idx = ids.indexOf(state.fileId);
+        let nextFile;
 
-      if (ev.ctrlKey && ev.key === 'ArrowLeft') {
-        const ids = [...framesByFile.keys()];
-        const nextFile = ids[(ids.indexOf(state.fileId) - 1 + ids.length) % ids.length];
+        if (ev.key === 'ArrowRight') {
+          nextFile = ids[(idx + 1) % ids.length];
+        } else {
+          nextFile = ids[(idx - 1 + ids.length) % ids.length];
+        }
+
         const nextFrames = framesByFile.get(nextFile) ?? [];
         const cap = Math.min(maxFrameIndexVisited, Math.max(0, nextFrames.length - 1));
         state = { fileId: nextFile, frameIndex: cap };
