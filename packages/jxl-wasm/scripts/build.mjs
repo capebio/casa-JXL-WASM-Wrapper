@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
+import { scanWasmForRelaxedSimd, reportRelaxedSimdScan } from "./assert-no-relaxed-simd.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..");
@@ -271,6 +272,15 @@ async function main() {
       const tierKey = `${kind}:${tier.name}`;
       const linkOnlyExtras = getLinkOnlyExtras(tierFlags, exportsFile, { emitSymbolMap: sizeReportRequested });
       const wasmBytes = await validateWasmArtifact(outWasm, exportsFile, tierKey, { allowValidateOnly: tier.relaxedSimd });
+      if (tier.relaxedSimd) {
+        // -mrelaxed-simd only *permits* relaxed opcodes; Highway (HWY_WANT_WASM2, HWY_NATIVE_FMA=0)
+        // must not emit any today. A toolchain default change (ffp-contract / relaxed_madd lowering)
+        // would silently fuse mul+add, change float results, and break the byte-exactness gate.
+        // JXL_ALLOW_RELAXED_SIMD=1 downgrades to a warning (see assert-no-relaxed-simd.mjs).
+        if (!reportRelaxedSimdScan(outWasm, scanWasmForRelaxedSimd(wasmBytes))) {
+          throw new Error(`${tierKey}: relaxed-SIMD opcodes found in ${outWasm}; byte-exactness gate at risk`);
+        }
+      }
       const jsArtifact = await readArtifactMetadata(outJs);
       const wasmArtifact = readArtifactMetadataFromBytes(wasmBytes);
       manifest.tiers[tierKey] = {
