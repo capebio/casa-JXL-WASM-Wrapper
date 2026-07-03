@@ -30,7 +30,7 @@ src/lib.rs             (RAW pipeline: ORF/DNG → RGB8/16 pixel buffer)
 | `packages/jxl-stream/src/browser.ts` | fromReadableStream / fromResponse; one-ahead I/O prefetch |
 | `packages/jxl-cache/src/browser.ts` | OPFS + LRU; content-agnostic |
 
-Optimization scores: scheduler/decode-handler/facade/cache/stream/lib.rs/protocol = **5/5**; decode-session = **4/5**; web/jxl-progressive-\*.js = **3/5** (legacy, lower priority).
+Optimization scores: scheduler/decode-handler/facade/cache/stream/lib.rs/protocol = **5/5**; decode-session = **4/5**; web/main.js + web/jxl-progressive-\*.js = **5/5**.
 
 ## Layer Invariants — What Belongs Where
 
