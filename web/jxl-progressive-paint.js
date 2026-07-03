@@ -1835,11 +1835,11 @@ function markdownCell(value) {
 }
 
 export function buildMeasurementsMarkdown() {
-    const parts = ['# Progressive Paint Measurements\n\n'];
-    parts.push('| Source | Paints | First ms | Final ms | One-shot ms | Encode ms | File KB | Final PSNR |\n');
-    parts.push('|---|---:|---:|---:|---:|---:|---:|---:|\n');
+    let out = '# Progressive Paint Measurements\n\n';
+    out += '| Source | Paints | First ms | Final ms | One-shot ms | Encode ms | File KB | Final PSNR |\n';
+    out += '|---|---:|---:|---:|---:|---:|---:|---:|\n';
     for (const m of runMeasurements) {
-        parts.push([
+        out += [
             markdownCell(m.source),
             m.paintsReceived ?? m.passesReceived ?? '',
             m.first_ms ?? '',
@@ -1848,17 +1848,17 @@ export function buildMeasurementsMarkdown() {
             m.encode_ms ?? '',
             m.fileSizeKB ?? '',
             m.final_psnr_vs_source ?? ''
-        ].join(' | '));
-        parts.push('\n');
+        ].join(' | ');
+        out += '\n';
     }
 
     for (const m of runMeasurements) {
-        parts.push(`\n## ${markdownCell(m.source)}\n\n`);
-        parts.push('| Pass | t ms | Final | alphaMin | alphaMax | alphaZeroPct | rgbNonzeroCount | lumaVariance | frameHash |\n');
-        parts.push('|---:|---:|---|---:|---:|---:|---:|---:|---|\n');
+        out += `\n## ${markdownCell(m.source)}\n\n`;
+        out += '| Pass | t ms | Final | alphaMin | alphaMax | alphaZeroPct | rgbNonzeroCount | lumaVariance | frameHash |\n';
+        out += '|---:|---:|---|---:|---:|---:|---:|---:|---|\n';
         for (const p of m.perPass || []) {
             const stats = p.stats || {};
-            parts.push([
+            out += [
                 p.pass,
                 p.t_ms,
                 p.isFinal ? 'true' : 'false',
@@ -1868,11 +1868,11 @@ export function buildMeasurementsMarkdown() {
                 stats.rgbNonzeroCount ?? '',
                 stats.lumaVariance ?? '',
                 markdownCell(stats.frameHash ?? '')
-            ].join(' | '));
-            parts.push('\n');
+            ].join(' | ');
+            out += '\n';
         }
     }
-    return parts.join('');
+    return out;
 }
 
 async function copyMeasurementsMarkdown() {
