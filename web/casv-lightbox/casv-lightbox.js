@@ -171,6 +171,7 @@ export class CasvLightbox {
     if (this.reader.audio) {
       try {
         if (!this.audioCtx) this.audioCtx = new AudioContext();
+        if (this.gainNode) this.gainNode.disconnect();
         this.gainNode = this.audioCtx.createGain();
         this.gainNode.connect(this.audioCtx.destination);
         // decodeAudioData requires a detached ArrayBuffer — .slice() copies it.
@@ -251,6 +252,7 @@ export class CasvLightbox {
       this.audioSrc = this.audioCtx.createBufferSource();
       this.audioSrc.buffer = this.audioBuf;
       this.audioSrc.connect(this.gainNode);
+      if (this.audioCtx.state === 'suspended') this.audioCtx.resume();
       this.audioSrc.start(0, offset);
     }
   }
