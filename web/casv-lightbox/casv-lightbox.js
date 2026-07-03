@@ -42,6 +42,10 @@ export class CasvLightbox {
     this.loadedName = null;
     this.encodeInputs = [];    // picked image paths (Tauri)
     this.el = {};
+    this.audioCtx  = null;   // AudioContext
+    this.audioBuf  = null;   // AudioBuffer (decoded Ogg/Opus)
+    this.audioSrc  = null;   // current AudioBufferSourceNode
+    this.gainNode  = null;   // GainNode for volume
   }
 
   mount() {
@@ -53,7 +57,7 @@ export class CasvLightbox {
       canvas: $('canvas'), stage: $('stage'), status: $('status'),
       play: $('play'), prev: $('prev'), next: $('next'), first: $('first'), last: $('last'),
       scrub: $('scrub'), counter: $('counter'), tc: $('tc'),
-      speed: $('speed'), loop: $('loop'),
+      speed: $('speed'), loop: $('loop'), vol: $('vol'), volRange: $('volRange'),
       meta: $('meta'), kind: $('kind'),
       encodePanel: $('encodePanel'), preset: $('preset'),
       distance: $('distance'), effort: $('effort'), gop: $('gop'),
@@ -101,6 +105,11 @@ export class CasvLightbox {
     this.el.scrub.addEventListener('input', () => this._seek(Number(this.el.scrub.value)));
     this.el.speed.addEventListener('change', () => { this.speed = Number(this.el.speed.value); });
     this.el.loop.addEventListener('change', () => { this.loop = this.el.loop.checked; });
+    if (this.el.volRange) {
+      this.el.volRange.addEventListener('input', () => {
+        if (this.gainNode) this.gainNode.gain.value = Number(this.el.volRange.value);
+      });
+    }
     this.el.preset.addEventListener('change', () => this._applyPreset(this.el.preset.value));
     this.el.pickImages.addEventListener('click', () => this._onPickImages());
     this.el.encodeGo.addEventListener('click', () => this._onEncode());
@@ -155,6 +164,28 @@ export class CasvLightbox {
       if (this.frames.length === 0) return;
     }
     this.index = 0;
+
+    // Decode embedded Ogg/Opus audio (if CSAU box present).
+    this._stopAudio();
+    this.audioBuf = null;
+    if (this.reader.audio) {
+      try {
+        if (!this.audioCtx) this.audioCtx = new AudioContext();
+        this.gainNode = this.audioCtx.createGain();
+        this.gainNode.connect(this.audioCtx.destination);
+        // decodeAudioData requires a detached ArrayBuffer — .slice() copies it.
+        const ab = this.reader.audio.bytes.buffer.slice(
+          this.reader.audio.bytes.byteOffset,
+          this.reader.audio.bytes.byteOffset + this.reader.audio.bytes.byteLength
+        );
+        this.audioBuf = await this.audioCtx.decodeAudioData(ab);
+      } catch (e) {
+        console.warn('casv-lightbox: audio decode failed:', e);
+        this.audioBuf = null;
+      }
+    }
+    if (this.el.vol) this.el.vol.style.display = this.audioBuf ? '' : 'none';
+
     this._sizeCanvas();
     this._renderMeta();
     this._renderControls();
@@ -213,9 +244,19 @@ export class CasvLightbox {
       this.rafId = requestAnimationFrame(step);
     };
     this.rafId = requestAnimationFrame(step);
+
+    // Start audio at the position corresponding to the current frame.
+    if (this.audioBuf && this.audioCtx && this.gainNode) {
+      const offset = Math.max(0, this.index / fps);
+      this.audioSrc = this.audioCtx.createBufferSource();
+      this.audioSrc.buffer = this.audioBuf;
+      this.audioSrc.connect(this.gainNode);
+      this.audioSrc.start(0, offset);
+    }
   }
 
   _pause() {
+    this._stopAudio();
     this.playing = false;
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.rafId = 0;
@@ -223,7 +264,14 @@ export class CasvLightbox {
   }
 
   _step(d) { this._pause(); this._render(this.index + d); }
-  _seek(i) { this._pause(); this._render(i); }
+  _seek(i) { this._stopAudio(); this._pause(); this._render(i); }
+
+  _stopAudio() {
+    if (this.audioSrc) {
+      try { this.audioSrc.stop(); } catch (_) {}
+      this.audioSrc = null;
+    }
+  }
 
   _onKey(e) {
     if (!this.frames.length) return;
@@ -241,6 +289,7 @@ export class CasvLightbox {
     }
     this.el.export.disabled = !this.loadedBytes;
     if (this.el.scrub) this.el.scrub.max = String(Math.max(0, this.frames.length - 1));
+    if (this.el.vol) this.el.vol.style.display = this.audioBuf ? '' : 'none';
   }
 
   _renderMeta() {
@@ -374,6 +423,9 @@ const TEMPLATE = `
     </select>
   </label>
   <label class="casv-lb__loop"><input data-el="loop" type="checkbox" checked> Loop</label>
+  <label class="casv-lb__vol" style="display:none" data-el="vol">Vol
+    <input data-el="volRange" type="range" min="0" max="1" step="0.05" value="1">
+  </label>
 </div>
 
 <div class="casv-lb__status" data-el="status"></div>
