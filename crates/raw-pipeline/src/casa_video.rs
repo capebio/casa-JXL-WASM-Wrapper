@@ -73,6 +73,21 @@ pub const CASV_HDR_FABLE_FLAG: u32 = 0x0000_0002;
 const CASV_FLAG_BITS: u32 =
     CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG;
 
+/// JE-8: high bit of the tile payload's leading `tile_size` u16 selects the v2
+/// **square atlas** layout (changed tiles packed into a ceil(sqrt(n))-column
+/// grid) instead of the v1 t-wide sliver. Tile sizes are far below 0x8000, so
+/// the bit is free; v1 payloads (bit clear) keep decoding unchanged.
+pub const CASV_TILE_V2_BIT: u16 = 0x8000;
+
+/// v2 atlas grid for `n` changed tiles: ~square, ceil(sqrt(n)) columns.
+#[inline]
+fn atlas_grid_v2(n: usize) -> (usize, usize) {
+    debug_assert!(n > 0);
+    let cols = (n as f64).sqrt().ceil() as usize;
+    let rows = n.div_ceil(cols);
+    (cols, rows)
+}
+
 // ── JOLT rate metadata (CasvHeader.flags layout) ──────────────────────────────
 // JOLT (JXL-Optimized Lossy Transport) is the lossy streaming profile of CASV.
 // The header `flags` word — previously always 0 — carries the rate signal so a
@@ -525,7 +540,12 @@ fn encode_stream_frame(
         let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
         ctx.changed.clear();
         ctx.changed.extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
-        payload.extend_from_slice(&(t as u16).to_le_bytes());
+        // JE-8: square-atlas (v2) layout, signalled by the tile-size high bit.
+        // The old t-wide sliver atlas (one t×t slot per row) is the shape that
+        // made multi-threaded encode SLOWER (CV-E6: 32px-wide strips starve
+        // libjxl's 256px group parallelism and its 2-D context modelling); a
+        // ~square atlas of ceil(sqrt(n)) columns fixes both.
+        payload.extend_from_slice(&((t as u16) | CASV_TILE_V2_BIT).to_le_bytes());
         let bitmap_len = map.len().div_ceil(8);
         ctx.bitmap.clear();
         ctx.bitmap.resize(bitmap_len, 0);
@@ -534,24 +554,27 @@ fn encode_stream_frame(
         }
         payload.extend_from_slice(&ctx.bitmap);
         if !ctx.changed.is_empty() {
-            // Zero-filled from empty every frame: edge-tile padding bytes are
-            // load-bearing (they are encoded), so a reused buffer must never
-            // leak a previous frame's pixels into the padding.
+            let (cols, rows) = atlas_grid_v2(ctx.changed.len());
+            let (aw, ah) = (cols * ts, rows * ts);
+            // Zero-filled from empty every frame: edge-tile padding bytes and
+            // trailing empty slots are load-bearing (they are encoded), so a
+            // reused buffer must never leak a previous frame's pixels.
             ctx.atlas.clear();
-            ctx.atlas.resize(ts * ts * 3 * ctx.changed.len(), 0);
+            ctx.atlas.resize(aw * ah * 3, 0);
             for (slot, &i) in ctx.changed.iter().enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(wus - tx * ts);
                 let bh = ts.min(height as usize - ty * ts);
+                let (sx, sy) = (slot % cols, slot / cols);
                 for row in 0..bh {
                     let s = ((ty * ts + row) * wus + tx * ts) * 3;
-                    let d = ((slot * ts + row) * ts) * 3;
+                    let d = ((sy * ts + row) * aw + sx * ts) * 3;
                     ctx.atlas[d..d + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
                 }
             }
-            let ah = t * ctx.changed.len() as u32;
-            ctx.enc.encode_into(&Frame::rgb(ctx.atlas.as_slice(), t, ah), payload)?;
+            ctx.enc
+                .encode_into(&Frame::rgb(ctx.atlas.as_slice(), aw as u32, ah as u32), payload)?;
         }
         return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
     }
@@ -1039,7 +1062,9 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
                 map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
 
             let mut payload = Vec::new();
-            payload.extend_from_slice(&(t as u16).to_le_bytes());
+            // JE-8: square-atlas v2 (see encode_stream_frame — layouts must stay
+            // byte-identical between the batch and streaming paths).
+            payload.extend_from_slice(&((t as u16) | CASV_TILE_V2_BIT).to_le_bytes());
             let bitmap_len = map.len().div_ceil(8);
             let mut bitmap = vec![0u8; bitmap_len];
             for &i in &changed {
@@ -1048,20 +1073,24 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
             payload.extend_from_slice(&bitmap);
 
             if !changed.is_empty() {
-                // atlas of FRESH pixels (not residuals), zero-padded edge tiles.
-                let mut atlas = vec![0u8; ts * ts * 3 * changed.len()];
+                // atlas of FRESH pixels (not residuals), zero-padded edge tiles
+                // + trailing empty slots.
+                let (cols, rows) = atlas_grid_v2(changed.len());
+                let (aw, ah) = (cols * ts, rows * ts);
+                let mut atlas = vec![0u8; aw * ah * 3];
                 for (slot, &i) in changed.iter().enumerate() {
                     let tx = (i as u32 % txn) as usize;
                     let ty = (i as u32 / txn) as usize;
                     let bw = ts.min(w - tx * ts);
                     let bh = ts.min(height as usize - ty * ts);
+                    let (sx, sy) = (slot % cols, slot / cols);
                     for row in 0..bh {
                         let src = ((ty * ts + row) * w + tx * ts) * 3;
-                        let dst = ((slot * ts + row) * ts) * 3;
+                        let dst = ((sy * ts + row) * aw + sx * ts) * 3;
                         atlas[dst..dst + bw * 3].copy_from_slice(&px[src..src + bw * 3]);
                     }
                 }
-                let jxl = encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone())?;
+                let jxl = encode_rgb8(&atlas, aw as u32, ah as u32, opts.clone())?;
                 payload.extend_from_slice(&jxl);
             }
             Ok((CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG, payload))
@@ -1645,7 +1674,10 @@ fn apply_pframe(
         if slice.len() < 2 {
             return None;
         }
-        let t = u16::from_le_bytes(slice[0..2].try_into().unwrap()) as u32;
+        let t_field = u16::from_le_bytes(slice[0..2].try_into().unwrap());
+        // JE-8: high bit selects the v2 square-atlas layout.
+        let v2 = t_field & CASV_TILE_V2_BIT != 0;
+        let t = (t_field & !CASV_TILE_V2_BIT) as u32;
         if t == 0 {
             return None;
         }
@@ -1667,22 +1699,31 @@ fn apply_pframe(
         if is_replace {
             // lossy tier: atlas holds fresh pixels — replace each tile.
             let (aw, ah) = sess.decode_u8(&slice[2 + bitmap_len..])?;
-            if aw != t || ah != t * changed_count as u32 {
+            // Atlas geometry: v2 = ceil(sqrt(n)) columns; v1 = one-column sliver.
+            let (cols, rows) = if v2 { atlas_grid_v2(changed_count) } else { (1, changed_count) };
+            if aw != (cols * ts) as u32 || ah != (rows * ts) as u32 {
                 return None;
             }
+            let awus = aw as usize;
             let atlas = &sess.px8;
             for (slot, i) in (0..n).filter(|&i| tile_set(i)).enumerate() {
                 let tx = (i as u32 % txn) as usize;
                 let ty = (i as u32 / txn) as usize;
                 let bw = ts.min(w - tx * ts);
                 let bh = ts.min(height as usize - ty * ts);
+                let (sx, sy) = (slot % cols, slot / cols);
                 for row in 0..bh {
                     let d = ((ty * ts + row) * w + tx * ts) * 3;
-                    let s = ((slot * ts + row) * ts) * 3;
+                    let s = ((sy * ts + row) * awus + sx * ts) * 3;
                     prev[d..d + bw * 3].copy_from_slice(&atlas[s..s + bw * 3]);
                 }
             }
             return Some(());
+        }
+        if v2 {
+            // v2 exists only on the lossy REPLACE tier; a residual payload
+            // claiming v2 is malformed.
+            return None;
         }
         let (aw, ah) = sess.decode_u16(&slice[2 + bitmap_len..])?;
         if aw != t || ah != t * changed_count as u32 {
@@ -2390,6 +2431,113 @@ mod tests {
         }
         let (px8, _, _) = decode_casv_frame_rgb8(&bytes, 8).unwrap();
         assert_eq!(px8, src[8]);
+    }
+
+    /// JE-8 back-compat: a hand-built v1 sliver-atlas REPLACE payload (tile_size
+    /// high bit clear) must still decode — the v2 square atlas is opt-in via the
+    /// bit, not a breaking change.
+    #[test]
+    fn v1_sliver_tile_payload_still_decodes() {
+        let (w, h) = (64u32, 64u32);
+        let t = 16u32;
+        let f0 = gradient(w, h, 0);
+        let mut f1 = f0.clone();
+        // Mutate tiles 5 (tx=1,ty=1) and 10 (tx=2,ty=2) of the 4×4 grid.
+        let changed = [5usize, 10usize];
+        for &i in &changed {
+            let (tx, ty) = (i % 4, i / 4);
+            for row in 0..16 {
+                for col in 0..16 {
+                    let o = ((ty * 16 + row) * 64 + tx * 16 + col) * 3;
+                    f1[o] = 255 - f1[o];
+                }
+            }
+        }
+
+        let iframe = encode_rgb8(&f0, w, h, EncodeOptions::distance(1.0)).unwrap();
+
+        // v1 payload: [t u16, bit clear][bitmap][16-wide sliver atlas].
+        let mut p = Vec::new();
+        p.extend_from_slice(&(t as u16).to_le_bytes());
+        let mut bitmap = [0u8; 2];
+        for &i in &changed {
+            bitmap[i / 8] |= 1 << (i % 8);
+        }
+        p.extend_from_slice(&bitmap);
+        let mut atlas = vec![0u8; 16 * 16 * 3 * changed.len()];
+        for (slot, &i) in changed.iter().enumerate() {
+            let (tx, ty) = (i % 4, i / 4);
+            for row in 0..16 {
+                let s = ((ty * 16 + row) * 64 + tx * 16) * 3;
+                let d = ((slot * 16 + row) * 16) * 3;
+                atlas[d..d + 48].copy_from_slice(&f1[s..s + 48]);
+            }
+        }
+        let atlas_jxl = encode_rgb8(&atlas, 16, 32, EncodeOptions::distance(1.0)).unwrap();
+        p.extend_from_slice(&atlas_jxl);
+
+        // Assemble a 2-frame container by hand.
+        let header = CasvHeader { width: w, height: h, frame_count: 2, fps_num: 24, fps_den: 1, flags: 0 };
+        let data_start = CASV_HEADER_BYTES + 2 * CASV_INDEX_ENTRY_BYTES;
+        let mut file = Vec::new();
+        file.extend_from_slice(&build_casv_header(&header));
+        file.extend_from_slice(&(data_start as u32).to_le_bytes());
+        file.extend_from_slice(&(iframe.len() as u32).to_le_bytes());
+        file.extend_from_slice(&((data_start + iframe.len()) as u32).to_le_bytes());
+        file.extend_from_slice(
+            &((p.len() as u32) | CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG).to_le_bytes(),
+        );
+        file.extend_from_slice(&iframe);
+        file.extend_from_slice(&p);
+
+        let out = decode_casv_all_rgb8(&file).expect("v1 payload decodes");
+        assert_eq!(out.len(), 2);
+        let (d0, d1) = (&out[0].0, &out[1].0);
+        // Changed tiles ≈ f1 (lossy); unchanged pixels identical to frame 0's decode.
+        let mut err_sum = 0f64;
+        let mut err_n = 0usize;
+        for row in 0..64usize {
+            for col in 0..64usize {
+                let i = (row / 16) * 4 + col / 16;
+                let o = (row * 64 + col) * 3;
+                if changed.contains(&i) {
+                    for c in 0..3 {
+                        err_sum += (d1[o + c] as i32 - f1[o + c] as i32).unsigned_abs() as f64;
+                        err_n += 3;
+                    }
+                } else {
+                    assert_eq!(&d1[o..o + 3], &d0[o..o + 3], "unchanged px ({col},{row})");
+                }
+            }
+        }
+        let mean_err = err_sum / err_n as f64;
+        assert!(mean_err < 8.0, "changed-tile mean err too high: {mean_err}");
+    }
+
+    /// JE-8: the v2 payload signals the high bit and carries a ~square atlas
+    /// (ceil(sqrt(n)) columns), not the t-wide sliver.
+    #[test]
+    fn v2_tile_payload_atlas_is_square() {
+        let (w, h) = (64u32, 64u32);
+        let src = two_region_motion(w, h, 2);
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_delta_lossy_tiled_rgb8(
+            &refs, w, h, 24, 1, 8, 16, EncodeOptions::distance(1.0), 0,
+        )
+        .unwrap();
+        let slice = casv_frame_slice(&bytes, 1).unwrap();
+        let t_field = u16::from_le_bytes(slice[0..2].try_into().unwrap());
+        assert_ne!(t_field & CASV_TILE_V2_BIT, 0, "v2 bit set");
+        let t = (t_field & !CASV_TILE_V2_BIT) as u32;
+        assert_eq!(t, 16);
+        let bitmap = &slice[2..4]; // 16 tiles -> 2 bytes
+        let cc = bitmap.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+        assert!(cc > 1, "test needs multiple changed tiles, got {cc}");
+        let (cols, rows) = atlas_grid_v2(cc);
+        let (apx, aw, ah) =
+            crate::jxl_casadecoder::decode_interleaved::<u8>(&slice[4..], 3).expect("atlas decodes");
+        assert_eq!((aw, ah), ((cols as u32) * t, (rows as u32) * t), "square grid dims");
+        assert_eq!(apx.len(), (aw * ah * 3) as usize);
     }
 
     // The lossy tier: fresh-pixel REPLACE skip. Unlike the residual approach (which
