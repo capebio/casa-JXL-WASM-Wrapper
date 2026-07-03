@@ -279,6 +279,36 @@ pub enum VideoRate {
     Lossy(f32),
 }
 
+/// JOLT rate control (spec §3.5, feedback form): a per-GOP leaky-bucket (VBV)
+/// controller that adjusts the encode distance toward a byte-rate target.
+///
+/// JXL is quality-targeted; this thin outer loop makes the streaming encoders
+/// bitrate-targeted. Implementation note vs the spec: instead of a per-GOP
+/// 1-D *search* with probe encodes (extra encode work per GOP), the controller
+/// uses closed-loop feedback — measured bytes of the finished GOP steer the
+/// next GOP's distance (damped multiplicative update) with a VBV term that
+/// corrects accumulated over/undershoot. Converges within a few GOPs at zero
+/// probe cost; the initial `VideoRate::Lossy(d)` is the starting distance.
+#[derive(Clone, Copy, Debug)]
+pub struct RateControl {
+    /// Target encoded bytes per second (bitrate / 8).
+    pub target_bytes_per_sec: u32,
+    /// Quality ceiling: distance never drops below this (bits stop improving).
+    pub min_distance: f32,
+    /// Quality floor: distance never rises above this (rate may overshoot).
+    pub max_distance: f32,
+    /// Leaky-bucket capacity in seconds of target rate (burst tolerance).
+    pub vbv_seconds: f32,
+}
+
+impl RateControl {
+    /// A sensible default envelope for a byte-rate target: distance free to
+    /// move in [0.3, 8.0], 2-second VBV.
+    pub fn targeting(target_bytes_per_sec: u32) -> Self {
+        RateControl { target_bytes_per_sec, min_distance: 0.3, max_distance: 8.0, vbv_seconds: 2.0 }
+    }
+}
+
 /// One coherent knob-set for [`encode_casv_video`].
 #[derive(Clone, Copy, Debug)]
 pub struct CasaVideoOptions {
@@ -294,6 +324,10 @@ pub struct CasaVideoOptions {
     /// Change-detection threshold; `None` = auto from the lossy distance
     /// ([`default_thresh_for_distance`]). Lossless skipping is always exact.
     pub thresh: Option<u8>,
+    /// Optional bitrate targeting for the STREAMING lossy encoders
+    /// ([`encode_casv_video_streaming`] / [`encode_casv_video_streaming_to`]).
+    /// `None` = fixed distance (the batch encoders ignore this field).
+    pub rate_control: Option<RateControl>,
 }
 
 impl Default for CasaVideoOptions {
@@ -305,11 +339,19 @@ impl Default for CasaVideoOptions {
 impl CasaVideoOptions {
     /// Byte-exact archival: lossless, bbox skip, GOP 24.
     pub fn lossless_archive() -> Self {
-        CasaVideoOptions { rate: VideoRate::Lossless, gop_len: 24, skip: SkipMode::Bbox, tile: 32, effort: 3, thresh: Some(0) }
+        CasaVideoOptions { rate: VideoRate::Lossless, gop_len: 24, skip: SkipMode::Bbox, tile: 32, effort: 3, thresh: Some(0), rate_control: None }
     }
     /// Streaming: lossy at `distance`, tile replace-skip, GOP 24, auto threshold.
     pub fn streaming(distance: f32) -> Self {
-        CasaVideoOptions { rate: VideoRate::Lossy(distance), gop_len: 24, skip: SkipMode::Tile, tile: 32, effort: 3, thresh: None }
+        CasaVideoOptions { rate: VideoRate::Lossy(distance), gop_len: 24, skip: SkipMode::Tile, tile: 32, effort: 3, thresh: None, rate_control: None }
+    }
+    /// Bitrate-targeted streaming (JOLT rate control): starts at `distance`
+    /// and steers toward `target_bytes_per_sec` per GOP. See [`RateControl`].
+    pub fn streaming_bitrate(start_distance: f32, target_bytes_per_sec: u32) -> Self {
+        CasaVideoOptions {
+            rate_control: Some(RateControl::targeting(target_bytes_per_sec)),
+            ..Self::streaming(start_distance)
+        }
     }
     /// JOLT preset → options. See [`JoltPreset`].
     pub fn jolt(preset: JoltPreset) -> Self {
@@ -323,6 +365,7 @@ impl CasaVideoOptions {
                 tile: 32,
                 effort: 1,
                 thresh: None,
+                rate_control: None,
             },
             // The measured sweet spot of the lossy tier (d1.0/e3, tile skip)
             // — same as `streaming(1.0)`.
@@ -336,6 +379,7 @@ impl CasaVideoOptions {
                 tile: 32,
                 effort: 4,
                 thresh: None,
+                rate_control: None,
             },
         }
     }
@@ -513,6 +557,76 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
     })
 }
 
+impl StreamCtx {
+    /// Rate-control hook: retarget the encoder to a new distance at a GOP
+    /// boundary. Rebuilds the reused Encoder handle (cheap: JxlEncoderCreate is
+    /// malloc + struct init) and re-derives the auto change threshold so
+    /// detection stays matched to the quantization error.
+    fn set_distance(&mut self, d: f32, opts: &CasaVideoOptions) -> Result<(), VideoError> {
+        if d == self.distance {
+            return Ok(());
+        }
+        self.distance = d;
+        self.enc = Encoder::new(EncodeOptions::distance(d).with_effort(opts.effort))?;
+        if opts.thresh.is_none() {
+            self.thresh = default_thresh_for_distance(d);
+        }
+        Ok(())
+    }
+}
+
+/// Leaky-bucket rate controller state (see [`RateControl`]).
+struct RateState {
+    ctrl: RateControl,
+    /// Target bytes per frame (target_bytes_per_sec × fps_den / fps_num).
+    frame_budget: f64,
+    /// Bucket capacity in bytes (target rate × vbv_seconds).
+    cap: f64,
+    /// Signed fullness: positive = under budget (credit), negative = debt.
+    bucket: f64,
+    gop_bytes: f64,
+    gop_frames: u32,
+}
+
+impl RateState {
+    fn new(ctrl: RateControl, fps_num: u32, fps_den: u32) -> Self {
+        let fps = fps_num.max(1) as f64 / fps_den.max(1) as f64;
+        let frame_budget = ctrl.target_bytes_per_sec as f64 / fps;
+        RateState {
+            ctrl,
+            frame_budget,
+            cap: (ctrl.target_bytes_per_sec as f64 * ctrl.vbv_seconds as f64).max(frame_budget),
+            bucket: 0.0,
+            gop_bytes: 0.0,
+            gop_frames: 0,
+        }
+    }
+
+    /// Account one encoded frame's bytes.
+    fn on_frame(&mut self, bytes: usize) {
+        self.bucket = (self.bucket + self.frame_budget - bytes as f64).clamp(-self.cap, self.cap);
+        self.gop_bytes += bytes as f64;
+        self.gop_frames += 1;
+    }
+
+    /// Distance for the next GOP, from the finished GOP's measured rate plus
+    /// the VBV term. Damped multiplicative update: distance ∝ size is roughly
+    /// inverse-monotone, so ratio^0.5 halves the log-domain step; the bucket
+    /// term (±50% at full debt/credit) corrects accumulated drift.
+    fn next_gop_distance(&mut self, cur: f32) -> f32 {
+        if self.gop_frames == 0 {
+            return cur;
+        }
+        let actual_per_frame = self.gop_bytes / self.gop_frames as f64;
+        let ratio = (actual_per_frame / self.frame_budget).max(1e-6);
+        let mut d = cur as f64 * ratio.sqrt();
+        d *= 1.0 - 0.5 * (self.bucket / self.cap);
+        self.gop_bytes = 0.0;
+        self.gop_frames = 0;
+        d.clamp(self.ctrl.min_distance as f64, self.ctrl.max_distance as f64) as f32
+    }
+}
+
 /// Encode one streaming frame into `payload` (cleared by the caller). I-frame via
 /// the chunked constant-peak encoder, P-frame via bbox/tile replace-skip. Returns
 /// the index flag bits. Shared by the buffered and stream-to-sink encoders.
@@ -623,6 +737,7 @@ pub fn encode_casv_video_streaming(
     let mut prev_src: Vec<u8> = Vec::new();
     let mut idx = 0usize;
     let mut payload = Vec::new();
+    let mut rc = opts.rate_control.map(|c| RateState::new(c, fps_num, fps_den));
 
     loop {
         std::mem::swap(&mut cur, &mut prev_src);
@@ -632,8 +747,18 @@ pub fn encode_casv_video_streaming(
         if cur.len() != expected {
             return Err(VideoError::FrameSize { idx, expected, got: cur.len() });
         }
+        let is_iframe = idx % gop == 0;
+        if is_iframe && idx > 0 {
+            if let Some(rc) = rc.as_mut() {
+                let d = rc.next_gop_distance(ctx.distance);
+                ctx.set_distance(d, opts)?;
+            }
+        }
         payload.clear();
-        let flags = encode_stream_frame(&cur, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
+        let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
+        if let Some(rc) = rc.as_mut() {
+            rc.on_frame(payload.len());
+        }
         index.push((flags, payload.len() as u32));
         data.extend_from_slice(&payload);
         idx += 1;
@@ -686,6 +811,7 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
     let mut idx = 0usize;
     let mut offset: u64 = 0;
     let mut payload = Vec::new();
+    let mut rc = opts.rate_control.map(|c| RateState::new(c, fps_num, fps_den));
 
     loop {
         std::mem::swap(&mut cur, &mut prev_src);
@@ -695,8 +821,18 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
         if cur.len() != expected {
             return Err(VideoError::FrameSize { idx, expected, got: cur.len() });
         }
+        let is_iframe = idx % gop == 0;
+        if is_iframe && idx > 0 {
+            if let Some(rc) = rc.as_mut() {
+                let d = rc.next_gop_distance(ctx.distance);
+                ctx.set_distance(d, opts)?;
+            }
+        }
         payload.clear();
-        let flags = encode_stream_frame(&cur, &prev_src, idx % gop == 0, &mut ctx, &mut payload)?;
+        let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
+        if let Some(rc) = rc.as_mut() {
+            rc.on_frame(payload.len());
+        }
         sink.write_all(&payload).map_err(|_| VideoError::Io)?;
         index.push((offset as u32, (payload.len() as u32) | flags));
         offset += payload.len() as u64;
@@ -2246,6 +2382,117 @@ mod tests {
             .collect()
     }
 
+    /// Noise-textured base + a moving noise block: lossy size responds strongly
+    /// to distance (flat gradients don't), which the rate-control tests need.
+    fn textured_motion(w: u32, h: u32, n: usize) -> Vec<Vec<u8>> {
+        let mut s: u32 = 0x1234_5678;
+        let mut rnd = move || {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        };
+        let base: Vec<u8> = (0..(w * h * 3) as usize).map(|_| rnd()).collect();
+        (0..n)
+            .map(|f| {
+                let mut v = base.clone();
+                // Moving 24x24 block of fresh noise (per-frame deterministic seed).
+                let mut bs: u32 = 0x9e37_79b9 ^ (f as u32).wrapping_mul(0x85eb_ca6b);
+                let mut brnd = move || {
+                    bs = bs.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (bs >> 24) as u8
+                };
+                let bx = (4 * f as u32) % (w - 24);
+                let by = (3 * f as u32) % (h - 24);
+                for yy in by..by + 24 {
+                    for xx in bx..bx + 24 {
+                        let o = ((yy * w + xx) * 3) as usize;
+                        v[o] = brnd();
+                        v[o + 1] = brnd();
+                        v[o + 2] = brnd();
+                    }
+                }
+                v
+            })
+            .collect()
+    }
+
+    /// JOLT rate control: bytes steer toward the target across GOPs, in both
+    /// directions, without leaving the distance clamps or breaking decode.
+    #[test]
+    fn rate_control_steers_toward_target() {
+        let (w, h) = (128u32, 128u32);
+        let frames = textured_motion(w, h, 72); // 3 s @ 24fps, 6 GOPs of 12
+        let gop = 12u32;
+        let run = |opts: &CasaVideoOptions| -> Vec<u8> {
+            let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+            encode_casv_video_streaming(&mut fs, opts).unwrap()
+        };
+
+        let mut fixed = CasaVideoOptions::streaming(1.5);
+        fixed.gop_len = gop;
+        let fixed_bytes = run(&fixed).len();
+        let fixed_rate = fixed_bytes as f64 / 3.0; // bytes/s over the 3 s clip
+
+        // Downward: target half the fixed rate — controller must raise distance
+        // and land materially below the fixed size.
+        let mut down = CasaVideoOptions::streaming_bitrate(1.5, (fixed_rate * 0.5) as u32);
+        down.gop_len = gop;
+        let down_out = run(&down);
+        assert!(
+            (down_out.len() as f64) < 0.8 * fixed_bytes as f64,
+            "rate control must cut bytes toward a lower target: {} vs fixed {}",
+            down_out.len(),
+            fixed_bytes
+        );
+        let decoded = decode_casv_all_rgb8(&down_out).expect("rate-controlled stream decodes");
+        assert_eq!(decoded.len(), 72);
+
+        // Upward: target double the fixed rate — distance drops toward
+        // min_distance and bytes must rise.
+        let mut up = CasaVideoOptions::streaming_bitrate(1.5, (fixed_rate * 2.0) as u32);
+        up.gop_len = gop;
+        let up_out = run(&up);
+        assert!(
+            up_out.len() > fixed_bytes,
+            "rate control must spend more bytes toward a higher target: {} vs fixed {}",
+            up_out.len(),
+            fixed_bytes
+        );
+
+        // Convergence quality (downward run): the LAST two GOPs should sit
+        // near the per-GOP byte budget once feedback has settled. Loose band —
+        // lossy size vs distance is steppy at this resolution.
+        let target_gop_bytes = fixed_rate * 0.5 * (gop as f64 / 24.0);
+        let mut gop_sizes = [0usize; 6];
+        for i in 0..72 {
+            gop_sizes[i / 12] += casv_frame_slice(&down_out, i).unwrap().len();
+        }
+        for (g, &sz) in gop_sizes.iter().enumerate().skip(4) {
+            let ratio = sz as f64 / target_gop_bytes;
+            assert!(
+                (0.4..=2.0).contains(&ratio),
+                "late GOP {g} rate ratio {ratio:.2} out of band (size {sz}, target {target_gop_bytes:.0})"
+            );
+        }
+    }
+
+    /// Extreme targets stay inside the distance clamps and keep the stream valid.
+    #[test]
+    fn rate_control_clamps_and_survives_extremes() {
+        let (w, h) = (96u32, 96u32);
+        let frames = textured_motion(w, h, 36);
+        let run = |target: u32| -> Vec<u8> {
+            let mut o = CasaVideoOptions::streaming_bitrate(1.0, target);
+            o.gop_len = 6;
+            let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+            encode_casv_video_streaming(&mut fs, &o).unwrap()
+        };
+        let starved = run(1); // 1 byte/s — pinned at max_distance
+        let flooded = run(1_000_000_000); // 1 GB/s — pinned at min_distance
+        assert!(starved.len() < flooded.len(), "starved must be smaller than flooded");
+        assert_eq!(decode_casv_all_rgb8(&starved).unwrap().len(), 36);
+        assert_eq!(decode_casv_all_rgb8(&flooded).unwrap().len(), 36);
+    }
+
     #[test]
     fn delta_beats_intra_on_low_motion() {
         let (w, h) = (64u32, 64u32);
@@ -2692,6 +2939,7 @@ mod tests {
             tile: 16,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
         let tv = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();
         for (i, (px, _, _)) in decode_casv_all_rgb8(&tv).unwrap().iter().enumerate() {
@@ -2734,6 +2982,7 @@ mod tests {
             tile: 32,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
         let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
         let casv = encode_casv_video_streaming(&mut fs, &opts).unwrap();
@@ -2783,6 +3032,7 @@ mod tests {
             tile: 32,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
 
         // Stream to an in-memory sink (footer-indexed format).
@@ -3002,6 +3252,7 @@ mod tests {
             tile: 16,
             effort: 3,
             thresh: Some(0),
+            rate_control: None,
         };
         let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
         let batch = encode_casv_video(&refs, w, h, 24, 1, &opts).unwrap();
