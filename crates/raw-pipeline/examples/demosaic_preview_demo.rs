@@ -263,7 +263,7 @@ fn main() {
     let half_rgba = pipeline::process_rgba(&half_down, &params);
 
     // ── perceptual + numeric comparison (FULL is the reference) ──
-    let mut cmp = Comparer::new(&full_rgba, dw, dh, Opts::default());
+    let mut cmp = Comparer::new(full_rgba, dw, dh, Opts::default());
     let butter = cmp.butteraugli(&half_rgba);
     let psnr = cmp.psnr(&half_rgba);
     let (maxd, meand) = abs_diff(&full_rgba, &half_rgba);

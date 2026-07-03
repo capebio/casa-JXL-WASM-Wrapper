@@ -122,6 +122,7 @@ fn streaming_peak_is_constant_while_batch_grows() {
         tile: 32,
         effort: 3,
         thresh: Some(2),
+        rate_control: None,
     };
     let kb = |b: usize| b / 1024;
 
