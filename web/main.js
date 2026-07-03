@@ -230,10 +230,20 @@ const clearStatsBtn = document.getElementById('clear-stats');
 // Seed the stats log with build / env info so the paste-back is self-describing.
 const statsLines = [];
 const statsKeyIdx = new Map();   // key → index into statsLines for mutable rows
-function pushStat(line) {
-    statsLines.push(line);
+let _statsLogPending = false;
+function _flushStatsLog() {
+    _statsLogPending = false;
     statsLog.textContent = statsLines.join('\n');
     statsLog.scrollTop = statsLog.scrollHeight;
+}
+function _scheduleStatsFlush() {
+    if (_statsLogPending) return;
+    _statsLogPending = true;
+    requestAnimationFrame(_flushStatsLog);
+}
+function pushStat(line) {
+    statsLines.push(line);
+    _scheduleStatsFlush();
 }
 // Mutable row that overwrites in place when the same key is pushed again.
 // Used to collapse "N files share this signature" rollups (jpeg sizes,
@@ -247,8 +257,7 @@ function updateStat(key, line) {
     } else {
         statsLines[idx] = line;
     }
-    statsLog.textContent = statsLines.join('\n');
-    statsLog.scrollTop = statsLog.scrollHeight;
+    _scheduleStatsFlush();
 }
 function resetStatKeys() { statsKeyIdx.clear(); }
 pushStat(`build:        ${BUILD_TAG}`);
@@ -282,7 +291,7 @@ function copyTextToClipboard(text) {
 }
 
 copyStatsBtn.addEventListener('click', () => {
-    copyTextToClipboard(statsLog.textContent).then(() => {
+    copyTextToClipboard(statsLines.join('\n')).then(() => {
         copyStatsBtn.textContent = 'copied';
         setTimeout(() => (copyStatsBtn.textContent = 'Copy'), 1200);
     }).catch(() => {
@@ -292,6 +301,7 @@ copyStatsBtn.addEventListener('click', () => {
 });
 clearStatsBtn.addEventListener('click', () => {
     statsLines.length = 0;
+    _flushStatsLog(); // immediate — user expects instant clear
     resetStatKeys();
     jpegSignatureCounts.clear();
     wbMatrixCounts.clear();
