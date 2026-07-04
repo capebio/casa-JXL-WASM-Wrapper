@@ -1,0 +1,84 @@
+import { readFileSync } from "node:fs";
+import { extname, basename } from "node:path";
+import sharp from "sharp";
+
+let raw, facade, PerceptualComparer;
+export async function initCodecCompareJxl() {
+  raw = await import("../pkg/raw_converter_wasm.js");
+  await raw.default({ module_or_path: readFileSync(new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url)) });
+  PerceptualComparer = raw.PerceptualComparer;
+  facade = await import("../packages/jxl-wasm/dist/index.js");
+}
+
+const TARGET = 1920;
+// Verbatim from StandardMultifileTest.mjs:155
+const PROCESS_ARGS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Number.NaN, Number.NaN, 0, 0];
+const exactBuffer = (u8) => (u8.buffer.byteLength === u8.byteLength ? u8 : u8.slice());
+function rgbaToRgb(d, w, h) { const out = new Uint8Array(w*h*3); for (let i=0,s=0,o=0;i<w*h;i++,s+=4,o+=3){ out[o]=d[s]; out[o+1]=d[s+1]; out[o+2]=d[s+2]; } return out; }
+
+export async function loadTargetRgba(path) {
+  const ext = extname(path).toLowerCase();
+  let rgb, srcW, srcH;
+  if (ext === ".jpg" || ext === ".jpeg") {
+    const { data, info } = await sharp(path).raw().toBuffer({ resolveWithObject: true });
+    rgb = info.channels === 4 ? rgbaToRgb(data, info.width, info.height) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    srcW = info.width; srcH = info.height;
+  } else {
+    const bytes = new Uint8Array(readFileSync(path));
+    let decoded;
+    if (ext === ".orf" || ext === ".raw") decoded = raw.process_orf_with_flags(bytes, 1, ...PROCESS_ARGS);
+    else if (ext === ".cr2") decoded = raw.process_cr2_with_flags(bytes, 1, ...PROCESS_ARGS);
+    else if (ext === ".dng") decoded = raw.process_dng_with_flags(bytes, 1, ...PROCESS_ARGS);
+    else throw new Error(`Unsupported ext ${ext}`);
+    rgb = decoded.take_rgb(); srcW = decoded.width; srcH = decoded.height; decoded.free();
+  }
+  const longEdge = Math.max(srcW, srcH);
+  const scale = longEdge > TARGET ? TARGET / longEdge : 1;
+  const tgtW = Math.round(srcW * scale), tgtH = Math.round(srcH * scale);
+  const rgba = scale < 1 ? raw.rgb_to_rgba(raw.downscale_rgb(rgb, srcW, srcH, tgtW, tgtH)) : raw.rgb_to_rgba(rgb);
+  return { rgba: new Uint8Array(rgba), tgtW, tgtH, file: basename(path) };
+}
+
+export function perceptualComparer(sourceRgba, w, h) { return new PerceptualComparer(sourceRgba, w, h); }
+
+// JXL adapter — distance 1.0 anchor. Encode/decode settings mirror encodeJxl/decodeJxl in the standard test.
+export function makeJxlAdapter() {
+  return {
+    key: "jxl", runtime: "wasm", lossless: false,
+    async encodeAnchor(rgba, w, h) {
+      const encoder = facade.createEncoder({
+        format: "rgba8", width: w, height: h, hasAlpha: true,
+        iccProfile: null, exif: null, xmp: null,
+        distance: 1.0, quality: 85, effort: 3,
+        progressive: true, progressiveFlavor: "ac", previewFirst: false, chunked: true,
+      });
+      const chunks = [];
+      const collect = (async () => { for await (const c of encoder.chunks()) chunks.push(c instanceof Uint8Array ? c : new Uint8Array(c)); })();
+      await encoder.pushPixels(exactBuffer(rgba));
+      await encoder.finish();
+      await collect;
+      await encoder.dispose();
+      let n = 0; for (const c of chunks) n += c.length;
+      const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+      return out;
+    },
+    async decode(bytes) {
+      const decoder = facade.createDecoder({ format: "rgba8", progressionTarget: "final", emitEveryPass: true, progressiveDetail: "passes", preserveIcc: false, preserveMetadata: false });
+      let firstFrameMs = null, pixels = null, width = 0, height = 0;
+      const t0 = performance.now();
+      const ev = (async () => {
+        for await (const e of decoder.events()) {
+          if (e.type === "progress" || e.type === "final") {
+            if (firstFrameMs === null) firstFrameMs = performance.now() - t0;
+            if (e.pixels) { pixels = e.pixels; width = e.width ?? width; height = e.height ?? height; }
+          } else if (e.type === "error") throw new Error(`${e.code}: ${e.message}`);
+        }
+      })();
+      await decoder.push(exactBuffer(bytes));
+      await decoder.close();
+      await ev;
+      await decoder.dispose();
+      return { data: new Uint8Array(pixels.buffer ?? pixels), width, height, firstFrameMs: firstFrameMs ?? (performance.now() - t0) };
+    },
+  };
+}
