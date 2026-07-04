@@ -9,11 +9,26 @@
 // Detection is by presence of the Tauri global; everything else degrades
 // gracefully so the same page works when opened as a plain web page.
 
-import { createDecoder } from '@casabio/jxl-wasm';
+import { createDecoder, preloadJxlModule } from '@casabio/jxl-wasm';
+
+/**
+ * Start compiling/instantiating the JXL WASM module ahead of first use, so the
+ * first frame decode doesn't pay cold-start on the critical path. Fire-and-forget;
+ * safe to call repeatedly (the module load is memoized in the facade).
+ */
+export function prewarmJxl() {
+  try { preloadJxlModule(); } catch (_) { /* non-fatal: cold path still works */ }
+}
 
 export function isTauri() {
   return typeof window !== 'undefined' &&
     !!(window.__TAURI__ || window.__TAURI_INTERNALS__);
+}
+
+export function openDesktopCasvEncoder() {
+  if (typeof window === 'undefined') return false;
+  window.location.href = 'raw-converter-tauri://casv-encode';
+  return true;
 }
 
 function tauriInvoke(cmd, args) {
@@ -98,10 +113,53 @@ export async function pickImagesToEncode() {
   return { native: false, paths: [] };
 }
 
+/** Pick one video file to encode into a .casv. Tauri only. */
+export async function pickVideoToEncode() {
+  if (isTauri()) {
+    const dialog = window.__TAURI__?.dialog;
+    let path = null;
+    if (dialog?.open) {
+      path = await dialog.open({
+        multiple: false,
+        filters: [{ name: 'Video', extensions: ['mp4', 'webm', 'mov', 'mkv'] }],
+      });
+    } else {
+      const paths = await tauriInvoke('casv_pick_videos', {});
+      path = Array.isArray(paths) ? paths[0] : paths;
+    }
+    return { native: true, paths: path ? [path] : [] };
+  }
+  return { native: false, paths: [] };
+}
+
 /**
- * Encode + save a .casv from picked images. Tauri only.
+ * Subscribe to native encode progress while the casv_encode sidecar runs.
+ * The desktop app relays each `CASVENC <stage> <done> <total>` line the sidecar
+ * prints (see TAURI_WIRING.md) as a `casv-encode-progress` event with payload
+ * `{ stage, done, total }`. Returns a Promise resolving to an unlisten function;
+ * in the browser (no Tauri) it resolves to a no-op so callers need no host check.
+ */
+export async function onEncodeProgress(cb) {
+  const listen = typeof window !== 'undefined' && window.__TAURI__?.event?.listen;
+  if (typeof listen !== 'function') return () => {};
+  try {
+    return await listen('casv-encode-progress', (event) => {
+      const p = event?.payload || {};
+      cb({
+        stage: String(p.stage || ''),
+        done: Number(p.done) || 0,
+        total: Number(p.total) || 0,
+      });
+    });
+  } catch (_) {
+    return () => {};
+  }
+}
+
+/**
+ * Encode + save a .casv from picked images or one video. Tauri only.
  * `request` is the object from buildEncodeRequest(). The native command
- * reads the input images, encodes via casa_video::encode_casv_video, and
+ * reads the source, invokes the CASAVA sidecar, and
  * (if request.outputPath is null) opens a save dialog. Returns { path }.
  */
 export async function encodeAndSave(request) {
