@@ -40,13 +40,14 @@ function sharpAdapter(key, format, applyQuality) {
 }
 
 // --- jsquash wasm adapters (lazy Node WASM init) ---
-function jsquashAdapter(key, enc, dec, ensureEnc, ensureDec, qKey = "quality") {
+// encOpts = fixed extra encode options merged with quality (e.g. force 4:4:4 chroma for jpeg fairness).
+function jsquashAdapter(key, enc, dec, ensureEnc, ensureDec, encOpts = {}, qKey = "quality") {
   return {
     key, runtime: "wasm", lossless: false,
     async encode(rgba, w, h, quality) {
       await ensureEnc();
       const img = { data: new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), width: w, height: h };
-      const buf = await enc(img, { [qKey]: quality });
+      const buf = await enc(img, { [qKey]: quality, ...encOpts });
       return toU8(buf);
     },
     async decode(bytes) {
@@ -65,12 +66,15 @@ const ensureWebpDec = onceInit(initWebpDec, "@jsquash/webp/decode.js", "codec/de
 const ensureAvifEnc = onceInit(initAvifEnc, "@jsquash/avif/encode.js", "codec/enc/avif_enc.wasm");
 const ensureAvifDec = onceInit(initAvifDec, "@jsquash/avif/decode.js", "codec/dec/avif_dec.wasm");
 
+// Chroma fairness: JPEG forced to 4:4:4 (native + mozjpeg) so its quality isn't capped by default 4:2:0.
+// WebP lossy is inherently 4:2:0 in libwebp (no 4:4:4) — left as-is; smartSubsample sharpens chroma edges.
+// AVIF defaults to 4:4:4 in both sharp and @jsquash.
 export const ADAPTERS = [
-  sharpAdapter("jpeg_native", "jpeg", (p, q) => p.jpeg({ quality: q })),
-  sharpAdapter("webp_native", "webp", (p, q) => p.webp({ quality: q })),
-  sharpAdapter("avif_native", "avif", (p, q) => p.avif({ quality: q })),
+  sharpAdapter("jpeg_native", "jpeg", (p, q) => p.jpeg({ quality: q, chromaSubsampling: "4:4:4" })),
+  sharpAdapter("webp_native", "webp", (p, q) => p.webp({ quality: q, smartSubsample: true })),
+  sharpAdapter("avif_native", "avif", (p, q) => p.avif({ quality: q, chromaSubsampling: "4:4:4" })),
   sharpAdapter("png_native", "png", (p) => p.png()),
-  jsquashAdapter("jpeg_wasm", jpegEnc, jpegDec, ensureJpegEnc, ensureJpegDec),
+  jsquashAdapter("jpeg_wasm", jpegEnc, jpegDec, ensureJpegEnc, ensureJpegDec, { auto_subsample: false, chroma_subsample: 1 }),
   jsquashAdapter("webp_wasm", webpEnc, webpDec, ensureWebpEnc, ensureWebpDec),
   jsquashAdapter("avif_wasm", avifEnc, avifDec, ensureAvifEnc, ensureAvifDec),
 ];
