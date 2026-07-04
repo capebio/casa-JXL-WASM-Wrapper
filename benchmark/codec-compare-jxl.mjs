@@ -52,6 +52,24 @@ export async function butteraugliDistance(refRgba, testRgba, w, h) {
 export function makeJxlAdapter() {
   return {
     key: "jxl", runtime: "wasm", lossless: false,
+    // Quality-parametric encode for RD sweeps (facade maps quality -> distance, verified monotonic).
+    async encode(rgba, w, h, quality) {
+      const encoder = facade.createEncoder({
+        format: "rgba8", width: w, height: h, hasAlpha: true,
+        iccProfile: null, exif: null, xmp: null,
+        quality, effort: 3,
+        progressive: true, progressiveFlavor: "ac", previewFirst: false, chunked: true,
+      });
+      const chunks = [];
+      const collect = (async () => { for await (const c of encoder.chunks()) chunks.push(c instanceof Uint8Array ? c : new Uint8Array(c)); })();
+      await encoder.pushPixels(exactBuffer(rgba));
+      await encoder.finish();
+      await collect;
+      await encoder.dispose();
+      let n = 0; for (const c of chunks) n += c.length;
+      const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+      return out;
+    },
     async encodeAnchor(rgba, w, h) {
       const encoder = facade.createEncoder({
         format: "rgba8", width: w, height: h, hasAlpha: true,
