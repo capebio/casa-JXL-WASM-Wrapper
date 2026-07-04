@@ -23,13 +23,24 @@
 //! Prints `OK <bytes> <out>` on success; exits non-zero with a message on error.
 
 use raw_pipeline::casa_video::{
-    default_thresh_for_distance, encode_casv_video, encode_casv_video_with_audio,
+    default_thresh_for_distance, encode_casv_video, encode_casv_video_with_audio_progress,
     CasaVideoOptions, SkipMode, VideoRate,
 };
 
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("casv_encode: {msg}");
     std::process::exit(1);
+}
+
+/// Machine-readable progress for the desktop app to relay to the lightbox UI.
+///
+/// One line per event on **stderr** (stdout is reserved for the final
+/// `OK <bytes> <out>` result line): `CASVENC <stage> <done> <total>`.
+/// `total == 0` means indeterminate (e.g. ffmpeg extract is one opaque call).
+/// The Tauri `encode_casv_video` command streams these lines and re-emits each
+/// as a `casv-encode-progress` event — see web/casv-lightbox/TAURI_WIRING.md.
+fn progress(stage: &str, done: usize, total: usize) {
+    eprintln!("CASVENC {stage} {done} {total}");
 }
 
 // ── video-mode helpers ────────────────────────────────────────────────────────
@@ -178,26 +189,29 @@ fn run_video_mode(args: &[String]) -> ! {
     };
     let _ = std::fs::remove_file(&audio_tmp);
 
-    // Extract video frames as concatenated PNG stream, then split
+    // Extract video frames as concatenated PNG stream, then split.
+    progress("extract", 0, 0); // ffmpeg is one opaque call → indeterminate
     let png_data = extract_png_frames(in_video, dim_str);
     let frames_png = split_png_frames(&png_data);
     if frames_png.is_empty() {
         fail("no frames extracted from video");
     }
+    let n = frames_png.len();
 
-    // Decode PNGs to RGB8
+    // Decode PNGs to RGB8, reporting per-frame progress.
     let first_img = image::load_from_memory(frames_png[0])
         .unwrap_or_else(|e| fail(format!("decode first frame: {e}")));
     let (w, h) = (first_img.width(), first_img.height());
-    let frames: Vec<Vec<u8>> = frames_png
-        .iter()
-        .map(|png| {
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for (i, png) in frames_png.iter().enumerate() {
+        frames.push(
             image::load_from_memory(png)
                 .unwrap_or_else(|e| fail(format!("decode png frame: {e}")))
                 .to_rgb8()
-                .into_raw()
-        })
-        .collect();
+                .into_raw(),
+        );
+        progress("decode", i + 1, n);
+    }
 
     let rate = match args[5].as_str() {
         "lossless" => VideoRate::Lossless,
@@ -213,7 +227,8 @@ fn run_video_mode(args: &[String]) -> ! {
         rate_control: None,
     };
 
-    let bytes = encode_casv_video_with_audio(
+    progress("encode", 0, n);
+    let bytes = encode_casv_video_with_audio_progress(
         &frames,
         w,
         h,
@@ -221,6 +236,7 @@ fn run_video_mode(args: &[String]) -> ! {
         fps_den.max(1),
         &opts,
         ogg_bytes.as_deref(),
+        &mut |done| progress("encode", done, n),
     )
     .unwrap_or_else(|e| fail(format!("encode failed: {e:?}")));
 
@@ -267,9 +283,10 @@ fn main() {
     }
 
     // Decode every image to tightly-packed RGB8; all frames must share dims.
-    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
+    let n = inputs.len();
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(n);
     let (mut w, mut h) = (0u32, 0u32);
-    for path in inputs {
+    for (i, path) in inputs.iter().enumerate() {
         let img = image::open(path)
             .unwrap_or_else(|e| fail(format!("{path}: {e}")))
             .to_rgb8();
@@ -281,6 +298,7 @@ fn main() {
             fail(format!("{path}: {iw}x{ih} != {w}x{h} (all frames must match)"));
         }
         frames.push(img.into_raw());
+        progress("decode", i + 1, n);
     }
 
     let rate = match rate_kind {
@@ -299,8 +317,10 @@ fn main() {
     };
 
     let refs: Vec<&[u8]> = frames.iter().map(|f| f.as_slice()).collect();
+    progress("encode", 0, n);
     let bytes = encode_casv_video(&refs, w, h, fps_num.max(1), fps_den.max(1), &opts)
         .unwrap_or_else(|e| fail(format!("encode failed: {e:?}")));
+    progress("encode", n, n);
     std::fs::write(out, &bytes).unwrap_or_else(|e| fail(format!("write {out}: {e}")));
     println!("OK {} {}", bytes.len(), out);
 }
