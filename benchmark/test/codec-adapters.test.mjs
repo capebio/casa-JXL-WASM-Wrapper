@@ -18,6 +18,17 @@ test("every non-jxl adapter round-trips rgba at correct dims + 4ch", async () =>
   }
 });
 
+test("jxl_orig adapter present, wasm, round-trips", async () => {
+  const a = ADAPTERS.find(x => x.key === "jxl_orig");
+  assert.ok(a, "jxl_orig adapter missing");
+  assert.equal(a.runtime, "wasm");
+  const bytes = await a.encode(rgba, w, h, 75);
+  assert.ok(bytes.length > 0);
+  const back = await a.decode(bytes);
+  assert.equal(back.width, w);
+  assert.equal(back.data.length, w * h * 4);
+});
+
 test("adapter keys are unique and runtime-tagged", () => {
   const keys = ADAPTERS.map(a => a.key);
   assert.equal(new Set(keys).size, keys.length);

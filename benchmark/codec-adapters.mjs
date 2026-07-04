@@ -11,6 +11,8 @@ import webpEnc, { init as initWebpEnc } from "@jsquash/webp/encode.js";
 import webpDec, { init as initWebpDec } from "@jsquash/webp/decode.js";
 import avifEnc, { init as initAvifEnc } from "@jsquash/avif/encode.js";
 import avifDec, { init as initAvifDec } from "@jsquash/avif/decode.js";
+import jxlEnc, { init as initJxlEnc } from "@jsquash/jxl/encode.js";
+import jxlDec, { init as initJxlDec } from "@jsquash/jxl/decode.js";
 
 const require = createRequire(import.meta.url);
 const toU8 = (x) => (x instanceof Uint8Array ? x : new Uint8Array(x.buffer ?? x));
@@ -65,6 +67,8 @@ const ensureWebpEnc = onceInit(initWebpEnc, "@jsquash/webp/encode.js", "codec/en
 const ensureWebpDec = onceInit(initWebpDec, "@jsquash/webp/decode.js", "codec/dec/webp_dec.wasm");
 const ensureAvifEnc = onceInit(initAvifEnc, "@jsquash/avif/encode.js", "codec/enc/avif_enc.wasm");
 const ensureAvifDec = onceInit(initAvifDec, "@jsquash/avif/decode.js", "codec/dec/avif_dec.wasm");
+const ensureJxlEnc = onceInit(initJxlEnc, "@jsquash/jxl/encode.js", "codec/enc/jxl_enc.wasm");
+const ensureJxlDec = onceInit(initJxlDec, "@jsquash/jxl/decode.js", "codec/dec/jxl_dec.wasm");
 
 // Chroma fairness: JPEG forced to 4:4:4 (native + mozjpeg) so its quality isn't capped by default 4:2:0.
 // WebP lossy is inherently 4:2:0 in libwebp (no 4:4:4) — left as-is; smartSubsample sharpens chroma edges.
@@ -77,4 +81,5 @@ export const ADAPTERS = [
   jsquashAdapter("jpeg_wasm", jpegEnc, jpegDec, ensureJpegEnc, ensureJpegDec, { auto_subsample: false, chroma_subsample: 1 }),
   jsquashAdapter("webp_wasm", webpEnc, webpDec, ensureWebpEnc, ensureWebpDec),
   jsquashAdapter("avif_wasm", avifEnc, avifDec, ensureAvifEnc, ensureAvifDec),
+  jsquashAdapter("jxl_orig", jxlEnc, jxlDec, ensureJxlEnc, ensureJxlDec, { effort: 3 }),
 ];
