@@ -16,6 +16,9 @@
     "icodec": "0.6.0"
   },
   "devDependencies": {
+    "@jsquash/avif": "^2.1.1",
+    "@jsquash/jpeg": "^1.6.0",
+    "@jsquash/webp": "^1.5.0",
     "@types/node": "^22.12.0",
     "bun": "^1.3.14",
     "playwright": "^1.59.1",
