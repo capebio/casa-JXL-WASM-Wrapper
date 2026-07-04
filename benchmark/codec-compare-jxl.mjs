@@ -41,6 +41,13 @@ export async function loadTargetRgba(path) {
 
 export function perceptualComparer(sourceRgba, w, h) { return new PerceptualComparer(sourceRgba, w, h); }
 
+// Standard-scale (p3) butteraugli via libjxl bridge (0=identical, ~1.0=imperceptible, >2.0=noticeable).
+// Used for quality parity; PerceptualComparer.butteraugli is a different, compressed scale (~10x smaller)
+// that made tol=0.15 swamp the whole range — see plan Task 8. SSIM still comes from PerceptualComparer.
+export async function butteraugliDistance(refRgba, testRgba, w, h) {
+  return facade.computeButteraugli(refRgba, testRgba, w, h);
+}
+
 // JXL adapter — distance 1.0 anchor. Encode/decode settings mirror encodeJxl/decodeJxl in the standard test.
 export function makeJxlAdapter() {
   return {

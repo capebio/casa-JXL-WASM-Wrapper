@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { initCodecCompareJxl, loadTargetRgba, perceptualComparer, makeJxlAdapter } from "./benchmark/codec-compare-jxl.mjs";
+import { initCodecCompareJxl, loadTargetRgba, perceptualComparer, butteraugliDistance, makeJxlAdapter } from "./benchmark/codec-compare-jxl.mjs";
 import { ADAPTERS } from "./benchmark/codec-adapters.mjs";
 import { searchQuality } from "./benchmark/butteraugli-search.mjs";
 import { buildCodecToon } from "./benchmark/codec-compare-serialize.mjs";
@@ -48,7 +48,7 @@ async function main() {
     // Anchor: our JXL @ d1.0
     const jxlEnc = await jxl.encodeAnchor(rgba, tgtW, tgtH);
     const jxlDec = await jxl.decode(jxlEnc);
-    const targetButter = pc.butteraugli(jxlDec.data);
+    const targetButter = await butteraugliDistance(rgba, jxlDec.data, tgtW, tgtH);
     const jxlEncMs = median(await roundsOf(N_ROUNDS, () => jxl.encodeAnchor(rgba, tgtW, tgtH)));
     const jxlDecMs = median(await roundsOf(N_ROUNDS, () => jxl.decode(jxlEnc)));
     rows.push({ file, codec: "jxl", runtime: "wasm", quality: null, target_butter: targetButter,
@@ -63,12 +63,12 @@ async function main() {
         const encMs = median(await roundsOf(N_ROUNDS, () => a.encode(rgba, tgtW, tgtH)));
         const decMs = median(await roundsOf(N_ROUNDS, () => a.decode(bytes)));
         rows.push({ file, codec: a.key, runtime: a.runtime, quality: null, target_butter: targetButter,
-          achieved_butter: pc.butteraugli(dec.data), converged: true, ssim: pc.ssim(dec.data),
+          achieved_butter: await butteraugliDistance(rgba, dec.data, tgtW, tgtH), converged: true, ssim: pc.ssim(dec.data),
           enc_ms: encMs, dec_ms: decMs, ttfp_ms: decMs, ttfp_kind: "full",
           bytes: bytes.length, bpp: (bytes.length * 8) / npx });
         continue;
       }
-      const measure = async (q) => { const b = await a.encode(rgba, tgtW, tgtH, q); const d = await a.decode(b); return pc.butteraugli(d.data); };
+      const measure = async (q) => { const b = await a.encode(rgba, tgtW, tgtH, q); const d = await a.decode(b); return butteraugliDistance(rgba, d.data, tgtW, tgtH); };
       const sr = await searchQuality({ measure, target: targetButter, tol: TOL, maxIters: MAX_ITERS });
       const bytes = await a.encode(rgba, tgtW, tgtH, sr.quality);
       const dec = await a.decode(bytes);
