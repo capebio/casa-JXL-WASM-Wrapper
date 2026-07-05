@@ -87,9 +87,15 @@ export async function jxlOrigDecode(bytes) {
 }
 
 // --- 16-bit adapters (RGBA16 Uint16Array in/out). sharp handles 16-bit natively. ---
-// Pass Uint16Array directly so sharp infers 'ushort' depth (NOT Buffer/Uint8Array byte-view).
+// sharp infers input depth from the TypedArray ctor (Uint16Array -> 'ushort'); a Buffer/Uint8Array
+// view would be read as 8-bit (raw input has no depth option). sharp reads the whole backing
+// ArrayBuffer, so a subview (non-zero byteOffset or oversized buffer) must be tightened to a
+// standalone Uint16Array first, else the wrong memory region is fed to libvips.
+const AVIF16_BITDEPTH = 12; // libaom AV1 high-bit-depth; 10 also valid
+const tight16 = (u16) =>
+  (u16.byteOffset === 0 && u16.byteLength === u16.buffer.byteLength) ? u16 : u16.slice();
 const sharpRaw16 = (rgba16, w, h) =>
-  sharp(rgba16, { raw: { width: w, height: h, channels: 4 } });
+  sharp(tight16(rgba16), { raw: { width: w, height: h, channels: 4 } });
 
 async function decodeSharp16(bytes) {
   const { data, info } = await sharp(Buffer.from(bytes))
@@ -97,6 +103,9 @@ async function decodeSharp16(bytes) {
     .toColourspace("rgb16")
     .raw({ depth: "ushort" })
     .toBuffer({ resolveWithObject: true });
+  // libvips gives LE uint16; wrap without copy. Uint16Array needs a 2-aligned byteOffset —
+  // sharp's external output Buffer is always byteOffset 0, but guard against a surprise.
+  if (data.byteOffset % 2 !== 0) throw new Error("decodeSharp16: output Buffer byteOffset not 2-aligned");
   const u16 = new Uint16Array(data.buffer, data.byteOffset, data.byteLength >> 1);
   return { data: u16, width: info.width, height: info.height };
 }
@@ -105,8 +114,7 @@ export const ADAPTERS16 = [
   {
     key: "avif16", runtime: "native", lossless: false,
     async encode(rgba16, w, h, quality) {
-      const bitdepth = 12; // 10 also valid; libaom high-bit-depth
-      return toU8(await sharpRaw16(rgba16, w, h).toColourspace("rgb16").avif({ quality, bitdepth, chromaSubsampling: "4:4:4" }).toBuffer());
+      return toU8(await sharpRaw16(rgba16, w, h).toColourspace("rgb16").avif({ quality, bitdepth: AVIF16_BITDEPTH, chromaSubsampling: "4:4:4" }).toBuffer());
     },
     decode: decodeSharp16,
   },
