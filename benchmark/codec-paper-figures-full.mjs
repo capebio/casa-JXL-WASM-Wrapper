@@ -131,7 +131,7 @@ const CAPTIONS = {
   "lossless-enc-ms.svg": "<b>Lossless</b> encode time per codec (within-runtime).",
   "rd-psnr-16bit.svg": "16-bit RD — <b>PSNR</b> (RAW-derived). Only JXL and AVIF-10/12-bit participate (JPEG and WebP are 8-bit-only). PSNR peak = 65535; higher = better.",
   "rd-ssim-16bit.svg": "16-bit RD — <b>SSIM</b> (RAW-derived), shown in dB on 16-bit luma. Only JXL and AVIF-10/12-bit participate.",
-  "rd-butteraugli-16bit.svg": "16-bit RD — <b>Butteraugli</b> (RAW-derived). Only JXL and AVIF-10/12-bit participate. Omitted when the WASM bridge metric is unavailable.",
+  "rd-butteraugli-16bit.svg": "16-bit RD — <b>Butteraugli</b> (RAW-derived). Only JXL and AVIF-10/12-bit participate; measured via the 16-bit Butteraugli WASM bridge (gamma-2.2 linearised, parity with the 8-bit path).",
 };
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
