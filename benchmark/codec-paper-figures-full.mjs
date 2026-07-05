@@ -50,6 +50,17 @@ export function writeFiguresFull({ outDir, sweep, timed, fixed, lossless, corpus
   // 9. size bars grouped
   files["bars-size.svg"] = barChart({ bars: codecs.map(c => ({ label: c, value: avg(fixed.filter(p => p.codec === c), r => r.bytes) / 1024, color: PALETTE[c] || "#000" })), yLabel: "mean KB @ butteraugli~1.5" });
 
+  // 9b. SUMMARY money figure: % bytes saved vs JPEG at matched quality (per image then averaged).
+  const jpegByImg = new Map(fixed.filter(p => p.codec === "jpeg_native").map(p => [p.image, p.bytes]));
+  const savingBars = codecs.filter(c => c !== "jpeg_native").map(c => {
+    const per = fixed.filter(p => p.codec === c).map(p => { const jb = jpegByImg.get(p.image); return jb ? (1 - p.bytes / jb) * 100 : null; }).filter(x => x != null);
+    return { label: c, value: per.length ? avg(per, x => x) : 0, color: PALETTE[c] || "#000" };
+  });
+  files["summary-savings-vs-jpeg.svg"] = barChart({ bars: savingBars, yLabel: "% smaller than JPEG @ equal quality (higher = better)" });
+
+  // 9c. encode-time with variance whiskers (within-runtime only)
+  files["bars-enc-time.svg"] = barChart({ bars: codecs.map(c => { const r = fixed.filter(p => p.codec === c); return { label: c, value: avg(r, p => p.enc_ms), err: avg(r, p => p.enc_ms_std || 0), color: PALETTE[c] || "#000" }; }), yLabel: "mean encode ms ± σ (within-runtime only)" });
+
   // 10. content-class split RD (butteraugli) for photo (standard) + raw
   for (const cls of ["standard", "raw"]) {
     const rows = sweep.filter(s => s.class === cls);
@@ -68,16 +79,19 @@ export function writeFiguresFull({ outDir, sweep, timed, fixed, lossless, corpus
 }
 
 // BD-rate matrix rows: for each codec, bd vs each baseline. bdFn(refRows, testRows)->number|null.
-export function bdMatrix(sweep, corpus, baselines, bdFn) {
+// distKey selects the distortion axis ("butteraugli" default, or "psnr"). bdFn reads `.butteraugli`,
+// so we map the chosen metric into that field.
+export function bdMatrix(sweep, corpus, baselines, bdFn, distKey = "butteraugli") {
   const codecs = [...new Set(sweep.map(s => s.codec))].sort(byFamily);
+  const asDist = (s) => ({ bpp: s.bpp, butteraugli: s[distKey] });
   const rows = [];
   for (const c of codecs) {
     const cell = { codec: c };
     for (const base of baselines) {
       const per = [];
       for (const img of corpus) {
-        const ref = sweep.filter(s => s.image === img.id && s.codec === base).map(s => ({ bpp: s.bpp, butteraugli: s.butteraugli }));
-        const tst = sweep.filter(s => s.image === img.id && s.codec === c).map(s => ({ bpp: s.bpp, butteraugli: s.butteraugli }));
+        const ref = sweep.filter(s => s.image === img.id && s.codec === base).map(asDist);
+        const tst = sweep.filter(s => s.image === img.id && s.codec === c).map(asDist);
         const bd = bdFn(ref, tst); if (bd != null) per.push(bd);
       }
       cell[base] = per.length ? per.reduce((a, b) => a + b, 0) / per.length : null;
@@ -106,11 +120,12 @@ const CAPTIONS = {
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const fmtPct = (v) => v == null ? "—" : v.toFixed(1) + "%";
 
-export function writeGalleryFull({ outDir, files, perFile, bdRows, baselines, oursVsOrig, capability, corpusInfo }) {
+export function writeGalleryFull({ outDir, files, perFile, bdRows, bdRowsPsnr, baselines, oursVsOrig, capability, corpusInfo }) {
   const figHtml = files.map(n => `<figure><h3>${n.replace(".svg", "")}</h3><img src="figures/${n}" alt="${n}"><figcaption>${CAPTIONS[n] || ""}</figcaption></figure>`).join("\n");
   const perFileRows = perFile.map(r => `<tr><td>${esc(r.image)}</td><td>${r.class}</td><td>${r.jxl_kb ?? "—"}</td><td>${r.jpeg_kb ?? "—"}</td><td>${r.saving ?? "—"}</td><td>${r.jxl_enc ?? "—"}</td><td>${r.jxl_dec ?? "—"}</td><td>${r.best ?? "—"}</td></tr>`).join("");
   const bdHead = `<tr><th>codec</th>${baselines.map(b => `<th>vs ${b}</th>`).join("")}</tr>`;
   const bdBody = bdRows.map(r => `<tr><td>${r.codec}</td>${baselines.map(b => `<td>${fmtPct(r[b])}</td>`).join("")}</tr>`).join("");
+  const bdPsnrBody = (bdRowsPsnr || []).map(r => `<tr><td>${r.codec}</td>${baselines.map(b => `<td>${fmtPct(r[b])}</td>`).join("")}</tr>`).join("");
   const capRows = capability.map(r => `<tr><td>${r.format}</td><td>${r.eightbit}</td><td>${r.sixteenbit}</td><td>${r.alpha}</td><td>${r.progressive}</td><td>${r.lossless}</td></tr>`).join("");
   const prose = oursVsOrig ? `<p>Against the reference libjxl (<code>@jsquash/jxl</code>) at matched effort 3, over the corpus at butteraugli ≈ 1.5: our WASM build encodes <b>${oursVsOrig.encX.toFixed(1)}× faster</b> and decodes <b>${oursVsOrig.decX.toFixed(1)}× faster</b>, at <b>${oursVsOrig.size.toFixed(0)}%</b> file size — near-parity size, large speed win. (Both WASM, so times are directly comparable.)</p>` : "";
   const html = `<!doctype html><meta charset="utf-8"><title>JXL Codec Comparison — Figures</title>
@@ -118,9 +133,12 @@ export function writeGalleryFull({ outDir, files, perFile, bdRows, baselines, ou
 <h1>JPEG XL vs JPEG / WebP / AVIF / PNG — comparison figures</h1>
 <p>${esc(corpusInfo)}. Perceptual quality via butteraugli (libjxl p3), plus PSNR and SSIM. Native = sharp/libvips; WASM = @jsquash and our facade build of libjxl.</p>
 <p><b>Runtime caveat:</b> native (sharp, multi-threaded + SIMD) vs WASM encode/decode <b>times are not comparable across runtimes</b>; file size and quality are.</p>
+<h2>Summary: how much smaller than JPEG?</h2>
+<figcaption>Headline result — mean % file-size reduction vs JPEG at equal perceptual quality (butteraugli ≈ 1.5), per codec. Taller = smaller files than JPEG.</figcaption>
+${["summary-savings-vs-jpeg.svg"].filter(n=>files.includes(n)).map(n=>`<figure><img src="figures/${n}"></figure>`).join("")}
 <h2>Our WASM JXL vs the original libjxl</h2>${prose}
 <h2>Rate–distortion (quality vs size)</h2>${["rd-butteraugli.svg","rd-psnr.svg","rd-ssim-db.svg","rd-butteraugli-standard.svg","rd-butteraugli-raw.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")}
-<h2>Speed</h2>${["enc-speed-vs-quality.svg","dec-speed-vs-quality.svg","decode-fps-vs-bpp.svg","pareto-enc.svg","pareto-dec.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")}
+<h2>Speed</h2>${["enc-speed-vs-quality.svg","dec-speed-vs-quality.svg","decode-fps-vs-bpp.svg","pareto-enc.svg","pareto-dec.svg","bars-enc-time.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||"Encode time per codec with ±σ error bars over "+"repeated runs (within-runtime only)."}</figcaption></figure>`).join("\n")}
 <h2>Size at matched quality</h2>${["bars-size.svg"].filter(n=>files.includes(n)).map(n=>`<figure><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")}
 <h2>Lossless</h2>${["lossless-size.svg","lossless-enc-ms.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")||"<p>(lossless pass not present)</p>"}
 <h2>Per-file summary (butteraugli ≈ 1.5)</h2>
@@ -129,6 +147,9 @@ export function writeGalleryFull({ outDir, files, perFile, bdRows, baselines, ou
 <h2>BD-rate matrix (negative = fewer bytes at equal quality)</h2>
 <figcaption><b>BD-rate (Bjøntegaard delta-rate)</b>: average % file-size change vs a baseline codec at equal quality, across the rate–distortion curve. Negative = smaller at same quality. Columns are the baselines.</figcaption>
 <table>${bdHead}${bdBody}</table>
+${bdPsnrBody ? `<h2>BD-rate matrix — PSNR (classic Bjøntegaard, negative = fewer bytes at equal PSNR)</h2>
+<figcaption>Same BD-rate but with <b>PSNR</b> as the distortion axis — the traditional codec-paper metric. Agreement with the butteraugli table above shows the result isn't metric-dependent.</figcaption>
+<table>${bdHead}${bdPsnrBody}</table>` : ""}
 <h2>Format capability</h2>
 <table><tr><th>format</th><th>8-bit</th><th>16-bit/HDR</th><th>alpha</th><th>progressive</th><th>lossless</th></tr>${capRows}</table>`;
   writeFileSync(join(outDir, "figures.html"), html);

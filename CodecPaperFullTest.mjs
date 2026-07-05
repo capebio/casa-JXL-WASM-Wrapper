@@ -16,10 +16,11 @@ const scriptDir = dirname(fileURLToPath(import.meta.url));
 const OUT_DIR = join(scriptDir, "docs", "outputs", "codec-paper-full");
 const JOSE = String.raw`C:\Foo\Jose\Submissions\JXL\Comparison with other formats\full`;
 const TIMED_LADDER = [40, 60, 80];
-const N_TIME = 2;
+const N_TIME = 3;
 const median = (a) => { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
 const timeMs = async (fn) => { const t = performance.now(); await fn(); return performance.now() - t; };
 const medMs = async (n, fn) => { const o = []; for (let i = 0; i < n; i++) o.push(await timeMs(fn)); return median(o); };
+const statMs = async (n, fn) => { const o = []; for (let i = 0; i < n; i++) o.push(await timeMs(fn)); const m = median(o); const mean = o.reduce((a, b) => a + b, 0) / o.length; const std = Math.sqrt(o.reduce((a, b) => a + (b - mean) ** 2, 0) / o.length); return { med: m, std }; };
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 const TEST_ROOT = String.raw`C:\Foo\raw-converter\tests`, GOB_ROOT = String.raw`C:\995\2026-02-20 Gobabeb To Windhoek`;
@@ -79,11 +80,12 @@ function emitAndDeliver(data, corpus, runTimestamp) {
       return { image: img.id, class: img.class, jxl_kb: jkb, jpeg_kb: jpkb, saving: (jkb != null && jpkb) ? (100 * (1 - jkb / jpkb)).toFixed(0) + "%" : null, jxl_enc: j.length ? Math.round(avg(j, x => x.enc_ms)) : null, jxl_dec: j.length ? Math.round(avg(j, x => x.dec_ms)) : null, best };
     });
     const baselines = ["jpeg_native", "webp_native", "avif_native"];
-    const bdRows = bdMatrix(sweep, corpus, baselines, bdRate);
+    const bdRows = bdMatrix(sweep, corpus, baselines, bdRate, "butteraugli");
+    const bdRowsPsnr = bdMatrix(sweep, corpus, baselines, bdRate, "psnr");
     const ours = fixed.filter(p => p.codec === "jxl"), orig = fixed.filter(p => p.codec === "jxl_orig");
     const pct = (a, b, k) => avg(a, r => r[k]) / avg(b, r => r[k]) * 100;
     const oursVsOrig = (ours.length && orig.length) ? { size: pct(ours, orig, "bytes"), encX: 100 / pct(ours, orig, "enc_ms"), decX: 100 / pct(ours, orig, "dec_ms") } : null;
-    writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920)` });
+    writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, bdRowsPsnr, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920)` });
     // data toon (compact) + full JSON dump (enables regen + new metrics without re-running)
     const stamp = runTimestamp.replace(/[:.]/g, "-");
     writeFileSync(join(OUT_DIR, `${stamp}-CodecPaperFull-general.toon`), `TestName: CodecPaperFull - general\nRunTimestamp: ${runTimestamp}\nsweep_rows: ${sweep.length}\ntimed_rows: ${timed.length}\nfixed_rows: ${fixed.length}\nlossless_rows: ${lossless.length}\n`);
@@ -137,10 +139,10 @@ async function main() {
           const measure = async (q) => { const b = await c.encode(img.rgba, img.width, img.height, q); const d = await c.decode(b); return butteraugliDistance(img.rgba, d.data, img.width, img.height); };
           const sr = await searchQuality({ measure, target: 1.5, tol: 0.15, maxIters: 8 });
           const fb = await c.encode(img.rgba, img.width, img.height, sr.quality); const fd = await c.decode(fb); const fm = await metrics(fd);
-          const enc_ms = await medMs(N_TIME, () => c.encode(img.rgba, img.width, img.height, sr.quality));
-          const dec_ms = await medMs(N_TIME, () => c.decode(fb));
-          const ttfp = (c.key === "jxl" && fd.firstFrameMs != null) ? fd.firstFrameMs : dec_ms;
-          data.fixed.push({ image: img.id, class: img.class, codec: c.key, runtime: c.runtime, quality: sr.quality, butteraugli: fm.butteraugli, bytes: fb.length, bpp: fb.length * 8 / npx, enc_ms, dec_ms, ttfp_ms: ttfp });
+          const encS = await statMs(N_TIME, () => c.encode(img.rgba, img.width, img.height, sr.quality));
+          const decS = await statMs(N_TIME, () => c.decode(fb));
+          const ttfp = (c.key === "jxl" && fd.firstFrameMs != null) ? fd.firstFrameMs : decS.med;
+          data.fixed.push({ image: img.id, class: img.class, codec: c.key, runtime: c.runtime, quality: sr.quality, butteraugli: fm.butteraugli, bytes: fb.length, bpp: fb.length * 8 / npx, enc_ms: encS.med, dec_ms: decS.med, enc_ms_std: encS.std, dec_ms_std: decS.std, ttfp_ms: ttfp });
         }
       } catch (e) { log("codec fail", img.id, c.key, e.message); }
     }

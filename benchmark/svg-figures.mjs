@@ -88,6 +88,11 @@ export function barChart({ bars, yLabel = "value", xLabel = "", width = 600, hei
     const x = PAD.l + (i + 0.25) * (f.plotW / bars.length);
     const y = py(b.value), h = (f.height - PAD.b) - y;
     body += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${b.color}"/>`;
+    // optional error whisker (± b.err) centred on the bar top
+    if (b.err != null && b.err > 0) {
+      const cx = x + bw / 2, yHi = py(b.value + b.err), yLo = py(Math.max(0, b.value - b.err));
+      body += `<line x1="${cx.toFixed(1)}" y1="${yHi.toFixed(1)}" x2="${cx.toFixed(1)}" y2="${yLo.toFixed(1)}" stroke="#222"/><line x1="${(cx-4).toFixed(1)}" y1="${yHi.toFixed(1)}" x2="${(cx+4).toFixed(1)}" y2="${yHi.toFixed(1)}" stroke="#222"/><line x1="${(cx-4).toFixed(1)}" y1="${yLo.toFixed(1)}" x2="${(cx+4).toFixed(1)}" y2="${yLo.toFixed(1)}" stroke="#222"/>`;
+    }
     // stagger labels up/down on alternating bars so long names don't overlap
     const labelY = f.height - PAD.b + 18 + (i % 2) * 15;
     body += `<line x1="${(x+bw/2).toFixed(1)}" y1="${f.height-PAD.b}" x2="${(x+bw/2).toFixed(1)}" y2="${labelY-9}" stroke="#ccc"/>`;
