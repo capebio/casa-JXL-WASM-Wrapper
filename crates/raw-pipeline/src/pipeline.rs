@@ -3344,6 +3344,215 @@ pub fn anti_transpose(src: &[u8], w: usize, h: usize) -> Vec<u8> {
     dst
 }
 
+// ── 16-bit orientation helpers ────────────────────────────────────────────────
+// Exact u16 twins of the u8 orientation functions above. Only the element type
+// changes (u8 → u16); all index arithmetic is identical because both use a
+// stride of 3 elements (channels) per pixel.
+
+pub fn apply_orientation_u16(
+    rgb: Vec<u16>,
+    width: usize,
+    height: usize,
+    orientation: u16,
+) -> (Vec<u16>, usize, usize) {
+    match orientation {
+        2 => (flip_horizontal_u16(&rgb, width, height), width, height),
+        3 => (rotate_180_u16(&rgb, width, height), width, height),
+        4 => (flip_vertical_u16(&rgb, width, height), width, height),
+        5 => (transpose_u16(&rgb, width, height), height, width),
+        6 => (rotate_90_cw_u16(&rgb, width, height), height, width),
+        7 => (anti_transpose_u16(&rgb, width, height), height, width),
+        8 => (rotate_90_ccw_u16(&rgb, width, height), height, width),
+        _ => (rgb, width, height), // orientation 1 + unknowns: zero-copy move
+    }
+}
+
+/// dst[c, h-1-r] = src[r, c].  Output dims: (h, w).
+pub fn rotate_90_cw_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    if w == 0 || h == 0 {
+        return vec![0u16; src.len()];
+    }
+    let w_dst = h;
+    let dst_row_bytes = w_dst * 3;
+    let mut dst = vec![0u16; src.len()];
+    let band_bytes = TILE * dst_row_bytes;
+
+    let body = |(band_idx, band): (usize, &mut [u16])| {
+        let c0 = band_idx * TILE;
+        let band_rows = band.len() / dst_row_bytes;
+        for r0 in (0..h).step_by(TILE) {
+            let r_end = (r0 + TILE).min(h);
+            for r in r0..r_end {
+                let dst_col_off = (h - 1 - r) * 3;
+                let src_row_off = r * w * 3;
+                for c_local in 0..band_rows {
+                    let s = src_row_off + (c0 + c_local) * 3;
+                    let d = c_local * dst_row_bytes + dst_col_off;
+                    band[d]     = src[s];
+                    band[d + 1] = src[s + 1];
+                    band[d + 2] = src[s + 2];
+                }
+            }
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    dst.par_chunks_mut(band_bytes).enumerate().for_each(body);
+    #[cfg(not(feature = "parallel"))]
+    dst.chunks_mut(band_bytes).enumerate().for_each(body);
+    dst
+}
+
+/// dst[w-1-c, r] = src[r, c].  Output dims: (h, w).
+pub fn rotate_90_ccw_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    if w == 0 || h == 0 {
+        return vec![0u16; src.len()];
+    }
+    let w_dst = h;
+    let dst_row_bytes = w_dst * 3;
+    let mut dst = vec![0u16; src.len()];
+    let band_bytes = TILE * dst_row_bytes;
+
+    let body = |(band_idx, band): (usize, &mut [u16])| {
+        let band_rows = band.len() / dst_row_bytes;
+        // Band owns dst rows [band_idx*TILE, band_idx*TILE+band_rows).
+        // dst row index = w-1-c  →  c = w-1-dst_row_idx.
+        let c_top = w - 1 - band_idx * TILE;        // c for c_local=0
+        for r0 in (0..h).step_by(TILE) {
+            let r_end = (r0 + TILE).min(h);
+            for r in r0..r_end {
+                let dst_col_off = r * 3;
+                let src_row_off = r * w * 3;
+                for c_local in 0..band_rows {
+                    let c = c_top - c_local;
+                    let s = src_row_off + c * 3;
+                    let d = c_local * dst_row_bytes + dst_col_off;
+                    band[d]     = src[s];
+                    band[d + 1] = src[s + 1];
+                    band[d + 2] = src[s + 2];
+                }
+            }
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    dst.par_chunks_mut(band_bytes).enumerate().for_each(body);
+    #[cfg(not(feature = "parallel"))]
+    dst.chunks_mut(band_bytes).enumerate().for_each(body);
+    dst
+}
+
+/// dst[h-1-r, w-1-c] = src[r, c].  Output dims: (w, h).  Already row-sequential;
+/// just parallelize over dst rows.
+pub fn rotate_180_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    if w == 0 || h == 0 {
+        return vec![0u16; src.len()];
+    }
+    let row_bytes = w * 3;
+    let mut dst = vec![0u16; src.len()];
+
+    let body = |(dst_row_idx, dst_row): (usize, &mut [u16])| {
+        let src_row_idx = h - 1 - dst_row_idx;
+        let s_row = &src[src_row_idx * row_bytes..(src_row_idx + 1) * row_bytes];
+        for c in 0..w {
+            let sc = w - 1 - c;
+            let s = sc * 3;
+            let d = c * 3;
+            dst_row[d]     = s_row[s];
+            dst_row[d + 1] = s_row[s + 1];
+            dst_row[d + 2] = s_row[s + 2];
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    dst.par_chunks_mut(row_bytes).enumerate().for_each(body);
+    #[cfg(not(feature = "parallel"))]
+    dst.chunks_mut(row_bytes).enumerate().for_each(body);
+    dst
+}
+
+/// Mirror each row left-right (EXIF orientation 2).
+pub fn flip_horizontal_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let row_bytes = w * 3;
+    let mut dst = src.to_vec();
+    for r in 0..h {
+        let row = &mut dst[r * row_bytes..(r + 1) * row_bytes];
+        for c in 0..w / 2 {
+            let a = c * 3;
+            let b = (w - 1 - c) * 3;
+            row.swap(a, b);
+            row.swap(a + 1, b + 1);
+            row.swap(a + 2, b + 2);
+        }
+    }
+    dst
+}
+
+/// Mirror rows top-bottom (EXIF orientation 4).
+pub fn flip_vertical_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let row_bytes = w * 3;
+    let mut dst = vec![0u16; src.len()];
+    for r in 0..h {
+        let src_row = r * row_bytes;
+        let dst_row = (h - 1 - r) * row_bytes;
+        dst[dst_row..dst_row + row_bytes].copy_from_slice(&src[src_row..src_row + row_bytes]);
+    }
+    dst
+}
+
+/// Transpose along the main diagonal: dst[c, r] = src[r, c]. Output dims: (h, w). (EXIF 5)
+///
+/// Tile-blocked (TILE × TILE) to stay L1-resident, matching the approach used by
+/// rotate_90_cw / rotate_90_ccw.
+pub fn transpose_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let mut dst = vec![0u16; src.len()];
+    // dst dims: w_dst = h, h_dst = w.  dst[c, r] with dst-row-stride = h*3.
+    let dst_row_stride = h * 3;
+    for r0 in (0..h).step_by(TILE) {
+        let r_end = (r0 + TILE).min(h);
+        for c0 in (0..w).step_by(TILE) {
+            let c_end = (c0 + TILE).min(w);
+            for r in r0..r_end {
+                let src_row_off = r * w * 3;
+                for c in c0..c_end {
+                    let si = src_row_off + c * 3;
+                    let di = c * dst_row_stride + r * 3;
+                    dst[di]     = src[si];
+                    dst[di + 1] = src[si + 1];
+                    dst[di + 2] = src[si + 2];
+                }
+            }
+        }
+    }
+    dst
+}
+
+/// Transpose along the anti-diagonal: dst[w-1-c, h-1-r] = src[r, c]. Output dims: (h, w). (EXIF 7)
+///
+/// Tile-blocked (TILE × TILE) to stay L1-resident.
+pub fn anti_transpose_u16(src: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let mut dst = vec![0u16; src.len()];
+    // dst dims: w_dst = h, h_dst = w.  dst[w-1-c, h-1-r] with dst-row-stride = h*3.
+    let dst_row_stride = h * 3;
+    for r0 in (0..h).step_by(TILE) {
+        let r_end = (r0 + TILE).min(h);
+        for c0 in (0..w).step_by(TILE) {
+            let c_end = (c0 + TILE).min(w);
+            for r in r0..r_end {
+                let src_row_off = r * w * 3;
+                for c in c0..c_end {
+                    let si = src_row_off + c * 3;
+                    let di = (w - 1 - c) * dst_row_stride + (h - 1 - r) * 3;
+                    dst[di]     = src[si];
+                    dst[di + 1] = src[si + 1];
+                    dst[di + 2] = src[si + 2];
+                }
+            }
+        }
+    }
+    dst
+}
+
 #[cfg(test)]
 mod pixel_buffer_validation_tests {
     use super::*;
@@ -4432,5 +4641,37 @@ mod downscale_recip_parity_tests {
             W,
             H
         );
+    }
+}
+
+#[cfg(test)]
+mod orientation_u16_tests {
+    use super::*;
+
+    #[test]
+    fn apply_orientation_u16_rotate_90_cw() {
+        // 2x1 image, pixels A=(1,2,3) B=(4,5,6) laid left-to-right.
+        // EXIF orientation 6 = rotate 90 CW -> becomes 1x2, top pixel = A, bottom = B.
+        let rgb: Vec<u16> = vec![1, 2, 3, 4, 5, 6];
+        let (out, w, h) = apply_orientation_u16(rgb, 2, 1, 6);
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn apply_orientation_u16_identity() {
+        let rgb: Vec<u16> = vec![10, 20, 30, 40, 50, 60];
+        let (out, w, h) = apply_orientation_u16(rgb.clone(), 2, 1, 1);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(out, rgb);
+    }
+
+    #[test]
+    fn apply_orientation_u16_flip_h() {
+        // orientation 2 = flip horizontal. 2x1: A B -> B A.
+        let rgb: Vec<u16> = vec![1, 2, 3, 4, 5, 6];
+        let (out, w, h) = apply_orientation_u16(rgb, 2, 1, 2);
+        assert_eq!((w, h), (2, 1));
+        assert_eq!(out, vec![4, 5, 6, 1, 2, 3]);
     }
 }
