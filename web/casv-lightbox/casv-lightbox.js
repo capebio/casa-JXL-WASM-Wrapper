@@ -606,7 +606,9 @@ export class CasvLightbox {
     if (!this.el.encodeProgress || this.el.encodeProgress.hidden) return;
     let frac = null, label = '';
     if (stage === 'extract') {
-      label = 'Extracting frames from video…';
+      // ffmpeg gives no upfront total → indeterminate bar, but show the live
+      // frame count so the (often slow) extraction visibly advances.
+      label = done > 0 ? `Extracting frames from video… (${done})` : 'Extracting frames from video…';
     } else if (stage === 'decode') {
       label = `Reading frame ${done} / ${total}`;
       frac = total ? done / total : null;
