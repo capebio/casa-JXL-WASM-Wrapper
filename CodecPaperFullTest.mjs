@@ -5,8 +5,9 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import sharp from "sharp";
 import { fetchKodak } from "./scripts/fetch-kodak.mjs";
-import { initCodecCompareJxl, loadTargetRgba, perceptualComparer, butteraugliDistance, makeJxlAdapter } from "./benchmark/codec-compare-jxl.mjs";
-import { ADAPTERS, jxlOrigLossless, jxlOrigDecode } from "./benchmark/codec-adapters.mjs";
+import { initCodecCompareJxl, loadTargetRgba, perceptualComparer, butteraugliDistance, makeJxlAdapter, loadTarget16, butteraugliDistance16, makeJxlAdapter16 } from "./benchmark/codec-compare-jxl.mjs";
+import { ADAPTERS, jxlOrigLossless, jxlOrigDecode, ADAPTERS16 } from "./benchmark/codec-adapters.mjs";
+import { psnr16, ssim16 } from "./benchmark/metrics16.mjs";
 import { sweepQualityLadder } from "./benchmark/rd-sweep.mjs";
 import { searchQuality } from "./benchmark/butteraugli-search.mjs";
 import { bdRate } from "./benchmark/bd-rate.mjs";
@@ -47,7 +48,7 @@ async function loadCorpus() {
     catch (e) { log("skip", basename(p), e.message); }
   }
   for (const p of RAW_FILES) {
-    try { const r = await loadTargetRgba(p); corpus.push({ id: r.file, class: "raw", rgba: r.rgba, width: r.tgtW, height: r.tgtH }); }
+    try { const r = await loadTargetRgba(p); corpus.push({ id: r.file, class: "raw", rgba: r.rgba, width: r.tgtW, height: r.tgtH, srcPath: p }); }
     catch (e) { log("skip RAW", basename(p), e.message); }
   }
   return corpus;
@@ -65,10 +66,10 @@ const LOSSLESS = {
 };
 
 function emitAndDeliver(data, corpus, runTimestamp) {
-  const { sweep, timed, fixed, lossless } = data;
+  const { sweep, timed, fixed, lossless, sweep16, lossless16 } = data;
   try {
     mkdirSync(OUT_DIR, { recursive: true });
-    const { files } = writeFiguresFull({ outDir: OUT_DIR, sweep, timed, fixed, lossless, corpus });
+    const { files } = writeFiguresFull({ outDir: OUT_DIR, sweep, timed, fixed, lossless, corpus, sweep16 });
     // per-file table at fixed point
     const perFile = corpus.map(img => {
       const j = fixed.filter(p => p.image === img.id && p.codec === "jxl");
@@ -85,11 +86,11 @@ function emitAndDeliver(data, corpus, runTimestamp) {
     const ours = fixed.filter(p => p.codec === "jxl"), orig = fixed.filter(p => p.codec === "jxl_orig");
     const pct = (a, b, k) => avg(a, r => r[k]) / avg(b, r => r[k]) * 100;
     const oursVsOrig = (ours.length && orig.length) ? { size: pct(ours, orig, "bytes"), encX: 100 / pct(ours, orig, "enc_ms"), decX: 100 / pct(ours, orig, "dec_ms") } : null;
-    writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, bdRowsPsnr, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920)` });
+    writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, bdRowsPsnr, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920); 16-bit RD: RAW-derived, JXL+AVIF (+PNG-16 lossless)` });
     // data toon (compact) + full JSON dump (enables regen + new metrics without re-running)
     const stamp = runTimestamp.replace(/[:.]/g, "-");
-    writeFileSync(join(OUT_DIR, `${stamp}-CodecPaperFull-general.toon`), `TestName: CodecPaperFull - general\nRunTimestamp: ${runTimestamp}\nsweep_rows: ${sweep.length}\ntimed_rows: ${timed.length}\nfixed_rows: ${fixed.length}\nlossless_rows: ${lossless.length}\n`);
-    writeFileSync(join(OUT_DIR, "data.json"), JSON.stringify({ runTimestamp, sweep, timed, fixed, lossless }));
+    writeFileSync(join(OUT_DIR, `${stamp}-CodecPaperFull-general.toon`), `TestName: CodecPaperFull - general\nRunTimestamp: ${runTimestamp}\nsweep_rows: ${sweep.length}\ntimed_rows: ${timed.length}\nfixed_rows: ${fixed.length}\nlossless_rows: ${lossless.length}\nsweep16_rows: ${sweep16.length}\nlossless16_rows: ${lossless16.length}\n`);
+    writeFileSync(join(OUT_DIR, "data.json"), JSON.stringify({ runTimestamp, sweep, timed, fixed, lossless, sweep16, lossless16 }));
     // deliver to Jose
     try {
       mkdirSync(join(JOSE, "figures"), { recursive: true });
@@ -112,7 +113,7 @@ async function main() {
   log(`START ${corpus.length} images, ${ADAPTERS.length + 1} codecs`);
   const jxlShim = { key: "jxl", runtime: "wasm", encode: (r, w, h, q) => jxl.encode(r, w, h, q), decode: (b) => jxl.decode(b) };
   const allCodecs = [jxlShim, ...ADAPTERS];
-  const data = { sweep: [], timed: [], fixed: [], lossless: [] };
+  const data = { sweep: [], timed: [], fixed: [], lossless: [], sweep16: [], lossless16: [] };
 
   for (let i = 0; i < corpus.length; i++) {
     const img = corpus[i];
@@ -156,6 +157,46 @@ async function main() {
         const enc_ms = await medMs(N_TIME, () => L.enc(img.rgba, img.width, img.height));
         data.lossless.push({ image: img.id, class: img.class, codec: key, runtime: L.rt, bytes: b.length, bpp: b.length * 8 / npx, enc_ms });
       } catch (_) { /* lossless not supported / failed — skip */ }
+    }
+    // 16-bit pass (RAW-derived images only)
+    if (img.class === "raw" && img.srcPath) {
+      try {
+        const { rgba16, tgtW, tgtH } = await loadTarget16(img.srcPath);
+        const npx16 = tgtW * tgtH;
+        const codecs16 = [
+          { ...makeJxlAdapter16(), key: "jxl", runtime: "wasm" },
+          ...ADAPTERS16.filter(a => a.key !== "png16"),
+        ];
+        for (const c of codecs16) {
+          try {
+            for (const q of [40, 60, 80, 95]) {
+              const b = await c.encode(rgba16, tgtW, tgtH, q);
+              const dec = await c.decode(b);
+              const psnrVal = psnr16(rgba16, dec.data, tgtW, tgtH);
+              const ssimVal = ssim16(rgba16, dec.data, tgtW, tgtH);
+              const bt16 = await butteraugliDistance16(rgba16, dec.data, tgtW, tgtH);
+              data.sweep16.push({
+                image: img.id, class: "raw", codec: c.key, runtime: c.runtime,
+                quality: q, bytes: b.length, bpp: b.length * 8 / npx16,
+                psnr16: psnrVal, ssim16: ssimVal,
+                ...(bt16 != null ? { butteraugli16: bt16 } : {}),
+              });
+            }
+          } catch (e) { log("codec16 fail", img.id, c.key, e.message); }
+        }
+        // PNG-16 lossless anchor
+        const png16 = ADAPTERS16.find(a => a.key === "png16");
+        if (png16) {
+          try {
+            const b = await png16.encode(rgba16, tgtW, tgtH);
+            const dec = await png16.decode(b);
+            let totalErr = 0;
+            for (let k = 0; k < rgba16.length; k++) totalErr += Math.abs(rgba16[k] - dec.data[k]);
+            if (totalErr !== 0) { log("png16 not lossless", img.id, totalErr); }
+            else { data.lossless16.push({ image: img.id, class: "raw", codec: "png16", runtime: "native", bytes: b.length, bpp: b.length * 8 / npx16 }); }
+          } catch (e) { log("codec16 fail", img.id, "png16", e.message); }
+        }
+      } catch (e) { log("16-bit pass fail", img.id, e.message); }
     }
     try { pc.free(); } catch (_) {}
     log(`✓ ${i + 1}/${corpus.length} ${img.id}`);
