@@ -283,6 +283,40 @@ export async function computeButteraugli(pixels1, pixels2, width, height) {
             module._free(ptr2);
     }
 }
+/**
+ * Compute Butteraugli perceptual distance between two RGBA16 images.
+ * Both pixel buffers must represent the same width×height image in RGBA16 format (8 bytes/px).
+ * Returns the p3 Butteraugli distance (0 = identical, ~1.0 = imperceptible, >2.0 = noticeable).
+ * Requires a WASM build with the 16-bit butteraugli bridge (jxl_wasm_butteraugli_compare16).
+ */
+export async function computeButteraugli16(pixels1, pixels2, width, height) {
+    const module = await loadLibjxlModule();
+    if (!module._jxl_wasm_butteraugli_compare16) {
+        throw new CapabilityMissing("Butteraugli16 requires a rebuilt WASM with 16-bit butteraugli bridge");
+    }
+    const pixelSize = width * height * 4 * 2;
+    const view1 = copyOrBorrowInput(pixels1, false);
+    const view2 = copyOrBorrowInput(pixels2, false);
+    if (view1.byteLength < pixelSize || view2.byteLength < pixelSize) {
+        throw new Error(`computeButteraugli16: expected ${pixelSize} bytes for ${width}×${height} RGBA16, got ${view1.byteLength}/${view2.byteLength}`);
+    }
+    const ptr1 = mallocOrThrow(module, pixelSize, "Butteraugli16 image A");
+    let ptr2 = 0;
+    try {
+        ptr2 = mallocOrThrow(module, pixelSize, "Butteraugli16 image B");
+        module.HEAPU8.set(view1.subarray(0, pixelSize), ptr1);
+        module.HEAPU8.set(view2.subarray(0, pixelSize), ptr2);
+        const bits = module._jxl_wasm_butteraugli_compare16(ptr1, ptr2, width, height);
+        if (bits < 0)
+            throw new Error("Butteraugli16 WASM compare failed");
+        return floatFromI32Bits(bits);
+    }
+    finally {
+        module._free(ptr1);
+        if (ptr2 !== 0)
+            module._free(ptr2);
+    }
+}
 export class ButteraugliComparator {
     module;
     width;
