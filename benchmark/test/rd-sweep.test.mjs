@@ -8,8 +8,8 @@ const fake = {
   async encode(rgba, w, h, q) { return new Uint8Array(q * 10); },
   async decode(bytes) { return { data: new Uint8Array([bytes.length & 0xff]), width: 2, height: 2, _n: bytes.length }; },
 };
-// metrics injected: butteraugli falls as bytes rise; ssim fixed.
-const metrics = async (decoded) => ({ butteraugli: 1000 / decoded._n, ssim: 0.99 });
+// metrics injected: butteraugli falls as bytes rise; ssim + psnr fixed. All fields must forward.
+const metrics = async (decoded) => ({ butteraugli: 1000 / decoded._n, ssim: 0.99, psnr: 42.5 });
 
 test("returns one point per ladder quality with bytes/bpp/butter/ssim from injected metrics", async () => {
   const pts = await sweepQualityLadder(fake, { rgba: new Uint8Array(), width: 2, height: 2, npx: 100, metrics, ladder: [25, 50, 100] });
@@ -18,7 +18,7 @@ test("returns one point per ladder quality with bytes/bpp/butter/ssim from injec
   assert.equal(pts[1].bytes, 500);            // q=50 -> 500 bytes
   assert.equal(pts[1].bpp, (500 * 8) / 100);  // bpp = bytes*8/npx
   assert.equal(pts[2].butteraugli, 1000 / 1000); // q=100 -> 1000 bytes -> butter 1.0
-  assert.ok(pts.every(p => p.ssim === 0.99 && p.codec === "fake" && p.runtime === "wasm"));
+  assert.ok(pts.every(p => p.ssim === 0.99 && p.psnr === 42.5 && p.codec === "fake" && p.runtime === "wasm"));
 });
 
 test("DEFAULT_LADDER is 8 ascending points in 1..100", () => {

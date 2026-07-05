@@ -16,8 +16,12 @@ function seriesBy(rows, xKey, yKey, transform = (v) => v) {
   const out = [];
   for (const codec of [...byCodec.keys()].sort(byFamily)) {
     const qmap = byCodec.get(codec);
-    const points = [...qmap.values()].map(arr => ({ x: avg(arr, r => r[xKey]), y: transform(avg(arr, r => r[yKey])) })).sort((a, b) => a.x - b.x);
-    out.push({ label: codec, color: PALETTE[codec] || "#000", points });
+    const points = [...qmap.values()]
+      .map(arr => ({ x: avg(arr, r => r[xKey]), y: transform(avg(arr, r => r[yKey])) }))
+      // drop non-finite points (e.g. PSNR = Infinity for lossless PNG) so the SVG never gets NaN coords
+      .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y))
+      .sort((a, b) => a.x - b.x);
+    if (points.length) out.push({ label: codec, color: PALETTE[codec] || "#000", points });
   }
   return out;
 }
