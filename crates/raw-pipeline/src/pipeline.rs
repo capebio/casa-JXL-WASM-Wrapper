@@ -3844,7 +3844,7 @@ mod downscale_recip_parity_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod orientation_u16_tests {
     use super::*;
 
     #[test]
