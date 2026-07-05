@@ -64,6 +64,18 @@ export function suggestExportName(sourceName) {
   return `${base || 'casava-export'}.casv`;
 }
 
+/**
+ * Suggested output filename for an *encode*: retain the full source filename
+ * (extension included) and append `.casv` — e.g. `holiday.mp4` → `holiday.mp4.casv`.
+ * Unlike suggestExportName (which swaps the extension of an already-`.casv`
+ * name), encoding a foreign source keeps the original name intact so the origin
+ * is obvious. `sourcePath` may be a full path or bare name.
+ */
+export function suggestEncodeName(sourcePath) {
+  const name = String(sourcePath || '').split(/[\\/]/).pop() || '';
+  return name ? `${name}.casv` : 'casava-encode.casv';
+}
+
 const basename = (path) => String(path || '').split(/[\\/]/).pop() || String(path || '');
 const extOf = (path) => {
   const m = String(path || '').toLowerCase().match(/\.([^.\\/]+)$/);
@@ -147,5 +159,9 @@ export function buildEncodeRequest(form) {
     rate, distance, effort, gop, skip, tile, thresh,
     fpsNum, fpsDen, dim,
     outputPath: form.outputPath || null,
+    // Default filename for the native save dialog: keep the source name and add
+    // `.casv` (e.g. clip.mp4 → clip.mp4.casv). Native encode_casv_video should
+    // seed the save dialog with this when outputPath is null.
+    outputName: suggestEncodeName(paths[0]),
   };
 }

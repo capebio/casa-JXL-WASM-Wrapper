@@ -49,6 +49,11 @@ Three Tauri commands (compiled — `cargo check` clean under MSVC):
 - `casv_pick_images(app) -> Vec<String>` — native image open dialog.
 - `encode_casv_video(app, request) -> String` — spawns the sidecar; if
   `request.outputPath` is absent, opens a native save dialog; returns the path.
+  **Seed the save dialog's default filename with `request.outputName`** (JS sets
+  it via `suggestEncodeName`: the full source name + `.casv`, e.g.
+  `holiday.mp4` → `holiday.mp4.casv`). Rust: `dialog.set_file_name(&request.output_name)`
+  (field is `outputName` over the wire; `#[serde(rename_all = "camelCase")]`).
+  Fall back to `output.casv` only if `output_name` is empty.
 - `save_casv_bytes(app, bytes, suggestedName) -> String` — native save of the
   currently-loaded `.casv` bytes.
 
