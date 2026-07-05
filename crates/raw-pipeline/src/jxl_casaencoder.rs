@@ -256,12 +256,21 @@ pub struct EncodeOptions {
     pub color: Option<ColorEncoding>,
     pub use_container: bool,
     pub uses_original_profile: bool,
-    /// Codestream spatial downsampling (`JXL_ENC_FRAME_SETTING_RESAMPLING`):
-    /// `Some(1|2|4|8)` encodes at 1/N linear resolution and the decoder upsamples
-    /// back to full size. `None` = libjxl default. A strong quality↔time↔size
-    /// lever (fewer pixels coded) and the mechanism behind the low-res proxy tier.
-    /// Full-resolution input is supplied; libjxl downsamples internally
-    /// (`ALREADY_DOWNSAMPLED` left at its 0 default).
+    /// Codestream spatial downsampling factor (`JXL_ENC_FRAME_SETTING_RESAMPLING`):
+    /// `Some(1|2|4|8)` = encode at 1/N linear resolution, decoder upsamples back;
+    /// `Some(-1)` = libjxl auto (only at low quality); `None` = don't set.
+    ///
+    /// Two ways to use it, picked by [`already_downsampled`](Self::already_downsampled):
+    /// - **standalone** (`already_downsampled = None`, full-res buffer): libjxl
+    ///   downsamples internally with a quality-optimized fit. This is SLOW — measured
+    ///   ~5–10× slower at factor 2 than a full-res encode — so it is only for offline
+    ///   / archival work where encode time is free. **Do NOT use it as a "make it
+    ///   faster" lever.**
+    /// - **fast** (paired with `already_downsampled`, via
+    ///   [`EncodeOptions::with_predownsampled`] / [`encode_rgb8_downsampled`]): the
+    ///   caller pre-downsamples, so the encoder only touches the small image. This is
+    ///   ~2× faster than a full-res encode at byte/PSNR parity with the standalone
+    ///   path — the recommended way to get a reduced-resolution codestream.
     pub resampling: Option<i64>,
     /// Favour decode speed over size (`JXL_ENC_FRAME_SETTING_DECODING_SPEED`,
     /// `0`..=`4`). `None` = libjxl default. Relevant to video: decode is the only
