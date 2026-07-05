@@ -35,11 +35,23 @@ test('speedToSettings maps 0..100 to monotone effort/distance', () => {
   assert.deepEqual(speedToSettings('x'), speedToSettings(50));
 });
 
-test('PROXY_PRESET is a fast lossy 720p tile proxy', () => {
-  assert.equal(PROXY_PRESET.rate, 'lossy');
+test('PROXY_PRESET is a fast full-dim proxy (factor 2)', () => {
   assert.equal(PROXY_PRESET.effort, 1);
-  assert.equal(PROXY_PRESET.dim, '720');
-  assert.equal(PROXY_PRESET.skip, 'tile');
+  assert.equal(PROXY_PRESET.proxyFactor, 2);
+});
+
+test('buildEncodeRequest proxy mode → rate proxyN, all-intra, exact dim', () => {
+  const r = buildEncodeRequest({
+    sourceKind: 'video', inputPaths: ['a.mp4'], proxyFactor: 2, distance: 1.5, effort: 1,
+  });
+  assert.equal(r.rate, 'proxy2');
+  assert.equal(r.skip, 'none');      // proxy is all-intra
+  assert.equal(r.dim, 'exact');      // ffmpeg delivers full res; proxy downsamples internally
+  assert.equal(r.proxyFactor, 2);
+  // factor < 2 stays a normal lossy encode
+  const n = buildEncodeRequest({ sourceKind: 'video', inputPaths: ['a.mp4'], proxyFactor: 0 });
+  assert.equal(n.rate, 'lossy');
+  assert.equal(n.proxyFactor, 0);
 });
 
 test('defaultThreshForDistance = distance*4 clamped to 16', () => {

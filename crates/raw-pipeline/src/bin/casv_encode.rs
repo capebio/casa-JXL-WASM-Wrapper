@@ -23,9 +23,10 @@
 //! Prints `OK <bytes> <out>` on success; exits non-zero with a message on error.
 
 use raw_pipeline::casa_video::{
-    default_thresh_for_distance, encode_casv_video, encode_casv_video_with_audio_progress,
-    CasaVideoOptions, SkipMode, VideoRate,
+    default_thresh_for_distance, encode_casv_proxy_rgb8, encode_casv_video,
+    encode_casv_video_with_audio_progress, CasaVideoOptions, SkipMode, VideoRate,
 };
+use raw_pipeline::jxl_casaencoder::EncodeOptions;
 
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("casv_encode: {msg}");
@@ -211,6 +212,33 @@ fn run_video_mode(args: &[String]) -> ! {
                 .into_raw(),
         );
         progress("decode", i + 1, n);
+    }
+
+    // Full-dimensioned editor proxy: rate = "proxy2" / "proxy4" (any "proxy<N>").
+    // All-intra, each frame stored at 1/N res but declaring full dims (self-
+    // upsampling on decode) — a fast, dimension-identical, instant-random-access
+    // scrub stand-in. No audio (a proxy is for editing, not playback).
+    if let Some(factor) = args[5]
+        .strip_prefix("proxy")
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        progress("encode", 0, n);
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_proxy_rgb8(
+            &refs,
+            w,
+            h,
+            fps_num.max(1),
+            fps_den.max(1),
+            factor.max(1),
+            EncodeOptions::distance(distance).with_effort(effort.clamp(1, 10)),
+        )
+        .unwrap_or_else(|e| fail(format!("proxy encode failed: {e:?}")));
+        progress("encode", n, n);
+        std::fs::write(out_casv, &bytes)
+            .unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
+        println!("OK {} {}", bytes.len(), out_casv);
+        std::process::exit(0);
     }
 
     let rate = match args[5].as_str() {

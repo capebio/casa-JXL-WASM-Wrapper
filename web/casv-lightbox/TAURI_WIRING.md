@@ -70,6 +70,24 @@ and prefers the `tauri-plugin-dialog` `open` else falls back to
 `casv_pick_images`. JS `camelCase` fields map to the Rust struct via
 `#[serde(rename_all = "camelCase")]`.
 
+## Preview proxy (full-dimensioned, fast)
+
+The lightbox **Preview proxy** button sets `request.rate = "proxy2"` (or `proxy4`)
+and `request.proxyFactor = 2`. The sidecar's `--video` path recognises any
+`proxy<N>` rate and encodes via `casa_video::encode_casv_proxy_rgb8`: all-intra,
+each frame stored at 1/N linear resolution but declaring the **full** dimensions,
+so it self-upsamples on decode. The result is a dimension-identical, instant-
+random-access scrub proxy that encodes ~2× (factor 2) to ~4× (factor 4) faster
+than a full-res encode; decode is the unchanged `.casv` path (each frame upsamples
+to the declared size). No audio (a proxy is for editing, not playback).
+
+**Cross-repo glue (app repo — one change):** `encode_casv_video` must pass
+`request.rate` **verbatim** as the sidecar `<rate>` arg — it already forwards
+`lossy`/`lossless`, so just don't reject a `proxy<N>` value — and pass
+`request.dim` (which `buildEncodeRequest` already forces to `"exact"` in proxy
+mode, so ffmpeg delivers full-res frames the proxy then downsamples internally).
+`proxyFactor` rides along for display only; nothing else changes.
+
 ## Encode progress (x / y)
 
 The sidecar prints progress to **stderr** as it runs, one line per event:

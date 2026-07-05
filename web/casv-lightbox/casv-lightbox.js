@@ -456,6 +456,7 @@ export class CasvLightbox {
   // ── Encode (Tauri) ──────────────────────────────────────────────────
   _applyPreset(name) {
     const p = PRESETS[name] || PRESETS.balanced;
+    this._proxyFactor = 0; // presets are normal (non-proxy) encodes
     this.el.preset.value = name in PRESETS ? name : 'balanced';
     this.el.distance.value = String(p.distance);
     this.el.effort.value = String(p.effort);
@@ -471,6 +472,7 @@ export class CasvLightbox {
    *  slider (see speedToSettings). Implies the lossy tier. */
   _applySpeed(speed) {
     const s = speedToSettings(speed);
+    this._proxyFactor = 0; // slider is a normal (non-proxy) lossy encode
     if (this._curPreset === 'archive') this._curPreset = 'balanced';
     this.el.distance.value = String(s.distance);
     this.el.effort.value = String(s.effort);
@@ -484,18 +486,17 @@ export class CasvLightbox {
     if (this.el.presetHelp) this.el.presetHelp.textContent = 'Custom speed (slider).';
   }
 
-  /** Fast low-res proxy for scrubbing / live editing (PROXY_PRESET): 720p via
-   *  the `dim` downscale + fastest effort + coarse distance. Lossy. */
+  /** Fast full-dimensioned proxy for scrubbing / live editing (PROXY_PRESET):
+   *  all-intra, half-res-inside / full-size-out (self-upsampling), fastest
+   *  effort. Sets proxyFactor so _onEncode requests the native proxy path. */
   _applyProxy() {
     const p = PROXY_PRESET;
     if (this._curPreset === 'archive') this._curPreset = 'balanced';
+    this._proxyFactor = p.proxyFactor;
     this.el.distance.value = String(p.distance);
     this.el.effort.value = String(p.effort);
-    this.el.skip.value = p.skip;
-    this.el.tile.value = String(p.tile);
     this.el.distance.disabled = false;
     this.el.preset.value = 'balanced';
-    if (this.encodeSourceKind === 'video' && p.dim) this.el.dim.value = p.dim;
     if (this.el.presetHelp) this.el.presetHelp.textContent = p.hint;
   }
 
@@ -564,6 +565,7 @@ export class CasvLightbox {
         tile: this.el.tile.value,
         thresh: this.el.thresh.value,
         dim: this.el.dim.value,
+        proxyFactor: this._proxyFactor || 0,
         autoFps: this.el.autoFps.checked,
         fpsNum: this.el.fpsNum.value,
         fpsDen: this.el.fpsDen.value,

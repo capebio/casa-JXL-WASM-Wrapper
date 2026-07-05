@@ -41,8 +41,8 @@
 
 use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
 use crate::jxl_casaencoder::{
-    encode_chunked_threaded, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame,
-    WholeImageSource,
+    encode_chunked_threaded, encode_rgb8, encode_rgb8_downsampled, EncodeError, EncodeOptions,
+    Encoder, Frame, WholeImageSource,
 };
 use rayon::prelude::*;
 
@@ -1235,6 +1235,72 @@ pub fn encode_casv_rgb8(
         offset += s.len();
     }
     // Data.
+    for s in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
+/// Encode a **full-dimensioned low-resolution proxy** `.casv`: every frame is an
+/// independent JXL codestream that stores `1/factor` linear resolution but
+/// declares the full `width×height`, so the decoder upsamples each frame back to
+/// full size ([`encode_rgb8_downsampled`]). All-intra (Architecture A) — instant
+/// random access, ideal for editor scrubbing — and ~2–5× faster to encode than a
+/// full-resolution all-intra `.casv` because each frame codes only `1/factor²`
+/// the pixels. The output is dimension-identical to the full-res encode, so it
+/// drops in 1:1 as a scrubbing proxy and decodes with the **unchanged**
+/// [`decode_casv_all_rgb8`] (each frame self-upsamples to the declared dims).
+/// `factor == 1` is byte-identical to [`encode_casv_rgb8`].
+pub fn encode_casv_proxy_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    factor: u32,
+    opts: EncodeOptions,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+
+    // Independent frames → encode in parallel (order preserved by collect).
+    let streams: Vec<Vec<u8>> = frames
+        .par_iter()
+        .enumerate()
+        .map(|(idx, px)| {
+            if px.len() != expected {
+                return Err(VideoError::FrameSize {
+                    idx,
+                    expected,
+                    got: px.len(),
+                });
+            }
+            Ok(encode_rgb8_downsampled(px, width, height, factor, opts.clone())?)
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
+
+    // Container declares the FULL dims; each frame's codestream self-upsamples.
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: frames.len() as u32,
+        fps_num,
+        fps_den,
+        flags: 0,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|s| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for s in &streams {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        offset += s.len();
+    }
     for s in &streams {
         out.extend_from_slice(s);
     }
@@ -2827,6 +2893,33 @@ mod tests {
         for (i, (px, dw, dh)) in all.iter().enumerate() {
             assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
             assert_eq!(px, &src[i], "frame {i} must be byte-exact (lossless)");
+        }
+    }
+
+    #[test]
+    fn proxy_encode_decodes_to_full_size_and_is_all_intra() {
+        // Dims divisible by 4 so factor 2/4 downsample cleanly. The proxy declares
+        // full dims; every frame self-upsamples on decode.
+        let (w, h) = (32u32, 24u32);
+        let src: Vec<Vec<u8>> = (0..3).map(|s| gradient(w, h, (s * 40) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+
+        // factor 1 == plain all-intra, byte-identical to encode_casv_rgb8.
+        let p1 = encode_casv_proxy_rgb8(&refs, w, h, 24, 1, 1, EncodeOptions::distance(1.0)).unwrap();
+        let a1 = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(1.0)).unwrap();
+        assert_eq!(p1, a1, "factor 1 proxy must equal encode_casv_rgb8");
+
+        // factor 2 proxy: smaller, all-intra, decodes to full dims via self-upsampling.
+        let p2 = encode_casv_proxy_rgb8(&refs, w, h, 24, 1, 2, EncodeOptions::distance(1.0)).unwrap();
+        assert!(p2.len() < a1.len(), "proxy must be smaller than full-res all-intra");
+        let all = decode_casv_all_rgb8(&p2).expect("decode proxy");
+        assert_eq!(all.len(), 3);
+        for (i, (px, dw, dh)) in all.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} decodes to full dims");
+            assert_eq!(px.len(), (w * h * 3) as usize);
+        }
+        for i in 0..3 {
+            assert!(!casv_frame_info(&p2, i).unwrap().0, "proxy frame {i} must be I (all-intra)");
         }
     }
 

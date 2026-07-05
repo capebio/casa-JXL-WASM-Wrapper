@@ -50,16 +50,16 @@ export function speedToSettings(speed) {
 }
 
 /**
- * Fast low-resolution **proxy** encode for scrubbing / live editing in a video
- * editor: quarter-ish resolution via the existing `dim` downscale + fastest
- * effort + coarse distance + tile replace-skip. The final export re-encodes at
- * full settings. This is the "real-time preview" tier — decode of a 720p
- * fast-effort stream is well inside the ~41ms/frame @24fps budget.
+ * Fast **full-dimensioned** proxy for scrubbing / live editing in a video editor.
+ * `proxyFactor` 2 = each frame stores half-resolution but the codestream declares
+ * the full size, so it self-upsamples on decode — the proxy is dimension-identical
+ * to the final (overlays 1:1, no UI reflow when you swap proxy↔final) yet ~2×
+ * faster to encode (~4× at factor 4) and all-intra (instant random-access scrub).
+ * Maps to the native `encode_casv_proxy_rgb8` path via rate `proxy<N>`.
  */
 export const PROXY_PRESET = {
-  label: 'Preview proxy', rate: 'lossy', distance: 2.0, effort: 1,
-  skip: 'tile', tile: 32, dim: '720',
-  hint: 'Fast low-resolution proxy for scrubbing and live editing. Re-encode at full resolution for the final file.',
+  label: 'Preview proxy', distance: 1.5, effort: 1, proxyFactor: 2,
+  hint: 'Fast full-size proxy (half-res inside, upsamples on decode) for scrubbing / live editing. Re-encode at full quality for the final file.',
 };
 
 /** Short badge for a frame's container entry (from casv-web CasvFrameEntry). */
@@ -175,8 +175,16 @@ export function buildEncodeRequest(form) {
     e.code = 'BAD_INPUT';
     throw e;
   }
-  const rate = form.rate === 'lossless' ? 'lossless' : 'lossy';
-  const skip = ['none', 'bbox', 'tile'].includes(form.skip) ? form.skip : 'none';
+  // Full-dimensioned proxy mode (proxyFactor 2/4): all-intra, each frame stored at
+  // 1/N res but declaring full dims. rate becomes `proxy<N>` for the native path.
+  const proxyFactor = Math.round(CLAMP(form.proxyFactor, 0, 8, 0));
+  const isProxy = proxyFactor >= 2;
+  const rate = isProxy
+    ? `proxy${proxyFactor}`
+    : (form.rate === 'lossless' ? 'lossless' : 'lossy');
+  // Proxy is all-intra and downsamples internally, so it never uses skip and needs
+  // ffmpeg to deliver full-resolution frames (dim = exact).
+  const skip = isProxy ? 'none' : (['none', 'bbox', 'tile'].includes(form.skip) ? form.skip : 'none');
   const distance = rate === 'lossless' ? 0 : CLAMP(form.distance, 0.1, 15, 1.0);
   const effort = Math.round(CLAMP(form.effort, 1, 10, rate === 'lossless' ? 7 : 3));
   const gop = Math.round(CLAMP(form.gop, 1, 600, 24));
@@ -187,15 +195,17 @@ export function buildEncodeRequest(form) {
   const thresh = form.thresh == null || form.thresh === ''
     ? defaultThreshForDistance(distance)
     : Math.round(CLAMP(form.thresh, 0, 255, 0));
-  const dim = sourceKind === 'video'
-    ? (['exact', '2160', '1440', '1080', '720', '512'].includes(String(form.dim)) ? String(form.dim) : 'exact')
-    : null;
+  const dim = sourceKind !== 'video'
+    ? null
+    : isProxy
+      ? 'exact'
+      : (['exact', '2160', '1440', '1080', '720', '512'].includes(String(form.dim)) ? String(form.dim) : 'exact');
 
   return {
     sourceKind,
     inputPaths: paths,
     rate, distance, effort, gop, skip, tile, thresh,
-    fpsNum, fpsDen, dim,
+    fpsNum, fpsDen, dim, proxyFactor,
     outputPath: form.outputPath || null,
     // Default filename for the native save dialog: keep the source name and add
     // `.casv` (e.g. clip.mp4 → clip.mp4.casv). Native encode_casv_video should
