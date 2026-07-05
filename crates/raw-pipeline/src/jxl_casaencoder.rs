@@ -207,6 +207,7 @@ pub enum ColorEncoding {
 pub enum FrameSettingId {
     Effort,
     DecodingSpeed,
+    Resampling,
     GroupOrder,
     GroupOrderCenterX,
     GroupOrderCenterY,
@@ -226,6 +227,7 @@ impl FrameSettingId {
         match self {
             FrameSettingId::Effort => F::JXL_ENC_FRAME_SETTING_EFFORT,
             FrameSettingId::DecodingSpeed => F::JXL_ENC_FRAME_SETTING_DECODING_SPEED,
+            FrameSettingId::Resampling => F::JXL_ENC_FRAME_SETTING_RESAMPLING,
             FrameSettingId::GroupOrder => F::JXL_ENC_FRAME_SETTING_GROUP_ORDER,
             FrameSettingId::GroupOrderCenterX => F::JXL_ENC_FRAME_SETTING_GROUP_ORDER_CENTER_X,
             FrameSettingId::GroupOrderCenterY => F::JXL_ENC_FRAME_SETTING_GROUP_ORDER_CENTER_Y,
@@ -252,6 +254,17 @@ pub struct EncodeOptions {
     pub color: Option<ColorEncoding>,
     pub use_container: bool,
     pub uses_original_profile: bool,
+    /// Codestream spatial downsampling (`JXL_ENC_FRAME_SETTING_RESAMPLING`):
+    /// `Some(1|2|4|8)` encodes at 1/N linear resolution and the decoder upsamples
+    /// back to full size. `None` = libjxl default. A strong quality↔time↔size
+    /// lever (fewer pixels coded) and the mechanism behind the low-res proxy tier.
+    /// Full-resolution input is supplied; libjxl downsamples internally
+    /// (`ALREADY_DOWNSAMPLED` left at its 0 default).
+    pub resampling: Option<i64>,
+    /// Favour decode speed over size (`JXL_ENC_FRAME_SETTING_DECODING_SPEED`,
+    /// `0`..=`4`). `None` = libjxl default. Relevant to video: decode is the only
+    /// real-time budget (~41.6 ms/frame @24fps).
+    pub decoding_speed: Option<i64>,
     /// Escape hatch: any present/future libjxl frame-setting knob.
     pub extra: Vec<(FrameSettingId, i64)>,
 }
@@ -266,6 +279,8 @@ impl Default for EncodeOptions {
             color: None,
             use_container: false,
             uses_original_profile: false,
+            resampling: None,
+            decoding_speed: None,
             extra: Vec::new(),
         }
     }
@@ -292,6 +307,16 @@ impl EncodeOptions {
     }
     pub fn with_effort(mut self, effort: u8) -> Self {
         self.effort = effort;
+        self
+    }
+    /// Set codestream resampling (1/2/4/8); see [`EncodeOptions::resampling`].
+    pub fn with_resampling(mut self, factor: i64) -> Self {
+        self.resampling = Some(factor);
+        self
+    }
+    /// Set the decode-speed tier (0..=4); see [`EncodeOptions::decoding_speed`].
+    pub fn with_decoding_speed(mut self, tier: i64) -> Self {
+        self.decoding_speed = Some(tier);
         self
     }
 
@@ -641,6 +666,12 @@ impl Encoder {
                 set_opt(fs, enc, FrameSettingId::GroupOrderCenterX, cx)?;
                 set_opt(fs, enc, FrameSettingId::GroupOrderCenterY, cy)?;
             }
+        }
+        if let Some(r) = self.opts.resampling {
+            set_opt(fs, enc, FrameSettingId::Resampling, r)?;
+        }
+        if let Some(ds) = self.opts.decoding_speed {
+            set_opt(fs, enc, FrameSettingId::DecodingSpeed, ds)?;
         }
         for &(id, val) in &self.opts.extra {
             set_opt(fs, enc, id, val)?;
