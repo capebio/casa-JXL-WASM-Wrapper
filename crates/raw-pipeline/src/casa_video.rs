@@ -41,7 +41,8 @@
 
 use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
 use crate::jxl_casaencoder::{
-    encode_chunked, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame, WholeImageSource,
+    encode_chunked_threaded, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame,
+    WholeImageSource,
 };
 use rayon::prelude::*;
 
@@ -711,6 +712,34 @@ pub trait VideoFrameSource {
 ///
 /// v1 buffers the compressed output in RAM (small vs raw frames); a true
 /// stream-to-sink footer format is a later step.
+/// Worker-thread count for the **streaming I-frame** libjxl encode. The
+/// streaming encoders process one frame at a time, so — unlike the rayon
+/// frame-parallel batch encoders — the cores sit idle during each I-frame's
+/// full-res VarDCT encode; a libjxl parallel runner fills them (flip-measured
+/// **1.62×** on all-intra content). The tiny P-frame REPLACE atlases are
+/// deliberately left single-threaded: a changed-tile atlas on typical (low-
+/// motion) content is one libjxl group or less, so the per-frame fork-join
+/// sync would cost more than the parallelism gains (this is the CV-E6 finding;
+/// the JE-8 square atlas fixed the sliver *shape* but not the sub-group *size*,
+/// and the flip sweep confirmed atlas MT is a wash-to-noise there). Threading
+/// only the reliably-large I-frame encode captures the win with no regression
+/// risk. Output is byte-identical across thread counts
+/// (`encode_chunked_threaded` is proven so), so this only moves wall-clock.
+/// `CASV_ENC_THREADS` overrides for A/B (`1` = single-threaded baseline,
+/// `0`/unset = auto = all cores).
+fn resolve_enc_threads() -> usize {
+    if let Ok(v) = std::env::var("CASV_ENC_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 struct StreamCtx {
     width: u32,
     height: u32,
@@ -719,6 +748,8 @@ struct StreamCtx {
     skip: SkipMode,
     tile: u32,
     thresh: u8,
+    /// Worker threads for the I-frame chunked encode (see [`resolve_enc_threads`]).
+    enc_threads: usize,
     /// One `JxlEncoder` handle reused for every P-frame crop/atlas encode
     /// (`encode_into` Resets it between encodes) — kills the per-frame
     /// create/destroy + settings resend and appends compressed bytes straight
@@ -740,6 +771,7 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
     if matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
+    let enc_threads = resolve_enc_threads();
     Ok(StreamCtx {
         width,
         height,
@@ -750,7 +782,10 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
         thresh: opts
             .thresh
             .unwrap_or_else(|| default_thresh_for_distance(distance)),
+        // P-frame atlas encoder stays single-threaded on purpose (see
+        // `resolve_enc_threads`): tiny sub-group atlases lose to fork-join sync.
         enc: Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?,
+        enc_threads,
         changed: Vec::new(),
         bitmap: Vec::new(),
         atlas: Vec::new(),
@@ -848,7 +883,15 @@ fn encode_stream_frame(
             data: px,
             width: width as usize,
         };
-        encode_chunked(width, height, ctx.distance, ctx.effort, &mut isrc, payload)?;
+        encode_chunked_threaded(
+            width,
+            height,
+            ctx.distance,
+            ctx.effort,
+            ctx.enc_threads,
+            &mut isrc,
+            payload,
+        )?;
         return Ok(0);
     }
     if matches!(ctx.skip, SkipMode::Tile) {
