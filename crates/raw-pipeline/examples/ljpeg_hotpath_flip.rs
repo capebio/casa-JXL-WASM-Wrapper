@@ -34,7 +34,8 @@ fn fnv1a_u16(seed: u64, pixels: &[u16]) -> u64 {
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng".into()
+        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng"
+            .into()
     });
     let data = std::fs::read(&path).expect("read DNG");
     let ranges = dng::ljpeg_tile_ranges(&data).expect("ljpeg tile ranges");
@@ -45,7 +46,10 @@ fn main() {
         "file: {}  tiles: {}  tile0: {}x{} cps={} prec={}",
         path.rsplit(['\\', '/']).next().unwrap_or(&path),
         ranges.len(),
-        info0.width, info0.height, info0.components, info0.precision,
+        info0.width,
+        info0.height,
+        info0.components,
+        info0.precision,
     );
 
     let tiles: Vec<(&[u8], usize, usize)> = ranges
@@ -95,6 +99,9 @@ fn main() {
     let min = sorted[0];
     println!(
         "decode full-frame ({} tiles), {} rounds (round0 dropped):  median {:.2} ms   min {:.2} ms",
-        tiles.len(), rounds, median, min
+        tiles.len(),
+        rounds,
+        median,
+        min
     );
 }

@@ -24,14 +24,16 @@
 
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 mod bench {
-    use raw_pipeline::jxl_casaencoder::{Encoder, EncodeOptions, Frame};
+    use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
 
     fn mkpix(w: u32, h: u32, seed: u64) -> Vec<u8> {
         let n = (w as usize) * (h as usize) * 3;
         let mut v = Vec::with_capacity(n);
         let mut s = seed;
         for _ in 0..n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             v.push(((s >> 33) & 0xff) as u8);
         }
         v
@@ -46,7 +48,15 @@ mod bench {
         time_encode_threads(label, w, h, opts, 0, warmup, iters);
     }
 
-    fn time_encode_threads(label: &str, w: u32, h: u32, opts: &EncodeOptions, nthreads: usize, warmup: usize, iters: usize) {
+    fn time_encode_threads(
+        label: &str,
+        w: u32,
+        h: u32,
+        opts: &EncodeOptions,
+        nthreads: usize,
+        warmup: usize,
+        iters: usize,
+    ) {
         let pixels = mkpix(w, h, 0xdeadbeef);
         let frame = Frame::rgb(&pixels, w, h);
         let mut enc = if nthreads > 1 {
@@ -72,8 +82,10 @@ mod bench {
         let med = median(&mut times);
         let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = times.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        println!("  {label}: med={med:.3}ms min={min:.3}ms max={max:.3}ms out={}B",
-            out.len());
+        println!(
+            "  {label}: med={med:.3}ms min={min:.3}ms max={max:.3}ms out={}B",
+            out.len()
+        );
     }
 
     pub fn run() {
@@ -161,5 +173,7 @@ fn main() {
     bench::run();
 
     #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]
-    eprintln!("requires: cargo run --release --example jxl_encode_cpp_bench (default features, native)");
+    eprintln!(
+        "requires: cargo run --release --example jxl_encode_cpp_bench (default features, native)"
+    );
 }

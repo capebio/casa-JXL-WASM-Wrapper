@@ -10,7 +10,7 @@
 //!
 //! Run: cd crates/raw-pipeline && cargo run --release --no-default-features --features parallel --example process_simd_flip
 use raw_pipeline::pipeline::{
-    process, process_simd, process_16bit_scalar, process_16bit_simd, PipelineParams,
+    process, process_16bit_scalar, process_16bit_simd, process_simd, PipelineParams,
 };
 use std::time::Instant;
 
@@ -40,7 +40,12 @@ fn main() {
         // parity on a warm pair
         let a0 = run_a();
         let b0 = run_b();
-        let max_diff = a0.iter().zip(b0.iter()).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap_or(0);
+        let max_diff = a0
+            .iter()
+            .zip(b0.iter())
+            .map(|(x, y)| (*x as i32 - *y as i32).abs())
+            .max()
+            .unwrap_or(0);
 
         let rounds = 9usize;
         let (mut ta, mut tb) = (Vec::new(), Vec::new());
@@ -62,17 +67,28 @@ fn main() {
         }
         let (ma, mb) = (med(&ta), med(&tb));
         println!("\n[{label}]  (sink={sink})");
-        println!("  parity: max abs output diff = {max_diff} ({} unit)", if bytes_per_ch == 1 { "u8" } else { "u16" });
+        println!(
+            "  parity: max abs output diff = {max_diff} ({} unit)",
+            if bytes_per_ch == 1 { "u8" } else { "u16" }
+        );
         println!("  A scalar: {ma:.1} ms median");
         println!("  B simd:   {mb:.1} ms median");
         if ma > 0.0 && mb > 0.0 {
-            println!("  %saved (B vs A): {:.1}%   speedup {:.2}×", (ma - mb) / ma * 100.0, ma / mb);
+            println!(
+                "  %saved (B vs A): {:.1}%   speedup {:.2}×",
+                (ma - mb) / ma * 100.0,
+                ma / mb
+            );
         } else {
             println!("  %saved (B vs A): (timing too fast to measure reliably)");
         }
     };
 
-    println!("process_simd_flip  {w}×{h} = {:.1} MP  parallel={}", n as f64 / 1e6, cfg!(feature = "parallel"));
+    println!(
+        "process_simd_flip  {w}×{h} = {:.1} MP  parallel={}",
+        n as f64 / 1e6,
+        cfg!(feature = "parallel")
+    );
 
     flip(
         "8-bit  process vs process_simd  (#1 apply_look / LookRenderer path)",
@@ -88,7 +104,12 @@ fn main() {
         let run_b = || process_16bit_simd(&rgb16, &params);
         let a0 = run_a();
         let b0 = run_b();
-        let max_diff = a0.iter().zip(b0.iter()).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap_or(0);
+        let max_diff = a0
+            .iter()
+            .zip(b0.iter())
+            .map(|(x, y)| (*x as i32 - *y as i32).abs())
+            .max()
+            .unwrap_or(0);
         let rounds = 9usize;
         let (mut ta, mut tb) = (Vec::new(), Vec::new());
         let mut sink = 0u64;
@@ -99,8 +120,13 @@ fn main() {
             t.elapsed().as_secs_f64() * 1e3
         };
         for r in 0..rounds {
-            if r % 2 == 0 { ta.push(time(&run_a, &mut sink)); tb.push(time(&run_b, &mut sink)); }
-            else { tb.push(time(&run_b, &mut sink)); ta.push(time(&run_a, &mut sink)); }
+            if r % 2 == 0 {
+                ta.push(time(&run_a, &mut sink));
+                tb.push(time(&run_b, &mut sink));
+            } else {
+                tb.push(time(&run_b, &mut sink));
+                ta.push(time(&run_a, &mut sink));
+            }
         }
         let (ma, mb) = (med(&ta), med(&tb));
         println!("\n[16-bit  process_16bit_scalar vs process_16bit_simd  (#2)]  (sink={sink})");
@@ -108,7 +134,11 @@ fn main() {
         println!("  A scalar: {ma:.1} ms median");
         println!("  B simd:   {mb:.1} ms median");
         if ma > 0.0 && mb > 0.0 {
-            println!("  %saved (B vs A): {:.1}%   speedup {:.2}×", (ma - mb) / ma * 100.0, ma / mb);
+            println!(
+                "  %saved (B vs A): {:.1}%   speedup {:.2}×",
+                (ma - mb) / ma * 100.0,
+                ma / mb
+            );
         } else {
             println!("  %saved (B vs A): (timing too fast to measure reliably)");
         }

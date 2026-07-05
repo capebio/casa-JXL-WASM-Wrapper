@@ -123,7 +123,8 @@ mod tests {
 
     #[test]
     fn constant_field_is_preserved() {
-        let w = 8; let h = 6;
+        let w = 8;
+        let h = 6;
         let src = vec![3.5f32; w * h];
         let out = box_blur(&src, w, h, 2);
         for v in out {
@@ -135,7 +136,8 @@ mod tests {
     fn radius_one_averages_neighbors_interior() {
         // 1-row impulse, interior pixel should be (0+9+0)/3 = 3 after H pass only;
         // with H+V on a single row, V pass clamps to itself → stays.
-        let w = 5; let h = 1;
+        let w = 5;
+        let h = 1;
         let mut src = vec![0f32; w];
         src[2] = 9.0;
         let out = box_blur(&src, w, h, 1);

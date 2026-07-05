@@ -10,7 +10,11 @@
 use raw_pipeline::jxl_casadecoder::{Channels, DecodeOptions, Decoder, Image};
 use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
 use raw_pipeline::perceptual::{Comparer, Opts};
-use raw_pipeline::{decompress, demosaic, pipeline::{self, PipelineParams}, tiff};
+use raw_pipeline::{
+    decompress, demosaic,
+    pipeline::{self, PipelineParams},
+    tiff,
+};
 
 fn decode_orf(path: &str) -> Option<(Vec<u8>, u32, u32)> {
     let data = std::fs::read(path).ok()?;
@@ -42,15 +46,28 @@ fn rgb8_to_rgba8(rgb: &[u8]) -> Vec<u8> {
 }
 
 fn main() {
-    let folder = std::env::args().nth(1).unwrap_or_else(|| r"C:\995\2026-02-20 Gobabeb To Windhoek".into());
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(12);
-    let effort: u8 = std::env::var("EFFORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let folder = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\995\2026-02-20 Gobabeb To Windhoek".into());
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
+    let effort: u8 = std::env::var("EFFORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
 
     let mut files: Vec<_> = std::fs::read_dir(&folder)
         .expect("readdir")
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("orf")).unwrap_or(false))
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("orf"))
+                .unwrap_or(false)
+        })
         .collect();
     files.sort();
     files.truncate(n);
@@ -58,7 +75,10 @@ fn main() {
     println!("effort={effort}  d=1.0  judge=rust-native Comparer (build-independent)\n");
     println!("{:<14} {:>10} {:>9}", "file", "bytes", "butter");
 
-    let opts = EncodeOptions { use_container: true, ..EncodeOptions::distance(1.0).with_effort(effort) };
+    let opts = EncodeOptions {
+        use_container: true,
+        ..EncodeOptions::distance(1.0).with_effort(effort)
+    };
 
     let mut tot_bytes = 0usize;
     let mut sum_butter = 0.0f64;
@@ -68,7 +88,8 @@ fn main() {
 
         let mut enc = Encoder::with_threads(opts.clone(), 1).expect("encoder");
         let mut jxl = Vec::with_capacity(rgb.len() / 3);
-        enc.encode_into(&Frame::rgb(&rgb, w, h), &mut jxl).expect("encode");
+        enc.encode_into(&Frame::rgb(&rgb, w, h), &mut jxl)
+            .expect("encode");
 
         let mut dec = Decoder::new(DecodeOptions::default()).expect("decoder");
         let img: Image<u8> = dec.decode(&jxl, Channels::Rgba).expect("decode jxl");
@@ -84,6 +105,14 @@ fn main() {
         max_butter = max_butter.max(b);
     }
     let nimg = files.len() as f64;
-    println!("\nbytes_total: {}  ({:.1} KB/img)", tot_bytes, tot_bytes as f64 / 1024.0 / nimg);
-    println!("butter mean: {:.4}   max: {:.4}", sum_butter / nimg, max_butter);
+    println!(
+        "\nbytes_total: {}  ({:.1} KB/img)",
+        tot_bytes,
+        tot_bytes as f64 / 1024.0 / nimg
+    );
+    println!(
+        "butter mean: {:.4}   max: {:.4}",
+        sum_butter / nimg,
+        max_butter
+    );
 }

@@ -31,12 +31,17 @@ fn box_a(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
                     for xx in 0..xstep {
                         let x = dx * xstep + xx;
                         let px = &row[(x as usize * 4)..];
-                        r += px[0] as u32; g += px[1] as u32; b += px[2] as u32; a += px[3] as u32;
+                        r += px[0] as u32;
+                        g += px[1] as u32;
+                        b += px[2] as u32;
+                        a += px[3] as u32;
                     }
                 }
                 let out = &mut dst[(dy as usize * dw as usize + dx as usize) * 4..];
-                out[0] = (r / count) as u8; out[1] = (g / count) as u8;
-                out[2] = (b / count) as u8; out[3] = (a / count) as u8;
+                out[0] = (r / count) as u8;
+                out[1] = (g / count) as u8;
+                out[2] = (b / count) as u8;
+                out[3] = (a / count) as u8;
             }
         }
         return;
@@ -44,7 +49,8 @@ fn box_a(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
     let x_ranges: Vec<(u32, u32)> = (0..dw)
         .map(|dx| {
             let x0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
-            let x1 = (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64).min(sw as u64) as u32;
+            let x1 =
+                (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64).min(sw as u64) as u32;
             (x0, x1)
         })
         .collect();
@@ -58,14 +64,21 @@ fn box_a(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
                 let row = &src[(sy as usize * sw as usize * 4)..];
                 for sx in x0..x1 {
                     let px = &row[(sx as usize * 4)..];
-                    r += px[0] as u32; g += px[1] as u32; b += px[2] as u32; a += px[3] as u32;
+                    r += px[0] as u32;
+                    g += px[1] as u32;
+                    b += px[2] as u32;
+                    a += px[3] as u32;
                     count += 1;
                 }
             }
-            if count == 0 { continue; }
+            if count == 0 {
+                continue;
+            }
             let out = &mut dst[(dy as usize * dw as usize + dx as usize) * 4..];
-            out[0] = (r / count) as u8; out[1] = (g / count) as u8;
-            out[2] = (b / count) as u8; out[3] = (a / count) as u8;
+            out[0] = (r / count) as u8;
+            out[1] = (g / count) as u8;
+            out[2] = (b / count) as u8;
+            out[3] = (a / count) as u8;
         }
     }
 }
@@ -88,12 +101,17 @@ fn box_b(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
                     for xx in 0..xstep {
                         let x = dx * xstep + xx;
                         let px = &row[x as usize * 4..];
-                        r += px[0] as u32; g += px[1] as u32; b += px[2] as u32; a += px[3] as u32;
+                        r += px[0] as u32;
+                        g += px[1] as u32;
+                        b += px[2] as u32;
+                        a += px[3] as u32;
                     }
                 }
                 let out = &mut out_row[dx as usize * 4..];
-                out[0] = (r / count) as u8; out[1] = (g / count) as u8;
-                out[2] = (b / count) as u8; out[3] = (a / count) as u8;
+                out[0] = (r / count) as u8;
+                out[1] = (g / count) as u8;
+                out[2] = (b / count) as u8;
+                out[3] = (a / count) as u8;
             }
         }
         return;
@@ -101,7 +119,8 @@ fn box_b(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
     let x_ranges: Vec<(u32, u32)> = (0..dw)
         .map(|dx| {
             let x0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
-            let x1 = (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64).min(sw as u64) as u32;
+            let x1 =
+                (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64).min(sw as u64) as u32;
             (x0, x1)
         })
         .collect();
@@ -115,14 +134,21 @@ fn box_b(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) {
                 let row = &src[sy as usize * src_stride..];
                 for sx in x0..x1 {
                     let px = &row[sx as usize * 4..];
-                    r += px[0] as u32; g += px[1] as u32; b += px[2] as u32; a += px[3] as u32;
+                    r += px[0] as u32;
+                    g += px[1] as u32;
+                    b += px[2] as u32;
+                    a += px[3] as u32;
                     count += 1;
                 }
             }
-            if count == 0 { continue; }
+            if count == 0 {
+                continue;
+            }
             let out = &mut out_row[dx * 4..];
-            out[0] = (r / count) as u8; out[1] = (g / count) as u8;
-            out[2] = (b / count) as u8; out[3] = (a / count) as u8;
+            out[0] = (r / count) as u8;
+            out[1] = (g / count) as u8;
+            out[2] = (b / count) as u8;
+            out[3] = (a / count) as u8;
         }
     }
 }
@@ -178,7 +204,14 @@ fn run_case(label: &str, sw: u32, sh: u32, dw: u32, dh: u32) {
     let saved = (ma - mb) / ma * 100.0;
     println!(
         "{:>22} {:>5}×{:<5}→{:>5}×{:<5} | A {:>8.3}ms  B {:>8.3}ms  saved {:>6.1}%  parity {}",
-        label, sw, sh, dw, dh, ma, mb, saved,
+        label,
+        sw,
+        sh,
+        dw,
+        dh,
+        ma,
+        mb,
+        saved,
         if parity { "EXACT" } else { "*** BROKEN ***" }
     );
 }

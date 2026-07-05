@@ -119,8 +119,14 @@ fn main() {
     let saved = (ma - mb) / ma * 100.0;
 
     println!("lut_shoulder_flipflop  n={n}  (sink={sink:.0})");
-    println!("  correctness: max_diff={max_diff:.7}  -> {}",
-        if max_diff < 0.001 { "PASS (≤0.001 tolerance)" } else { "INVESTIGATE" });
+    println!(
+        "  correctness: max_diff={max_diff:.7}  -> {}",
+        if max_diff < 0.001 {
+            "PASS (≤0.001 tolerance)"
+        } else {
+            "INVESTIGATE"
+        }
+    );
     println!("  A (orig):     {ma:.2} ms");
     println!("  B (lut):      {mb:.2} ms");
     println!("  B speedup:    {saved:.1}% faster");

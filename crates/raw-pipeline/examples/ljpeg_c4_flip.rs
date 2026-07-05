@@ -11,9 +11,9 @@ use raw_pipeline::{cr2, ljpeg};
 use std::time::Instant;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter\tests\_MG_1744.CR2".into()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\Foo\raw-converter\tests\_MG_1744.CR2".into());
     let data = std::fs::read(&path).expect("read CR2");
     let (off, len, w, h) = cr2::ljpeg_strip_geometry(&data).expect("strip geometry");
     let strip = &data[off..off + len];
@@ -55,11 +55,20 @@ fn main() {
     std::hint::black_box(sink);
 
     let (ma, mb) = (med(&ta), med(&tb));
-    println!("file: {}  strip {}x{} px", path.rsplit(['\\', '/']).next().unwrap_or(&path), w, h);
+    println!(
+        "file: {}  strip {}x{} px",
+        path.rsplit(['\\', '/']).next().unwrap_or(&path),
+        w,
+        h
+    );
     println!("LJPEG strip decode, interleaved {rounds} rounds, round0 dropped:");
     println!("  A generic (dyn comp loop): {ma:.1} ms");
     println!("  B decode_c4 (dispatched):  {mb:.1} ms");
-    println!("  saved: {:.1} ms  ({:.1}%)  parity: {}",
-        ma - mb, (ma - mb) / ma * 100.0, if exact { "EXACT" } else { "DIFF!" });
+    println!(
+        "  saved: {:.1} ms  ({:.1}%)  parity: {}",
+        ma - mb,
+        (ma - mb) / ma * 100.0,
+        if exact { "EXACT" } else { "DIFF!" }
+    );
     assert!(exact, "parity broken");
 }

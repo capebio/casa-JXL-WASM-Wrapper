@@ -12,9 +12,10 @@
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn main() {
     use raw_pipeline::casa_video::{
-        decode_casv_all_rgb8, decode_casv_footer_all_rgb8, decode_casv_footer_for_each_rgb8_threaded,
-        decode_casv_for_each_rgb8_threaded, encode_casv_fable_rgb8, encode_casv_video,
-        jolt_encode_stream_to, CasaVideoOptions, JoltPreset, VideoFrameSource,
+        decode_casv_all_rgb8, decode_casv_footer_all_rgb8,
+        decode_casv_footer_for_each_rgb8_threaded, decode_casv_for_each_rgb8_threaded,
+        encode_casv_fable_rgb8, encode_casv_video, jolt_encode_stream_to, CasaVideoOptions,
+        JoltPreset, VideoFrameSource,
     };
     use std::time::Instant;
 
@@ -42,9 +43,16 @@ fn main() {
         }
     }
 
-    let dir = std::env::args().nth(1).expect("usage: tier_bench <frames_dir> [gop]");
-    let gop: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(24);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: tier_bench <frames_dir> [gop]");
+    let gop: u32 = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
 
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("read frames dir")
@@ -83,7 +91,12 @@ fn main() {
         let t0 = Instant::now();
         let bytes = match &tier {
             Tier::Jolt(p) => {
-                let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+                let mut src = VecFrames {
+                    frames: frames.clone(),
+                    i: 0,
+                    w,
+                    h,
+                };
                 let mut sink: Vec<u8> = Vec::new();
                 jolt_encode_stream_to(&mut src, *p, &mut sink).unwrap();
                 sink

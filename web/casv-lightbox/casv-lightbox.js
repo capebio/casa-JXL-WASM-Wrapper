@@ -13,11 +13,13 @@
 import { CasvReader, playCasv } from '@casabio/casv-web';
 import {
   PRESETS, frameKindLabel, formatRate, fpsOf, timecode,
-  suggestExportName, buildEncodeRequest,
+  suggestExportName, buildEncodeRequest, classifyDroppedEncodePaths,
+  shouldHandleEncodeDrop,
 } from './casv-lightbox-core.js';
 import {
-  isTauri, makeBrowserJxlDecoder, pickCasvFile,
-  pickImagesToEncode, encodeAndSave, exportCasv,
+  isTauri, makeBrowserJxlDecoder, prewarmJxl, pickCasvFile,
+  pickImagesToEncode, pickVideoToEncode, openDesktopCasvEncoder,
+  encodeAndSave, exportCasv, onEncodeProgress,
 } from './casv-platform.js';
 
 const PLAY = '▶', PAUSE = '⏸';
@@ -40,7 +42,8 @@ export class CasvLightbox {
     this.acc = 0;
     this.loadedBytes = null;   // for export
     this.loadedName = null;
-    this.encodeInputs = [];    // picked image paths (Tauri)
+    this.encodeInputs = [];    // picked image/video paths (Tauri)
+    this.encodeSourceKind = 'video';
     this.el = {};
     this.audioCtx  = null;   // AudioContext
     this.audioBuf  = null;   // AudioBuffer (decoded Ogg/Opus)
@@ -59,18 +62,24 @@ export class CasvLightbox {
       scrub: $('scrub'), counter: $('counter'), tc: $('tc'),
       speed: $('speed'), loop: $('loop'), vol: $('vol'), volRange: $('volRange'),
       meta: $('meta'), kind: $('kind'),
-      encodePanel: $('encodePanel'), preset: $('preset'),
+      encodePanel: $('encodePanel'), sourceKind: $('sourceKind'), preset: $('preset'),
+      presetHelp: $('presetHelp'), sourceHelp: $('sourceHelp'),
       distance: $('distance'), effort: $('effort'), gop: $('gop'),
-      skip: $('skip'), tile: $('tile'), thresh: $('thresh'),
-      fpsNum: $('fpsNum'), fpsDen: $('fpsDen'),
+      skip: $('skip'), tile: $('tile'), thresh: $('thresh'), dim: $('dim'),
+      autoFps: $('autoFps'), fpsNum: $('fpsNum'), fpsDen: $('fpsDen'),
       pickImages: $('pickImages'), encodeGo: $('encodeGo'), encodeInputs: $('encodeInputs'),
+      encodeProgress: $('encodeProgress'), encodeBar: $('encodeBar'), encodeProgressLabel: $('encodeProgressLabel'),
       hostBadge: $('hostBadge'),
     };
     this.ctx = this.el.canvas.getContext('2d');
+    // Overlap WASM compile/instantiate with the user picking a file, so the
+    // first frame decode starts warm instead of paying cold-start.
+    prewarmJxl();
     this._wire();
     this._applyPreset('balanced');
+    this._setEncodeSource('video');
     this._reflectHost();
-    this._setStatus('Open a .casv file to begin.');
+    this._setStatus('Encode MP4/MOV/WEBM to create .casv, or open an existing .casv to preview.');
     this._renderControls();
     return this;
   }
@@ -80,9 +89,10 @@ export class CasvLightbox {
     this.el.hostBadge.textContent = tauri ? 'desktop (Tauri): encode + save enabled'
       : 'browser: decode / showcase / export';
     this.el.hostBadge.dataset.host = tauri ? 'tauri' : 'browser';
-    // Encoding is native-only; disable the "Encode & Save" action in-browser.
+    // Encoding is native-only. Keep source picking clickable in-browser so the
+    // user gets an explicit desktop-app message instead of a dead grey button.
     this.el.encodeGo.disabled = !tauri;
-    this.el.pickImages.disabled = !tauri;
+    this.el.pickImages.disabled = false;
     if (!tauri) {
       this.el.encodeGo.title = 'Encoding requires the desktop app (native codec).';
       this.el.pickImages.title = this.el.encodeGo.title;
@@ -96,6 +106,9 @@ export class CasvLightbox {
       const open = this.el.encodePanel.hidden;
       this.el.encodePanel.hidden = !open;
       this.el.encodeToggle.setAttribute('aria-expanded', String(open));
+      if (open && !isTauri()) {
+        this._setStatus('MP4/MOV/WEBM encoding needs the desktop app. This browser page can preview/export .casv only.', 'warn');
+      }
     });
     this.el.play.addEventListener('click', () => this._togglePlay());
     this.el.prev.addEventListener('click', () => this._step(-1));
@@ -111,10 +124,87 @@ export class CasvLightbox {
       });
     }
     this.el.preset.addEventListener('change', () => this._applyPreset(this.el.preset.value));
-    this.el.pickImages.addEventListener('click', () => this._onPickImages());
+    this.el.sourceKind.addEventListener('change', () => this._setEncodeSource(this.el.sourceKind.value));
+    this.el.autoFps.addEventListener('change', () => this._reflectFpsMode());
+    this.el.pickImages.addEventListener('click', () => this._onPickEncodeSource());
     this.el.encodeGo.addEventListener('click', () => this._onEncode());
+    this._wireDesktopEvents();
+    this._wireDomDropGuard();
+    window.addEventListener('casv-open-encode', () => this._openEncodePanel(true));
+    if (location.hash === '#encode') setTimeout(() => this._openEncodePanel(true), 0);
     this.root.addEventListener('keydown', (e) => this._onKey(e));
     this.root.tabIndex = 0;
+  }
+
+  _openEncodePanel(pickVideo = false) {
+    this.el.encodePanel.hidden = false;
+    this.el.encodeToggle.setAttribute('aria-expanded', 'true');
+    // Don't wipe an already-picked source: _setEncodeSource() clears
+    // encodeInputs. On a cold desktop launch the #encode hash AND the
+    // casabio-handoff event both call this — the second must not erase the
+    // file the first one picked.
+    if (this.encodeSourceKind !== 'video') this._setEncodeSource('video');
+    this._setStatus('Pick an MP4/MOV/WEBM source in the desktop dialog.');
+    // Auto-open the picker once. The reentrancy guard in _onPickEncodeSource
+    // collapses the duplicate handoff+hash triggers into a single dialog, and
+    // we skip auto-pick entirely once a file is already chosen.
+    if (pickVideo && isTauri() && !this.encodeInputs.length) this._onPickEncodeSource();
+  }
+
+  _wireDomDropGuard() {
+    const namesFromEvent = (event) => {
+      const items = Array.from(event.dataTransfer?.items || []);
+      const files = Array.from(event.dataTransfer?.files || []);
+      return [
+        ...items.map((item) => item.kind === 'file' ? item.getAsFile()?.name : '').filter(Boolean),
+        ...files.map((file) => file.name).filter(Boolean),
+      ];
+    };
+    const stopFileDrop = (event) => {
+      const names = namesFromEvent(event);
+      const hasFiles = Array.from(event.dataTransfer?.types || []).includes('Files');
+      if (!hasFiles && !shouldHandleEncodeDrop(names)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.type === 'drop' && !isTauri()) {
+        openDesktopCasvEncoder();
+        this._setStatus('Browser blocked local video paths. Opening the desktop app for MP4/MOV/WEBM encode...', 'warn');
+      }
+    };
+    for (const type of ['dragenter', 'dragover', 'drop']) {
+      this.root.addEventListener(type, stopFileDrop);
+      window.addEventListener(type, stopFileDrop, true);
+    }
+  }
+
+  _wireDesktopEvents() {
+    const listen = (window.__TAURI__ || {}).event?.listen;
+    if (!listen) return;
+    listen('tauri://drag-drop', (event) => {
+      const payload = event.payload || {};
+      const paths = Array.isArray(payload) ? payload : payload.paths ?? [];
+      this._useDroppedEncodePaths(paths);
+    });
+    listen('casabio-handoff', (event) => {
+      const raw = String(event.payload || '');
+      let url = null;
+      try { url = new URL(raw); } catch (_) { return; }
+      if (url.protocol !== 'raw-converter-tauri:' || url.hostname !== 'casv-encode') return;
+      this._openEncodePanel(true);
+    });
+  }
+
+  _useDroppedEncodePaths(paths) {
+    const picked = classifyDroppedEncodePaths(paths, this.encodeSourceKind);
+    if (!picked.inputPaths.length) return;
+    this.el.encodePanel.hidden = false;
+    this.el.encodeToggle.setAttribute('aria-expanded', 'true');
+    this._setEncodeSource(picked.sourceKind);
+    this.encodeInputs = picked.inputPaths;
+    this.el.encodeInputs.textContent = picked.label;
+    this._setStatus(picked.sourceKind === 'video'
+      ? `Ready to encode ${picked.label}.`
+      : `Ready to encode ${picked.inputPaths.length} images.`);
   }
 
   // ── Loading / decoding ──────────────────────────────────────────────
@@ -152,48 +242,69 @@ export class CasvLightbox {
     }
 
     this._setStatus(`Decoding ${this.reader.frameCount} frames…`);
+    this.index = 0;
+    // Audio is decoded off the first-paint critical path (see _decodeAudio).
+    this._stopAudio();
+    this.audioBuf = null;
+    if (this.el.vol) this.el.vol.style.display = 'none';
+
+    let painted = false;
+    let i = 0;
     try {
-      let i = 0;
       for await (const f of playCasv(bytes, this.decodeJxl)) {
         // playCasv reuses no buffer by default → each frame is its own copy.
         this.frames.push({ rgba: f.rgba, width: f.width, height: f.height });
-        if ((++i & 7) === 0) this._setStatus(`Decoding… ${i}/${this.reader.frameCount}`);
+        if (!painted) {
+          // Paint frame 0 the instant it's ready — don't wait for the whole clip.
+          painted = true;
+          this._sizeCanvas();
+          this._renderMeta();
+          this._renderControls();
+          this._render(0);
+          // Kick audio decode in the background; ready by the time playback starts.
+          if (this.reader.audio) this._decodeAudio();
+          // Yield once so the browser actually paints frame 0 before we grind
+          // through the remaining decodes.
+          await new Promise((r) => requestAnimationFrame(() => r()));
+        } else if ((++i & 7) === 0) {
+          this._renderControls();  // grow scrub range as frames stream in
+          this._setStatus(`Playing · buffering ${this.frames.length}/${this.reader.frameCount}…`);
+        }
       }
     } catch (e) {
       this._setStatus(`Decode failed at frame ${this.frames.length}: ${e.message}`, 'error');
       if (this.frames.length === 0) return;
     }
-    this.index = 0;
 
-    // Decode embedded Ogg/Opus audio (if CSAU box present).
-    this._stopAudio();
-    this.audioBuf = null;
-    if (this.reader.audio) {
-      try {
-        if (!this.audioCtx) this.audioCtx = new AudioContext();
-        if (this.gainNode) this.gainNode.disconnect();
-        this.gainNode = this.audioCtx.createGain();
-        this.gainNode.connect(this.audioCtx.destination);
-        // decodeAudioData requires a detached ArrayBuffer — .slice() copies it.
-        const ab = this.reader.audio.bytes.buffer.slice(
-          this.reader.audio.bytes.byteOffset,
-          this.reader.audio.bytes.byteOffset + this.reader.audio.bytes.byteLength
-        );
-        this.audioBuf = await this.audioCtx.decodeAudioData(ab);
-      } catch (e) {
-        console.warn('casv-lightbox: audio decode failed:', e);
-        this.audioBuf = null;
-      }
-    }
-    if (this.el.vol) this.el.vol.style.display = this.audioBuf ? '' : 'none';
-
-    this._sizeCanvas();
-    this._renderMeta();
     this._renderControls();
-    this._render(0);
     this._setStatus(`Loaded ${this.frames.length} frame${this.frames.length === 1 ? '' : 's'} · `
       + `${this.header.width}×${this.header.height} · ${fpsOf(this.header).toFixed(2)} fps · `
       + formatRate(this.rate), 'ok');
+  }
+
+  /**
+   * Decode the embedded Ogg/Opus (CSAU) track off the first-paint critical path.
+   * Fire-and-forget: sets this.audioBuf when ready so the next _play() has sound.
+   */
+  async _decodeAudio() {
+    if (!this.reader || !this.reader.audio) return;
+    try {
+      if (!this.audioCtx) this.audioCtx = new AudioContext();
+      if (this.gainNode) this.gainNode.disconnect();
+      this.gainNode = this.audioCtx.createGain();
+      this.gainNode.connect(this.audioCtx.destination);
+      // decodeAudioData requires a detached ArrayBuffer — .slice() copies it.
+      const ab = this.reader.audio.bytes.buffer.slice(
+        this.reader.audio.bytes.byteOffset,
+        this.reader.audio.bytes.byteOffset + this.reader.audio.bytes.byteLength
+      );
+      this.audioBuf = await this.audioCtx.decodeAudioData(ab);
+      if (this.el.vol) this.el.vol.style.display = '';
+      this._renderControls();
+    } catch (e) {
+      console.warn('casv-lightbox: audio decode failed:', e);
+      this.audioBuf = null;
+    }
   }
 
   _sizeCanvas() {
@@ -339,22 +450,57 @@ export class CasvLightbox {
     this.el.tile.value = String(p.tile);
     this.el.distance.disabled = p.rate === 'lossless';
     this.el.thresh.placeholder = 'auto';
+    if (this.el.presetHelp) this.el.presetHelp.textContent = p.hint || '';
     this._curPreset = name;
   }
 
-  async _onPickImages() {
+  _setEncodeSource(kind) {
+    this.encodeSourceKind = kind === 'images' ? 'images' : 'video';
+    this.encodeInputs = [];
+    this.el.sourceKind.value = this.encodeSourceKind;
+    this.el.pickImages.textContent = this.encodeSourceKind === 'video' ? '3 · Pick video...' : '3 · Pick images...';
+    this.el.dim.disabled = this.encodeSourceKind !== 'video';
+    this.el.autoFps.disabled = this.encodeSourceKind !== 'video';
+    if (this.el.sourceHelp) {
+      this.el.sourceHelp.textContent = this.encodeSourceKind === 'video'
+        ? 'One movie file. Frame rate and size are read from the video.'
+        : 'Many still images, encoded in filename order as frames.';
+    }
+    this.el.encodeInputs.textContent = 'none selected';
+    this._reflectFpsMode();
+  }
+
+  _reflectFpsMode() {
+    const auto = this.encodeSourceKind === 'video' && this.el.autoFps.checked;
+    this.el.fpsNum.disabled = auto;
+    this.el.fpsDen.disabled = auto;
+  }
+
+  async _onPickEncodeSource() {
+    if (this._picking) return;   // one OS file dialog at a time — no double pickers
+    this._picking = true;
     try {
-      const res = await pickImagesToEncode();
+      const res = this.encodeSourceKind === 'video'
+        ? await pickVideoToEncode()
+        : await pickImagesToEncode();
       if (!res.native) {
-        this._setStatus('Image picking for encode is a desktop-app feature.', 'warn');
+        openDesktopCasvEncoder();
+        this._setStatus('Browser cannot pass local video paths to the encoder. Opening the desktop app...', 'warn');
         return;
       }
+      // A cancelled dialog returns no paths — keep the previous selection
+      // rather than clobbering it back to "none selected".
+      if (!res.paths.length) return;
       this.encodeInputs = res.paths;
-      this.el.encodeInputs.textContent = res.paths.length
-        ? `${res.paths.length} image${res.paths.length === 1 ? '' : 's'} selected`
-        : 'none selected';
+      if (this.encodeSourceKind === 'video') {
+        this.el.encodeInputs.textContent = res.paths[0].split(/[\\/]/).pop();
+      } else {
+        this.el.encodeInputs.textContent = `${res.paths.length} image${res.paths.length === 1 ? '' : 's'} selected`;
+      }
     } catch (e) {
       this._setStatus(`Pick failed: ${e.message}`, 'error');
+    } finally {
+      this._picking = false;
     }
   }
 
@@ -363,6 +509,7 @@ export class CasvLightbox {
     let request;
     try {
       request = buildEncodeRequest({
+        sourceKind: this.encodeSourceKind,
         inputPaths: this.encodeInputs,
         rate: p.rate,
         distance: this.el.distance.value,
@@ -371,6 +518,8 @@ export class CasvLightbox {
         skip: this.el.skip.value,
         tile: this.el.tile.value,
         thresh: this.el.thresh.value,
+        dim: this.el.dim.value,
+        autoFps: this.el.autoFps.checked,
         fpsNum: this.el.fpsNum.value,
         fpsDen: this.el.fpsDen.value,
       });
@@ -378,7 +527,13 @@ export class CasvLightbox {
       this._setStatus(e.message, 'error');
       return;
     }
-    this._setStatus(`Encoding ${request.inputPaths.length} frames (${request.rate})…`);
+    this._setStatus(this.encodeSourceKind === 'video'
+      ? `Encoding video (${request.rate})...`
+      : `Encoding ${request.inputPaths.length} frames (${request.rate})...`);
+    this.el.encodeGo.disabled = true;
+    this._showEncodeProgress(true, 'Starting…');
+    // Subscribe before invoking so no early progress line is missed.
+    let unlisten = await onEncodeProgress((p) => this._renderEncodeProgress(p));
     try {
       const res = await encodeAndSave(request);
       const path = res && res.path ? res.path : '(saved)';
@@ -387,6 +542,46 @@ export class CasvLightbox {
       this._setStatus(e.code === 'ENCODE_NATIVE_ONLY'
         ? e.message
         : `Encode failed: ${e.message}`, e.code === 'ENCODE_NATIVE_ONLY' ? 'warn' : 'error');
+    } finally {
+      if (typeof unlisten === 'function') unlisten();
+      this._showEncodeProgress(false);
+      this.el.encodeGo.disabled = !isTauri();
+    }
+  }
+
+  /** Show/hide the encode progress bar; optional starting label. */
+  _showEncodeProgress(on, label = '') {
+    if (!this.el.encodeProgress) return;
+    this.el.encodeProgress.hidden = !on;
+    if (on) {
+      this.el.encodeBar.style.width = '0%';
+      this.el.encodeBar.dataset.indeterminate = '1';
+      this.el.encodeProgressLabel.textContent = label;
+    }
+  }
+
+  /** Translate a { stage, done, total } event into the bar + label. */
+  _renderEncodeProgress({ stage, done, total }) {
+    if (!this.el.encodeProgress || this.el.encodeProgress.hidden) return;
+    let frac = null, label = '';
+    if (stage === 'extract') {
+      label = 'Extracting frames from video…';
+    } else if (stage === 'decode') {
+      label = `Reading frame ${done} / ${total}`;
+      frac = total ? done / total : null;
+    } else if (stage === 'encode') {
+      if (total && done >= total) { label = `Encoded ${total} frames · saving…`; frac = 1; }
+      else if (total && done > 0) { label = `Encoding frame ${done} / ${total}`; frac = done / total; }
+      else { label = `Encoding ${total || ''} frame${total === 1 ? '' : 's'}…`; frac = null; }
+    } else {
+      label = stage || 'Working…';
+    }
+    this.el.encodeProgressLabel.textContent = label;
+    if (frac == null) {
+      this.el.encodeBar.dataset.indeterminate = '1';
+    } else {
+      delete this.el.encodeBar.dataset.indeterminate;
+      this.el.encodeBar.style.width = `${Math.round(Math.max(0, Math.min(1, frac)) * 100)}%`;
     }
   }
 
@@ -398,11 +593,16 @@ export class CasvLightbox {
 
 const TEMPLATE = `
 <div class="casv-lb__bar">
-  <button data-el="open" class="casv-lb__btn casv-lb__btn--primary">Open .casv…</button>
+  <button data-el="encodeToggle" class="casv-lb__btn casv-lb__btn--primary" aria-expanded="false">Encode MP4/MOV/WEBM...</button>
+  <button data-el="open" class="casv-lb__btn">Open .casv...</button>
   <button data-el="export" class="casv-lb__btn" disabled>Export .casv</button>
-  <button data-el="encodeToggle" class="casv-lb__btn" aria-expanded="false">Encode…</button>
   <span class="casv-lb__host" data-el="hostBadge"></span>
 </div>
+<p class="casv-lb__barhint">
+  <b>Encode</b> turns a video or image sequence into a <code>.casv</code> (desktop app). &nbsp;
+  <b>Open</b> plays an existing <code>.casv</code>. &nbsp;
+  <b>Export</b> saves the loaded clip back out.
+</p>
 
 <div class="casv-lb__stage" data-el="stage">
   <canvas data-el="canvas" class="casv-lb__canvas" width="16" height="9"></canvas>
@@ -435,35 +635,76 @@ const TEMPLATE = `
 <dl class="casv-lb__meta" data-el="meta"></dl>
 
 <div class="casv-lb__encode" data-el="encodePanel" hidden>
-  <h3>Encode a .casv <small>(native / desktop)</small></h3>
-  <div class="casv-lb__grid">
-    <label>Preset
-      <select data-el="preset">
-        <option value="realtime">Realtime (d2 · e1)</option>
-        <option value="balanced" selected>Balanced (d1 · e3)</option>
-        <option value="quality">Quality (d0.5 · e4)</option>
-        <option value="archive">Lossless archive</option>
-      </select>
-    </label>
-    <label>Distance <input data-el="distance" type="number" step="0.1" min="0.1" max="15" value="1.0"></label>
-    <label>Effort <input data-el="effort" type="number" step="1" min="1" max="10" value="3"></label>
-    <label>GOP <input data-el="gop" type="number" step="1" min="1" max="600" value="24"></label>
-    <label>Skip
-      <select data-el="skip">
-        <option value="none">none</option>
-        <option value="bbox">bbox</option>
-        <option value="tile" selected>tile</option>
-      </select>
-    </label>
-    <label>Tile <input data-el="tile" type="number" step="8" min="8" max="512" value="64"></label>
-    <label>Threshold <input data-el="thresh" type="number" step="1" min="0" max="255" placeholder="auto"></label>
-    <label>FPS num <input data-el="fpsNum" type="number" step="1" min="1" value="24"></label>
-    <label>FPS den <input data-el="fpsDen" type="number" step="1" min="1" value="1"></label>
-  </div>
+  <h3>Encode MP4/MOV/WEBM to .casv <small>(native / desktop)</small></h3>
+  <p class="casv-lb__steps">1. Choose a source &nbsp;→&nbsp; 2. Pick a quality preset &nbsp;→&nbsp; 3. Pick the file &nbsp;→&nbsp; 4. Encode &amp; Save</p>
+
+  <label class="casv-lb__field">1 · What are you encoding?
+    <select data-el="sourceKind">
+      <option value="video" selected>Video file — MP4 / MOV / WEBM / MKV</option>
+      <option value="images">Image sequence — PNG / JPEG / TIFF / EXR / JXL</option>
+    </select>
+    <span class="casv-lb__help" data-el="sourceHelp"></span>
+  </label>
+
+  <label class="casv-lb__field">2 · Quality preset
+    <select data-el="preset">
+      <option value="realtime">Realtime — fastest, biggest (d2 · e1)</option>
+      <option value="balanced" selected>Balanced — recommended (d1 · e3)</option>
+      <option value="quality">Quality — slower, sharper (d0.5 · e4)</option>
+      <option value="archive">Lossless archive — every pixel kept</option>
+    </select>
+    <span class="casv-lb__help" data-el="presetHelp"></span>
+  </label>
+
+  <details class="casv-lb__adv">
+    <summary>Advanced options <span class="casv-lb__advhint">(set by the preset — override only if you know what they do)</span></summary>
+
+    <h4 class="casv-lb__grouph">Quality</h4>
+    <div class="casv-lb__grid">
+      <label>Distance <small>butteraugli · lower = better</small><input data-el="distance" type="number" step="0.1" min="0.1" max="15" value="1.0"></label>
+      <label>Effort <small>1 fast … 10 slow</small><input data-el="effort" type="number" step="1" min="1" max="10" value="3"></label>
+    </div>
+
+    <h4 class="casv-lb__grouph">Motion &amp; size</h4>
+    <div class="casv-lb__grid">
+      <label>GOP <small>keyframe every N frames</small><input data-el="gop" type="number" step="1" min="1" max="600" value="24"></label>
+      <label>Skip <small>reuse static regions</small>
+        <select data-el="skip">
+          <option value="none">none — every frame full</option>
+          <option value="bbox">bbox — changed box only</option>
+          <option value="tile" selected>tile — changed tiles only</option>
+        </select>
+      </label>
+      <label>Tile <small>pixels</small><input data-el="tile" type="number" step="8" min="8" max="512" value="32"></label>
+      <label>Threshold <small>blank = auto</small><input data-el="thresh" type="number" step="1" min="0" max="255" placeholder="auto"></label>
+      <label>Max size <small>downscale cap</small>
+        <select data-el="dim">
+          <option value="exact" selected>Exact — keep source size</option>
+          <option value="2160">2160 max</option>
+          <option value="1440">1440 max</option>
+          <option value="1080">1080 max</option>
+          <option value="720">720 max</option>
+          <option value="512">512 max</option>
+        </select>
+      </label>
+    </div>
+
+    <h4 class="casv-lb__grouph">Frame rate <small>video only</small></h4>
+    <div class="casv-lb__grid">
+      <label class="casv-lb__check"><input data-el="autoFps" type="checkbox" checked> Match source FPS</label>
+      <label>FPS numerator <input data-el="fpsNum" type="number" step="1" min="1" value="24"></label>
+      <label>FPS denominator <input data-el="fpsDen" type="number" step="1" min="1" value="1"></label>
+    </div>
+  </details>
+
   <div class="casv-lb__encode-actions">
-    <button data-el="pickImages" class="casv-lb__btn">Pick images…</button>
+    <button data-el="pickImages" class="casv-lb__btn">3 · Pick video...</button>
     <span class="casv-lb__inputs" data-el="encodeInputs">none selected</span>
-    <button data-el="encodeGo" class="casv-lb__btn casv-lb__btn--primary">Encode &amp; Save</button>
+    <button data-el="encodeGo" class="casv-lb__btn casv-lb__btn--primary">4 · Encode &amp; Save</button>
+  </div>
+  <div class="casv-lb__progress" data-el="encodeProgress" hidden>
+    <div class="casv-lb__progress-track"><div class="casv-lb__progress-fill" data-el="encodeBar" data-indeterminate="1"></div></div>
+    <span class="casv-lb__progress-label" data-el="encodeProgressLabel">Starting…</span>
   </div>
 </div>
 `;

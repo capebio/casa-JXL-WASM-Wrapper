@@ -27,8 +27,19 @@ fn clampi(v: isize, lo: isize, hi: isize) -> usize {
 
 #[inline(always)]
 fn mhc_pixel_phased(
-    raw: &[u16], width: usize, r_c: usize, r_n: usize, r_s: usize, r_n2: usize, r_s2: usize,
-    col: usize, c_w: usize, c_e: usize, c_w2: usize, c_e2: usize, phase: (usize, usize),
+    raw: &[u16],
+    width: usize,
+    r_c: usize,
+    r_n: usize,
+    r_s: usize,
+    r_n2: usize,
+    r_s2: usize,
+    col: usize,
+    c_w: usize,
+    c_e: usize,
+    c_w2: usize,
+    c_e2: usize,
+    phase: (usize, usize),
 ) -> (i32, i32, i32) {
     match ((r_c + phase.0) & 1, (col + phase.1) & 1) {
         (0, 0) => {
@@ -44,8 +55,10 @@ fn mhc_pixel_phased(
             let sum_g4 = gn + ge + gs + gw;
             let sum_d4 = rn2 + re2 + rs2 + rw2;
             let g_mhc = (2 * sum_g4 + 4 * rc - sum_d4) >> 3;
-            let sum_b4 = at(raw, width, r_n, c_w) + at(raw, width, r_n, c_e)
-                + at(raw, width, r_s, c_w) + at(raw, width, r_s, c_e);
+            let sum_b4 = at(raw, width, r_n, c_w)
+                + at(raw, width, r_n, c_e)
+                + at(raw, width, r_s, c_w)
+                + at(raw, width, r_s, c_e);
             let b_v = sum_b4 >> 2;
             (rc, g_mhc.clamp(0, 65535), b_v.clamp(0, 65535))
         }
@@ -88,9 +101,17 @@ fn mhc_pixel_phased(
             let bs2 = at(raw, width, r_s2, col);
             let bw2 = at(raw, width, r_c, c_w2);
             let g_mhc = (2 * (gn + ge + gs + gw) + 4 * bc - bn2 - be2 - bs2 - bw2) >> 3;
-            let r_v = (2 * (at(raw, width, r_n, c_e) + at(raw, width, r_n, c_w)
-                + at(raw, width, r_s, c_e) + at(raw, width, r_s, c_w))
-                + 4 * bc - bn2 - be2 - bs2 - bw2) >> 3;
+            let r_v = (2
+                * (at(raw, width, r_n, c_e)
+                    + at(raw, width, r_n, c_w)
+                    + at(raw, width, r_s, c_e)
+                    + at(raw, width, r_s, c_w))
+                + 4 * bc
+                - bn2
+                - be2
+                - bs2
+                - bw2)
+                >> 3;
             (r_v.clamp(0, 65535), g_mhc.clamp(0, 65535), bc)
         }
     }
@@ -108,37 +129,80 @@ fn mhc_scalar(raw: &[u16], width: usize, height: usize, phase: (u8, u8)) -> Vec<
         let r_s = clampi(r + 1, 0, h_max);
         let r_n2 = clampi(r - 2, 0, h_max);
         let r_s2 = clampi(r + 2, 0, h_max);
-        let (int_start, int_end) = if width >= 4 { (2usize, width - 2) } else { (width, width) };
+        let (int_start, int_end) = if width >= 4 {
+            (2usize, width - 2)
+        } else {
+            (width, width)
+        };
         for col in 0..int_start {
             let c = col as isize;
             let (rr, gg, bb) = mhc_pixel_phased(
-                raw, width, row, r_n, r_s, r_n2, r_s2, col,
-                clampi(c - 1, 0, w_max), clampi(c + 1, 0, w_max),
-                clampi(c - 2, 0, w_max), clampi(c + 2, 0, w_max), phase,
+                raw,
+                width,
+                row,
+                r_n,
+                r_s,
+                r_n2,
+                r_s2,
+                col,
+                clampi(c - 1, 0, w_max),
+                clampi(c + 1, 0, w_max),
+                clampi(c - 2, 0, w_max),
+                clampi(c + 2, 0, w_max),
+                phase,
             );
             let o = col * 3;
-            out_row[o] = rr as u16; out_row[o + 1] = gg as u16; out_row[o + 2] = bb as u16;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
         }
         for col in int_start..int_end {
             let (rr, gg, bb) = mhc_pixel_phased(
-                raw, width, row, r_n, r_s, r_n2, r_s2, col,
-                col - 1, col + 1, col - 2, col + 2, phase,
+                raw,
+                width,
+                row,
+                r_n,
+                r_s,
+                r_n2,
+                r_s2,
+                col,
+                col - 1,
+                col + 1,
+                col - 2,
+                col + 2,
+                phase,
             );
             let o = col * 3;
-            out_row[o] = rr as u16; out_row[o + 1] = gg as u16; out_row[o + 2] = bb as u16;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
         }
         for col in int_end..width {
             let c = col as isize;
             let (rr, gg, bb) = mhc_pixel_phased(
-                raw, width, row, r_n, r_s, r_n2, r_s2, col,
-                clampi(c - 1, 0, w_max), clampi(c + 1, 0, w_max),
-                clampi(c - 2, 0, w_max), clampi(c + 2, 0, w_max), phase,
+                raw,
+                width,
+                row,
+                r_n,
+                r_s,
+                r_n2,
+                r_s2,
+                col,
+                clampi(c - 1, 0, w_max),
+                clampi(c + 1, 0, w_max),
+                clampi(c - 2, 0, w_max),
+                clampi(c + 2, 0, w_max),
+                phase,
             );
             let o = col * 3;
-            out_row[o] = rr as u16; out_row[o + 1] = gg as u16; out_row[o + 2] = bb as u16;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
         }
     };
-    rgb.par_chunks_mut(width * 3).enumerate().for_each(|(row, out_row)| do_row(row, out_row));
+    rgb.par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(row, out_row)| do_row(row, out_row));
     rgb
 }
 

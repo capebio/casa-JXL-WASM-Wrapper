@@ -34,7 +34,7 @@ pub struct StreamingBandSource<S: RawRowSource> {
     h: usize,
     params: PipelineParams,
     nr_strength: f32, // luminance-NR strength (0 = off); external, ISO-derived like the app
-    phase: (u8, u8), // R position in the 2x2 (ORF/RGGB = (0,0); DNG per CFA)
+    phase: (u8, u8),  // R position in the 2x2 (ORF/RGGB = (0,0); DNG per CFA)
     // rolling raw window [raw_first, raw_decoded)
     raw_win: Vec<u16>,
     raw_first: usize,
@@ -67,30 +67,62 @@ fn extend_for_overwrite(v: &mut Vec<u8>, n: usize) {
 
 impl<S: RawRowSource> StreamingBandSource<S> {
     pub fn new(
-        src: S, w: usize, h: usize, params: PipelineParams, nr_strength: f32, phase: (u8, u8),
+        src: S,
+        w: usize,
+        h: usize,
+        params: PipelineParams,
+        nr_strength: f32,
+        phase: (u8, u8),
     ) -> Self {
         Self {
-            src, w, h, params, nr_strength, phase,
-            raw_win: Vec::new(), raw_first: 0, raw_decoded: 0,
-            rgb8: Vec::new(), win_first: 0, produced: 0,
-            rowbuf: Vec::new(), ctx: Vec::new(), rgb16: Vec::new(),
+            src,
+            w,
+            h,
+            params,
+            nr_strength,
+            phase,
+            raw_win: Vec::new(),
+            raw_first: 0,
+            raw_decoded: 0,
+            rgb8: Vec::new(),
+            win_first: 0,
+            produced: 0,
+            rowbuf: Vec::new(),
+            ctx: Vec::new(),
+            rgb16: Vec::new(),
         }
     }
 
     #[inline]
-    pub fn width(&self) -> usize { self.w }
+    pub fn width(&self) -> usize {
+        self.w
+    }
     #[inline]
-    pub fn height(&self) -> usize { self.h }
+    pub fn height(&self) -> usize {
+        self.h
+    }
 
     /// Materialize toned RGB8 rows for [xpos, ypos, xsize×ysize] and return a pointer to the
     /// first requested pixel plus the row stride in bytes. Pulls MUST be monotonic in `ypos`
     /// (rows below `ypos` are front-dropped). The returned pointer is valid until the next call.
     /// This is the codec-independent core the native `ChunkedColorSource` and the WASM binding
     /// both call.
-    pub fn band(&mut self, xpos: usize, ypos: usize, _xsize: usize, ysize: usize) -> (*const u8, usize) {
-        assert!(ypos >= self.win_first, "non-monotonic pull ypos {} < win_first {}", ypos, self.win_first);
+    pub fn band(
+        &mut self,
+        xpos: usize,
+        ypos: usize,
+        _xsize: usize,
+        ysize: usize,
+    ) -> (*const u8, usize) {
+        assert!(
+            ypos >= self.win_first,
+            "non-monotonic pull ypos {} < win_first {}",
+            ypos,
+            self.win_first
+        );
         self.drop_front_to(ypos);
-        self.extend_to(ypos + ysize).expect("streaming decode/demosaic failed");
+        self.extend_to(ypos + ysize)
+            .expect("streaming decode/demosaic failed");
         let stride = self.w * 3;
         let off = (ypos - self.win_first) * stride + xpos * 3;
         (unsafe { self.rgb8.as_ptr().add(off) }, stride)
@@ -141,7 +173,11 @@ impl<S: RawRowSource> StreamingBandSource<S> {
             // demosaic_bayer_mhc_band derives CFA parity from the local ctx row; with an even
             // halo the local parity matches the global row only when s0 is even. Pull ypos are
             // multiples of 8 and sub-chunks step by 256, so s0 is always even.
-            debug_assert_eq!(s0 % 2, 0, "sub-chunk start must be even for correct CFA phase");
+            debug_assert_eq!(
+                s0 % 2,
+                0,
+                "sub-chunk start must be even for correct CFA phase"
+            );
             let ctx_h = ns + 4; // 2 halo above + ns band + 2 halo below
             self.rgb16.resize(ns * w * 3, 0);
             if s0 >= 2 && s1 + 2 <= h {
@@ -151,7 +187,16 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                 // elements and derives the same local parity, so bytes are unchanged.
                 let a = (s0 - 2 - self.raw_first) * w;
                 let b = (s1 + 2 - self.raw_first) * w;
-                demosaic_bayer_mhc_band(&self.raw_win[a..b], w, ctx_h, 2, self.phase, 0, ns, &mut self.rgb16)?;
+                demosaic_bayer_mhc_band(
+                    &self.raw_win[a..b],
+                    w,
+                    ctx_h,
+                    2,
+                    self.phase,
+                    0,
+                    ns,
+                    &mut self.rgb16,
+                )?;
             } else {
                 // Top/bottom clamp: build the halo context row-by-row (reused scratch).
                 self.ctx.resize(ctx_h * w, 0);
@@ -160,7 +205,16 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     let li = g - self.raw_first;
                     self.ctx[i * w..i * w + w].copy_from_slice(&self.raw_win[li * w..li * w + w]);
                 }
-                demosaic_bayer_mhc_band(&self.ctx, w, ctx_h, 2, self.phase, 0, ns, &mut self.rgb16)?;
+                demosaic_bayer_mhc_band(
+                    &self.ctx,
+                    w,
+                    ctx_h,
+                    2,
+                    self.phase,
+                    0,
+                    ns,
+                    &mut self.rgb16,
+                )?;
             }
             let start = self.rgb8.len();
             // No dead zero-fill: process_into_auto fully overwrites the appended tail.
@@ -205,7 +259,11 @@ impl<S: RawRowSource> StreamingBandSource<S> {
         while s0 < target {
             let s1 = (s0 + SUB_ROWS).min(target);
             let ns = s1 - s0;
-            debug_assert_eq!(s0 % 2, 0, "sub-chunk start must be even for correct CFA phase");
+            debug_assert_eq!(
+                s0 % 2,
+                0,
+                "sub-chunk start must be even for correct CFA phase"
+            );
             // Padded band [b_lo, b_hi): halo rows of real data (clamped to the image). b_lo stays
             // even (s0 even, SPATIAL_HALO even, or 0) so the CFA parity is preserved; at the image
             // top/bottom the clamp coincides with the whole-frame clamp ⇒ still byte-exact.
@@ -221,7 +279,16 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                 // borrow it directly (same bytes the copy loop below would assemble).
                 let a = (b_lo - 2 - self.raw_first) * w;
                 let b = (b_hi + 2 - self.raw_first) * w;
-                demosaic_bayer_mhc_band(&self.raw_win[a..b], w, ctx_h, 2, self.phase, 0, b_h, &mut self.rgb16)?;
+                demosaic_bayer_mhc_band(
+                    &self.raw_win[a..b],
+                    w,
+                    ctx_h,
+                    2,
+                    self.phase,
+                    0,
+                    b_h,
+                    &mut self.rgb16,
+                )?;
             } else {
                 self.ctx.resize(ctx_h * w, 0);
                 for i in 0..ctx_h {
@@ -229,7 +296,16 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     let li = g - self.raw_first;
                     self.ctx[i * w..i * w + w].copy_from_slice(&self.raw_win[li * w..li * w + w]);
                 }
-                demosaic_bayer_mhc_band(&self.ctx, w, ctx_h, 2, self.phase, 0, b_h, &mut self.rgb16)?;
+                demosaic_bayer_mhc_band(
+                    &self.ctx,
+                    w,
+                    ctx_h,
+                    2,
+                    self.phase,
+                    0,
+                    b_h,
+                    &mut self.rgb16,
+                )?;
             }
             // Spatial look ops in place on the padded band (matches app order: NR → unsharp).
             if self.nr_strength > 0.0 {
@@ -242,7 +318,9 @@ impl<S: RawRowSource> StreamingBandSource<S> {
             // No dead zero-fill: process_into_auto fully overwrites the appended tail.
             extend_for_overwrite(&mut self.rgb8, ns * w * 3);
             pipeline::process_into_auto(
-                &self.rgb16[src_off..src_off + ns * w * 3], &self.params, &mut self.rgb8[start..],
+                &self.rgb16[src_off..src_off + ns * w * 3],
+                &self.params,
+                &mut self.rgb8[start..],
             );
             s0 = s1;
         }
@@ -278,12 +356,20 @@ impl<'a> StreamingBandSource<OrfRowDecoder<'a>> {
         let end = (info.strip_offset as usize)
             .checked_add(info.strip_byte_count as usize)
             .ok_or("strip range overflow")?;
-        let strip = orf.get(info.strip_offset as usize..end).ok_or("strip OOB")?;
+        let strip = orf
+            .get(info.strip_offset as usize..end)
+            .ok_or("strip OOB")?;
         let mut params = PipelineParams::default_olympus();
         params.black = 256; // Olympus 12-bit pedestal (matches decode_orf_raw)
-        if let Some(r) = info.wb_r { params.wb_r = r; }
-        if let Some(b) = info.wb_b { params.wb_b = b; }
-        if let Some(m) = info.color_matrix { params.color_matrix = Some(m); }
+        if let Some(r) = info.wb_r {
+            params.wb_r = r;
+        }
+        if let Some(b) = info.wb_b {
+            params.wb_b = b;
+        }
+        if let Some(m) = info.color_matrix {
+            params.color_matrix = Some(m);
+        }
         let src = OrfRowDecoder::new(strip, w, h)?;
         Ok(Self::new(src, w, h, params, nr_strength, (0, 0)))
     }
@@ -297,7 +383,15 @@ impl<'a> StreamingBandSource<DngRowSource<'a>> {
         let phase = src.phase();
         let (w, h, black, white, wb_r, wb_b, cm) = {
             let m = src.meta();
-            (m.width, m.height, m.black, m.white, m.wb_r, m.wb_b, m.color_matrix)
+            (
+                m.width,
+                m.height,
+                m.black,
+                m.white,
+                m.wb_r,
+                m.wb_b,
+                m.color_matrix,
+            )
         };
         let mut params = PipelineParams::default_olympus();
         params.black = black;

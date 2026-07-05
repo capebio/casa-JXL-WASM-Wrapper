@@ -64,7 +64,13 @@ pub fn vib_zero_matrix(m: &[[f32; 3]; 3], sat: f32) -> [[f32; 3]; 3] {
 /// `c2 = sat*vib*0.6` (all folded once by the caller).
 #[inline(always)]
 fn tone_active(
-    rr: f32, gg: f32, bb: f32, m: &[[f32; 3]; 3], lm: &[f32; 3], c1: f32, c2: f32,
+    rr: f32,
+    gg: f32,
+    bb: f32,
+    m: &[[f32; 3]; 3],
+    lm: &[f32; 3],
+    c1: f32,
+    c2: f32,
 ) -> (f32, f32, f32) {
     let r2 = m[0][0].mul_add(rr, m[0][1].mul_add(gg, m[0][2] * bb));
     let g2 = m[1][0].mul_add(rr, m[1][1].mul_add(gg, m[1][2] * bb));
@@ -119,8 +125,13 @@ pub fn apply_tone_bulk(
 /// Scalar-forced bulk (the branchless parity path), exposed for benchmarking against
 /// the SIMD path. Production callers use `apply_tone_bulk` (auto-dispatches).
 pub fn apply_tone_bulk_ref(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32],
-    m: &[[f32; 3]; 3], sat: f32, vib: f32, vib_zero: bool,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    m: &[[f32; 3]; 3],
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
 ) {
     let n = r.len().min(g.len()).min(b.len());
     apply_tone_bulk_scalar(r, g, b, m, sat, vib, vib_zero, n);
@@ -128,8 +139,14 @@ pub fn apply_tone_bulk_ref(
 
 #[inline]
 fn apply_tone_bulk_scalar(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32],
-    m: &[[f32; 3]; 3], sat: f32, vib: f32, vib_zero: bool, n: usize,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    m: &[[f32; 3]; 3],
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
+    n: usize,
 ) {
     if vib_zero {
         // Entire tone is the single 3×3 M' — applied by the shared matrix-only kernel.
@@ -141,7 +158,9 @@ fn apply_tone_bulk_scalar(
         let (c1, c2) = (sat * (1.0 + vib6), sat * vib6);
         for i in 0..n {
             let (nr, ng, nb) = tone_active(r[i], g[i], b[i], m, &lm, c1, c2);
-            r[i] = nr; g[i] = ng; b[i] = nb;
+            r[i] = nr;
+            g[i] = ng;
+            b[i] = nb;
         }
     }
 }
@@ -149,8 +168,14 @@ fn apply_tone_bulk_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn apply_tone_bulk_avx2(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32],
-    m: &[[f32; 3]; 3], sat: f32, vib: f32, vib_zero: bool, n: usize,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    m: &[[f32; 3]; 3],
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
+    n: usize,
 ) {
     // Safety: caller (apply_tone_bulk) passes n = min(r.len(), g.len(), b.len()) so all
     // three slices are guaranteed to have at least n elements.
@@ -164,11 +189,27 @@ unsafe fn apply_tone_bulk_avx2(
         let p = vib_zero_matrix(m, sat);
         apply_tone_bulk_matrix_avx2(r, g, b, &p, n);
     } else {
-        let (m00, m01, m02) = (_mm256_set1_ps(m[0][0]), _mm256_set1_ps(m[0][1]), _mm256_set1_ps(m[0][2]));
-        let (m10, m11, m12) = (_mm256_set1_ps(m[1][0]), _mm256_set1_ps(m[1][1]), _mm256_set1_ps(m[1][2]));
-        let (m20, m21, m22) = (_mm256_set1_ps(m[2][0]), _mm256_set1_ps(m[2][1]), _mm256_set1_ps(m[2][2]));
+        let (m00, m01, m02) = (
+            _mm256_set1_ps(m[0][0]),
+            _mm256_set1_ps(m[0][1]),
+            _mm256_set1_ps(m[0][2]),
+        );
+        let (m10, m11, m12) = (
+            _mm256_set1_ps(m[1][0]),
+            _mm256_set1_ps(m[1][1]),
+            _mm256_set1_ps(m[1][2]),
+        );
+        let (m20, m21, m22) = (
+            _mm256_set1_ps(m[2][0]),
+            _mm256_set1_ps(m[2][1]),
+            _mm256_set1_ps(m[2][2]),
+        );
         let lm = luma_weights(m);
-        let (l0, l1, l2) = (_mm256_set1_ps(lm[0]), _mm256_set1_ps(lm[1]), _mm256_set1_ps(lm[2]));
+        let (l0, l1, l2) = (
+            _mm256_set1_ps(lm[0]),
+            _mm256_set1_ps(lm[1]),
+            _mm256_set1_ps(lm[2]),
+        );
         let one = _mm256_set1_ps(1.0);
         let zero = _mm256_setzero_ps();
         let vib6 = vib * 0.6;
@@ -203,7 +244,9 @@ unsafe fn apply_tone_bulk_avx2(
         // scalar tail via the oracle → parity on the ragged end (vibrance-active path).
         while i < n {
             let (r2, g2, b2) = apply_tone_math(r[i], g[i], b[i], m, sat, vib, vib_zero, false);
-            r[i] = r2; g[i] = g2; b[i] = b2;
+            r[i] = r2;
+            g[i] = g2;
+            b[i] = b2;
             i += 1;
         }
     }
@@ -214,8 +257,14 @@ unsafe fn apply_tone_bulk_avx2(
 /// stays inside the same reassociation tolerance the parity tests assert.
 #[cfg(target_arch = "wasm32")]
 fn apply_tone_bulk_wasm(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32],
-    m: &[[f32; 3]; 3], sat: f32, vib: f32, vib_zero: bool, n: usize,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    m: &[[f32; 3]; 3],
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
+    n: usize,
 ) {
     use core::arch::wasm32::*;
     let lanes = n / 4 * 4;
@@ -229,9 +278,21 @@ fn apply_tone_bulk_wasm(
             apply_tone_bulk_matrix_wasm(r, g, b, &p, n);
             i = n;
         } else {
-            let (m00, m01, m02) = (f32x4_splat(m[0][0]), f32x4_splat(m[0][1]), f32x4_splat(m[0][2]));
-            let (m10, m11, m12) = (f32x4_splat(m[1][0]), f32x4_splat(m[1][1]), f32x4_splat(m[1][2]));
-            let (m20, m21, m22) = (f32x4_splat(m[2][0]), f32x4_splat(m[2][1]), f32x4_splat(m[2][2]));
+            let (m00, m01, m02) = (
+                f32x4_splat(m[0][0]),
+                f32x4_splat(m[0][1]),
+                f32x4_splat(m[0][2]),
+            );
+            let (m10, m11, m12) = (
+                f32x4_splat(m[1][0]),
+                f32x4_splat(m[1][1]),
+                f32x4_splat(m[1][2]),
+            );
+            let (m20, m21, m22) = (
+                f32x4_splat(m[2][0]),
+                f32x4_splat(m[2][1]),
+                f32x4_splat(m[2][2]),
+            );
             let lm = luma_weights(m);
             let (l0, l1, l2) = (f32x4_splat(lm[0]), f32x4_splat(lm[1]), f32x4_splat(lm[2]));
             let one = f32x4_splat(1.0);
@@ -243,10 +304,22 @@ fn apply_tone_bulk_wasm(
                 let vr = v128_load(r.as_ptr().add(i) as *const v128);
                 let vg = v128_load(g.as_ptr().add(i) as *const v128);
                 let vb = v128_load(b.as_ptr().add(i) as *const v128);
-                let r2 = f32x4_add(f32x4_mul(m00, vr), f32x4_add(f32x4_mul(m01, vg), f32x4_mul(m02, vb)));
-                let g2 = f32x4_add(f32x4_mul(m10, vr), f32x4_add(f32x4_mul(m11, vg), f32x4_mul(m12, vb)));
-                let b2 = f32x4_add(f32x4_mul(m20, vr), f32x4_add(f32x4_mul(m21, vg), f32x4_mul(m22, vb)));
-                let luma = f32x4_add(f32x4_mul(l0, vr), f32x4_add(f32x4_mul(l1, vg), f32x4_mul(l2, vb)));
+                let r2 = f32x4_add(
+                    f32x4_mul(m00, vr),
+                    f32x4_add(f32x4_mul(m01, vg), f32x4_mul(m02, vb)),
+                );
+                let g2 = f32x4_add(
+                    f32x4_mul(m10, vr),
+                    f32x4_add(f32x4_mul(m11, vg), f32x4_mul(m12, vb)),
+                );
+                let b2 = f32x4_add(
+                    f32x4_mul(m20, vr),
+                    f32x4_add(f32x4_mul(m21, vg), f32x4_mul(m22, vb)),
+                );
+                let luma = f32x4_add(
+                    f32x4_mul(l0, vr),
+                    f32x4_add(f32x4_mul(l1, vg), f32x4_mul(l2, vb)),
+                );
                 let raw_mx = f32x4_max(f32x4_max(r2, g2), b2);
                 let mx = f32x4_max(raw_mx, one);
                 let mn = f32x4_max(f32x4_min(f32x4_min(r2, g2), b2), zero);
@@ -270,7 +343,9 @@ fn apply_tone_bulk_wasm(
     // scalar tail via the oracle → guaranteed parity.
     while i < n {
         let (r2, g2, b2) = apply_tone_math(r[i], g[i], b[i], m, sat, vib, vib_zero, false);
-        r[i] = r2; g[i] = g2; b[i] = b2;
+        r[i] = r2;
+        g[i] = g2;
+        b[i] = b2;
         i += 1;
     }
 }
@@ -285,12 +360,7 @@ fn apply_tone_bulk_wasm(
 /// fused tail). Dispatches AVX2+FMA / SIMD128 / branchless scalar exactly like
 /// `apply_tone_bulk`; length is clamped to the shortest slice.
 #[inline]
-pub fn apply_tone_bulk_matrix(
-    r: &mut [f32],
-    g: &mut [f32],
-    b: &mut [f32],
-    p: &[[f32; 3]; 3],
-) {
+pub fn apply_tone_bulk_matrix(r: &mut [f32], g: &mut [f32], b: &mut [f32], p: &[[f32; 3]; 3]) {
     let n = r.len().min(g.len()).min(b.len());
     debug_assert_eq!(g.len(), r.len());
     debug_assert_eq!(b.len(), r.len());
@@ -314,7 +384,11 @@ pub fn apply_tone_bulk_matrix(
 /// `vib_zero` scalar body verbatim.
 #[inline]
 fn apply_tone_bulk_matrix_scalar(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32], p: &[[f32; 3]; 3], n: usize,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    p: &[[f32; 3]; 3],
+    n: usize,
 ) {
     for i in 0..n {
         let (rr, gg, bb) = (r[i], g[i], b[i]);
@@ -327,16 +401,32 @@ fn apply_tone_bulk_matrix_scalar(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn apply_tone_bulk_matrix_avx2(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32], p: &[[f32; 3]; 3], n: usize,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    p: &[[f32; 3]; 3],
+    n: usize,
 ) {
     // Safety: callers pass n = min(r.len(), g.len(), b.len()); all three slices hold ≥ n.
     debug_assert!(n <= r.len() && n <= g.len() && n <= b.len());
     use core::arch::x86_64::*;
     let lanes = n / 8 * 8;
     let mut i = 0;
-    let (p00, p01, p02) = (_mm256_set1_ps(p[0][0]), _mm256_set1_ps(p[0][1]), _mm256_set1_ps(p[0][2]));
-    let (p10, p11, p12) = (_mm256_set1_ps(p[1][0]), _mm256_set1_ps(p[1][1]), _mm256_set1_ps(p[1][2]));
-    let (p20, p21, p22) = (_mm256_set1_ps(p[2][0]), _mm256_set1_ps(p[2][1]), _mm256_set1_ps(p[2][2]));
+    let (p00, p01, p02) = (
+        _mm256_set1_ps(p[0][0]),
+        _mm256_set1_ps(p[0][1]),
+        _mm256_set1_ps(p[0][2]),
+    );
+    let (p10, p11, p12) = (
+        _mm256_set1_ps(p[1][0]),
+        _mm256_set1_ps(p[1][1]),
+        _mm256_set1_ps(p[1][2]),
+    );
+    let (p20, p21, p22) = (
+        _mm256_set1_ps(p[2][0]),
+        _mm256_set1_ps(p[2][1]),
+        _mm256_set1_ps(p[2][2]),
+    );
     while i < lanes {
         let vr = _mm256_loadu_ps(r.as_ptr().add(i));
         let vg = _mm256_loadu_ps(g.as_ptr().add(i));
@@ -363,22 +453,47 @@ unsafe fn apply_tone_bulk_matrix_avx2(
 /// `vib_zero` wasm body. Processes the full `[0, n)` range (lanes + scalar mul+add tail).
 #[cfg(target_arch = "wasm32")]
 fn apply_tone_bulk_matrix_wasm(
-    r: &mut [f32], g: &mut [f32], b: &mut [f32], p: &[[f32; 3]; 3], n: usize,
+    r: &mut [f32],
+    g: &mut [f32],
+    b: &mut [f32],
+    p: &[[f32; 3]; 3],
+    n: usize,
 ) {
     use core::arch::wasm32::*;
     let lanes = n / 4 * 4;
     let mut i = 0;
     unsafe {
-        let (p00, p01, p02) = (f32x4_splat(p[0][0]), f32x4_splat(p[0][1]), f32x4_splat(p[0][2]));
-        let (p10, p11, p12) = (f32x4_splat(p[1][0]), f32x4_splat(p[1][1]), f32x4_splat(p[1][2]));
-        let (p20, p21, p22) = (f32x4_splat(p[2][0]), f32x4_splat(p[2][1]), f32x4_splat(p[2][2]));
+        let (p00, p01, p02) = (
+            f32x4_splat(p[0][0]),
+            f32x4_splat(p[0][1]),
+            f32x4_splat(p[0][2]),
+        );
+        let (p10, p11, p12) = (
+            f32x4_splat(p[1][0]),
+            f32x4_splat(p[1][1]),
+            f32x4_splat(p[1][2]),
+        );
+        let (p20, p21, p22) = (
+            f32x4_splat(p[2][0]),
+            f32x4_splat(p[2][1]),
+            f32x4_splat(p[2][2]),
+        );
         while i < lanes {
             let vr = v128_load(r.as_ptr().add(i) as *const v128);
             let vg = v128_load(g.as_ptr().add(i) as *const v128);
             let vb = v128_load(b.as_ptr().add(i) as *const v128);
-            let nr = f32x4_add(f32x4_mul(p00, vr), f32x4_add(f32x4_mul(p01, vg), f32x4_mul(p02, vb)));
-            let ng = f32x4_add(f32x4_mul(p10, vr), f32x4_add(f32x4_mul(p11, vg), f32x4_mul(p12, vb)));
-            let nb = f32x4_add(f32x4_mul(p20, vr), f32x4_add(f32x4_mul(p21, vg), f32x4_mul(p22, vb)));
+            let nr = f32x4_add(
+                f32x4_mul(p00, vr),
+                f32x4_add(f32x4_mul(p01, vg), f32x4_mul(p02, vb)),
+            );
+            let ng = f32x4_add(
+                f32x4_mul(p10, vr),
+                f32x4_add(f32x4_mul(p11, vg), f32x4_mul(p12, vb)),
+            );
+            let nb = f32x4_add(
+                f32x4_mul(p20, vr),
+                f32x4_add(f32x4_mul(p21, vg), f32x4_mul(p22, vb)),
+            );
             v128_store(r.as_mut_ptr().add(i) as *mut v128, nr);
             v128_store(g.as_mut_ptr().add(i) as *mut v128, ng);
             v128_store(b.as_mut_ptr().add(i) as *mut v128, nb);
@@ -413,16 +528,34 @@ fn apply_tone_bulk_matrix_wasm(
 /// `docs/ToneSimd-LutGather-JsWasm-handoff.md`.
 pub fn apply_tone_fused_u16_u8(
     rgb16: &[u16],
-    pre_r: &[u16], pre_g: &[u16], pre_b: &[u16], post: &[u8],
-    m: &[[f32; 3]; 3], sat: f32, vib: f32, vib_zero: bool,
+    pre_r: &[u16],
+    pre_g: &[u16],
+    pre_b: &[u16],
+    post: &[u8],
+    m: &[[f32; 3]; 3],
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
     out: &mut [u8],
 ) {
     // Each pre-LUT must cover the full u16 range so that rgb16[i] (any u16 value) is a valid index.
-    assert!(pre_r.len() >= 65536, "apply_tone_fused_u16_u8: pre_r must have at least 65536 entries");
-    assert!(pre_g.len() >= 65536, "apply_tone_fused_u16_u8: pre_g must have at least 65536 entries");
-    assert!(pre_b.len() >= 65536, "apply_tone_fused_u16_u8: pre_b must have at least 65536 entries");
+    assert!(
+        pre_r.len() >= 65536,
+        "apply_tone_fused_u16_u8: pre_r must have at least 65536 entries"
+    );
+    assert!(
+        pre_g.len() >= 65536,
+        "apply_tone_fused_u16_u8: pre_g must have at least 65536 entries"
+    );
+    assert!(
+        pre_b.len() >= 65536,
+        "apply_tone_fused_u16_u8: pre_b must have at least 65536 entries"
+    );
     // The post-LUT is indexed by the full u16 domain (clamped f32→u16), so it must cover it too.
-    assert!(post.len() >= 65536, "apply_tone_fused_u16_u8: post must have at least 65536 entries");
+    assert!(
+        post.len() >= 65536,
+        "apply_tone_fused_u16_u8: post must have at least 65536 entries"
+    );
     const BLK: usize = 2048;
     let np = (rgb16.len() / 3).min(out.len() / 3);
     // One reused stack scratch (zeroed once), not a fresh zeroed buffer per block.
@@ -438,7 +571,15 @@ pub fn apply_tone_fused_u16_u8(
             gs[i] = pre_g[rgb16[j + 1] as usize] as f32;
             bs[i] = pre_b[rgb16[j + 2] as usize] as f32;
         }
-        apply_tone_bulk(&mut rs[..cnt], &mut gs[..cnt], &mut bs[..cnt], m, sat, vib, vib_zero);
+        apply_tone_bulk(
+            &mut rs[..cnt],
+            &mut gs[..cnt],
+            &mut bs[..cnt],
+            m,
+            sat,
+            vib,
+            vib_zero,
+        );
         for i in 0..cnt {
             let j = 3 * (p + i);
             out[j] = post[(rs[i].clamp(0.0, 65535.0) as u16) as usize];
@@ -453,11 +594,7 @@ pub fn apply_tone_fused_u16_u8(
 mod tests {
     use super::*;
 
-    const M: [[f32; 3]; 3] = [
-        [1.7, -0.5, -0.2],
-        [-0.3, 1.4, -0.1],
-        [0.0, -0.4, 1.4],
-    ];
+    const M: [[f32; 3]; 3] = [[1.7, -0.5, -0.2], [-0.3, 1.4, -0.1], [0.0, -0.4, 1.4]];
 
     fn data(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut r = vec![0f32; n];
@@ -480,12 +617,21 @@ mod tests {
         (a - b).abs() < 0.05 || (a - b).abs() / a.abs().max(b.abs()).max(1e-6) < 1e-3
     }
 
-    fn oracle(r: &[f32], g: &[f32], b: &[f32], m: &[[f32; 3]; 3], sat: f32, vib: f32, vib_zero: bool)
-        -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    fn oracle(
+        r: &[f32],
+        g: &[f32],
+        b: &[f32],
+        m: &[[f32; 3]; 3],
+        sat: f32,
+        vib: f32,
+        vib_zero: bool,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let (mut sr, mut sg, mut sb) = (r.to_vec(), g.to_vec(), b.to_vec());
         for i in 0..r.len() {
             let (r2, g2, b2) = apply_tone_math(sr[i], sg[i], sb[i], m, sat, vib, vib_zero, false);
-            sr[i] = r2; sg[i] = g2; sb[i] = b2;
+            sr[i] = r2;
+            sg[i] = g2;
+            sb[i] = b2;
         }
         (sr, sg, sb)
     }
@@ -517,17 +663,27 @@ mod tests {
     }
 
     #[test]
-    fn parity_vib_zero() { check(&M, true, 1.30, 0.0, 1000); }
+    fn parity_vib_zero() {
+        check(&M, true, 1.30, 0.0, 1000);
+    }
     #[test]
-    fn parity_vibrance_active() { check(&M, false, 1.30, 0.5, 1000); }
+    fn parity_vibrance_active() {
+        check(&M, false, 1.30, 0.5, 1000);
+    }
     #[test]
-    fn parity_desaturate() { check(&M, false, 0.7, -0.4, 1000); }
+    fn parity_desaturate() {
+        check(&M, false, 0.7, -0.4, 1000);
+    }
 
     #[test]
-    fn parity_identity_fast_path() { check(&M, true, 1.0, 0.0, 1000); }
+    fn parity_identity_fast_path() {
+        check(&M, true, 1.0, 0.0, 1000);
+    }
 
     #[test]
-    fn parity_full_desaturate() { check(&M, true, 0.0, 0.0, 1000); }
+    fn parity_full_desaturate() {
+        check(&M, true, 0.0, 0.0, 1000);
+    }
 
     #[test]
     fn parity_empty() {
@@ -567,24 +723,38 @@ mod tests {
         let lm = luma_weights(&M);
         for &sat in &[0.0f32, 0.5, 1.0, 1.3] {
             let p = vib_zero_matrix(&M, sat);
-            for &(rr, gg, bb) in &[(12000.0f32, 30000.0, 51000.0), (0.0, 0.0, 0.0), (60000.0, 5.0, 33000.0)] {
+            for &(rr, gg, bb) in &[
+                (12000.0f32, 30000.0, 51000.0),
+                (0.0, 0.0, 0.0),
+                (60000.0, 5.0, 33000.0),
+            ] {
                 let r2 = M[0][0] * rr + M[0][1] * gg + M[0][2] * bb;
                 let g2 = M[1][0] * rr + M[1][1] * gg + M[1][2] * bb;
                 let b2 = M[2][0] * rr + M[2][1] * gg + M[2][2] * bb;
                 let luma = lm[0] * rr + lm[1] * gg + lm[2] * bb;
-                let want = (luma + sat * (r2 - luma), luma + sat * (g2 - luma), luma + sat * (b2 - luma));
+                let want = (
+                    luma + sat * (r2 - luma),
+                    luma + sat * (g2 - luma),
+                    luma + sat * (b2 - luma),
+                );
                 let got = (
                     p[0][0] * rr + p[0][1] * gg + p[0][2] * bb,
                     p[1][0] * rr + p[1][1] * gg + p[1][2] * bb,
                     p[2][0] * rr + p[2][1] * gg + p[2][2] * bb,
                 );
-                assert!(ok(want.0, got.0) && ok(want.1, got.1) && ok(want.2, got.2),
-                    "sat={sat} want={want:?} got={got:?}");
+                assert!(
+                    ok(want.0, got.0) && ok(want.1, got.1) && ok(want.2, got.2),
+                    "sat={sat} want={want:?} got={got:?}"
+                );
             }
         }
         // sat==1 ⇒ identity.
         let p1 = vib_zero_matrix(&M, 1.0);
-        for i in 0..3 { for j in 0..3 { assert!((p1[i][j] - M[i][j]).abs() < 1e-4); } }
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((p1[i][j] - M[i][j]).abs() < 1e-4);
+            }
+        }
     }
 
     // Fused u16→u8 path is byte-exact to the explicit two-pass (pre-LUT, tone, post-LUT).
@@ -599,7 +769,12 @@ mod tests {
             rgb16[3 * i + 1] = (i.wrapping_mul(104729) & 0xffff) as u16;
             rgb16[3 * i + 2] = (i.wrapping_mul(1299709) & 0xffff) as u16;
         }
-        for &(vz, sat, vib) in &[(true, 1.3f32, 0f32), (false, 1.3, 0.5), (false, 0.7, -0.4), (true, 1.0, 0.0)] {
+        for &(vz, sat, vib) in &[
+            (true, 1.3f32, 0f32),
+            (false, 1.3, 0.5),
+            (false, 0.7, -0.4),
+            (true, 1.0, 0.0),
+        ] {
             // explicit two-pass oracle
             let (mut r, mut g, mut b) = (vec![0f32; np], vec![0f32; np], vec![0f32; np]);
             for i in 0..np {
@@ -648,12 +823,21 @@ mod tests {
                 let p = vib_zero_matrix(&M, sat);
                 let (mut mr, mut mg, mut mb) = (r0, g0, b0);
                 apply_tone_bulk_matrix(&mut mr, &mut mg, &mut mb, &p);
-                assert_eq!(vr.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                           mr.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "r n={n} sat={sat}");
-                assert_eq!(vg.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                           mg.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "g n={n} sat={sat}");
-                assert_eq!(vb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                           mb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), "b n={n} sat={sat}");
+                assert_eq!(
+                    vr.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    mr.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "r n={n} sat={sat}"
+                );
+                assert_eq!(
+                    vg.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    mg.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "g n={n} sat={sat}"
+                );
+                assert_eq!(
+                    vb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    mb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "b n={n} sat={sat}"
+                );
             }
         }
     }

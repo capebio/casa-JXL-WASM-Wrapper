@@ -20,6 +20,11 @@ _jxl_wasm_dec_close_input
 _jxl_wasm_dec_width
 _jxl_wasm_dec_height
 _jxl_wasm_dec_error
+_jxl_wasm_dec_flush_attempts
+_jxl_wasm_dec_flush_successes
+_jxl_wasm_dec_flush_zero_skips
+_jxl_wasm_dec_flush_duplicate_skips
+_jxl_wasm_dec_flush_image_ms
 _jxl_wasm_dec_take_flushed
 _jxl_wasm_dec_take_final
 _jxl_wasm_dec_free

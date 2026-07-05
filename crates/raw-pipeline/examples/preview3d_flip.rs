@@ -15,7 +15,10 @@
 use raw_pipeline::pipeline::{process, process_simd, PipelineParams};
 use std::time::Instant;
 
-fn median(v: &mut [f64]) -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] }
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
 
 /// Build an N³ RGB→RGB u8 LUT by running the exact pipeline on every node triple.
 /// Node domain = [0, white] per channel (uniform). Returns flat (N*N*N*3) u8.
@@ -47,7 +50,11 @@ fn apply_lut(rgb16: &[u16], lut: &[u8], n: usize, white: u16, out: &mut [u8]) {
         let fg = (px[1] as f32 * scale).min(nm1);
         let fb = (px[2] as f32 * scale).min(nm1);
         let (r0, g0, b0) = (fr as usize, fg as usize, fb as usize);
-        let (r1, g1, b1) = ((r0 + 1).min(n - 1), (g0 + 1).min(n - 1), (b0 + 1).min(n - 1));
+        let (r1, g1, b1) = (
+            (r0 + 1).min(n - 1),
+            (g0 + 1).min(n - 1),
+            (b0 + 1).min(n - 1),
+        );
         let (dr, dg, db) = (fr - r0 as f32, fg - g0 as f32, fb - b0 as f32);
         for c in 0..3 {
             let l = |ri: usize, gi: usize, bi: usize| lut[idx(ri, gi, bi) + c] as f32;
@@ -88,7 +95,11 @@ fn main() {
         base.push(t.elapsed().as_secs_f64() * 1e3);
     }
     let base_ms = median(&mut base);
-    println!("preview3d_flip  {w}×{h} = {:.1} MP  white={white}  parallel={}", n_px as f64 / 1e6, cfg!(feature = "parallel"));
+    println!(
+        "preview3d_flip  {w}×{h} = {:.1} MP  white={white}  parallel={}",
+        n_px as f64 / 1e6,
+        cfg!(feature = "parallel")
+    );
     println!("baseline process_simd (cached chain): {base_ms:.1} ms\n");
     println!("  N   lut_kb  build_ms  apply_ms  speedup   maxΔ  meanΔ");
 
@@ -118,8 +129,13 @@ fn main() {
             ap.push(t.elapsed().as_secs_f64() * 1e3);
         }
         let apply_ms = median(&mut ap);
-        println!("{n:4}  {lut_kb:6.1}  {build_ms:8.2}  {apply_ms:8.1}  {:6.2}×  {maxd:5}  {mean:5.2}", base_ms / apply_ms);
+        println!(
+            "{n:4}  {lut_kb:6.1}  {build_ms:8.2}  {apply_ms:8.1}  {:6.2}×  {maxd:5}  {mean:5.2}",
+            base_ms / apply_ms
+        );
     }
-    println!("\n(apply is single-threaded here; baseline process_simd is parallel — compare shapes, and");
+    println!(
+        "\n(apply is single-threaded here; baseline process_simd is parallel — compare shapes, and"
+    );
     println!(" judge quality by maxΔ/meanΔ. A real impl would parallel-tile the apply like process_simd.)");
 }

@@ -12,7 +12,16 @@ use std::time::Instant;
 const M: [[f32; 3]; 3] = [[1.7, -0.5, -0.2], [-0.3, 1.4, -0.1], [0.0, -0.4, 1.4]];
 
 // Caller-style: a fresh `[0f32; BLK]` zeroed every block, full SoA fill → tone → post.
-fn two_pass(rgb16: &[u16], pre: &[u16], post: &[u8], out: &mut [u8], np: usize, sat: f32, vib: f32, vz: bool) {
+fn two_pass(
+    rgb16: &[u16],
+    pre: &[u16],
+    post: &[u8],
+    out: &mut [u8],
+    np: usize,
+    sat: f32,
+    vib: f32,
+    vz: bool,
+) {
     const BLK: usize = 2048;
     let mut p = 0;
     while p < np {
@@ -26,7 +35,15 @@ fn two_pass(rgb16: &[u16], pre: &[u16], post: &[u8], out: &mut [u8], np: usize, 
             g[i] = pre[rgb16[j + 1] as usize] as f32;
             b[i] = pre[rgb16[j + 2] as usize] as f32;
         }
-        apply_tone_bulk(&mut r[..cnt], &mut g[..cnt], &mut b[..cnt], &M, sat, vib, vz);
+        apply_tone_bulk(
+            &mut r[..cnt],
+            &mut g[..cnt],
+            &mut b[..cnt],
+            &M,
+            sat,
+            vib,
+            vz,
+        );
         for i in 0..cnt {
             let j = 3 * (p + i);
             out[j] = post[(r[i].clamp(0.0, 65535.0) as u16) as usize];
@@ -42,7 +59,17 @@ fn median(mut v: Vec<f64>) -> f64 {
     v[v.len() / 2]
 }
 
-fn run(label: &str, rgb16: &[u16], pre: &[u16], post: &[u8], out: &mut [u8], np: usize, sat: f32, vib: f32, vz: bool) {
+fn run(
+    label: &str,
+    rgb16: &[u16],
+    pre: &[u16],
+    post: &[u8],
+    out: &mut [u8],
+    np: usize,
+    sat: f32,
+    vib: f32,
+    vz: bool,
+) {
     let rounds = 7;
     two_pass(rgb16, pre, post, out, np, sat, vib, vz); // warmup
     apply_tone_fused_u16_u8(rgb16, pre, pre, pre, post, &M, sat, vib, vz, out);
@@ -59,7 +86,13 @@ fn run(label: &str, rgb16: &[u16], pre: &[u16], post: &[u8], out: &mut [u8], np:
         fu.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     let (m_tp, m_fu) = (median(tp), median(fu));
-    println!("  {:<22} two-pass {:7.2} ms  |  fused {:7.2} ms  |  {:.2}x", label, m_tp, m_fu, m_tp / m_fu);
+    println!(
+        "  {:<22} two-pass {:7.2} ms  |  fused {:7.2} ms  |  {:.2}x",
+        label,
+        m_tp,
+        m_fu,
+        m_tp / m_fu
+    );
 }
 
 fn main() {
@@ -73,20 +106,63 @@ fn main() {
         rgb16[3 * i + 2] = (i.wrapping_mul(1299709) & 0xffff) as u16;
     }
     let mut out = vec![0u8; np * 3];
-    println!("fused tone+LUT vs two-pass — {} MP, median of 7 rounds (single-thread)", np / 1_000_000);
-    run("vib_zero (sat only)", &rgb16, &pre, &post, &mut out, np, 1.30, 0.0, true);
-    run("vibrance active (div)", &rgb16, &pre, &post, &mut out, np, 1.30, 0.5, false);
+    println!(
+        "fused tone+LUT vs two-pass — {} MP, median of 7 rounds (single-thread)",
+        np / 1_000_000
+    );
+    run(
+        "vib_zero (sat only)",
+        &rgb16,
+        &pre,
+        &post,
+        &mut out,
+        np,
+        1.30,
+        0.0,
+        true,
+    );
+    run(
+        "vibrance active (div)",
+        &rgb16,
+        &pre,
+        &post,
+        &mut out,
+        np,
+        1.30,
+        0.5,
+        false,
+    );
 
     // 12-bit compact LUT (4096 entries) — simulates post-Task-2 cache-resident scenario.
     // rgb16 values bounded to [0, 4095] and identity pre-LUT has 4096 entries.
     let pre12: Vec<u16> = (0..4096u32).map(|x| (x * 16) as u16).collect();
     let mut rgb16_12: Vec<u16> = vec![0u16; np * 3];
     for i in 0..np {
-        rgb16_12[3 * i]     = (rgb16[3 * i] & 0x0FFF) as u16;
+        rgb16_12[3 * i] = (rgb16[3 * i] & 0x0FFF) as u16;
         rgb16_12[3 * i + 1] = (rgb16[3 * i + 1] & 0x0FFF) as u16;
         rgb16_12[3 * i + 2] = (rgb16[3 * i + 2] & 0x0FFF) as u16;
     }
     println!("\n--- 12-bit compact pre-LUT (4096 entries, L1-resident) ---");
-    run("vib_zero (compact)", &rgb16_12, &pre12, &post, &mut out, np, 1.30, 0.0, true);
-    run("vibrance (compact)", &rgb16_12, &pre12, &post, &mut out, np, 1.30, 0.5, false);
+    run(
+        "vib_zero (compact)",
+        &rgb16_12,
+        &pre12,
+        &post,
+        &mut out,
+        np,
+        1.30,
+        0.0,
+        true,
+    );
+    run(
+        "vibrance (compact)",
+        &rgb16_12,
+        &pre12,
+        &post,
+        &mut out,
+        np,
+        1.30,
+        0.5,
+        false,
+    );
 }

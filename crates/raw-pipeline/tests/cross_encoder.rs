@@ -16,27 +16,39 @@ fn gradient(w: u32, h: u32) -> Vec<u8> {
 fn libjxl_encoded_variants_decode_with_oxide() {
     let rgba = gradient(1024, 768);
     let v = encode_variants(&rgba, 1024, 768, SourceType::Jpeg, false).unwrap();
-    
-    let img_thumb = JxlImage::builder().read(v.thumb_300.as_slice()).expect("oxide parse");
+
+    let img_thumb = JxlImage::builder()
+        .read(v.thumb_300.as_slice())
+        .expect("oxide parse");
     let _ = img_thumb.render_frame(0).expect("oxide decode");
     assert!(img_thumb.width().max(img_thumb.height()) <= 300);
 
-    let img_preview = JxlImage::builder().read(v.preview_1080.as_slice()).expect("oxide parse");
+    let img_preview = JxlImage::builder()
+        .read(v.preview_1080.as_slice())
+        .expect("oxide parse");
     let _ = img_preview.render_frame(0).expect("oxide decode");
     assert!(img_preview.width().max(img_preview.height()) <= 1080);
 
-    let img_full = JxlImage::builder().read(v.full.as_slice()).expect("oxide parse");
+    let img_full = JxlImage::builder()
+        .read(v.full.as_slice())
+        .expect("oxide parse");
     let _ = img_full.render_frame(0).expect("oxide decode");
     assert_eq!(img_full.width(), 1024);
     assert_eq!(img_full.height(), 768);
 
     let aspect_orig = 1024.0 / 768.0;
-    
+
     let aspect_thumb = img_thumb.width() as f32 / img_thumb.height() as f32;
-    assert!((aspect_orig - aspect_thumb).abs() < 0.02, "aspect ratio mismatch: thumb {aspect_thumb} vs orig {aspect_orig}");
+    assert!(
+        (aspect_orig - aspect_thumb).abs() < 0.02,
+        "aspect ratio mismatch: thumb {aspect_thumb} vs orig {aspect_orig}"
+    );
 
     let aspect_preview = img_preview.width() as f32 / img_preview.height() as f32;
-    assert!((aspect_orig - aspect_preview).abs() < 0.02, "aspect ratio mismatch: preview {aspect_preview} vs orig {aspect_orig}");
+    assert!(
+        (aspect_orig - aspect_preview).abs() < 0.02,
+        "aspect ratio mismatch: preview {aspect_preview} vs orig {aspect_orig}"
+    );
 }
 
 #[test]
@@ -77,14 +89,16 @@ fn full_variant_roundtrips_pixels_through_oxide() {
 #[test]
 fn progressive_dc2_center_out_decodes_with_oxide() {
     let rgba = gradient(512, 384);
-    let v = encode_variants_with_progressive(&rgba, 512, 384, SourceType::Raw, false, 2, 1).unwrap();
-    let img = JxlImage::builder().read(v.full.as_slice()).expect("oxide parse progressive");
+    let v =
+        encode_variants_with_progressive(&rgba, 512, 384, SourceType::Raw, false, 2, 1).unwrap();
+    let img = JxlImage::builder()
+        .read(v.full.as_slice())
+        .expect("oxide parse progressive");
     let render = img.render_frame(0).expect("oxide decode progressive");
     assert_eq!(img.width(), 512);
     assert_eq!(img.height(), 384);
     let _ = render.image_all_channels();
 }
-
 
 #[test]
 fn ct5_encode_variants_from_rgb16_smoke() {
@@ -99,9 +113,19 @@ fn ct5_encode_variants_from_rgb16_smoke() {
         }
     }
     let params = raw_pipeline::pipeline::PipelineParams::default_olympus();
-    let v = raw_pipeline::casabio_encode::encode_variants_from_rgb16(&rgb16, &params, w, h, SourceType::Raw, false).unwrap();
-    
-    let img_full = JxlImage::builder().read(v.full.as_slice()).expect("oxide parse");
+    let v = raw_pipeline::casabio_encode::encode_variants_from_rgb16(
+        &rgb16,
+        &params,
+        w,
+        h,
+        SourceType::Raw,
+        false,
+    )
+    .unwrap();
+
+    let img_full = JxlImage::builder()
+        .read(v.full.as_slice())
+        .expect("oxide parse");
     let _ = img_full.render_frame(0).expect("oxide decode");
     assert_eq!(img_full.width(), 64);
     assert_eq!(img_full.height(), 64);

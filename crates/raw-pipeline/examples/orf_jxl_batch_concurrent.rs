@@ -12,7 +12,11 @@
 //!     --example orf_jxl_batch_concurrent -- "C:\995\2026-02-20 Gobabeb To Windhoek" 6
 //!   (arg2 = worker count, default 6; arg3 = max files, default all)
 use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
-use raw_pipeline::{decompress, demosaic, pipeline::{self, PipelineParams}, tiff};
+use raw_pipeline::{
+    decompress, demosaic,
+    pipeline::{self, PipelineParams},
+    tiff,
+};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -53,7 +57,9 @@ mod winmem {
 }
 #[cfg(not(windows))]
 mod winmem {
-    pub fn working_set() -> (u64, u64) { (0, 0) }
+    pub fn working_set() -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 fn decode_orf(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
@@ -61,9 +67,14 @@ fn decode_orf(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     let w = info.width as usize;
     let h = info.height as usize;
     let end = info.strip_offset as usize + info.strip_byte_count as usize;
-    let strip = data
-        .get(info.strip_offset as usize..end)
-        .ok_or_else(|| format!("strip {}..{} OOB (len {})", info.strip_offset, end, data.len()))?;
+    let strip = data.get(info.strip_offset as usize..end).ok_or_else(|| {
+        format!(
+            "strip {}..{} OOB (len {})",
+            info.strip_offset,
+            end,
+            data.len()
+        )
+    })?;
     let raw = decompress::decompress(strip, w, h).map_err(|e| format!("decompress: {e}"))?;
     let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| format!("demosaic: {e}"))?;
     let mut p = PipelineParams::default_olympus();
@@ -81,11 +92,16 @@ fn process(data: &[u8], enc_threads: usize) -> Result<(f64, f64, usize, usize, u
     let (rgb8, w, h) = decode_orf(data)?;
     let dec_ms = t.elapsed().as_secs_f64() * 1e3;
     let frame = Frame::rgb(&rgb8, w as u32, h as u32);
-    let opts = EncodeOptions { use_container: true, ..EncodeOptions::distance(1.0).with_effort(3) };
-    let mut enc = Encoder::with_threads(opts, enc_threads).map_err(|e| format!("with_threads: {e:?}"))?;
+    let opts = EncodeOptions {
+        use_container: true,
+        ..EncodeOptions::distance(1.0).with_effort(3)
+    };
+    let mut enc =
+        Encoder::with_threads(opts, enc_threads).map_err(|e| format!("with_threads: {e:?}"))?;
     let mut out = Vec::with_capacity(rgb8.len() / 3);
     let t = Instant::now();
-    enc.encode_into(&frame, &mut out).map_err(|e| format!("encode: {e:?}"))?;
+    enc.encode_into(&frame, &mut out)
+        .map_err(|e| format!("encode: {e:?}"))?;
     Ok((dec_ms, t.elapsed().as_secs_f64() * 1e3, out.len(), w, h))
 }
 
@@ -101,8 +117,13 @@ struct Agg {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let folder = args.get(1).cloned().unwrap_or_else(|| r"C:\995\2026-02-20 Gobabeb To Windhoek".into());
-    let logical = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(12);
+    let folder = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| r"C:\995\2026-02-20 Gobabeb To Windhoek".into());
+    let logical = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(12);
     let workers: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6).max(1);
     let enc_threads = (logical / workers).max(1);
 
@@ -110,7 +131,12 @@ fn main() {
         Ok(rd) => rd
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("orf")).unwrap_or(false))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("orf"))
+                    .unwrap_or(false)
+            })
             .collect(),
         Err(e) => {
             eprintln!("read_dir {folder}: {e}");
@@ -195,7 +221,10 @@ fn main() {
     let (end_cur, _) = winmem::working_set();
     let peak_mb = peak_rss.load(Ordering::Relaxed) as f64 / 1_048_576.0;
     let a = agg.lock().unwrap();
-    println!("\n=== done in {secs:.1}s — {} ok, {} fail ===", a.ok, a.fail);
+    println!(
+        "\n=== done in {secs:.1}s — {} ok, {} fail ===",
+        a.ok, a.fail
+    );
     if a.ok > 0 {
         println!(
             "throughput: {:.1} files/min ({:.2}s/file wall) · {:.1} MP/s",

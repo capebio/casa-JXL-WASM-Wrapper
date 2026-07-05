@@ -54,7 +54,9 @@ mod winmem {
 }
 #[cfg(not(windows))]
 mod winmem {
-    pub fn working_set() -> u64 { 0 }
+    pub fn working_set() -> u64 {
+        0
+    }
 }
 
 /// Verbatim box-downscale (integer + float paths) matching downscale_rgb16_impl, so the
@@ -62,9 +64,12 @@ mod winmem {
 fn box_downscale(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh * 6];
     let w16 = |out: &mut [u8], o: usize, r: u16, g: u16, b: u16| {
-        out[o] = r as u8; out[o + 1] = (r >> 8) as u8;
-        out[o + 2] = g as u8; out[o + 3] = (g >> 8) as u8;
-        out[o + 4] = b as u8; out[o + 5] = (b >> 8) as u8;
+        out[o] = r as u8;
+        out[o + 1] = (r >> 8) as u8;
+        out[o + 2] = g as u8;
+        out[o + 3] = (g >> 8) as u8;
+        out[o + 4] = b as u8;
+        out[o + 5] = (b >> 8) as u8;
     };
     if sw % dw == 0 && sh % dh == 0 {
         let (xs, ys) = (sw / dw, sh / dh);
@@ -76,10 +81,21 @@ fn box_downscale(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec
                 let mut rb = dy * ys * sw;
                 for _ in 0..ys {
                     let mut i = (rb + dx * xs) * 3;
-                    for _ in 0..xs { rr += src[i] as u32; gg += src[i + 1] as u32; bb += src[i + 2] as u32; i += 3; }
+                    for _ in 0..xs {
+                        rr += src[i] as u32;
+                        gg += src[i + 1] as u32;
+                        bb += src[i + 2] as u32;
+                        i += 3;
+                    }
                     rb += sw;
                 }
-                w16(&mut out, o, (rr / pc) as u16, (gg / pc) as u16, (bb / pc) as u16);
+                w16(
+                    &mut out,
+                    o,
+                    (rr / pc) as u16,
+                    (gg / pc) as u16,
+                    (bb / pc) as u16,
+                );
                 o += 6;
             }
         }
@@ -97,10 +113,21 @@ fn box_downscale(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec
             let (mut rr, mut gg, mut bb) = (0u32, 0u32, 0u32);
             let mut rb = y0 * sw;
             for _ in y0..y1 {
-                for x in x0..x1 { let i = (rb + x) * 3; rr += src[i] as u32; gg += src[i + 1] as u32; bb += src[i + 2] as u32; }
+                for x in x0..x1 {
+                    let i = (rb + x) * 3;
+                    rr += src[i] as u32;
+                    gg += src[i + 1] as u32;
+                    bb += src[i + 2] as u32;
+                }
                 rb += sw;
             }
-            w16(&mut out, o, (rr / n) as u16, (gg / n) as u16, (bb / n) as u16);
+            w16(
+                &mut out,
+                o,
+                (rr / n) as u16,
+                (gg / n) as u16,
+                (bb / n) as u16,
+            );
             o += 6;
         }
     }
@@ -109,7 +136,8 @@ fn box_downscale(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec
 
 fn full_preview(data: &[u8], targets: &[(usize, usize)]) -> Result<usize, String> {
     let img = dng::decode_bytes(data).map_err(|e| e.to_string())?;
-    let rgb = demosaic::demosaic_bayer_mhc(&img.raw, img.width, img.height, dng::cfa_phase(img.cfa))?;
+    let rgb =
+        demosaic::demosaic_bayer_mhc(&img.raw, img.width, img.height, dng::cfa_phase(img.cfa))?;
     let mut bytes = 0;
     for &(dw, dh) in targets {
         bytes += box_downscale(&rgb, img.width, img.height, dw, dh).len();
@@ -124,15 +152,28 @@ fn stream_preview_fn(data: &[u8], targets: &[(usize, usize)]) -> Result<usize, S
     Ok(prev.iter().map(|p| p.len()).sum())
 }
 
-fn run(mode: &str, n_workers: usize, reps: usize, data: Arc<Vec<u8>>, targets: Arc<Vec<(usize, usize)>>) -> (f64, u64) {
+fn run(
+    mode: &str,
+    n_workers: usize,
+    reps: usize,
+    data: Arc<Vec<u8>>,
+    targets: Arc<Vec<(usize, usize)>>,
+) -> (f64, u64) {
     let next = Arc::new(AtomicUsize::new(0));
     let wall = Instant::now();
     let mut handles = Vec::new();
     for _ in 0..n_workers {
-        let (next, data, targets, mode) = (Arc::clone(&next), Arc::clone(&data), Arc::clone(&targets), mode.to_string());
+        let (next, data, targets, mode) = (
+            Arc::clone(&next),
+            Arc::clone(&data),
+            Arc::clone(&targets),
+            mode.to_string(),
+        );
         handles.push(std::thread::spawn(move || loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= reps { break; }
+            if i >= reps {
+                break;
+            }
             let r = if mode == "stream" {
                 stream_preview_fn(&data, &targets)
             } else {
@@ -141,22 +182,41 @@ fn run(mode: &str, n_workers: usize, reps: usize, data: Arc<Vec<u8>>, targets: A
             std::hint::black_box(r.expect("decode"));
         }));
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     let secs = wall.elapsed().as_secs_f64();
     (reps as f64 / secs, 0) // peak filled by caller via sampler
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let file = args.get(1).cloned().unwrap_or_else(||
-        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng".into());
-    let reps: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(24).max(1);
-    let data = Arc::new(match std::fs::read(&file) { Ok(d) => d, Err(e) => { eprintln!("read {file}: {e}"); return; } });
+    let file = args.get(1).cloned().unwrap_or_else(|| {
+        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng"
+            .into()
+    });
+    let reps: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24)
+        .max(1);
+    let data = Arc::new(match std::fs::read(&file) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("read {file}: {e}");
+            return;
+        }
+    });
 
     // Preview targets sized from the image (both modes produce the same output dims).
-    let (w, h) = { let s = dng::DngRowSource::new(&data).expect("parse"); (s.meta().width, s.meta().height) };
+    let (w, h) = {
+        let s = dng::DngRowSource::new(&data).expect("parse");
+        (s.meta().width, s.meta().height)
+    };
     let targets = Arc::new(vec![(w / 4, h / 4), (w / 12, h / 12)]);
-    let cores = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(8);
+    let cores = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(8);
 
     // Background WS sampler: tracks max current working-set; reset per run.
     let ws_max = Arc::new(AtomicU64::new(0));
@@ -171,10 +231,18 @@ fn main() {
         })
     };
 
-    let ns: Vec<usize> = [1usize, 2, 4, cores, cores * 2].into_iter().filter(|&n| n >= 1).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let ns: Vec<usize> = [1usize, 2, 4, cores, cores * 2]
+        .into_iter()
+        .filter(|&n| n >= 1)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     println!("=== DNG preview concurrency: {w}x{h}, {reps} decodes/run, {cores} cores ===");
     println!("(build --no-default-features so N threads = the only parallelism)\n");
-    println!("{:<8} {:>4}  {:>10}  {:>10}", "mode", "N", "dec/s", "peakRSS_MB");
+    println!(
+        "{:<8} {:>4}  {:>10}  {:>10}",
+        "mode", "N", "dec/s", "peakRSS_MB"
+    );
     for mode in ["full", "stream"] {
         for &n in &ns {
             ws_max.store(winmem::working_set(), Ordering::Relaxed); // reset to current baseline

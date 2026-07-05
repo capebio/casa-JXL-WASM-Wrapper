@@ -22,18 +22,32 @@ fn ref_moments(b: &[u8], np: usize, ch: usize) -> ([u64; 3], [u64; 3]) {
     let (mut sb, mut sbb) = ([0u64; 3], [0u64; 3]);
     let mut j = 0;
     for _ in 0..np {
-        for c in 0..wch { let y = b[j + c] as u64; sb[c] += y; sbb[c] += y * y; }
+        for c in 0..wch {
+            let y = b[j + c] as u64;
+            sb[c] += y;
+            sbb[c] += y * y;
+        }
         j += ch;
     }
     (sb, sbb)
 }
 
-fn finalize(sa: &[u64; 3], sb: &[u64; 3], saa: &[u64; 3], sbb: &[u64; 3], sab: &[u64; 3], np: usize, wch: usize) -> f32 {
+fn finalize(
+    sa: &[u64; 3],
+    sb: &[u64; 3],
+    saa: &[u64; 3],
+    sbb: &[u64; 3],
+    sab: &[u64; 3],
+    np: usize,
+    wch: usize,
+) -> f32 {
     let n = np as f64;
     let mut s = 0.0f64;
     for c in 0..wch {
-        let mua = sa[c] as f64 / n; let mub = sb[c] as f64 / n;
-        let va = saa[c] as f64 / n - mua * mua; let vb = sbb[c] as f64 / n - mub * mub;
+        let mua = sa[c] as f64 / n;
+        let mub = sb[c] as f64 / n;
+        let va = saa[c] as f64 / n - mua * mua;
+        let vb = sbb[c] as f64 / n - mub * mub;
         let cov = sab[c] as f64 / n - mua * mub;
         let num = (2.0 * mua * mub + C1) * (2.0 * cov + C2);
         let den = (mua * mua + mub * mub + C1) * (va + vb + C2);
@@ -43,14 +57,24 @@ fn finalize(sa: &[u64; 3], sb: &[u64; 3], saa: &[u64; 3], sbb: &[u64; 3], sab: &
 }
 
 // ---- shared SSIM pass: accumulates sa/saa/sab, returns them + the score ----
-fn ssim_pass(a: &[u8], b: &[u8], np: usize, ch: usize, sb: &[u64; 3], sbb: &[u64; 3]) -> (f32, [u64; 3], [u64; 3]) {
+fn ssim_pass(
+    a: &[u8],
+    b: &[u8],
+    np: usize,
+    ch: usize,
+    sb: &[u64; 3],
+    sbb: &[u64; 3],
+) -> (f32, [u64; 3], [u64; 3]) {
     let wch = ch.min(3);
     let (mut sa, mut saa, mut sab) = ([0u64; 3], [0u64; 3], [0u64; 3]);
     let mut j = 0;
     for _ in 0..np {
         for c in 0..wch {
-            let x = a[j + c] as u64; let y = b[j + c] as u64;
-            sa[c] += x; saa[c] += x * x; sab[c] += x * y;
+            let x = a[j + c] as u64;
+            let y = b[j + c] as u64;
+            sa[c] += x;
+            saa[c] += x * x;
+            sab[c] += x * y;
         }
         j += ch;
     }
@@ -65,9 +89,15 @@ fn channel_moments(px: &[u8], np: usize, ch: usize, max_ch: usize) -> ([f32; 3],
     for c in 0..nch {
         let (mut sum, mut sum2) = (0u64, 0u64);
         let mut j = c;
-        for _ in 0..np { let v = px[j] as u64; sum += v; sum2 += v * v; j += ch; }
+        for _ in 0..np {
+            let v = px[j] as u64;
+            sum += v;
+            sum2 += v * v;
+            j += ch;
+        }
         let mu = sum as f64 / n;
-        mus[c] = mu as f32; vars[c] = (sum2 as f64 / n - mu * mu) as f32;
+        mus[c] = mu as f32;
+        vars[c] = (sum2 as f64 / n - mu * mu) as f32;
     }
     (mus, vars)
 }
@@ -78,7 +108,8 @@ fn moments_from_sums(sa: &[u64; 3], saa: &[u64; 3], np: usize, nch: usize) -> ([
     let n = np as f64;
     for c in 0..nch {
         let mu = sa[c] as f64 / n;
-        mus[c] = mu as f32; vars[c] = (saa[c] as f64 / n - mu * mu) as f32;
+        mus[c] = mu as f32;
+        vars[c] = (saa[c] as f64 / n - mu * mu) as f32;
     }
     (mus, vars)
 }
@@ -89,12 +120,24 @@ fn median(v: &[f64]) -> f64 {
     w[w.len() / 2]
 }
 
-fn variant_a(a: &[u8], b: &[u8], np: usize, sb: &[u64; 3], sbb: &[u64; 3]) -> (f32, [f32; 3], [f32; 3]) {
+fn variant_a(
+    a: &[u8],
+    b: &[u8],
+    np: usize,
+    sb: &[u64; 3],
+    sbb: &[u64; 3],
+) -> (f32, [f32; 3], [f32; 3]) {
     let (s, _sa, _saa) = ssim_pass(a, b, np, 4, sb, sbb);
     let (mus, vars) = channel_moments(a, np, 4, 3); // independent second pass
     (s, mus, vars)
 }
-fn variant_b(a: &[u8], b: &[u8], np: usize, sb: &[u64; 3], sbb: &[u64; 3]) -> (f32, [f32; 3], [f32; 3]) {
+fn variant_b(
+    a: &[u8],
+    b: &[u8],
+    np: usize,
+    sb: &[u64; 3],
+    sbb: &[u64; 3],
+) -> (f32, [f32; 3], [f32; 3]) {
     let (s, sa, saa) = ssim_pass(a, b, np, 4, sb, sbb);
     let (mus, vars) = moments_from_sums(&sa, &saa, np, 3);
     (s, mus, vars)
@@ -118,15 +161,22 @@ fn main() {
     let rounds = 11usize;
     let (mut ta, mut tb) = (Vec::new(), Vec::new());
     let mut sink = 0f64;
-    let time = |f: &dyn Fn(&[u8], &[u8], usize, &[u64; 3], &[u64; 3]) -> (f32, [f32; 3], [f32; 3]), sink: &mut f64| {
-        let t = Instant::now();
-        let r = f(&a, &b, np, &sb, &sbb);
-        *sink += r.0 as f64 + r.1[0] as f64 + r.2[2] as f64;
-        t.elapsed().as_secs_f64() * 1e3
-    };
+    let time =
+        |f: &dyn Fn(&[u8], &[u8], usize, &[u64; 3], &[u64; 3]) -> (f32, [f32; 3], [f32; 3]),
+         sink: &mut f64| {
+            let t = Instant::now();
+            let r = f(&a, &b, np, &sb, &sbb);
+            *sink += r.0 as f64 + r.1[0] as f64 + r.2[2] as f64;
+            t.elapsed().as_secs_f64() * 1e3
+        };
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(time(&variant_a, &mut sink)); tb.push(time(&variant_b, &mut sink)); }
-        else { tb.push(time(&variant_b, &mut sink)); ta.push(time(&variant_a, &mut sink)); }
+        if r % 2 == 0 {
+            ta.push(time(&variant_a, &mut sink));
+            tb.push(time(&variant_b, &mut sink));
+        } else {
+            tb.push(time(&variant_b, &mut sink));
+            ta.push(time(&variant_a, &mut sink));
+        }
     }
     std::hint::black_box(sink);
     let (ma, mb) = (median(&ta), median(&tb));

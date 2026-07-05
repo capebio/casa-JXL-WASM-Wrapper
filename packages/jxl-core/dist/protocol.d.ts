@@ -9,6 +9,7 @@ export interface MsgDecodeStart {
     progressionTarget: "header" | "dc" | "pass" | "final";
     emitEveryPass: boolean;
     progressiveDetail: "dc" | "lastPasses" | "passes" | "dcProgressive" | null;
+    suppressDuplicateProgress: boolean;
     preserveIcc: boolean;
     preserveMetadata: boolean;
     priority: "visible" | "near" | "background";

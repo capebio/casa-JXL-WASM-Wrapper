@@ -1,4 +1,4 @@
-use raw_pipeline::frame_stats::{analyze_scalar, analyze};
+use raw_pipeline::frame_stats::{analyze, analyze_scalar};
 use std::env;
 
 fn main() {

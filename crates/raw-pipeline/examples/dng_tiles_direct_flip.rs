@@ -12,7 +12,8 @@ use std::time::Instant;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng".into()
+        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng"
+            .into()
     });
     let data = std::fs::read(&path).expect("read DNG");
 
@@ -22,7 +23,11 @@ fn main() {
             if let Ok(i) = ljpeg::probe_tile(&data[o..e]) {
                 println!(
                     "tile0 SOF: width(samples)={} height={} cps={} prec={}  (tiles={})",
-                    i.width, i.height, i.components, i.precision, ranges.len()
+                    i.width,
+                    i.height,
+                    i.components,
+                    i.precision,
+                    ranges.len()
                 );
             }
         }
@@ -35,7 +40,12 @@ fn main() {
     assert_eq!(a.height, b.height, "height mismatch");
     assert_eq!(a.raw.len(), b.raw.len(), "raw len mismatch");
     let w = a.width;
-    let diffs = a.raw.iter().zip(b.raw.iter()).filter(|(x, y)| x != y).count();
+    let diffs = a
+        .raw
+        .iter()
+        .zip(b.raw.iter())
+        .filter(|(x, y)| x != y)
+        .count();
     let max_abs = a
         .raw
         .iter()
@@ -53,12 +63,21 @@ fn main() {
     let mut shown = 0;
     for (idx, (x, y)) in a.raw.iter().zip(b.raw.iter()).enumerate() {
         if x != y {
-            println!("  diff @ idx={idx} (row={}, col={})  blit={x} direct={y}", idx / w, idx % w);
+            println!(
+                "  diff @ idx={idx} (row={}, col={})  blit={x} direct={y}",
+                idx / w,
+                idx % w
+            );
             shown += 1;
-            if shown >= 8 { break; }
+            if shown >= 8 {
+                break;
+            }
         }
     }
-    assert_eq!(diffs, 0, "tile paths diverged ({diffs} px, max_abs={max_abs})");
+    assert_eq!(
+        diffs, 0,
+        "tile paths diverged ({diffs} px, max_abs={max_abs})"
+    );
 
     // --- timing: interleaved, start-rotated, round-0 dropped ---
     let blit = || -> f64 {

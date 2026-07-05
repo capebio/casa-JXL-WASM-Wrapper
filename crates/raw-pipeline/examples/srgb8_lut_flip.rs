@@ -14,7 +14,11 @@ use std::time::Instant;
 
 #[inline(always)]
 fn linear_to_srgb(v: f32) -> f32 {
-    if v <= 0.0031308 { v * 12.92 } else { 1.055f32.mul_add(v.powf(1.0 / 2.4), -0.055) }
+    if v <= 0.0031308 {
+        v * 12.92
+    } else {
+        1.055f32.mul_add(v.powf(1.0 / 2.4), -0.055)
+    }
 }
 
 // ---- A: current powf piecewise ----
@@ -23,7 +27,11 @@ fn srgb8_powf(rgba_f32: &[f32]) -> Vec<u8> {
     for px in rgba_f32.chunks_exact(4) {
         for &c in &px[..3] {
             let c = c.clamp(0.0, 1.0);
-            let s = if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+            let s = if c <= 0.0031308 {
+                12.92 * c
+            } else {
+                1.055 * c.powf(1.0 / 2.4) - 0.055
+            };
             out.push((s * 255.0 + 0.5) as u8);
         }
         out.push((px[3].clamp(0.0, 1.0) * 255.0 + 0.5) as u8);
@@ -34,7 +42,9 @@ fn srgb8_powf(rgba_f32: &[f32]) -> Vec<u8> {
 // ---- B: cached LUT + lerp (mirror of pipeline::srgb_encode_lerp) ----
 const SRGB_LUT_N: usize = 16384;
 fn build_tbl() -> Vec<f32> {
-    (0..=SRGB_LUT_N).map(|i| linear_to_srgb(i as f32 / SRGB_LUT_N as f32)).collect()
+    (0..=SRGB_LUT_N)
+        .map(|i| linear_to_srgb(i as f32 / SRGB_LUT_N as f32))
+        .collect()
 }
 #[inline(always)]
 fn srgb_encode_lerp(tbl: &[f32], y: f32) -> f32 {
@@ -78,7 +88,12 @@ fn main() {
     let oa = srgb8_powf(&buf);
     let ob = srgb8_lut(&buf, &tbl);
     let diffs = oa.iter().zip(&ob).filter(|(a, b)| a != b).count();
-    let maxdiff = oa.iter().zip(&ob).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap_or(0);
+    let maxdiff = oa
+        .iter()
+        .zip(&ob)
+        .map(|(a, b)| (*a as i32 - *b as i32).abs())
+        .max()
+        .unwrap_or(0);
 
     let rounds = 11usize;
     let (mut ta, mut tb) = (Vec::new(), Vec::new());
@@ -96,8 +111,13 @@ fn main() {
         t.elapsed().as_secs_f64() * 1e3
     };
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(time_a(&mut sink)); tb.push(time_b(&mut sink)); }
-        else { tb.push(time_b(&mut sink)); ta.push(time_a(&mut sink)); }
+        if r % 2 == 0 {
+            ta.push(time_a(&mut sink));
+            tb.push(time_b(&mut sink));
+        } else {
+            tb.push(time_b(&mut sink));
+            ta.push(time_a(&mut sink));
+        }
     }
     std::hint::black_box(sink);
     let (ma, mb) = (median(&ta), median(&tb));
@@ -105,6 +125,11 @@ fn main() {
     println!("srgb8 linear->u8 flip @12MP  A=powf  B=LUT-lerp\n");
     println!("  A powf  {:>8.3} ms", ma);
     println!("  B LUT   {:>8.3} ms   saved {:.1}%", mb, saved);
-    println!("  parity: {} byte diffs / {} (max |Δ| = {} u8)", diffs, oa.len(), maxdiff);
+    println!(
+        "  parity: {} byte diffs / {} (max |Δ| = {} u8)",
+        diffs,
+        oa.len(),
+        maxdiff
+    );
     println!("\n  Gate >=2% AND byte-exact (0 diffs) -> apply to image_formats.rs.");
 }

@@ -37,7 +37,12 @@ fn main() {
     let mut images: Vec<(String, usize, usize, Vec<u8>)> = vec![
         ("rand640x480".into(), 640, 480, rand_rgb(640, 480, 0xA1)),
         ("rand1023x300".into(), 1023, 300, rand_rgb(1023, 300, 0xB2)),
-        ("rand1200x2600".into(), 1200, 2600, rand_rgb(1200, 2600, 0xC3)),
+        (
+            "rand1200x2600".into(),
+            1200,
+            2600,
+            rand_rgb(1200, 2600, 0xC3),
+        ),
         ("rand1x3000".into(), 1, 3000, rand_rgb(1, 3000, 0xD4)),
     ];
     // Real DNG-derived rgb8 (tone-mapped) when present — the actual app payload.
@@ -88,14 +93,10 @@ fn main() {
             let whole = enc
                 .encode(&Frame::rgb(rgb, *w as u32, *h as u32))
                 .expect("whole encode");
-            let chunked =
-                encode_chunked_rgb8(rgb, *w as u32, *h as u32, dist.unwrap_or(0.0), 3)
-                    .expect("chunked encode");
+            let chunked = encode_chunked_rgb8(rgb, *w as u32, *h as u32, dist.unwrap_or(0.0), 3)
+                .expect("chunked encode");
             match first_diff(&whole, &chunked) {
-                None => println!(
-                    "{name} {cname}: EQUAL ({} bytes)",
-                    whole.len()
-                ),
+                None => println!("{name} {cname}: EQUAL ({} bytes)", whole.len()),
                 Some(off) => {
                     all_equal = false;
                     println!(
@@ -107,7 +108,14 @@ fn main() {
             }
         }
     }
-    println!("verdict: {}", if all_equal { "ALL EQUAL" } else { "NOT byte-identical" });
+    println!(
+        "verdict: {}",
+        if all_equal {
+            "ALL EQUAL"
+        } else {
+            "NOT byte-identical"
+        }
+    );
 
     // ── thread-parity gate: chunked output must be byte-identical across thread counts,
     //    and whole-frame MT must match whole-frame ST (prerequisite for wiring the
@@ -117,15 +125,31 @@ fn main() {
         for (cname, dist) in [("d1.00_e3", 1.0f32), ("lossless_e3", 0.0)] {
             let mut st = Vec::new();
             encode_chunked_threaded(
-                *w as u32, *h as u32, dist, 3, 1,
-                &mut WholeImageSource { data: rgb, width: *w }, &mut st,
+                *w as u32,
+                *h as u32,
+                dist,
+                3,
+                1,
+                &mut WholeImageSource {
+                    data: rgb,
+                    width: *w,
+                },
+                &mut st,
             )
             .expect("chunked st");
             for threads in [2usize, 4, 8] {
                 let mut mt = Vec::new();
                 encode_chunked_threaded(
-                    *w as u32, *h as u32, dist, 3, threads,
-                    &mut WholeImageSource { data: rgb, width: *w }, &mut mt,
+                    *w as u32,
+                    *h as u32,
+                    dist,
+                    3,
+                    threads,
+                    &mut WholeImageSource {
+                        data: rgb,
+                        width: *w,
+                    },
+                    &mut mt,
                 )
                 .expect("chunked mt");
                 if mt != st {
@@ -135,7 +159,11 @@ fn main() {
             }
             // whole-frame MT vs ST
             let opts = if dist > 0.0 {
-                EncodeOptions { rate: Rate::Distance(dist), ..Default::default() }.with_effort(3)
+                EncodeOptions {
+                    rate: Rate::Distance(dist),
+                    ..Default::default()
+                }
+                .with_effort(3)
             } else {
                 EncodeOptions::lossless().with_effort(3)
             };
@@ -156,6 +184,10 @@ fn main() {
     }
     println!(
         "thread-parity verdict: {}",
-        if threads_equal { "ALL EQUAL ACROSS THREADS" } else { "THREAD-DEPENDENT OUTPUT" }
+        if threads_equal {
+            "ALL EQUAL ACROSS THREADS"
+        } else {
+            "THREAD-DEPENDENT OUTPUT"
+        }
     );
 }

@@ -226,7 +226,13 @@ impl<'a> RansDecoder<'a> {
         if buf.len() < 2 {
             return None;
         }
-        Some(RansDecoder { x: states, buf, pos: 0, end2: buf.len() - 2, tab })
+        Some(RansDecoder {
+            x: states,
+            buf,
+            pos: 0,
+            end2: buf.len() - 2,
+            tab,
+        })
     }
 
     /// Decode the *entire* symbol sequence into `out` in one run (must be
@@ -450,7 +456,13 @@ fn scan_predictor_into(plane: &[u8], w: usize, h: usize, pred: Predictor, s: &mu
 
 /// Encode one plane from its predictor scan (residuals/modes/histogram are
 /// consumed from `s`; `s.modes` is updated in place by RAW demotion).
-fn encode_plane_from_scan(w: usize, h: usize, pred: Predictor, s: &mut PredScan, out: &mut Vec<u8>) {
+fn encode_plane_from_scan(
+    w: usize,
+    h: usize,
+    pred: Predictor,
+    s: &mut PredScan,
+    out: &mut Vec<u8>,
+) {
     out.push(pred.id());
 
     // Left-delta candidate histogram over the non-COPY rows (the scan already
@@ -603,7 +615,10 @@ fn decode_plane_into(
         }
     }
     let raw_len = r.u32()? as usize;
-    let mut raw = Reader { b: r.take(raw_len)?, p: 0 };
+    let mut raw = Reader {
+        b: r.take(raw_len)?,
+        p: 0,
+    };
 
     match pred_id {
         PRED_EXTERNAL => {
@@ -791,8 +806,7 @@ mod simd_plans {
         }
         m
     }
-    pub const SHIFT: [[u8; 16]; 4] =
-        [shift_plan(1), shift_plan(2), shift_plan(4), shift_plan(8)];
+    pub const SHIFT: [[u8; 16]; 4] = [shift_plan(1), shift_plan(2), shift_plan(4), shift_plan(8)];
 
     /// Interleave step 1 of output block `block`: t = shuffle(vr, vg); lanes
     /// holding channel 2 are placeholders (index 0), overwritten by step 2.
@@ -846,7 +860,11 @@ mod simd_plans {
         let mut l = 0;
         while l < 16 {
             let j = 3 * l + ch;
-            m[l] = if j >= 32 { (j - 32 + 16) as u8 } else { l as u8 };
+            m[l] = if j >= 32 {
+                (j - 32 + 16) as u8
+            } else {
+                l as u8
+            };
             l += 1;
         }
         m
@@ -928,8 +946,14 @@ mod kernels_wasm {
             let vb = i8x16_add(v128_load(b_sg.as_ptr().add(i) as *const v128), vg);
             let dst = out.as_mut_ptr().add(i * 3);
             v128_store(dst as *mut v128, shuf!(shuf!(vr, vg, IL_T[0]), vb, IL_O[0]));
-            v128_store(dst.add(16) as *mut v128, shuf!(shuf!(vr, vg, IL_T[1]), vb, IL_O[1]));
-            v128_store(dst.add(32) as *mut v128, shuf!(shuf!(vr, vg, IL_T[2]), vb, IL_O[2]));
+            v128_store(
+                dst.add(16) as *mut v128,
+                shuf!(shuf!(vr, vg, IL_T[1]), vb, IL_O[1]),
+            );
+            v128_store(
+                dst.add(32) as *mut v128,
+                shuf!(shuf!(vr, vg, IL_T[2]), vb, IL_O[2]),
+            );
             i += 16;
         }
         while i < n {
@@ -1258,7 +1282,11 @@ impl DeltaDecodeSession {
         DeltaDecodeSession {
             planes: [Vec::new(), Vec::new(), Vec::new()],
             spare: [Vec::new(), Vec::new(), Vec::new()],
-            scratch: [DecodeScratch::default(), DecodeScratch::default(), DecodeScratch::default()],
+            scratch: [
+                DecodeScratch::default(),
+                DecodeScratch::default(),
+                DecodeScratch::default(),
+            ],
             dims: None,
         }
     }
@@ -1274,8 +1302,15 @@ impl DeltaDecodeSession {
         // Shared by the serial and plane-parallel arms; disjoint &mut are
         // passed in, everything captured is shared/immutable.
         let decode_one = |i: usize, sc: &mut DecodeScratch, out: &mut Vec<u8>| -> Option<()> {
-            let mut pr = Reader { b: pb.blobs[i], p: 0 };
-            let e = if ext { Some(planes[i].as_slice()) } else { None };
+            let mut pr = Reader {
+                b: pb.blobs[i],
+                p: 0,
+            };
+            let e = if ext {
+                Some(planes[i].as_slice())
+            } else {
+                None
+            };
             decode_plane_into(&mut pr, w, h, e, &mut sc.tab, &mut sc.res, out)
         };
         // Plane-parallel gate: measured on the ghana corpus (48f, interleaved
@@ -1446,7 +1481,13 @@ mod tests {
         for _ in 0..10_000 {
             // skewed: mostly 0, some small, rare large
             let r = rng.byte();
-            syms.push(if r < 200 { 0 } else if r < 240 { r & 3 } else { r });
+            syms.push(if r < 200 {
+                0
+            } else if r < 240 {
+                r & 3
+            } else {
+                r
+            });
         }
         let mut hist = [0u64; 256];
         for &s in &syms {
@@ -1525,7 +1566,11 @@ mod tests {
         assert_eq!(dec, cur);
         // identical frame should be tiny (all COPY rows)
         let same = encode_rgb8_delta(&prev, &prev, w, h);
-        assert!(same.len() < 400, "all-COPY delta should be near-empty, got {}", same.len());
+        assert!(
+            same.len() < 400,
+            "all-COPY delta should be near-empty, got {}",
+            same.len()
+        );
     }
 
     #[test]
@@ -1711,11 +1756,17 @@ mod tests {
         let bigger_b = photo_like(w as usize * 2, h as usize, 8);
         let bad = encode_rgb8_delta(&bigger_b, &bigger_a, w * 2, h);
         assert!(decode_rgb8_delta(&bad, &frames[0], w, h).is_none());
-        assert!(DeltaDecodeSession::new().decode_delta(&bad, &frames[0], w, h).is_none());
+        assert!(DeltaDecodeSession::new()
+            .decode_delta(&bad, &frames[0], w, h)
+            .is_none());
         // 3n/8 syms per plane keeps lane alignment; also cover a fresh session
         // starting mid-chain (seeds from prev).
         let mut mid = DeltaDecodeSession::new();
-        assert_eq!(mid.decode_delta(&encs[1], &frames[0], w, h).expect("mid-chain"), frames[1]);
+        assert_eq!(
+            mid.decode_delta(&encs[1], &frames[0], w, h)
+                .expect("mid-chain"),
+            frames[1]
+        );
     }
 
     #[test]

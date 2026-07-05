@@ -137,12 +137,24 @@ fn streaming_peak_is_constant_while_batch_grows() {
     let grow = b32 as f64 / b8 as f64;
     let flat = s32 as f64 / s8 as f64;
     let ratio = s32 as f64 / b32 as f64;
-    eprintln!("stream/batch @N=32: {:.1}%  (batch grow {grow:.2}x, stream flat {flat:.2}x)", 100.0 * ratio);
+    eprintln!(
+        "stream/batch @N=32: {:.1}%  (batch grow {grow:.2}x, stream flat {flat:.2}x)",
+        100.0 * ratio
+    );
 
     // Batch peak grows with N (holds all raw frames): 4x frames => well over 2.5x.
-    assert!(grow > 2.5, "batch peak should grow with N: N=8 {b8} vs N=32 {b32}");
+    assert!(
+        grow > 2.5,
+        "batch peak should grow with N: N=8 {b8} vs N=32 {b32}"
+    );
     // Streaming peak stays ~constant (only prev+cur resident).
-    assert!(flat < 1.5, "streaming peak should be ~constant in N: N=8 {s8} vs N=32 {s32}");
+    assert!(
+        flat < 1.5,
+        "streaming peak should be ~constant in N: N=8 {s8} vs N=32 {s32}"
+    );
     // And streaming is far below batch at N=32.
-    assert!(ratio < 0.5, "streaming peak ({s32}) should be well under batch ({b32}) at N=32");
+    assert!(
+        ratio < 0.5,
+        "streaming peak ({s32}) should be well under batch ({b32}) at N=32"
+    );
 }

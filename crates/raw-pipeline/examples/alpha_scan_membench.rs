@@ -63,14 +63,22 @@ fn bench<F: Fn() -> bool>(label: &str, reps: usize, f: F) {
     ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     println!(
         "  {:<22} median_ms {:>7.3}  alloc/call {:>6.1} MB ({} allocs)",
-        label, ms[ms.len() / 2], alloc_mb, alloc_n
+        label,
+        ms[ms.len() / 2],
+        alloc_mb,
+        alloc_n
     );
 }
 
 fn main() {
     let (w, h) = (6000usize, 4000); // 24 MP
     let rgba = vec![255u8; w * h * 4]; // fully opaque (the RAW case)
-    println!("alpha detection @ {}x{} ({:.1} MP), opaque RGBA:", w, h, (w * h) as f64 / 1e6);
+    println!(
+        "alpha detection @ {}x{} ({:.1} MP), opaque RGBA:",
+        w,
+        h,
+        (w * h) as f64 / 1e6
+    );
     bench("alpha_strip (old)", 21, || alpha_strip(&rgba).0);
     bench("has_meaningful_alpha", 21, || has_meaningful_alpha(&rgba));
 }

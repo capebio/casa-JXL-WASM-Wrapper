@@ -20,7 +20,7 @@
 
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 mod bench {
-    use raw_pipeline::jxl_casaencoder::{Encoder, EncodeOptions, Frame};
+    use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
     use std::io::Write;
 
     /// Minimal binary P6 PPM parser. Returns (w, h, rgb-bytes).
@@ -94,7 +94,11 @@ mod bench {
         let nthreads = std::env::var("JXL_BENCH_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8));
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(8)
+            });
         let mut enc = if nthreads > 1 {
             Encoder::with_threads(opts.clone(), nthreads).expect("encoder")
         } else {
@@ -120,7 +124,13 @@ mod bench {
         // Machine-parseable line: RESULT <wxh> e<effort> min=.. med=.. size=..
         println!(
             "RESULT {}x{} e{} min={:.3} med={:.3} size={} threads={}",
-            w, h, effort, min, med, out.len(), nthreads
+            w,
+            h,
+            effort,
+            min,
+            med,
+            out.len(),
+            nthreads
         );
         if let Some(p) = out_path {
             let mut f = std::fs::File::create(&p).expect("create out");

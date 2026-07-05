@@ -4,9 +4,9 @@
 #![cfg(target_arch = "x86_64")]
 // SpeedCodeReview ✓ 2026-06-19 · opus-4.8[1m] · sweeps=2 · Arch 2/0/1 Alg 2/0/0 Code 6/5/1 (x/y/z=found/green/red, +3 deferred)
 
-use core::arch::x86_64::*;
-use super::scalar::{scale_err_tail, xyb_tail, downsample_row_tail};
+use super::scalar::{downsample_row_tail, scale_err_tail, xyb_tail};
 use crate::perceptual::blur::box_blur_h;
+use core::arch::x86_64::*;
 
 #[inline]
 unsafe fn hsum256(v: __m256) -> f32 {
@@ -24,10 +24,16 @@ unsafe fn hsum256(v: __m256) -> f32 {
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn scale_err_avx2(
     mask: &[f32],
-    rx: &[f32], ry: &[f32], rb: &[f32],
-    tx: &[f32], ty: &[f32], tb: &[f32],
+    rx: &[f32],
+    ry: &[f32],
+    rb: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+    tb: &[f32],
     n: usize,
-    kx: f32, ky: f32, kb: f32,
+    kx: f32,
+    ky: f32,
+    kb: f32,
     rsqrt_path: bool,
 ) -> f32 {
     // Guard n==0: dividing by n below would produce NaN, matching the scalar oracle
@@ -41,8 +47,13 @@ pub unsafe fn scale_err_avx2(
     // all slices are sized to n, so this is a no-op; it converts an adversarial
     // desync into a defined panic instead of OOB.
     assert!(
-        mask.len() >= n && rx.len() >= n && ry.len() >= n && rb.len() >= n
-            && tx.len() >= n && ty.len() >= n && tb.len() >= n,
+        mask.len() >= n
+            && rx.len() >= n
+            && ry.len() >= n
+            && rb.len() >= n
+            && tx.len() >= n
+            && ty.len() >= n
+            && tb.len() >= n,
         "scale_err_avx2: all input slices must have len >= n"
     );
     let vkx = _mm256_set1_ps(kx);
@@ -74,9 +85,27 @@ pub unsafe fn scale_err_avx2(
         } else {
             _mm256_div_ps(_mm256_set1_ps(1.0), mm)
         };
-        let ex = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(rx.as_ptr().add(i)), _mm256_loadu_ps(tx.as_ptr().add(i))), inv);
-        let ey = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(ry.as_ptr().add(i)), _mm256_loadu_ps(ty.as_ptr().add(i))), inv);
-        let eb = _mm256_mul_ps(_mm256_sub_ps(_mm256_loadu_ps(rb.as_ptr().add(i)), _mm256_loadu_ps(tb.as_ptr().add(i))), inv);
+        let ex = _mm256_mul_ps(
+            _mm256_sub_ps(
+                _mm256_loadu_ps(rx.as_ptr().add(i)),
+                _mm256_loadu_ps(tx.as_ptr().add(i)),
+            ),
+            inv,
+        );
+        let ey = _mm256_mul_ps(
+            _mm256_sub_ps(
+                _mm256_loadu_ps(ry.as_ptr().add(i)),
+                _mm256_loadu_ps(ty.as_ptr().add(i)),
+            ),
+            inv,
+        );
+        let eb = _mm256_mul_ps(
+            _mm256_sub_ps(
+                _mm256_loadu_ps(rb.as_ptr().add(i)),
+                _mm256_loadu_ps(tb.as_ptr().add(i)),
+            ),
+            inv,
+        );
         // e2 = kx*ex^2 + ky*ey^2 + kb*eb^2
         let mut e2 = _mm256_mul_ps(vkx, _mm256_mul_ps(ex, ex));
         e2 = _mm256_fmadd_ps(vky, _mm256_mul_ps(ey, ey), e2);
@@ -90,7 +119,10 @@ pub unsafe fn scale_err_avx2(
             let z = _mm256_add_ps(e2, veps);
             let y0 = _mm256_rsqrt_ps(z);
             // y1 = y0 * (1.5 - 0.5*z*y0*y0)  (one Newton step on 1/sqrt(z))
-            let y1 = _mm256_mul_ps(y0, _mm256_fnmadd_ps(_mm256_mul_ps(half, z), _mm256_mul_ps(y0, y0), threehalf));
+            let y1 = _mm256_mul_ps(
+                y0,
+                _mm256_fnmadd_ps(_mm256_mul_ps(half, z), _mm256_mul_ps(y0, y0), threehalf),
+            );
             _mm256_mul_ps(z, y1) // z * rsqrt(z) ≈ sqrt(z)
         } else {
             _mm256_sqrt_ps(_mm256_add_ps(e2, veps))
@@ -194,7 +226,11 @@ unsafe fn drain8_rgb(v: __m256i, acc: &mut [u64; 3]) {
 /// The old AVX2 *deinterleave* attempt that lost was a different layout; the scalar
 /// `ssim_moments_avx2` below is kept as the parity oracle for tests + the flip.
 #[target_feature(enable = "avx2")]
-pub unsafe fn ssim_moments_avx2_cal(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], [u64; 3]) {
+pub unsafe fn ssim_moments_avx2_cal(
+    a: &[u8],
+    b: &[u8],
+    np: usize,
+) -> ([u64; 3], [u64; 3], [u64; 3]) {
     assert!(
         a.len() >= np * 4 && b.len() >= np * 4,
         "ssim_moments_avx2_cal: a.len() and b.len() must be >= np*4"
@@ -262,9 +298,7 @@ pub unsafe fn ssim_moments_avx2_cal(a: &[u8], b: &[u8], np: usize) -> ([u64; 3],
 /// uses no AVX2 intrinsics. This is intentional: FMA is also not needed here.
 /// Do not add AVX2 intrinsics without a measured win from the flip-flop bench.
 #[target_feature(enable = "avx2")]
-pub unsafe fn ssim_moments_avx2(
-    a: &[u8], b: &[u8], np: usize,
-) -> ([u64; 3], [u64; 3], [u64; 3]) {
+pub unsafe fn ssim_moments_avx2(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], [u64; 3]) {
     // Length precondition: both buffers must hold np RGBA pixels (np*4 bytes).
     // The loop reads a[j+c]/b[j+c] with j up to (np-1)*4 and c in 0..3; a short
     // buffer would otherwise index-OOB with no descriptive message. No-op for
@@ -277,12 +311,17 @@ pub unsafe fn ssim_moments_avx2(
     // tight scalar loop with u64 accumulators (madd-based SIMD over a deinterleaved
     // temp gave no measured win — see flip-flop). Kept in the avx2 module so the
     // dispatcher has a single call site; correctness == scalar by construction.
-    let mut sa = [0u64; 3]; let mut saa = [0u64; 3]; let mut sab = [0u64; 3];
+    let mut sa = [0u64; 3];
+    let mut saa = [0u64; 3];
+    let mut sab = [0u64; 3];
     let mut j = 0;
     for _ in 0..np {
         for c in 0..3 {
-            let x = a[j + c] as u64; let y = b[j + c] as u64;
-            sa[c] += x; saa[c] += x * x; sab[c] += x * y;
+            let x = a[j + c] as u64;
+            let y = b[j + c] as u64;
+            sa[c] += x;
+            saa[c] += x * x;
+            sab[c] += x * y;
         }
         j += 4;
     }
@@ -346,7 +385,10 @@ pub unsafe fn pixels_to_xyb_avx2(
         let g = _mm256_i32gather_ps(lp, gi, 4);
         let bb = _mm256_i32gather_ps(lp, bi, 4);
         // X=(r-b)*0.5 ; Y=(r+b)*0.5+g ; B=b
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(_mm256_sub_ps(r, bb), half));
+        _mm256_storeu_ps(
+            x.as_mut_ptr().add(i),
+            _mm256_mul_ps(_mm256_sub_ps(r, bb), half),
+        );
         _mm256_storeu_ps(
             y.as_mut_ptr().add(i),
             _mm256_fmadd_ps(_mm256_add_ps(r, bb), half, g),
@@ -413,7 +455,10 @@ pub unsafe fn pixels_to_xyb_avx2_scalar_lut(
         let r = lut8_scalar_insert(p, 0, lp);
         let g = lut8_scalar_insert(p, 1, lp);
         let bb = lut8_scalar_insert(p, 2, lp);
-        _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(_mm256_sub_ps(r, bb), half));
+        _mm256_storeu_ps(
+            x.as_mut_ptr().add(i),
+            _mm256_mul_ps(_mm256_sub_ps(r, bb), half),
+        );
         _mm256_storeu_ps(
             y.as_mut_ptr().add(i),
             _mm256_fmadd_ps(_mm256_add_ps(r, bb), half, g),
@@ -478,8 +523,8 @@ pub unsafe fn downsample_avx2(
         let mut x = 0usize;
         while x + 8 <= dw && 2 * x + 16 <= w {
             // Load 16 consecutive src floats per row starting at src[row0 + 2*x].
-            let p00 = _mm256_loadu_ps(src.as_ptr().add(row0 + 2 * x));       // s0..s7
-            let p01 = _mm256_loadu_ps(src.as_ptr().add(row0 + 2 * x + 8));   // s8..s15
+            let p00 = _mm256_loadu_ps(src.as_ptr().add(row0 + 2 * x)); // s0..s7
+            let p01 = _mm256_loadu_ps(src.as_ptr().add(row0 + 2 * x + 8)); // s8..s15
             let p10 = _mm256_loadu_ps(src.as_ptr().add(row1 + 2 * x));
             let p11 = _mm256_loadu_ps(src.as_ptr().add(row1 + 2 * x + 8));
 
@@ -497,7 +542,7 @@ pub unsafe fn downsample_avx2(
 
             let o0_perm = _mm256_permutevar8x32_ps(p00, odd_idx);
             let o1_perm = _mm256_permutevar8x32_ps(p01, odd_idx);
-            let odd_r0 = _mm256_permute2f128_ps(o0_perm, o1_perm, 0x20);  // [s1,s3,s5,s7,s9,s11,s13,s15]
+            let odd_r0 = _mm256_permute2f128_ps(o0_perm, o1_perm, 0x20); // [s1,s3,s5,s7,s9,s11,s13,s15]
 
             let e0_perm10 = _mm256_permutevar8x32_ps(p10, even_idx);
             let e1_perm10 = _mm256_permutevar8x32_ps(p11, even_idx);
@@ -614,9 +659,24 @@ mod xyb_tests {
         let (mut ax, mut ay, mut ab) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
         unsafe { pixels_to_xyb_avx2(&px, n, sqrt_lin_lut_ptr(), &mut ax, &mut ay, &mut ab) };
         for i in 0..n {
-            assert!((sx[i] - ax[i]).abs() < 1e-6, "x[{i}] {} vs {}", sx[i], ax[i]);
-            assert!((sy[i] - ay[i]).abs() < 1e-6, "y[{i}] {} vs {}", sy[i], ay[i]);
-            assert!((sb[i] - ab[i]).abs() < 1e-6, "b[{i}] {} vs {}", sb[i], ab[i]);
+            assert!(
+                (sx[i] - ax[i]).abs() < 1e-6,
+                "x[{i}] {} vs {}",
+                sx[i],
+                ax[i]
+            );
+            assert!(
+                (sy[i] - ay[i]).abs() < 1e-6,
+                "y[{i}] {} vs {}",
+                sy[i],
+                ay[i]
+            );
+            assert!(
+                (sb[i] - ab[i]).abs() < 1e-6,
+                "b[{i}] {} vs {}",
+                sb[i],
+                ab[i]
+            );
         }
     }
 
@@ -667,10 +727,18 @@ mod blur_tests {
         if !std::is_x86_feature_detected!("avx2") {
             return;
         }
-        for (w, h) in [(64usize, 48usize), (65, 49), (17, 5), (8, 8), (3, 33), (100, 1)] {
+        for (w, h) in [
+            (64usize, 48usize),
+            (65, 49),
+            (17, 5),
+            (8, 8),
+            (3, 33),
+            (100, 1),
+        ] {
             for r in [1usize, 2, 4, 8] {
-                let src: Vec<f32> =
-                    (0..w * h).map(|i| ((i * 37 % 251) as f32 * 0.013).sin() * 4.2).collect();
+                let src: Vec<f32> = (0..w * h)
+                    .map(|i| ((i * 37 % 251) as f32 * 0.013).sin() * 4.2)
+                    .collect();
                 let want = box_blur(&src, w, h, r);
                 let got = unsafe { box_blur_avx2(&src, w, h, r) };
                 assert_eq!(want.len(), got.len(), "{w}x{h} r{r} len");
@@ -727,23 +795,46 @@ mod tests {
             return;
         }
         let n = 1000usize; // non-multiple of 8 to exercise the tail
-        let mut rx = vec![0f32; n]; let mut ry = vec![0f32; n]; let mut rb = vec![0f32; n];
-        let mut tx = vec![0f32; n]; let mut ty = vec![0f32; n]; let mut tb = vec![0f32; n];
+        let mut rx = vec![0f32; n];
+        let mut ry = vec![0f32; n];
+        let mut rb = vec![0f32; n];
+        let mut tx = vec![0f32; n];
+        let mut ty = vec![0f32; n];
+        let mut tb = vec![0f32; n];
         let mut mask = vec![0f32; n];
         for i in 0..n {
             let f = i as f32;
-            rx[i] = (f * 0.013).sin() * 0.4; tx[i] = rx[i] + (f * 0.07).cos() * 0.05;
-            ry[i] = (f * 0.021).cos() * 0.5 + 0.5; ty[i] = ry[i] + (f * 0.03).sin() * 0.05;
-            rb[i] = (f * 0.017).sin() * 0.3 + 0.3; tb[i] = rb[i] + (f * 0.05).cos() * 0.04;
+            rx[i] = (f * 0.013).sin() * 0.4;
+            tx[i] = rx[i] + (f * 0.07).cos() * 0.05;
+            ry[i] = (f * 0.021).cos() * 0.5 + 0.5;
+            ty[i] = ry[i] + (f * 0.03).sin() * 0.05;
+            rb[i] = (f * 0.017).sin() * 0.3 + 0.3;
+            tb[i] = rb[i] + (f * 0.05).cos() * 0.04;
             mask[i] = ((f * 0.009).sin() * 0.5 + 0.5).abs() * 0.6;
         }
         let k = Kweights::default();
         let want = scale_err(&mask, &rx, &ry, &rb, &tx, &ty, &tb, n, &k);
-        let got_strict = unsafe { scale_err_avx2(&mask, &rx, &ry, &rb, &tx, &ty, &tb, n, k.kx, k.ky, k.kb, false) };
-        let got_rsqrt = unsafe { scale_err_avx2(&mask, &rx, &ry, &rb, &tx, &ty, &tb, n, k.kx, k.ky, k.kb, true) };
+        let got_strict = unsafe {
+            scale_err_avx2(
+                &mask, &rx, &ry, &rb, &tx, &ty, &tb, n, k.kx, k.ky, k.kb, false,
+            )
+        };
+        let got_rsqrt = unsafe {
+            scale_err_avx2(
+                &mask, &rx, &ry, &rb, &tx, &ty, &tb, n, k.kx, k.ky, k.kb, true,
+            )
+        };
         let rel = |a: f32, b: f32| (a - b).abs() / a.abs().max(b.abs()).max(1e-12);
-        assert!(rel(want, got_strict) < 1e-4, "strict rel={} want={want} got={got_strict}", rel(want, got_strict));
-        assert!(rel(want, got_rsqrt) < 1e-4, "rsqrt rel={} want={want} got={got_rsqrt}", rel(want, got_rsqrt));
+        assert!(
+            rel(want, got_strict) < 1e-4,
+            "strict rel={} want={want} got={got_strict}",
+            rel(want, got_strict)
+        );
+        assert!(
+            rel(want, got_rsqrt) < 1e-4,
+            "rsqrt rel={} want={want} got={got_rsqrt}",
+            rel(want, got_rsqrt)
+        );
     }
 }
 
@@ -754,19 +845,26 @@ mod reduction_tests {
 
     #[test]
     fn ssd_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") { return; }
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let n = 4096 + 7;
         let a: Vec<u8> = (0..n).map(|i| (i * 31 % 251) as u8).collect();
         let b: Vec<u8> = (0..n).map(|i| (i * 17 % 239) as u8).collect();
         let mut want = 0u64;
-        for i in 0..n { let d = a[i] as i64 - b[i] as i64; want += (d * d) as u64; }
+        for i in 0..n {
+            let d = a[i] as i64 - b[i] as i64;
+            want += (d * d) as u64;
+        }
         let got = unsafe { ssd_avx2(&a, &b) };
         assert_eq!(want, got);
     }
 
     #[test]
     fn ssim_moments_match_scalar_finalize() {
-        if !std::is_x86_feature_detected!("avx2") { return; }
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let np = 1000;
         let a: Vec<u8> = (0..np * 4).map(|i| (i * 13 % 255) as u8).collect();
         let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
@@ -779,7 +877,9 @@ mod reduction_tests {
 
     #[test]
     fn ssim_moments_cal_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") { return; }
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let np = 1000usize + 1; // odd → exercise the 2-px-group scalar tail
         let a: Vec<u8> = (0..np * 4).map(|i| (i * 13 % 255) as u8).collect();
         let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
@@ -793,7 +893,9 @@ mod reduction_tests {
     /// discarded). Odd np exercises the 2-px-group scalar tail.
     #[test]
     fn ref_moments_via_cal_matches_scalar() {
-        if !std::is_x86_feature_detected!("avx2") { return; }
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
         let np = 1000usize + 1;
         let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
         let (sb, sbb) = ssim::ref_moments(&b, np, 4);

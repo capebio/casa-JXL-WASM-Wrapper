@@ -4,14 +4,16 @@
 //!
 //! Run: cd crates/raw-pipeline && cargo run --release --no-default-features --example demosaic_bilinear_flip
 
-use raw_pipeline::demosaic::{demosaic_rggb, demosaic_bayer};
+use raw_pipeline::demosaic::{demosaic_bayer, demosaic_rggb};
 
 fn make_bayer(width: usize, height: usize, seed: u32) -> Vec<u16> {
     let mut s = seed;
-    (0..width * height).map(|_| {
-        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        ((s >> 12) & 0x3fff) as u16
-    }).collect()
+    (0..width * height)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 12) & 0x3fff) as u16
+        })
+        .collect()
 }
 
 fn median(v: &mut Vec<f64>) -> f64 {
@@ -58,7 +60,7 @@ fn bench_pair(raw: &[u16], w: usize, h: usize, rounds: usize, iters: usize) -> (
 
 fn main() {
     let sizes: &[(usize, usize, &str)] = &[
-        (512,  512,  "0.26MP"),
+        (512, 512, "0.26MP"),
         (1024, 1024, "1.05MP"),
         (2048, 2048, "4.19MP"),
         (4096, 4096, "16.78MP"),
@@ -73,12 +75,18 @@ fn main() {
         let out_a = demosaic_rggb(&raw, 512, 512).unwrap();
         let out_b = demosaic_bayer(&raw, 512, 512, (0, 0)).unwrap();
         let exact = out_a == out_b;
-        println!("  Parity (512×512): {}", if exact { "EXACT" } else { "DIFF! *** BUG ***" });
+        println!(
+            "  Parity (512×512): {}",
+            if exact { "EXACT" } else { "DIFF! *** BUG ***" }
+        );
         if !exact {
             // Show first mismatch
             for i in 0..out_a.len() {
                 if out_a[i] != out_b[i] {
-                    println!("    First diff at index {}: rggb={} bayer={}", i, out_a[i], out_b[i]);
+                    println!(
+                        "    First diff at index {}: rggb={} bayer={}",
+                        i, out_a[i], out_b[i]
+                    );
                     break;
                 }
             }

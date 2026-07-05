@@ -57,6 +57,8 @@ export interface DecodeOptions {
      * otherwise "dc". Ignored when progressionTarget="final" and emitEveryPass=false (no subscription).
      */
     progressiveDetail?: "dc" | "lastPasses" | "passes" | "dcProgressive";
+    /** Experimental bridge gate: suppress byte-identical progressive frames after flush. Default false. */
+    suppressDuplicateProgress?: boolean;
     priority?: "visible" | "near" | "background";
     budgetMs?: number;
     signal?: AbortSignal;
@@ -291,6 +293,9 @@ export type CodecMetric = {
     name: "encode_total_ms";
     value: number;
 } | {
+    name: "encode_finish_ms";
+    value: number;
+} | {
     name: "peak_memory_bytes";
     value: number;
 } | {
@@ -313,6 +318,21 @@ export type CodecMetric = {
     value: number;
 } | {
     name: "copied_bytes";
+    value: number;
+} | {
+    name: "bridge_flush_attempts";
+    value: number;
+} | {
+    name: "bridge_flush_successes";
+    value: number;
+} | {
+    name: "bridge_flush_zero_skips";
+    value: number;
+} | {
+    name: "bridge_flush_duplicate_skips";
+    value: number;
+} | {
+    name: "bridge_flush_image_ms";
     value: number;
 } | {
     name: "dropped_due_to_budget";

@@ -89,7 +89,14 @@ pub fn encode_variants(
     source: SourceType,
     hq_override: bool,
 ) -> Result<VariantSet, EncodeError> {
-    encode_variants_progressive_opts(rgba, width, height, source, hq_override, ProgressiveOpts::default())
+    encode_variants_progressive_opts(
+        rgba,
+        width,
+        height,
+        source,
+        hq_override,
+        ProgressiveOpts::default(),
+    )
 }
 
 pub fn encode_variants_with_progressive(
@@ -101,11 +108,18 @@ pub fn encode_variants_with_progressive(
     progressive_dc: u32,
     group_order: u32,
 ) -> Result<VariantSet, EncodeError> {
-    encode_variants_progressive_opts(rgba, width, height, source, hq_override, ProgressiveOpts {
-        progressive_dc,
-        group_order,
-        center: None,
-    })
+    encode_variants_progressive_opts(
+        rgba,
+        width,
+        height,
+        source,
+        hq_override,
+        ProgressiveOpts {
+            progressive_dc,
+            group_order,
+            center: None,
+        },
+    )
 }
 
 pub fn encode_variants_progressive_opts(
@@ -116,7 +130,15 @@ pub fn encode_variants_progressive_opts(
     hq_override: bool,
     opts: ProgressiveOpts,
 ) -> Result<VariantSet, EncodeError> {
-    encode_variants_cancellable(rgba, width, height, source, hq_override, opts, &AtomicBool::new(false))
+    encode_variants_cancellable(
+        rgba,
+        width,
+        height,
+        source,
+        hq_override,
+        opts,
+        &AtomicBool::new(false),
+    )
 }
 
 pub fn encode_variants_cancellable(
@@ -158,7 +180,15 @@ pub fn encode_variants_cancellable(
     // to the old RGBA-resize-then-strip-per-tier path. Alpha inputs keep the RGBA path.
     if !has_alpha {
         let rgb = strip_rgba_to_rgb(rgba);
-        return encode_variants_rgb_cancellable(&rgb, width, height, source, hq_override, opts, cancel);
+        return encode_variants_rgb_cancellable(
+            &rgb,
+            width,
+            height,
+            source,
+            hq_override,
+            opts,
+            cancel,
+        );
     }
 
     let full_quality: u8 = if hq_override {
@@ -233,13 +263,33 @@ pub fn encode_variants_cancellable(
                     if cancel.load(Ordering::Acquire) {
                         return Err(EncodeError::Cancelled);
                     }
-                    encode_variant(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, has_alpha, width, height)
+                    encode_variant(
+                        thumb_src,
+                        tw,
+                        th,
+                        85,
+                        EFFORT_THUMB,
+                        thumb_opts,
+                        has_alpha,
+                        width,
+                        height,
+                    )
                 },
                 || {
                     if cancel.load(Ordering::Acquire) {
                         return Err(EncodeError::Cancelled);
                     }
-                    encode_variant(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, has_alpha, width, height)
+                    encode_variant(
+                        preview_src,
+                        pw,
+                        ph,
+                        85,
+                        EFFORT_PREVIEW,
+                        preview_opts,
+                        has_alpha,
+                        width,
+                        height,
+                    )
                 },
             );
             let pf = pf_res?;
@@ -251,7 +301,17 @@ pub fn encode_variants_cancellable(
                     if cancel.load(Ordering::Acquire) {
                         return Err(EncodeError::Cancelled);
                     }
-                    encode_variant(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, has_alpha, width, height)
+                    encode_variant(
+                        thumb_src,
+                        tw,
+                        th,
+                        85,
+                        EFFORT_THUMB,
+                        thumb_opts,
+                        has_alpha,
+                        width,
+                        height,
+                    )
                 },
                 || {
                     rayon::join(
@@ -259,13 +319,33 @@ pub fn encode_variants_cancellable(
                             if cancel.load(Ordering::Acquire) {
                                 return Err(EncodeError::Cancelled);
                             }
-                            encode_variant(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, has_alpha, width, height)
+                            encode_variant(
+                                preview_src,
+                                pw,
+                                ph,
+                                85,
+                                EFFORT_PREVIEW,
+                                preview_opts,
+                                has_alpha,
+                                width,
+                                height,
+                            )
                         },
                         || {
                             if cancel.load(Ordering::Acquire) {
                                 return Err(EncodeError::Cancelled);
                             }
-                            encode_variant(rgba, width, height, full_quality, EFFORT_FULL, opts, has_alpha, width, height)
+                            encode_variant(
+                                rgba,
+                                width,
+                                height,
+                                full_quality,
+                                EFFORT_FULL,
+                                opts,
+                                has_alpha,
+                                width,
+                                height,
+                            )
                         },
                     )
                 },
@@ -278,18 +358,51 @@ pub fn encode_variants_cancellable(
     let (thumb_300, preview_1080, full) = {
         // One held Encoder, reused across the whole variant set.
         let mut enc = Encoder::new(EncodeOptions::default())?;
-        let t = encode_into(&mut enc, thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, has_alpha, width, height)?;
+        let t = encode_into(
+            &mut enc,
+            thumb_src,
+            tw,
+            th,
+            85,
+            EFFORT_THUMB,
+            thumb_opts,
+            has_alpha,
+            width,
+            height,
+        )?;
         if cancel.load(Ordering::Acquire) {
             return Err(EncodeError::Cancelled);
         }
-        let p = encode_into(&mut enc, preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, has_alpha, width, height)?;
+        let p = encode_into(
+            &mut enc,
+            preview_src,
+            pw,
+            ph,
+            85,
+            EFFORT_PREVIEW,
+            preview_opts,
+            has_alpha,
+            width,
+            height,
+        )?;
         if cancel.load(Ordering::Acquire) {
             return Err(EncodeError::Cancelled);
         }
         let f = if coalesce_preview_full {
             p.clone()
         } else {
-            encode_into(&mut enc, rgba, width, height, full_quality, EFFORT_FULL, opts, has_alpha, width, height)?
+            encode_into(
+                &mut enc,
+                rgba,
+                width,
+                height,
+                full_quality,
+                EFFORT_FULL,
+                opts,
+                has_alpha,
+                width,
+                height,
+            )?
         };
         (t, p, f)
     };
@@ -402,13 +515,31 @@ fn encode_variants_rgb_cancellable(
                     if cancel.load(Ordering::Acquire) {
                         return Err(EncodeError::Cancelled);
                     }
-                    encode_variant_rgb(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, width, height)
+                    encode_variant_rgb(
+                        thumb_src,
+                        tw,
+                        th,
+                        85,
+                        EFFORT_THUMB,
+                        thumb_opts,
+                        width,
+                        height,
+                    )
                 },
                 || {
                     if cancel.load(Ordering::Acquire) {
                         return Err(EncodeError::Cancelled);
                     }
-                    encode_variant_rgb(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, width, height)
+                    encode_variant_rgb(
+                        preview_src,
+                        pw,
+                        ph,
+                        85,
+                        EFFORT_PREVIEW,
+                        preview_opts,
+                        width,
+                        height,
+                    )
                 },
             );
             let pf = pf_res?;
@@ -420,7 +551,16 @@ fn encode_variants_rgb_cancellable(
                     if cancel.load(Ordering::Acquire) {
                         return Err(EncodeError::Cancelled);
                     }
-                    encode_variant_rgb(thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, width, height)
+                    encode_variant_rgb(
+                        thumb_src,
+                        tw,
+                        th,
+                        85,
+                        EFFORT_THUMB,
+                        thumb_opts,
+                        width,
+                        height,
+                    )
                 },
                 || {
                     rayon::join(
@@ -428,7 +568,16 @@ fn encode_variants_rgb_cancellable(
                             if cancel.load(Ordering::Acquire) {
                                 return Err(EncodeError::Cancelled);
                             }
-                            encode_variant_rgb(preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, width, height)
+                            encode_variant_rgb(
+                                preview_src,
+                                pw,
+                                ph,
+                                85,
+                                EFFORT_PREVIEW,
+                                preview_opts,
+                                width,
+                                height,
+                            )
                         },
                         || {
                             if cancel.load(Ordering::Acquire) {
@@ -447,11 +596,31 @@ fn encode_variants_rgb_cancellable(
     let (thumb_300, preview_1080, full) = {
         // One held Encoder, reused across the whole variant set.
         let mut enc = Encoder::new(EncodeOptions::default())?;
-        let t = encode_rgb_into(&mut enc, thumb_src, tw, th, 85, EFFORT_THUMB, thumb_opts, width, height)?;
+        let t = encode_rgb_into(
+            &mut enc,
+            thumb_src,
+            tw,
+            th,
+            85,
+            EFFORT_THUMB,
+            thumb_opts,
+            width,
+            height,
+        )?;
         if cancel.load(Ordering::Acquire) {
             return Err(EncodeError::Cancelled);
         }
-        let p = encode_rgb_into(&mut enc, preview_src, pw, ph, 85, EFFORT_PREVIEW, preview_opts, width, height)?;
+        let p = encode_rgb_into(
+            &mut enc,
+            preview_src,
+            pw,
+            ph,
+            85,
+            EFFORT_PREVIEW,
+            preview_opts,
+            width,
+            height,
+        )?;
         if cancel.load(Ordering::Acquire) {
             return Err(EncodeError::Cancelled);
         }
@@ -497,8 +666,16 @@ fn build_opts(
         let center = prog.center.map(|(cx, cy)| {
             // Integer coordinate scaling (handoff item 4): deterministic, no f32
             // precision edge cases. u32×u32 widened to u64 cannot overflow.
-            let mx = if orig_w > 0 { (cx as u64 * w as u64 / orig_w as u64) as i64 } else { cx as i64 };
-            let my = if orig_h > 0 { (cy as u64 * h as u64 / orig_h as u64) as i64 } else { cy as i64 };
+            let mx = if orig_w > 0 {
+                (cx as u64 * w as u64 / orig_w as u64) as i64
+            } else {
+                cx as i64
+            };
+            let my = if orig_h > 0 {
+                (cy as u64 * h as u64 / orig_h as u64) as i64
+            } else {
+                cy as i64
+            };
             (mx, my)
         });
         o.group_order = Some(GroupOrder { center });
@@ -559,7 +736,9 @@ fn encode_variant(
     orig_h: u32,
 ) -> Result<Vec<u8>, EncodeError> {
     let mut enc = Encoder::new(EncodeOptions::default())?;
-    encode_into(&mut enc, pixels, w, h, quality, effort, prog, has_alpha, orig_w, orig_h)
+    encode_into(
+        &mut enc, pixels, w, h, quality, effort, prog, has_alpha, orig_w, orig_h,
+    )
 }
 
 /// Encode one variant from an **already-RGB** (3ch) buffer, reusing a held [`Encoder`].
@@ -630,12 +809,24 @@ fn encode_full_tier_rgb(
             distance_from_quality(quality as f32),
             EFFORT_FULL as i64,
             1, // runs inside the variant fan-out — rayon already saturates cores
-            &mut WholeImageSource { data: rgb, width: width as usize },
+            &mut WholeImageSource {
+                data: rgb,
+                width: width as usize,
+            },
             &mut out,
         )?;
         Ok(out)
     } else {
-        encode_variant_rgb(rgb, width, height, quality, EFFORT_FULL, opts, width, height)
+        encode_variant_rgb(
+            rgb,
+            width,
+            height,
+            quality,
+            EFFORT_FULL,
+            opts,
+            width,
+            height,
+        )
     }
 }
 
@@ -649,7 +840,13 @@ fn resize_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>
 
 /// Fast resize using bilinear (Triangle) filter — ~3× faster than Lanczos3.
 /// Perceptually equivalent at thumbnail scales (≤300px long edge).
-fn resize_rgba_fast(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Result<Vec<u8>, EncodeError> {
+fn resize_rgba_fast(
+    src: &[u8],
+    sw: u32,
+    sh: u32,
+    dw: u32,
+    dh: u32,
+) -> Result<Vec<u8>, EncodeError> {
     use image::{imageops, ImageBuffer, Rgba};
     let img: ImageBuffer<Rgba<u8>, &[u8]> =
         ImageBuffer::from_raw(sw, sh, src).ok_or(EncodeError::Resize)?;
@@ -690,7 +887,16 @@ pub fn encode_variants_from_rgb16(
     source: SourceType,
     hq_override: bool,
 ) -> Result<VariantSet, EncodeError> {
-    encode_variants_from_rgb16_with_progressive(rgb16, params, width, height, source, hq_override, 0, 0)
+    encode_variants_from_rgb16_with_progressive(
+        rgb16,
+        params,
+        width,
+        height,
+        source,
+        hq_override,
+        0,
+        0,
+    )
 }
 
 /// Like `encode_variants_from_rgb16` but with progressive_dc / group_order.
@@ -710,7 +916,12 @@ pub fn encode_variants_from_rgb16_with_progressive(
     // meta-seam cut the pyramid from_rgb16 entry already ships.
     let rgb = if params.texture != 0.0 || params.clarity != 0.0 {
         let mut rgb16_mut = rgb16.to_vec();
-        crate::pipeline::apply_unsharp_masks(&mut rgb16_mut, width as usize, height as usize, params);
+        crate::pipeline::apply_unsharp_masks(
+            &mut rgb16_mut,
+            width as usize,
+            height as usize,
+            params,
+        );
         crate::pipeline::process_rgb(&rgb16_mut, params)
     } else {
         crate::pipeline::process_rgb(rgb16, params)
@@ -721,7 +932,11 @@ pub fn encode_variants_from_rgb16_with_progressive(
         height,
         source,
         hq_override,
-        ProgressiveOpts { progressive_dc, group_order, center: None },
+        ProgressiveOpts {
+            progressive_dc,
+            group_order,
+            center: None,
+        },
         &AtomicBool::new(false),
     )
 }
@@ -757,7 +972,11 @@ pub fn encode_variants_from_rgb16_owned(
         height,
         source,
         hq_override,
-        ProgressiveOpts { progressive_dc, group_order, center: None },
+        ProgressiveOpts {
+            progressive_dc,
+            group_order,
+            center: None,
+        },
         &AtomicBool::new(false),
     )
 }
@@ -802,8 +1021,12 @@ fn box_downscale_rgba8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh
     }
     // Checked multiply: on 32-bit/WASM targets the product can overflow usize and
     // wrap to a small value that spuriously passes the length guard.
-    let src_len = (sw as usize).checked_mul(sh as usize).and_then(|n| n.checked_mul(4));
-    let dst_len = (dw as usize).checked_mul(dh as usize).and_then(|n| n.checked_mul(4));
+    let src_len = (sw as usize)
+        .checked_mul(sh as usize)
+        .and_then(|n| n.checked_mul(4));
+    let dst_len = (dw as usize)
+        .checked_mul(dh as usize)
+        .and_then(|n| n.checked_mul(4));
     let (src_len, dst_len) = match (src_len, dst_len) {
         (Some(s), Some(d)) => (s, d),
         _ => return false, // overflow → reject
@@ -856,8 +1079,8 @@ fn box_downscale_rgba8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh
     let x_ranges: Vec<(u32, u32)> = (0..dw)
         .map(|dx| {
             let x0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
-            let x1 = (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64)
-                .min(sw as u64) as u32;
+            let x1 =
+                (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64).min(sw as u64) as u32;
             (x0, x1)
         })
         .collect();
@@ -917,8 +1140,12 @@ fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh:
     }
     // Checked multiply: on 32-bit/WASM targets the product can overflow usize and
     // wrap to a small value that spuriously passes the length guard.
-    let src_len = (sw as usize).checked_mul(sh as usize).and_then(|n| n.checked_mul(3));
-    let dst_len = (dw as usize).checked_mul(dh as usize).and_then(|n| n.checked_mul(3));
+    let src_len = (sw as usize)
+        .checked_mul(sh as usize)
+        .and_then(|n| n.checked_mul(3));
+    let dst_len = (dw as usize)
+        .checked_mul(dh as usize)
+        .and_then(|n| n.checked_mul(3));
     let (src_len, dst_len) = match (src_len, dst_len) {
         (Some(s), Some(d)) => (s, d),
         _ => return false,
@@ -961,8 +1188,8 @@ fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh:
     let x_ranges: Vec<(u32, u32)> = (0..dw)
         .map(|dx| {
             let x0 = ((dx as u64 * sw as u64) / dw as u64) as u32;
-            let x1 = (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64)
-                .min(sw as u64) as u32;
+            let x1 =
+                (((dx as u64 + 1) * sw as u64 + dw as u64 - 1) / dw as u64).min(sw as u64) as u32;
             (x0, x1)
         })
         .collect();
@@ -1050,7 +1277,9 @@ fn serial_encode_threads(px: usize) -> usize {
     if px < 512 * 512 {
         return 1;
     }
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// One sidecar level target: dimensions + butteraugli distance. Channel-agnostic —
@@ -1085,14 +1314,24 @@ fn build_sorted_scs(
         }
         let (tw, th) = if width >= height {
             let tw = max_dim;
-            let th = std::cmp::max(1u32, (((max_dim as u64 * height as u64) + (width as u64 / 2)) / (width as u64)) as u32);
+            let th = std::cmp::max(
+                1u32,
+                (((max_dim as u64 * height as u64) + (width as u64 / 2)) / (width as u64)) as u32,
+            );
             (tw, th)
         } else {
             let th = max_dim;
-            let tw = std::cmp::max(1u32, (((max_dim as u64 * width as u64) + (height as u64 / 2)) / (height as u64)) as u32);
+            let tw = std::cmp::max(
+                1u32,
+                (((max_dim as u64 * width as u64) + (height as u64 / 2)) / (height as u64)) as u32,
+            );
             (tw, th)
         };
-        scs.push(Sc { tw, th, dist: sidecar_distances[i] });
+        scs.push(Sc {
+            tw,
+            th,
+            dist: sidecar_distances[i],
+        });
     }
 
     // Sort descending by the actual LONG edge so the cascade (largest → smallest)
@@ -1131,7 +1370,11 @@ fn pyramid_encode_rgb(
         let mut ch = height;
         for sc in scs.iter() {
             let mut buf = vec![0u8; sc.tw as usize * sc.th as usize * 3];
-            let src: &[u8] = if scaled_bufs.is_empty() { rgb } else { &scaled_bufs.last().unwrap().0 };
+            let src: &[u8] = if scaled_bufs.is_empty() {
+                rgb
+            } else {
+                &scaled_bufs.last().unwrap().0
+            };
             if !box_downscale_rgb8(src, cw, ch, &mut buf, sc.tw, sc.th) {
                 return Err(EncodeError::Resize);
             }
@@ -1150,9 +1393,16 @@ fn pyramid_encode_rgb(
             .map_init(
                 || Encoder::new(EncodeOptions::default()),
                 |enc_slot, (buf, tw, th, dist)| {
-                    let enc = enc_slot.as_mut().map_err(|_| EncodeError::Jxl("encoder init".into()))?;
+                    let enc = enc_slot
+                        .as_mut()
+                        .map_err(|_| EncodeError::Jxl("encoder init".into()))?;
                     let data = encode_distance_rgb_into(enc, &buf, tw, th, dist, effort)?;
-                    Ok(PyramidLevel { data, width: tw, height: th, bits_per_sample: 8 })
+                    Ok(PyramidLevel {
+                        data,
+                        width: tw,
+                        height: th,
+                        bits_per_sample: 8,
+                    })
                 },
             )
             .collect();
@@ -1165,7 +1415,12 @@ fn pyramid_encode_rgb(
         let mut v = Vec::with_capacity(scaled_bufs.len());
         for (buf, tw, th, dist) in scaled_bufs {
             let data = encode_distance_rgb_into(&mut enc, &buf, tw, th, dist, effort)?;
-            v.push(PyramidLevel { data, width: tw, height: th, bits_per_sample: 8 });
+            v.push(PyramidLevel {
+                data,
+                width: tw,
+                height: th,
+                bits_per_sample: 8,
+            });
         }
         v
     };
@@ -1187,12 +1442,20 @@ fn pyramid_encode_rgb(
             full_distance,
             effort as i64,
             threads,
-            &mut WholeImageSource { data: rgb, width: width as usize },
+            &mut WholeImageSource {
+                data: rgb,
+                width: width as usize,
+            },
             &mut out,
         )?;
         out
     };
-    sides.push(PyramidLevel { data: full, width, height, bits_per_sample: 8 });
+    sides.push(PyramidLevel {
+        data: full,
+        width,
+        height,
+        bits_per_sample: 8,
+    });
     Ok(sides)
 }
 
@@ -1254,7 +1517,11 @@ pub fn encode_rgba8_pyramid(
         for sc in scs.iter() {
             let mut thumb = vec![0u8; sc.tw as usize * sc.th as usize * 4];
             // Source for this iteration: last pushed buffer or original rgba.
-            let src: &[u8] = if scaled_bufs.is_empty() { rgba } else { &scaled_bufs.last().unwrap().0 };
+            let src: &[u8] = if scaled_bufs.is_empty() {
+                rgba
+            } else {
+                &scaled_bufs.last().unwrap().0
+            };
             if !box_downscale_rgba8(src, cw, ch, &mut thumb, sc.tw, sc.th) {
                 return Err(EncodeError::Resize);
             }
@@ -1275,7 +1542,9 @@ pub fn encode_rgba8_pyramid(
             .map_init(
                 || Encoder::new(EncodeOptions::default()),
                 |enc_slot, (buf, tw, th, dist)| {
-                    let enc = enc_slot.as_mut().map_err(|_| EncodeError::Jxl("encoder init".into()))?;
+                    let enc = enc_slot
+                        .as_mut()
+                        .map_err(|_| EncodeError::Jxl("encoder init".into()))?;
                     enc.set_options(EncodeOptions::distance(dist).with_effort(effort));
                     let bytes = if has_alpha {
                         enc.encode(&Frame::rgba8(&buf, tw, th))?
@@ -1284,7 +1553,12 @@ pub fn encode_rgba8_pyramid(
                         let rgb = strip_rgba_to_rgb(&buf);
                         enc.encode(&Frame::rgb(&rgb, tw, th))?
                     };
-                    Ok(PyramidLevel { data: bytes, width: tw, height: th, bits_per_sample: 8 })
+                    Ok(PyramidLevel {
+                        data: bytes,
+                        width: tw,
+                        height: th,
+                        bits_per_sample: 8,
+                    })
                 },
             )
             .collect();
@@ -1297,7 +1571,12 @@ pub fn encode_rgba8_pyramid(
         let mut v = Vec::with_capacity(scaled_bufs.len());
         for (buf, tw, th, dist) in scaled_bufs {
             let data = encode_distance_into(&mut enc, &buf, tw, th, dist, effort, has_alpha)?;
-            v.push(PyramidLevel { data, width: tw, height: th, bits_per_sample: 8 });
+            v.push(PyramidLevel {
+                data,
+                width: tw,
+                height: th,
+                bits_per_sample: 8,
+            });
         }
         v
     };
@@ -1314,9 +1593,22 @@ pub fn encode_rgba8_pyramid(
     let full = {
         let threads = serial_encode_threads(width as usize * height as usize);
         let mut enc = Encoder::with_threads(EncodeOptions::default(), threads)?;
-        encode_distance_into(&mut enc, rgba, width, height, full_distance, effort, has_alpha)?
+        encode_distance_into(
+            &mut enc,
+            rgba,
+            width,
+            height,
+            full_distance,
+            effort,
+            has_alpha,
+        )?
     };
-    sides.push(PyramidLevel { data: full, width, height, bits_per_sample: 8 });
+    sides.push(PyramidLevel {
+        data: full,
+        width,
+        height,
+        bits_per_sample: 8,
+    });
     Ok(sides)
 }
 
@@ -1408,7 +1700,10 @@ mod tests {
         let v = encode_variants(&rgba, 640, 480, SourceType::Jpeg, false).unwrap();
         assert_eq!(v.full_quality, 85);
         assert_eq!((v.preview_w, v.preview_h), (640, 480));
-        assert_eq!(v.preview_1080, v.full, "coalesced tiers must be byte-identical");
+        assert_eq!(
+            v.preview_1080, v.full,
+            "coalesced tiers must be byte-identical"
+        );
         assert!(!v.full.is_empty());
     }
 
@@ -1418,7 +1713,10 @@ mod tests {
         let rgba = gradient(640, 480);
         let v = encode_variants(&rgba, 640, 480, SourceType::Jpeg, true).unwrap();
         assert_eq!(v.full_quality, 95);
-        assert_ne!(v.preview_1080, v.full, "q95 full must differ from q85 preview");
+        assert_ne!(
+            v.preview_1080, v.full,
+            "q95 full must differ from q85 preview"
+        );
 
         // RAW (q90 full) must NOT coalesce.
         let v = encode_variants(&rgba, 640, 480, SourceType::Raw, false).unwrap();
@@ -1426,7 +1724,8 @@ mod tests {
         assert_ne!(v.preview_1080, v.full);
 
         // progressive_dc on the full tier must NOT coalesce.
-        let v = encode_variants_with_progressive(&rgba, 640, 480, SourceType::Jpeg, false, 2, 0).unwrap();
+        let v = encode_variants_with_progressive(&rgba, 640, 480, SourceType::Jpeg, false, 2, 0)
+            .unwrap();
         assert_ne!(v.preview_1080, v.full, "progressive full must differ");
 
         // >1080 long edge downsizes the preview: dims differ, no coalescing.
@@ -1471,11 +1770,25 @@ mod tests {
             params.texture = t;
             params.clarity = c;
             let a = encode_variants_from_rgb16_with_progressive(
-                &rgb16, &params, w, h, SourceType::Raw, false, 0, 0,
+                &rgb16,
+                &params,
+                w,
+                h,
+                SourceType::Raw,
+                false,
+                0,
+                0,
             )
             .unwrap();
             let b = encode_variants_from_rgb16_owned(
-                rgb16.clone(), &params, w, h, SourceType::Raw, false, 0, 0,
+                rgb16.clone(),
+                &params,
+                w,
+                h,
+                SourceType::Raw,
+                false,
+                0,
+                0,
             )
             .unwrap();
             assert_eq!(a.thumb_300, b.thumb_300, "thumb t={t} c={c}");
@@ -1483,8 +1796,20 @@ mod tests {
             assert_eq!(a.full, b.full, "full t={t} c={c}");
             assert_eq!(a.has_alpha, b.has_alpha);
             assert_eq!(
-                (a.thumb_w, a.thumb_h, a.preview_w, a.preview_h, a.full_quality),
-                (b.thumb_w, b.thumb_h, b.preview_w, b.preview_h, b.full_quality)
+                (
+                    a.thumb_w,
+                    a.thumb_h,
+                    a.preview_w,
+                    a.preview_h,
+                    a.full_quality
+                ),
+                (
+                    b.thumb_w,
+                    b.thumb_h,
+                    b.preview_w,
+                    b.preview_h,
+                    b.full_quality
+                )
             );
         }
     }
@@ -1492,7 +1817,8 @@ mod tests {
     #[test]
     fn encode_variants_with_progressive_dc2_smoke() {
         let rgba = solid(64, 64);
-        let v = encode_variants_with_progressive(&rgba, 64, 64, SourceType::Raw, false, 2, 1).unwrap();
+        let v =
+            encode_variants_with_progressive(&rgba, 64, 64, SourceType::Raw, false, 2, 1).unwrap();
         assert!(!v.full.is_empty());
         let b = &v.full;
         let cs = b[0] == 0xFF && b[1] == 0x0A;
@@ -1503,7 +1829,8 @@ mod tests {
     #[test]
     fn encode_rgba8_pyramid_smoke() {
         let rgba = solid(200, 150);
-        let levels = encode_rgba8_pyramid(&rgba, 200, 150, 0.55, &[128, 256], &[1.45, 1.45], 3).unwrap();
+        let levels =
+            encode_rgba8_pyramid(&rgba, 200, 150, 0.55, &[128, 256], &[1.45, 1.45], 3).unwrap();
         assert_eq!(levels.len(), 2);
         assert!(levels[0].width <= 128);
         assert_eq!(levels.last().unwrap().width, 200);
@@ -1520,7 +1847,16 @@ mod tests {
     #[test]
     fn pyramid_skips_upscale_and_produces_ascending() {
         let rgba = solid(800, 600);
-        let levels = encode_rgba8_pyramid(&rgba, 800, 600, 0.55, &[256, 512, 1024, 2048], &[1.45, 1.45, 1.45, 0.55], 3).unwrap();
+        let levels = encode_rgba8_pyramid(
+            &rgba,
+            800,
+            600,
+            0.55,
+            &[256, 512, 1024, 2048],
+            &[1.45, 1.45, 1.45, 0.55],
+            3,
+        )
+        .unwrap();
         assert!(levels.len() >= 2);
         let last = levels.last().unwrap();
         assert_eq!(last.width, 800);
@@ -1532,7 +1868,8 @@ mod tests {
     fn encode_rgba8_pyramid_from_rgb16_smoke() {
         let rgb16: Vec<u16> = (0..(4 * 4 * 3)).map(|i| 3000 + (i as u16) * 10).collect();
         let params = crate::pipeline::PipelineParams::default_olympus();
-        let levels = encode_rgba8_pyramid_from_rgb16(&rgb16, &params, 4, 4, 0.55, &[2], &[1.45], 3).unwrap();
+        let levels =
+            encode_rgba8_pyramid_from_rgb16(&rgb16, &params, 4, 4, 0.55, &[2], &[1.45], 3).unwrap();
         assert!(!levels.is_empty());
         let last = levels.last().unwrap();
         assert_eq!(last.width, 4);
@@ -1599,7 +1936,13 @@ mod tests {
         let rgba = vec![0u8; 4 * 4 * 4 - 1]; // 4×4 RGBA minus one byte
         let err = encode_rgba8_pyramid(&rgba, 4, 4, 0.55, &[], &[], 3).unwrap_err();
         assert!(
-            matches!(err, EncodeError::Input { expected: 64, got: 63 }),
+            matches!(
+                err,
+                EncodeError::Input {
+                    expected: 64,
+                    got: 63
+                }
+            ),
             "expected Input{{64,63}}, got {err:?}"
         );
     }
@@ -1610,19 +1953,33 @@ mod tests {
     #[test]
     fn pyramid_ultra_narrow_portrait_orders_by_long_edge() {
         let rgba = solid(1, 1000);
-        let levels =
-            encode_rgba8_pyramid(&rgba, 1, 1000, 0.55, &[128, 512, 256], &[1.45, 1.45, 1.45], 3)
-                .unwrap();
+        let levels = encode_rgba8_pyramid(
+            &rgba,
+            1,
+            1000,
+            0.55,
+            &[128, 512, 256],
+            &[1.45, 1.45, 1.45],
+            3,
+        )
+        .unwrap();
         // smallest→largest for consumers; final entry is the full image.
         let dims: Vec<(u32, u32)> = levels.iter().map(|l| (l.width, l.height)).collect();
-        assert_eq!(dims, vec![(1, 128), (1, 256), (1, 512), (1, 1000)], "cascade not strictly ascending by long edge");
+        assert_eq!(
+            dims,
+            vec![(1, 128), (1, 256), (1, 512), (1, 1000)],
+            "cascade not strictly ascending by long edge"
+        );
     }
 
     // Deterministic pseudo-random RGBA source (LCG), α set to a constant 255.
     fn rand_rgba(sw: u32, sh: u32) -> Vec<u8> {
         let n = (sw * sh) as usize;
         let mut v = vec![0u8; n * 4];
-        let mut s: u32 = 0x9e37_79b9u32.wrapping_mul(sw).wrapping_add(sh).wrapping_add(1);
+        let mut s: u32 = 0x9e37_79b9u32
+            .wrapping_mul(sw)
+            .wrapping_add(sh)
+            .wrapping_add(1);
         for px in v.chunks_exact_mut(4) {
             s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             px[0] = (s >> 24) as u8;
@@ -1702,9 +2059,15 @@ mod tests {
     fn process_rgb_matches_process_rgba_stripped() {
         let params = crate::pipeline::PipelineParams::default_olympus();
         // A spread of 16-bit values across the LUT domain.
-        let rgb16: Vec<u16> = (0..(13 * 7 * 3)).map(|i| ((i * 911) % 65536) as u16).collect();
+        let rgb16: Vec<u16> = (0..(13 * 7 * 3))
+            .map(|i| ((i * 911) % 65536) as u16)
+            .collect();
         let rgba = crate::pipeline::process_rgba(&rgb16, &params);
         let rgb = crate::pipeline::process_rgb(&rgb16, &params);
-        assert_eq!(rgb, strip_rgba_to_rgb(&rgba), "process_rgb != strip(process_rgba)");
+        assert_eq!(
+            rgb,
+            strip_rgba_to_rgb(&rgba),
+            "process_rgb != strip(process_rgba)"
+        );
     }
 }

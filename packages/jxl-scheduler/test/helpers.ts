@@ -53,6 +53,7 @@ export function makeDecodeStart(sessionId: string, priority: "visible" | "near" 
     downsample: 1,
     progressionTarget: "final",
     emitEveryPass: true,
+    suppressDuplicateProgress: false,
     preserveIcc: true,
     preserveMetadata: true,
     priority,

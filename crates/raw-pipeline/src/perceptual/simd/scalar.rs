@@ -10,10 +10,16 @@
 #[inline]
 pub fn scale_err_tail(
     mask: &[f32],
-    rx: &[f32], ry: &[f32], rb: &[f32],
-    tx: &[f32], ty: &[f32], tb: &[f32],
+    rx: &[f32],
+    ry: &[f32],
+    rb: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+    tb: &[f32],
     n: usize,
-    kx: f32, ky: f32, kb: f32,
+    kx: f32,
+    ky: f32,
+    kb: f32,
     i_start: usize,
     sum_in: f64,
 ) -> f64 {
@@ -35,8 +41,15 @@ pub fn scale_err_tail(
 /// pixels_to_xyb scalar tail: converts RGBA pixels in `[i_start, n)` into planar
 /// X/Y/B via a 256-entry sqrt-linear LUT. Called after SIMD gather exhausts lanes.
 #[inline]
-pub fn xyb_tail(px: &[u8], lut: &[f32; 256], n: usize, i_start: usize,
-                x: &mut [f32], y: &mut [f32], b: &mut [f32]) {
+pub fn xyb_tail(
+    px: &[u8],
+    lut: &[f32; 256],
+    n: usize,
+    i_start: usize,
+    x: &mut [f32],
+    y: &mut [f32],
+    b: &mut [f32],
+) {
     let mut i = i_start;
     while i < n {
         let j = i * 4;
@@ -54,9 +67,13 @@ pub fn xyb_tail(px: &[u8], lut: &[f32; 256], n: usize, i_start: usize,
 /// single output row `dy`. Called after the vectorised inner loop exhausts full-width chunks.
 #[inline]
 pub fn downsample_row_tail(
-    src: &[f32], w: usize, h: usize,
-    dst_row: &mut [f32], dw: usize,
-    dy: usize, x_start: usize,
+    src: &[f32],
+    w: usize,
+    h: usize,
+    dst_row: &mut [f32],
+    dw: usize,
+    dy: usize,
+    x_start: usize,
 ) {
     let sy0 = dy << 1;
     let sy1 = if sy0 + 1 < h { sy0 + 1 } else { h - 1 };
@@ -64,8 +81,9 @@ pub fn downsample_row_tail(
     while x < dw {
         let sx0 = x << 1;
         let sx1 = if sx0 + 1 < w { sx0 + 1 } else { w - 1 };
-        dst_row[x] = (src[sy0 * w + sx0] + src[sy0 * w + sx1]
-                    + src[sy1 * w + sx0] + src[sy1 * w + sx1]) * 0.25;
+        dst_row[x] =
+            (src[sy0 * w + sx0] + src[sy0 * w + sx1] + src[sy1 * w + sx0] + src[sy1 * w + sx1])
+                * 0.25;
         x += 1;
     }
 }

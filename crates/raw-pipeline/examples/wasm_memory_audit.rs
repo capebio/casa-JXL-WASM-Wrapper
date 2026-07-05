@@ -34,7 +34,9 @@ fn main() {
     println!("  Peak total:                          ~60 MB\n");
 
     println!("Memory tracking checklist:");
-    println!("  ✓ Browser: use .flipflop/memory-audit.mjs to inspect Module.memory.buffer.byteLength");
+    println!(
+        "  ✓ Browser: use .flipflop/memory-audit.mjs to inspect Module.memory.buffer.byteLength"
+    );
     println!("  ✓ Tool: Monitor growth over 5 rapid sessions (same config)");
     println!("  ✓ Leak test: Measure memory before and after each session");
     println!("  ✓ Stress: Decode 1000 small images in loop, check for ramp\n");
