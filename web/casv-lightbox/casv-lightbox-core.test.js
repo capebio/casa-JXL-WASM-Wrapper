@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   PRESETS, defaultThreshForDistance, frameKindLabel, formatRate,
-  fpsOf, timecode, suggestExportName, buildEncodeRequest,
+  fpsOf, timecode, suggestExportName, suggestEncodeName, buildEncodeRequest,
   classifyDroppedEncodePaths, shouldHandleEncodeDrop,
 } from './casv-lightbox-core.js';
 
@@ -88,6 +88,16 @@ test('buildEncodeRequest supports video defaults', () => {
   assert.equal(req.fpsDen, 1);
   assert.equal(req.dim, 'exact');
   assert.equal(req.tile, 32);
+  // Output name retains the full source filename and appends .casv.
+  assert.equal(req.outputName, 'sintel.webm.casv');
+});
+
+test('suggestEncodeName retains full source name + .casv', () => {
+  assert.equal(suggestEncodeName('C:/video/holiday.mp4'), 'holiday.mp4.casv');
+  assert.equal(suggestEncodeName('clip.MOV'), 'clip.MOV.casv');
+  assert.equal(suggestEncodeName('/home/u/a.b.mkv'), 'a.b.mkv.casv');
+  assert.equal(suggestEncodeName(''), 'casava-encode.casv');
+  assert.equal(suggestEncodeName(null), 'casava-encode.casv');
 });
 
 test('buildEncodeRequest validates video input count and dim', () => {
