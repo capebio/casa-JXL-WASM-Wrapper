@@ -550,6 +550,20 @@ export class ProcessResult {
     /**
      * @returns {number}
      */
+    get disp16_h() {
+        const ret = wasm.__wbg_get_processresult_disp16_h(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    get disp16_w() {
+        const ret = wasm.__wbg_get_processresult_disp16_w(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
     get exposure_den() {
         const ret = wasm.__wbg_get_processresult_exposure_den(this.__wbg_ptr);
         return ret >>> 0;
@@ -883,6 +897,17 @@ export class ProcessResult {
         const ret = wasm.processresult_take_rgb(this.__wbg_ptr);
         var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * Display-referred, oriented, full-res RGB16 (interleaved, [0,65535]). Empty after first call
+     * or if OUT_FULL_DISP16 was not requested.
+     * @returns {Uint16Array}
+     */
+    take_rgb16_disp() {
+        const ret = wasm.processresult_take_rgb16_disp(this.__wbg_ptr);
+        var v1 = getArrayU16FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 2, 2);
         return v1;
     }
     /**
@@ -1279,6 +1304,28 @@ export function downscale_rgb(src, src_w, src_h, dst_w, dst_h) {
     }
     var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Box-filter downscale a 16-bit RGB buffer (u16 interleaved, 3 channels).
+ * Returns a `Uint16Array`-compatible `Vec<u16>` from JS.
+ * @param {Uint16Array} src
+ * @param {number} src_w
+ * @param {number} src_h
+ * @param {number} dst_w
+ * @param {number} dst_h
+ * @returns {Uint16Array}
+ */
+export function downscale_rgb16_pub(src, src_w, src_h, dst_w, dst_h) {
+    const ptr0 = passArray16ToWasm0(src, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.downscale_rgb16_pub(ptr0, len0, src_w, src_h, dst_w, dst_h);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU16FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 2, 2);
     return v2;
 }
 
@@ -1707,6 +1754,22 @@ export function process_orf_with_flags(data, output_flags, exposure_ev, contrast
 }
 
 /**
+ * Convert interleaved RGB16 → RGBA16 (alpha = 0xFFFF). Returns a `Uint16Array`-compatible
+ * `Vec<u16>` from JS. Intended as a source buffer for a 16-bit PNG/JXL encoder.
+ * Scalar loop: called once per encode (not a hot path); no SIMD twin until it appears in profiles.
+ * @param {Uint16Array} rgb
+ * @returns {Uint16Array}
+ */
+export function rgb16_to_rgba16(rgb) {
+    const ptr0 = passArray16ToWasm0(rgb, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.rgb16_to_rgba16(ptr0, len0);
+    var v2 = getArrayU16FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 2, 2);
+    return v2;
+}
+
+/**
  * Convert interleaved RGB8 → RGBA8 (alpha = 255).  HTML canvas wants RGBA.
  * @param {Uint8Array} rgb
  * @returns {Uint8Array}
@@ -1932,6 +1995,11 @@ function addToExternrefTable0(obj) {
 function getArrayF32FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getFloat32ArrayMemory0().subarray(ptr / 4, ptr / 4 + len);
+}
+
+function getArrayU16FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint16ArrayMemory0().subarray(ptr / 2, ptr / 2 + len);
 }
 
 function getArrayU8FromWasm0(ptr, len) {
