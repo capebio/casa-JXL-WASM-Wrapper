@@ -159,6 +159,7 @@ async function main() {
       } catch (_) { /* lossless not supported / failed — skip */ }
     }
     // 16-bit pass (RAW-derived images only)
+    if (img.class === "raw" && !img.srcPath) log("16-bit skip: no srcPath", img.id);
     if (img.class === "raw" && img.srcPath) {
       try {
         const { rgba16, tgtW, tgtH } = await loadTarget16(img.srcPath);
@@ -192,7 +193,7 @@ async function main() {
             const dec = await png16.decode(b);
             let totalErr = 0;
             for (let k = 0; k < rgba16.length; k++) totalErr += Math.abs(rgba16[k] - dec.data[k]);
-            if (totalErr !== 0) { log("png16 not lossless", img.id, totalErr); }
+            if (totalErr !== 0) { log("png16 not lossless", img.id, "mae", (totalErr / rgba16.length).toFixed(2)); }
             else { data.lossless16.push({ image: img.id, class: "raw", codec: "png16", runtime: "native", bytes: b.length, bpp: b.length * 8 / npx16 }); }
           } catch (e) { log("codec16 fail", img.id, "png16", e.message); }
         }
