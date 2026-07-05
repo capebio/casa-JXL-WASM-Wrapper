@@ -58,6 +58,36 @@
 .casv-lb__status[data-tone="warn"] { color: var(--warn); }
 .casv-lb__status[data-tone="error"] { color: var(--err); }
 
+/* Debug console */
+.casv-lb__console {
+  border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  margin: 6px 0 10px; background: #0c0d0a;
+}
+.casv-lb__console-bar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px 8px; background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.casv-lb__console-title {
+  font-size: .78rem; color: var(--muted); font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; margin-right: auto;
+}
+.casv-lb__console-btn {
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 5px; padding: 2px 9px; font-size: .74rem; cursor: pointer;
+}
+.casv-lb__console-btn:hover { border-color: var(--leaf); color: var(--ink); }
+.casv-lb__console-body {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: .74rem; line-height: 1.5; color: #b9c4ad;
+  height: 160px; overflow-y: auto; padding: 6px 8px;
+  white-space: pre-wrap; word-break: break-word;
+}
+.casv-lb__console[data-collapsed="1"] .casv-lb__console-body { display: none; }
+.casv-lb__log-line { padding: 0; }
+.casv-lb__log-line[data-level="warn"] { color: var(--warn); }
+.casv-lb__log-line[data-level="error"] { color: #e8785e; }
+.casv-lb__log-line[data-level="debug"] { color: var(--muted); }
+
 .casv-lb__meta {
   display: grid; grid-template-columns: max-content 1fr; gap: 3px 16px;
   margin: 6px 0; padding: 10px 12px; background: var(--panel);
