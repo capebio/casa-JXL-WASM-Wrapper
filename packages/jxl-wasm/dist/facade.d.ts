@@ -384,6 +384,11 @@ interface LibjxlWasmModule {
     _jxl_wasm_dec_take_flushed?(state: number): number;
     _jxl_wasm_dec_take_final?(state: number): number;
     _jxl_wasm_dec_free?(state: number): void;
+    _jxl_wasm_dec_flush_attempts?(state: number): number;
+    _jxl_wasm_dec_flush_successes?(state: number): number;
+    _jxl_wasm_dec_flush_zero_skips?(state: number): number;
+    _jxl_wasm_dec_flush_duplicate_skips?(state: number): number;
+    _jxl_wasm_dec_flush_image_ms?(state: number): number;
     _jxl_wasm_encode_rgba8_with_sidecars?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, sidecarDimsPtr: number, numSidecars: number): number;
     _jxl_wasm_buffer_next?(handle: number): number;
     _jxl_wasm_decode_rgba8_region?(inputPtr: number, inputSize: number, cx: number, cy: number, cw: number, ch: number, downsample: number): number;

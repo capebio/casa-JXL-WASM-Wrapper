@@ -60,8 +60,14 @@ pub fn analyze_fused_scalar(d: &[u8], px: usize) -> TelemetryMetrics {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u64, 0u64);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
     let mut lanes = [
-        lane_seed(0), lane_seed(1), lane_seed(2), lane_seed(3),
-        lane_seed(4), lane_seed(5), lane_seed(6), lane_seed(7),
+        lane_seed(0),
+        lane_seed(1),
+        lane_seed(2),
+        lane_seed(3),
+        lane_seed(4),
+        lane_seed(5),
+        lane_seed(6),
+        lane_seed(7),
     ];
     let mut hist = RgbHistogram::new();
 
@@ -85,9 +91,15 @@ pub fn analyze_fused_scalar(d: &[u8], px: usize) -> TelemetryMetrics {
         let lane = p & 7;
         lanes[lane] = (lanes[lane] ^ w).wrapping_mul(PRIME);
         rgb_nz += (r != 0) as u64 + (g != 0) as u64 + (b != 0) as u64;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
@@ -97,7 +109,10 @@ pub fn analyze_fused_scalar(d: &[u8], px: usize) -> TelemetryMetrics {
         l_sq = new_sq;
     }
 
-    if px == 0 { a_min = 255; a_max = 0; }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
 
     let stats = FrameStats {
         alpha_min: a_min,
@@ -131,8 +146,14 @@ unsafe fn analyze_fused_avx2(d: &[u8], px: usize) -> TelemetryMetrics {
     let mut l_sq_c = 0f64;
 
     let mut hv = _mm256_setr_epi32(
-        lane_seed(0) as i32, lane_seed(1) as i32, lane_seed(2) as i32, lane_seed(3) as i32,
-        lane_seed(4) as i32, lane_seed(5) as i32, lane_seed(6) as i32, lane_seed(7) as i32,
+        lane_seed(0) as i32,
+        lane_seed(1) as i32,
+        lane_seed(2) as i32,
+        lane_seed(3) as i32,
+        lane_seed(4) as i32,
+        lane_seed(5) as i32,
+        lane_seed(6) as i32,
+        lane_seed(7) as i32,
     );
     let prime_v = _mm256_set1_epi32(PRIME as i32);
 
@@ -170,13 +191,25 @@ unsafe fn analyze_fused_avx2(d: &[u8], px: usize) -> TelemetryMetrics {
 
         let lo16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(pv));
         let hi16 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(pv, 1));
-        _mm256_storeu_si256(arr_lo.as_mut_ptr() as *mut __m256i, _mm256_madd_epi16(lo16, wv));
-        _mm256_storeu_si256(arr_hi.as_mut_ptr() as *mut __m256i, _mm256_madd_epi16(hi16, wv));
+        _mm256_storeu_si256(
+            arr_lo.as_mut_ptr() as *mut __m256i,
+            _mm256_madd_epi16(lo16, wv),
+        );
+        _mm256_storeu_si256(
+            arr_hi.as_mut_ptr() as *mut __m256i,
+            _mm256_madd_epi16(hi16, wv),
+        );
         // FS-002: pairwise integer reduction — one Kahan step per 8-pixel chunk instead of 8.
         // Reduces f64 ops from 24M→3M at 24MP. Exact for i64: max chunk_sq_sum = 8×65025²≈3.4e10.
         let luma = [
-            arr_lo[0] + arr_lo[1], arr_lo[2] + arr_lo[3], arr_lo[4] + arr_lo[5], arr_lo[6] + arr_lo[7],
-            arr_hi[0] + arr_hi[1], arr_hi[2] + arr_hi[3], arr_hi[4] + arr_hi[5], arr_hi[6] + arr_hi[7],
+            arr_lo[0] + arr_lo[1],
+            arr_lo[2] + arr_lo[3],
+            arr_lo[4] + arr_lo[5],
+            arr_lo[6] + arr_lo[7],
+            arr_hi[0] + arr_hi[1],
+            arr_hi[2] + arr_hi[3],
+            arr_hi[4] + arr_hi[5],
+            arr_hi[6] + arr_hi[7],
         ];
         let chunk_sum: i64 = luma.iter().map(|&x| x as i64).sum();
         let chunk_sq_sum: i64 = luma.iter().map(|&x| (x as i64) * (x as i64)).sum();
@@ -211,8 +244,12 @@ unsafe fn analyze_fused_avx2(d: &[u8], px: usize) -> TelemetryMetrics {
     _mm256_storeu_si256(maxs.as_mut_ptr() as *mut __m256i, vmax);
     let mut k = 3;
     while k < 32 {
-        if (mins[k] as u32) < a_min { a_min = mins[k] as u32; }
-        if (maxs[k] as u32) > a_max { a_max = maxs[k] as u32; }
+        if (mins[k] as u32) < a_min {
+            a_min = mins[k] as u32;
+        }
+        if (maxs[k] as u32) > a_max {
+            a_max = maxs[k] as u32;
+        }
         k += 4;
     }
 
@@ -234,9 +271,15 @@ unsafe fn analyze_fused_avx2(d: &[u8], px: usize) -> TelemetryMetrics {
         let lane = p & 7;
         lanes[lane] = (lanes[lane] ^ w).wrapping_mul(PRIME);
         rgb_nz += (r != 0) as u64 + (g != 0) as u64 + (b != 0) as u64;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
@@ -245,7 +288,10 @@ unsafe fn analyze_fused_avx2(d: &[u8], px: usize) -> TelemetryMetrics {
         l_sq_c = (new_sq - l_sq) - term;
         l_sq = new_sq;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
 
     let stats = FrameStats {
         alpha_min: a_min,
@@ -310,9 +356,21 @@ mod tests {
             if is_x86_feature_detected!("avx2") {
                 let av = unsafe { analyze_fused_avx2(&buf, w * h) };
                 assert_eq!(sc.stats, av.stats, "stats mismatch at {}x{}", w, h);
-                assert_eq!(sc.histogram.r, av.histogram.r, "R histogram mismatch at {}x{}", w, h);
-                assert_eq!(sc.histogram.g, av.histogram.g, "G histogram mismatch at {}x{}", w, h);
-                assert_eq!(sc.histogram.b, av.histogram.b, "B histogram mismatch at {}x{}", w, h);
+                assert_eq!(
+                    sc.histogram.r, av.histogram.r,
+                    "R histogram mismatch at {}x{}",
+                    w, h
+                );
+                assert_eq!(
+                    sc.histogram.g, av.histogram.g,
+                    "G histogram mismatch at {}x{}",
+                    w, h
+                );
+                assert_eq!(
+                    sc.histogram.b, av.histogram.b,
+                    "B histogram mismatch at {}x{}",
+                    w, h
+                );
             }
         }
     }
@@ -329,8 +387,17 @@ mod tests {
         let g_sum: u32 = metrics.histogram.g.iter().sum();
         let b_sum: u32 = metrics.histogram.b.iter().sum();
 
-        assert_eq!(r_sum as usize, px, "R histogram sum should equal pixel count");
-        assert_eq!(g_sum as usize, px, "G histogram sum should equal pixel count");
-        assert_eq!(b_sum as usize, px, "B histogram sum should equal pixel count");
+        assert_eq!(
+            r_sum as usize, px,
+            "R histogram sum should equal pixel count"
+        );
+        assert_eq!(
+            g_sum as usize, px,
+            "G histogram sum should equal pixel count"
+        );
+        assert_eq!(
+            b_sum as usize, px,
+            "B histogram sum should equal pixel count"
+        );
     }
 }

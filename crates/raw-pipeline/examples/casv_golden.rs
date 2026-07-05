@@ -42,7 +42,9 @@ fn main() {
     let dir = std::env::args()
         .nth(1)
         .unwrap_or_else(|| r"C:\Foo\raw-converter\tests\real_video_ghana".to_string());
-    let out_dir = std::env::args().nth(2).unwrap_or_else(|| "casv_golden_out".to_string());
+    let out_dir = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "casv_golden_out".to_string());
     std::fs::create_dir_all(&out_dir).expect("create out dir");
 
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
@@ -83,13 +85,23 @@ fn main() {
                 let batch_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 std::fs::write(format!("{out_dir}/{tag}_batch.casv"), &batch).unwrap();
 
-                let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+                let mut src = VecFrames {
+                    frames: frames.clone(),
+                    i: 0,
+                    w,
+                    h,
+                };
                 let t0 = std::time::Instant::now();
                 let stream = encode_casv_video_streaming(&mut src, &opts).unwrap();
                 let stream_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 std::fs::write(format!("{out_dir}/{tag}_stream.casv"), &stream).unwrap();
 
-                let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+                let mut src = VecFrames {
+                    frames: frames.clone(),
+                    i: 0,
+                    w,
+                    h,
+                };
                 let mut sink: Vec<u8> = Vec::new();
                 let t0 = std::time::Instant::now();
                 encode_casv_video_streaming_to(&mut src, &opts, &mut sink).unwrap();

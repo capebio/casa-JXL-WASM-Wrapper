@@ -22,24 +22,43 @@ fn main() -> io::Result<()> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--variant" => { variant = Box::leak(args[i + 1].clone().into_boxed_str()); i += 2; }
-            "--in"  => { in_path  = Some(args[i + 1].clone()); i += 2; }
-            "--out" => { out_path = Some(args[i + 1].clone()); i += 2; }
-            "--reps" => { reps_arg = args[i + 1].parse().ok(); i += 2; }
-            _ => { i += 1; }
+            "--variant" => {
+                variant = Box::leak(args[i + 1].clone().into_boxed_str());
+                i += 2;
+            }
+            "--in" => {
+                in_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--reps" => {
+                reps_arg = args[i + 1].parse().ok();
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
-    let in_path  = in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
-    let out_path = out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
+    let in_path =
+        in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
+    let out_path =
+        out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
 
     let src = fs::read(&in_path)?;
     let n_u16 = src.len() / 2;
     let side = (n_u16 as f64).sqrt() as usize;
-    let width  = side & !1;
+    let width = side & !1;
     let height = if side > 0 { (n_u16 / side) & !1 } else { 0 };
     if width < 4 || height < 4 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "input too small (need ≥4×4)"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input too small (need ≥4×4)",
+        ));
     }
 
     let raw: Vec<u16> = src[..width * height * 2]
@@ -67,11 +86,18 @@ fn main() -> io::Result<()> {
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
             "rggb-specific" => demosaic_rggb_mhc(&raw, width, height)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?,
-            _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "variant must be generic or rggb-specific")),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "variant must be generic or rggb-specific",
+                ))
+            }
         };
     }
     let elapsed_ms = t0.elapsed().as_millis();
-    eprintln!("demosaic-bench: variant={variant} {width}x{height} reps={reps} elapsed={elapsed_ms}ms");
+    eprintln!(
+        "demosaic-bench: variant={variant} {width}x{height} reps={reps} elapsed={elapsed_ms}ms"
+    );
 
     let out_bytes: Vec<u8> = last_rgb.iter().flat_map(|&v| v.to_le_bytes()).collect();
     fs::write(&out_path, &out_bytes)?;

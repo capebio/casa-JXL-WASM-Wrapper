@@ -49,6 +49,11 @@ Three Tauri commands (compiled — `cargo check` clean under MSVC):
 - `casv_pick_images(app) -> Vec<String>` — native image open dialog.
 - `encode_casv_video(app, request) -> String` — spawns the sidecar; if
   `request.outputPath` is absent, opens a native save dialog; returns the path.
+  **Seed the save dialog's default filename with `request.outputName`** (JS sets
+  it via `suggestEncodeName`: the full source name + `.casv`, e.g.
+  `holiday.mp4` → `holiday.mp4.casv`). Rust: `dialog.set_file_name(&request.output_name)`
+  (field is `outputName` over the wire; `#[serde(rename_all = "camelCase")]`).
+  Fall back to `output.casv` only if `output_name` is empty.
 - `save_casv_bytes(app, bytes, suggestedName) -> String` — native save of the
   currently-loaded `.casv` bytes.
 
@@ -64,6 +69,58 @@ from `buildEncodeRequest`), `save_casv_bytes` with `{ bytes, suggestedName }`,
 and prefers the `tauri-plugin-dialog` `open` else falls back to
 `casv_pick_images`. JS `camelCase` fields map to the Rust struct via
 `#[serde(rename_all = "camelCase")]`.
+
+## Encode progress (x / y)
+
+The sidecar prints progress to **stderr** as it runs, one line per event:
+
+```
+CASVENC <stage> <done> <total>
+```
+
+- `stage` ∈ `extract | decode | encode`
+- `total == 0` → indeterminate (e.g. the ffmpeg extract is one opaque call)
+- `stdout` still carries only the final `OK <bytes> <out>` result line
+
+**Cross-repo glue (app repo — one change):** `encode_casv_video` currently
+captures the sidecar with `.output()` (buffers to completion). To relay
+progress, spawn with piped stderr and read it line-by-line, re-emitting each
+`CASVENC` line as a `casv-encode-progress` event:
+
+```rust
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+
+let mut child = Command::new(bin)
+    .args(&sidecar_args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+
+let stderr = child.stderr.take().unwrap();
+let app2 = app.clone();
+std::thread::spawn(move || {
+    for line in BufReader::new(stderr).lines().flatten() {
+        if let Some(rest) = line.strip_prefix("CASVENC ") {
+            let f: Vec<&str> = rest.split_whitespace().collect();
+            if f.len() == 3 {
+                let _ = app2.emit("casv-encode-progress", serde_json::json!({
+                    "stage": f[0],
+                    "done":  f[1].parse::<u64>().unwrap_or(0),
+                    "total": f[2].parse::<u64>().unwrap_or(0),
+                }));
+            }
+        }
+    }
+});
+
+let status = child.wait()?;              // read stdout for the OK line as before
+```
+
+The frontend already listens: `casv-platform.js` `onEncodeProgress()` subscribes
+to `casv-encode-progress`, and the lightbox renders a determinate bar for the
+`decode` phase (real `x / y`) and an indeterminate bar for `extract` / `encode`.
+No frontend change is needed once the app emits the event.
 
 ## Remaining for a shipped desktop build
 

@@ -36,8 +36,13 @@ fn main() {
         }
     }
 
-    let dir = std::env::args().nth(1).expect("usage: dist_effort_probe <frames_dir> [n]");
-    let take: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(12);
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: dist_effort_probe <frames_dir> [n]");
+    let take: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
 
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
         .expect("read frames dir")
@@ -60,17 +65,34 @@ fn main() {
     println!("{:<16} {:>10} {:>9}", "d / e", "enc ms/f", "size MB");
 
     // Interleave the matrix twice in reversed order to expose drift.
-    let matrix = [(2.0f32, 1u8), (1.0, 3), (0.5, 3), (1.0, 4), (0.5, 4), (2.0, 3)];
+    let matrix = [
+        (2.0f32, 1u8),
+        (1.0, 3),
+        (0.5, 3),
+        (1.0, 4),
+        (0.5, 4),
+        (2.0, 3),
+    ];
     let mut run = |d: f32, e: u8| {
         let mut opts = CasaVideoOptions::streaming(d);
         opts.effort = e;
         opts.rate = VideoRate::Lossy(d);
-        let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let mut src = VecFrames {
+            frames: frames.clone(),
+            i: 0,
+            w,
+            h,
+        };
         let mut sink: Vec<u8> = Vec::new();
         let t0 = Instant::now();
         encode_casv_video_streaming_to(&mut src, &opts, &mut sink).unwrap();
         let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-        println!("{:<16} {:>10.1} {:>9.2}", format!("d{d} / e{e}"), ms, sink.len() as f64 / 1e6);
+        println!(
+            "{:<16} {:>10.1} {:>9.2}",
+            format!("d{d} / e{e}"),
+            ms,
+            sink.len() as f64 / 1e6
+        );
     };
     for &(d, e) in &matrix {
         run(d, e);

@@ -16,7 +16,10 @@
 //!
 //! Reps for the timed loop can be overridden with ORF_BENCH_REPS env var (default 7).
 
-use raw_pipeline::{decode_orf_rgba8, perceptual::{Comparer, Opts}};
+use raw_pipeline::{
+    decode_orf_rgba8,
+    perceptual::{Comparer, Opts},
+};
 use std::{env, fs, path::Path, time::Instant};
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -40,14 +43,21 @@ fn main() {
 
     // Decode all ORFs up-front (decode time not part of the metric bench).
     eprintln!("[decode] loading {} ORF files...", args.len());
-    let images: Vec<(String, Vec<u8>, u32, u32)> = args.iter().map(|path| {
-        let data = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        let (rgba, w, h) = decode_orf_rgba8(&data)
-            .unwrap_or_else(|e| panic!("decode {path}: {e}"));
-        let name = Path::new(path).file_stem().unwrap().to_string_lossy().into_owned();
-        eprintln!("  {name}  {w}×{h}  {:.1} MP", (w as f64 * h as f64) / 1e6);
-        (name, rgba, w, h)
-    }).collect();
+    let images: Vec<(String, Vec<u8>, u32, u32)> = args
+        .iter()
+        .map(|path| {
+            let data = fs::read(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            let (rgba, w, h) =
+                decode_orf_rgba8(&data).unwrap_or_else(|e| panic!("decode {path}: {e}"));
+            let name = Path::new(path)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            eprintln!("  {name}  {w}×{h}  {:.1} MP", (w as f64 * h as f64) / 1e6);
+            (name, rgba, w, h)
+        })
+        .collect();
 
     // Consecutive pairs.
     for i in 0..images.len().saturating_sub(1) {
@@ -55,7 +65,9 @@ fn main() {
         let (ref test_name, ref test_rgba, tw, th) = images[i + 1];
 
         if rw != tw || rh != th {
-            eprintln!("[skip] {ref_name} vs {test_name}: dimension mismatch {rw}×{rh} vs {tw}×{th}");
+            eprintln!(
+                "[skip] {ref_name} vs {test_name}: dimension mismatch {rw}×{rh} vs {tw}×{th}"
+            );
             continue;
         }
         let w = rw as usize;

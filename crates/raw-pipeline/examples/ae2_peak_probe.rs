@@ -22,12 +22,16 @@ fn bump(n: usize) {
 unsafe impl GlobalAlloc for PeakAlloc {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
-        if !p.is_null() { bump(l.size()); }
+        if !p.is_null() {
+            bump(l.size());
+        }
         p
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         let p = System.alloc_zeroed(l);
-        if !p.is_null() { bump(l.size()); }
+        if !p.is_null() {
+            bump(l.size());
+        }
         p
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -53,7 +57,10 @@ static A: PeakAlloc = PeakAlloc;
 fn rand_rgb16(w: u32, h: u32) -> Vec<u16> {
     let n = (w * h) as usize * 3;
     let mut v = vec![0u16; n];
-    let mut s: u32 = 0x85eb_ca6bu32.wrapping_mul(w).wrapping_add(h).wrapping_add(3);
+    let mut s: u32 = 0x85eb_ca6bu32
+        .wrapping_mul(w)
+        .wrapping_add(h)
+        .wrapping_add(3);
     for x in v.iter_mut() {
         s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         *x = (s >> 16) as u16;
@@ -82,7 +89,14 @@ fn main() {
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
     let va = encode_variants_from_rgb16_with_progressive(
-        &rgb16, &params, w, h, SourceType::Raw, false, 0, 0,
+        &rgb16,
+        &params,
+        w,
+        h,
+        SourceType::Raw,
+        false,
+        0,
+        0,
     )
     .unwrap();
     let peak_a = PEAK.load(Ordering::Relaxed) - base;
@@ -92,15 +106,12 @@ fn main() {
     let rgb16 = rand_rgb16(w, h);
     let base = LIVE.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
-    let vb = encode_variants_from_rgb16_owned(
-        rgb16, &params, w, h, SourceType::Raw, false, 0, 0,
-    )
-    .unwrap();
+    let vb = encode_variants_from_rgb16_owned(rgb16, &params, w, h, SourceType::Raw, false, 0, 0)
+        .unwrap();
     let peak_b = PEAK.load(Ordering::Relaxed) - base;
 
-    let equal = va.thumb_300 == vb.thumb_300
-        && va.preview_1080 == vb.preview_1080
-        && va.full == vb.full;
+    let equal =
+        va.thumb_300 == vb.thumb_300 && va.preview_1080 == vb.preview_1080 && va.full == vb.full;
     println!(
         "{}x{} texture/clarity on: borrowed peak-above-entry {:.1} MB, owned {:.1} MB, delta {:.1} MB, outputs {}",
         w, h,
@@ -109,5 +120,8 @@ fn main() {
         mb(peak_a.saturating_sub(peak_b)),
         if equal { "IDENTICAL" } else { "DIFFER (FAIL)" },
     );
-    assert!(equal, "owned entry must be byte-identical to borrowed entry");
+    assert!(
+        equal,
+        "owned entry must be byte-identical to borrowed entry"
+    );
 }

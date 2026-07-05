@@ -8,8 +8,8 @@
 #![cfg(target_arch = "x86_64")]
 // SpeedCodeReview ✓ 2026-06-19 · opus-4.8[1m] · sweeps=2 · Arch 2/0/1 Alg 2/0/0 Code 6/5/1 (x/y/z=found/green/red, +3 deferred)
 
+use super::scalar::{downsample_row_tail, scale_err_tail, xyb_tail};
 use core::arch::x86_64::*;
-use super::scalar::{scale_err_tail, xyb_tail, downsample_row_tail};
 
 /// Drain a 16-lane i32 partial ([R,G,B,A]×4 pixels) into a per-channel u64[3]:
 /// lanes {0,4,8,12}→R, {1,5,9,13}→G, {2,6,10,14}→B (lane%4==3 = alpha, dropped).
@@ -30,10 +30,16 @@ unsafe fn drain16_rgb(v: __m512i, acc: &mut [u64; 3]) {
 #[target_feature(enable = "avx512f")]
 pub unsafe fn scale_err_avx512(
     mask: &[f32],
-    rx: &[f32], ry: &[f32], rb: &[f32],
-    tx: &[f32], ty: &[f32], tb: &[f32],
+    rx: &[f32],
+    ry: &[f32],
+    rb: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+    tb: &[f32],
     n: usize,
-    kx: f32, ky: f32, kb: f32,
+    kx: f32,
+    ky: f32,
+    kb: f32,
     rsqrt_path: bool,
 ) -> f32 {
     // All seven slices are read via _mm512_loadu_ps up to index `lanes < n` and
@@ -44,8 +50,13 @@ pub unsafe fn scale_err_avx512(
         return 0.0;
     }
     assert!(
-        mask.len() >= n && rx.len() >= n && ry.len() >= n && rb.len() >= n
-            && tx.len() >= n && ty.len() >= n && tb.len() >= n,
+        mask.len() >= n
+            && rx.len() >= n
+            && ry.len() >= n
+            && rb.len() >= n
+            && tx.len() >= n
+            && ty.len() >= n
+            && tb.len() >= n,
         "scale_err_avx512: a slice is shorter than n"
     );
     let vkx = _mm512_set1_ps(kx);
@@ -76,16 +87,37 @@ pub unsafe fn scale_err_avx512(
         } else {
             _mm512_div_ps(vone, mm)
         };
-        let ex = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(rx.as_ptr().add(i)), _mm512_loadu_ps(tx.as_ptr().add(i))), inv);
-        let ey = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(ry.as_ptr().add(i)), _mm512_loadu_ps(ty.as_ptr().add(i))), inv);
-        let eb = _mm512_mul_ps(_mm512_sub_ps(_mm512_loadu_ps(rb.as_ptr().add(i)), _mm512_loadu_ps(tb.as_ptr().add(i))), inv);
+        let ex = _mm512_mul_ps(
+            _mm512_sub_ps(
+                _mm512_loadu_ps(rx.as_ptr().add(i)),
+                _mm512_loadu_ps(tx.as_ptr().add(i)),
+            ),
+            inv,
+        );
+        let ey = _mm512_mul_ps(
+            _mm512_sub_ps(
+                _mm512_loadu_ps(ry.as_ptr().add(i)),
+                _mm512_loadu_ps(ty.as_ptr().add(i)),
+            ),
+            inv,
+        );
+        let eb = _mm512_mul_ps(
+            _mm512_sub_ps(
+                _mm512_loadu_ps(rb.as_ptr().add(i)),
+                _mm512_loadu_ps(tb.as_ptr().add(i)),
+            ),
+            inv,
+        );
         let mut e2 = _mm512_mul_ps(vkx, _mm512_mul_ps(ex, ex));
         e2 = _mm512_fmadd_ps(vky, _mm512_mul_ps(ey, ey), e2);
         e2 = _mm512_fmadd_ps(vkb, _mm512_mul_ps(eb, eb), e2);
         let root = if rsqrt_path {
             let z = _mm512_add_ps(e2, veps);
             let y0 = _mm512_rsqrt14_ps(z);
-            let y1 = _mm512_mul_ps(y0, _mm512_fnmadd_ps(_mm512_mul_ps(half, z), _mm512_mul_ps(y0, y0), threehalf));
+            let y1 = _mm512_mul_ps(
+                y0,
+                _mm512_fnmadd_ps(_mm512_mul_ps(half, z), _mm512_mul_ps(y0, y0), threehalf),
+            );
             _mm512_mul_ps(z, y1)
         } else {
             _mm512_sqrt_ps(_mm512_add_ps(e2, veps))
@@ -109,7 +141,14 @@ pub unsafe fn scale_err_avx512(
 /// AVX-512 RGBA(u8) → planar X/Y/B via 16-wide `vgatherdps` over the sqrt-linear
 /// LUT. This is the fast-gather path that motivates AVX-512 here.
 #[target_feature(enable = "avx512f")]
-pub unsafe fn pixels_to_xyb_avx512(px: &[u8], n: usize, lut: &[f32; 256], x: &mut [f32], y: &mut [f32], b: &mut [f32]) {
+pub unsafe fn pixels_to_xyb_avx512(
+    px: &[u8],
+    n: usize,
+    lut: &[f32; 256],
+    x: &mut [f32],
+    y: &mut [f32],
+    b: &mut [f32],
+) {
     // px is read at indices up to (n-1)*4 + 2 (RGBA stride); x/y/b are written up
     // to n-1. Use assert! (not debug_assert!) to match avx2.rs:210-213 — release
     // builds must be guarded so OOB via get_unchecked is a defined panic, not UB.
@@ -134,8 +173,14 @@ pub unsafe fn pixels_to_xyb_avx512(px: &[u8], n: usize, lut: &[f32; 256], x: &mu
         let r = _mm512_i32gather_ps::<4>(_mm512_loadu_si512(ri.as_ptr() as *const __m512i), lp);
         let g = _mm512_i32gather_ps::<4>(_mm512_loadu_si512(gi.as_ptr() as *const __m512i), lp);
         let bb = _mm512_i32gather_ps::<4>(_mm512_loadu_si512(bi.as_ptr() as *const __m512i), lp);
-        _mm512_storeu_ps(x.as_mut_ptr().add(i), _mm512_mul_ps(_mm512_sub_ps(r, bb), half));
-        _mm512_storeu_ps(y.as_mut_ptr().add(i), _mm512_fmadd_ps(_mm512_add_ps(r, bb), half, g));
+        _mm512_storeu_ps(
+            x.as_mut_ptr().add(i),
+            _mm512_mul_ps(_mm512_sub_ps(r, bb), half),
+        );
+        _mm512_storeu_ps(
+            y.as_mut_ptr().add(i),
+            _mm512_fmadd_ps(_mm512_add_ps(r, bb), half, g),
+        );
         _mm512_storeu_ps(b.as_mut_ptr().add(i), bb);
         i += 16;
     }
@@ -146,7 +191,14 @@ pub unsafe fn pixels_to_xyb_avx512(px: &[u8], n: usize, lut: &[f32; 256], x: &mu
 /// AVX-512 2× box downsample (16 output px/iter interior, scalar edge). Uses
 /// `permutex2var_ps` to split 32 contiguous src floats into even (sx0) / odd (sx1).
 #[target_feature(enable = "avx512f")]
-pub unsafe fn downsample_avx512(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usize, dh: usize) {
+pub unsafe fn downsample_avx512(
+    src: &[f32],
+    dst: &mut [f32],
+    w: usize,
+    h: usize,
+    dw: usize,
+    dh: usize,
+) {
     // Mirror avx2.rs:261-264: both source and destination dimensions must be in-bounds
     // before any _mm512_loadu_ps/_mm512_storeu_ps call, or reads/writes are silent UB.
     assert!(
@@ -173,7 +225,10 @@ pub unsafe fn downsample_avx512(src: &[f32], dst: &mut [f32], w: usize, h: usize
             let odd_r0 = _mm512_permutex2var_ps(a0, odd_idx, b0);
             let even_r1 = _mm512_permutex2var_ps(a1, even_idx, b1);
             let odd_r1 = _mm512_permutex2var_ps(a1, odd_idx, b1);
-            let sum = _mm512_add_ps(_mm512_add_ps(even_r0, odd_r0), _mm512_add_ps(even_r1, odd_r1));
+            let sum = _mm512_add_ps(
+                _mm512_add_ps(even_r0, odd_r0),
+                _mm512_add_ps(even_r1, odd_r1),
+            );
             _mm512_storeu_ps(dst.as_mut_ptr().add(drow + xx), _mm512_mul_ps(sum, quarter));
             xx += 16;
         }
@@ -253,7 +308,7 @@ pub unsafe fn ssim_moments_avx512(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::perceptual::butteraugli::{scale_err, dn2, Kweights};
+    use crate::perceptual::butteraugli::{dn2, scale_err, Kweights};
     use crate::perceptual::xyb::{pixels_to_xyb, sqrt_lin_lut_ptr};
 
     fn avx512() -> bool {
@@ -262,36 +317,58 @@ mod tests {
 
     #[test]
     fn scale_err_avx512_matches_scalar() {
-        if !avx512() { eprintln!("avx512 unavailable — skipping"); return; }
+        if !avx512() {
+            eprintln!("avx512 unavailable — skipping");
+            return;
+        }
         let n = 1000usize;
-        let mut rx = vec![0f32; n]; let mut ry = vec![0f32; n]; let mut rb = vec![0f32; n];
-        let mut tx = vec![0f32; n]; let mut ty = vec![0f32; n]; let mut tb = vec![0f32; n];
+        let mut rx = vec![0f32; n];
+        let mut ry = vec![0f32; n];
+        let mut rb = vec![0f32; n];
+        let mut tx = vec![0f32; n];
+        let mut ty = vec![0f32; n];
+        let mut tb = vec![0f32; n];
         let mut mask = vec![0f32; n];
         for i in 0..n {
             let f = i as f32;
-            rx[i] = (f * 0.013).sin() * 0.4; tx[i] = rx[i] + (f * 0.07).cos() * 0.05;
-            ry[i] = (f * 0.021).cos() * 0.5 + 0.5; ty[i] = ry[i] + (f * 0.03).sin() * 0.05;
-            rb[i] = (f * 0.017).sin() * 0.3 + 0.3; tb[i] = rb[i] + (f * 0.05).cos() * 0.04;
+            rx[i] = (f * 0.013).sin() * 0.4;
+            tx[i] = rx[i] + (f * 0.07).cos() * 0.05;
+            ry[i] = (f * 0.021).cos() * 0.5 + 0.5;
+            ty[i] = ry[i] + (f * 0.03).sin() * 0.05;
+            rb[i] = (f * 0.017).sin() * 0.3 + 0.3;
+            tb[i] = rb[i] + (f * 0.05).cos() * 0.04;
             mask[i] = ((f * 0.009).sin() * 0.5 + 0.5).abs() * 0.6;
         }
         let k = Kweights::default();
         let want = scale_err(&mask, &rx, &ry, &rb, &tx, &ty, &tb, n, &k);
         let rel = |a: f32, b: f32| (a - b).abs() / a.abs().max(b.abs()).max(1e-12);
         for rsqrt in [false, true] {
-            let got = unsafe { scale_err_avx512(&mask, &rx, &ry, &rb, &tx, &ty, &tb, n, k.kx, k.ky, k.kb, rsqrt) };
-            assert!(rel(want, got) < 1e-4, "rsqrt={rsqrt} rel={} want={want} got={got}", rel(want, got));
+            let got = unsafe {
+                scale_err_avx512(
+                    &mask, &rx, &ry, &rb, &tx, &ty, &tb, n, k.kx, k.ky, k.kb, rsqrt,
+                )
+            };
+            assert!(
+                rel(want, got) < 1e-4,
+                "rsqrt={rsqrt} rel={} want={want} got={got}",
+                rel(want, got)
+            );
         }
     }
 
     #[test]
     fn xyb_avx512_matches_scalar() {
-        if !avx512() { return; }
+        if !avx512() {
+            return;
+        }
         let n = 1000usize;
         let px: Vec<u8> = (0..n * 4).map(|i| (i * 37 % 256) as u8).collect();
         let (mut sx, mut sy, mut sb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
         pixels_to_xyb(&px, n, &mut sx, &mut sy, &mut sb);
         let (mut ax, mut ay, mut ab) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
-        unsafe { pixels_to_xyb_avx512(&px, n, sqrt_lin_lut_ptr(), &mut ax, &mut ay, &mut ab); }
+        unsafe {
+            pixels_to_xyb_avx512(&px, n, sqrt_lin_lut_ptr(), &mut ax, &mut ay, &mut ab);
+        }
         for i in 0..n {
             assert!((sx[i] - ax[i]).abs() < 1e-6);
             assert!((sy[i] - ay[i]).abs() < 1e-6);
@@ -301,7 +378,9 @@ mod tests {
 
     #[test]
     fn ssim_moments_avx512_matches_scalar() {
-        if !avx512() { return; }
+        if !avx512() {
+            return;
+        }
         let np = 1000usize; // non-multiple of 4 to exercise the scalar tail (1000%4==0 → bump)
         let np = np + 3;
         let a: Vec<u8> = (0..np * 4).map(|i| (i * 13 % 255) as u8).collect();
@@ -312,7 +391,9 @@ mod tests {
         for _ in 0..np {
             for c in 0..3 {
                 let (x, y) = (a[j + c] as u64, b[j + c] as u64);
-                sa[c] += x; saa[c] += x * x; sab[c] += x * y;
+                sa[c] += x;
+                saa[c] += x * x;
+                sab[c] += x * y;
             }
             j += 4;
         }
@@ -322,12 +403,16 @@ mod tests {
 
     #[test]
     fn downsample_avx512_matches_dn2() {
-        if !avx512() { return; }
+        if !avx512() {
+            return;
+        }
         for (w, h) in [(64usize, 48usize), (65, 49), (2, 2), (33, 17)] {
             let src: Vec<f32> = (0..w * h).map(|i| (i as f32 * 0.013).sin()).collect();
             let (want, dw, dh) = dn2(&src, w, h);
             let mut got = vec![0f32; dw * dh];
-            unsafe { downsample_avx512(&src, &mut got, w, h, dw, dh); }
+            unsafe {
+                downsample_avx512(&src, &mut got, w, h, dw, dh);
+            }
             for i in 0..dw * dh {
                 assert!((want[i] - got[i]).abs() < 1e-5);
             }

@@ -28,7 +28,11 @@ fn psnr_pass(reference: &[u8], test: &[u8]) -> f32 {
         }
     }
     let mse = mse_acc as f64 / n3;
-    if mse == 0.0 { f32::INFINITY } else { (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32 }
+    if mse == 0.0 {
+        f32::INFINITY
+    } else {
+        (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+    }
 }
 
 fn means_pass(test: &[u8]) -> [f32; 3] {
@@ -39,7 +43,11 @@ fn means_pass(test: &[u8]) -> [f32; 3] {
         sums[1] += test[i * 4 + 1] as u64;
         sums[2] += test[i * 4 + 2] as u64;
     }
-    [sums[0] as f32 / n as f32, sums[1] as f32 / n as f32, sums[2] as f32 / n as f32]
+    [
+        sums[0] as f32 / n as f32,
+        sums[1] as f32 / n as f32,
+        sums[2] as f32 / n as f32,
+    ]
 }
 
 fn psnr_means_fused(reference: &[u8], test: &[u8]) -> (f32, [f32; 3]) {
@@ -56,7 +64,11 @@ fn psnr_means_fused(reference: &[u8], test: &[u8]) -> (f32, [f32; 3]) {
         }
     }
     let mse = mse_acc as f64 / (n * 3) as f64;
-    let psnr = if mse == 0.0 { f32::INFINITY } else { (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32 };
+    let psnr = if mse == 0.0 {
+        f32::INFINITY
+    } else {
+        (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+    };
     let means: [f32; 3] = std::array::from_fn(|c| ch_sums[c] as f32 / n as f32);
     (psnr, means)
 }
@@ -71,20 +83,39 @@ fn main() -> io::Result<()> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--variant" => { variant = Box::leak(args[i + 1].clone().into_boxed_str()); i += 2; }
-            "--in"  => { in_path  = Some(args[i + 1].clone()); i += 2; }
-            "--out" => { out_path = Some(args[i + 1].clone()); i += 2; }
-            "--reps" => { reps_arg = args[i + 1].parse().ok(); i += 2; }
-            _ => { i += 1; }
+            "--variant" => {
+                variant = Box::leak(args[i + 1].clone().into_boxed_str());
+                i += 2;
+            }
+            "--in" => {
+                in_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--reps" => {
+                reps_arg = args[i + 1].parse().ok();
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
-    let in_path  = in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
-    let out_path = out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
+    let in_path =
+        in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
+    let out_path =
+        out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
 
     let rgba = fs::read(&in_path)?;
     if rgba.len() % 4 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "input not 4-byte aligned"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "input not 4-byte aligned",
+        ));
     }
     let n = rgba.len() / 4;
     // Synthesise test image: each byte +15 (wrapping), simulates codec artifact noise.
@@ -108,15 +139,20 @@ fn main() -> io::Result<()> {
         for _ in 0..reps {
             match variant {
                 "twopasses" => {
-                    psnr_out  = psnr_pass(&rgba, &test);
+                    psnr_out = psnr_pass(&rgba, &test);
                     means_out = means_pass(&test);
                 }
                 "onepass" => {
                     let (p, m) = psnr_means_fused(&rgba, &test);
-                    psnr_out  = p;
+                    psnr_out = p;
                     means_out = m;
                 }
-                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "variant must be twopasses or onepass")),
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "variant must be twopasses or onepass",
+                    ))
+                }
             }
         }
         let elapsed_ms = t0.elapsed().as_millis();

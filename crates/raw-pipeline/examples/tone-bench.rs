@@ -31,12 +31,17 @@ fn main() -> io::Result<()> {
         }
     }
 
-    let in_path = in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
-    let out_path = out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
+    let in_path =
+        in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
+    let out_path =
+        out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
 
     let rgba = fs::read(in_path)?;
     if rgba.len() % 4 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "RGBA not 4-byte aligned"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "RGBA not 4-byte aligned",
+        ));
     }
 
     let n = rgba.len() / 4;
@@ -54,16 +59,25 @@ fn main() -> io::Result<()> {
     match variant {
         "scalar" => {
             for i in 0..n {
-                let (r2, g2, b2) = raw_pipeline::pipeline::apply_tone_math(r[i], g[i], b[i], &m, sat, vib, vib_zero, false);
+                let (r2, g2, b2) = raw_pipeline::pipeline::apply_tone_math(
+                    r[i], g[i], b[i], &m, sat, vib, vib_zero, false,
+                );
                 r[i] = r2;
                 g[i] = g2;
                 b[i] = b2;
             }
         }
         "simd" => {
-            raw_pipeline::tone_simd::apply_tone_bulk(&mut r, &mut g, &mut b, &m, sat, vib, vib_zero);
+            raw_pipeline::tone_simd::apply_tone_bulk(
+                &mut r, &mut g, &mut b, &m, sat, vib, vib_zero,
+            );
         }
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "variant must be scalar or simd")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "variant must be scalar or simd",
+            ))
+        }
     }
 
     let mut out = Vec::with_capacity(rgba.len());

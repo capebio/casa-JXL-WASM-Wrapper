@@ -49,7 +49,11 @@ pub fn detect_native(prefer_rsqrt: bool) -> Backend {
             return Backend::Avx512Strict;
         }
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
-            return if prefer_rsqrt { Backend::Avx2Rsqrt } else { Backend::Avx2Strict };
+            return if prefer_rsqrt {
+                Backend::Avx2Rsqrt
+            } else {
+                Backend::Avx2Strict
+            };
         }
     }
     let _ = prefer_rsqrt;
@@ -74,6 +78,14 @@ mod tests {
     #[test]
     fn detect_returns_something() {
         let b = detect_native(false);
-        assert!(matches!(b, Backend::Scalar | Backend::Avx2Strict | Backend::Avx2Rsqrt | Backend::Avx512Strict | Backend::Avx512Rsqrt | Backend::WasmSimd));
+        assert!(matches!(
+            b,
+            Backend::Scalar
+                | Backend::Avx2Strict
+                | Backend::Avx2Rsqrt
+                | Backend::Avx512Strict
+                | Backend::Avx512Rsqrt
+                | Backend::WasmSimd
+        ));
     }
 }

@@ -22,7 +22,11 @@ fn build_lut() -> [f32; 256] {
     let mut t = [0f32; 256];
     for (i, slot) in t.iter_mut().enumerate() {
         let v = i as f64 / 255.0;
-        let lin = if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
+        let lin = if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        };
         *slot = lin.sqrt() as f32;
     }
     t
@@ -60,8 +64,7 @@ fn main() {
             pixels_to_xyb_avx2_scalar_lut(&px, n, &lut, &mut bx, &mut by, &mut bb);
         }
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
-        let parity =
-            bits(&ax) == bits(&bx) && bits(&ay) == bits(&by) && bits(&ab) == bits(&bb);
+        let parity = bits(&ax) == bits(&bx) && bits(&ay) == bits(&by) && bits(&ab) == bits(&bb);
 
         let rounds = 11usize;
         let mut times: [Vec<f64>; 2] = [Vec::new(), Vec::new()];
@@ -78,7 +81,11 @@ fn main() {
                     }
                 }
                 let dt = t.elapsed().as_secs_f64() * 1e3;
-                sink = sink.wrapping_add(if which == 0 { ax[n / 2].to_bits() } else { bx[n / 2].to_bits() });
+                sink = sink.wrapping_add(if which == 0 {
+                    ax[n / 2].to_bits()
+                } else {
+                    bx[n / 2].to_bits()
+                });
                 times[which].push(dt);
             }
         }
@@ -93,7 +100,11 @@ fn main() {
             "    B scalar-LUT:  {mb:.3} ms median   %saved {:+.1}%   {:.2}×   gate(≥5%): {}",
             (ma - mb) / ma * 100.0,
             ma / mb,
-            if (ma - mb) / ma * 100.0 >= 5.0 { "PASS" } else { "FAIL" }
+            if (ma - mb) / ma * 100.0 >= 5.0 {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
         println!("    (sink={sink})");
     }

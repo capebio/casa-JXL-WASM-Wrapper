@@ -9,16 +9,22 @@
 fn run() {
     use raw_pipeline::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
 
-    let path = std::env::args().nth(1).expect("usage: runner <file.jxl> [iters]");
-    let iters: usize = std::env::args().nth(2)
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: runner <file.jxl> [iters]");
+    let iters: usize = std::env::args()
+        .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
     let jxl = std::fs::read(&path).expect("read jxl");
     println!("Loaded {} ({} bytes)", path, jxl.len());
 
-    let mut dec = Decoder::new(DecodeOptions { parallel: false, ..Default::default() })
-        .expect("JxlDecoderCreate");
+    let mut dec = Decoder::new(DecodeOptions {
+        parallel: false,
+        ..Default::default()
+    })
+    .expect("JxlDecoderCreate");
 
     // warmup
     for _ in 0..3 {

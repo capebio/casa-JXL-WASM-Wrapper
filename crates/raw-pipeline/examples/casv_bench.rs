@@ -46,7 +46,9 @@ fn main() {
     println!(
         "CasaVideo encoder comparison: {n} frames @ {w}x{h} ({mp:.2} MP), parallel encode / sequential decode, lossless e3"
     );
-    println!("(decode = sequential playback via decode_casv_all_rgb8; 24fps budget 41.7 ms/frame)\n");
+    println!(
+        "(decode = sequential playback via decode_casv_all_rgb8; 24fps budget 41.7 ms/frame)\n"
+    );
     println!(
         "{:<16} {:>9} {:>10} {:>10} {:>10} {:>9}  {}",
         "encoder", "size MB", "vs intra", "enc ms/f", "dec ms/f", "dec fps", "24fps?"
@@ -99,9 +101,30 @@ fn main() {
         "encoder", "size MB", "vs l-intra", "dec ms/f", "dec fps", "24fps?"
     );
     let dist = 1.0f32;
-    let li = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(dist)).expect("lossy intra");
-    let lr0 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, EncodeOptions::distance(dist), 0).expect("replace t0");
-    let lr6 = encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, gop, EncodeOptions::distance(dist), 6).expect("replace t6");
+    let li =
+        encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(dist)).expect("lossy intra");
+    let lr0 = encode_casv_delta_lossy_bbox_rgb8(
+        &refs,
+        w,
+        h,
+        24,
+        1,
+        gop,
+        EncodeOptions::distance(dist),
+        0,
+    )
+    .expect("replace t0");
+    let lr6 = encode_casv_delta_lossy_bbox_rgb8(
+        &refs,
+        w,
+        h,
+        24,
+        1,
+        gop,
+        EncodeOptions::distance(dist),
+        6,
+    )
+    .expect("replace t6");
     let li_sz = li.len() as f64;
     let showl = |label: String, casv: &[u8]| {
         let t = Instant::now();

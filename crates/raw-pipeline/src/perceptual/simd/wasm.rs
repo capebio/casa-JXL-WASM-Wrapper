@@ -4,8 +4,8 @@
 #![cfg(target_arch = "wasm32")]
 // SpeedCodeReview ✓ 2026-06-19 · opus-4.8[1m] · sweeps=2 · Arch 2/0/1 Alg 2/0/0 Code 6/5/1 (x/y/z=found/green/red, +3 deferred)
 
-use core::arch::wasm32::*;
 use super::scalar::{scale_err_tail, xyb_tail};
+use core::arch::wasm32::*;
 
 /// 4-wide horizontal sum.
 #[inline]
@@ -18,9 +18,17 @@ fn hsum(v: v128) -> f32 {
 
 /// wasm v128 scale error (p=3). Strict full sqrt; mirrors scalar `scale_err`.
 pub fn scale_err_wasm(
-    mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32],
-    tx: &[f32], ty: &[f32], tb: &[f32], n: usize,
-    kx: f32, ky: f32, kb: f32,
+    mask: &[f32],
+    rx: &[f32],
+    ry: &[f32],
+    rb: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+    tb: &[f32],
+    n: usize,
+    kx: f32,
+    ky: f32,
+    kb: f32,
 ) -> f32 {
     // Guard n==0 before the `sum / n` divide below: 0.0/0.0 is NaN, whereas the
     // scalar oracle (butteraugli.rs) and the avx2/avx512 kernels all early-return
@@ -33,8 +41,13 @@ pub fn scale_err_wasm(
     // avx2.rs:36-40 — WASM release builds ship as the primary production target and
     // must also be guarded so OOB reads are a defined panic, not silent UB.
     assert!(
-        mask.len() >= n && rx.len() >= n && ry.len() >= n && rb.len() >= n
-            && tx.len() >= n && ty.len() >= n && tb.len() >= n,
+        mask.len() >= n
+            && rx.len() >= n
+            && ry.len() >= n
+            && rb.len() >= n
+            && tx.len() >= n
+            && ty.len() >= n
+            && tb.len() >= n,
         "scale_err_wasm: a slice is shorter than n"
     );
     let vkx = f32x4_splat(kx);
@@ -59,11 +72,32 @@ pub fn scale_err_wasm(
             let m = v128_load(mask.as_ptr().add(i) as *const v128);
             let mm = f32x4_max(f32x4_add(f32x4_mul(m, v2), v015), v015);
             let inv = f32x4_div(one, mm);
-            let ex = f32x4_mul(f32x4_sub(v128_load(rx.as_ptr().add(i) as *const v128), v128_load(tx.as_ptr().add(i) as *const v128)), inv);
-            let ey = f32x4_mul(f32x4_sub(v128_load(ry.as_ptr().add(i) as *const v128), v128_load(ty.as_ptr().add(i) as *const v128)), inv);
-            let eb = f32x4_mul(f32x4_sub(v128_load(rb.as_ptr().add(i) as *const v128), v128_load(tb.as_ptr().add(i) as *const v128)), inv);
+            let ex = f32x4_mul(
+                f32x4_sub(
+                    v128_load(rx.as_ptr().add(i) as *const v128),
+                    v128_load(tx.as_ptr().add(i) as *const v128),
+                ),
+                inv,
+            );
+            let ey = f32x4_mul(
+                f32x4_sub(
+                    v128_load(ry.as_ptr().add(i) as *const v128),
+                    v128_load(ty.as_ptr().add(i) as *const v128),
+                ),
+                inv,
+            );
+            let eb = f32x4_mul(
+                f32x4_sub(
+                    v128_load(rb.as_ptr().add(i) as *const v128),
+                    v128_load(tb.as_ptr().add(i) as *const v128),
+                ),
+                inv,
+            );
             let e2 = f32x4_add(
-                f32x4_add(f32x4_mul(vkx, f32x4_mul(ex, ex)), f32x4_mul(vky, f32x4_mul(ey, ey))),
+                f32x4_add(
+                    f32x4_mul(vkx, f32x4_mul(ex, ex)),
+                    f32x4_mul(vky, f32x4_mul(ey, ey)),
+                ),
                 f32x4_mul(vkb, f32x4_mul(eb, eb)),
             );
             let root = f32x4_sqrt(f32x4_add(e2, veps));
@@ -213,7 +247,14 @@ pub fn ssim_moments_wasm(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], 
 }
 
 /// wasm v128 RGBA→planar XYB. Scalar LUT loads (no wasm gather) + vector arithmetic.
-pub fn pixels_to_xyb_wasm(px: &[u8], n: usize, lut: &[f32; 256], x: &mut [f32], y: &mut [f32], b: &mut [f32]) {
+pub fn pixels_to_xyb_wasm(
+    px: &[u8],
+    n: usize,
+    lut: &[f32; 256],
+    x: &mut [f32],
+    y: &mut [f32],
+    b: &mut [f32],
+) {
     // Reads px via get_unchecked up to (n-1)*4+2 and v128_store/index x/y/b up to
     // n-1. Use assert! (not debug_assert!) to match avx2.rs:210-213 — WASM release
     // builds are the primary production target and must be guarded so OOB reads via
@@ -239,8 +280,14 @@ pub fn pixels_to_xyb_wasm(px: &[u8], n: usize, lut: &[f32; 256], x: &mut [f32], 
             let rv = v128_load(r.as_ptr() as *const v128);
             let gv = v128_load(g.as_ptr() as *const v128);
             let bv = v128_load(bb.as_ptr() as *const v128);
-            v128_store(x.as_mut_ptr().add(i) as *mut v128, f32x4_mul(f32x4_sub(rv, bv), half));
-            v128_store(y.as_mut_ptr().add(i) as *mut v128, f32x4_add(f32x4_mul(f32x4_add(rv, bv), half), gv));
+            v128_store(
+                x.as_mut_ptr().add(i) as *mut v128,
+                f32x4_mul(f32x4_sub(rv, bv), half),
+            );
+            v128_store(
+                y.as_mut_ptr().add(i) as *mut v128,
+                f32x4_add(f32x4_mul(f32x4_add(rv, bv), half), gv),
+            );
             v128_store(b.as_mut_ptr().add(i) as *mut v128, bv);
             i += 4;
         }
@@ -280,11 +327,17 @@ pub fn downsample_wasm(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usi
                 let o0 = r0 + (x << 1);
                 let a0 = v128_load(src.as_ptr().add(o0) as *const v128);
                 let b0 = v128_load(src.as_ptr().add(o0 + 4) as *const v128);
-                let s0 = f32x4_add(u32x4_shuffle::<0, 2, 4, 6>(a0, b0), u32x4_shuffle::<1, 3, 5, 7>(a0, b0));
+                let s0 = f32x4_add(
+                    u32x4_shuffle::<0, 2, 4, 6>(a0, b0),
+                    u32x4_shuffle::<1, 3, 5, 7>(a0, b0),
+                );
                 let o1 = r1 + (x << 1);
                 let a1 = v128_load(src.as_ptr().add(o1) as *const v128);
                 let b1 = v128_load(src.as_ptr().add(o1 + 4) as *const v128);
-                let s1 = f32x4_add(u32x4_shuffle::<0, 2, 4, 6>(a1, b1), u32x4_shuffle::<1, 3, 5, 7>(a1, b1));
+                let s1 = f32x4_add(
+                    u32x4_shuffle::<0, 2, 4, 6>(a1, b1),
+                    u32x4_shuffle::<1, 3, 5, 7>(a1, b1),
+                );
                 let res = f32x4_mul(f32x4_add(s0, s1), quarter);
                 v128_store(dst.as_mut_ptr().add(y * dw + x) as *mut v128, res);
                 x += 4;
@@ -294,7 +347,8 @@ pub fn downsample_wasm(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usi
         while x < dw {
             let sx0 = x << 1;
             let sx1 = if sx0 + 1 < w { sx0 + 1 } else { sx0 };
-            dst[y * dw + x] = (src[r0 + sx0] + src[r0 + sx1] + src[r1 + sx0] + src[r1 + sx1]) * 0.25;
+            dst[y * dw + x] =
+                (src[r0 + sx0] + src[r0 + sx1] + src[r1 + sx0] + src[r1 + sx1]) * 0.25;
             x += 1;
         }
     }

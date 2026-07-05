@@ -14,7 +14,10 @@ fn main() {
     let path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| r"C:\Tmp\jf-cvdec-golden\arch_bbox_g24.casv".to_string());
-    let iters: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(24);
+    let iters: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
     let data = std::fs::read(&path).unwrap();
     let hdr = parse_casv_header(&data).expect("header casv");
 
@@ -27,7 +30,10 @@ fn main() {
         }
     }
     assert!(!payloads.is_empty(), "no P-frames in {path}");
-    println!("{} P-frame residual payloads; {iters} interleaved iters", payloads.len());
+    println!(
+        "{} P-frame residual payloads; {iters} interleaved iters",
+        payloads.len()
+    );
 
     let mut dec = Decoder::new(DecodeOptions::default()).unwrap();
     let mut buf: Vec<u16> = Vec::new();
@@ -42,13 +48,18 @@ fn main() {
             if fresh {
                 for p in &payloads {
                     let (px, _, _) = decode_interleaved::<u16>(p, 3).unwrap();
-                    sink = sink.wrapping_add(px[0] as u64).wrapping_add(px[px.len() - 1] as u64);
+                    sink = sink
+                        .wrapping_add(px[0] as u64)
+                        .wrapping_add(px[px.len() - 1] as u64);
                 }
                 t_fresh.push(t.elapsed().as_secs_f64() * 1000.0);
             } else {
                 for p in &payloads {
-                    dec.decode_into_dims::<u16>(p, Channels::Rgb, &mut buf).unwrap();
-                    sink = sink.wrapping_add(buf[0] as u64).wrapping_add(buf[buf.len() - 1] as u64);
+                    dec.decode_into_dims::<u16>(p, Channels::Rgb, &mut buf)
+                        .unwrap();
+                    sink = sink
+                        .wrapping_add(buf[0] as u64)
+                        .wrapping_add(buf[buf.len() - 1] as u64);
                 }
                 t_reuse.push(t.elapsed().as_secs_f64() * 1000.0);
             }
@@ -58,7 +69,8 @@ fn main() {
     // Byte-equality proof once (not timed).
     for p in &payloads {
         let (px, _, _) = decode_interleaved::<u16>(p, 3).unwrap();
-        dec.decode_into_dims::<u16>(p, Channels::Rgb, &mut buf).unwrap();
+        dec.decode_into_dims::<u16>(p, Channels::Rgb, &mut buf)
+            .unwrap();
         assert_eq!(px, buf, "reuse decode must be byte-identical");
     }
     let med = |v: &mut Vec<f64>| {

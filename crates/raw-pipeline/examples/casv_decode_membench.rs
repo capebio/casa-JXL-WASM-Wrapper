@@ -71,7 +71,9 @@ fn main() {
         let (frames, checksum) = f();
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let pk = peak.load(Ordering::Relaxed) as f64 / 1e6;
-        println!("{label:<28} {frames} frames  {ms:>8.1} ms  peak RSS {pk:>8.1} MB  fnv {checksum:016x}");
+        println!(
+            "{label:<28} {frames} frames  {ms:>8.1} ms  peak RSS {pk:>8.1} MB  fnv {checksum:016x}"
+        );
     };
     let fnv = |acc: u64, bytes: &[u8]| {
         let mut hsh = acc;

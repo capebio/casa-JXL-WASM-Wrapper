@@ -13,7 +13,11 @@ use raw_pipeline::tone_simd::vib_zero_matrix;
 use std::time::Instant;
 
 // A representative camera→sRGB matrix (rows sum near 1, off-diagonals negative).
-const M: [[f32; 3]; 3] = [[1.70, -0.60, -0.10], [-0.20, 1.40, -0.20], [0.00, -0.35, 1.35]];
+const M: [[f32; 3]; 3] = [
+    [1.70, -0.60, -0.10],
+    [-0.20, 1.40, -0.20],
+    [0.00, -0.35, 1.35],
+];
 
 #[inline(always)]
 fn idx(v: f32) -> u16 {
@@ -42,7 +46,10 @@ fn main() {
     for &(r, g, b) in &buf {
         let (ar, ag, ab) = apply_tone_math(r, g, b, &M, sat, 0.0, true, false);
         let (br, bg, bb) = apply_tone_fused(r, g, b, &mf);
-        max_abs = max_abs.max((ar - br).abs()).max((ag - bg).abs()).max((ab - bb).abs());
+        max_abs = max_abs
+            .max((ar - br).abs())
+            .max((ag - bg).abs())
+            .max((ab - bb).abs());
         max_idx = max_idx
             .max((idx(ar) as i32 - idx(br) as i32).abs())
             .max((idx(ag) as i32 - idx(bg) as i32).abs())
@@ -97,7 +104,11 @@ fn main() {
     println!("tone_fuse_flipflop  n={n} sat={sat}  (sink={sink:.0})");
     println!(
         "  correctness: max_abs_diff={max_abs:.5}  max_u16_index_diff={max_idx}  -> {}",
-        if max_idx == 0 { "BYTE-EXACT through post-LUT" } else { "differs (inspect LUT shoulders)" }
+        if max_idx == 0 {
+            "BYTE-EXACT through post-LUT"
+        } else {
+            "differs (inspect LUT shoulders)"
+        }
     );
     println!("  A unfused (matrix+luma+sat): {ma:.2} ms median");
     println!("  B fused   (S·M matvec):      {mb:.2} ms median");

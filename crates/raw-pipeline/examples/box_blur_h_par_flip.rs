@@ -105,7 +105,11 @@ fn main() {
             "    B rayon:  {mb:.3} ms median   %saved {:+.1}%   {:.2}×   gate(≥5%): {}",
             (ma - mb) / ma * 100.0,
             ma / mb,
-            if (ma - mb) / ma * 100.0 >= 5.0 { "PASS" } else { "FAIL" }
+            if (ma - mb) / ma * 100.0 >= 5.0 {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
         println!("    (sink={sink})");
     }

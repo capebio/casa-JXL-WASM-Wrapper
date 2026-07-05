@@ -16,8 +16,12 @@ fn main() {
         eprintln!("usage: fable_flip <rgb-file> <w> <h> <frames> <gop> <reps> <dec|enc>");
         std::process::exit(1);
     }
-    let (path, w, h, count) = (&a[1], a[2].parse::<u32>().unwrap(),
-                               a[3].parse::<u32>().unwrap(), a[4].parse::<usize>().unwrap());
+    let (path, w, h, count) = (
+        &a[1],
+        a[2].parse::<u32>().unwrap(),
+        a[3].parse::<u32>().unwrap(),
+        a[4].parse::<usize>().unwrap(),
+    );
     let gop = a[5].parse::<u32>().unwrap();
     let reps = a[6].parse::<usize>().unwrap();
     let mode = a[7].as_str();
@@ -66,6 +70,10 @@ fn main() {
     }
     let mut s = times.clone();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!("STAT {mode} gop{gop} x{reps}: min {:.3} med {:.3} ms  ({:.3} ms/f min)",
-             s[0], s[s.len() / 2], s[0] / count as f64);
+    println!(
+        "STAT {mode} gop{gop} x{reps}: min {:.3} med {:.3} ms  ({:.3} ms/f min)",
+        s[0],
+        s[s.len() / 2],
+        s[0] / count as f64
+    );
 }

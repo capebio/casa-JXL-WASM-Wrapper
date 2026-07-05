@@ -39,10 +39,15 @@ pub struct ExifData {
 
 impl ExifData {
     pub fn from_orf_info(info: &OrfInfo, image_w: u32, image_h: u32) -> Self {
-        let nonempty = |s: &str| if s.is_empty() { None } else { Some(s.to_string()) };
-        let unsigned_ratio = |(num, den): (u32, u32)| {
-            (den != 0).then_some(ExifRatio::Unsigned { num, den })
+        let nonempty = |s: &str| {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
         };
+        let unsigned_ratio =
+            |(num, den): (u32, u32)| (den != 0).then_some(ExifRatio::Unsigned { num, den });
 
         let gps = if info.gps_lat.is_some() && info.gps_lon.is_some() {
             Some(GpsData {
@@ -55,26 +60,26 @@ impl ExifData {
         };
 
         ExifData {
-            make:           nonempty(&info.make),
-            model:          nonempty(&info.model),
-            lens:           nonempty(&info.lens),
-            datetime:       nonempty(&info.datetime),
-            exposure:       info.exposure.and_then(unsigned_ratio),
-            fnumber:        info.fnumber.and_then(unsigned_ratio),
-            iso:            info.iso,
-            focal_length:   info.focal_length.and_then(unsigned_ratio),
+            make: nonempty(&info.make),
+            model: nonempty(&info.model),
+            lens: nonempty(&info.lens),
+            datetime: nonempty(&info.datetime),
+            exposure: info.exposure.and_then(unsigned_ratio),
+            fnumber: info.fnumber.and_then(unsigned_ratio),
+            iso: info.iso,
+            focal_length: info.focal_length.and_then(unsigned_ratio),
             focal_length_35: info.focal_length_35.map(|v| v as u32),
             gps,
-            orientation:    info.orientation,
-            width:          Some(image_w),
-            height:         Some(image_h),
-            raw_width:      Some(info.width),
-            raw_height:     Some(info.height),
-            wb_r:           info.wb_r,
-            wb_b:           info.wb_b,
-            wb_mode:        info.wb_mode,
+            orientation: info.orientation,
+            width: Some(image_w),
+            height: Some(image_h),
+            raw_width: Some(info.width),
+            raw_height: Some(info.height),
+            wb_r: info.wb_r,
+            wb_b: info.wb_b,
+            wb_mode: info.wb_mode,
             wb_from_camera: info.wb_r.is_some() && info.wb_b.is_some(),
-            quality:        info.quality.map(|q| q as u8),
+            quality: info.quality.map(|q| q as u8),
         }
     }
 }

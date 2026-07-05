@@ -9,11 +9,50 @@
 // Detection is by presence of the Tauri global; everything else degrades
 // gracefully so the same page works when opened as a plain web page.
 
-import { createDecoder } from '@casabio/jxl-wasm';
+import { createDecoder, preloadJxlModule } from '@casabio/jxl-wasm';
+
+/**
+ * Start compiling/instantiating the JXL WASM module ahead of first use, so the
+ * first frame decode doesn't pay cold-start on the critical path. Fire-and-forget;
+ * safe to call repeatedly (the module load is memoized in the facade).
+ */
+export function prewarmJxl() {
+  try { preloadJxlModule(); } catch (_) { /* non-fatal: cold path still works */ }
+}
 
 export function isTauri() {
   return typeof window !== 'undefined' &&
     !!(window.__TAURI__ || window.__TAURI_INTERNALS__);
+}
+
+export function openDesktopCasvEncoder() {
+  if (typeof window === 'undefined') return false;
+  window.location.href = 'raw-converter-tauri://casv-encode';
+  return true;
+}
+
+// Remember the last folder used for incoming (pick a source to encode) and
+// outgoing (save the .casv) *separately*, so the two native dialogs stop
+// fighting over one shared "last directory". Persisted in localStorage, so it
+// survives app restarts. `which` is 'in' or 'out'.
+const DIR_KEYS = { in: 'casvLastIncomingDir', out: 'casvLastOutgoingDir' };
+
+export function rememberedDir(which) {
+  try {
+    return window.localStorage?.getItem(DIR_KEYS[which]) || undefined;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+/** Store the parent folder of `filePath` under the incoming/outgoing slot. */
+export function rememberDirFromPath(which, filePath) {
+  if (!filePath) return;
+  const p = String(filePath);
+  const dir = p.replace(/[\\/][^\\/]*$/, '');
+  if (dir && dir !== p) {
+    try { window.localStorage?.setItem(DIR_KEYS[which], dir); } catch (_) { /* ignore */ }
+  }
 }
 
 function tauriInvoke(cmd, args) {
@@ -83,25 +122,74 @@ export async function pickImagesToEncode() {
   if (isTauri()) {
     // Prefer the Tauri dialog plugin if present; else a dedicated command.
     const dialog = window.__TAURI__?.dialog;
+    const defaultPath = rememberedDir('in');
     let paths = null;
     if (dialog?.open) {
       paths = await dialog.open({
         multiple: true,
+        defaultPath,
         filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'ppm', 'jxl'] }],
       });
     } else {
-      paths = await tauriInvoke('casv_pick_images', {});
+      paths = await tauriInvoke('casv_pick_images', { defaultDir: defaultPath });
     }
     const arr = Array.isArray(paths) ? paths : paths ? [paths] : [];
+    rememberDirFromPath('in', arr[0]);
     return { native: true, paths: arr };
   }
   return { native: false, paths: [] };
 }
 
+/** Pick one video file to encode into a .casv. Tauri only. */
+export async function pickVideoToEncode() {
+  if (isTauri()) {
+    const dialog = window.__TAURI__?.dialog;
+    const defaultPath = rememberedDir('in');
+    let path = null;
+    if (dialog?.open) {
+      path = await dialog.open({
+        multiple: false,
+        defaultPath,
+        filters: [{ name: 'Video', extensions: ['mp4', 'webm', 'mov', 'mkv'] }],
+      });
+    } else {
+      const paths = await tauriInvoke('casv_pick_videos', { defaultDir: defaultPath });
+      path = Array.isArray(paths) ? paths[0] : paths;
+    }
+    rememberDirFromPath('in', path);
+    return { native: true, paths: path ? [path] : [] };
+  }
+  return { native: false, paths: [] };
+}
+
 /**
- * Encode + save a .casv from picked images. Tauri only.
+ * Subscribe to native encode progress while the casv_encode sidecar runs.
+ * The desktop app relays each `CASVENC <stage> <done> <total>` line the sidecar
+ * prints (see TAURI_WIRING.md) as a `casv-encode-progress` event with payload
+ * `{ stage, done, total }`. Returns a Promise resolving to an unlisten function;
+ * in the browser (no Tauri) it resolves to a no-op so callers need no host check.
+ */
+export async function onEncodeProgress(cb) {
+  const listen = typeof window !== 'undefined' && window.__TAURI__?.event?.listen;
+  if (typeof listen !== 'function') return () => {};
+  try {
+    return await listen('casv-encode-progress', (event) => {
+      const p = event?.payload || {};
+      cb({
+        stage: String(p.stage || ''),
+        done: Number(p.done) || 0,
+        total: Number(p.total) || 0,
+      });
+    });
+  } catch (_) {
+    return () => {};
+  }
+}
+
+/**
+ * Encode + save a .casv from picked images or one video. Tauri only.
  * `request` is the object from buildEncodeRequest(). The native command
- * reads the input images, encodes via casa_video::encode_casv_video, and
+ * reads the source, invokes the CASAVA sidecar, and
  * (if request.outputPath is null) opens a save dialog. Returns { path }.
  */
 export async function encodeAndSave(request) {
@@ -113,7 +201,12 @@ export async function encodeAndSave(request) {
     e.code = 'ENCODE_NATIVE_ONLY';
     throw e;
   }
-  return tauriInvoke('encode_casv_video', { request });
+  // Start the save dialog in the last outgoing folder (kept separate from the
+  // incoming-source folder), and remember where the user actually saved.
+  const req = { ...request, defaultDir: rememberedDir('out') };
+  const path = await tauriInvoke('encode_casv_video', { request: req });
+  rememberDirFromPath('out', path);
+  return path;
 }
 
 /**
@@ -127,7 +220,9 @@ export async function exportCasv(bytes, suggestedName) {
     const path = await tauriInvoke('save_casv_bytes', {
       bytes: Array.from(bytes),
       suggestedName,
+      defaultDir: rememberedDir('out'),
     });
+    rememberDirFromPath('out', path);
     return { path: path || suggestedName, method: 'tauri' };
   }
   const blob = new Blob([bytes], { type: 'application/octet-stream' });

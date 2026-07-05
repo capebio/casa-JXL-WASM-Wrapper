@@ -14,9 +14,12 @@ fn pack_scalar(src: &[u16], w: usize, h: usize) -> Vec<u8> {
     for i in 0..(w * h) {
         let o = i * 6;
         let (r, g, b) = (src[i * 3], src[i * 3 + 1], src[i * 3 + 2]);
-        out[o] = (r & 0xff) as u8; out[o + 1] = (r >> 8) as u8;
-        out[o + 2] = (g & 0xff) as u8; out[o + 3] = (g >> 8) as u8;
-        out[o + 4] = (b & 0xff) as u8; out[o + 5] = (b >> 8) as u8;
+        out[o] = (r & 0xff) as u8;
+        out[o + 1] = (r >> 8) as u8;
+        out[o + 2] = (g & 0xff) as u8;
+        out[o + 3] = (g >> 8) as u8;
+        out[o + 4] = (b & 0xff) as u8;
+        out[o + 5] = (b >> 8) as u8;
     }
     out
 }
@@ -31,7 +34,10 @@ fn unpack_scalar(src: &[u8]) -> Vec<u16> {
     let n = src.len() / 2;
     let mut out = Vec::with_capacity(n);
     let mut i = 0;
-    while i < src.len() { out.push(u16::from_le_bytes([src[i], src[i + 1]])); i += 2; }
+    while i < src.len() {
+        out.push(u16::from_le_bytes([src[i], src[i + 1]]));
+        i += 2;
+    }
     out
 }
 fn unpack_memcpy(src: &[u8]) -> Vec<u16> {
@@ -59,28 +65,56 @@ fn flip<T, A: Fn() -> T, B: Fn() -> T>(label: &str, a: A, b: B, sink: impl Fn(&T
         t.elapsed().as_secs_f64() * 1e3
     };
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(time(&a, &mut s)); tb.push(time(&b, &mut s)); }
-        else { tb.push(time(&b, &mut s)); ta.push(time(&a, &mut s)); }
+        if r % 2 == 0 {
+            ta.push(time(&a, &mut s));
+            tb.push(time(&b, &mut s));
+        } else {
+            tb.push(time(&b, &mut s));
+            ta.push(time(&a, &mut s));
+        }
     }
     std::hint::black_box(s);
     let (ma, mb) = (med(&ta), med(&tb));
-    println!("  {label:<8} scalar={ma:7.3}ms  memcpy={mb:7.3}ms  saved={:5.1}%", (ma - mb) / ma * 100.0);
+    println!(
+        "  {label:<8} scalar={ma:7.3}ms  memcpy={mb:7.3}ms  saved={:5.1}%",
+        (ma - mb) / ma * 100.0
+    );
 }
 
 fn main() {
     let (w, h) = (6000usize, 4000usize); // 24 MP full-master
     let mut s: u32 = 0x9e37_79b9;
-    let src16: Vec<u16> = (0..w * h * 3).map(|_| {
-        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        ((s >> 8) & 0xffff) as u16
-    }).collect();
+    let src16: Vec<u16> = (0..w * h * 3)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 8) & 0xffff) as u16
+        })
+        .collect();
     let packed = pack_memcpy(&src16, w, h);
 
-    assert_eq!(pack_scalar(&src16, w, h), pack_memcpy(&src16, w, h), "PACK parity broken");
-    assert_eq!(unpack_scalar(&packed), unpack_memcpy(&packed), "UNPACK parity broken");
+    assert_eq!(
+        pack_scalar(&src16, w, h),
+        pack_memcpy(&src16, w, h),
+        "PACK parity broken"
+    );
+    assert_eq!(
+        unpack_scalar(&packed),
+        unpack_memcpy(&packed),
+        "UNPACK parity broken"
+    );
     assert_eq!(unpack_memcpy(&packed), src16, "round-trip broken");
 
     println!("rgb16 pack/unpack flip  {w}x{h} (24 MP)  parity: EXACT");
-    flip("PACK", || pack_scalar(&src16, w, h), || pack_memcpy(&src16, w, h), |o| o[o.len() / 2] as u64);
-    flip("UNPACK", || unpack_scalar(&packed), || unpack_memcpy(&packed), |o| o[o.len() / 2] as u64);
+    flip(
+        "PACK",
+        || pack_scalar(&src16, w, h),
+        || pack_memcpy(&src16, w, h),
+        |o| o[o.len() / 2] as u64,
+    );
+    flip(
+        "UNPACK",
+        || unpack_scalar(&packed),
+        || unpack_memcpy(&packed),
+        |o| o[o.len() / 2] as u64,
+    );
 }

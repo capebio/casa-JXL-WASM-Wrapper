@@ -450,6 +450,11 @@ interface LibjxlWasmModule {
   _jxl_wasm_dec_take_flushed?(state: number): number;
   _jxl_wasm_dec_take_final?(state: number): number;
   _jxl_wasm_dec_free?(state: number): void;
+  _jxl_wasm_dec_flush_attempts?(state: number): number;
+  _jxl_wasm_dec_flush_successes?(state: number): number;
+  _jxl_wasm_dec_flush_zero_skips?(state: number): number;
+  _jxl_wasm_dec_flush_duplicate_skips?(state: number): number;
+  _jxl_wasm_dec_flush_image_ms?(state: number): number;
   // Sidecar thumbnail encode (present after WASM rebuild with sidecar bridge)
   _jxl_wasm_encode_rgba8_with_sidecars?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, sidecarDimsPtr: number, numSidecars: number): number;
   _jxl_wasm_buffer_next?(handle: number): number;
@@ -551,6 +556,21 @@ function resolveProgressFrameBudget(options: DecoderOptions): number {
   if (maxFrames == null) return Number.POSITIVE_INFINITY;
   if (!Number.isFinite(maxFrames)) return Number.POSITIVE_INFINITY;
   return Math.max(0, Math.trunc(maxFrames) - 1);
+}
+
+function emitDecoderBridgeMetrics(module: LibjxlWasmModule, dec: number, options: DecoderOptions): void {
+  const onMetric = options.onMetric;
+  if (!onMetric || dec === 0) return;
+  const metrics: Array<[string, ((state: number) => number) | undefined]> = [
+    ["bridge_flush_attempts", module._jxl_wasm_dec_flush_attempts],
+    ["bridge_flush_successes", module._jxl_wasm_dec_flush_successes],
+    ["bridge_flush_zero_skips", module._jxl_wasm_dec_flush_zero_skips],
+    ["bridge_flush_duplicate_skips", module._jxl_wasm_dec_flush_duplicate_skips],
+    ["bridge_flush_image_ms", module._jxl_wasm_dec_flush_image_ms],
+  ];
+  for (const [name, fn] of metrics) {
+    if (typeof fn === "function") onMetric(name, fn(dec));
+  }
 }
 
 function resolveEncoderBridgeSettings(options: EncoderOptions) {
@@ -1926,6 +1946,7 @@ class LibjxlDecoder implements JxlDecoder {
       }
     } finally {
       if (chunkBufPtr !== 0) module._free(chunkBufPtr);
+      emitDecoderBridgeMetrics(module, dec, this.options);
       decFree(dec);
     }
   }

@@ -12,6 +12,7 @@ const baseDecodeStart: MsgDecodeStart = {
   downsample: 1,
   progressionTarget: "final",
   emitEveryPass: true,
+  suppressDuplicateProgress: false,
   preserveIcc: true,
   preserveMetadata: true,
   priority: "visible",
@@ -115,6 +116,49 @@ describe("browser codec handlers", () => {
       "decode_final",
     ]);
     expect(ended).toEqual(["decode-1"]);
+  });
+
+  test("decode handler forwards suppressDuplicateProgress to codec decoder", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    const seenOptions: Array<{ suppressDuplicateProgress?: boolean }> = [];
+    installWorkerPostMessage(messages);
+
+    const info = {
+      width: 1,
+      height: 1,
+      bitsPerSample: 8,
+      hasAlpha: true,
+      hasAnimation: false,
+      jpegReconstructionAvailable: false,
+    };
+    const codec = {
+      createDecoder(options: { suppressDuplicateProgress?: boolean }) {
+        seenOptions.push(options);
+        return {
+          push() {},
+          close() {},
+          cancel() {},
+          dispose() {},
+          async *events() {
+            yield { type: "header", info };
+            yield { type: "final", info, pixels: new Uint8Array([1, 2, 3, 4]).buffer, format: "rgba8", pixelStride: 4 };
+          },
+        };
+      },
+    };
+
+    const handler = new DecodeHandler(
+      { ...baseDecodeStart, sessionId: "dedup-pass-through", suppressDuplicateProgress: true },
+      codec as never,
+      { onSessionEnd: (sessionId) => ended.push(sessionId) },
+    );
+    handler.onChunk(new Uint8Array([0xff]).buffer);
+    handler.onClose();
+
+    await waitFor(() => ended.length === 1);
+
+    expect(seenOptions[0]?.suppressDuplicateProgress).toBe(true);
   });
 
   test("budget_exceeded before first progress emits terminal message, not silent death", async () => {

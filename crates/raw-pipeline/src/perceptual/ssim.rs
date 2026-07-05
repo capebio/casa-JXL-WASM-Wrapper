@@ -60,7 +60,12 @@ pub(crate) fn ssim_with_ref(
 /// cross term `sab=Σxy` over `np` pixels of stride `ch`. Split out of
 /// `ssim_with_ref` so `all()` can reuse `sa`/`saa` for `channel_moments` instead of
 /// re-streaming the test buffer (the SIMD backends already return these three sums).
-pub(crate) fn ssim_sums(a: &[u8], b: &[u8], np: usize, ch: usize) -> ([u64; 3], [u64; 3], [u64; 3]) {
+pub(crate) fn ssim_sums(
+    a: &[u8],
+    b: &[u8],
+    np: usize,
+    ch: usize,
+) -> ([u64; 3], [u64; 3], [u64; 3]) {
     let wch = ch.min(3);
     let mut sa = [0u64; 3];
     let mut saa = [0u64; 3];
@@ -83,7 +88,12 @@ pub(crate) fn ssim_sums(a: &[u8], b: &[u8], np: usize, ch: usize) -> ([u64; 3], 
 /// `saa=Σx²` that the SSIM path already accumulated. Bit-identical to
 /// `channel_moments` (same u64 sums, same f64 arithmetic) while saving a full
 /// strided pass over the test buffer. `nch` is the channel count moments cover.
-pub(crate) fn moments_from_sums(sa: &[u64; 3], saa: &[u64; 3], np: usize, nch: usize) -> ([f32; 3], [f32; 3], usize) {
+pub(crate) fn moments_from_sums(
+    sa: &[u64; 3],
+    saa: &[u64; 3],
+    np: usize,
+    nch: usize,
+) -> ([f32; 3], [f32; 3], usize) {
     let nch = nch.min(3);
     let mut mus = [0f32; 3];
     let mut vars = [0f32; 3];
@@ -134,7 +144,12 @@ pub(crate) fn finalize_ssim(
 }
 
 /// Per-channel mean/variance feature side-output (port of `computeChannelMoments`).
-pub(crate) fn channel_moments(px: &[u8], np: usize, ch: usize, max_ch: usize) -> ([f32; 3], [f32; 3], usize) {
+pub(crate) fn channel_moments(
+    px: &[u8],
+    np: usize,
+    ch: usize,
+    max_ch: usize,
+) -> ([f32; 3], [f32; 3], usize) {
     let nch = max_ch.min(ch).min(3);
     let mut mus = [0f32; 3];
     let mut vars = [0f32; 3];
@@ -173,19 +188,28 @@ mod tests {
 
     #[test]
     fn identical_rgba_is_one() {
-        let a = [10u8, 200, 30, 255, 90, 40, 160, 255, 5, 5, 5, 255, 250, 1, 128, 255];
+        let a = [
+            10u8, 200, 30, 255, 90, 40, 160, 255, 5, 5, 5, 255, 250, 1, 128, 255,
+        ];
         let np = 4;
         let (sb, sbb) = ref_moments(&a, np, 4);
         let s = ssim_with_ref(&a, &a, np, 4, &sb, &sbb);
-        assert!((s - 1.0).abs() < 1e-5, "identical SSIM should be ~1, got {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-5,
+            "identical SSIM should be ~1, got {s}"
+        );
     }
 
     #[test]
     fn matches_js_reference_value() {
         // Deterministic 2x2 RGBA; expected computed offline from the JS formula.
-        let a = [0u8, 0, 0, 255, 255, 255, 255, 255, 64, 128, 192, 255, 200, 100, 50, 255];
+        let a = [
+            0u8, 0, 0, 255, 255, 255, 255, 255, 64, 128, 192, 255, 200, 100, 50, 255,
+        ];
         let mut b = a;
-        b[0] = 20; b[5] = 200; b[8] = 70;
+        b[0] = 20;
+        b[5] = 200;
+        b[8] = 70;
         let np = 4;
         let (sb, sbb) = ref_moments(&b, np, 4);
         let s = ssim_with_ref(&a, &b, np, 4, &sb, &sbb);

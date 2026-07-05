@@ -32,11 +32,26 @@ const SEC = {
   'Cross-Origin-Resource-Policy': 'cross-origin',
 };
 const MIME = { '.html': 'text/html', '.mjs': 'application/javascript', '.js': 'application/javascript', '.wasm': 'application/wasm', '.json': 'application/json', '.css': 'text/css' };
+const IMPORTMAP_HTML = `<script type="importmap">
+{
+  "imports": {
+    "@casabio/jxl-core": "/packages/jxl-core/dist/index.js",
+    "@casabio/jxl-core/errors": "/packages/jxl-core/dist/errors.js",
+    "@casabio/jxl-core/protocol": "/packages/jxl-core/dist/protocol.js",
+    "@casabio/jxl-core/types": "/packages/jxl-core/dist/types.js",
+    "@casabio/jxl-wasm": "/packages/jxl-wasm/dist/index.js",
+    "@casabio/jxl-worker-browser": "/packages/jxl-worker-browser/dist/index.js",
+    "@casabio/jxl-session": "/packages/jxl-session/dist/index.js",
+    "@casabio/jxl-scheduler": "/packages/jxl-scheduler/dist/index.js",
+    "@casabio/jxl-capabilities": "/packages/jxl-capabilities/dist/index.js"
+  }
+}
+</script>`;
 function startServer() {
   return new Promise((res) => {
     const srv = http.createServer((req, rep) => {
       const u = new URL(req.url, 'http://localhost');
-      if (u.pathname === '/__dom__') { rep.writeHead(200, { ...SEC, 'Content-Type': 'text/html' }); rep.end('<!doctype html><meta charset=utf8><title>flipflopdom</title><body>'); return; }
+      if (u.pathname === '/__dom__') { rep.writeHead(200, { ...SEC, 'Content-Type': 'text/html' }); rep.end(`<!doctype html><meta charset=utf8><title>flipflopdom</title>${IMPORTMAP_HTML}<body>`); return; }
       const fp = path.join(ROOT, decodeURIComponent(u.pathname));
       if (!fp.startsWith(ROOT) || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()) { rep.writeHead(404, SEC); rep.end('not found'); return; }
       rep.writeHead(200, { ...SEC, 'Content-Type': MIME[path.extname(fp).toLowerCase()] || 'application/octet-stream' });
@@ -111,7 +126,11 @@ export async function runTestDom(testFile, opts) {
           const idx = variants.indexOf(v);
           let res;
           try { res = await page.evaluate(({ idx, reps, r }) => window.__ff.flip(idx, reps, r), { idx, reps, r }); }
-          catch (e) { flips.push({ input: desc.name, round: r, variant: v.name, ms: NaN, rss_mb: 'n/a', temp_c: 'n/a', freq_ratio: 'n/a', first_paint: r === 0 }); continue; }
+          catch (e) {
+            console.error(`[flipflopdom] flip failed input=${desc.name} round=${r} variant=${v.name}:`, e.stack || e.message || e);
+            flips.push({ input: desc.name, round: r, variant: v.name, ms: NaN, rss_mb: 'n/a', temp_c: 'n/a', freq_ratio: 'n/a', first_paint: r === 0 });
+            continue;
+          }
           const samp = nearestSample(sampler.samples, performance.now());
           flips.push({ input: desc.name, round: r, variant: v.name, ms: +res.ms.toFixed(3), rss_mb: res.heap_mb ?? 'n/a', temp_c: samp.temp, freq_ratio: samp.freq, first_paint: r === 0, marks: res.marks });
         }

@@ -10,7 +10,11 @@ pub struct Kweights {
 }
 impl Default for Kweights {
     fn default() -> Self {
-        Kweights { kx: 24.0, ky: 12.0, kb: 4.0 }
+        Kweights {
+            kx: 24.0,
+            ky: 12.0,
+            kb: 4.0,
+        }
     }
 }
 
@@ -18,8 +22,12 @@ impl Default for Kweights {
 /// the JS number semantics; the `(mask*2+0.15).max(0.15)` clamp is kept literal.
 pub(crate) fn scale_err(
     mask: &[f32],
-    rx: &[f32], ry: &[f32], rb: &[f32],
-    tx: &[f32], ty: &[f32], tb: &[f32],
+    rx: &[f32],
+    ry: &[f32],
+    rb: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+    tb: &[f32],
     n: usize,
     k: &Kweights,
 ) -> f32 {
@@ -85,11 +93,9 @@ pub(crate) fn dn2_into(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usi
         for x in 0..dw {
             let sx0 = x << 1;
             let sx1 = (sx0 + 1).min(w - 1);
-            dst[y * dw + x] = (src[sy0 * w + sx0]
-                + src[sy0 * w + sx1]
-                + src[sy1 * w + sx0]
-                + src[sy1 * w + sx1])
-                * 0.25;
+            dst[y * dw + x] =
+                (src[sy0 * w + sx0] + src[sy0 * w + sx1] + src[sy1 * w + sx0] + src[sy1 * w + sx1])
+                    * 0.25;
         }
     }
 }

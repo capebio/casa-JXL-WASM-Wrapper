@@ -12,9 +12,12 @@ pub const STRIP_ROWS: usize = 128;
 
 #[inline(always)]
 fn write_rgb16_le(out: &mut [u8], o: usize, r: u16, g: u16, b: u16) {
-    out[o] = r as u8; out[o + 1] = (r >> 8) as u8;
-    out[o + 2] = g as u8; out[o + 3] = (g >> 8) as u8;
-    out[o + 4] = b as u8; out[o + 5] = (b >> 8) as u8;
+    out[o] = r as u8;
+    out[o + 1] = (r >> 8) as u8;
+    out[o + 2] = g as u8;
+    out[o + 3] = (g >> 8) as u8;
+    out[o + 4] = b as u8;
+    out[o + 5] = (b >> 8) as u8;
 }
 
 /// Streaming box-downscale. Accepts source rows in top-to-bottom order via
@@ -56,7 +59,9 @@ impl StreamingBoxDownscale {
             xspan.push((x0 as u32, x1 as u32));
         }
         let mut s = Self {
-            sh, dw, dh,
+            sh,
+            dw,
+            dh,
             out: vec![0u8; dw * dh * 6],
             acc: vec![0u32; dw * 3],
             dy: 0,
@@ -122,7 +127,8 @@ impl StreamingBoxDownscale {
                 let n = rows * (x1 - x0).max(1);
                 let a = dx * 3;
                 write_rgb16_le(
-                    &mut self.out, o,
+                    &mut self.out,
+                    o,
                     (self.acc[a] / n) as u16,
                     (self.acc[a + 1] / n) as u16,
                     (self.acc[a + 2] / n) as u16,
@@ -157,34 +163,44 @@ pub fn build_previews_streaming<S: RawRowSource>(
 ) -> Result<Vec<Vec<u8>>, String> {
     let (hw, hh) = (w / 2, h / 2);
     if hw == 0 || hh == 0 {
-        return Err(format!("stream_preview: {}×{} too small for half-res", w, h));
+        return Err(format!(
+            "stream_preview: {}×{} too small for half-res",
+            w, h
+        ));
     }
     debug_assert_eq!(source.width(), w);
     debug_assert_eq!(source.height(), h);
-    let mut downs: Vec<StreamingBoxDownscale> =
-        targets.iter().map(|&(dw, dh)| StreamingBoxDownscale::new(hw, hh, dw, dh)).collect();
+    let mut downs: Vec<StreamingBoxDownscale> = targets
+        .iter()
+        .map(|&(dw, dh)| StreamingBoxDownscale::new(hw, hh, dw, dh))
+        .collect();
 
     let mut scratch: Vec<u16> = Vec::new();
     let mut half_strip = vec![0u16; (STRIP_ROWS / 2) * hw * 3];
 
-    for_each_strip(&mut source, STRIP_ROWS, &mut scratch, |_first_row, k, raw_strip| {
-        // Only whole 2-row pairs demosaic; a trailing odd row (only possible on the
-        // final strip when h is odd) is dropped, matching hh = h/2.
-        let keven = k & !1;
-        if keven == 0 {
-            return Ok(());
-        }
-        let half_rows = keven / 2;
-        let hs = &mut half_strip[..half_rows * hw * 3];
-        demosaic_half_band(&raw_strip[..keven * w], w, keven, phase, hs);
-        for hr in 0..half_rows {
-            let row = &hs[hr * hw * 3..(hr + 1) * hw * 3];
-            for d in downs.iter_mut() {
-                d.push_row(row);
+    for_each_strip(
+        &mut source,
+        STRIP_ROWS,
+        &mut scratch,
+        |_first_row, k, raw_strip| {
+            // Only whole 2-row pairs demosaic; a trailing odd row (only possible on the
+            // final strip when h is odd) is dropped, matching hh = h/2.
+            let keven = k & !1;
+            if keven == 0 {
+                return Ok(());
             }
-        }
-        Ok(())
-    })?;
+            let half_rows = keven / 2;
+            let hs = &mut half_strip[..half_rows * hw * 3];
+            demosaic_half_band(&raw_strip[..keven * w], w, keven, phase, hs);
+            for hr in 0..half_rows {
+                let row = &hs[hr * hw * 3..(hr + 1) * hw * 3];
+                for d in downs.iter_mut() {
+                    d.push_row(row);
+                }
+            }
+            Ok(())
+        },
+    )?;
 
     Ok(downs.into_iter().map(|d| d.finish()).collect())
 }
@@ -218,7 +234,13 @@ mod tests {
                         }
                         rb += sw;
                     }
-                    write_rgb16_le(&mut out, o, (rr / pc) as u16, (gg / pc) as u16, (bb / pc) as u16);
+                    write_rgb16_le(
+                        &mut out,
+                        o,
+                        (rr / pc) as u16,
+                        (gg / pc) as u16,
+                        (bb / pc) as u16,
+                    );
                     o += 6;
                 }
             }
@@ -245,7 +267,13 @@ mod tests {
                     }
                     rb += sw;
                 }
-                write_rgb16_le(&mut out, o, (rr / n) as u16, (gg / n) as u16, (bb / n) as u16);
+                write_rgb16_le(
+                    &mut out,
+                    o,
+                    (rr / n) as u16,
+                    (gg / n) as u16,
+                    (bb / n) as u16,
+                );
                 o += 6;
             }
         }
@@ -274,9 +302,11 @@ mod tests {
             (7, 5, 3, 2),
             (13, 9, 4, 3),
             (33, 17, 10, 6),
-            (7, 4, 3, 3),   // dh=3 from sh=4 (thin vertical spans)
+            (7, 4, 3, 3), // dh=3 from sh=4 (thin vertical spans)
         ] {
-            let src: Vec<u16> = (0..(sw * sh * 3)).map(|i| ((i * 31 + 7) & 0xffff) as u16).collect();
+            let src: Vec<u16> = (0..(sw * sh * 3))
+                .map(|i| ((i * 31 + 7) & 0xffff) as u16)
+                .collect();
             let want = reference_downscale(&src, sw, sh, dw, dh);
             let got = stream_all(&src, sw, sh, dw, dh);
             assert_eq!(got, want, "{}x{} -> {}x{}", sw, sh, dw, dh);
@@ -295,12 +325,17 @@ mod tests {
         let raw = decompress::decompress(&payload, w, h).unwrap();
         let half = demosaic::demosaic_rggb_half(&raw, w, h).unwrap();
         let lb = reference_downscale(&half, hw, hh, 20, 15); // float dims
-        let th = reference_downscale(&half, hw, hh, 8, 6);   // integer dims
+        let th = reference_downscale(&half, hw, hh, 8, 6); // integer dims
 
         // streaming
         let got = build_previews_streaming(
-            OrfRowDecoder::new(&payload, w, h).unwrap(), w, h, (0, 0), &[(20, 15), (8, 6)],
-        ).unwrap();
+            OrfRowDecoder::new(&payload, w, h).unwrap(),
+            w,
+            h,
+            (0, 0),
+            &[(20, 15), (8, 6)],
+        )
+        .unwrap();
         assert_eq!(got[0], lb, "lightbox differs");
         assert_eq!(got[1], th, "thumb differs");
     }
@@ -325,22 +360,43 @@ mod tests {
         };
         let stream = || {
             let _ = build_previews_streaming(
-                OrfRowDecoder::new(&payload, w, h).unwrap(), w, h, (0, 0), &targets,
-            ).unwrap();
+                OrfRowDecoder::new(&payload, w, h).unwrap(),
+                w,
+                h,
+                (0, 0),
+                &targets,
+            )
+            .unwrap();
         };
 
         let iters = 30u32;
         let (mut tf, mut ts) = (0u128, 0u128);
         for k in 0..iters {
             if k & 1 == 0 {
-                let t = Instant::now(); full();   tf += t.elapsed().as_nanos();
-                let t = Instant::now(); stream(); ts += t.elapsed().as_nanos();
+                let t = Instant::now();
+                full();
+                tf += t.elapsed().as_nanos();
+                let t = Instant::now();
+                stream();
+                ts += t.elapsed().as_nanos();
             } else {
-                let t = Instant::now(); stream(); ts += t.elapsed().as_nanos();
-                let t = Instant::now(); full();   tf += t.elapsed().as_nanos();
+                let t = Instant::now();
+                stream();
+                ts += t.elapsed().as_nanos();
+                let t = Instant::now();
+                full();
+                tf += t.elapsed().as_nanos();
             }
         }
-        let (mf, ms) = (tf as f64 / iters as f64 / 1e6, ts as f64 / iters as f64 / 1e6);
-        println!("preview build: FULL {:.3} ms  STREAM {:.3} ms  delta {:+.2}%", mf, ms, (ms - mf) / mf * 100.0);
+        let (mf, ms) = (
+            tf as f64 / iters as f64 / 1e6,
+            ts as f64 / iters as f64 / 1e6,
+        );
+        println!(
+            "preview build: FULL {:.3} ms  STREAM {:.3} ms  delta {:+.2}%",
+            mf,
+            ms,
+            (ms - mf) / mf * 100.0
+        );
     }
 }

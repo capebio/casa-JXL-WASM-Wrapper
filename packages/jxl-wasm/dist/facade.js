@@ -61,6 +61,22 @@ function resolveProgressFrameBudget(options) {
         return Number.POSITIVE_INFINITY;
     return Math.max(0, Math.trunc(maxFrames) - 1);
 }
+function emitDecoderBridgeMetrics(module, dec, options) {
+    const onMetric = options.onMetric;
+    if (!onMetric || dec === 0)
+        return;
+    const metrics = [
+        ["bridge_flush_attempts", module._jxl_wasm_dec_flush_attempts],
+        ["bridge_flush_successes", module._jxl_wasm_dec_flush_successes],
+        ["bridge_flush_zero_skips", module._jxl_wasm_dec_flush_zero_skips],
+        ["bridge_flush_duplicate_skips", module._jxl_wasm_dec_flush_duplicate_skips],
+        ["bridge_flush_image_ms", module._jxl_wasm_dec_flush_image_ms],
+    ];
+    for (const [name, fn] of metrics) {
+        if (typeof fn === "function")
+            onMetric(name, fn(dec));
+    }
+}
 function resolveEncoderBridgeSettings(options) {
     const groupOrder = options.groupOrder ?? 0;
     if (!options.progressive) {
@@ -1305,6 +1321,7 @@ class LibjxlDecoder {
         finally {
             if (chunkBufPtr !== 0)
                 module._free(chunkBufPtr);
+            emitDecoderBridgeMetrics(module, dec, this.options);
             decFree(dec);
         }
     }

@@ -17,7 +17,10 @@ const HEADER_SKIP: usize = 7;
 #[cold]
 #[inline(never)]
 fn bitstream_exhausted(width: usize, nrows: usize) -> String {
-    format!("decompress: bitstream exhausted before {}x{} pixels", width, nrows)
+    format!(
+        "decompress: bitstream exhausted before {}x{} pixels",
+        width, nrows
+    )
 }
 
 /// Decode one full row of `width` pixels into `cur_row` (len == width).
@@ -114,14 +117,20 @@ fn decode_row_into<const WIDE: bool>(
             let far = (awn > 32) | (ann > 32);
             let p_between = if far { w_ + n_ - nw } else { (w_ + n_) >> 1 };
             let p_else = if awn > ann { w_ } else { n_ };
-            if between { p_between } else { p_else }
+            if between {
+                p_between
+            } else {
+                p_else
+            }
         };
 
         let v = (pred + ((diff << 2) | low)) & 0xFFFF;
         // SAFETY: cur_row_ptr from cur_row (len == width); col < width, so
         // cur_row_ptr.add(col) is in-bounds and exclusively owned; north_row is a
         // disjoint borrow. Same invariant as the pre-refactor inline loop.
-        unsafe { *cur_row_ptr.add(col) = v as u16; }
+        unsafe {
+            *cur_row_ptr.add(col) = v as u16;
+        }
         west[parity] = v;
         if row >= 2 {
             north_west[parity] = north;
@@ -135,9 +144,12 @@ pub fn decompress(compressed: &[u8], width: usize, height: usize) -> Result<Vec<
 }
 
 /// Decode only the first `max_rows` rows (full width); cost proportional to rows decoded.
-pub fn decompress_rows(compressed: &[u8], width: usize, height: usize, max_rows: usize)
-    -> Result<Vec<u16>, String>
-{
+pub fn decompress_rows(
+    compressed: &[u8],
+    width: usize,
+    height: usize,
+    max_rows: usize,
+) -> Result<Vec<u16>, String> {
     let nrows = max_rows.min(height);
     let n = width
         .checked_mul(nrows)
@@ -187,7 +199,11 @@ pub fn decompress_rows_into(
         .checked_mul(nrows)
         .ok_or_else(|| format!("decompress: {}x{} overflows", width, nrows))?;
     if out.len() < n {
-        return Err(format!("decompress: output too small ({} < {})", out.len(), n));
+        return Err(format!(
+            "decompress: output too small ({} < {})",
+            out.len(),
+            n
+        ));
     }
     if nrows == 0 {
         return Ok(0);
@@ -195,7 +211,8 @@ pub fn decompress_rows_into(
     if compressed.len() <= HEADER_SKIP {
         return Err(format!(
             "decompress: input too short ({} bytes, need > {})",
-            compressed.len(), HEADER_SKIP
+            compressed.len(),
+            HEADER_SKIP
         ));
     }
     // A zero-width frame has no pixels; the row loop would otherwise spin `nrows`
@@ -207,12 +224,16 @@ pub fn decompress_rows_into(
     let mut br = BitReader::<WIDE_FILL>::new(&compressed[HEADER_SKIP..]);
 
     for row in 0..nrows {
-        let row_base  = row * width;
+        let row_base = row * width;
         let row2_base = if row >= 2 { (row - 2) * width } else { 0 };
         // D1: north_row borrows the row two above (disjoint from cur via split_at_mut);
         // the per-row decode + predictor lives in the shared `decode_row_into` helper.
         let (above, cur) = out[..n].split_at_mut(row_base);
-        let north_row: &[u16] = if row >= 2 { &above[row2_base..row2_base + width] } else { &[] };
+        let north_row: &[u16] = if row >= 2 {
+            &above[row2_base..row2_base + width]
+        } else {
+            &[]
+        };
         decode_row_into::<WIDE_FILL>(&mut br, row, width, nrows, north_row, &mut cur[..width])?;
     }
     if br.truncated {
@@ -246,7 +267,8 @@ impl<'a> OrfRowDecoder<'a> {
         if compressed.len() <= HEADER_SKIP {
             return Err(format!(
                 "decompress: input too short ({} bytes, need > {})",
-                compressed.len(), HEADER_SKIP
+                compressed.len(),
+                HEADER_SKIP
             ));
         }
         Ok(Self {
@@ -260,8 +282,12 @@ impl<'a> OrfRowDecoder<'a> {
 }
 
 impl RawRowSource for OrfRowDecoder<'_> {
-    fn width(&self) -> usize { self.width }
-    fn height(&self) -> usize { self.height }
+    fn width(&self) -> usize {
+        self.width
+    }
+    fn height(&self) -> usize {
+        self.height
+    }
 
     fn next_row_into(&mut self, dst: &mut [u16]) -> Result<bool, String> {
         if self.row >= self.height {
@@ -359,12 +385,17 @@ impl<'a, const WIDE: bool> BitReader<'a, WIDE> {
 
     #[inline(always)]
     fn fill(&mut self, need: u32) {
-        if self.nbits >= need { return; }
+        if self.nbits >= need {
+            return;
+        }
         // Batch-fill to 56 bits so subsequent calls are usually no-ops.
         // Safe headroom: 56 + 8 (one more read_huff/read_bits) = 64 = u64 max.
         // The formula guarantees in_bounds*8 <= 56 - nbits, so the existing <=15
         // valid bits never shift past bit 55 — no u64 overflow.
-        let in_bounds = self.data.len().saturating_sub(self.pos)
+        let in_bounds = self
+            .data
+            .len()
+            .saturating_sub(self.pos)
             .min(((56 - self.nbits.min(56)) / 8) as usize);
         if WIDE && in_bounds > 0 && self.pos + 8 <= self.data.len() {
             // Wide path: one unaligned big-endian u64 load instead of up to 7
@@ -372,9 +403,7 @@ impl<'a, const WIDE: bool> BitReader<'a, WIDE> {
             // from_be_bytes puts data[pos] in the MSB; keeping the top `in_bounds`
             // bytes (>> the rest) reproduces the byte loop's MSB-first packing
             // EXACTLY. in_bounds is 1..=7, so the shift is 8..=56 (never 64/UB).
-            let word = u64::from_be_bytes(
-                self.data[self.pos..self.pos + 8].try_into().unwrap(),
-            );
+            let word = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
             let chunk = word >> ((8 - in_bounds) as u32 * 8);
             self.buf = (self.buf << (in_bounds as u32 * 8)) | chunk;
         } else {
@@ -450,15 +479,11 @@ mod tests {
     // D8(a) golden: small crop generated from original impl (real ORF crop equiv via model),
     // pins D1/D2 bit-exactness. 4x3 exercises delay lines (row>=2, col parity, NW/west/north paths).
     const GOLDEN_FULL: &[u8] = &[
-        0,0,0,0,0,0,0, 0x52,0x15,0x15,0x15,0x73,0x36,0x15,0x15,0x50,0x50,0x50,0x50
+        0, 0, 0, 0, 0, 0, 0, 0x52, 0x15, 0x15, 0x15, 0x73, 0x36, 0x15, 0x15, 0x50, 0x50, 0x50, 0x50,
     ];
     const GOLDEN_W: usize = 4;
     const GOLDEN_H: usize = 3;
-    const GOLDEN_EXPECT: &[u16] = &[
-        10,20,30,40,
-        15,25,35,45,
-        12,22,32,42,
-    ];
+    const GOLDEN_EXPECT: &[u16] = &[10, 20, 30, 40, 15, 25, 35, 45, 12, 22, 32, 42];
 
     #[test]
     fn golden_vector_d1_d2() {
@@ -514,7 +539,12 @@ mod tests {
             let value = idx.leading_zeros() - 20;
             let len = (value + 1).min(12);
 
-            assert_eq!((val_tbl, len_tbl), (value, len), "huff mismatch at idx={}", idx);
+            assert_eq!(
+                (val_tbl, len_tbl),
+                (value, len),
+                "huff mismatch at idx={}",
+                idx
+            );
         }
     }
 
@@ -538,7 +568,8 @@ mod tests {
                     old_nbits(carry, ii),
                     new_nbits(carry, ii),
                     "mismatch carry={} i={}",
-                    carry, ii
+                    carry,
+                    ii
                 );
             }
         }
@@ -594,7 +625,11 @@ mod tests {
     fn decompress_rows_rejects_giant_dims_without_alloc() {
         let tiny = vec![0u8; HEADER_SKIP + 16];
         let err = decompress_rows(&tiny, 100_000, 100_000, 100_000).unwrap_err();
-        assert!(err.contains("bitstream exhausted before 100000x100000"), "got: {}", err);
+        assert!(
+            err.contains("bitstream exhausted before 100000x100000"),
+            "got: {}",
+            err
+        );
     }
 
     // #3: zero-width frame decodes to zero pixels for any height without spinning
@@ -603,7 +638,10 @@ mod tests {
     fn decompress_zero_width_is_noop() {
         let payload = synth_payload(1, 1, 1); // any >HEADER_SKIP payload
         let mut out: [u16; 0] = [];
-        assert_eq!(decompress_rows_into(&payload, 0, 5, 5, &mut out).unwrap(), 5);
+        assert_eq!(
+            decompress_rows_into(&payload, 0, 5, 5, &mut out).unwrap(),
+            5
+        );
         assert_eq!(decompress(&payload, 0, 5).unwrap(), Vec::<u16>::new());
         // sub-header input for width 0 still reports "input too short" (unchanged)
         let err = decompress_rows_into(&[0u8; 3], 0, 5, 5, &mut out).unwrap_err();
@@ -658,7 +696,11 @@ mod tests {
             .checked_mul(nrows)
             .ok_or_else(|| format!("decompress: {}x{} overflows", width, nrows))?;
         if out.len() < n {
-            return Err(format!("decompress: output too small ({} < {})", out.len(), n));
+            return Err(format!(
+                "decompress: output too small ({} < {})",
+                out.len(),
+                n
+            ));
         }
         if nrows == 0 {
             return Ok(0);
@@ -666,7 +708,8 @@ mod tests {
         if compressed.len() <= HEADER_SKIP {
             return Err(format!(
                 "decompress: input too short ({} bytes, need > {})",
-                compressed.len(), HEADER_SKIP
+                compressed.len(),
+                HEADER_SKIP
             ));
         }
         // <false> = byte-loop refill: the true pre-optimisation baseline.
@@ -676,8 +719,11 @@ mod tests {
             let row_base = row * width;
             let row2_base = if row >= 2 { (row - 2) * width } else { 0 };
             let (above, cur) = out[..n].split_at_mut(row_base);
-            let north_row: &[u16] =
-                if row >= 2 { &above[row2_base..row2_base + width] } else { &[] };
+            let north_row: &[u16] = if row >= 2 {
+                &above[row2_base..row2_base + width]
+            } else {
+                &[]
+            };
             let cur_row = &mut cur[..width];
             let mut west = [0i32; 2];
             let mut north_west = [0i32; 2];
@@ -690,13 +736,19 @@ mod tests {
                 let nbits = (2 + i as i32).max(bitlen - i as i32).min(16) as usize;
                 let sb = br.read_bits(3);
                 if br.truncated {
-                    return Err(format!("decompress: bitstream exhausted before {}x{} pixels", width, nrows));
+                    return Err(format!(
+                        "decompress: bitstream exhausted before {}x{} pixels",
+                        width, nrows
+                    ));
                 }
                 let low = (sb & 3) as i32;
                 let sign = (((sb as i32) << 29) >> 31) as i32;
                 let high0 = br.read_huff();
                 if br.truncated {
-                    return Err(format!("decompress: bitstream exhausted before {}x{} pixels", width, nrows));
+                    return Err(format!(
+                        "decompress: bitstream exhausted before {}x{} pixels",
+                        width, nrows
+                    ));
                 }
                 let high = if high0 == 12 {
                     let extra = (16u32).saturating_sub(nbits as u32);
@@ -705,15 +757,25 @@ mod tests {
                     high0 as i32
                 };
                 if br.truncated {
-                    return Err(format!("decompress: bitstream exhausted before {}x{} pixels", width, nrows));
+                    return Err(format!(
+                        "decompress: bitstream exhausted before {}x{} pixels",
+                        width, nrows
+                    ));
                 }
                 acarry[parity][0] = (high << (nbits as u32)) | (br.read_bits(nbits as u32) as i32);
                 if br.truncated {
-                    return Err(format!("decompress: bitstream exhausted before {}x{} pixels", width, nrows));
+                    return Err(format!(
+                        "decompress: bitstream exhausted before {}x{} pixels",
+                        width, nrows
+                    ));
                 }
                 let diff = (acarry[parity][0] ^ sign) + acarry[parity][1];
                 acarry[parity][1] = (diff * 3 + acarry[parity][1]) >> 5;
-                acarry[parity][2] = if acarry[parity][0] > 16 { 0 } else { acarry[parity][2] + 1 };
+                acarry[parity][2] = if acarry[parity][0] > 16 {
+                    0
+                } else {
+                    acarry[parity][2] + 1
+                };
                 let pred = if row < 2 && col < 2 {
                     0
                 } else if row < 2 {
@@ -730,10 +792,16 @@ mod tests {
                     let far = (awn > 32) | (ann > 32);
                     let p_between = if far { w_ + n_ - nw } else { (w_ + n_) >> 1 };
                     let p_else = if awn > ann { w_ } else { n_ };
-                    if between { p_between } else { p_else }
+                    if between {
+                        p_between
+                    } else {
+                        p_else
+                    }
                 };
                 let v = (pred + ((diff << 2) | low)) & 0xFFFF;
-                unsafe { *cur_row_ptr.add(col) = v as u16; }
+                unsafe {
+                    *cur_row_ptr.add(col) = v as u16;
+                }
                 west[parity] = v;
                 if row >= 2 {
                     north_west[parity] = north_row[col] as i32;
@@ -741,7 +809,10 @@ mod tests {
             }
         }
         if br.truncated {
-            return Err(format!("decompress: bitstream exhausted before {}x{} pixels", width, nrows));
+            return Err(format!(
+                "decompress: bitstream exhausted before {}x{} pixels",
+                width, nrows
+            ));
         }
         Ok(nrows)
     }
@@ -758,17 +829,26 @@ mod tests {
     ) -> Result<usize, String> {
         let nrows = max_rows.min(height);
         let n = width.checked_mul(nrows).ok_or_else(|| "ovf".to_string())?;
-        if out.len() < n { return Err("small".into()); }
-        if nrows == 0 { return Ok(0); }
-        if compressed.len() <= HEADER_SKIP { return Err("short".into()); }
+        if out.len() < n {
+            return Err("small".into());
+        }
+        if nrows == 0 {
+            return Ok(0);
+        }
+        if compressed.len() <= HEADER_SKIP {
+            return Err("short".into());
+        }
         let mut br = BitReader::<WIDE>::new(&compressed[HEADER_SKIP..]);
         for row in 0..nrows {
             let mut acarry = [[0i32; 3]; 2];
             let row_base = row * width;
             let row2_base = if row >= 2 { (row - 2) * width } else { 0 };
             let (above, cur) = out[..n].split_at_mut(row_base);
-            let north_row: &[u16] =
-                if row >= 2 { &above[row2_base..row2_base + width] } else { &[] };
+            let north_row: &[u16] = if row >= 2 {
+                &above[row2_base..row2_base + width]
+            } else {
+                &[]
+            };
             let cur_row = &mut cur[..width];
             let mut west = [0i32; 2];
             let mut north_west = [0i32; 2];
@@ -780,31 +860,55 @@ mod tests {
                 let bitlen = 32 - carry_lo.leading_zeros() as i32;
                 let nbits = (2 + i as i32).max(bitlen - i as i32).min(16) as usize;
                 let sb = br.read_bits(3);
-                if !FOLD && br.truncated { return Err("trunc".into()); }
+                if !FOLD && br.truncated {
+                    return Err("trunc".into());
+                }
                 let low = (sb & 3) as i32;
                 let sign = (((sb as i32) << 29) >> 31) as i32;
                 let high0 = br.read_huff();
-                if !FOLD && br.truncated { return Err("trunc".into()); }
+                if !FOLD && br.truncated {
+                    return Err("trunc".into());
+                }
                 let high = if high0 == 12 {
                     let extra = (16u32).saturating_sub(nbits as u32);
                     (br.read_bits(extra) >> 1) as i32
-                } else { high0 as i32 };
-                if !FOLD && br.truncated { return Err("trunc".into()); }
+                } else {
+                    high0 as i32
+                };
+                if !FOLD && br.truncated {
+                    return Err("trunc".into());
+                }
                 let literal = br.read_bits(nbits as u32) as i32;
-                if br.truncated { return Err("trunc".into()); }
+                if br.truncated {
+                    return Err("trunc".into());
+                }
                 acarry[parity][0] = (high << (nbits as u32)) | literal;
                 let diff = (acarry[parity][0] ^ sign) + acarry[parity][1];
                 acarry[parity][1] = (diff * 3 + acarry[parity][1]) >> 5;
-                acarry[parity][2] = if acarry[parity][0] > 16 { 0 } else { acarry[parity][2] + 1 };
+                acarry[parity][2] = if acarry[parity][0] > 16 {
+                    0
+                } else {
+                    acarry[parity][2] + 1
+                };
                 let north = if HOIST {
-                    if row >= 2 { north_row[col] as i32 } else { 0 }
-                } else { 0 };
+                    if row >= 2 {
+                        north_row[col] as i32
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
                 let pred = if row < 2 && col < 2 {
                     0
                 } else if row < 2 {
                     west[parity]
                 } else if col < 2 {
-                    if HOIST { north } else { north_row[col] as i32 }
+                    if HOIST {
+                        north
+                    } else {
+                        north_row[col] as i32
+                    }
                 } else {
                     let w_ = west[parity];
                     let n_ = if HOIST { north } else { north_row[col] as i32 };
@@ -815,17 +919,25 @@ mod tests {
                     let far = (awn > 32) | (ann > 32);
                     let p_between = if far { w_ + n_ - nw } else { (w_ + n_) >> 1 };
                     let p_else = if awn > ann { w_ } else { n_ };
-                    if between { p_between } else { p_else }
+                    if between {
+                        p_between
+                    } else {
+                        p_else
+                    }
                 };
                 let v = (pred + ((diff << 2) | low)) & 0xFFFF;
-                unsafe { *cur_row_ptr.add(col) = v as u16; }
+                unsafe {
+                    *cur_row_ptr.add(col) = v as u16;
+                }
                 west[parity] = v;
                 if row >= 2 {
                     north_west[parity] = if HOIST { north } else { north_row[col] as i32 };
                 }
             }
         }
-        if br.truncated { return Err("trunc".into()); }
+        if br.truncated {
+            return Err("trunc".into());
+        }
         Ok(nrows)
     }
 
@@ -847,7 +959,12 @@ mod tests {
 
     #[test]
     fn stream_rows_equal_full_decode() {
-        for (w, h, seed) in [(128usize, 96usize, 0x1234u64), (255, 64, 0xBEEF), (64, 255, 0xABCD), (3, 257, 0x55)] {
+        for (w, h, seed) in [
+            (128usize, 96usize, 0x1234u64),
+            (255, 64, 0xBEEF),
+            (64, 255, 0xABCD),
+            (3, 257, 0x55),
+        ] {
             let payload = synth_payload(w, h, seed);
             let mut full = vec![0u16; w * h];
             decompress_rows_into(&payload, w, h, h, &mut full).unwrap();
@@ -871,7 +988,10 @@ mod tests {
             match dec.next_row_into(&mut rowbuf) {
                 Ok(true) => continue,
                 Ok(false) => break,
-                Err(_) => { err = true; break; }
+                Err(_) => {
+                    err = true;
+                    break;
+                }
             }
         }
         assert!(err, "truncated stream should error");
@@ -894,7 +1014,8 @@ mod tests {
             got.extend_from_slice(&band[..k * w]);
             strips += 1;
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(got, full);
         assert_eq!(strips, 4); // 6+6+6+2
     }
@@ -903,7 +1024,12 @@ mod tests {
     // edges) — far stronger than the 4x3 golden. Always runs.
     #[test]
     fn decompress_old_vs_new_byteexact() {
-        for (w, h, seed) in [(128usize, 96usize, 0x1234u64), (255, 64, 0xBEEF), (64, 255, 0xABCDEF), (3, 257, 0x55)] {
+        for (w, h, seed) in [
+            (128usize, 96usize, 0x1234u64),
+            (255, 64, 0xBEEF),
+            (64, 255, 0xABCDEF),
+            (3, 257, 0x55),
+        ] {
             let payload = synth_payload(w, h, seed);
             let mut a = vec![0u16; w * h];
             let mut b = vec![0u16; w * h];
@@ -977,7 +1103,9 @@ mod tests {
             let ms = acc[i] as f64 / iters as f64 / 1e6;
             println!(
                 "  {}: {:.3} ms  ({:+.2}% vs base)",
-                variants[i].0, ms, (ms - base_ms) / base_ms * 100.0
+                variants[i].0,
+                ms,
+                (ms - base_ms) / base_ms * 100.0
             );
         }
     }

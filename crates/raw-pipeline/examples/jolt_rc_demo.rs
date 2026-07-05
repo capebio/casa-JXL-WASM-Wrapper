@@ -56,7 +56,12 @@ fn main() {
     let gop = 12u32;
 
     let run = |opts: &CasaVideoOptions| {
-        let mut fs = VecFrames { frames: frames.clone(), i: 0, w, h };
+        let mut fs = VecFrames {
+            frames: frames.clone(),
+            i: 0,
+            w,
+            h,
+        };
         encode_casv_video_streaming(&mut fs, opts).unwrap()
     };
 
@@ -82,8 +87,10 @@ fn main() {
             sizes[i / gop as usize] += casv_frame_slice(&out, i).unwrap().len();
         }
         let gop_secs = gop as f64 / 24.0;
-        let rates: Vec<String> =
-            sizes.iter().map(|&s| format!("{:.0}k", s as f64 / gop_secs / 1000.0)).collect();
+        let rates: Vec<String> = sizes
+            .iter()
+            .map(|&s| format!("{:.0}k", s as f64 / gop_secs / 1000.0))
+            .collect();
         println!(
             "  target {:>8} B/s ({mult}x): total {:>9} bytes  ({:.0} B/s, {:+.1}% vs target)   per-GOP B/s: [{}]   hdr d={:?}",
             target,

@@ -9,26 +9,42 @@ use std::time::Instant;
 
 fn synth(w: usize, h: usize, seed: u32) -> Vec<u8> {
     let mut s = seed | 1;
-    let mut rng = || { s ^= s << 13; s ^= s >> 17; s ^= s << 5; s };
+    let mut rng = || {
+        s ^= s << 13;
+        s ^= s >> 17;
+        s ^= s << 5;
+        s
+    };
     let n = w * h;
     let mut px = vec![0u8; n * 4];
     for i in 0..n {
-        let x = (i % w) as f32; let y = (i / w) as f32;
+        let x = (i % w) as f32;
+        let y = (i / w) as f32;
         // Add RNG-based noise to break coherent patterns that might alias with SIMD widths.
         let noise = (rng() >> 24) as u8;
-        px[i * 4] = (((x * 255.0 / w as f32 + 40.0 * (y / 17.0).sin()) as i32 & 255) as u8).wrapping_add(noise >> 4);
-        px[i * 4 + 1] = (((y * 255.0 / h as f32 + 40.0 * (x / 23.0).sin()) as i32 & 255) as u8).wrapping_add(noise >> 5);
-        px[i * 4 + 2] = ((((x + y) * 127.0 / (w + h) as f32) as i32 & 255) as u8).wrapping_add(noise >> 6);
+        px[i * 4] = (((x * 255.0 / w as f32 + 40.0 * (y / 17.0).sin()) as i32 & 255) as u8)
+            .wrapping_add(noise >> 4);
+        px[i * 4 + 1] = (((y * 255.0 / h as f32 + 40.0 * (x / 23.0).sin()) as i32 & 255) as u8)
+            .wrapping_add(noise >> 5);
+        px[i * 4 + 2] =
+            ((((x + y) * 127.0 / (w + h) as f32) as i32 & 255) as u8).wrapping_add(noise >> 6);
         px[i * 4 + 3] = 255;
     }
     px
 }
 
-fn time_runs(reference: &[u8], test: &[u8], w: usize, h: usize, choice: BackendChoice, iters: usize) -> f64 {
+fn time_runs(
+    reference: &[u8],
+    test: &[u8],
+    w: usize,
+    h: usize,
+    choice: BackendChoice,
+    iters: usize,
+) -> f64 {
     let mut opts = Opts::default();
     opts.backend = choice;
     let mut cmp = Comparer::new(reference.to_vec(), w, h, opts); // C-7: by-value API
-    // warmup
+                                                                 // warmup
     let _ = cmp.butteraugli(test);
     let t0 = Instant::now();
     let mut sink = 0f32;
@@ -55,7 +71,8 @@ fn main() {
     // them on a non-AVX-512 part would execute illegal instructions (SIGILL).
     // When present, candidates indices 3 (strict, Force(3)) and 4 (rsqrt, Force(5)).
     // Note: Force id 4 = WasmSimd; Force ids are non-contiguous — rsqrt uses Force(5).
-    let have_avx512 = std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw");
+    let have_avx512 =
+        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw");
     if have_avx512 {
         candidates.push(("avx512-strict", BackendChoice::Force(3)));
         candidates.push(("avx512-rsqrt", BackendChoice::Force(5)));
@@ -63,8 +80,14 @@ fn main() {
         println!("(AVX-512 not detected on this CPU — avx512 routes skipped; run on server hardware to compare)");
     }
 
-    println!("perceptual butteraugli flip-flop — {}x{} ({:.2} MP), {} iters x {} rounds",
-        w, h, (w * h) as f64 / 1e6, iters, rounds);
+    println!(
+        "perceptual butteraugli flip-flop — {}x{} ({:.2} MP), {} iters x {} rounds",
+        w,
+        h,
+        (w * h) as f64 / 1e6,
+        iters,
+        rounds
+    );
 
     // avx2-strict vs scalar, avx2-strict vs avx2-rsqrt; plus avx512 routes when present.
     let mut pairs = vec![(0usize, 1usize), (1usize, 2usize)];
@@ -96,7 +119,9 @@ fn main() {
         } else {
             format!("WINNER {} ({:.2}x)", candidates[ib].0, amed / bmed)
         };
-        println!("  {:<12} {:.3} ms  vs  {:<12} {:.3} ms  | margin {:.3} ms | {}",
-            candidates[ia].0, amed, candidates[ib].0, bmed, margin, verdict);
+        println!(
+            "  {:<12} {:.3} ms  vs  {:<12} {:.3} ms  | margin {:.3} ms | {}",
+            candidates[ia].0, amed, candidates[ib].0, bmed, margin, verdict
+        );
     }
 }
