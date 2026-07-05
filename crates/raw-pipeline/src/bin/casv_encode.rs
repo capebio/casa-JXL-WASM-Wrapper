@@ -24,7 +24,8 @@
 
 use raw_pipeline::casa_video::{
     default_thresh_for_distance, encode_casv_proxy_rgb8, encode_casv_video,
-    encode_casv_video_with_audio_progress, CasaVideoOptions, SkipMode, VideoRate,
+    encode_casv_video_streaming_with_audio_progress, CasaVideoOptions, SkipMode, VideoFrameSource,
+    VideoRate,
 };
 use raw_pipeline::jxl_casaencoder::EncodeOptions;
 
@@ -75,7 +76,31 @@ fn probe_fps(video: &str) -> (u32, u32) {
     }
 }
 
-fn extract_png_frames(video: &str, dim: &str) -> Vec<u8> {
+/// Best-effort total frame count from the container metadata, for a determinate
+/// extract bar. Fast (reads header metadata, does not decode); returns None when
+/// the container doesn't record `nb_frames` (common for VFR / some webm/mkv), in
+/// which case the extract bar stays indeterminate with a live count.
+fn probe_frame_count(video: &str) -> Option<usize> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=nb_frames",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            video,
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    s.trim().parse::<usize>().ok().filter(|&n| n > 0)
+}
+
+fn extract_png_frames(video: &str, dim: &str, total: usize) -> Vec<u8> {
+    use std::io::Read;
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-i", video]);
     if dim != "exact" {
@@ -94,13 +119,53 @@ fn extract_png_frames(video: &str, dim: &str) -> Vec<u8> {
     cmd.args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
-    match cmd.output() {
-        Ok(o) => o.stdout,
+    // Stream stdout instead of one opaque `output()`: count PNG signatures as
+    // frames arrive so the UI shows extraction advancing (ffmpeg gives no
+    // upfront frame total, so `total` stays 0 → indeterminate bar with a live
+    // count). stderr is null, so draining only stdout can't deadlock.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("casv_encode: ffmpeg failed: {e}");
             std::process::exit(1);
         }
+    };
+    let mut out = child.stdout.take().expect("ffmpeg stdout piped");
+    let mut data: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut scan = 0usize; // next index to test for a signature (monotonic)
+    let mut frames = 0usize;
+    let mut reported = 0usize;
+    loop {
+        match out.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                // Advance a monotonic cursor: never rescans, and a signature
+                // split across two reads is found once (cursor waits for bytes).
+                while scan + PNG_MAGIC.len() <= data.len() {
+                    if data[scan..scan + PNG_MAGIC.len()] == *PNG_MAGIC {
+                        frames += 1;
+                        scan += PNG_MAGIC.len();
+                    } else {
+                        scan += 1;
+                    }
+                }
+                // Throttle stderr: report every 4th new frame. `total` from
+                // ffprobe (0 if unknown → indeterminate bar with a live count).
+                if frames >= reported + 4 {
+                    progress("extract", frames, total);
+                    reported = frames;
+                }
+            }
+            Err(e) => {
+                eprintln!("casv_encode: ffmpeg read failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
+    let _ = child.wait();
+    data
 }
 
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
@@ -160,8 +225,9 @@ fn run_video_mode(args: &[String]) -> ! {
         fps_den = pd;
     }
 
-    // Extract audio as Ogg/Opus
-    let audio_tmp = std::env::temp_dir().join("casv_audio_tmp.ogg");
+    // Extract audio as Ogg/Opus. Unique per-process temp name so concurrent
+    // encodes don't clobber each other's audio file.
+    let audio_tmp = std::env::temp_dir().join(format!("casv_audio_tmp_{}.ogg", std::process::id()));
     let audio_status = std::process::Command::new("ffmpeg")
         .args([
             "-i",
@@ -190,29 +256,22 @@ fn run_video_mode(args: &[String]) -> ! {
     };
     let _ = std::fs::remove_file(&audio_tmp);
 
-    // Extract video frames as concatenated PNG stream, then split.
-    progress("extract", 0, 0); // ffmpeg is one opaque call → indeterminate
-    let png_data = extract_png_frames(in_video, dim_str);
+    // Extract video frames as a concatenated PNG stream, then split. ffprobe
+    // gives a best-effort frame total for a determinate extract bar.
+    let probed = probe_frame_count(in_video).unwrap_or(0);
+    progress("extract", 0, probed);
+    let png_data = extract_png_frames(in_video, dim_str, probed);
     let frames_png = split_png_frames(&png_data);
     if frames_png.is_empty() {
         fail("no frames extracted from video");
     }
     let n = frames_png.len();
 
-    // Decode PNGs to RGB8, reporting per-frame progress.
-    let first_img = image::load_from_memory(frames_png[0])
-        .unwrap_or_else(|e| fail(format!("decode first frame: {e}")));
-    let (w, h) = (first_img.width(), first_img.height());
-    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(n);
-    for (i, png) in frames_png.iter().enumerate() {
-        frames.push(
-            image::load_from_memory(png)
-                .unwrap_or_else(|e| fail(format!("decode png frame: {e}")))
-                .to_rgb8()
-                .into_raw(),
-        );
-        progress("decode", i + 1, n);
-    }
+    // Dims from the first frame (decoded once; the lazy source reuses it).
+    let first_rgb = image::load_from_memory(frames_png[0])
+        .unwrap_or_else(|e| fail(format!("decode first frame: {e}")))
+        .to_rgb8();
+    let (w, h) = (first_rgb.width(), first_rgb.height());
 
     // Full-dimensioned editor proxy: rate = "proxy2" / "proxy4" (any "proxy<N>").
     // All-intra, each frame stored at 1/N res but declaring full dims (self-
@@ -222,6 +281,13 @@ fn run_video_mode(args: &[String]) -> ! {
         .strip_prefix("proxy")
         .and_then(|s| s.parse::<u32>().ok())
     {
+        // Proxy is all-intra and frame-parallel, so every frame must be resident
+        // (unlike the lazy streaming path below). Decode them all up front.
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for (i, png) in frames_png.iter().enumerate() {
+            frames.push(decode_png_rgb(png));
+            progress("decode", i + 1, n);
+        }
         progress("encode", 0, n);
         let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
         let bytes = encode_casv_proxy_rgb8(
@@ -255,13 +321,55 @@ fn run_video_mode(args: &[String]) -> ! {
         rate_control: None,
     };
 
-    progress("encode", 0, n);
-    let bytes = encode_casv_video_with_audio_progress(
-        &frames,
+    // Lazy frame source: decode each PNG on demand and drop it, so peak memory
+    // is ~2 decoded frames (encoder ping-pong) + the compressed PNG buffer,
+    // instead of every decoded RGB frame resident at once. The streaming encoder
+    // pulls frames one at a time; decode+encode are fused per frame.
+    struct LazyPngSource<'a> {
+        pngs: &'a [&'a [u8]],
+        first: Option<Vec<u8>>,
+        i: usize,
+        w: u32,
+        h: u32,
+        fps_num: u32,
+        fps_den: u32,
+    }
+    impl VideoFrameSource for LazyPngSource<'_> {
+        fn dims(&self) -> (u32, u32) {
+            (self.w, self.h)
+        }
+        fn fps(&self) -> (u32, u32) {
+            (self.fps_num, self.fps_den)
+        }
+        fn next_frame(&mut self) -> Option<Vec<u8>> {
+            if self.i >= self.pngs.len() {
+                return None;
+            }
+            let rgb = if self.i == 0 {
+                self.first
+                    .take()
+                    .unwrap_or_else(|| decode_png_rgb(self.pngs[0]))
+            } else {
+                decode_png_rgb(self.pngs[self.i])
+            };
+            self.i += 1;
+            Some(rgb)
+        }
+    }
+
+    let mut src = LazyPngSource {
+        pngs: &frames_png,
+        first: Some(first_rgb.into_raw()),
+        i: 0,
         w,
         h,
-        fps_num.max(1),
-        fps_den.max(1),
+        fps_num: fps_num.max(1),
+        fps_den: fps_den.max(1),
+    };
+
+    progress("encode", 0, n);
+    let bytes = encode_casv_video_streaming_with_audio_progress(
+        &mut src,
         &opts,
         ogg_bytes.as_deref(),
         &mut |done| progress("encode", done, n),
@@ -272,6 +380,14 @@ fn run_video_mode(args: &[String]) -> ! {
         .unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
     println!("OK {} {}", bytes.len(), out_casv);
     std::process::exit(0);
+}
+
+/// Decode one PNG frame to interleaved RGB8, or exit with a message.
+fn decode_png_rgb(png: &[u8]) -> Vec<u8> {
+    image::load_from_memory(png)
+        .unwrap_or_else(|e| fail(format!("decode png frame: {e}")))
+        .to_rgb8()
+        .into_raw()
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
