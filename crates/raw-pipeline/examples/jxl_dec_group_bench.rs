@@ -30,14 +30,16 @@
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 mod bench {
     use raw_pipeline::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
-    use raw_pipeline::jxl_casaencoder::{Encoder, EncodeOptions, Frame, FrameSettingId};
+    use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame, FrameSettingId};
 
     fn mkpix(w: u32, h: u32, seed: u64) -> Vec<u8> {
         let n = (w as usize) * (h as usize) * 3;
         let mut v = Vec::with_capacity(n);
         let mut s = seed;
         for _ in 0..n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             v.push(((s >> 33) & 0xff) as u8);
         }
         v
@@ -56,13 +58,7 @@ mod bench {
         v[v.len() / 2]
     }
 
-    fn time_decode(
-        label: &str,
-        jxl: &[u8],
-        parallel: bool,
-        warmup: usize,
-        iters: usize,
-    ) {
+    fn time_decode(label: &str, jxl: &[u8], parallel: bool, warmup: usize, iters: usize) {
         let mut dec = Decoder::new(DecodeOptions {
             parallel,
             ..Default::default()
@@ -188,5 +184,7 @@ fn main() {
     bench::run();
 
     #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]
-    eprintln!("requires: cargo run --release --example jxl_dec_group_bench (default features, native)");
+    eprintln!(
+        "requires: cargo run --release --example jxl_dec_group_bench (default features, native)"
+    );
 }

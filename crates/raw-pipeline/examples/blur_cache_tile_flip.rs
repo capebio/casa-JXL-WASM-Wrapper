@@ -31,10 +31,14 @@ const STRIP_H: usize = 160;
 const VTILE: usize = 128;
 
 fn k13() -> [f32; 13] {
-    [0.0185, 0.0342, 0.0563, 0.0831, 0.1097, 0.1296, 0.1372,
-     0.1296, 0.1097, 0.0831, 0.0563, 0.0342, 0.0185]
+    [
+        0.0185, 0.0342, 0.0563, 0.0831, 0.1097, 0.1296, 0.1372, 0.1296, 0.1097, 0.0831, 0.0563,
+        0.0342, 0.0185,
+    ]
 }
-fn k5() -> [f32; 5] { [0.0545, 0.2442, 0.4026, 0.2442, 0.0545] }
+fn k5() -> [f32; 5] {
+    [0.0545, 0.2442, 0.4026, 0.2442, 0.0545]
+}
 
 // ── A: current pipeline.rs ─────────────────────────────────────────────────────
 // 1-D FIR on an f32 plane, stride-1, FMA — mirrors blur_fir_planar.
@@ -69,8 +73,14 @@ fn fir_planar(plane: &[f32], kernel: &[f32], half: usize, out: &mut [f32]) {
     }
 }
 
-fn blur_a(src: &[u16], width: usize, height: usize, kernel: &[f32],
-          temp: &mut Vec<u16>, out: &mut Vec<u16>) {
+fn blur_a(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    temp: &mut Vec<u16>,
+    out: &mut Vec<u16>,
+) {
     let half = kernel.len() / 2;
     let n = width * height * 3;
     temp.resize(n, 0);
@@ -97,7 +107,7 @@ fn blur_a(src: &[u16], width: usize, height: usize, kernel: &[f32],
         let row = &mut temp[y * width * 3..(y + 1) * width * 3];
         for px in 0..width {
             let b = px * 3;
-            row[b]     = r_out[px].round() as u16;
+            row[b] = r_out[px].round() as u16;
             row[b + 1] = g_out[px].round() as u16;
             row[b + 2] = b_out[px].round() as u16;
         }
@@ -115,15 +125,19 @@ fn blur_a(src: &[u16], width: usize, height: usize, kernel: &[f32],
         for x0 in (0..width).step_by(VTILE) {
             let x1 = (x0 + VTILE).min(width);
             let tile = x1 - x0;
-            for xi in 0..tile { acc_r[xi] = 0.0; acc_g[xi] = 0.0; acc_b[xi] = 0.0; }
+            for xi in 0..tile {
+                acc_r[xi] = 0.0;
+                acc_g[xi] = 0.0;
+                acc_b[xi] = 0.0;
+            }
             for ki in 0..klen {
                 let kv = kernel[ki];
-                let yi = (y as isize + ki as isize - half as isize)
-                    .clamp(0, height as isize - 1) as usize;
+                let yi = (y as isize + ki as isize - half as isize).clamp(0, height as isize - 1)
+                    as usize;
                 let row_base = yi * width * 3;
                 for xi in 0..tile {
                     let b = row_base + (x0 + xi) * 3;
-                    r_tap[xi] = temp[b]     as f32;
+                    r_tap[xi] = temp[b] as f32;
                     g_tap[xi] = temp[b + 1] as f32;
                     b_tap[xi] = temp[b + 2] as f32;
                 }
@@ -135,7 +149,7 @@ fn blur_a(src: &[u16], width: usize, height: usize, kernel: &[f32],
             }
             for xi in 0..tile {
                 let b = (y * width + x0 + xi) * 3;
-                out[b]     = acc_r[xi].round() as u16;
+                out[b] = acc_r[xi].round() as u16;
                 out[b + 1] = acc_g[xi].round() as u16;
                 out[b + 2] = acc_b[xi].round() as u16;
             }
@@ -144,8 +158,14 @@ fn blur_a(src: &[u16], width: usize, height: usize, kernel: &[f32],
 }
 
 // ── B: stash{1} cache-tiled strips ─────────────────────────────────────────────
-fn blur_b(src: &[u16], width: usize, height: usize, kernel: &[f32],
-          temp: &mut Vec<u16>, out: &mut Vec<u16>) {
+fn blur_b(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    temp: &mut Vec<u16>,
+    out: &mut Vec<u16>,
+) {
     let half = kernel.len() / 2;
     let buf_rows = STRIP_H + 2 * half;
     temp.resize(buf_rows * width * 3, 0);
@@ -169,8 +189,8 @@ fn blur_b(src: &[u16], width: usize, height: usize, kernel: &[f32],
             for x in 0..int_start.min(width) {
                 let mut acc = [0f32; 3];
                 for (ki, &kv) in kernel.iter().enumerate() {
-                    let xi = (x as isize + ki as isize - half as isize)
-                        .clamp(0, width as isize - 1) as usize;
+                    let xi = (x as isize + ki as isize - half as isize).clamp(0, width as isize - 1)
+                        as usize;
                     let b = src_base + xi * 3;
                     acc[0] += src[b] as f32 * kv;
                     acc[1] += src[b + 1] as f32 * kv;
@@ -200,8 +220,8 @@ fn blur_b(src: &[u16], width: usize, height: usize, kernel: &[f32],
             for x in right_start..width {
                 let mut acc = [0f32; 3];
                 for (ki, &kv) in kernel.iter().enumerate() {
-                    let xi = (x as isize + ki as isize - half as isize)
-                        .clamp(0, width as isize - 1) as usize;
+                    let xi = (x as isize + ki as isize - half as isize).clamp(0, width as isize - 1)
+                        as usize;
                     let b = src_base + xi * 3;
                     acc[0] += src[b] as f32 * kv;
                     acc[1] += src[b + 1] as f32 * kv;
@@ -275,7 +295,10 @@ fn run_case(label: &str, width: usize, height: usize, kernel: &[f32], rounds: us
         let d = (oa[i] as i32 - ob[i] as i32).abs();
         if d > 0 {
             nmis += 1;
-            if d > max_diff { max_diff = d; worst_idx = i; }
+            if d > max_diff {
+                max_diff = d;
+                worst_idx = i;
+            }
         }
     }
     let worst_row = (worst_idx / 3) / width;
@@ -315,11 +338,21 @@ fn run_case(label: &str, width: usize, height: usize, kernel: &[f32], rounds: us
     let verdict = if max_diff == 0 {
         "EXACT".to_string()
     } else {
-        format!("max|Δ|={} ({:.4}% px, worst row {})", max_diff, pct_mis, worst_row)
+        format!(
+            "max|Δ|={} ({:.4}% px, worst row {})",
+            max_diff, pct_mis, worst_row
+        )
     };
     println!(
         "{:>18} {:>5}×{:<5} k{:<2} | A {:>8.2}ms  B {:>8.2}ms  saved {:>6.1}%  | parity {}",
-        label, width, height, kernel.len(), ma, mb, saved, verdict
+        label,
+        width,
+        height,
+        kernel.len(),
+        ma,
+        mb,
+        saved,
+        verdict
     );
 }
 
@@ -333,5 +366,8 @@ fn main() {
     run_case("24MP", 6000, 4000, &k13, 7);
     run_case("20MP (5-tap)", 5184, 3888, &k5, 7);
     println!("\nGate ≥5% (median, round0 dropped). max|Δ| should be a few LSB (FMA/layout);");
-    println!("a spike concentrated at a row multiple of {} would mean a strip-seam bug.", STRIP_H);
+    println!(
+        "a spike concentrated at a row multiple of {} would mean a strip-seam bug.",
+        STRIP_H
+    );
 }

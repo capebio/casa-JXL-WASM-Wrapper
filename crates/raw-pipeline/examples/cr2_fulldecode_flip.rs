@@ -12,9 +12,9 @@ use raw_pipeline::cr2;
 use std::time::Instant;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter\tests\_MG_1750.CR2".into()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\Foo\raw-converter\tests\_MG_1750.CR2".into());
     let data = std::fs::read(&path).expect("read CR2");
 
     // parity (warm pair)
@@ -54,7 +54,11 @@ fn main() {
     println!("full decode_bytes (multi-slice), interleaved {rounds} rounds, round0 dropped:");
     println!("  A scatter (pre-#1): {ma:.1} ms");
     println!("  B bulk    (#1):     {mb:.1} ms");
-    println!("  saved: {:.1} ms  ({:.1}%)  parity: {}",
-        ma - mb, (ma - mb) / ma * 100.0, if exact { "EXACT" } else { "DIFF!" });
+    println!(
+        "  saved: {:.1} ms  ({:.1}%)  parity: {}",
+        ma - mb,
+        (ma - mb) / ma * 100.0,
+        if exact { "EXACT" } else { "DIFF!" }
+    );
     assert!(exact, "parity broken");
 }

@@ -5,7 +5,9 @@
 //!        --example pipeline_profile -- <path-to.orf>
 //! Default file: C:/Foo/raw-converter/tests/P1110226.ORF
 
-use raw_pipeline::tiff::{bench_pipeline_orf, bench_tone_e2e_orf, bench_tone_split_orf, bench_tone_stage_3way_orf};
+use raw_pipeline::tiff::{
+    bench_pipeline_orf, bench_tone_e2e_orf, bench_tone_split_orf, bench_tone_stage_3way_orf,
+};
 use std::fs;
 
 fn med(mut v: Vec<f64>) -> f64 {
@@ -53,7 +55,11 @@ fn main() {
     let math = (f - l).max(0.0);
     println!("\ntone sub-profile (single-thread, median of {}):", runs);
     println!("  LUT gather+store {:9.2} ms  {:5.1}%", l, 100.0 * l / f);
-    println!("  apply_tone_math  {:9.2} ms  {:5.1}%  (matrix + sat/vibrance + divide)", math, 100.0 * math / f);
+    println!(
+        "  apply_tone_math  {:9.2} ms  {:5.1}%  (matrix + sat/vibrance + divide)",
+        math,
+        100.0 * math / f
+    );
     println!("  tone full        {:9.2} ms", f);
 
     // 3-stage sub-profile: pre-LUT gather / tone math / post-LUT gather.
@@ -61,14 +67,31 @@ fn main() {
     let (mut pre, mut math2, mut post) = (Vec::new(), Vec::new(), Vec::new());
     for _ in 0..runs {
         let (pr, ma, po) = bench_tone_stage_3way_orf(&data).expect("3way");
-        pre.push(pr); math2.push(ma); post.push(po);
+        pre.push(pr);
+        math2.push(ma);
+        post.push(po);
     }
     let (pr, ma, po) = (med(pre), med(math2), med(post));
     let subtotal = pr + ma + po;
-    println!("\ntone 3-stage sub-profile (single-thread, compact pre-LUT, median of {}):", runs);
-    println!("  pre-LUT gather   {:9.2} ms  {:5.1}%", pr, 100.0 * pr / subtotal);
-    println!("  tone math        {:9.2} ms  {:5.1}%", ma, 100.0 * ma / subtotal);
-    println!("  post-LUT gather  {:9.2} ms  {:5.1}%", po, 100.0 * po / subtotal);
+    println!(
+        "\ntone 3-stage sub-profile (single-thread, compact pre-LUT, median of {}):",
+        runs
+    );
+    println!(
+        "  pre-LUT gather   {:9.2} ms  {:5.1}%",
+        pr,
+        100.0 * pr / subtotal
+    );
+    println!(
+        "  tone math        {:9.2} ms  {:5.1}%",
+        ma,
+        100.0 * ma / subtotal
+    );
+    println!(
+        "  post-LUT gather  {:9.2} ms  {:5.1}%",
+        po,
+        100.0 * po / subtotal
+    );
     println!("  ──────────────────────────────────────");
     println!("  (3-stage total   {:9.2} ms)", subtotal);
 
@@ -85,7 +108,12 @@ fn main() {
     println!("\nend-to-end tone (parallel, median of {}):", runs);
     println!("  scalar process_into      {:9.2} ms", s);
     println!("  SIMD   process_into_simd {:9.2} ms   ({:.2}x)", i, s / i);
-    println!("  output parity: {} px differ (of {}), max byte diff {}", nd, mp_px(wh), md);
+    println!(
+        "  output parity: {} px differ (of {}), max byte diff {}",
+        nd,
+        mp_px(wh),
+        md
+    );
 }
 
 fn mp_px(wh: (u32, u32)) -> usize {

@@ -31,7 +31,11 @@ fn median(v: &[f64]) -> f64 {
 
 fn run_case(label: &str, rgba: &[u8], expect: bool) {
     assert_eq!(alpha_a(rgba), expect, "{label}: A wrong result");
-    assert_eq!(alpha_b(rgba), expect, "{label}: B wrong result / parity broken");
+    assert_eq!(
+        alpha_b(rgba),
+        expect,
+        "{label}: B wrong result / parity broken"
+    );
 
     let rounds = 11usize;
     let (mut ta, mut tb) = (Vec::new(), Vec::new());
@@ -54,7 +58,10 @@ fn run_case(label: &str, rgba: &[u8], expect: bool) {
     std::hint::black_box(sink);
     let (ma, mb) = (median(&ta), median(&tb));
     let saved = (ma - mb) / ma * 100.0;
-    println!("{:>22} | A {:>8.4}ms  B {:>8.4}ms  saved {:>6.1}%  (result {})", label, ma, mb, saved, expect);
+    println!(
+        "{:>22} | A {:>8.4}ms  B {:>8.4}ms  saved {:>6.1}%  (result {})",
+        label, ma, mb, saved, expect
+    );
 }
 
 fn main() {
@@ -71,5 +78,7 @@ fn main() {
     println!("has_meaningful_alpha flip — A=chunks_exact(4).any  B=[3..].step_by(4).any  @24MP\n");
     run_case("opaque (false)", &opaque, false);
     run_case("alpha at tail (true)", &tail, true);
-    println!("\nGate ≥5% on the opaque row decides item 3. If A ≥ B, keep current chunks_exact form.");
+    println!(
+        "\nGate ≥5% on the opaque row decides item 3. If A ≥ B, keep current chunks_exact form."
+    );
 }

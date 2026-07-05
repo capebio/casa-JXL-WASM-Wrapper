@@ -68,16 +68,28 @@ fn peak_mem_stream_vs_full() {
     PEAK.store(base_stream, Ordering::Relaxed);
     {
         let previews = stream_preview::build_previews_streaming(
-            decompress::OrfRowDecoder::new(&payload, w, h).unwrap(), w, h, (0, 0), &[(300, 300)],
-        ).unwrap();
+            decompress::OrfRowDecoder::new(&payload, w, h).unwrap(),
+            w,
+            h,
+            (0, 0),
+            &[(300, 300)],
+        )
+        .unwrap();
         std::hint::black_box(&previews);
     }
     let stream_peak = PEAK.load(Ordering::Relaxed) - base_stream;
 
     println!(
         "working-set peak (above input): full={} bytes  stream={} bytes  ratio={:.3}",
-        full_peak, stream_peak, stream_peak as f64 / full_peak as f64
+        full_peak,
+        stream_peak,
+        stream_peak as f64 / full_peak as f64
     );
     // Design target is < 1/4; assert a robust < 1/3 to avoid allocator-granularity flake.
-    assert!(stream_peak * 3 < full_peak, "streaming peak {} not < full/3 {}", stream_peak, full_peak);
+    assert!(
+        stream_peak * 3 < full_peak,
+        "streaming peak {} not < full/3 {}",
+        stream_peak,
+        full_peak
+    );
 }

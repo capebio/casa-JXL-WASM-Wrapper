@@ -4,9 +4,9 @@
 use raw_pipeline::cr2;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter\tests\ADH 1234.CR2".into()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\Foo\raw-converter\tests\ADH 1234.CR2".into());
     let data = std::fs::read(&path).expect("read CR2");
     let (_img, stats) = cr2::decode_bytes_with_ljpeg_stats(&data).expect("decode CR2");
     let kernel = match (stats.cps as usize, stats.precision) {
@@ -17,6 +17,9 @@ fn main() {
     println!(
         "{}: cps={} precision={} -> {}  ({} symbols)",
         path.rsplit(['\\', '/']).next().unwrap_or(&path),
-        stats.cps, stats.precision, kernel, stats.total_symbols,
+        stats.cps,
+        stats.precision,
+        kernel,
+        stats.total_symbols,
     );
 }

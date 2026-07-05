@@ -13,10 +13,12 @@ fn main() {
     let (w, h) = (4000usize, 3000usize); // 12 MP, typical phone DNG
     let phase = (0u8, 0u8);
     let mut s: u32 = 0x9e37_79b9;
-    let raw: Vec<u16> = (0..w * h).map(|_| {
-        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        ((s >> 12) & 0x3fff) as u16
-    }).collect();
+    let raw: Vec<u16> = (0..w * h)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((s >> 12) & 0x3fff) as u16
+        })
+        .collect();
 
     let exact = demosaic_bayer_mhc(&raw, w, h, phase).unwrap()
         == demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
@@ -39,14 +41,24 @@ fn main() {
     let (mut ta, mut tb) = (Vec::new(), Vec::new());
     let mut sink = 0u64;
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(time(&run_a, &mut sink)); tb.push(time(&run_b, &mut sink)); }
-        else { tb.push(time(&run_b, &mut sink)); ta.push(time(&run_a, &mut sink)); }
+        if r % 2 == 0 {
+            ta.push(time(&run_a, &mut sink));
+            tb.push(time(&run_b, &mut sink));
+        } else {
+            tb.push(time(&run_b, &mut sink));
+            ta.push(time(&run_a, &mut sink));
+        }
     }
     std::hint::black_box(sink);
     let (ma, mb) = (med(&ta), med(&tb));
-    println!("DNG MHC demosaic interior-split flip  {w}x{h} (12 MP)  parity: {}",
-        if exact { "EXACT" } else { "DIFF!" });
-    println!("  clamped(ref)={ma:.3}ms  interior-split={mb:.3}ms  saved={:.1}% ({:.1}ms)",
-        (ma - mb) / ma * 100.0, ma - mb);
+    println!(
+        "DNG MHC demosaic interior-split flip  {w}x{h} (12 MP)  parity: {}",
+        if exact { "EXACT" } else { "DIFF!" }
+    );
+    println!(
+        "  clamped(ref)={ma:.3}ms  interior-split={mb:.3}ms  saved={:.1}% ({:.1}ms)",
+        (ma - mb) / ma * 100.0,
+        ma - mb
+    );
     assert!(exact, "parity broken");
 }

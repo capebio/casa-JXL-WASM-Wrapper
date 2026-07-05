@@ -6,7 +6,11 @@
 //! Run: cargo run --release --no-default-features --features jxl-codec \
 //!        --example encoder_ab_ffi -- "C:\995\2026-02-20 Gobabeb To Windhoek" 12
 use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
-use raw_pipeline::{decompress, demosaic, pipeline::{self, PipelineParams}, tiff};
+use raw_pipeline::{
+    decompress, demosaic,
+    pipeline::{self, PipelineParams},
+    tiff,
+};
 use rayon::prelude::*;
 use std::io::Write;
 use std::time::Instant;
@@ -31,22 +35,41 @@ fn decode(path: &str) -> Option<(Vec<u8>, u32, u32)> {
 }
 
 fn casa_encode(rgb: &[u8], w: u32, h: u32, threads: usize) -> usize {
-    let opts = EncodeOptions { use_container: true, ..EncodeOptions::distance(1.0).with_effort(std::env::var("EFFORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3)) };
+    let opts = EncodeOptions {
+        use_container: true,
+        ..EncodeOptions::distance(1.0).with_effort(
+            std::env::var("EFFORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+        )
+    };
     let mut enc = Encoder::with_threads(opts, threads).expect("encoder");
     let mut out = Vec::with_capacity(rgb.len() / 3);
-    enc.encode_into(&Frame::rgb(rgb, w, h), &mut out).expect("encode");
+    enc.encode_into(&Frame::rgb(rgb, w, h), &mut out)
+        .expect("encode");
     out.len()
 }
 
 fn main() {
-    let folder = std::env::args().nth(1).unwrap_or_else(|| r"C:\995\2026-02-20 Gobabeb To Windhoek".into());
-    let n: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(12);
+    let folder = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\995\2026-02-20 Gobabeb To Windhoek".into());
+    let n: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
 
     let mut files: Vec<_> = std::fs::read_dir(&folder)
         .expect("readdir")
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("orf")).unwrap_or(false))
+        .filter(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x.eq_ignore_ascii_case("orf"))
+                .unwrap_or(false)
+        })
         .collect();
     files.sort();
     files.truncate(n);
@@ -63,19 +86,41 @@ fn main() {
         f.write_all(&rgb).unwrap();
         imgs.push((rgb, w, h));
     }
-    println!("decoded + dumped {} imgs -> {}", imgs.len(), dumpdir.display());
-    println!("stack: Casa -> jxl-ffi -> libjxl 0.11.2 ; 12-wide x 1 thread ; d=1.0(=q90) effort=3\n");
+    println!(
+        "decoded + dumped {} imgs -> {}",
+        imgs.len(),
+        dumpdir.display()
+    );
+    println!(
+        "stack: Casa -> jxl-ffi -> libjxl 0.11.2 ; 12-wide x 1 thread ; d=1.0(=q90) effort=3\n"
+    );
 
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(imgs.len().max(1)).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(imgs.len().max(1))
+        .build()
+        .unwrap();
     let mut secs = Vec::new();
     for r in 1..=3 {
         let t = Instant::now();
-        let acc: usize = pool.install(|| imgs.par_iter().map(|(rgb, w, h)| casa_encode(rgb, *w, *h, 1)).sum());
-        println!("  bytes_total: {} ({:.1} KB/img)", acc, acc as f64/1024.0/imgs.len() as f64); std::hint::black_box(acc);
+        let acc: usize = pool.install(|| {
+            imgs.par_iter()
+                .map(|(rgb, w, h)| casa_encode(rgb, *w, *h, 1))
+                .sum()
+        });
+        println!(
+            "  bytes_total: {} ({:.1} KB/img)",
+            acc,
+            acc as f64 / 1024.0 / imgs.len() as f64
+        );
+        std::hint::black_box(acc);
         let s = t.elapsed().as_secs_f64();
         println!("round {r}: {s:.3}s  {:.2} files/sec", imgs.len() as f64 / s);
         secs.push(s);
     }
     secs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!("\njxl-ffi (libjxl 0.11.2) median: {:.3}s  {:.2} files/sec", secs[1], imgs.len() as f64 / secs[1]);
+    println!(
+        "\njxl-ffi (libjxl 0.11.2) median: {:.3}s  {:.2} files/sec",
+        secs[1],
+        imgs.len() as f64 / secs[1]
+    );
 }

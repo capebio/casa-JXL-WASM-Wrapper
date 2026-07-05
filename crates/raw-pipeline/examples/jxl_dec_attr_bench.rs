@@ -51,14 +51,16 @@
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 mod bench {
     use raw_pipeline::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
-    use raw_pipeline::jxl_casaencoder::{Encoder, EncodeOptions, Frame};
+    use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
 
     fn mkpix(w: u32, h: u32, seed: u64) -> Vec<u8> {
         let n = (w as usize) * (h as usize) * 3;
         let mut v = Vec::with_capacity(n);
         let mut s = seed;
         for _ in 0..n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             v.push(((s >> 33) & 0xff) as u8);
         }
         v
@@ -81,8 +83,11 @@ mod bench {
         const WARMUP: usize = 5;
         const ITERS: usize = 60;
 
-        let mut dec = Decoder::new(DecodeOptions { parallel: false, ..Default::default() })
-            .expect("JxlDecoderCreate");
+        let mut dec = Decoder::new(DecodeOptions {
+            parallel: false,
+            ..Default::default()
+        })
+        .expect("JxlDecoderCreate");
 
         for _ in 0..WARMUP {
             let _ = dec.decode::<u8>(jxl, Channels::Rgb).expect("warmup");

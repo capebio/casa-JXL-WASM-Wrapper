@@ -9,7 +9,7 @@
 //!          --example cr2_demosaic_realfile_flip -- [path/to/_MG_1744.CR2]
 
 use raw_pipeline::cr2;
-use raw_pipeline::demosaic::{demosaic_rggb, demosaic_bayer_mhc};
+use raw_pipeline::demosaic::{demosaic_bayer_mhc, demosaic_rggb};
 use std::time::Instant;
 
 fn median(v: &mut Vec<f64>) -> f64 {
@@ -29,24 +29,28 @@ fn checksum(data: &[u16]) -> u64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cr2_path = args.get(1).cloned()
+    let cr2_path = args
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| r"C:/Foo/raw-converter/tests/_MG_1744.CR2".into());
 
     eprintln!("Reading {cr2_path} ...");
-    let data = std::fs::read(&cr2_path)
-        .unwrap_or_else(|e| panic!("Cannot read {cr2_path}: {e}"));
+    let data = std::fs::read(&cr2_path).unwrap_or_else(|e| panic!("Cannot read {cr2_path}: {e}"));
 
     eprintln!("Decoding CR2 (LJPEG + crop, not timed) ...");
-    let img = cr2::decode_bytes(&data)
-        .unwrap_or_else(|e| panic!("CR2 decode failed: {e}"));
+    let img = cr2::decode_bytes(&data).unwrap_or_else(|e| panic!("CR2 decode failed: {e}"));
 
     let w = img.width;
     let h = img.height;
     let raw = &img.raw;
     let phase = (0u8, 0u8); // RGGB — CR2 Bayer phase
 
-    eprintln!("CR2 decoded: {w}x{h} ({:.1} MP)  black={} white={}",
-        w as f64 * h as f64 / 1e6, img.black, img.white);
+    eprintln!(
+        "CR2 decoded: {w}x{h} ({:.1} MP)  black={} white={}",
+        w as f64 * h as f64 / 1e6,
+        img.black,
+        img.white
+    );
     eprintln!("Model: {} {}  ISO: {:?}", img.make, img.model, img.iso);
     eprintln!("Running demosaic flipflop (bilinear vs MHC) ...\n");
 
@@ -127,6 +131,8 @@ fn main() {
         println!("VERDICT: bilinear marginally faster ({speedup:.2}x) — gate FAILS (< 1.05×).");
         println!("  On real files MHC overhead is negligible. Re-evaluate.");
     } else {
-        println!("VERDICT: MHC faster than bilinear ({speedup:.2}x) — unexpected. Check build flags.");
+        println!(
+            "VERDICT: MHC faster than bilinear ({speedup:.2}x) — unexpected. Check build flags."
+        );
     }
 }

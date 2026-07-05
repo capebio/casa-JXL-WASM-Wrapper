@@ -9,18 +9,22 @@
 use raw_pipeline::{cr2, ljpeg};
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter\tests\ADH 1234.CR2".into()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\Foo\raw-converter\tests\ADH 1234.CR2".into());
     let data = std::fs::read(&path).expect("read CR2");
     let (off, len, stride, rows) = cr2::ljpeg_strip_geometry(&data).expect("geometry");
     let si = cr2::parse_sensor_info(&data).expect("SensorInfo");
     let img = cr2::decode_bytes(&data).expect("decode");
     let (cw, ch) = (img.width, img.height);
     let mut lc = (stride - cw) / 2;
-    if lc & 1 != 0 { lc -= 1; }
+    if lc & 1 != 0 {
+        lc -= 1;
+    }
     let mut tc = (rows - ch) / 2;
-    if tc & 1 != 0 { tc -= 1; }
+    if tc & 1 != 0 {
+        tc -= 1;
+    }
 
     let mut grid = vec![0u16; stride * rows];
     ljpeg::decode_tile(&data[off..off + len], &mut grid, 0, stride, stride, rows)
@@ -39,11 +43,32 @@ fn main() {
     };
 
     let ls = si.left as usize;
-    println!("file: {}  grid {stride}x{rows}  black={} white={}",
-        path.rsplit(['\\', '/']).next().unwrap_or(&path), img.black, img.white);
-    println!("center-crop left edge   cols {:>4}..{:<4} mean = {:>8.1}", lc, lc + 8, band_mean(lc, 8));
-    println!("active-area left edge   cols {:>4}..{:<4} mean = {:>8.1}", ls, ls + 8, band_mean(ls, 8));
-    println!("dropped-right (active)  cols {:>4}..{:<4} mean = {:>8.1}",
-        lc + cw, lc + cw + 8, band_mean(lc + cw, 8));
-    println!("far-left optical black  cols    0..8    mean = {:>8.1}", band_mean(0, 8));
+    println!(
+        "file: {}  grid {stride}x{rows}  black={} white={}",
+        path.rsplit(['\\', '/']).next().unwrap_or(&path),
+        img.black,
+        img.white
+    );
+    println!(
+        "center-crop left edge   cols {:>4}..{:<4} mean = {:>8.1}",
+        lc,
+        lc + 8,
+        band_mean(lc, 8)
+    );
+    println!(
+        "active-area left edge   cols {:>4}..{:<4} mean = {:>8.1}",
+        ls,
+        ls + 8,
+        band_mean(ls, 8)
+    );
+    println!(
+        "dropped-right (active)  cols {:>4}..{:<4} mean = {:>8.1}",
+        lc + cw,
+        lc + cw + 8,
+        band_mean(lc + cw, 8)
+    );
+    println!(
+        "far-left optical black  cols    0..8    mean = {:>8.1}",
+        band_mean(0, 8)
+    );
 }

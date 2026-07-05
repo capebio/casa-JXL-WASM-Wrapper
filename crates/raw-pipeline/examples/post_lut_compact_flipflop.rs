@@ -126,10 +126,20 @@ fn main() {
     let saved = (ma - mb) / ma * 100.0;
 
     println!("post_lut_compact_flipflop  n={n}  (sink={sink:.0})");
-    println!("  correctness: max_diff={max_diff}  pixels with diff>1: {diff_count}  -> {}",
-        if max_diff <= 2 { "PASS (≤2 byte tolerance)" } else { "INVESTIGATE" });
+    println!(
+        "  correctness: max_diff={max_diff}  pixels with diff>1: {diff_count}  -> {}",
+        if max_diff <= 2 {
+            "PASS (≤2 byte tolerance)"
+        } else {
+            "INVESTIGATE"
+        }
+    );
     println!("  A (full 65k):    {ma:.2} ms  (65 KB footprint)");
     println!("  B (compact 4k):  {mb:.2} ms  (4 KB footprint, 16x smaller)");
-    let dir = if saved > 0.0 { "faster".to_string() } else { format!("slower ({}%)", -(saved as i32)) };
+    let dir = if saved > 0.0 {
+        "faster".to_string()
+    } else {
+        format!("slower ({}%)", -(saved as i32))
+    };
     println!("  B speedup:       {saved:.1}% {dir}");
 }

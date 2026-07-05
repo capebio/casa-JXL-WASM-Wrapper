@@ -81,8 +81,16 @@ fn main() {
         // full-frame residual P-frames (SkipMode::None), 6 GOPs.
         write(
             "none_g8_e1.casv",
-            &encode_casv_delta_rgb8(&refs, w, h, 24, 1, 8, EncodeOptions::lossless().with_effort(1))
-                .unwrap(),
+            &encode_casv_delta_rgb8(
+                &refs,
+                w,
+                h,
+                24,
+                1,
+                8,
+                EncodeOptions::lossless().with_effort(1),
+            )
+            .unwrap(),
         );
         // lossless tile residual, 6 GOPs.
         write(
@@ -105,7 +113,10 @@ fn main() {
             &encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, 1.0, 6).unwrap(),
         );
         // JOLT batch (header format, tile REPLACE).
-        write("jolt_bal_hdr.casv", &jolt_encode(&refs, w, h, 24, 1, JoltPreset::Balanced).unwrap());
+        write(
+            "jolt_bal_hdr.casv",
+            &jolt_encode(&refs, w, h, 24, 1, JoltPreset::Balanced).unwrap(),
+        );
         // streaming header-format encode (chunked I-frames + bbox replace).
         let sopts = CasaVideoOptions {
             rate: VideoRate::Lossy(1.0),
@@ -115,8 +126,16 @@ fn main() {
             effort: 3,
             thresh: None,
         };
-        let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
-        write("stream_hdr_bbox_g8.casv", &encode_casv_video_streaming(&mut src, &sopts).unwrap());
+        let mut src = VecFrames {
+            frames: frames.clone(),
+            i: 0,
+            w,
+            h,
+        };
+        write(
+            "stream_hdr_bbox_g8.casv",
+            &encode_casv_video_streaming(&mut src, &sopts).unwrap(),
+        );
 
         // Footer-format (streamed) JOLT presets — the jolt_bench decode path.
         for (name, preset) in [
@@ -124,7 +143,12 @@ fn main() {
             ("jolt_bal_ftr.casv", JoltPreset::Balanced),
             ("jolt_q_ftr.casv", JoltPreset::Quality),
         ] {
-            let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+            let mut src = VecFrames {
+                frames: frames.clone(),
+                i: 0,
+                w,
+                h,
+            };
             let mut sink: Vec<u8> = Vec::new();
             jolt_encode_stream_to(&mut src, preset, &mut sink).unwrap();
             write(name, &sink);
@@ -158,8 +182,10 @@ fn main() {
                 *k += 1;
             };
             let n = if is_footer {
-                decode_casv_footer_for_each_rgb8(&data, |i, px, dw, dh| check(i, px, dw, dh, &mut k))
-                    .expect("footer for_each decode")
+                decode_casv_footer_for_each_rgb8(&data, |i, px, dw, dh| {
+                    check(i, px, dw, dh, &mut k)
+                })
+                .expect("footer for_each decode")
             } else {
                 decode_casv_for_each_rgb8(&data, |i, px, dw, dh| check(i, px, dw, dh, &mut k))
                     .expect("for_each decode")
@@ -173,7 +199,9 @@ fn main() {
     if mode == "mt" {
         // Verify MT == ST bytes on the whole corpus (header-format files) and
         // report sequential-playback decode times per thread width.
-        let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8);
         let mut names: Vec<_> = std::fs::read_dir(&dir)
             .expect("read corpus dir")
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -230,7 +258,11 @@ fn main() {
         for (px, _, _) in &frames {
             hasher.update(px);
         }
-        println!("{name} all[{}] sha256={:x}", frames.len(), hasher.finalize());
+        println!(
+            "{name} all[{}] sha256={:x}",
+            frames.len(),
+            hasher.finalize()
+        );
 
         // Random-access probes (header format only): I-frame, early P, GOP edges, last.
         if !is_footer {

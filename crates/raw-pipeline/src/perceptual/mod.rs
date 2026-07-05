@@ -5,10 +5,10 @@
 mod blur;
 pub(crate) mod butteraugli;
 mod psnr;
+mod simd;
 pub(crate) mod ssim;
 pub mod telemetry;
 pub(crate) mod xyb;
-mod simd;
 pub use simd::{detect_native, Backend};
 // wasm-only: surface the v128 kernels so the bench-wasm harness can A/B them in a
 // real wasm runtime (the kernels are arch-gated internally, so this is invisible to
@@ -19,7 +19,7 @@ pub use simd::wasm as wasm_kernels;
 // fns are arch-gated + unsafe; this just lets an out-of-crate example A/B them.
 #[cfg(target_arch = "x86_64")]
 pub use simd::avx2 as avx2_kernels;
-pub use telemetry::{TelemetryMetrics, RgbHistogram, analyze_fused};
+pub use telemetry::{analyze_fused, RgbHistogram, TelemetryMetrics};
 
 pub use butteraugli::Kweights;
 
@@ -46,7 +46,11 @@ pub struct Opts {
 }
 impl Default for Opts {
     fn default() -> Self {
-        Opts { weights: [4.0, 2.0, 1.0], k: Kweights::default(), backend: BackendChoice::Auto }
+        Opts {
+            weights: [4.0, 2.0, 1.0],
+            k: Kweights::default(),
+            backend: BackendChoice::Auto,
+        }
     }
 }
 
@@ -147,16 +151,34 @@ impl Comparer {
                 // at s=1. Dispatched (not scalar dn2_into) so the reference pyramid uses the
                 // same SIMD downsample as the test side; the scalar fallback
                 // (downsample_inplace) is byte-identical to the old dn2_into path.
-                levels.push(Level { x: cx, y: cy, b: cb, mask, w, h });
+                levels.push(Level {
+                    x: cx,
+                    y: cy,
+                    b: cb,
+                    mask,
+                    w,
+                    h,
+                });
                 let lvl = levels.last().expect("level just pushed");
                 downsample_one(backend, &lvl.x, &mut nx, w, h, dw, dh);
                 downsample_one(backend, &lvl.y, &mut ny, w, h, dw, dh);
                 downsample_one(backend, &lvl.b, &mut nb, w, h, dw, dh);
-                cx = nx; cy = ny; cb = nb; w = dw; h = dh;
+                cx = nx;
+                cy = ny;
+                cb = nb;
+                w = dw;
+                h = dh;
             } else {
                 // Last level (s==2, or image too small to downsample): move cx/cy/cb
                 // directly into the Level — saves 3 × n f32 allocations (up to 288 MB at 24MP).
-                levels.push(Level { x: cx, y: cy, b: cb, mask, w, h });
+                levels.push(Level {
+                    x: cx,
+                    y: cy,
+                    b: cb,
+                    mask,
+                    w,
+                    h,
+                });
                 break;
             }
         }
@@ -164,11 +186,21 @@ impl Comparer {
         // `backend` was resolved above (before the reference XYB build) via
         // resolve_backend(&opts).
         Comparer {
-            width, height, n, opts, backend, levels,
+            width,
+            height,
+            n,
+            opts,
+            backend,
+            levels,
             ref_rgba, // CRAWL C-7: moved in (was ref_rgba.to_vec() — a full n*4 copy)
-            ssim_sb, ssim_sbb,
-            tx: vec![0f32; n], ty: vec![0f32; n], tb: vec![0f32; n],
-            dx: vec![0f32; n], dy: vec![0f32; n], db: vec![0f32; n],
+            ssim_sb,
+            ssim_sbb,
+            tx: vec![0f32; n],
+            ty: vec![0f32; n],
+            tb: vec![0f32; n],
+            dx: vec![0f32; n],
+            dy: vec![0f32; n],
+            db: vec![0f32; n],
         }
     }
 
@@ -176,7 +208,14 @@ impl Comparer {
         // Same conversion the reference pyramid used in Comparer::new (convert_xyb).
         // On AVX2 this is the scalar-LUT kernel — flip-measured ~2.6× over the
         // i32-gather kernel at 1/6/24 MP (examples/xyb_gather_flip.rs).
-        convert_xyb(self.backend, test, self.n, &mut self.tx, &mut self.ty, &mut self.tb);
+        convert_xyb(
+            self.backend,
+            test,
+            self.n,
+            &mut self.tx,
+            &mut self.ty,
+            &mut self.tb,
+        );
     }
 
     fn downsample_dispatch(&mut self, w: usize, h: usize, dw: usize, dh: usize) {
@@ -243,7 +282,8 @@ impl Comparer {
             if s < num_levels - 1 && w > 1 && h > 1 {
                 let (dw, dh) = ((w >> 1).max(1), (h >> 1).max(1));
                 self.downsample_dispatch(w, h, dw, dh);
-                w = dw; h = dh;
+                w = dw;
+                h = dh;
             }
         }
         // Divide by the sum of weights for the EVALUATED levels only.
@@ -279,8 +319,13 @@ impl Comparer {
             // exact). The AVX2 *deinterleave* attempt that lost was a different layout — the
             // scalar `ssim_moments_avx2` is retained as the parity oracle for tests + flip.
             Backend::Avx2Strict | Backend::Avx2Rsqrt => {
-                let (sa, saa, sab) = unsafe { simd::avx2::ssim_moments_avx2_cal(test, &self.ref_rgba, self.n) };
-                (ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3), sa, saa)
+                let (sa, saa, sab) =
+                    unsafe { simd::avx2::ssim_moments_avx2_cal(test, &self.ref_rgba, self.n) };
+                (
+                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
+                    sa,
+                    saa,
+                )
             }
             #[cfg(target_arch = "x86_64")]
             // Server option: channel-as-lane SIMD moments (16-wide, 4 px/iter). The
@@ -288,18 +333,31 @@ impl Comparer {
             // overturning the AVX2 deinterleave "no win"; this is its AVX-512 width,
             // active whenever an AVX-512 backend is selected (auto on server hardware).
             Backend::Avx512Strict | Backend::Avx512Rsqrt => {
-                let (sa, saa, sab) = unsafe { simd::avx512::ssim_moments_avx512(test, &self.ref_rgba, self.n) };
-                (ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3), sa, saa)
+                let (sa, saa, sab) =
+                    unsafe { simd::avx512::ssim_moments_avx512(test, &self.ref_rgba, self.n) };
+                (
+                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
+                    sa,
+                    saa,
+                )
             }
             #[cfg(target_arch = "wasm32")]
             // wasm v128 channel-as-lane moments — bench-measured 3.73× over scalar.
             Backend::WasmSimd => {
                 let (sa, saa, sab) = simd::wasm::ssim_moments_wasm(test, &self.ref_rgba, self.n);
-                (ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3), sa, saa)
+                (
+                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
+                    sa,
+                    saa,
+                )
             }
             _ => {
                 let (sa, saa, sab) = ssim::ssim_sums(test, &self.ref_rgba, self.n, 4);
-                (ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3), sa, saa)
+                (
+                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
+                    sa,
+                    saa,
+                )
             }
         }
     }
@@ -312,7 +370,10 @@ impl Comparer {
             #[cfg(target_arch = "x86_64")]
             // AVX-512 arms intentionally call the avx2 psnr (ssd) kernel: no AVX-512
             // PSNR implementation exists yet; avx2+fma is implied by AVX-512 hardware.
-            Backend::Avx2Strict | Backend::Avx2Rsqrt | Backend::Avx512Strict | Backend::Avx512Rsqrt => {
+            Backend::Avx2Strict
+            | Backend::Avx2Rsqrt
+            | Backend::Avx512Strict
+            | Backend::Avx512Rsqrt => {
                 let sum_sq = unsafe { simd::avx2::ssd_avx2(test, &self.ref_rgba) };
                 if sum_sq == 0 {
                     return f32::INFINITY;
@@ -341,22 +402,32 @@ impl Comparer {
         match self.backend {
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2Strict => unsafe {
-                simd::avx2::scale_err_avx2(&lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, false)
+                simd::avx2::scale_err_avx2(
+                    &lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, false,
+                )
             },
             #[cfg(target_arch = "x86_64")]
             Backend::Avx2Rsqrt => unsafe {
-                simd::avx2::scale_err_avx2(&lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, true)
+                simd::avx2::scale_err_avx2(
+                    &lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, true,
+                )
             },
             #[cfg(target_arch = "x86_64")]
             Backend::Avx512Strict => unsafe {
-                simd::avx512::scale_err_avx512(&lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, false)
+                simd::avx512::scale_err_avx512(
+                    &lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, false,
+                )
             },
             #[cfg(target_arch = "x86_64")]
             Backend::Avx512Rsqrt => unsafe {
-                simd::avx512::scale_err_avx512(&lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, true)
+                simd::avx512::scale_err_avx512(
+                    &lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb, true,
+                )
             },
             #[cfg(target_arch = "wasm32")]
-            Backend::WasmSimd => simd::wasm::scale_err_wasm(&lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb),
+            Backend::WasmSimd => simd::wasm::scale_err_wasm(
+                &lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k.kx, k.ky, k.kb,
+            ),
             _ => butteraugli::scale_err(&lvl.mask, &lvl.x, &lvl.y, &lvl.b, tx, ty, tb, cur_n, k),
         }
     }
@@ -379,7 +450,12 @@ impl Comparer {
         } else {
             (f32::NAN, ChannelMoments::default())
         };
-        Metrics { butteraugli, ssim, psnr, moments }
+        Metrics {
+            butteraugli,
+            ssim,
+            psnr,
+            moments,
+        }
     }
 }
 
@@ -397,7 +473,8 @@ impl Comparer {
 fn resolve_forced_backend(id: u8) -> Backend {
     #[cfg(target_arch = "x86_64")]
     {
-        let has_avx2 = std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
+        let has_avx2 =
+            std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma");
         let has_avx512 = has_avx2
             && std::is_x86_feature_detected!("avx512f")
             && std::is_x86_feature_detected!("avx512bw");
@@ -421,7 +498,11 @@ fn resolve_forced_backend(id: u8) -> Backend {
         // id=4 is Backend::WasmSimd (discriminant 4); all other ids fall back to Scalar.
         // Without this branch, Force(4) on wasm32 silently returns Scalar, making
         // the flip-flop bench override useless on the primary production target.
-        return if id == 4 { Backend::WasmSimd } else { Backend::Scalar };
+        return if id == 4 {
+            Backend::WasmSimd
+        } else {
+            Backend::Scalar
+        };
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "wasm32")))]
     {
@@ -535,7 +616,15 @@ fn blur_mask(backend: Backend, src: &[f32], w: usize, h: usize, r: usize) -> Vec
     }
 }
 
-fn downsample_one(backend: Backend, src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usize, dh: usize) {
+fn downsample_one(
+    backend: Backend,
+    src: &[f32],
+    dst: &mut [f32],
+    w: usize,
+    h: usize,
+    dw: usize,
+    dh: usize,
+) {
     match backend {
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2Strict | Backend::Avx2Rsqrt => unsafe {
@@ -559,11 +648,9 @@ fn downsample_inplace(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usiz
         for x in 0..dw {
             let sx0 = x << 1;
             let sx1 = (sx0 + 1).min(w - 1);
-            dst[y * dw + x] = (src[sy0 * w + sx0]
-                + src[sy0 * w + sx1]
-                + src[sy1 * w + sx0]
-                + src[sy1 * w + sx1])
-                * 0.25;
+            dst[y * dw + x] =
+                (src[sy0 * w + sx0] + src[sy0 * w + sx1] + src[sy1 * w + sx0] + src[sy1 * w + sx1])
+                    * 0.25;
         }
     }
 }
@@ -577,7 +664,10 @@ mod tests {
         for i in 0..w * h {
             let on = ((i % w) ^ (i / w)) & 1 == 1;
             let c = if on { 200 } else { 40 };
-            v[i * 4] = c; v[i * 4 + 1] = c / 2; v[i * 4 + 2] = c / 3; v[i * 4 + 3] = 255;
+            v[i * 4] = c;
+            v[i * 4 + 1] = c / 2;
+            v[i * 4 + 2] = c / 3;
+            v[i * 4 + 3] = 255;
         }
         v
     }
@@ -601,12 +691,17 @@ mod tests {
         let img = checker(w, h);
         let mut noisy = img.clone();
         for (i, p) in noisy.iter_mut().enumerate() {
-            if i % 4 != 3 { *p = p.saturating_add(((i * 7) % 11) as u8); }
+            if i % 4 != 3 {
+                *p = p.saturating_add(((i * 7) % 11) as u8);
+            }
         }
         let mut cmp = Comparer::new(img.clone(), w, h, Opts::default());
         let m1 = cmp.all(&noisy);
         let m2 = cmp.all(&noisy);
-        assert!((m1.butteraugli - m2.butteraugli).abs() < 1e-6, "butteraugli not idempotent");
+        assert!(
+            (m1.butteraugli - m2.butteraugli).abs() < 1e-6,
+            "butteraugli not idempotent"
+        );
         assert!((m1.ssim - m2.ssim).abs() < 1e-6, "ssim not idempotent");
         assert!((m1.psnr - m2.psnr).abs() < 1e-3, "psnr not idempotent");
     }
@@ -617,7 +712,9 @@ mod tests {
         let img = checker(w, h);
         let mut noisy = img.clone();
         for (i, p) in noisy.iter_mut().enumerate() {
-            if i % 4 != 3 { *p = p.saturating_add(((i * 7) % 11) as u8); }
+            if i % 4 != 3 {
+                *p = p.saturating_add(((i * 7) % 11) as u8);
+            }
         }
         let mut cmp = Comparer::new(img.clone(), w, h, Opts::default());
         let m = cmp.all(&noisy);
@@ -630,7 +727,10 @@ mod tests {
         let (mus, vars, ch) = ssim::channel_moments(&noisy, w * h, 4, 3);
         assert_eq!(m.moments.ch, ch, "moments channel count");
         assert_eq!(m.moments.mus, mus, "fused mus must equal channel_moments");
-        assert_eq!(m.moments.vars, vars, "fused vars must equal channel_moments");
+        assert_eq!(
+            m.moments.vars, vars,
+            "fused vars must equal channel_moments"
+        );
     }
 
     /// Regression: tiny images (1×N, N×1, 1×1) must not panic with index-out-of-bounds.
@@ -646,9 +746,15 @@ mod tests {
             let test: Vec<u8> = (0..w * h * 4).map(|i| ((i + 7) % 251) as u8).collect();
             let mut cmp = Comparer::new(img, w, h, Opts::default());
             let score = cmp.butteraugli(&test);
-            assert!(score.is_finite(), "1×8 butteraugli must be finite, got {score}");
+            assert!(
+                score.is_finite(),
+                "1×8 butteraugli must be finite, got {score}"
+            );
             let m = cmp.all(&test);
-            assert!(m.butteraugli.is_finite(), "1×8 all().butteraugli must be finite");
+            assert!(
+                m.butteraugli.is_finite(),
+                "1×8 all().butteraugli must be finite"
+            );
         }
         // 8×1: same condition, h=1 at s=0.
         {
@@ -657,9 +763,15 @@ mod tests {
             let test: Vec<u8> = (0..w * h * 4).map(|i| ((i + 7) % 251) as u8).collect();
             let mut cmp = Comparer::new(img, w, h, Opts::default());
             let score = cmp.butteraugli(&test);
-            assert!(score.is_finite(), "8×1 butteraugli must be finite, got {score}");
+            assert!(
+                score.is_finite(),
+                "8×1 butteraugli must be finite, got {score}"
+            );
             let m = cmp.all(&test);
-            assert!(m.butteraugli.is_finite(), "8×1 all().butteraugli must be finite");
+            assert!(
+                m.butteraugli.is_finite(),
+                "8×1 all().butteraugli must be finite"
+            );
         }
         // 1×1: extreme degenerate — single pixel, 1 level.
         {
@@ -668,9 +780,15 @@ mod tests {
             let test = vec![110u8, 140, 190, 255];
             let mut cmp = Comparer::new(img, w, h, Opts::default());
             let score = cmp.butteraugli(&test);
-            assert!(score.is_finite(), "1×1 butteraugli must be finite, got {score}");
+            assert!(
+                score.is_finite(),
+                "1×1 butteraugli must be finite, got {score}"
+            );
             let m = cmp.all(&test);
-            assert!(m.butteraugli.is_finite(), "1×1 all().butteraugli must be finite");
+            assert!(
+                m.butteraugli.is_finite(),
+                "1×1 all().butteraugli must be finite"
+            );
         }
         // 2×4: both dims > 1 at s=0, but after one downsample → 1×2, which is ≤ 1 in w
         // → only 2 levels pushed (verifies 2-level path).
@@ -680,7 +798,10 @@ mod tests {
             let test: Vec<u8> = (0..w * h * 4).map(|i| ((i + 5) % 251) as u8).collect();
             let mut cmp = Comparer::new(img, w, h, Opts::default());
             let score = cmp.butteraugli(&test);
-            assert!(score.is_finite(), "2×4 butteraugli must be finite, got {score}");
+            assert!(
+                score.is_finite(),
+                "2×4 butteraugli must be finite, got {score}"
+            );
         }
     }
 
@@ -694,7 +815,9 @@ mod tests {
         let img = checker(w, h);
         let mut noisy = img.clone();
         for (i, p) in noisy.iter_mut().enumerate() {
-            if i % 4 != 3 { *p = p.saturating_add(((i * 13) % 17) as u8); }
+            if i % 4 != 3 {
+                *p = p.saturating_add(((i * 13) % 17) as u8);
+            }
         }
         let mut cmp = Comparer::new(img.clone(), w, h, Opts::default());
         // Call all() first — this mutates tx/ty/tb via butteraugli.
@@ -705,15 +828,21 @@ mod tests {
         let ps = cmp.psnr(&noisy);
         assert!(
             (m.butteraugli - ba).abs() < 1e-5,
-            "butteraugli: all()={} vs individual={}", m.butteraugli, ba
+            "butteraugli: all()={} vs individual={}",
+            m.butteraugli,
+            ba
         );
         assert!(
             (m.ssim - ss).abs() < 1e-6,
-            "ssim: all()={} vs individual={}", m.ssim, ss
+            "ssim: all()={} vs individual={}",
+            m.ssim,
+            ss
         );
         assert!(
             (m.psnr - ps).abs() < 1e-3,
-            "psnr: all()={} vs individual={}", m.psnr, ps
+            "psnr: all()={} vs individual={}",
+            m.psnr,
+            ps
         );
     }
 }

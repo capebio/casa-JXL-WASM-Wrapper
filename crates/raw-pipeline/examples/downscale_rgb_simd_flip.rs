@@ -147,7 +147,9 @@ fn main() {
         for &(sw, sh, dw, dh) in sizes {
             let npx = sw * sh;
             let mut src = vec![0u8; npx * 3];
-            let mut s: u32 = 0x9e37_79b9u32.wrapping_mul(sw as u32).wrapping_add(sh as u32);
+            let mut s: u32 = 0x9e37_79b9u32
+                .wrapping_mul(sw as u32)
+                .wrapping_add(sh as u32);
             for v in &mut src {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 *v = (s >> 24) as u8;
@@ -170,11 +172,19 @@ fn main() {
             for i in 0..rounds {
                 let mut run_a = |sink: &mut u64| {
                     let p = da[dlen / 2];
-                    ta.push(time(&mut || down_scalar(&src, sw, sh, &mut da, dw, dh), p, sink));
+                    ta.push(time(
+                        &mut || down_scalar(&src, sw, sh, &mut da, dw, dh),
+                        p,
+                        sink,
+                    ));
                 };
                 let mut run_b = |sink: &mut u64| {
                     let p = db[dlen / 2];
-                    tb.push(time(&mut || unsafe { down_sse(&src, sw, sh, &mut db, dw, dh) }, p, sink));
+                    tb.push(time(
+                        &mut || unsafe { down_sse(&src, sw, sh, &mut db, dw, dh) },
+                        p,
+                        sink,
+                    ));
                 };
                 if i % 2 == 0 {
                     run_a(&mut sink);

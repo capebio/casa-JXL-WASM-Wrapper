@@ -16,8 +16,8 @@ mod old {
     //! Byte-for-byte replica of the BASELINE decode path (public API only).
     use raw_pipeline::casa_video::{
         casv_frame_info, casv_frame_is_bbox, casv_frame_is_replace, casv_frame_is_tile,
-        parse_casv_footer, parse_casv_header, CASV_HEADER_BYTES, CASV_INDEX_ENTRY_BYTES,
-        CasvHeader,
+        parse_casv_footer, parse_casv_header, CasvHeader, CASV_HEADER_BYTES,
+        CASV_INDEX_ENTRY_BYTES,
     };
     use raw_pipeline::jxl_casadecoder::decode_interleaved;
 
@@ -26,7 +26,13 @@ mod old {
     }
 
     fn blit_into(dst: &mut [u8], width: u32, x: u32, y: u32, bw: u32, bh: u32, crop: &[u8]) {
-        let (w, x, y, bw, bh) = (width as usize, x as usize, y as usize, bw as usize, bh as usize);
+        let (w, x, y, bw, bh) = (
+            width as usize,
+            x as usize,
+            y as usize,
+            bw as usize,
+            bh as usize,
+        );
         for row in 0..bh {
             let d = ((y + row) * w + x) * 3;
             let s = row * bw * 3;
@@ -64,8 +70,9 @@ mod old {
                 return None;
             }
             let bitmap = &slice[2..2 + bitmap_len];
-            let changed: Vec<usize> =
-                (0..n).filter(|&i| bitmap[i / 8] & (1 << (i % 8)) != 0).collect();
+            let changed: Vec<usize> = (0..n)
+                .filter(|&i| bitmap[i / 8] & (1 << (i % 8)) != 0)
+                .collect();
             if changed.is_empty() {
                 return Some(());
             }
@@ -102,8 +109,9 @@ mod old {
                         let asrc = ((slot * ts + row) * ts + col) * 3;
                         let fdst = ((ty * ts + row) * w + tx * ts + col) * 3;
                         for c in 0..3 {
-                            prev[fdst + c] =
-                                (prev[fdst + c] as i32 + atlas[asrc + c] as i32 - 32768).clamp(0, 255) as u8;
+                            prev[fdst + c] = (prev[fdst + c] as i32 + atlas[asrc + c] as i32
+                                - 32768)
+                                .clamp(0, 255) as u8;
                         }
                     }
                 }
@@ -213,11 +221,18 @@ mod old {
 
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn main() {
-    use raw_pipeline::casa_video::{decode_casv_all_rgb8, decode_casv_footer_all_rgb8, parse_casv_header};
+    use raw_pipeline::casa_video::{
+        decode_casv_all_rgb8, decode_casv_footer_all_rgb8, parse_casv_header,
+    };
     use std::time::Instant;
 
-    let dir = std::env::args().nth(1).unwrap_or_else(|| r"C:\Tmp\jf-cvdec-golden".to_string());
-    let reps: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+    let dir = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\Tmp\jf-cvdec-golden".to_string());
+    let reps: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
 
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .expect("read corpus dir")
@@ -226,7 +241,9 @@ fn main() {
         .collect();
     names.sort();
 
-    println!("CASV decode A/B (interleaved, {reps} reps, rotation): OLD=baseline replica NEW=library");
+    println!(
+        "CASV decode A/B (interleaved, {reps} reps, rotation): OLD=baseline replica NEW=library"
+    );
     for p in &names {
         let data = std::fs::read(p).unwrap();
         let name = p.file_name().unwrap().to_string_lossy().to_string();

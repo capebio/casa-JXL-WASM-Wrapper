@@ -68,13 +68,22 @@ fn main() {
         }
     }
     let (ma, mb) = (med(&ta), med(&tb));
-    println!("ssim_moments_avx2_flip  {w}×{h} = {:.1} MP  (sink={sink})", np as f64 / 1e6);
-    println!("  parity (exact u64 tuples): {}", if parity { "PASS" } else { "FAIL" });
+    println!(
+        "ssim_moments_avx2_flip  {w}×{h} = {:.1} MP  (sink={sink})",
+        np as f64 / 1e6
+    );
+    println!(
+        "  parity (exact u64 tuples): {}",
+        if parity { "PASS" } else { "FAIL" }
+    );
     println!("  A scalar (ssim_moments_avx2):     {ma:.2} ms median");
     println!("  B cal    (ssim_moments_avx2_cal): {mb:.2} ms median");
     if ma > 0.0 && mb > 0.0 {
         let pct = (ma - mb) / ma * 100.0;
-        println!("  %saved (B vs A): {pct:.1}%   speedup {:.2}×   gate(≥5%): {}",
-                 ma / mb, if pct >= 5.0 { "PASS" } else { "FAIL" });
+        println!(
+            "  %saved (B vs A): {pct:.1}%   speedup {:.2}×   gate(≥5%): {}",
+            ma / mb,
+            if pct >= 5.0 { "PASS" } else { "FAIL" }
+        );
     }
 }

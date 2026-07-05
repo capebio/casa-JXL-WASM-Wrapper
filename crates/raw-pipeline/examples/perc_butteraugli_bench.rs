@@ -26,6 +26,11 @@ fn main() {
             std::hint::black_box(b);
         }
         ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("{0}x{0} ({1:.1} MP): butteraugli median {2:.2} ms", size, n as f64 / 1e6, ms[ms.len() / 2]);
+        println!(
+            "{0}x{0} ({1:.1} MP): butteraugli median {2:.2} ms",
+            size,
+            n as f64 / 1e6,
+            ms[ms.len() / 2]
+        );
     }
 }

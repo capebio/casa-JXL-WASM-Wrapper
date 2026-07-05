@@ -21,8 +21,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use raw_pipeline::pipeline::PipelineParams;
 use raw_pipeline::perceptual::{Comparer, Opts};
+use raw_pipeline::pipeline::PipelineParams;
 use raw_pipeline::{decompress, demosaic, pipeline, tiff};
 
 const OLYMPUS_BLACK_LEVEL: u16 = 256;
@@ -92,7 +92,10 @@ fn load_orf(path: &Path) -> Result<(Vec<u16>, usize, usize, PipelineParams), Str
     let data = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let info = tiff::parse(&data).map_err(|e| format!("tiff::parse: {e}"))?;
     if info.compression != 1 {
-        return Err(format!("compression {} unsupported (want Olympus 12-bit)", info.compression));
+        return Err(format!(
+            "compression {} unsupported (want Olympus 12-bit)",
+            info.compression
+        ));
     }
     let (w, h) = (info.width as usize, info.height as usize);
     let s = info.strip_offset as usize;
@@ -115,7 +118,15 @@ fn load_orf(path: &Path) -> Result<(Vec<u16>, usize, usize, PipelineParams), Str
     if let Some(m) = info.color_matrix {
         params.color_matrix = Some(m);
     }
-    println!("loaded REAL ORF {}  {}x{} ({:.1} MP)  wb=({:.3},{:.3})", path.display(), w, h, (w * h) as f64 / 1e6, params.wb_r, params.wb_b);
+    println!(
+        "loaded REAL ORF {}  {}x{} ({:.1} MP)  wb=({:.3},{:.3})",
+        path.display(),
+        w,
+        h,
+        (w * h) as f64 / 1e6,
+        params.wb_r,
+        params.wb_b
+    );
     Ok((raw, w, h, params))
 }
 
@@ -149,7 +160,10 @@ fn synth() -> (Vec<u16>, usize, usize, PipelineParams) {
     params.black = 0;
     params.wb_r = 1.0;
     params.wb_b = 1.0;
-    println!("no ORF found — using SYNTHETIC high-detail target {}x{}", w, h);
+    println!(
+        "no ORF found — using SYNTHETIC high-detail target {}x{}",
+        w, h
+    );
     (raw, w, h, params)
 }
 
@@ -173,7 +187,8 @@ fn abs_diff(a: &[u8], b: &[u8]) -> (u8, f64) {
 fn save_rgba_png(path: &Path, rgba: &[u8], w: usize, h: usize) {
     let img: image::RgbaImage =
         image::ImageBuffer::from_raw(w as u32, h as u32, rgba.to_vec()).expect("buffer fits");
-    img.save(path).unwrap_or_else(|e| eprintln!("save {}: {e}", path.display()));
+    img.save(path)
+        .unwrap_or_else(|e| eprintln!("save {}: {e}", path.display()));
 }
 
 /// |full-half| per channel, amplified, as an opaque RGB png.
@@ -187,11 +202,20 @@ fn save_diff_png(path: &Path, a: &[u8], b: &[u8], w: usize, h: usize, amp: u16) 
     }
     let img: image::RgbImage =
         image::ImageBuffer::from_raw(w as u32, h as u32, rgb).expect("buffer fits");
-    img.save(path).unwrap_or_else(|e| eprintln!("save {}: {e}", path.display()));
+    img.save(path)
+        .unwrap_or_else(|e| eprintln!("save {}: {e}", path.display()));
 }
 
 /// 100% center-crop montage: [ FULL | HALF | DIFFx8 ], 1px white separators.
-fn save_crop_montage(path: &Path, full: &[u8], half: &[u8], w: usize, h: usize, side: usize, amp: u16) {
+fn save_crop_montage(
+    path: &Path,
+    full: &[u8],
+    half: &[u8],
+    w: usize,
+    h: usize,
+    side: usize,
+    amp: u16,
+) {
     let side = side.min(w).min(h);
     let (cx, cy) = ((w - side) / 2, (h - side) / 2);
     let sep = 2usize;
@@ -215,7 +239,8 @@ fn save_crop_montage(path: &Path, full: &[u8], half: &[u8], w: usize, h: usize, 
     }
     let img: image::RgbImage =
         image::ImageBuffer::from_raw(mw as u32, side as u32, out).expect("buffer fits");
-    img.save(path).unwrap_or_else(|e| eprintln!("save {}: {e}", path.display()));
+    img.save(path)
+        .unwrap_or_else(|e| eprintln!("save {}: {e}", path.display()));
 }
 
 fn med(v: &mut [f64]) -> f64 {
@@ -274,16 +299,38 @@ fn main() {
     save_rgba_png(&dir.join("full.png"), &full_rgba, dw, dh);
     save_rgba_png(&dir.join("half.png"), &half_rgba, dw, dh);
     save_diff_png(&dir.join("diff_x8.png"), &full_rgba, &half_rgba, dw, dh, 8);
-    save_crop_montage(&dir.join("crop_montage.png"), &full_rgba, &half_rgba, dw, dh, 480, 8);
+    save_crop_montage(
+        &dir.join("crop_montage.png"),
+        &full_rgba,
+        &half_rgba,
+        dw,
+        dh,
+        480,
+        8,
+    );
 
     let fm = med(&mut t_full);
     let hm = med(&mut t_half);
     println!("\n=== demosaic, full-res @ {}x{} ===", w, h);
     println!("  FULL bilinear   median {:7.2} ms", fm);
-    println!("  HALF superpixel median {:7.2} ms   → {:.2}x faster ({:+.0}% time)", hm, fm / hm, (hm - fm) / fm * 100.0);
-    println!("\n=== preview quality, HALF vs FULL @ {}x{} (FULL = reference) ===", dw, dh);
-    println!("  Butteraugli distance : {:.4}   (house perceptual; <~1.0 ≈ not visible side-by-side)", butter);
-    println!("  PSNR                 : {:.2} dB  (higher = closer; >40 dB ≈ visually equivalent)", psnr);
+    println!(
+        "  HALF superpixel median {:7.2} ms   → {:.2}x faster ({:+.0}% time)",
+        hm,
+        fm / hm,
+        (hm - fm) / fm * 100.0
+    );
+    println!(
+        "\n=== preview quality, HALF vs FULL @ {}x{} (FULL = reference) ===",
+        dw, dh
+    );
+    println!(
+        "  Butteraugli distance : {:.4}   (house perceptual; <~1.0 ≈ not visible side-by-side)",
+        butter
+    );
+    println!(
+        "  PSNR                 : {:.2} dB  (higher = closer; >40 dB ≈ visually equivalent)",
+        psnr
+    );
     println!("  max abs diff (8-bit) : {}", maxd);
     println!("  mean abs diff (8-bit): {:.3}", meand);
     println!("\nartifacts → {}", dir.display());

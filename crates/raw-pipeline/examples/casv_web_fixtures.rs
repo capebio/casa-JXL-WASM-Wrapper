@@ -99,7 +99,11 @@ fn main() {
         manifest.push_str(&format!(
             "  \"{name}\": {{ \"width\": {w}, \"height\": {h}, \"frames\": {n} }},\n"
         ));
-        println!("{name}: {} bytes casv, {} bytes expected", casv.len(), rgb.len());
+        println!(
+            "{name}: {} bytes casv, {} bytes expected",
+            casv.len(),
+            rgb.len()
+        );
     };
 
     // tile v2 (header format)
@@ -122,7 +126,12 @@ fn main() {
 
     // footer format + rate box (tile skip via the streaming-to-sink encoder)
     let mut sink = Vec::new();
-    let mut src = VecFrames { frames: fx.clone(), i: 0, w, h };
+    let mut src = VecFrames {
+        frames: fx.clone(),
+        i: 0,
+        w,
+        h,
+    };
     encode_casv_video_streaming_to(&mut src, &tile_opts, &mut sink).unwrap();
     let sink_exp = decode_casv_footer_all_rgb8(&sink).unwrap();
     emit("sink_ratebox", sink, sink_exp);

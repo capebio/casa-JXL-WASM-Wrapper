@@ -26,7 +26,12 @@ fn main() {
         (width.div_ceil(tile), height.div_ceil(tile))
     }
     fn changed_tile_map_thresh(
-        cur: &[u8], prev: &[u8], width: u32, height: u32, tile: u32, thresh: u8,
+        cur: &[u8],
+        prev: &[u8],
+        width: u32,
+        height: u32,
+        tile: u32,
+        thresh: u8,
     ) -> Vec<bool> {
         let (txn, tyn) = tile_grid(width, height, tile);
         let (w, t) = (width as usize, tile as usize);
@@ -57,8 +62,13 @@ fn main() {
     /// Verbatim pre-JE-8 batch lossy tiled encoder (v1 sliver atlas) —
     /// frame-parallel like production, so enc timings are apples-to-apples.
     fn encode_v1_sliver(
-        frames: &[&[u8]], width: u32, height: u32, gop_len: u32, tile: u32,
-        opts: &EncodeOptions, thresh: u8,
+        frames: &[&[u8]],
+        width: u32,
+        height: u32,
+        gop_len: u32,
+        tile: u32,
+        opts: &EncodeOptions,
+        thresh: u8,
     ) -> Vec<u8> {
         use rayon::prelude::*;
         const HEADER: usize = 32;
@@ -75,8 +85,12 @@ fn main() {
                     return (0, encode_rgb8(px, width, height, opts.clone()).unwrap());
                 }
                 let map = changed_tile_map_thresh(px, frames[idx - 1], width, height, t, thresh);
-                let changed: Vec<usize> =
-                    map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i).collect();
+                let changed: Vec<usize> = map
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c)
+                    .map(|(i, _)| i)
+                    .collect();
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&(t as u16).to_le_bytes()); // v1: bit clear
                 let mut bitmap = vec![0u8; map.len().div_ceil(8)];
@@ -101,7 +115,10 @@ fn main() {
                         encode_rgb8(&atlas, t, t * changed.len() as u32, opts.clone()).unwrap();
                     payload.extend_from_slice(&jxl);
                 }
-                (CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG, payload)
+                (
+                    CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG,
+                    payload,
+                )
             })
             .collect();
         let _ = CASV_BBOX_FLAG;
@@ -153,7 +170,11 @@ fn main() {
         let mut s = 0f64;
         let mut c = 0usize;
         for (i, (px, _, _)) in decoded.iter().enumerate() {
-            s += px.iter().zip(&frames[i]).map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64).sum::<f64>();
+            s += px
+                .iter()
+                .zip(&frames[i])
+                .map(|(&a, &b)| (a as i32 - b as i32).unsigned_abs() as f64)
+                .sum::<f64>();
             c += px.len();
         }
         s / c as f64
@@ -192,7 +213,10 @@ fn main() {
         for (k, name) in ["A v1 sliver", "B v2 square"].iter().enumerate() {
             println!(
                 "    {name}: {:>9} bytes   enc {:>6.1} ms/f   dec {:>6.2} ms/f   mean-err {:.3}",
-                sizes[k], med(&enc_ms[k]), med(&dec_ms[k]), errs[k]
+                sizes[k],
+                med(&enc_ms[k]),
+                med(&dec_ms[k]),
+                errs[k]
             );
         }
         println!(

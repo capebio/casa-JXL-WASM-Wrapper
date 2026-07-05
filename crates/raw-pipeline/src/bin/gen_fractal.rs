@@ -57,7 +57,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // u16 / u8 TIFF (tone-mapped to display range so they are viewable)
     let disp = raw_pipeline::image_formats::f32_linear_to_srgb8(&f32buf); // RGBA8
-    let rgb8: Vec<u8> = disp.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+    let rgb8: Vec<u8> = disp
+        .chunks_exact(4)
+        .flat_map(|p| [p[0], p[1], p[2]])
+        .collect();
     image::RgbImage::from_raw(w, h, rgb8.clone())
         .expect("rgb8 buffer sized w*h*3")
         .save(format!("{dir}/mandelbrot_u8.tiff"))?;

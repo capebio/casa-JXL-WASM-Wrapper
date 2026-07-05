@@ -17,12 +17,16 @@ fn bulk(src: &[u16], stride: usize, high: usize, n: usize, nw: usize, lw: usize)
     let block = nw.saturating_mul(high);
     for i in 0..n {
         let col0 = i * nw;
-        if nw == 0 || col0 >= stride { break; }
+        if nw == 0 || col0 >= stride {
+            break;
+        }
         let run = nw.min(stride - col0);
         let src_base = i * block;
         for row in 0..high {
             let s = src_base + row * nw;
-            if s + run > buf_len { break; }
+            if s + run > buf_len {
+                break;
+            }
             let d = row * stride + col0;
             raster[d..d + run].copy_from_slice(&src[s..s + run]);
         }
@@ -34,7 +38,9 @@ fn bulk(src: &[u16], stride: usize, high: usize, n: usize, nw: usize, lw: usize)
             let src_base = n * block;
             for row in 0..high {
                 let s = src_base + row * lw;
-                if s + run > buf_len { break; }
+                if s + run > buf_len {
+                    break;
+                }
                 let d = row * stride + col0;
                 raster[d..d + run].copy_from_slice(&src[s..s + run]);
             }
@@ -50,10 +56,14 @@ fn scatter(src: &[u16], stride: usize, high: usize, n: usize, nw: usize, lw: usi
     for jidx in 0..(stride * high) {
         let mut i = jidx / block;
         let last = i >= n;
-        if last { i = n; }
+        if last {
+            i = n;
+        }
         let local = jidx - i * block;
         let sw = if last { lw } else { nw };
-        if sw == 0 { break; }
+        if sw == 0 {
+            break;
+        }
         let row = local / sw;
         let col = local % sw + i * nw;
         if row < high && col < stride {
@@ -75,7 +85,10 @@ fn main() {
     };
 
     println!("CR2 slice-reassembly flip  geometry n={n} nw={nw} lw={lw} stride={stride}");
-    println!("{:>6} | {:>10} {:>10} {:>8} | parity", "rows", "scatter_ms", "bulk_ms", "%saved");
+    println!(
+        "{:>6} | {:>10} {:>10} {:>8} | parity",
+        "rows", "scatter_ms", "bulk_ms", "%saved"
+    );
 
     for &high in &sizes {
         let total = stride * high;
@@ -93,7 +106,12 @@ fn main() {
         // parity (warm pair)
         let a0 = run_a();
         let b0 = run_b();
-        let max_diff = a0.iter().zip(b0.iter()).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap_or(0);
+        let max_diff = a0
+            .iter()
+            .zip(b0.iter())
+            .map(|(x, y)| (*x as i32 - *y as i32).abs())
+            .max()
+            .unwrap_or(0);
 
         let rounds = 11usize;
         let (mut ta, mut tb) = (Vec::new(), Vec::new());
@@ -120,7 +138,10 @@ fn main() {
         let saved = (ma - mb) / ma * 100.0;
         println!(
             "{:>6} | {:>10.3} {:>10.3} {:>7.1}% | {}",
-            high, ma, mb, saved,
+            high,
+            ma,
+            mb,
+            saved,
             if max_diff == 0 { "EXACT" } else { "DIFF!" }
         );
         assert_eq!(max_diff, 0, "parity broken at rows={high}");

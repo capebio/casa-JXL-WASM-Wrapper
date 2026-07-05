@@ -20,9 +20,13 @@ fn scan_a(src: &[u8]) -> (u64, usize) {
     while pos < src.len() {
         let remaining = src.len() - pos;
         if remaining >= 4 {
-            let b0 = src[pos]; let b1 = src[pos + 1]; let b2 = src[pos + 2]; let b3 = src[pos + 3];
+            let b0 = src[pos];
+            let b1 = src[pos + 1];
+            let b2 = src[pos + 2];
+            let b3 = src[pos + 3];
             if b0 != 0xFF && b1 != 0xFF && b2 != 0xFF && b3 != 0xFF {
-                let word = ((b0 as u64) << 24) | ((b1 as u64) << 16) | ((b2 as u64) << 8) | (b3 as u64);
+                let word =
+                    ((b0 as u64) << 24) | ((b1 as u64) << 16) | ((b2 as u64) << 8) | (b3 as u64);
                 acc = acc.wrapping_mul(31).wrapping_add(word);
                 pos += 4;
                 continue;
@@ -86,8 +90,13 @@ fn main() {
         t.elapsed().as_secs_f64() * 1e3
     };
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(time(&scan_a, &mut sink)); tb.push(time(&scan_b, &mut sink)); }
-        else { tb.push(time(&scan_b, &mut sink)); ta.push(time(&scan_a, &mut sink)); }
+        if r % 2 == 0 {
+            ta.push(time(&scan_a, &mut sink));
+            tb.push(time(&scan_b, &mut sink));
+        } else {
+            tb.push(time(&scan_b, &mut sink));
+            ta.push(time(&scan_a, &mut sink));
+        }
     }
     std::hint::black_box(sink);
     let (ma, mb) = (median(&ta), median(&tb));

@@ -78,7 +78,12 @@ fn main() {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[v.len() / 2]
     };
-    println!("demosaic_rggb_planar @ {}x{} ({:.1} MP)", w, h, (w * h) as f64 / 1e6);
+    println!(
+        "demosaic_rggb_planar @ {}x{} ({:.1} MP)",
+        w,
+        h,
+        (w * h) as f64 / 1e6
+    );
     println!("  peak_transient_MB : {:.1}", med(&mut peaks));
     println!("  total_alloc_MB    : {:.1}", med(&mut totals));
     println!("  alloc_count       : {}", counts[counts.len() / 2]);

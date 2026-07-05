@@ -44,15 +44,17 @@ pub fn parallel_path_reset() {
 }
 
 #[cfg(not(feature = "parallel"))]
-pub fn parallel_path_call_count() -> u32 { 0 }
+pub fn parallel_path_call_count() -> u32 {
+    0
+}
 
 #[cfg(not(feature = "parallel"))]
 pub fn parallel_path_reset() {}
 
 pub const CAM_TO_SRGB: [[f32; 3]; 3] = [
-    [ 1.526, -0.450, -0.077],
-    [-0.245,  1.336, -0.091],
-    [ 0.018, -0.298,  1.281],
+    [1.526, -0.450, -0.077],
+    [-0.245, 1.336, -0.091],
+    [0.018, -0.298, 1.281],
 ];
 
 /// Max pixel payload (<1 GiB) — blocks corrupt dimension exploits before buffer writes.
@@ -61,7 +63,9 @@ pub const MAX_PIXEL_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
 /// Validate width×height×channels fits the memory budget.
 pub fn validate_pixel_dims(width: usize, height: usize, channels: usize) -> Result<(), String> {
     if width == 0 || height == 0 || channels == 0 {
-        return Err(format!("pixel dimensions must be positive, got {width}×{height}×{channels}"));
+        return Err(format!(
+            "pixel dimensions must be positive, got {width}×{height}×{channels}"
+        ));
     }
     let bytes = width
         .checked_mul(height)
@@ -116,9 +120,9 @@ pub fn validate_pixel_buffer_u16(
 /// Always-applied baselines that emulate Olympus Picture-Mode (Natural).
 /// Without these, raw matrix output looks "flat" relative to the embedded
 /// JPEG.  User look sliders adjust on top.
-const BASELINE_SAT: f32 = 1.30;        // chroma scale around luma — tuned to embedded JPEG saturation
-const BASELINE_CONTRAST: f32 = 0.55;   // S-curve blend, [0,1] — tuned to embedded JPEG luma std-dev
-const BASELINE_EXP_EV: f32 = 1.40;     // tuned to embedded JPEG luminance
+const BASELINE_SAT: f32 = 1.30; // chroma scale around luma — tuned to embedded JPEG saturation
+const BASELINE_CONTRAST: f32 = 0.55; // S-curve blend, [0,1] — tuned to embedded JPEG luma std-dev
+const BASELINE_EXP_EV: f32 = 1.40; // tuned to embedded JPEG luminance
 
 // Luma coeffs (BT.709) hoisted for FMA + ILP in per-pixel apply.
 const LUMA_R: f32 = 0.2126;
@@ -164,19 +168,19 @@ pub struct PipelineParams {
     pub wb_b: f32,
 
     // All zero-centred:
-    pub exposure_ev: f32,   // stops, -3..+3
-    pub contrast: f32,      // -1..+1
-    pub shadows: f32,       // -1..+1
-    pub highlights: f32,    // -1..+1
-    pub whites: f32,        // -1..+1
-    pub blacks: f32,        // -1..+1
-    pub saturation: f32,    // -1..+1
-    pub vibrance: f32,      // -1..+1
-    pub temp: f32,          // -1..+1 (warm <-> cool)
-    pub tint: f32,          // -1..+1 (magenta <-> green)
+    pub exposure_ev: f32, // stops, -3..+3
+    pub contrast: f32,    // -1..+1
+    pub shadows: f32,     // -1..+1
+    pub highlights: f32,  // -1..+1
+    pub whites: f32,      // -1..+1
+    pub blacks: f32,      // -1..+1
+    pub saturation: f32,  // -1..+1
+    pub vibrance: f32,    // -1..+1
+    pub temp: f32,        // -1..+1 (warm <-> cool)
+    pub tint: f32,        // -1..+1 (magenta <-> green)
     pub color_matrix: Option<[[f32; 3]; 3]>,
-    pub texture: f32,       // -1..+1, unsharp σ=1
-    pub clarity: f32,       // -1..+1, unsharp σ=3
+    pub texture: f32, // -1..+1, unsharp σ=1
+    pub clarity: f32, // -1..+1, unsharp σ=3
     // Runtime-only flag for Perceptual Constancy Mode (illumination-invariant
     // adjustments via the advanced log-geodesic / Molchanov engine during
     // progressive JXL paints). Never for ingest-time producedBy or bake-time.
@@ -244,7 +248,9 @@ const SRGB_LUT_N: usize = 16384;
 #[inline(always)]
 pub(crate) fn srgb_encode_lerp(y: f32) -> f32 {
     let tbl = SRGB_ENCODE.get_or_init(|| {
-        (0..=SRGB_LUT_N).map(|i| linear_to_srgb(i as f32 / SRGB_LUT_N as f32)).collect()
+        (0..=SRGB_LUT_N)
+            .map(|i| linear_to_srgb(i as f32 / SRGB_LUT_N as f32))
+            .collect()
     });
     let pos = y.clamp(0.0, 1.0) * SRGB_LUT_N as f32;
     let i0 = (pos as usize).min(SRGB_LUT_N - 1);
@@ -303,7 +309,8 @@ fn tone_curve(x: f32, p: &TonePost) -> f32 {
         BASELINE_CONTRAST + p.contrast * (1.0 - BASELINE_CONTRAST)
     } else {
         BASELINE_CONTRAST + p.contrast * (1.0 + BASELINE_CONTRAST)
-    }.clamp(-1.0, 1.0);
+    }
+    .clamp(-1.0, 1.0);
     if c > 1e-4 {
         let s = y * y * (3.0 - 2.0 * y);
         y = y.mul_add(1.0 - c, s * c);
@@ -356,23 +363,19 @@ fn highlight_shoulder(x: f32) -> f32 {
 /// See docs/PerceptualConstancyMode.md and docs/hooks.md for the math and hooking.
 
 const SENSOR_SHARPEN_B: [[f32; 3]; 3] = [
-    [ 1.05, -0.025, -0.025],
-    [-0.025,  1.05, -0.025],
-    [-0.025, -0.025,  1.05],
+    [1.05, -0.025, -0.025],
+    [-0.025, 1.05, -0.025],
+    [-0.025, -0.025, 1.05],
 ]; // Plausible sensor-sharpen; full system can load per-camera or fixed.
 
 #[inline(always)]
 fn to_log_euclidean(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     let eps = 1e-6f32;
     // B * rgb then component log to map geodesics to flat Euclidean space.
-    let sr = SENSOR_SHARPEN_B[0][0]*r + SENSOR_SHARPEN_B[0][1]*g + SENSOR_SHARPEN_B[0][2]*b;
-    let sg = SENSOR_SHARPEN_B[1][0]*r + SENSOR_SHARPEN_B[1][1]*g + SENSOR_SHARPEN_B[1][2]*b;
-    let sb = SENSOR_SHARPEN_B[2][0]*r + SENSOR_SHARPEN_B[2][1]*g + SENSOR_SHARPEN_B[2][2]*b;
-    (
-        (sr.max(eps)).ln(),
-        (sg.max(eps)).ln(),
-        (sb.max(eps)).ln(),
-    )
+    let sr = SENSOR_SHARPEN_B[0][0] * r + SENSOR_SHARPEN_B[0][1] * g + SENSOR_SHARPEN_B[0][2] * b;
+    let sg = SENSOR_SHARPEN_B[1][0] * r + SENSOR_SHARPEN_B[1][1] * g + SENSOR_SHARPEN_B[1][2] * b;
+    let sb = SENSOR_SHARPEN_B[2][0] * r + SENSOR_SHARPEN_B[2][1] * g + SENSOR_SHARPEN_B[2][2] * b;
+    ((sr.max(eps)).ln(), (sg.max(eps)).ln(), (sb.max(eps)).ln())
 }
 
 #[inline(always)]
@@ -388,7 +391,13 @@ fn from_log_euclidean(lr: f32, lg: f32, lb: f32) -> (f32, f32, f32) {
 /// Molchanov residuals + A_tensor for adaptive discretization and uniform modulation.
 /// Density around neutral grays and saturated greens.
 #[inline(always)]
-fn molchanov_residuals_and_atensor(luma_l: f32, lr: f32, lg: f32, lb: f32, base_scale: f32) -> (f32, f32, f32, f32) {
+fn molchanov_residuals_and_atensor(
+    luma_l: f32,
+    lr: f32,
+    lg: f32,
+    lb: f32,
+    base_scale: f32,
+) -> (f32, f32, f32, f32) {
     // Parallelogram law residuals discretize metric grid. *self instead of powi(2) for ILP.
     let dr = lr - luma_l;
     let dg = lg - luma_l;
@@ -398,15 +407,18 @@ fn molchanov_residuals_and_atensor(luma_l: f32, lr: f32, lg: f32, lb: f32, base_
     let res_b = 0.02 * (db * db);
 
     // A_tensor modulation of scale (and conceptually sliders/edges).
-    let gray_dist = ((lr - luma_l).abs() + (lg - luma_l).abs() + (lb - luma_l).abs()).min(2.0) / 2.0;
+    let gray_dist =
+        ((lr - luma_l).abs() + (lg - luma_l).abs() + (lb - luma_l).abs()).min(2.0) / 2.0;
     let a_mod = 1.0 + 0.3 * (1.0 - gray_dist); // higher density (stronger effect) near gray
     let green_boost = if lg > lr.max(lb) { 1.15 } else { 1.0 }; // saturated greens
     let modulated_scale = base_scale * a_mod * green_boost;
 
-    (luma_l + (lr - luma_l + res_r) * modulated_scale,
-     luma_l + (lg - luma_l + res_g) * modulated_scale,
-     luma_l + (lb - luma_l + res_b) * modulated_scale,
-     modulated_scale)
+    (
+        luma_l + (lr - luma_l + res_r) * modulated_scale,
+        luma_l + (lg - luma_l + res_g) * modulated_scale,
+        luma_l + (lb - luma_l + res_b) * modulated_scale,
+        modulated_scale,
+    )
 }
 
 /// Hybrid Riemannian/non-Riemannian spring (ΔE2000-like) + Los Alamos f(c) diminishing returns.
@@ -420,7 +432,7 @@ fn hybrid_spring_and_dimishing_fc(lr: f32, lg: f32, lb: f32, luma_l: f32) -> (f3
     let dr = r - luma_l;
     let dg = g - luma_l;
     let db = b - luma_l;
-    let dist = ((dr*dr) + (dg*dg) + (db*db)).sqrt();
+    let dist = ((dr * dr) + (dg * dg) + (db * db)).sqrt();
     if dist < 0.25 {
         let spring = 0.7 * (0.25 - dist);
         r = r * (1.0 - spring) + luma_l * spring;
@@ -483,7 +495,8 @@ impl PerceptualGrid {
                     // Run the exact advanced path (post-matrix input) with fixed scale for this grid point
                     let (lr, lg, lb) = to_log_euclidean(r, g, b);
                     let luma_l = (lr + lg + lb) / 3.0;
-                    let (lr2, lg2, lb2, _mod) = molchanov_residuals_and_atensor(luma_l, lr, lg, lb, scale);
+                    let (lr2, lg2, lb2, _mod) =
+                        molchanov_residuals_and_atensor(luma_l, lr, lg, lb, scale);
                     let (lr3, lg3, lb3) = hybrid_spring_and_dimishing_fc(lr2, lg2, lb2, luma_l);
                     let (rr, gg, bb) = from_log_euclidean(lr3, lg3, lb3);
                     let idx = ri * SZ * SZ + gi * SZ + bi;
@@ -493,7 +506,12 @@ impl PerceptualGrid {
                 }
             }
         }
-        Self { data_r, data_g, data_b, size: SZ }
+        Self {
+            data_r,
+            data_g,
+            data_b,
+            size: SZ,
+        }
     }
 
     #[inline(always)]
@@ -525,7 +543,14 @@ impl PerceptualGrid {
         let idx110 = r1 * self.size * self.size + g1 * self.size + bi;
         let idx111 = r1 * self.size * self.size + g1 * self.size + b1;
         // lerp r then g then b for each channel
-        let lerp = |c000: f32, c001: f32, c010: f32, c011: f32, c100: f32, c101: f32, c110: f32, c111: f32| {
+        let lerp = |c000: f32,
+                    c001: f32,
+                    c010: f32,
+                    c011: f32,
+                    c100: f32,
+                    c101: f32,
+                    c110: f32,
+                    c111: f32| {
             let c00 = c000 * (1.0 - bfr) + c001 * bfr;
             let c01 = c010 * (1.0 - bfr) + c011 * bfr;
             let c10 = c100 * (1.0 - bfr) + c101 * bfr;
@@ -534,12 +559,36 @@ impl PerceptualGrid {
             let c1 = c10 * (1.0 - gfr) + c11 * gfr;
             c0 * (1.0 - rfr) + c1 * rfr
         };
-        let dr = lerp(self.data_r[idx000], self.data_r[idx001], self.data_r[idx010], self.data_r[idx011],
-                      self.data_r[idx100], self.data_r[idx101], self.data_r[idx110], self.data_r[idx111]);
-        let dg = lerp(self.data_g[idx000], self.data_g[idx001], self.data_g[idx010], self.data_g[idx011],
-                      self.data_g[idx100], self.data_g[idx101], self.data_g[idx110], self.data_g[idx111]);
-        let db = lerp(self.data_b[idx000], self.data_b[idx001], self.data_b[idx010], self.data_b[idx011],
-                      self.data_b[idx100], self.data_b[idx101], self.data_b[idx110], self.data_b[idx111]);
+        let dr = lerp(
+            self.data_r[idx000],
+            self.data_r[idx001],
+            self.data_r[idx010],
+            self.data_r[idx011],
+            self.data_r[idx100],
+            self.data_r[idx101],
+            self.data_r[idx110],
+            self.data_r[idx111],
+        );
+        let dg = lerp(
+            self.data_g[idx000],
+            self.data_g[idx001],
+            self.data_g[idx010],
+            self.data_g[idx011],
+            self.data_g[idx100],
+            self.data_g[idx101],
+            self.data_g[idx110],
+            self.data_g[idx111],
+        );
+        let db = lerp(
+            self.data_b[idx000],
+            self.data_b[idx001],
+            self.data_b[idx010],
+            self.data_b[idx011],
+            self.data_b[idx100],
+            self.data_b[idx101],
+            self.data_b[idx110],
+            self.data_b[idx111],
+        );
         (dr, dg, db)
     }
 }
@@ -569,8 +618,17 @@ fn build_pre_lut(black: u16, white: u16, wb_eff: f32, exp_gain: f32) -> Vec<u16>
 /// This covers the common case where `white < lut_len` so all valid raw values index directly.
 /// For the strided (compact 4096-entry) variant accessed via `raw_value >> COMPACT_LUT_SHIFT`, use
 /// `build_pre_lut_strided` instead. Do not mix the two access patterns.
-fn build_pre_lut_compact(black: u16, white: u16, wb_eff: f32, exp_gain: f32, lut_len: usize) -> Vec<u16> {
-    assert!(lut_len.is_power_of_two() && lut_len <= 65536, "build_pre_lut_compact: lut_len must be a power of two ≤ 65536, got {lut_len}");
+fn build_pre_lut_compact(
+    black: u16,
+    white: u16,
+    wb_eff: f32,
+    exp_gain: f32,
+    lut_len: usize,
+) -> Vec<u16> {
+    assert!(
+        lut_len.is_power_of_two() && lut_len <= 65536,
+        "build_pre_lut_compact: lut_len must be a power of two ≤ 65536, got {lut_len}"
+    );
     let mut lut = vec![0u16; lut_len];
     let denom = (white.saturating_sub(black)).max(1) as f32;
     let gain = wb_eff * exp_gain;
@@ -612,11 +670,20 @@ fn build_pre_lut_strided(black: u16, white: u16, wb_eff: f32, exp_gain: f32) -> 
 }
 
 struct LutCache {
-    black: u16, white: u16,
-    wb_r_bits: u32, wb_g_bits: u32, wb_b_bits: u32, exp_gain_bits: u32,
-    contrast_bits: u32, shadows_bits: u32, highlights_bits: u32,
-    whites_bits: u32, blacks_bits: u32,
-    pre_r: std::sync::Arc<Vec<u16>>, pre_g: std::sync::Arc<Vec<u16>>, pre_b: std::sync::Arc<Vec<u16>>,
+    black: u16,
+    white: u16,
+    wb_r_bits: u32,
+    wb_g_bits: u32,
+    wb_b_bits: u32,
+    exp_gain_bits: u32,
+    contrast_bits: u32,
+    shadows_bits: u32,
+    highlights_bits: u32,
+    whites_bits: u32,
+    blacks_bits: u32,
+    pre_r: std::sync::Arc<Vec<u16>>,
+    pre_g: std::sync::Arc<Vec<u16>>,
+    pre_b: std::sync::Arc<Vec<u16>>,
     post: std::sync::Arc<Vec<u8>>,
     post16: Option<std::sync::Arc<Vec<u16>>>,
     pre_lut_len: usize,
@@ -626,29 +693,42 @@ struct LutCache {
 
 // All fields are either plain integers, bool, or Arc<Vec<_>> which are Send.
 // This compile-time assertion catches future non-Send field additions.
-fn _assert_lut_cache_send() where LutCache: Send {}
+fn _assert_lut_cache_send()
+where
+    LutCache: Send,
+{
+}
 
 impl LutCache {
     /// Pre-LUT validity: depends ONLY on the linearisation params (black/white/WB/exposure/compact).
     /// A tone-only slider drag (contrast/shadows/highlights/whites/blacks) leaves these intact, so
     /// the 3 pre-LUTs are NOT rebuilt — see `ensure_lut`.
-    fn pre_matches(&self, black: u16, white: u16, wb_r: f32, wb_g: f32, wb_b: f32,
-                   exp_gain: f32, compact: bool) -> bool {
-        self.black == black && self.white == white
+    fn pre_matches(
+        &self,
+        black: u16,
+        white: u16,
+        wb_r: f32,
+        wb_g: f32,
+        wb_b: f32,
+        exp_gain: f32,
+        compact: bool,
+    ) -> bool {
+        self.black == black
+            && self.white == white
             && self.compact_lut == compact
-            && self.wb_r_bits    == wb_r.to_bits()
-            && self.wb_g_bits    == wb_g.to_bits()
-            && self.wb_b_bits    == wb_b.to_bits()
+            && self.wb_r_bits == wb_r.to_bits()
+            && self.wb_g_bits == wb_g.to_bits()
+            && self.wb_b_bits == wb_b.to_bits()
             && self.exp_gain_bits == exp_gain.to_bits()
     }
     /// Post-LUT validity: depends ONLY on the tone curve params. A WB/exposure/black/white drag
     /// leaves these intact, so the powf-heavy post-LUT is NOT rebuilt.
     fn post_matches(&self, tone: &TonePost) -> bool {
-        self.contrast_bits   == tone.contrast.to_bits()
-            && self.shadows_bits    == tone.shadows.to_bits()
+        self.contrast_bits == tone.contrast.to_bits()
+            && self.shadows_bits == tone.shadows.to_bits()
             && self.highlights_bits == tone.highlights.to_bits()
-            && self.whites_bits     == tone.whites.to_bits()
-            && self.blacks_bits     == tone.blacks.to_bits()
+            && self.whites_bits == tone.whites.to_bits()
+            && self.blacks_bits == tone.blacks.to_bits()
     }
 }
 
@@ -720,12 +800,33 @@ fn build_post_lut_strided(t: &TonePost) -> Vec<u8> {
 fn build_pre_luts(
     params: &PipelineParams,
     ti: &ToneInputs,
-) -> (std::sync::Arc<Vec<u16>>, std::sync::Arc<Vec<u16>>, std::sync::Arc<Vec<u16>>, usize, u32) {
+) -> (
+    std::sync::Arc<Vec<u16>>,
+    std::sync::Arc<Vec<u16>>,
+    std::sync::Arc<Vec<u16>>,
+    usize,
+    u32,
+) {
     if params.compact_lut {
         (
-            std::sync::Arc::new(build_pre_lut_strided(params.black, params.white, ti.wb_r, ti.exp_gain)),
-            std::sync::Arc::new(build_pre_lut_strided(params.black, params.white, ti.wb_g, ti.exp_gain)),
-            std::sync::Arc::new(build_pre_lut_strided(params.black, params.white, ti.wb_b, ti.exp_gain)),
+            std::sync::Arc::new(build_pre_lut_strided(
+                params.black,
+                params.white,
+                ti.wb_r,
+                ti.exp_gain,
+            )),
+            std::sync::Arc::new(build_pre_lut_strided(
+                params.black,
+                params.white,
+                ti.wb_g,
+                ti.exp_gain,
+            )),
+            std::sync::Arc::new(build_pre_lut_strided(
+                params.black,
+                params.white,
+                ti.wb_b,
+                ti.exp_gain,
+            )),
             COMPACT_LUT_LEN,
             COMPACT_LUT_SHIFT,
         )
@@ -735,9 +836,27 @@ fn build_pre_luts(
         // the mask `0xFFFF` is an identity for all u16 inputs.
         let lut_len = 65536usize;
         (
-            std::sync::Arc::new(build_pre_lut_compact(params.black, params.white, ti.wb_r, ti.exp_gain, lut_len)),
-            std::sync::Arc::new(build_pre_lut_compact(params.black, params.white, ti.wb_g, ti.exp_gain, lut_len)),
-            std::sync::Arc::new(build_pre_lut_compact(params.black, params.white, ti.wb_b, ti.exp_gain, lut_len)),
+            std::sync::Arc::new(build_pre_lut_compact(
+                params.black,
+                params.white,
+                ti.wb_r,
+                ti.exp_gain,
+                lut_len,
+            )),
+            std::sync::Arc::new(build_pre_lut_compact(
+                params.black,
+                params.white,
+                ti.wb_g,
+                ti.exp_gain,
+                lut_len,
+            )),
+            std::sync::Arc::new(build_pre_lut_compact(
+                params.black,
+                params.white,
+                ti.wb_b,
+                ti.exp_gain,
+                lut_len,
+            )),
             lut_len,
             0u32,
         )
@@ -770,15 +889,21 @@ pub fn gaussian_kernel_5() -> [f32; 5] {
 }
 
 pub fn gaussian_kernel_13() -> [f32; 13] {
-    [0.0185, 0.0342, 0.0563, 0.0831, 0.1097, 0.1296,
-     0.1372,
-     0.1296, 0.1097, 0.0831, 0.0563, 0.0342, 0.0185]
+    [
+        0.0185, 0.0342, 0.0563, 0.0831, 0.1097, 0.1296, 0.1372, 0.1296, 0.1097, 0.0831, 0.0563,
+        0.0342, 0.0185,
+    ]
 }
 
 /// Horizontal blur pass: de-interleave → planar FIR (stride-1, LLVM vectorises) → re-interleave.
 /// Const-generic dispatch (N=5 or N=13) gives LLVM a fixed inner-loop bound to unroll.
-fn separable_blur_into(src: &[u16], width: usize, _height: usize,
-                       kernel: &[f32], temp: &mut [u16]) {
+fn separable_blur_into(
+    src: &[u16],
+    width: usize,
+    _height: usize,
+    kernel: &[f32],
+    temp: &mut [u16],
+) {
     let half = kernel.len() / 2;
     let klen = kernel.len();
 
@@ -788,7 +913,7 @@ fn separable_blur_into(src: &[u16], width: usize, _height: usize,
     let iter = temp.chunks_mut(width * 3).enumerate();
 
     iter.for_each(|(y, row)| {
-        let src_row = &src[y * width * 3 .. (y + 1) * width * 3];
+        let src_row = &src[y * width * 3..(y + 1) * width * 3];
         BLUR_ROW_F32.with(|cell| {
             let mut scratch = cell.borrow_mut();
             // Layout: [R_in | G_in | B_in | R_out | G_out | B_out] each width f32.
@@ -802,7 +927,7 @@ fn separable_blur_into(src: &[u16], width: usize, _height: usize,
             // De-interleave: stride-3 u16 read => 3 x stride-1 f32.
             for px in 0..width {
                 let b = px * 3;
-                r_in[px] = src_row[b]     as f32;
+                r_in[px] = src_row[b] as f32;
                 g_in[px] = src_row[b + 1] as f32;
                 b_in[px] = src_row[b + 2] as f32;
             }
@@ -810,24 +935,24 @@ fn separable_blur_into(src: &[u16], width: usize, _height: usize,
             // Dispatch on kernel length so LLVM sees a compile-time inner bound.
             match klen {
                 13 => blur_fir_planar::<13>(r_in, kernel, half, r_out),
-                5  => blur_fir_planar::<5> (r_in, kernel, half, r_out),
-                _  => blur_fir_planar_dyn  (r_in, kernel, half, r_out),
+                5 => blur_fir_planar::<5>(r_in, kernel, half, r_out),
+                _ => blur_fir_planar_dyn(r_in, kernel, half, r_out),
             }
             match klen {
                 13 => blur_fir_planar::<13>(g_in, kernel, half, g_out),
-                5  => blur_fir_planar::<5> (g_in, kernel, half, g_out),
-                _  => blur_fir_planar_dyn  (g_in, kernel, half, g_out),
+                5 => blur_fir_planar::<5>(g_in, kernel, half, g_out),
+                _ => blur_fir_planar_dyn(g_in, kernel, half, g_out),
             }
             match klen {
                 13 => blur_fir_planar::<13>(b_in, kernel, half, b_out),
-                5  => blur_fir_planar::<5> (b_in, kernel, half, b_out),
-                _  => blur_fir_planar_dyn  (b_in, kernel, half, b_out),
+                5 => blur_fir_planar::<5>(b_in, kernel, half, b_out),
+                _ => blur_fir_planar_dyn(b_in, kernel, half, b_out),
             }
 
             // Re-interleave + f32->u16: stride-1 read => stride-3 write.
             for px in 0..width {
                 let b = px * 3;
-                row[b]     = r_out[px].round() as u16;
+                row[b] = r_out[px].round() as u16;
                 row[b + 1] = g_out[px].round() as u16;
                 row[b + 2] = b_out[px].round() as u16;
             }
@@ -848,9 +973,13 @@ fn separable_blur_into(src: &[u16], width: usize, _height: usize,
 #[inline(always)]
 fn bfma(a: f32, b: f32, c: f32) -> f32 {
     #[cfg(target_feature = "fma")]
-    { a.mul_add(b, c) }
+    {
+        a.mul_add(b, c)
+    }
     #[cfg(not(target_feature = "fma"))]
-    { a * b + c }
+    {
+        a * b + c
+    }
 }
 
 /// 1-D FIR on a single f32 plane with stride-1 I/O and fixed kernel length N.
@@ -859,7 +988,7 @@ fn bfma(a: f32, b: f32, c: f32) -> f32 {
 fn blur_fir_planar<const N: usize>(plane: &[f32], kernel: &[f32], half: usize, out: &mut [f32]) {
     let width = plane.len();
     let int_start = half;
-    let int_end   = width.saturating_sub(half);
+    let int_end = width.saturating_sub(half);
     let wm = width as isize - 1;
 
     // Left border.
@@ -896,7 +1025,7 @@ fn blur_fir_planar<const N: usize>(plane: &[f32], kernel: &[f32], half: usize, o
 fn blur_fir_planar_dyn(plane: &[f32], kernel: &[f32], half: usize, out: &mut [f32]) {
     let width = plane.len();
     let int_start = half;
-    let int_end   = width.saturating_sub(half);
+    let int_end = width.saturating_sub(half);
     let wm = width as isize - 1;
     for x in 0..int_start.min(width) {
         let mut acc = 0f32;
@@ -909,7 +1038,9 @@ fn blur_fir_planar_dyn(plane: &[f32], kernel: &[f32], half: usize, out: &mut [f3
     for x in int_start..int_end {
         let b0 = x - half;
         let mut acc = 0f32;
-        for (ki, &kv) in kernel.iter().enumerate() { acc = bfma(plane[b0 + ki], kv, acc); }
+        for (ki, &kv) in kernel.iter().enumerate() {
+            acc = bfma(plane[b0 + ki], kv, acc);
+        }
         out[x] = acc;
     }
     for x in int_end.max(int_start)..width {
@@ -921,8 +1052,14 @@ fn blur_fir_planar_dyn(plane: &[f32], kernel: &[f32], half: usize, out: &mut [f3
         out[x] = acc;
     }
 }
-fn separable_blur_with_bufs(src: &[u16], width: usize, height: usize, kernel: &[f32],
-                             temp: &mut Vec<u16>, out: &mut Vec<u16>) {
+fn separable_blur_with_bufs(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    temp: &mut Vec<u16>,
+    out: &mut Vec<u16>,
+) {
     let n = width * height * 3;
     temp.resize(n, 0);
     out.resize(n, 0);
@@ -934,44 +1071,51 @@ fn separable_blur_with_bufs(src: &[u16], width: usize, height: usize, kernel: &[
         const VTILE: usize = 128;
         let klen = kernel.len();
         let temp_slice = temp.as_slice();
-        out.par_chunks_mut(width * 3).enumerate().for_each(|(y, row)| {
-            let mut acc_r = [0f32; VTILE];
-            let mut acc_g = [0f32; VTILE];
-            let mut acc_b = [0f32; VTILE];
-            let mut r_tap = [0f32; VTILE];
-            let mut g_tap = [0f32; VTILE];
-            let mut b_tap = [0f32; VTILE];
-            for x0 in (0..width).step_by(VTILE) {
-                let x1 = (x0 + VTILE).min(width);
-                let tile = x1 - x0;
-                for xi in 0..tile { acc_r[xi] = 0.0; acc_g[xi] = 0.0; acc_b[xi] = 0.0; }
-                for ki in 0..klen {
-                    let kv = kernel[ki];
-                    let yi = (y as isize + ki as isize - half as isize)
-                        .clamp(0, height as isize - 1) as usize;
-                    let row_base = yi * width * 3;
-                    // De-interleave tap row: stride-3 reads → stride-1 planar writes.
+        out.par_chunks_mut(width * 3)
+            .enumerate()
+            .for_each(|(y, row)| {
+                let mut acc_r = [0f32; VTILE];
+                let mut acc_g = [0f32; VTILE];
+                let mut acc_b = [0f32; VTILE];
+                let mut r_tap = [0f32; VTILE];
+                let mut g_tap = [0f32; VTILE];
+                let mut b_tap = [0f32; VTILE];
+                for x0 in (0..width).step_by(VTILE) {
+                    let x1 = (x0 + VTILE).min(width);
+                    let tile = x1 - x0;
                     for xi in 0..tile {
-                        let b = row_base + (x0 + xi) * 3;
-                        r_tap[xi] = temp_slice[b]     as f32;
-                        g_tap[xi] = temp_slice[b + 1] as f32;
-                        b_tap[xi] = temp_slice[b + 2] as f32;
+                        acc_r[xi] = 0.0;
+                        acc_g[xi] = 0.0;
+                        acc_b[xi] = 0.0;
                     }
-                    // Accumulate: stride-1 reads + writes → LLVM auto-vectorises.
+                    for ki in 0..klen {
+                        let kv = kernel[ki];
+                        let yi = (y as isize + ki as isize - half as isize)
+                            .clamp(0, height as isize - 1)
+                            as usize;
+                        let row_base = yi * width * 3;
+                        // De-interleave tap row: stride-3 reads → stride-1 planar writes.
+                        for xi in 0..tile {
+                            let b = row_base + (x0 + xi) * 3;
+                            r_tap[xi] = temp_slice[b] as f32;
+                            g_tap[xi] = temp_slice[b + 1] as f32;
+                            b_tap[xi] = temp_slice[b + 2] as f32;
+                        }
+                        // Accumulate: stride-1 reads + writes → LLVM auto-vectorises.
+                        for xi in 0..tile {
+                            acc_r[xi] = bfma(r_tap[xi], kv, acc_r[xi]);
+                            acc_g[xi] = bfma(g_tap[xi], kv, acc_g[xi]);
+                            acc_b[xi] = bfma(b_tap[xi], kv, acc_b[xi]);
+                        }
+                    }
                     for xi in 0..tile {
-                        acc_r[xi] = bfma(r_tap[xi], kv, acc_r[xi]);
-                        acc_g[xi] = bfma(g_tap[xi], kv, acc_g[xi]);
-                        acc_b[xi] = bfma(b_tap[xi], kv, acc_b[xi]);
+                        let o = (x0 + xi) * 3;
+                        row[o] = acc_r[xi].round() as u16;
+                        row[o + 1] = acc_g[xi].round() as u16;
+                        row[o + 2] = acc_b[xi].round() as u16;
                     }
                 }
-                for xi in 0..tile {
-                    let o = (x0 + xi) * 3;
-                    row[o]     = acc_r[xi].round() as u16;
-                    row[o + 1] = acc_g[xi].round() as u16;
-                    row[o + 2] = acc_b[xi].round() as u16;
-                }
-            }
-        });
+            });
     }
 
     #[cfg(not(feature = "parallel"))]
@@ -989,9 +1133,13 @@ fn separable_blur_with_bufs(src: &[u16], width: usize, height: usize, kernel: &[
         let mut b_tap = [0f32; VTILE];
         for y in 0..height {
             for x0 in (0..width).step_by(VTILE) {
-                let x1   = (x0 + VTILE).min(width);
+                let x1 = (x0 + VTILE).min(width);
                 let tile = x1 - x0;
-                for xi in 0..tile { acc_r[xi] = 0.0; acc_g[xi] = 0.0; acc_b[xi] = 0.0; }
+                for xi in 0..tile {
+                    acc_r[xi] = 0.0;
+                    acc_g[xi] = 0.0;
+                    acc_b[xi] = 0.0;
+                }
                 for ki in 0..klen {
                     let kv = kernel[ki];
                     let yi = (y as isize + ki as isize - half as isize)
@@ -999,7 +1147,7 @@ fn separable_blur_with_bufs(src: &[u16], width: usize, height: usize, kernel: &[
                     let row_base = yi * width * 3;
                     for xi in 0..tile {
                         let b = row_base + (x0 + xi) * 3;
-                        r_tap[xi] = temp[b]     as f32;
+                        r_tap[xi] = temp[b] as f32;
                         g_tap[xi] = temp[b + 1] as f32;
                         b_tap[xi] = temp[b + 2] as f32;
                     }
@@ -1011,7 +1159,7 @@ fn separable_blur_with_bufs(src: &[u16], width: usize, height: usize, kernel: &[
                 }
                 for xi in 0..tile {
                     let b = (y * width + x0 + xi) * 3;
-                    out[b]     = acc_r[xi].round() as u16;
+                    out[b] = acc_r[xi].round() as u16;
                     out[b + 1] = acc_g[xi].round() as u16;
                     out[b + 2] = acc_b[xi].round() as u16;
                 }
@@ -1020,9 +1168,15 @@ fn separable_blur_with_bufs(src: &[u16], width: usize, height: usize, kernel: &[
     }
 }
 
-pub fn apply_unsharp_masks(rgb16: &mut [u16], width: usize, height: usize,
-                            params: &PipelineParams) {
-    if params.texture == 0.0 && params.clarity == 0.0 { return; }
+pub fn apply_unsharp_masks(
+    rgb16: &mut [u16],
+    width: usize,
+    height: usize,
+    params: &PipelineParams,
+) {
+    if params.texture == 0.0 && params.clarity == 0.0 {
+        return;
+    }
     // PIPE-003: When both texture and clarity are active, each must operate on the original
     // (pre-unsharp) image.  Previously this called rgb16.to_vec() here (full-frame allocation,
     // ~144 MB at 24 MP on every slider tick).  Instead we reuse the third BLUR_SCRATCH slot
@@ -1039,13 +1193,17 @@ pub fn apply_unsharp_masks(rgb16: &mut [u16], width: usize, height: usize,
         if params.texture != 0.0 {
             separable_blur_with_bufs(rgb16, width, height, &gaussian_kernel_5(), temp, blurred);
             #[cfg(feature = "parallel")]
-            rgb16.par_chunks_mut(width * 3).zip(blurred.par_chunks(width * 3)).for_each(|(r_row, b_row)| {
-                for i in 0..r_row.len() {
-                    let orig = r_row[i] as i32;
-                    let blur = b_row[i] as i32;
-                    r_row[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16;
-                }
-            });
+            rgb16
+                .par_chunks_mut(width * 3)
+                .zip(blurred.par_chunks(width * 3))
+                .for_each(|(r_row, b_row)| {
+                    for i in 0..r_row.len() {
+                        let orig = r_row[i] as i32;
+                        let blur = b_row[i] as i32;
+                        r_row[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32)
+                            .clamp(0, 65535) as u16;
+                    }
+                });
             #[cfg(not(feature = "parallel"))]
             {
                 let n = rgb16.len();
@@ -1053,7 +1211,8 @@ pub fn apply_unsharp_masks(rgb16: &mut [u16], width: usize, height: usize,
                 while i < n {
                     let orig = rgb16[i] as i32;
                     let blur = blurred[i] as i32;
-                    rgb16[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16;
+                    rgb16[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32)
+                        .clamp(0, 65535) as u16;
                     i += 1;
                 }
             }
@@ -1062,22 +1221,31 @@ pub fn apply_unsharp_masks(rgb16: &mut [u16], width: usize, height: usize,
             // Clarity blurs the original image (not the texture-sharpened output).
             // When has_snap (both passes active), blur the snapshot in snap_buf; else blur rgb16 as usual.
             if has_snap {
-                separable_blur_with_bufs(snap_buf, width, height, &gaussian_kernel_13(), temp, blurred);
+                separable_blur_with_bufs(
+                    snap_buf,
+                    width,
+                    height,
+                    &gaussian_kernel_13(),
+                    temp,
+                    blurred,
+                );
                 // Apply clarity: orig from snap_buf, delta from snap blur, added to texture-sharpened rgb16.
                 #[cfg(feature = "parallel")]
-                rgb16.par_chunks_mut(width * 3)
+                rgb16
+                    .par_chunks_mut(width * 3)
                     .zip(snap_buf.par_chunks(width * 3))
                     .zip(blurred.par_chunks(width * 3))
                     .for_each(|((r_row, o_row), b_row)| {
-                    for i in 0..r_row.len() {
-                        let orig = o_row[i] as i32;
-                        let blur = b_row[i] as i32;
-                        let v = orig as f32 / 65535.0;
-                        let w = 4.0 * v * (1.0 - v);
-                        r_row[i] = (r_row[i] as i32 + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                            .clamp(0, 65535) as u16;
-                    }
-                });
+                        for i in 0..r_row.len() {
+                            let orig = o_row[i] as i32;
+                            let blur = b_row[i] as i32;
+                            let v = orig as f32 / 65535.0;
+                            let w = 4.0 * v * (1.0 - v);
+                            r_row[i] = (r_row[i] as i32
+                                + (params.clarity * w * (orig - blur) as f32).round() as i32)
+                                .clamp(0, 65535) as u16;
+                        }
+                    });
                 #[cfg(not(feature = "parallel"))]
                 {
                     let n = rgb16.len();
@@ -1087,25 +1255,37 @@ pub fn apply_unsharp_masks(rgb16: &mut [u16], width: usize, height: usize,
                         let blur = blurred[i] as i32;
                         let v = orig as f32 / 65535.0;
                         let w = 4.0 * v * (1.0 - v);
-                        rgb16[i] = (rgb16[i] as i32 + (params.clarity * w * (orig - blur) as f32).round() as i32)
+                        rgb16[i] = (rgb16[i] as i32
+                            + (params.clarity * w * (orig - blur) as f32).round() as i32)
                             .clamp(0, 65535) as u16;
                         i += 1;
                     }
                 }
             } else {
                 // Only clarity is active (no texture pass ran): blur rgb16 directly as before.
-                separable_blur_with_bufs(rgb16, width, height, &gaussian_kernel_13(), temp, blurred);
+                separable_blur_with_bufs(
+                    rgb16,
+                    width,
+                    height,
+                    &gaussian_kernel_13(),
+                    temp,
+                    blurred,
+                );
                 #[cfg(feature = "parallel")]
-                rgb16.par_chunks_mut(width * 3).zip(blurred.par_chunks(width * 3)).for_each(|(r_row, b_row)| {
-                    for i in 0..r_row.len() {
-                        let orig = r_row[i] as i32;
-                        let blur = b_row[i] as i32;
-                        let v = orig as f32 / 65535.0;
-                        let w = 4.0 * v * (1.0 - v);
-                        r_row[i] = (orig + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                            .clamp(0, 65535) as u16;
-                    }
-                });
+                rgb16
+                    .par_chunks_mut(width * 3)
+                    .zip(blurred.par_chunks(width * 3))
+                    .for_each(|(r_row, b_row)| {
+                        for i in 0..r_row.len() {
+                            let orig = r_row[i] as i32;
+                            let blur = b_row[i] as i32;
+                            let v = orig as f32 / 65535.0;
+                            let w = 4.0 * v * (1.0 - v);
+                            r_row[i] = (orig
+                                + (params.clarity * w * (orig - blur) as f32).round() as i32)
+                                .clamp(0, 65535) as u16;
+                        }
+                    });
                 #[cfg(not(feature = "parallel"))]
                 {
                     let n = rgb16.len();
@@ -1195,11 +1375,31 @@ pub fn perceptual_apply_bulk(
     vib_zero: bool,
 ) {
     let n = r.len();
-    assert_eq!(g.len(), n, "perceptual_apply_bulk: all slices must be the same length");
-    assert_eq!(b.len(), n, "perceptual_apply_bulk: all slices must be the same length");
-    assert_eq!(out_r.len(), n, "perceptual_apply_bulk: all slices must be the same length");
-    assert_eq!(out_g.len(), n, "perceptual_apply_bulk: all slices must be the same length");
-    assert_eq!(out_b.len(), n, "perceptual_apply_bulk: all slices must be the same length");
+    assert_eq!(
+        g.len(),
+        n,
+        "perceptual_apply_bulk: all slices must be the same length"
+    );
+    assert_eq!(
+        b.len(),
+        n,
+        "perceptual_apply_bulk: all slices must be the same length"
+    );
+    assert_eq!(
+        out_r.len(),
+        n,
+        "perceptual_apply_bulk: all slices must be the same length"
+    );
+    assert_eq!(
+        out_g.len(),
+        n,
+        "perceptual_apply_bulk: all slices must be the same length"
+    );
+    assert_eq!(
+        out_b.len(),
+        n,
+        "perceptual_apply_bulk: all slices must be the same length"
+    );
     if n == 0 {
         return;
     }
@@ -1246,7 +1446,17 @@ pub fn apply_tone_math(
             let mut gg = 0.0f32;
             let mut bb = 0.0f32;
             unsafe {
-                perceptual_apply_full(r2, g2, b2, sat, vib, if vib_zero { 1 } else { 0 }, &mut rr, &mut gg, &mut bb);
+                perceptual_apply_full(
+                    r2,
+                    g2,
+                    b2,
+                    sat,
+                    vib,
+                    if vib_zero { 1 } else { 0 },
+                    &mut rr,
+                    &mut gg,
+                    &mut bb,
+                );
             }
             r2 = rr;
             g2 = gg;
@@ -1267,7 +1477,10 @@ pub fn apply_tone_math(
             });
             // Read-only borrow for the hot pixel loop — avoids borrow_mut on every pixel.
             let (rr, gg, bb) = PERCEPTUAL_GRID.with(|g| {
-                g.borrow().as_ref().unwrap().sample(r2 * norm, g2 * norm, b2 * norm)
+                g.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .sample(r2 * norm, g2 * norm, b2 * norm)
             });
             // Grid output is in [0, 1.5]; scale back to [0, 65535] for the post-LUT.
             r2 = rr * 65535.0;
@@ -1302,10 +1515,20 @@ pub fn apply_tone_math(
 /// Allows JS postDecodeTransform (from byte-benchmark harness + Cursor for layer) to apply the full
 /// log-geodesic/Molchanov/LANL engine on early cutoff frames before butter or display.
 /// Positive: directly enables the AR/LLM/ photogram vision on progressive arrivals; zero cost if not called.
-pub fn apply_perceptual_constancy(r: f32, g: f32, b: f32, sat: f32, vib: f32, vib_zero: bool, layer: u32) -> (f32, f32, f32) {
+pub fn apply_perceptual_constancy(
+    r: f32,
+    g: f32,
+    b: f32,
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
+    layer: u32,
+) -> (f32, f32, f32) {
     let (lr, lg, lb) = to_log_euclidean(r, g, b);
     let luma_l = (lr + lg + lb) / 3.0;
-    let base_scale = if vib_zero { sat } else {
+    let base_scale = if vib_zero {
+        sat
+    } else {
         let raw_mx = r.max(g).max(b);
         let mx = raw_mx.max(1.0);
         let mn = r.min(g).min(b).max(0.0);
@@ -1322,7 +1545,11 @@ pub fn apply_perceptual_constancy(r: f32, g: f32, b: f32, sat: f32, vib: f32, vi
     // perceptual "strength" of the adjustment.  Lerp in linear output instead.
     let layer_scale = 1.0 - (layer as f32 * 0.1).min(0.5);
     let blend = |out: f32, inp: f32| inp + (out - inp) * layer_scale;
-    (blend(rr, r).clamp(0.0, 1.5), blend(gg, g).clamp(0.0, 1.5), blend(bb, b).clamp(0.0, 1.5))
+    (
+        blend(rr, r).clamp(0.0, 1.5),
+        blend(gg, g).clamp(0.0, 1.5),
+        blend(bb, b).clamp(0.0, 1.5),
+    )
 }
 
 /// Fused-matrix fast path: `m` is already `S·M` (around-luma saturation pre-multiplied into the
@@ -1369,7 +1596,9 @@ fn apply_tone_math4(
         // Rare in this call site (bulk handles when c-perceptual); fall back for correctness.
         for i in 0..4 {
             let (r2, g2, b2) = apply_tone_math(rs[i], gs[i], bs[i], m, sat, vib, vib_zero, true);
-            r2s[i] = r2; g2s[i] = g2; b2s[i] = b2;
+            r2s[i] = r2;
+            g2s[i] = g2;
+            b2s[i] = b2;
         }
     } else if sat_fused {
         // Fused: m is already S·M ⇒ matrix only (saturation pre-multiplied). Drops the luma+blend loop.
@@ -1408,13 +1637,23 @@ fn apply_tone_math4(
     (r2s, g2s, b2s)
 }
 
-struct ToneInputs { pub exp_gain: f32, pub wb_r: f32, pub wb_g: f32, pub wb_b: f32, pub tone: TonePost, pub sat: f32, pub vib: f32, pub vib_zero: bool, pub perceptual_constancy: bool,
+struct ToneInputs {
+    pub exp_gain: f32,
+    pub wb_r: f32,
+    pub wb_g: f32,
+    pub wb_b: f32,
+    pub tone: TonePost,
+    pub sat: f32,
+    pub vib: f32,
+    pub vib_zero: bool,
+    pub perceptual_constancy: bool,
     /// When the default path applies (`vib_zero && !perceptual_constancy`), the colour matrix
     /// and around-luma saturation are pre-fused into ONE 3×3 (`S·M`) so per-pixel tone is a
     /// single matvec — no luma, no blend.
     /// Invariant: `matrix_fused == Some(_) ⟺ vib_zero && !perceptual_constancy`.
     /// `None` ⇒ vibrance active OR perceptual constancy enabled (both require runtime luma).
-    pub matrix_fused: Option<[[f32; 3]; 3]> }
+    pub matrix_fused: Option<[[f32; 3]; 3]>,
+}
 
 fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
     let exp_gain = 2f32.powf((params.exposure_ev + BASELINE_EXP_EV).clamp(-3.0, 4.0));
@@ -1446,7 +1685,18 @@ fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
     } else {
         None
     };
-    ToneInputs { exp_gain, wb_r, wb_g, wb_b, tone, sat, vib, vib_zero, perceptual_constancy, matrix_fused }
+    ToneInputs {
+        exp_gain,
+        wb_r,
+        wb_g,
+        wb_b,
+        tone,
+        sat,
+        vib,
+        vib_zero,
+        perceptual_constancy,
+        matrix_fused,
+    }
 }
 
 /// Lazily (re)build the LUT cache, rebuilding ONLY the half whose inputs changed. The pre-LUTs
@@ -1454,9 +1704,22 @@ fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
 /// drag rebuilds at most one half: a WB/exposure drag skips the powf-heavy post-LUT entirely; a
 /// tone drag skips the three pre-LUTs. Bundling them (the old `matches`) rebuilt all four every
 /// tick — ~7.5 ms of needless work in the interactive loop.
-fn ensure_lut(cache: &mut Option<LutCache>, params: &PipelineParams, ti: &ToneInputs, need16: bool) {
+fn ensure_lut(
+    cache: &mut Option<LutCache>,
+    params: &PipelineParams,
+    ti: &ToneInputs,
+    need16: bool,
+) {
     let pre_ok = cache.as_ref().is_some_and(|c| {
-        c.pre_matches(params.black, params.white, ti.wb_r, ti.wb_g, ti.wb_b, ti.exp_gain, params.compact_lut)
+        c.pre_matches(
+            params.black,
+            params.white,
+            ti.wb_r,
+            ti.wb_g,
+            ti.wb_b,
+            ti.exp_gain,
+            params.compact_lut,
+        )
     });
     let post_ok = cache.as_ref().is_some_and(|c| c.post_matches(&ti.tone));
 
@@ -1464,17 +1727,26 @@ fn ensure_lut(cache: &mut Option<LutCache>, params: &PipelineParams, ti: &ToneIn
         None => {
             let (pre_r, pre_g, pre_b, pre_lut_len, pre_lut_shift) = build_pre_luts(params, ti);
             *cache = Some(LutCache {
-                black: params.black, white: params.white,
-                wb_r_bits: ti.wb_r.to_bits(), wb_g_bits: ti.wb_g.to_bits(),
-                wb_b_bits: ti.wb_b.to_bits(), exp_gain_bits: ti.exp_gain.to_bits(),
-                contrast_bits:   ti.tone.contrast.to_bits(),
-                shadows_bits:    ti.tone.shadows.to_bits(),
+                black: params.black,
+                white: params.white,
+                wb_r_bits: ti.wb_r.to_bits(),
+                wb_g_bits: ti.wb_g.to_bits(),
+                wb_b_bits: ti.wb_b.to_bits(),
+                exp_gain_bits: ti.exp_gain.to_bits(),
+                contrast_bits: ti.tone.contrast.to_bits(),
+                shadows_bits: ti.tone.shadows.to_bits(),
                 highlights_bits: ti.tone.highlights.to_bits(),
-                whites_bits:     ti.tone.whites.to_bits(),
-                blacks_bits:     ti.tone.blacks.to_bits(),
-                pre_r, pre_g, pre_b,
+                whites_bits: ti.tone.whites.to_bits(),
+                blacks_bits: ti.tone.blacks.to_bits(),
+                pre_r,
+                pre_g,
+                pre_b,
                 post: std::sync::Arc::new(build_post_lut(&ti.tone)),
-                post16: if need16 { Some(std::sync::Arc::new(build_post16_lut(&ti.tone))) } else { None },
+                post16: if need16 {
+                    Some(std::sync::Arc::new(build_post16_lut(&ti.tone)))
+                } else {
+                    None
+                },
                 pre_lut_len,
                 pre_lut_shift,
                 compact_lut: params.compact_lut,
@@ -1483,16 +1755,26 @@ fn ensure_lut(cache: &mut Option<LutCache>, params: &PipelineParams, ti: &ToneIn
         Some(c) => {
             if !pre_ok {
                 let (pre_r, pre_g, pre_b, pre_lut_len, pre_lut_shift) = build_pre_luts(params, ti);
-                c.pre_r = pre_r; c.pre_g = pre_g; c.pre_b = pre_b;
-                c.pre_lut_len = pre_lut_len; c.pre_lut_shift = pre_lut_shift;
+                c.pre_r = pre_r;
+                c.pre_g = pre_g;
+                c.pre_b = pre_b;
+                c.pre_lut_len = pre_lut_len;
+                c.pre_lut_shift = pre_lut_shift;
                 c.compact_lut = params.compact_lut;
-                c.black = params.black; c.white = params.white;
-                c.wb_r_bits = ti.wb_r.to_bits(); c.wb_g_bits = ti.wb_g.to_bits();
-                c.wb_b_bits = ti.wb_b.to_bits(); c.exp_gain_bits = ti.exp_gain.to_bits();
+                c.black = params.black;
+                c.white = params.white;
+                c.wb_r_bits = ti.wb_r.to_bits();
+                c.wb_g_bits = ti.wb_g.to_bits();
+                c.wb_b_bits = ti.wb_b.to_bits();
+                c.exp_gain_bits = ti.exp_gain.to_bits();
             }
             if !post_ok {
                 c.post = std::sync::Arc::new(build_post_lut(&ti.tone));
-                c.post16 = if need16 { Some(std::sync::Arc::new(build_post16_lut(&ti.tone))) } else { None };
+                c.post16 = if need16 {
+                    Some(std::sync::Arc::new(build_post16_lut(&ti.tone)))
+                } else {
+                    None
+                };
                 c.contrast_bits = ti.tone.contrast.to_bits();
                 c.shadows_bits = ti.tone.shadows.to_bits();
                 c.highlights_bits = ti.tone.highlights.to_bits();
@@ -1512,7 +1794,11 @@ fn ensure_lut(cache: &mut Option<LutCache>, params: &PipelineParams, ti: &ToneIn
 /// cost is acceptable.
 // doc(alias) tags are not needed here; callers that need the fast path already use process_into.
 pub fn process(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
-    assert_eq!(rgb16.len() % 3, 0, "process: rgb16.len() must be divisible by 3");
+    assert_eq!(
+        rgb16.len() % 3,
+        0,
+        "process: rgb16.len() must be divisible by 3"
+    );
     let n = rgb16.len() / 3;
     let mut out = vec![0u8; n * 3];
     process_into(rgb16, params, &mut out);
@@ -1524,8 +1810,16 @@ pub fn process(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 /// Lets the interactive LookRenderer reuse one output buffer across re-renders instead of
 /// allocating + zeroing a fresh Vec each slider tick. Output is byte-identical to `process`.
 pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
-    assert_eq!(rgb16.len() % 3, 0, "process_into: rgb16.len() must be divisible by 3");
-    assert_eq!(out.len(), rgb16.len(), "process_into: out must have rgb16.len() elements");
+    assert_eq!(
+        rgb16.len() % 3,
+        0,
+        "process_into: rgb16.len() must be divisible by 3"
+    );
+    assert_eq!(
+        out.len(),
+        rgb16.len(),
+        "process_into: out must have rgb16.len() elements"
+    );
     let ti = derive_tone_inputs(params);
     let fallback = CAM_TO_SRGB;
     let m = params.color_matrix.as_ref().unwrap_or(&fallback);
@@ -1544,7 +1838,7 @@ pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
             // advance exactly rgb16.len() elements. (Wrap added to fix the wasm/no-parallel build.)
             // Enhanced (this pass): 4x unroll for !pc classic path (amortizes loop overhead on 90% scalar math).
             // Tile-bulk path for pc + c-perceptual: feeds fixed SoA to AVX2 hand-intrinsics (perceptual_apply_full_avx2)
-// (WASM/native strategy: C++ only when feature + native; else pure Rust vec4/grid for WASM + default)
+            // (WASM/native strategy: C++ only when feature + native; else pure Rust vec4/grid for WASM + default)
             // avoiding scalar FFI call overhead per pixel for the heavy Lens17 advanced color path.
             // TILE=64 amortizes; remainder handled naturally. Replicate pattern to rgba/16bit loops if they become hot for AR.
             unsafe {
@@ -1573,21 +1867,36 @@ pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
                         while src < src_end {
                             let mut t = 0usize;
                             while t < TILE && src < src_end {
-                                tr[t] = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                                tg[t] = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                                tb[t] = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
+                                tr[t] = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask)
+                                    as f32;
+                                src = src.add(1);
+                                tg[t] = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask)
+                                    as f32;
+                                src = src.add(1);
+                                tb[t] = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask)
+                                    as f32;
+                                src = src.add(1);
                                 t += 1;
                             }
                             if t > 0 {
                                 perceptual_apply_bulk(
-                                    &tr[..t], &tg[..t], &tb[..t],
-                                    &mut orr[..t], &mut ogg[..t], &mut obb[..t],
-                                    ti.sat, ti.vib, ti.vib_zero,
+                                    &tr[..t],
+                                    &tg[..t],
+                                    &tb[..t],
+                                    &mut orr[..t],
+                                    &mut ogg[..t],
+                                    &mut obb[..t],
+                                    ti.sat,
+                                    ti.vib,
+                                    ti.vib_zero,
                                 );
                                 for i in 0..t {
-                                    *dst = *post.add(orr[i].clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                                    *dst = *post.add(ogg[i].clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                                    *dst = *post.add(obb[i].clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                                    *dst = *post.add(orr[i].clamp(0.0, 65535.0) as u16 as usize);
+                                    dst = dst.add(1);
+                                    *dst = *post.add(ogg[i].clamp(0.0, 65535.0) as u16 as usize);
+                                    dst = dst.add(1);
+                                    *dst = *post.add(obb[i].clamp(0.0, 65535.0) as u16 as usize);
+                                    dst = dst.add(1);
                                 }
                             }
                         }
@@ -1602,18 +1911,41 @@ pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
                         let mut bs = [0f32; 4];
                         let mut cnt = 0usize;
                         for k in 0..4 {
-                            if src >= src_end { break; }
-                            rs[k] = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                            gs[k] = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                            bs[k] = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
+                            if src >= src_end {
+                                break;
+                            }
+                            rs[k] =
+                                *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                            src = src.add(1);
+                            gs[k] =
+                                *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                            src = src.add(1);
+                            bs[k] =
+                                *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                            src = src.add(1);
                             cnt += 1;
                         }
-                        if cnt == 0 { break; }
-                        let (r2s, g2s, b2s) = apply_tone_math4(rs, gs, bs, ti.matrix_fused.as_ref().unwrap_or(m), ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy, ti.matrix_fused.is_some());
+                        if cnt == 0 {
+                            break;
+                        }
+                        let (r2s, g2s, b2s) = apply_tone_math4(
+                            rs,
+                            gs,
+                            bs,
+                            ti.matrix_fused.as_ref().unwrap_or(m),
+                            ti.sat,
+                            ti.vib,
+                            ti.vib_zero,
+                            ti.perceptual_constancy,
+                            ti.matrix_fused.is_some(),
+                        );
                         for k in 0..cnt {
-                            *dst = *post.add(r2s[k].clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                            *dst = *post.add(g2s[k].clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                            *dst = *post.add(b2s[k].clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                            *dst = *post.add(r2s[k].clamp(0.0, 65535.0) as u16 as usize);
+                            dst = dst.add(1);
+                            *dst = *post.add(g2s[k].clamp(0.0, 65535.0) as u16 as usize);
+                            dst = dst.add(1);
+                            *dst = *post.add(b2s[k].clamp(0.0, 65535.0) as u16 as usize);
+                            dst = dst.add(1);
                         }
                     }
                 }
@@ -1624,21 +1956,44 @@ pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
     #[cfg(feature = "parallel")]
     {
         PARALLEL_PATH_CALLS.with(|c| c.set(c.get() + 1));
-        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) = LUT_CACHE.with(|cache_cell| {
-            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
-            let c = cache_cell.borrow();
-            let cr = c.as_ref().unwrap();
-            (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post.clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
-        });
-        out.par_chunks_mut(3).zip(rgb16.par_chunks(3)).with_min_len(4096).for_each(|(out_px, in_px)| {
-            let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-            out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
-        });
+        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) =
+            LUT_CACHE.with(|cache_cell| {
+                ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
+                let c = cache_cell.borrow();
+                let cr = c.as_ref().unwrap();
+                (
+                    cr.pre_r.clone(),
+                    cr.pre_g.clone(),
+                    cr.pre_b.clone(),
+                    cr.post.clone(),
+                    cr.pre_lut_len - 1,
+                    cr.pre_lut_shift,
+                )
+            });
+        out.par_chunks_mut(3)
+            .zip(rgb16.par_chunks(3))
+            .with_min_len(4096)
+            .for_each(|(out_px, in_px)| {
+                let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                    Some(mf) => apply_tone_fused(r, g, b, mf),
+                    None => apply_tone_math(
+                        r,
+                        g,
+                        b,
+                        m,
+                        ti.sat,
+                        ti.vib,
+                        ti.vib_zero,
+                        ti.perceptual_constancy,
+                    ),
+                };
+                out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
+            });
     }
 }
 
@@ -1683,13 +2038,23 @@ fn simd_block_kernel<T: Copy>(
 ) {
     let np = ib.len() / 3;
     for i in 0..np {
-        r[i] = pre_r[(ib[i * 3]     as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+        r[i] = pre_r[(ib[i * 3] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
         g[i] = pre_g[(ib[i * 3 + 1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
         b[i] = pre_b[(ib[i * 3 + 2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
     }
     match fused_matrix {
-        Some(mf) => crate::tone_simd::apply_tone_bulk_matrix(&mut r[..np], &mut g[..np], &mut b[..np], mf),
-        None => crate::tone_simd::apply_tone_bulk(&mut r[..np], &mut g[..np], &mut b[..np], m, sat, vib, vib_zero),
+        Some(mf) => {
+            crate::tone_simd::apply_tone_bulk_matrix(&mut r[..np], &mut g[..np], &mut b[..np], mf)
+        }
+        None => crate::tone_simd::apply_tone_bulk(
+            &mut r[..np],
+            &mut g[..np],
+            &mut b[..np],
+            m,
+            sat,
+            vib,
+            vib_zero,
+        ),
     }
     // MEASURED FLOOR (2026-06-19, item-0 `examples/tonemap_subspans.rs`): this post stage
     // (clamp + f32→u16 cast + LUT gather) is ~45% of the 24 MP tone frame and is the bottleneck
@@ -1706,7 +2071,7 @@ fn simd_block_kernel<T: Copy>(
     // The inline clamp+cast+gather below IS the floor. The remaining lever is the SEAM:
     // parallelise this (native rayon = ~5× over serial), not the kernel.
     for i in 0..np {
-        ob[i * 3]     = post_fn(r[i].clamp(0.0, 65535.0));
+        ob[i * 3] = post_fn(r[i].clamp(0.0, 65535.0));
         ob[i * 3 + 1] = post_fn(g[i].clamp(0.0, 65535.0));
         ob[i * 3 + 2] = post_fn(b[i].clamp(0.0, 65535.0));
     }
@@ -1719,7 +2084,11 @@ fn simd_block_kernel<T: Copy>(
 /// (perceptual_constancy must be false).
 pub fn process_into_simd(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
     debug_assert_eq!(rgb16.len() % 3, 0);
-    assert_eq!(out.len(), rgb16.len(), "process_into_simd: out must be rgb16.len() elements");
+    assert_eq!(
+        out.len(),
+        rgb16.len(),
+        "process_into_simd: out must be rgb16.len() elements"
+    );
     // Guard before derive_tone_inputs so the assertion fires before any work is done.
     assert!(!params.perceptual_constancy, "process_into_simd is the plain ingest path only; use process_into for perceptual_constancy");
     let ti = derive_tone_inputs(params);
@@ -1733,7 +2102,14 @@ pub fn process_into_simd(rgb16: &[u16], params: &PipelineParams, out: &mut [u8])
         ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
         let c = cache_cell.borrow();
         let cr = c.as_ref().unwrap();
-        (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post.clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
+        (
+            cr.pre_r.clone(),
+            cr.pre_g.clone(),
+            cr.pre_b.clone(),
+            cr.post.clone(),
+            cr.pre_lut_len - 1,
+            cr.pre_lut_shift,
+        )
     });
 
     const BLK: usize = 2048;
@@ -1749,10 +2125,24 @@ pub fn process_into_simd(rgb16: &[u16], params: &PipelineParams, out: &mut [u8])
                 let mut r = [0f32; BLK];
                 let mut g = [0f32; BLK];
                 let mut b = [0f32; BLK];
-                simd_block_kernel(ob, ib, &mut r, &mut g, &mut b,
-                    &pre_r, &pre_g, &pre_b, pre_lut_shift, pre_lut_mask,
-                    m, fused, ti.sat, ti.vib, ti.vib_zero,
-                    |v| post[(v as u16) as usize]);
+                simd_block_kernel(
+                    ob,
+                    ib,
+                    &mut r,
+                    &mut g,
+                    &mut b,
+                    &pre_r,
+                    &pre_g,
+                    &pre_b,
+                    pre_lut_shift,
+                    pre_lut_mask,
+                    m,
+                    fused,
+                    ti.sat,
+                    ti.vib,
+                    ti.vib_zero,
+                    |v| post[(v as u16) as usize],
+                );
             });
     }
     // Serial/WASM path: hoist r/g/b scratch once (PIPE-005: eliminates per-block
@@ -1763,10 +2153,24 @@ pub fn process_into_simd(rgb16: &[u16], params: &PipelineParams, out: &mut [u8])
         let mut g = [0f32; BLK];
         let mut b = [0f32; BLK];
         for (ob, ib) in out.chunks_mut(3 * BLK).zip(rgb16.chunks(3 * BLK)) {
-            simd_block_kernel(ob, ib, &mut r, &mut g, &mut b,
-                &pre_r, &pre_g, &pre_b, pre_lut_shift, pre_lut_mask,
-                m, fused, ti.sat, ti.vib, ti.vib_zero,
-                |v| post[(v as u16) as usize]);
+            simd_block_kernel(
+                ob,
+                ib,
+                &mut r,
+                &mut g,
+                &mut b,
+                &pre_r,
+                &pre_g,
+                &pre_b,
+                pre_lut_shift,
+                pre_lut_mask,
+                m,
+                fused,
+                ti.sat,
+                ti.vib,
+                ti.vib_zero,
+                |v| post[(v as u16) as usize],
+            );
         }
     }
 }
@@ -1833,7 +2237,7 @@ pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f6
     while p < np {
         let cnt = (np - p).min(BLK);
         for i in 0..cnt {
-            r[i] = pre_r[rgb16[(p + i) * 3]     as usize & lut_mask] as f32;
+            r[i] = pre_r[rgb16[(p + i) * 3] as usize & lut_mask] as f32;
             g[i] = pre_g[rgb16[(p + i) * 3 + 1] as usize & lut_mask] as f32;
             b[i] = pre_b[rgb16[(p + i) * 3 + 2] as usize & lut_mask] as f32;
         }
@@ -1847,8 +2251,20 @@ pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f6
     let mut p = 0;
     while p < np {
         let cnt = (np - p).min(BLK);
-        for i in 0..cnt { r[i] = 32767.5; g[i] = 32767.5; b[i] = 32767.5; }
-        crate::tone_simd::apply_tone_bulk(&mut r[..cnt], &mut g[..cnt], &mut b[..cnt], m, ti.sat, ti.vib, ti.vib_zero);
+        for i in 0..cnt {
+            r[i] = 32767.5;
+            g[i] = 32767.5;
+            b[i] = 32767.5;
+        }
+        crate::tone_simd::apply_tone_bulk(
+            &mut r[..cnt],
+            &mut g[..cnt],
+            &mut b[..cnt],
+            m,
+            ti.sat,
+            ti.vib,
+            ti.vib_zero,
+        );
         p += cnt;
     }
     std::hint::black_box((&r, &g, &b));
@@ -1873,7 +2289,7 @@ pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f6
         let cnt = (np - p).min(BLK);
         for i in 0..cnt {
             let j = (p + i) * 3;
-            out[j]     = post[(r[i].clamp(0.0, 65535.0) as u16) as usize];
+            out[j] = post[(r[i].clamp(0.0, 65535.0) as u16) as usize];
             out[j + 1] = post[(g[i].clamp(0.0, 65535.0) as u16) as usize];
             out[j + 2] = post[(b[i].clamp(0.0, 65535.0) as u16) as usize];
         }
@@ -1904,7 +2320,19 @@ pub fn bench_tone_split(rgb16: &[u16], params: &PipelineParams) -> (f64, f64) {
         let r = pre_r[px[0] as usize] as f32;
         let g = pre_g[px[1] as usize] as f32;
         let b = pre_b[px[2] as usize] as f32;
-        let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
+        let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+            Some(mf) => apply_tone_fused(r, g, b, mf),
+            None => apply_tone_math(
+                r,
+                g,
+                b,
+                m,
+                ti.sat,
+                ti.vib,
+                ti.vib_zero,
+                ti.perceptual_constancy,
+            ),
+        };
         o[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
         o[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
         o[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
@@ -1968,14 +2396,33 @@ pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
                 let pre_b = c.pre_b.as_ptr();
                 let post = c.post.as_ptr();
                 while src < src_end {
-                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-                    *dst = *post.add(r2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = *post.add(g2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = *post.add(b2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = 255; dst = dst.add(1);
+                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                        Some(mf) => apply_tone_fused(r, g, b, mf),
+                        None => apply_tone_math(
+                            r,
+                            g,
+                            b,
+                            m,
+                            ti.sat,
+                            ti.vib,
+                            ti.vib_zero,
+                            ti.perceptual_constancy,
+                        ),
+                    };
+                    *dst = *post.add(r2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = *post.add(g2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = *post.add(b2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = 255;
+                    dst = dst.add(1);
                 }
             }
         });
@@ -1983,22 +2430,45 @@ pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 
     #[cfg(feature = "parallel")]
     {
-        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) = LUT_CACHE.with(|cache_cell| {
-            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
-            let c = cache_cell.borrow();
-            let cr = c.as_ref().unwrap();
-            (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post.clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
-        });
-        out.par_chunks_mut(4).zip(rgb16.par_chunks(3)).with_min_len(4096).for_each(|(out_px, in_px)| {
-            let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-            out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[3] = 255;
-        });
+        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) =
+            LUT_CACHE.with(|cache_cell| {
+                ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
+                let c = cache_cell.borrow();
+                let cr = c.as_ref().unwrap();
+                (
+                    cr.pre_r.clone(),
+                    cr.pre_g.clone(),
+                    cr.pre_b.clone(),
+                    cr.post.clone(),
+                    cr.pre_lut_len - 1,
+                    cr.pre_lut_shift,
+                )
+            });
+        out.par_chunks_mut(4)
+            .zip(rgb16.par_chunks(3))
+            .with_min_len(4096)
+            .for_each(|(out_px, in_px)| {
+                let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                    Some(mf) => apply_tone_fused(r, g, b, mf),
+                    None => apply_tone_math(
+                        r,
+                        g,
+                        b,
+                        m,
+                        ti.sat,
+                        ti.vib,
+                        ti.vib_zero,
+                        ti.perceptual_constancy,
+                    ),
+                };
+                out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[3] = 255;
+            });
     }
 
     out
@@ -2037,13 +2507,31 @@ pub fn process_rgb(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
                 let pre_b = c.pre_b.as_ptr();
                 let post = c.post.as_ptr();
                 while src < src_end {
-                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-                    *dst = *post.add(r2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = *post.add(g2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = *post.add(b2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                        Some(mf) => apply_tone_fused(r, g, b, mf),
+                        None => apply_tone_math(
+                            r,
+                            g,
+                            b,
+                            m,
+                            ti.sat,
+                            ti.vib,
+                            ti.vib_zero,
+                            ti.perceptual_constancy,
+                        ),
+                    };
+                    *dst = *post.add(r2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = *post.add(g2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = *post.add(b2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
                 }
             }
         });
@@ -2051,21 +2539,44 @@ pub fn process_rgb(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 
     #[cfg(feature = "parallel")]
     {
-        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) = LUT_CACHE.with(|cache_cell| {
-            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
-            let c = cache_cell.borrow();
-            let cr = c.as_ref().unwrap();
-            (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post.clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
-        });
-        out.par_chunks_mut(3).zip(rgb16.par_chunks(3)).with_min_len(4096).for_each(|(out_px, in_px)| {
-            let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-            out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
-        });
+        let (pre_r, pre_g, pre_b, post, pre_lut_mask, pre_lut_shift) =
+            LUT_CACHE.with(|cache_cell| {
+                ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, false);
+                let c = cache_cell.borrow();
+                let cr = c.as_ref().unwrap();
+                (
+                    cr.pre_r.clone(),
+                    cr.pre_g.clone(),
+                    cr.pre_b.clone(),
+                    cr.post.clone(),
+                    cr.pre_lut_len - 1,
+                    cr.pre_lut_shift,
+                )
+            });
+        out.par_chunks_mut(3)
+            .zip(rgb16.par_chunks(3))
+            .with_min_len(4096)
+            .for_each(|(out_px, in_px)| {
+                let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                    Some(mf) => apply_tone_fused(r, g, b, mf),
+                    None => apply_tone_math(
+                        r,
+                        g,
+                        b,
+                        m,
+                        ti.sat,
+                        ti.vib,
+                        ti.vib_zero,
+                        ti.perceptual_constancy,
+                    ),
+                };
+                out_px[0] = post[r2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[1] = post[g2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[2] = post[b2.clamp(0.0, 65535.0) as u16 as usize];
+            });
     }
 
     out
@@ -2092,9 +2603,12 @@ pub fn auto_wb_rggb(raw: &[u16], w: usize, h: usize, black: u16) -> (f32, f32) {
             let g1 = g1.saturating_sub(blk);
             let g2 = g2.saturating_sub(blk);
             let b = b.saturating_sub(blk);
-            sr += r as u64; nr += 1;
-            sg += (g1 + g2) as u64; ng += 2;
-            sb += b as u64; nb += 1;
+            sr += r as u64;
+            nr += 1;
+            sg += (g1 + g2) as u64;
+            ng += 2;
+            sb += b as u64;
+            nb += 1;
             x += 8;
         }
         y += 8;
@@ -2112,7 +2626,9 @@ pub fn auto_wb_rggb(raw: &[u16], w: usize, h: usize, black: u16) -> (f32, f32) {
 /// Call after demosaic, before tone mapping.  Strength should be derived from
 /// EXIF ISO: 0 below ISO 1600, 0.15–0.5 at higher ISOs.
 pub fn apply_luminance_nr(rgb16: &mut [u16], width: usize, height: usize, strength: f32) {
-    if strength <= 0.0 { return; }
+    if strength <= 0.0 {
+        return;
+    }
     let s = strength.clamp(0.0, 1.0);
     let kernel = gaussian_kernel_5();
     BLUR_SCRATCH.with(|scratch| {
@@ -2122,10 +2638,13 @@ pub fn apply_luminance_nr(rgb16: &mut [u16], width: usize, height: usize, streng
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
-            rgb16.par_iter_mut().zip(blurred.par_iter()).for_each(|(o, &b)| {
-                let ov = *o as f32;
-                *o = (ov + (b as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16;
-            });
+            rgb16
+                .par_iter_mut()
+                .zip(blurred.par_iter())
+                .for_each(|(o, &b)| {
+                    let ov = *o as f32;
+                    *o = (ov + (b as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16;
+                });
         }
         #[cfg(not(feature = "parallel"))]
         {
@@ -2184,13 +2703,31 @@ pub fn process_16bit_scalar(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> 
                 let pre_b = c.pre_b.as_ptr();
                 let post16 = c.post16.as_ref().unwrap().as_ptr();
                 while src < src_end {
-                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32; src = src.add(1);
-                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-                    *dst = *post16.add(r2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = *post16.add(g2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
-                    *dst = *post16.add(b2.clamp(0.0, 65535.0) as u16 as usize); dst = dst.add(1);
+                    let r = *pre_r.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let g = *pre_g.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let b = *pre_b.add((*src as usize >> pre_lut_shift) & pre_lut_mask) as f32;
+                    src = src.add(1);
+                    let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                        Some(mf) => apply_tone_fused(r, g, b, mf),
+                        None => apply_tone_math(
+                            r,
+                            g,
+                            b,
+                            m,
+                            ti.sat,
+                            ti.vib,
+                            ti.vib_zero,
+                            ti.perceptual_constancy,
+                        ),
+                    };
+                    *dst = *post16.add(r2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = *post16.add(g2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
+                    *dst = *post16.add(b2.clamp(0.0, 65535.0) as u16 as usize);
+                    dst = dst.add(1);
                 }
             }
         });
@@ -2198,21 +2735,44 @@ pub fn process_16bit_scalar(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> 
 
     #[cfg(feature = "parallel")]
     {
-        let (pre_r, pre_g, pre_b, post16, pre_lut_mask, pre_lut_shift) = LUT_CACHE.with(|cache_cell| {
-            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, true);
-            let c = cache_cell.borrow();
-            let cr = c.as_ref().unwrap();
-            (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post16.as_ref().unwrap().clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
-        });
-        out.par_chunks_mut(3).zip(rgb16.par_chunks(3)).with_min_len(4096).for_each(|(out_px, in_px)| {
-            let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
-            let (r2, g2, b2) = match ti.matrix_fused.as_ref() { Some(mf) => apply_tone_fused(r, g, b, mf), None => apply_tone_math(r, g, b, m, ti.sat, ti.vib, ti.vib_zero, ti.perceptual_constancy) };
-            out_px[0] = post16[r2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[1] = post16[g2.clamp(0.0, 65535.0) as u16 as usize];
-            out_px[2] = post16[b2.clamp(0.0, 65535.0) as u16 as usize];
-        });
+        let (pre_r, pre_g, pre_b, post16, pre_lut_mask, pre_lut_shift) =
+            LUT_CACHE.with(|cache_cell| {
+                ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, true);
+                let c = cache_cell.borrow();
+                let cr = c.as_ref().unwrap();
+                (
+                    cr.pre_r.clone(),
+                    cr.pre_g.clone(),
+                    cr.pre_b.clone(),
+                    cr.post16.as_ref().unwrap().clone(),
+                    cr.pre_lut_len - 1,
+                    cr.pre_lut_shift,
+                )
+            });
+        out.par_chunks_mut(3)
+            .zip(rgb16.par_chunks(3))
+            .with_min_len(4096)
+            .for_each(|(out_px, in_px)| {
+                let r = pre_r[(in_px[0] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let g = pre_g[(in_px[1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let b = pre_b[(in_px[2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
+                let (r2, g2, b2) = match ti.matrix_fused.as_ref() {
+                    Some(mf) => apply_tone_fused(r, g, b, mf),
+                    None => apply_tone_math(
+                        r,
+                        g,
+                        b,
+                        m,
+                        ti.sat,
+                        ti.vib,
+                        ti.vib_zero,
+                        ti.perceptual_constancy,
+                    ),
+                };
+                out_px[0] = post16[r2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[1] = post16[g2.clamp(0.0, 65535.0) as u16 as usize];
+                out_px[2] = post16[b2.clamp(0.0, 65535.0) as u16 as usize];
+            });
     }
 
     out
@@ -2237,7 +2797,14 @@ pub fn process_16bit_simd(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
         ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, true);
         let c = cache_cell.borrow();
         let cr = c.as_ref().unwrap();
-        (cr.pre_r.clone(), cr.pre_g.clone(), cr.pre_b.clone(), cr.post16.as_ref().unwrap().clone(), cr.pre_lut_len - 1, cr.pre_lut_shift)
+        (
+            cr.pre_r.clone(),
+            cr.pre_g.clone(),
+            cr.pre_b.clone(),
+            cr.post16.as_ref().unwrap().clone(),
+            cr.pre_lut_len - 1,
+            cr.pre_lut_shift,
+        )
     });
 
     const BLK: usize = 2048;
@@ -2251,10 +2818,24 @@ pub fn process_16bit_simd(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
                 let mut r = [0f32; BLK];
                 let mut g = [0f32; BLK];
                 let mut b = [0f32; BLK];
-                simd_block_kernel(ob, ib, &mut r, &mut g, &mut b,
-                    &pre_r, &pre_g, &pre_b, pre_lut_shift, pre_lut_mask,
-                    m, fused, ti.sat, ti.vib, ti.vib_zero,
-                    |v| post16[(v as u16) as usize]);
+                simd_block_kernel(
+                    ob,
+                    ib,
+                    &mut r,
+                    &mut g,
+                    &mut b,
+                    &pre_r,
+                    &pre_g,
+                    &pre_b,
+                    pre_lut_shift,
+                    pre_lut_mask,
+                    m,
+                    fused,
+                    ti.sat,
+                    ti.vib,
+                    ti.vib_zero,
+                    |v| post16[(v as u16) as usize],
+                );
             });
     }
     // Serial/WASM: hoist scratch once (PIPE-005).
@@ -2264,10 +2845,24 @@ pub fn process_16bit_simd(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
         let mut g = [0f32; BLK];
         let mut b = [0f32; BLK];
         for (ob, ib) in out.chunks_mut(3 * BLK).zip(rgb16.chunks(3 * BLK)) {
-            simd_block_kernel(ob, ib, &mut r, &mut g, &mut b,
-                &pre_r, &pre_g, &pre_b, pre_lut_shift, pre_lut_mask,
-                m, fused, ti.sat, ti.vib, ti.vib_zero,
-                |v| post16[(v as u16) as usize]);
+            simd_block_kernel(
+                ob,
+                ib,
+                &mut r,
+                &mut g,
+                &mut b,
+                &pre_r,
+                &pre_g,
+                &pre_b,
+                pre_lut_shift,
+                pre_lut_mask,
+                m,
+                fused,
+                ti.sat,
+                ti.vib,
+                ti.vib_zero,
+                |v| post16[(v as u16) as usize],
+            );
         }
     }
     out
@@ -2286,13 +2881,18 @@ pub fn downscale_rgb16(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) 
 
 /// Writes the downscaled result directly into `out` (must be exactly dw*dh*3 elements).
 /// No allocation. Rayon over rows.
-pub fn downscale_rgb16_into(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize, out: &mut [u16]) {
+pub fn downscale_rgb16_into(
+    src: &[u16],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+    out: &mut [u16],
+) {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
-    validate_pixel_buffer_u16(src, sw, sh, 3)
-        .expect("downscale_rgb16_into: source buffer bounds");
-    validate_pixel_buffer_u16(out, dw, dh, 3)
-        .expect("downscale_rgb16_into: output buffer bounds");
+    validate_pixel_buffer_u16(src, sw, sh, 3).expect("downscale_rgb16_into: source buffer bounds");
+    validate_pixel_buffer_u16(out, dw, dh, 3).expect("downscale_rgb16_into: output buffer bounds");
 
     // Integer fast path for exact factors (very common: 1800px lb → 360px thumb = 5x).
     // Flipflop bench (2026-06-18): serial 8ms, parallel 3.4ms → 2.37× speedup on 12MP.
@@ -2357,12 +2957,17 @@ pub fn downscale_rgb16_into(src: &[u16], sw: usize, sh: usize, dw: usize, dh: us
             for y in y0..y1 {
                 for x in x0..x1 {
                     let i = (y * sw + x) * 3;
-                    rr += src[i] as u64; gg += src[i+1] as u64; bb += src[i+2] as u64; n += 1;
+                    rr += src[i] as u64;
+                    gg += src[i + 1] as u64;
+                    bb += src[i + 2] as u64;
+                    n += 1;
                 }
             }
             let n = n.max(1);
             let o = dx * 3;
-            row[o] = (rr / n) as u16; row[o+1] = (gg / n) as u16; row[o+2] = (bb / n) as u16;
+            row[o] = (rr / n) as u16;
+            row[o + 1] = (gg / n) as u16;
+            row[o + 2] = (bb / n) as u16;
         }
     });
 }
@@ -2380,10 +2985,8 @@ pub fn downscale_rgb8(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) ->
 pub fn downscale_rgb8_into(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, out: &mut [u8]) {
     #[cfg(feature = "parallel")]
     use rayon::prelude::*;
-    validate_pixel_buffer(src, sw, sh, 3)
-        .expect("downscale_rgb8_into: source buffer bounds");
-    validate_pixel_buffer(out, dw, dh, 3)
-        .expect("downscale_rgb8_into: output buffer bounds");
+    validate_pixel_buffer(src, sw, sh, 3).expect("downscale_rgb8_into: source buffer bounds");
+    validate_pixel_buffer(out, dw, dh, 3).expect("downscale_rgb8_into: output buffer bounds");
 
     // Integer fast path for exact factors (symmetric to the rgb16 version).
     // Optimization (C7, 2026-06-19): replace 3 divides/pixel with reciprocal multiply (8–13% faster).
@@ -2443,12 +3046,17 @@ pub fn downscale_rgb8_into(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usiz
             for y in y0..y1 {
                 for x in x0..x1 {
                     let i = (y * sw + x) * 3;
-                    rr += src[i] as u32; gg += src[i+1] as u32; bb += src[i+2] as u32; n += 1;
+                    rr += src[i] as u32;
+                    gg += src[i + 1] as u32;
+                    bb += src[i + 2] as u32;
+                    n += 1;
                 }
             }
             let n = n.max(1);
             let o = dx * 3;
-            row[o] = (rr / n) as u8; row[o+1] = (gg / n) as u8; row[o+2] = (bb / n) as u8;
+            row[o] = (rr / n) as u8;
+            row[o + 1] = (gg / n) as u8;
+            row[o + 2] = (bb / n) as u8;
         }
     });
 }
@@ -2571,7 +3179,7 @@ pub fn rotate_90_cw(src: &[u8], w: usize, h: usize) -> Vec<u8> {
                 for c_local in 0..band_rows {
                     let s = src_row_off + (c0 + c_local) * 3;
                     let d = c_local * dst_row_bytes + dst_col_off;
-                    band[d]     = src[s];
+                    band[d] = src[s];
                     band[d + 1] = src[s + 1];
                     band[d + 2] = src[s + 2];
                 }
@@ -2600,7 +3208,7 @@ pub fn rotate_90_ccw(src: &[u8], w: usize, h: usize) -> Vec<u8> {
         let band_rows = band.len() / dst_row_bytes;
         // Band owns dst rows [band_idx*TILE, band_idx*TILE+band_rows).
         // dst row index = w-1-c  →  c = w-1-dst_row_idx.
-        let c_top = w - 1 - band_idx * TILE;        // c for c_local=0
+        let c_top = w - 1 - band_idx * TILE; // c for c_local=0
         for r0 in (0..h).step_by(TILE) {
             let r_end = (r0 + TILE).min(h);
             for r in r0..r_end {
@@ -2610,7 +3218,7 @@ pub fn rotate_90_ccw(src: &[u8], w: usize, h: usize) -> Vec<u8> {
                     let c = c_top - c_local;
                     let s = src_row_off + c * 3;
                     let d = c_local * dst_row_bytes + dst_col_off;
-                    band[d]     = src[s];
+                    band[d] = src[s];
                     band[d + 1] = src[s + 1];
                     band[d + 2] = src[s + 2];
                 }
@@ -2641,7 +3249,7 @@ pub fn rotate_180(src: &[u8], w: usize, h: usize) -> Vec<u8> {
             let sc = w - 1 - c;
             let s = sc * 3;
             let d = c * 3;
-            dst_row[d]     = s_row[s];
+            dst_row[d] = s_row[s];
             dst_row[d + 1] = s_row[s + 1];
             dst_row[d + 2] = s_row[s + 2];
         }
@@ -2700,7 +3308,7 @@ pub fn transpose(src: &[u8], w: usize, h: usize) -> Vec<u8> {
                 for c in c0..c_end {
                     let si = src_row_off + c * 3;
                     let di = c * dst_row_stride + r * 3;
-                    dst[di]     = src[si];
+                    dst[di] = src[si];
                     dst[di + 1] = src[si + 1];
                     dst[di + 2] = src[si + 2];
                 }
@@ -2726,7 +3334,7 @@ pub fn anti_transpose(src: &[u8], w: usize, h: usize) -> Vec<u8> {
                 for c in c0..c_end {
                     let si = src_row_off + c * 3;
                     let di = (w - 1 - c) * dst_row_stride + (h - 1 - r) * 3;
-                    dst[di]     = src[si];
+                    dst[di] = src[si];
                     dst[di + 1] = src[si + 1];
                     dst[di + 2] = src[si + 2];
                 }
@@ -2746,7 +3354,9 @@ mod pixel_buffer_validation_tests {
     #[test]
     fn tone_band_equals_whole() {
         let (w, h) = (64usize, 40usize);
-        let rgb16: Vec<u16> = (0..(w * h * 3)).map(|i| ((i * 29 + 7) & 0xffff) as u16).collect();
+        let rgb16: Vec<u16> = (0..(w * h * 3))
+            .map(|i| ((i * 29 + 7) & 0xffff) as u16)
+            .collect();
         let params = PipelineParams::default_olympus();
         let mut whole = vec![0u8; w * h * 3];
         process_into_auto(&rgb16, &params, &mut whole);
@@ -2789,7 +3399,7 @@ mod rotate_tests {
         for r in 0..h {
             for c in 0..w {
                 let i = (r * w + c) * 3;
-                v[i]     = (r & 0xff) as u8;
+                v[i] = (r & 0xff) as u8;
                 v[i + 1] = (c & 0xff) as u8;
                 v[i + 2] = ((r + c) & 0xff) as u8;
             }
@@ -2820,10 +3430,10 @@ mod rotate_tests {
     fn rotate_90_cw_four_times_is_identity() {
         let (w, h) = (33usize, 17usize);
         let src = synth(w, h);
-        let a = rotate_90_cw(&src, w, h);          // h x w
-        let b = rotate_90_cw(&a, h, w);            // w x h
-        let c = rotate_90_cw(&b, w, h);            // h x w
-        let d = rotate_90_cw(&c, h, w);            // w x h
+        let a = rotate_90_cw(&src, w, h); // h x w
+        let b = rotate_90_cw(&a, h, w); // w x h
+        let c = rotate_90_cw(&b, w, h); // h x w
+        let d = rotate_90_cw(&c, h, w); // w x h
         assert_eq!(d, src);
     }
 
@@ -2832,7 +3442,9 @@ mod rotate_tests {
         let (w, h) = (4usize, 3usize);
         let mut src = vec![0u8; w * h * 3];
         // mark (0,0) = (10, 20, 30)
-        src[0] = 10; src[1] = 20; src[2] = 30;
+        src[0] = 10;
+        src[1] = 20;
+        src[2] = 30;
         // After CW: src (0,0) → dst (0, h-1) = (0, 2)
         let rot = rotate_90_cw(&src, w, h);
         // dst dims: w_dst = h = 3, h_dst = w = 4
@@ -2852,7 +3464,7 @@ mod rotate_tests {
             for c in 0..w {
                 let s = (r * w + c) * 3;
                 let d = (c * w_dst + (h - 1 - r)) * 3;
-                naive[d]     = src[s];
+                naive[d] = src[s];
                 naive[d + 1] = src[s + 1];
                 naive[d + 2] = src[s + 2];
             }
@@ -2871,7 +3483,7 @@ mod rotate_tests {
             for c in 0..w {
                 let s = (r * w + c) * 3;
                 let d = ((w - 1 - c) * w_dst + r) * 3;
-                naive[d]     = src[s];
+                naive[d] = src[s];
                 naive[d + 1] = src[s + 1];
                 naive[d + 2] = src[s + 2];
             }
@@ -2893,7 +3505,9 @@ mod rotate_tests {
         let (w, h) = (4usize, 3usize);
         let mut src = vec![0u8; w * h * 3];
         // pixel (row=0, col=0) = (10, 20, 30)
-        src[0] = 10; src[1] = 20; src[2] = 30;
+        src[0] = 10;
+        src[1] = 20;
+        src[2] = 30;
         let dst = flip_horizontal(&src, w, h);
         // After H-flip, (0,0) → (0, w-1) = (0, 3)
         let i = (0 * w + (w - 1)) * 3;
@@ -2914,8 +3528,8 @@ mod rotate_tests {
         // transpose(transpose(img, w, h), h, w) should be identity.
         for (w, h) in [(7usize, 5usize), (32, 32), (33, 31)] {
             let src = synth(w, h);
-            let t1 = transpose(&src, w, h);      // dims become (h, w)
-            let t2 = transpose(&t1, h, w);       // dims back to (w, h)
+            let t1 = transpose(&src, w, h); // dims become (h, w)
+            let t2 = transpose(&t1, h, w); // dims back to (w, h)
             assert_eq!(t2, src, "{w}x{h}");
         }
     }
@@ -2931,7 +3545,9 @@ mod rotate_tests {
             for c in 0..w {
                 let si = (r * w + c) * 3;
                 let di = (c * h + r) * 3;
-                naive[di] = src[si]; naive[di+1] = src[si+1]; naive[di+2] = src[si+2];
+                naive[di] = src[si];
+                naive[di + 1] = src[si + 1];
+                naive[di + 2] = src[si + 2];
             }
         }
         assert_eq!(fast, naive);
@@ -2947,7 +3563,9 @@ mod rotate_tests {
             for c in 0..w {
                 let si = (r * w + c) * 3;
                 let di = ((w - 1 - c) * h + (h - 1 - r)) * 3;
-                naive[di] = src[si]; naive[di+1] = src[si+1]; naive[di+2] = src[si+2];
+                naive[di] = src[si];
+                naive[di + 1] = src[si + 1];
+                naive[di + 2] = src[si + 2];
             }
         }
         assert_eq!(fast, naive);
@@ -2959,9 +3577,11 @@ mod rotate_tests {
         let src = synth(w, h);
         // orientation 1 and unknown → identity
         let (out, ow, oh) = apply_orientation(src.clone(), w, h, 1);
-        assert_eq!(out, src); assert_eq!((ow, oh), (w, h));
+        assert_eq!(out, src);
+        assert_eq!((ow, oh), (w, h));
         let (out, ow, oh) = apply_orientation(src.clone(), w, h, 99);
-        assert_eq!(out, src); assert_eq!((ow, oh), (w, h));
+        assert_eq!(out, src);
+        assert_eq!((ow, oh), (w, h));
     }
 
     #[test]
@@ -3018,7 +3638,7 @@ mod rotate_bench {
                 let r = h - 1 - nc;
                 let s = (r * w + c) * 3;
                 let d = nc * 3;
-                dst_row[d]     = src[s];
+                dst_row[d] = src[s];
                 dst_row[d + 1] = src[s + 1];
                 dst_row[d + 2] = src[s + 2];
             }
@@ -3033,7 +3653,9 @@ mod rotate_bench {
         let (w, h) = (5184usize, 3888usize);
         // Varying content so the CPU can't trivially cache constant fills.
         let mut src = vec![0u8; w * h * 3];
-        for (i, b) in src.iter_mut().enumerate() { *b = (i & 0xff) as u8; }
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i & 0xff) as u8;
+        }
 
         // Warm up.
         let _ = rotate_90_cw(&src, w, h);
@@ -3074,7 +3696,10 @@ mod rotate_bench {
         }
         let avg_ms = (t0.elapsed().as_secs_f64() / N as f64) * 1000.0;
         let mb = (w * h * 3) as f64 / 1_048_576.0;
-        println!("rotate_90_cw 1800×1200 RGB8 ({:.1} MB): {:.2} ms (avg of {} runs)", mb, avg_ms, N);
+        println!(
+            "rotate_90_cw 1800×1200 RGB8 ({:.1} MB): {:.2} ms (avg of {} runs)",
+            mb, avg_ms, N
+        );
     }
 }
 
@@ -3090,17 +3715,31 @@ mod tonemap_flip_flops {
     use std::time::Instant;
 
     fn make_test_rgb16(n_pixels: usize) -> Vec<u16> {
-        (0..n_pixels * 3).map(|i| ((i * 37) % 65535) as u16).collect()
+        (0..n_pixels * 3)
+            .map(|i| ((i * 37) % 65535) as u16)
+            .collect()
     }
 
     #[test]
     fn flip_flop_tonemap_apply_10x() {
         let buf = make_test_rgb16(1920 * 1080 / 4); // ~0.5M pixels, manageable
-        // Explicit struct (no Default derive in all feature sets).
+                                                    // Explicit struct (no Default derive in all feature sets).
         let base_params = PipelineParams {
-            black: 0, white: 16383, wb_r: 2.0, wb_g: 1.0, wb_b: 1.7,
-            exposure_ev: 0.0, temp: 0.0, tint: 0.0, saturation: 0.0, vibrance: 0.0,
-            contrast: 0.0, shadows: 0.0, highlights: 0.0, whites: 0.0, blacks: 0.0,
+            black: 0,
+            white: 16383,
+            wb_r: 2.0,
+            wb_g: 1.0,
+            wb_b: 1.7,
+            exposure_ev: 0.0,
+            temp: 0.0,
+            tint: 0.0,
+            saturation: 0.0,
+            vibrance: 0.0,
+            contrast: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
             color_matrix: None,
             texture: 0.0,
             clarity: 0.0,
@@ -3110,7 +3749,10 @@ mod tonemap_flip_flops {
 
         // Support graphing stabilization: print CSV + running stats. 30 is often excessive; bench shows signal settles ~8-12.
         // Run with env TRIALS=12 or edit. Default keeps 30 for back-compat with prior handoff numbers.
-        let trials: usize = std::env::var("TRIALS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+        let trials: usize = std::env::var("TRIALS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
         println!("\n=== Flip-flop tonemap (Lens22/23/25): apply_tone_math new (perceptual=true) vs old (false) x{} for stats (CSV for graph) ===", trials);
         println!("CSV: trial,new_ms,old_ms,ratio_new_over_old,running_mean_ratio");
         let mut new_times: Vec<f64> = Vec::new();
@@ -3122,27 +3764,45 @@ mod tonemap_flip_flops {
             // warm
             let _ = process(&buf, &params);
             let t0 = Instant::now();
-            for _ in 0..5 { let _ = process(&buf, &params); } // inner iters for stable timing
+            for _ in 0..5 {
+                let _ = process(&buf, &params);
+            } // inner iters for stable timing
             let ms = (t0.elapsed().as_secs_f64() / 5.0) * 1000.0;
-            if use_new { new_times.push(ms); } else { old_times.push(ms); }
+            if use_new {
+                new_times.push(ms);
+            } else {
+                old_times.push(ms);
+            }
             let ratio = if !use_new && !old_times.is_empty() && !new_times.is_empty() {
                 new_times.last().unwrap() / old_times.last().unwrap()
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             // running mean of observed ratios (new/old pairs so far)
             let run_mean = if !new_times.is_empty() && !old_times.is_empty() {
                 let pairs = new_times.len().min(old_times.len());
                 let sum_r: f64 = (0..pairs).map(|k| new_times[k] / old_times[k]).sum();
                 sum_r / pairs as f64
-            } else { 0.0 };
-            println!("CSV,{},{:.3},{:.3},{:.3},{:.3}", i, if use_new {ms} else {0.0}, if !use_new {ms} else {0.0}, ratio, run_mean);
+            } else {
+                0.0
+            };
+            println!(
+                "CSV,{},{:.3},{:.3},{:.3},{:.3}",
+                i,
+                if use_new { ms } else { 0.0 },
+                if !use_new { ms } else { 0.0 },
+                ratio,
+                run_mean
+            );
             println!("tone flip {}: {:.3} ms (new/perceptual={})", i, ms, use_new);
         }
         // Quick stabilization note (mirrors C++ bench)
         if new_times.len() > 1 && old_times.len() > 1 {
             let pairs = new_times.len().min(old_times.len());
-            let ratios: Vec<f64> = (0..pairs).map(|k| new_times[k]/old_times[k]).collect();
+            let ratios: Vec<f64> = (0..pairs).map(|k| new_times[k] / old_times[k]).collect();
             let m = ratios.iter().sum::<f64>() / pairs as f64;
-            let var = ratios.iter().map(|r| (r-m).powi(2)).sum::<f64>() / (pairs as f64 - 1.0).max(1.0);
+            let var =
+                ratios.iter().map(|r| (r - m).powi(2)).sum::<f64>() / (pairs as f64 - 1.0).max(1.0);
             println!("Post-run: mean ratio new/old = {:.3}, sample std = {:.3} over {} pairs ({} trials). 8-12 often enough per C++ graphed bench.", m, var.sqrt(), pairs, trials);
         }
     }
@@ -3183,7 +3843,9 @@ mod tonemap_flip_flops {
     }
 
     fn synth_bayer(w: usize, h: usize) -> Vec<u16> {
-        (0..w * h).map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16).collect()
+        (0..w * h)
+            .map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16)
+            .collect()
     }
 
     #[test]
@@ -3194,7 +3856,9 @@ mod tonemap_flip_flops {
         let params = PipelineParams::default_olympus();
         assert!(!derive_tone_inputs(&params).perceptual_constancy);
         let n = 5000usize;
-        let rgb16: Vec<u16> = (0..n * 3).map(|i| (i.wrapping_mul(2654435761) & 0xffff) as u16).collect();
+        let rgb16: Vec<u16> = (0..n * 3)
+            .map(|i| (i.wrapping_mul(2654435761) & 0xffff) as u16)
+            .collect();
         let a = process_16bit_scalar(&rgb16, &params);
         let b = process_16bit_simd(&rgb16, &params);
         assert_eq!(a.len(), b.len(), "length mismatch");
@@ -3218,19 +3882,32 @@ mod tonemap_flip_flops {
         let mut params = PipelineParams::default_olympus();
         params.vibrance = 0.0; // force the fused vib_zero path
         let ti = derive_tone_inputs(&params);
-        assert!(ti.matrix_fused.is_some() && !ti.perceptual_constancy, "expected the fused vib_zero path");
+        assert!(
+            ti.matrix_fused.is_some() && !ti.perceptual_constancy,
+            "expected the fused vib_zero path"
+        );
         // 14-bit data (sensor domain), n NOT a multiple of 8 so the fused ragged tail is exercised,
         // and large enough to sample any rare boundary pixel a small buffer would miss.
         let n = 2_000_001usize;
-        let rgb16: Vec<u16> = (0..n * 3).map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16).collect();
+        let rgb16: Vec<u16> = (0..n * 3)
+            .map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16)
+            .collect();
         let (mut a, mut b) = (vec![0u8; n * 3], vec![0u8; n * 3]);
         process_into(&rgb16, &params, &mut a);
         process_into_simd(&rgb16, &params, &mut b);
-        let max_diff = a.iter().zip(b.iter()).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap_or(0);
+        let max_diff = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (*x as i32 - *y as i32).abs())
+            .max()
+            .unwrap_or(0);
         eprintln!("process_into vs process_into_simd: max u8 diff = {max_diff} over {n} px");
         // avx2 lanes use hw FMA == scalar mul_add and the tail is fused to the SAME matrix, so the
         // two are byte-exact on this path. ≤1 left as the documented SIMD-reassociation ceiling.
-        assert!(max_diff <= 1, "process_into_simd diverged from scalar by {max_diff} (>1) — real wiring bug");
+        assert!(
+            max_diff <= 1,
+            "process_into_simd diverged from scalar by {max_diff} (>1) — real wiring bug"
+        );
     }
 
     #[test]
@@ -3240,7 +3917,10 @@ mod tonemap_flip_flops {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
             v[v.len() / 2]
         };
-        eprintln!("=== LUT MOVEMENT FLIP (parallel={}) ===", cfg!(feature = "parallel"));
+        eprintln!(
+            "=== LUT MOVEMENT FLIP (parallel={}) ===",
+            cfg!(feature = "parallel")
+        );
 
         // === A: invalidation split — a single-slider drag rebuilds only ONE half ===
         let params = PipelineParams::default_olympus();
@@ -3254,8 +3934,14 @@ mod tonemap_flip_flops {
         let (pre3, post) = (med(pre_acc), med(post_acc));
         let full = pre3 + post;
         eprintln!("[A split] full rebuild = pre3 {pre3:.3} + post {post:.3} = {full:.3} ms");
-        eprintln!("[A split] tone-drag    -> POST only, saves pre3 {pre3:.3} ms ({:.0}%)", pre3 / full * 100.0);
-        eprintln!("[A split] wb/exp-drag  -> PRE  only, saves post {post:.3} ms ({:.0}%)", post / full * 100.0);
+        eprintln!(
+            "[A split] tone-drag    -> POST only, saves pre3 {pre3:.3} ms ({:.0}%)",
+            pre3 / full * 100.0
+        );
+        eprintln!(
+            "[A split] wb/exp-drag  -> PRE  only, saves post {post:.3} ms ({:.0}%)",
+            post / full * 100.0
+        );
 
         // === B: sRGB EOTF powf vs cached-lerp — accuracy + EOTF build speed ===
         let _ = srgb_encode_lerp(0.5); // warm the table
@@ -3272,7 +3958,9 @@ mod tonemap_flip_flops {
         // flipflop convention) — a single-shot powf-block-then-lerp-block would bias the delta.
         let time = |f: &dyn Fn(f32) -> f32| {
             let t = std::time::Instant::now();
-            let v: Vec<u16> = (0..n).map(|i| (f(i as f32 / (n as f32 - 1.0)) * 65535.0 + 0.5) as u16).collect();
+            let v: Vec<u16> = (0..n)
+                .map(|i| (f(i as f32 / (n as f32 - 1.0)) * 65535.0 + 0.5) as u16)
+                .collect();
             std::hint::black_box(&v);
             t.elapsed().as_secs_f64() * 1000.0
         };
@@ -3291,9 +3979,18 @@ mod tonemap_flip_flops {
         }
         let (powf_ms, lerp_ms) = (med(powf_t), med(lerp_t));
         eprintln!("[B srgb] EOTF accuracy: max u8 diff = {max_u8}, max u16 diff = {max_u16}");
-        eprintln!("[B srgb] EOTF 65536-build: powf {powf_ms:.3} -> lerp {lerp_ms:.3} ms ({:.0}% faster)", (powf_ms - lerp_ms) / powf_ms * 100.0);
-        assert!(max_u8 == 0, "sRGB lerp must be byte-exact on the u8 post-LUT (got {max_u8})");
-        assert!(max_u16 <= 1, "sRGB lerp must be ≤1 LSB on the u16 post-LUT (got {max_u16})");
+        eprintln!(
+            "[B srgb] EOTF 65536-build: powf {powf_ms:.3} -> lerp {lerp_ms:.3} ms ({:.0}% faster)",
+            (powf_ms - lerp_ms) / powf_ms * 100.0
+        );
+        assert!(
+            max_u8 == 0,
+            "sRGB lerp must be byte-exact on the u8 post-LUT (got {max_u8})"
+        );
+        assert!(
+            max_u16 <= 1,
+            "sRGB lerp must be ≤1 LSB on the u16 post-LUT (got {max_u16})"
+        );
     }
 
     #[test]
@@ -3302,7 +3999,10 @@ mod tonemap_flip_flops {
         let params = PipelineParams::default_olympus();
         let ti = derive_tone_inputs(&params);
 
-        eprintln!("=== FLIP-FLOP A/B (release, parallel={}) ===", cfg!(feature = "parallel"));
+        eprintln!(
+            "=== FLIP-FLOP A/B (release, parallel={}) ===",
+            cfg!(feature = "parallel")
+        );
         eprintln!("ROW\tcontext\told_ms\tnew_ms\tspeedup");
 
         // B1 — T1 parallel LUT build (new) vs serial (old). One full set = 3 pre + 1 post (an ensure_lut miss).
@@ -3312,7 +4012,11 @@ mod tonemap_flip_flops {
                 build_pre_lut_serial(params.black, params.white, ti.wb_r, ti.exp_gain),
                 "B1 pre LUT parallel must equal serial"
             );
-            assert_eq!(build_post_lut(&ti.tone), build_post_lut_serial(&ti.tone), "B1 post LUT parallel must equal serial");
+            assert_eq!(
+                build_post_lut(&ti.tone),
+                build_post_lut_serial(&ti.tone),
+                "B1 post LUT parallel must equal serial"
+            );
             let iters = 200;
             for _ in 0..10 {
                 let _ = build_pre_lut(params.black, params.white, ti.wb_r, ti.exp_gain);
@@ -3341,34 +4045,68 @@ mod tonemap_flip_flops {
         }
 
         // B2 — T2 process() alloc-each-call (old) vs process_into() buffer reuse (new).
-        for &(w, h, label) in &[(5000usize, 4000usize, "20MP"), (1800usize, 1200usize, "lightbox")] {
-            let rgb16: Vec<u16> = (0..w * h * 3).map(|i| (i.wrapping_mul(2654435761) & 0xffff) as u16).collect();
+        for &(w, h, label) in &[
+            (5000usize, 4000usize, "20MP"),
+            (1800usize, 1200usize, "lightbox"),
+        ] {
+            let rgb16: Vec<u16> = (0..w * h * 3)
+                .map(|i| (i.wrapping_mul(2654435761) & 0xffff) as u16)
+                .collect();
             let mut buf = vec![0u8; w * h * 3];
             process_into(&rgb16, &params, &mut buf);
-            assert_eq!(process(&rgb16, &params), buf, "B2 process_into must equal process");
+            assert_eq!(
+                process(&rgb16, &params),
+                buf,
+                "B2 process_into must equal process"
+            );
             let iters = if w >= 5000 { 15 } else { 40 };
-            for _ in 0..3 { std::hint::black_box(process(&rgb16, &params)); process_into(&rgb16, &params, &mut buf); }
+            for _ in 0..3 {
+                std::hint::black_box(process(&rgb16, &params));
+                process_into(&rgb16, &params, &mut buf);
+            }
             let (mut oldt, mut newt) = (Vec::new(), Vec::new());
             for _ in 0..iters {
-                let t = Instant::now(); let r = process(&rgb16, &params); oldt.push(t.elapsed().as_secs_f64() * 1000.0); std::hint::black_box(r);
-                let t = Instant::now(); process_into(&rgb16, &params, &mut buf); newt.push(t.elapsed().as_secs_f64() * 1000.0); std::hint::black_box(&buf);
+                let t = Instant::now();
+                let r = process(&rgb16, &params);
+                oldt.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(r);
+                let t = Instant::now();
+                process_into(&rgb16, &params, &mut buf);
+                newt.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(&buf);
             }
             let (o, n) = (median(oldt), median(newt));
             eprintln!("B2-process\t{}\t{:.4}\t{:.4}\t{:.2}x", label, o, n, o / n);
         }
 
         // B3 — T3 demosaic_rggb() alloc (old) vs demosaic_rggb_into() reuse (new).
-        for &(w, h, label) in &[(5000usize, 4000usize, "20MP"), (1800usize, 1200usize, "lightbox")] {
+        for &(w, h, label) in &[
+            (5000usize, 4000usize, "20MP"),
+            (1800usize, 1200usize, "lightbox"),
+        ] {
             let raw = synth_bayer(w, h);
             let mut buf = vec![0u16; w * h * 3];
             demosaic::demosaic_rggb_into(&raw, w, h, &mut buf).unwrap();
-            assert_eq!(demosaic::demosaic_rggb(&raw, w, h).unwrap(), buf, "B3 into must equal alloc");
+            assert_eq!(
+                demosaic::demosaic_rggb(&raw, w, h).unwrap(),
+                buf,
+                "B3 into must equal alloc"
+            );
             let iters = if w >= 5000 { 15 } else { 40 };
-            for _ in 0..3 { std::hint::black_box(demosaic::demosaic_rggb(&raw, w, h).unwrap()); demosaic::demosaic_rggb_into(&raw, w, h, &mut buf).unwrap(); }
+            for _ in 0..3 {
+                std::hint::black_box(demosaic::demosaic_rggb(&raw, w, h).unwrap());
+                demosaic::demosaic_rggb_into(&raw, w, h, &mut buf).unwrap();
+            }
             let (mut oldt, mut newt) = (Vec::new(), Vec::new());
             for _ in 0..iters {
-                let t = Instant::now(); let r = demosaic::demosaic_rggb(&raw, w, h).unwrap(); oldt.push(t.elapsed().as_secs_f64() * 1000.0); std::hint::black_box(r);
-                let t = Instant::now(); demosaic::demosaic_rggb_into(&raw, w, h, &mut buf).unwrap(); newt.push(t.elapsed().as_secs_f64() * 1000.0); std::hint::black_box(&buf);
+                let t = Instant::now();
+                let r = demosaic::demosaic_rggb(&raw, w, h).unwrap();
+                oldt.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(r);
+                let t = Instant::now();
+                demosaic::demosaic_rggb_into(&raw, w, h, &mut buf).unwrap();
+                newt.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(&buf);
             }
             let (o, n) = (median(oldt), median(newt));
             eprintln!("B3-demosaic\t{}\t{:.4}\t{:.4}\t{:.2}x", label, o, n, o / n);
@@ -3376,26 +4114,40 @@ mod tonemap_flip_flops {
 
         // B4 — rgb16-cache payoff (Lens 24): full re-render (demosaic+tone) per slider tick vs tone-only
         // when rgb16 is cached. old = full, new = tone-only. Demonstrates the JS-layer cache win.
-        for &(w, h, label) in &[(1800usize, 1200usize, "lightbox"), (640usize, 480usize, "thumb")] {
+        for &(w, h, label) in &[
+            (1800usize, 1200usize, "lightbox"),
+            (640usize, 480usize, "thumb"),
+        ] {
             let raw = synth_bayer(w, h);
             let iters = 30;
-            for _ in 0..3 { let r = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap(); std::hint::black_box(process(&r, &params)); }
+            for _ in 0..3 {
+                let r = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+                std::hint::black_box(process(&r, &params));
+            }
             let mut full = Vec::new();
             for _ in 0..iters {
                 let t = Instant::now();
                 let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
                 let r = process(&rgb16, &params);
-                full.push(t.elapsed().as_secs_f64() * 1000.0); std::hint::black_box(r);
+                full.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(r);
             }
             let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
             let mut warm = Vec::new();
             for _ in 0..iters {
                 let t = Instant::now();
                 let r = process(&rgb16, &params);
-                warm.push(t.elapsed().as_secs_f64() * 1000.0); std::hint::black_box(r);
+                warm.push(t.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(r);
             }
             let (f, wm) = (median(full), median(warm));
-            eprintln!("B4-rgb16cache\t{}\t{:.4}\t{:.4}\t{:.2}x", label, f, wm, f / wm);
+            eprintln!(
+                "B4-rgb16cache\t{}\t{:.4}\t{:.4}\t{:.2}x",
+                label,
+                f,
+                wm,
+                f / wm
+            );
         }
     }
 }
@@ -3409,7 +4161,12 @@ mod lut_property_tests {
     fn pre_lut_monotone_strided() {
         let lut = build_pre_lut_strided(64, 4095, 1.78, 1.0);
         for i in 1..lut.len() {
-            assert!(lut[i] >= lut[i - 1], "strided LUT not monotone at index {i}: {} < {}", lut[i], lut[i - 1]);
+            assert!(
+                lut[i] >= lut[i - 1],
+                "strided LUT not monotone at index {i}: {} < {}",
+                lut[i],
+                lut[i - 1]
+            );
         }
     }
 
@@ -3417,7 +4174,12 @@ mod lut_property_tests {
     fn pre_lut_monotone_compact() {
         let lut = build_pre_lut_compact(64, 4095, 1.78, 1.0, 65536);
         for i in 1..lut.len() {
-            assert!(lut[i] >= lut[i - 1], "compact LUT not monotone at index {i}: {} < {}", lut[i], lut[i - 1]);
+            assert!(
+                lut[i] >= lut[i - 1],
+                "compact LUT not monotone at index {i}: {} < {}",
+                lut[i],
+                lut[i - 1]
+            );
         }
     }
 
@@ -3431,7 +4193,10 @@ mod lut_property_tests {
         // Values above white should saturate to the same top value (highlight shoulder clamps to 1.0).
         for raw in (white as usize + 1)..=65535 {
             let v = lut[raw];
-            assert!(v >= at_white, "raw {raw} mapped below white-point value ({v} < {at_white})");
+            assert!(
+                v >= at_white,
+                "raw {raw} mapped below white-point value ({v} < {at_white})"
+            );
         }
     }
 
@@ -3452,8 +4217,8 @@ mod tone_simd_near_zero_tests {
     fn vibrance_near_zero_raw_mx() {
         const M: [[f32; 3]; 3] = [
             [1.526, -0.450, -0.077],
-            [-0.245,  1.336, -0.091],
-            [ 0.018, -0.298,  1.281],
+            [-0.245, 1.336, -0.091],
+            [0.018, -0.298, 1.281],
         ];
         let mut r = vec![0.0f32, 1e-7, 0.0];
         let mut g = vec![0.0f32, 0.0, 1e-7];
@@ -3476,17 +4241,29 @@ mod black_neutrality_tests {
     // tone+WB+matrix pipeline; return the mean output sRGB.
     fn render_patch(r12: u16, g12: u16, b12: u16, p: &PipelineParams) -> (f32, f32, f32) {
         let (w, h) = (4usize, 4usize);
-        let rgb16: Vec<u16> = std::iter::repeat([r12, g12, b12]).take(w * h).flatten().collect();
+        let rgb16: Vec<u16> = std::iter::repeat([r12, g12, b12])
+            .take(w * h)
+            .flatten()
+            .collect();
         let mut out = vec![0u8; w * h * 3];
         process_into(&rgb16, p, &mut out);
         let n = (w * h) as f32;
-        out.chunks_exact(3).fold((0f32, 0f32, 0f32), |(r, g, b), px|
-            (r + px[0] as f32 / n, g + px[1] as f32 / n, b + px[2] as f32 / n))
+        out.chunks_exact(3)
+            .fold((0f32, 0f32, 0f32), |(r, g, b), px| {
+                (
+                    r + px[0] as f32 / n,
+                    g + px[1] as f32 / n,
+                    b + px[2] as f32 / n,
+                )
+            })
     }
 
     fn olympus(black: u16, wb: f32) -> PipelineParams {
         let mut p = PipelineParams::default_olympus();
-        p.black = black; p.wb_r = wb; p.wb_g = 1.0; p.wb_b = wb;
+        p.black = black;
+        p.wb_r = wb;
+        p.wb_g = 1.0;
+        p.wb_b = wb;
         p
     }
 
@@ -3500,7 +4277,12 @@ mod black_neutrality_tests {
         const G_GAIN: f32 = 1.797; // sensor green over R,B (== the 0x0100 WB)
         const PED: u16 = 256;
         for s in [40u16, 80, 150, 300] {
-            let (r, g, b) = render_patch(s + PED, (s as f32 * G_GAIN) as u16 + PED, s + PED, &olympus(PED, G_GAIN));
+            let (r, g, b) = render_patch(
+                s + PED,
+                (s as f32 * G_GAIN) as u16 + PED,
+                s + PED,
+                &olympus(PED, G_GAIN),
+            );
             let magenta = (r + b) * 0.5 - g;
             assert!(magenta.abs() < 4.0, "signal {s}: magenta {magenta:+.1} (R={r:.0} G={g:.0} B={b:.0}) — black subtraction broken");
         }
@@ -3514,8 +4296,16 @@ mod black_neutrality_tests {
         const G_GAIN: f32 = 1.797;
         const PED: u16 = 256;
         let s = 40u16;
-        let (r, g, b) = render_patch(s + PED, (s as f32 * G_GAIN) as u16 + PED, s + PED, &olympus(0, G_GAIN));
-        assert!((r + b) * 0.5 - g > 30.0, "expected strong magenta at black=0, got R={r:.0} G={g:.0} B={b:.0}");
+        let (r, g, b) = render_patch(
+            s + PED,
+            (s as f32 * G_GAIN) as u16 + PED,
+            s + PED,
+            &olympus(0, G_GAIN),
+        );
+        assert!(
+            (r + b) * 0.5 - g > 30.0,
+            "expected strong magenta at black=0, got R={r:.0} G={g:.0} B={b:.0}"
+        );
     }
 }
 
@@ -3553,7 +4343,7 @@ mod downscale_recip_parity_tests {
                     }
                 }
                 let o = (dy * dw + dx) * 3;
-                out[o]     = (rr / n).min(65535) as u16;
+                out[o] = (rr / n).min(65535) as u16;
                 out[o + 1] = (gg / n).min(65535) as u16;
                 out[o + 2] = (bb / n).min(65535) as u16;
             }
@@ -3606,7 +4396,10 @@ mod downscale_recip_parity_tests {
         let out = downscale_rgb16(&src, 1800, 1350, 1280, 960);
         assert_eq!(out.len(), 1280 * 960 * 3);
         // Sanity: values in range
-        assert!(out.iter().all(|&v| v <= 0x3fff), "output out of 14-bit source range");
+        assert!(
+            out.iter().all(|&v| v <= 0x3fff),
+            "output out of 14-bit source range"
+        );
     }
 
     #[test]
@@ -3625,11 +4418,19 @@ mod downscale_recip_parity_tests {
         process_into(&rgb16, &params, &mut out);
 
         let calls = parallel_path_call_count();
-        eprintln!("parallel_path_call_count: {} (process_into on {}×{})", calls, W, H);
+        eprintln!(
+            "parallel_path_call_count: {} (process_into on {}×{})",
+            calls, W, H
+        );
 
         // If parallel feature is on and rayon has threads, we expect calls > 0.
         // With 1920×1440×3 = 8.3M pixels, that's well above rayon's min_len threshold (4096).
         // If calls == 0 but feature is on, parallel isn't firing (check threadpool init, workload size).
-        assert!(calls > 0, "parallel path not taken on {}×{} image; rayon may not be initialized", W, H);
+        assert!(
+            calls > 0,
+            "parallel path not taken on {}×{} image; rayon may not be initialized",
+            W,
+            H
+        );
     }
 }

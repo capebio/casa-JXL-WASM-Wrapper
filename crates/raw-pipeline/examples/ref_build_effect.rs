@@ -38,8 +38,14 @@ fn main() {
         w.sort_by(|x, y| x.partial_cmp(y).unwrap());
         w[w.len() / 2]
     };
-    let scalar_opts = || Opts { backend: BackendChoice::ForceScalar, ..Opts::default() };
-    let auto_opts = || Opts { backend: BackendChoice::Auto, ..Opts::default() };
+    let scalar_opts = || Opts {
+        backend: BackendChoice::ForceScalar,
+        ..Opts::default()
+    };
+    let auto_opts = || Opts {
+        backend: BackendChoice::Auto,
+        ..Opts::default()
+    };
 
     println!("ref_build_effect   A=Comparer::new(scalar ref)   B=Comparer::new(SIMD ref)");
     for (w, h) in sizes {
@@ -54,7 +60,11 @@ fn main() {
         for r in 0..rounds {
             for k in 0..2 {
                 let which = (r + k) % 2;
-                let opts = if which == 0 { scalar_opts() } else { auto_opts() };
+                let opts = if which == 0 {
+                    scalar_opts()
+                } else {
+                    auto_opts()
+                };
                 let src = refimg.clone(); // clone outside timer (new() consumes it)
                 let t = Instant::now();
                 let cmp = Comparer::new(src, w, h, opts);

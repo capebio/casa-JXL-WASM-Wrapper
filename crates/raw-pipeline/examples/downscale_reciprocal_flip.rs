@@ -89,8 +89,8 @@ fn main() {
     // 4K → 360p (5× factor)
     let sw = 4096usize;
     let sh = 2160usize;
-    let dw = 819usize;  // ~4096 / 5
-    let dh = 432usize;  // ~2160 / 5
+    let dw = 819usize; // ~4096 / 5
+    let dh = 432usize; // ~2160 / 5
 
     // Deterministic synthetic RGB16 data (high color variation).
     let mut s: u32 = 0xdead_beef;
@@ -109,7 +109,9 @@ fn main() {
 
     // Allow small rounding error due to fixed-point vs integer division.
     // recip method uses (accum * recip) >> 64, which can differ by ±1 per channel.
-    let diffs: Vec<i32> = a0.iter().zip(b0.iter())
+    let diffs: Vec<i32> = a0
+        .iter()
+        .zip(b0.iter())
         .map(|(x, y)| (*x as i32 - *y as i32).abs())
         .collect();
     let max_diff = diffs.iter().max().copied().unwrap_or(0);
@@ -126,14 +128,20 @@ fn main() {
     println!("Input: {sw}×{sh}×3 = {} samples", sw * sh * 3);
     println!("Output: {dw}×{dh}×3 = {} samples", dw * dh * 3);
     println!();
-    println!("Parity: max_diff = {}, rms_diff = {:.4}, count(diff==1) = {}", max_diff, rms_diff, diff_count_1);
+    println!(
+        "Parity: max_diff = {}, rms_diff = {:.4}, count(diff==1) = {}",
+        max_diff, rms_diff, diff_count_1
+    );
     if max_diff > 1 {
         println!("WARNING: parity broken (max_diff > 1); check algorithm!");
     } else {
         println!("OK: All diffs in [0,1] (acceptable for fixed-point rounding)");
     }
     println!();
-    println!("{:>12} {:>12} {:>10} | Method", "divide_ms", "reciprocal_ms", "%saved");
+    println!(
+        "{:>12} {:>12} {:>10} | Method",
+        "divide_ms", "reciprocal_ms", "%saved"
+    );
 
     let rounds = 11usize;
     let (mut ta, mut tb) = (Vec::new(), Vec::new());

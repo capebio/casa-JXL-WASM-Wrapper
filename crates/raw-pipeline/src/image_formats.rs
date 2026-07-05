@@ -73,7 +73,13 @@ pub fn decode_exr_bytes(bytes: &[u8]) -> Result<DecodedRgba, ImageFormatError> {
         .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
     let (width, height) = (img.width(), img.height());
     let rgba = img.to_rgba32f();
-    Ok(DecodedRgba { width, height, bit_depth: 32, f32: rgba.into_raw(), ..Default::default() })
+    Ok(DecodedRgba {
+        width,
+        height,
+        bit_depth: 32,
+        f32: rgba.into_raw(),
+        ..Default::default()
+    })
 }
 
 /// Pick 16-bit output when the source is >8-bit, else 8-bit. Always RGBA.
@@ -88,10 +94,22 @@ fn dynamic_to_rgba(img: DynamicImage) -> DecodedRgba {
     );
     if sixteen {
         let rgba = img.to_rgba16();
-        DecodedRgba { width, height, bit_depth: 16, u16: rgba.into_raw(), ..Default::default() }
+        DecodedRgba {
+            width,
+            height,
+            bit_depth: 16,
+            u16: rgba.into_raw(),
+            ..Default::default()
+        }
     } else {
         let rgba = img.to_rgba8();
-        DecodedRgba { width, height, bit_depth: 8, u8: rgba.into_raw(), ..Default::default() }
+        DecodedRgba {
+            width,
+            height,
+            bit_depth: 8,
+            u8: rgba.into_raw(),
+            ..Default::default()
+        }
     }
 }
 
@@ -134,7 +152,8 @@ mod tests {
         let img: image::ImageBuffer<image::Rgb<u16>, Vec<u16>> =
             image::ImageBuffer::from_raw(1, 1, vec![65535, 1000, 0]).unwrap();
         image::DynamicImage::ImageRgb16(img)
-            .write_to(&mut buf, image::ImageFormat::Tiff).unwrap();
+            .write_to(&mut buf, image::ImageFormat::Tiff)
+            .unwrap();
         buf.into_inner()
     }
 
@@ -144,7 +163,8 @@ mod tests {
         let img: image::ImageBuffer<image::Rgba<f32>, Vec<f32>> =
             image::ImageBuffer::from_raw(1, 1, vec![4.0, 0.5, 0.0, 1.0]).unwrap();
         image::DynamicImage::ImageRgba32F(img)
-            .write_to(&mut buf, image::ImageFormat::OpenExr).unwrap();
+            .write_to(&mut buf, image::ImageFormat::OpenExr)
+            .unwrap();
         buf.into_inner()
     }
 
@@ -167,7 +187,11 @@ mod tests {
     fn decode_exr_keeps_f32_hdr() {
         let d = decode_exr_bytes(&make_rgba32f_exr()).unwrap();
         assert_eq!((d.width, d.height, d.bit_depth), (1, 1, 32));
-        assert!((d.f32[0] - 4.0).abs() < 1e-4, "HDR value >1.0 must survive: {}", d.f32[0]);
+        assert!(
+            (d.f32[0] - 4.0).abs() < 1e-4,
+            "HDR value >1.0 must survive: {}",
+            d.f32[0]
+        );
         assert!((d.f32[3] - 1.0).abs() < 1e-4);
     }
 
@@ -180,7 +204,7 @@ mod tests {
         assert_eq!(out[1], 255);
         assert_eq!(out[2], 255); // HDR clamp
         assert_eq!(out[3], 255); // alpha 1.0 -> 255
-        // sRGB(0.5 linear) ~ 0.7353 -> ~188
+                                 // sRGB(0.5 linear) ~ 0.7353 -> ~188
         assert!((out[4] as i32 - 188).abs() <= 1, "got {}", out[4]);
         assert_eq!(out[7], 64); // alpha 0.25 -> 64 (linear, no sRGB on alpha)
     }

@@ -55,7 +55,11 @@ pub struct FrameStats {
 
 impl FrameStats {
     pub fn mean_luma(&self) -> f64 {
-        if self.pixel_count == 0 { 0.0 } else { self.luma_sum / self.pixel_count as f64 }
+        if self.pixel_count == 0 {
+            0.0
+        } else {
+            self.luma_sum / self.pixel_count as f64
+        }
     }
 
     /// Combine two partial `FrameStats` (e.g. from parallel strips or tiles).
@@ -80,7 +84,9 @@ impl FrameStats {
     /// so the result can reach ~16256.25. Keep this divisor in lock-step with the WASM
     /// `frame_stats` mirror — changing it here alone would desync cross-target telemetry.
     pub fn luma_variance(&self) -> f64 {
-        if self.pixel_count == 0 { return 0.0; }
+        if self.pixel_count == 0 {
+            return 0.0;
+        }
         let m = self.mean_luma();
         ((self.luma_sq / self.pixel_count as f64) - m * m).max(0.0) / 65025.0
     }
@@ -97,8 +103,14 @@ pub fn analyze_scalar(d: &[u8], px: usize) -> FrameStats {
     // to analyze_avx2 for every input because both sum the same exact integers.
     let (mut l_sum, mut l_sq) = (0u64, 0u64);
     let mut lanes = [
-        lane_seed(0), lane_seed(1), lane_seed(2), lane_seed(3),
-        lane_seed(4), lane_seed(5), lane_seed(6), lane_seed(7),
+        lane_seed(0),
+        lane_seed(1),
+        lane_seed(2),
+        lane_seed(3),
+        lane_seed(4),
+        lane_seed(5),
+        lane_seed(6),
+        lane_seed(7),
     ];
     // FS-003: iterate whole RGBA words via chunks_exact(4) — one bounds-checked word
     // load per pixel instead of four byte loads plus a redundant from_le_bytes re-read.
@@ -110,17 +122,29 @@ pub fn analyze_scalar(d: &[u8], px: usize) -> FrameStats {
         let b = (w >> 16) & 0xff;
         let a = w >> 24;
         rgb_nz += (r != 0) as u64 + (g != 0) as u64 + (b != 0) as u64;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = (54 * r + 183 * g + 18 * b) as u64; // ≤ 65025
         l_sum += l;
         l_sq += l * l; // ≤ 4.23e9 per px; u64 exact to ~4.3 Gpx
     }
     // px == 0 ⇒ the loop body never runs, so a_min/a_max keep their 255/0 init.
     FrameStats {
-        alpha_min: a_min, alpha_max: a_max, alpha_zero: a_zero, rgb_nonzero: rgb_nz,
-        luma_sum: l_sum as f64, luma_sq: l_sq as f64, hash: combine_lanes(&lanes), pixel_count: px,
+        alpha_min: a_min,
+        alpha_max: a_max,
+        alpha_zero: a_zero,
+        rgb_nonzero: rgb_nz,
+        luma_sum: l_sum as f64,
+        luma_sq: l_sq as f64,
+        hash: combine_lanes(&lanes),
+        pixel_count: px,
     }
 }
 
@@ -141,12 +165,18 @@ unsafe fn analyze_avx2(d: &[u8], px: usize) -> FrameStats {
     let (mut l_sum, mut l_sq) = (0u64, 0u64);
 
     let mut hv = _mm256_setr_epi32(
-        lane_seed(0) as i32, lane_seed(1) as i32, lane_seed(2) as i32, lane_seed(3) as i32,
-        lane_seed(4) as i32, lane_seed(5) as i32, lane_seed(6) as i32, lane_seed(7) as i32,
+        lane_seed(0) as i32,
+        lane_seed(1) as i32,
+        lane_seed(2) as i32,
+        lane_seed(3) as i32,
+        lane_seed(4) as i32,
+        lane_seed(5) as i32,
+        lane_seed(6) as i32,
+        lane_seed(7) as i32,
     );
     let prime_v = _mm256_set1_epi32(PRIME as i32);
 
-    let rgb_or = _mm256_set1_epi32(0x00FF_FFFFu32 as i32);  // r,g,b -> 0xff, a -> 0x00
+    let rgb_or = _mm256_set1_epi32(0x00FF_FFFFu32 as i32); // r,g,b -> 0xff, a -> 0x00
     let alpha_and = _mm256_set1_epi32(0xFF00_0000u32 as i32); // a kept, r,g,b -> 0
     let mut vmin = _mm256_set1_epi8(-1); // 0xff
     let mut vmax = _mm256_setzero_si256();
@@ -177,10 +207,7 @@ unsafe fn analyze_avx2(d: &[u8], px: usize) -> FrameStats {
         let lo16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(pv));
         let hi16 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(pv, 1));
         // Each madd pairs (54r+183g, 18b); hadd folds the pair → full per-pixel luma.
-        let luma_v = _mm256_hadd_epi32(
-            _mm256_madd_epi16(lo16, wv),
-            _mm256_madd_epi16(hi16, wv),
-        );
+        let luma_v = _mm256_hadd_epi32(_mm256_madd_epi16(lo16, wv), _mm256_madd_epi16(hi16, wv));
 
         // chunk_sum = Σ luma  (≤ 8 × 65025 = 520200, fits i32).
         let s4 = _mm_add_epi32(
@@ -217,8 +244,12 @@ unsafe fn analyze_avx2(d: &[u8], px: usize) -> FrameStats {
     let mut a_max = 0u32;
     let mut k = 3;
     while k < 32 {
-        if (mins[k] as u32) < a_min { a_min = mins[k] as u32; }
-        if (maxs[k] as u32) > a_max { a_max = maxs[k] as u32; }
+        if (mins[k] as u32) < a_min {
+            a_min = mins[k] as u32;
+        }
+        if (maxs[k] as u32) > a_max {
+            a_max = maxs[k] as u32;
+        }
         k += 4;
     }
 
@@ -235,18 +266,33 @@ unsafe fn analyze_avx2(d: &[u8], px: usize) -> FrameStats {
         let lane = p & 7;
         lanes[lane] = (lanes[lane] ^ w).wrapping_mul(PRIME);
         rgb_nz += (r != 0) as u64 + (g != 0) as u64 + (b != 0) as u64;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = (54 * r + 183 * g + 18 * b) as u64;
         l_sum += l;
         l_sq += l * l;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
 
     FrameStats {
-        alpha_min: a_min, alpha_max: a_max, alpha_zero: a_zero, rgb_nonzero: rgb_nz,
-        luma_sum: l_sum as f64, luma_sq: l_sq as f64, hash: combine_lanes(&lanes), pixel_count: px,
+        alpha_min: a_min,
+        alpha_max: a_max,
+        alpha_zero: a_zero,
+        rgb_nonzero: rgb_nz,
+        luma_sum: l_sum as f64,
+        luma_sq: l_sq as f64,
+        hash: combine_lanes(&lanes),
+        pixel_count: px,
     }
 }
 
@@ -256,13 +302,27 @@ pub fn analyze(pixels: &[u8], width: usize, height: usize) -> FrameStats {
     // to a wrong pixel count and cause the kernel to read stale/zeroed padding as real pixels.
     let px = match width.checked_mul(height) {
         Some(n) => n,
-        None => return FrameStats {
-            alpha_min: 255, alpha_max: 0, alpha_zero: 0, rgb_nonzero: 0,
-            luma_sum: 0.0, luma_sq: 0.0, hash: combine_lanes(&[
-                lane_seed(0), lane_seed(1), lane_seed(2), lane_seed(3),
-                lane_seed(4), lane_seed(5), lane_seed(6), lane_seed(7),
-            ]), pixel_count: 0,
-        },
+        None => {
+            return FrameStats {
+                alpha_min: 255,
+                alpha_max: 0,
+                alpha_zero: 0,
+                rgb_nonzero: 0,
+                luma_sum: 0.0,
+                luma_sq: 0.0,
+                hash: combine_lanes(&[
+                    lane_seed(0),
+                    lane_seed(1),
+                    lane_seed(2),
+                    lane_seed(3),
+                    lane_seed(4),
+                    lane_seed(5),
+                    lane_seed(6),
+                    lane_seed(7),
+                ]),
+                pixel_count: 0,
+            }
+        }
     };
     if pixels.len() < px.saturating_mul(4) {
         // Buffer is shorter than the declared pixel count: analyze only the complete pixels
@@ -279,7 +339,6 @@ pub fn analyze(pixels: &[u8], width: usize, height: usize) -> FrameStats {
     }
     analyze_scalar(pixels, px)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -300,15 +359,26 @@ mod tests {
     #[ignore] // byte-exact gate: run on OLD and NEW binaries, diff stdout (must be identical)
     fn dump_fixed() {
         for (w, h, seed) in [
-            (64usize, 48usize, 1u32), (101, 49, 7), (257, 257, 3),
-            (1920, 1280, 11), (6000, 4000, 99),
+            (64usize, 48usize, 1u32),
+            (101, 49, 7),
+            (257, 257, 3),
+            (1920, 1280, 11),
+            (6000, 4000, 99),
         ] {
             let buf = mkbuf(w * h, seed);
             let s = analyze(&buf, w, h);
             println!(
                 "{}x{} amin={} amax={} az={} nz={} ls={:016x} lq={:016x} h={:08x} pc={}",
-                w, h, s.alpha_min, s.alpha_max, s.alpha_zero, s.rgb_nonzero,
-                s.luma_sum.to_bits(), s.luma_sq.to_bits(), s.hash, s.pixel_count,
+                w,
+                h,
+                s.alpha_min,
+                s.alpha_max,
+                s.alpha_zero,
+                s.rgb_nonzero,
+                s.luma_sum.to_bits(),
+                s.luma_sq.to_bits(),
+                s.hash,
+                s.pixel_count,
             );
         }
     }
@@ -353,32 +423,55 @@ mod tests {
     #[test]
     #[ignore] // run: cargo test --no-default-features --release -- --ignored --nocapture native_bench
     fn native_bench() {
-        let sizes = [(1920usize, 1280usize, "2.46MP"), (1024, 1024, "1.05MP"), (6000, 4000, "24.0MP")];
+        let sizes = [
+            (1920usize, 1280usize, "2.46MP"),
+            (1024, 1024, "1.05MP"),
+            (6000, 4000, "24.0MP"),
+        ];
         #[cfg(target_arch = "x86_64")]
         let has_avx2 = is_x86_feature_detected!("avx2");
         #[cfg(not(target_arch = "x86_64"))]
         let has_avx2 = false;
-        println!("\n=== NATIVE frame-stats: scalar vs AVX2 (min ms/call) === avx2={}", has_avx2);
+        println!(
+            "\n=== NATIVE frame-stats: scalar vs AVX2 (min ms/call) === avx2={}",
+            has_avx2
+        );
         for (w, h, label) in sizes {
             let px = w * h;
             let buf = mkbuf(px, 7);
             let bench = |f: &dyn Fn() -> FrameStats| {
-                for _ in 0..8 { std::hint::black_box(f()); }
+                for _ in 0..8 {
+                    std::hint::black_box(f());
+                }
                 let mut best = f64::INFINITY;
                 for _ in 0..12 {
                     let t = Instant::now();
-                    for _ in 0..10 { std::hint::black_box(f()); }
+                    for _ in 0..10 {
+                        std::hint::black_box(f());
+                    }
                     let ms = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
-                    if ms < best { best = ms; }
+                    if ms < best {
+                        best = ms;
+                    }
                 }
                 best
             };
             let sc = bench(&|| analyze_scalar(&buf, px));
             #[cfg(target_arch = "x86_64")]
-            let av = if has_avx2 { bench(&|| unsafe { analyze_avx2(&buf, px) }) } else { f64::NAN };
+            let av = if has_avx2 {
+                bench(&|| unsafe { analyze_avx2(&buf, px) })
+            } else {
+                f64::NAN
+            };
             #[cfg(not(target_arch = "x86_64"))]
             let av = f64::NAN;
-            println!("{}: scalar {:.3} ms   avx2 {:.3} ms   speedup {:.2}x", label, sc, av, sc / av);
+            println!(
+                "{}: scalar {:.3} ms   avx2 {:.3} ms   speedup {:.2}x",
+                label,
+                sc,
+                av,
+                sc / av
+            );
         }
     }
 }

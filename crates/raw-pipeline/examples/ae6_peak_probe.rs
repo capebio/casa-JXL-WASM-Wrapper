@@ -23,13 +23,40 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 mod winmem {
     #[repr(C)]
-    struct Pmc { cb: u32, pfc: u32, peak_ws: usize, ws: usize, qpp: usize, qp: usize, qpn: usize, qn: usize, pf: usize, ppf: usize }
-    extern "system" { fn GetCurrentProcess() -> isize; fn K32GetProcessMemoryInfo(p: isize, c: *mut Pmc, cb: u32) -> i32; }
-    pub fn ws() -> u64 { unsafe { let mut c: Pmc = core::mem::zeroed(); c.cb = core::mem::size_of::<Pmc>() as u32;
-        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 { c.ws as u64 } else { 0 } } }
+    struct Pmc {
+        cb: u32,
+        pfc: u32,
+        peak_ws: usize,
+        ws: usize,
+        qpp: usize,
+        qp: usize,
+        qpn: usize,
+        qn: usize,
+        pf: usize,
+        ppf: usize,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(p: isize, c: *mut Pmc, cb: u32) -> i32;
+    }
+    pub fn ws() -> u64 {
+        unsafe {
+            let mut c: Pmc = core::mem::zeroed();
+            c.cb = core::mem::size_of::<Pmc>() as u32;
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+                c.ws as u64
+            } else {
+                0
+            }
+        }
+    }
 }
 #[cfg(not(windows))]
-mod winmem { pub fn ws() -> u64 { 0 } }
+mod winmem {
+    pub fn ws() -> u64 {
+        0
+    }
+}
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -37,7 +64,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(7);
+    let iters: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
     let dng_path = r"C:\Foo\raw-converter\tests\PXL_20260527_180319603.RAW-02.ORIGINAL.dng";
     let data = std::fs::read(dng_path).expect("fixture DNG");
     let img = raw_pipeline::dng::decode_bytes(&data).expect("dng decode");
@@ -58,7 +88,10 @@ fn main() {
     let rgb = raw_pipeline::pipeline::process_rgb(&rgb16, &p);
     drop(rgb16);
     let (w, h) = (img.width, img.height);
-    println!("=== AE-6 probe: {w}x{h} ({:.1} MP), iters={iters} ===", (w * h) as f64 / 1e6);
+    println!(
+        "=== AE-6 probe: {w}x{h} ({:.1} MP), iters={iters} ===",
+        (w * h) as f64 / 1e6
+    );
 
     let ws_max = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
@@ -72,7 +105,9 @@ fn main() {
         })
     };
 
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let arms: &[(&str, f32, usize)] = &[
         ("variants_full_q90_st", distance_from_quality(90.0), 1),
         ("pyramid_full_d055_mt", 0.55, cores),
@@ -85,28 +120,44 @@ fn main() {
         let mut peak_chunk: f64 = 0.0;
         for i in 0..iters {
             // start rotation: alternate which mode goes first each iteration
-            let order: [&str; 2] = if i % 2 == 0 { ["whole", "chunk"] } else { ["chunk", "whole"] };
+            let order: [&str; 2] = if i % 2 == 0 {
+                ["whole", "chunk"]
+            } else {
+                ["chunk", "whole"]
+            };
             for mode in order {
                 let base = winmem::ws();
                 ws_max.store(base, Ordering::Relaxed);
                 let t = Instant::now();
                 let out = if mode == "whole" {
-                    let opts = EncodeOptions { rate: Rate::Distance(*dist), ..Default::default() }
-                        .with_effort(3);
+                    let opts = EncodeOptions {
+                        rate: Rate::Distance(*dist),
+                        ..Default::default()
+                    }
+                    .with_effort(3);
                     let mut enc = Encoder::with_threads(opts, *threads).unwrap();
                     enc.encode(&Frame::rgb(&rgb, w as u32, h as u32)).unwrap()
                 } else {
                     let mut o = Vec::new();
                     encode_chunked_threaded(
-                        w as u32, h as u32, *dist, 3, *threads,
-                        &mut WholeImageSource { data: &rgb, width: w }, &mut o,
+                        w as u32,
+                        h as u32,
+                        *dist,
+                        3,
+                        *threads,
+                        &mut WholeImageSource {
+                            data: &rgb,
+                            width: w,
+                        },
+                        &mut o,
                     )
                     .unwrap();
                     o
                 };
                 let ms = t.elapsed().as_secs_f64() * 1e3;
                 std::hint::black_box(&out);
-                let peak = (ws_max.load(Ordering::Relaxed).saturating_sub(base)) as f64 / 1_048_576.0;
+                let peak =
+                    (ws_max.load(Ordering::Relaxed).saturating_sub(base)) as f64 / 1_048_576.0;
                 if mode == "whole" {
                     ms_whole.push(ms);
                     peak_whole = peak_whole.max(peak);

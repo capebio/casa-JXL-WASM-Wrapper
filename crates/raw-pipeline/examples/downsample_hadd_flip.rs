@@ -39,18 +39,16 @@ unsafe fn downsample_hadd(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: 
             let h0 = _mm256_hadd_ps(p00, p01);
             let h1 = _mm256_hadd_ps(p10, p11);
             let sum_scrambled = _mm256_add_ps(h0, h1);
-            let sum = _mm256_castpd_ps(_mm256_permute4x64_pd(
-                _mm256_castps_pd(sum_scrambled),
-                0xD8,
-            ));
+            let sum =
+                _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(sum_scrambled), 0xD8));
             _mm256_storeu_ps(dst.as_mut_ptr().add(drow + x), _mm256_mul_ps(sum, quarter));
             x += 8;
         }
         while x < dw {
             let sx0 = x << 1;
             let sx1 = if sx0 + 1 < w { sx0 + 1 } else { w - 1 };
-            dst[drow + x] = (src[row0 + sx0] + src[row0 + sx1]
-                + src[row1 + sx0] + src[row1 + sx1]) * 0.25;
+            dst[drow + x] =
+                (src[row0 + sx0] + src[row0 + sx1] + src[row1 + sx0] + src[row1 + sx1]) * 0.25;
             x += 1;
         }
     }
@@ -98,8 +96,8 @@ unsafe fn downsample_old(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: u
         while x < dw {
             let sx0 = x << 1;
             let sx1 = if sx0 + 1 < w { sx0 + 1 } else { w - 1 };
-            dst[drow + x] = (src[row0 + sx0] + src[row0 + sx1]
-                + src[row1 + sx0] + src[row1 + sx1]) * 0.25;
+            dst[drow + x] =
+                (src[row0 + sx0] + src[row0 + sx1] + src[row1 + sx0] + src[row1 + sx1]) * 0.25;
             x += 1;
         }
     }
@@ -111,7 +109,13 @@ fn main() {
         return;
     }
     // Butteraugli pyramid levels for typical RAW previews + full frames.
-    let sizes = [(1024usize, 1024usize), (3000, 2000), (6000, 4000), (1500, 1000), (750, 500)];
+    let sizes = [
+        (1024usize, 1024usize),
+        (3000, 2000),
+        (6000, 4000),
+        (1500, 1000),
+        (750, 500),
+    ];
     let med = |v: &[f64]| {
         let mut w: Vec<f64> = v[1..].to_vec();
         w.sort_by(|x, y| x.partial_cmp(y).unwrap());
@@ -166,7 +170,11 @@ fn main() {
             "    B hadd:  {mb:.4} ms median   %saved {:+.1}%   {:.2}×   gate(≥5%): {}",
             (ma - mb) / ma * 100.0,
             ma / mb,
-            if (ma - mb) / ma * 100.0 >= 5.0 { "PASS" } else { "FAIL" }
+            if (ma - mb) / ma * 100.0 >= 5.0 {
+                "PASS"
+            } else {
+                "FAIL"
+            }
         );
         println!("    (sink={sink})");
     }
