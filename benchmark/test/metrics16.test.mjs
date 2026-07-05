@@ -17,7 +17,16 @@ test("psnr16 identical -> Infinity", () => {
 test("psnr16 resolves sub-8-bit diffs", () => {
   const B = img([[101,100,100],[200,200,200],[300,300,300],[400,400,400]]); // +1 in 16-bit
   const p = psnr16(A, B, 2, 2);
-  assert.ok(Number.isFinite(p) && p > 90 && p < 130, `psnr16=${p}`); // tiny diff => very high but finite
+  // exact answer 107.12 dB; tight window pins the peak constant + n*3 denom (a wrong L2 or denom lands outside)
+  assert.ok(Number.isFinite(p) && p > 104 && p < 110, `psnr16=${p}`);
+});
+
+test("psnr16 max-diff -> 0 dB (validates peak=65535)", () => {
+  const w = 2, h = 2;
+  const black = new Uint16Array(w * h * 4); for (let p = 0; p < w * h; p++) black[p*4+3] = 0xFFFF;
+  const white = new Uint16Array(w * h * 4); for (let i = 0; i < white.length; i++) white[i] = 0xFFFF;
+  const p = psnr16(black, white, w, h);
+  assert.ok(Math.abs(p) < 1e-9, `max-diff psnr16 should be 0 dB, got ${p}`);
 });
 
 test("ssim16 identical -> ~1", () => {
