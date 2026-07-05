@@ -69,7 +69,7 @@ function emitAndDeliver(data, corpus, runTimestamp) {
   const { sweep, timed, fixed, lossless, sweep16, lossless16 } = data;
   try {
     mkdirSync(OUT_DIR, { recursive: true });
-    const { files } = writeFiguresFull({ outDir: OUT_DIR, sweep, timed, fixed, lossless, corpus, sweep16 });
+    const { files } = writeFiguresFull({ outDir: OUT_DIR, sweep, timed, fixed, lossless, corpus, sweep16, lossless16 });
     // per-file table at fixed point
     const perFile = corpus.map(img => {
       const j = fixed.filter(p => p.image === img.id && p.codec === "jxl");
@@ -86,7 +86,7 @@ function emitAndDeliver(data, corpus, runTimestamp) {
     const ours = fixed.filter(p => p.codec === "jxl"), orig = fixed.filter(p => p.codec === "jxl_orig");
     const pct = (a, b, k) => avg(a, r => r[k]) / avg(b, r => r[k]) * 100;
     const oursVsOrig = (ours.length && orig.length) ? { size: pct(ours, orig, "bytes"), encX: 100 / pct(ours, orig, "enc_ms"), decX: 100 / pct(ours, orig, "dec_ms") } : null;
-    writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, bdRowsPsnr, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920); 16-bit RD figures: RAW-derived only, JXL + AVIF-10/12 (JPEG/WebP are 8-bit-only; PNG-16 lossless bpp captured in data.json)` });
+    writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, bdRowsPsnr, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920); 16-bit RD figures: RAW-derived only, JXL + AVIF-10/12 (JPEG/WebP are 8-bit-only) + PNG-16 lossless floor` });
     // data toon (compact) + full JSON dump (enables regen + new metrics without re-running)
     const stamp = runTimestamp.replace(/[:.]/g, "-");
     writeFileSync(join(OUT_DIR, `${stamp}-CodecPaperFull-general.toon`), `TestName: CodecPaperFull - general\nRunTimestamp: ${runTimestamp}\nsweep_rows: ${sweep.length}\ntimed_rows: ${timed.length}\nfixed_rows: ${fixed.length}\nlossless_rows: ${lossless.length}\nsweep16_rows: ${sweep16.length}\nlossless16_rows: ${lossless16.length}\n`);
