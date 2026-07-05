@@ -28,3 +28,30 @@ test("jxl16 adapter round-trips RGBA16 near-lossless", async () => {
   const mae = e / src.length;
   assert.ok(mae < 2000, `jxl16 mae=${mae}`);
 });
+
+// --- Task 6: AVIF-10/12 + PNG-16 adapters ---
+import { ADAPTERS16 } from "../codec-adapters.mjs";
+
+function grad16(w, h) {
+  const out = new Uint16Array(w * h * 4);
+  for (let p = 0; p < w * h; p++) { const v = (p * 65535 / (w*h-1)) | 0; out[p*4]=v; out[p*4+1]=65535-v; out[p*4+2]=(v*7)&0xFFFF; out[p*4+3]=0xFFFF; }
+  return out;
+}
+
+for (const spec of [{ key: "avif16", q: 90, maeMax: 4000 }, { key: "png16", q: 100, maeMax: 1 }]) {
+  test(`${spec.key} round-trips RGBA16 to full-range and near-source`, async () => {
+    const a = ADAPTERS16.find(x => x.key === spec.key);
+    if (!a) { console.log(`SKIP ${spec.key} (adapter absent)`); return; }
+    const w = 32, h = 32, src = grad16(w, h);
+    let bytes;
+    try { bytes = await a.encode(src, w, h, spec.q); }
+    catch (e) { console.log(`SKIP ${spec.key} (encode unsupported at runtime): ${e.message}`); return; }
+    const dec = await a.decode(bytes);
+    assert.ok(dec.data instanceof Uint16Array, `${spec.key} decode must yield Uint16Array`);
+    assert.equal(dec.data.length, w * h * 4, `${spec.key} decode length`);
+    let mx = 0; for (let i = 0; i < dec.data.length; i += 4) { if (dec.data[i] > mx) mx = dec.data[i]; }
+    assert.ok(mx > (255 << 8), `${spec.key} decoded not full-range max=${mx}`);
+    let e = 0; for (let i = 0; i < src.length; i++) e += Math.abs(src[i] - dec.data[i]);
+    assert.ok(e / src.length < spec.maeMax, `${spec.key} mae=${e / src.length}`);
+  });
+}

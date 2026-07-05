@@ -86,6 +86,39 @@ export async function jxlOrigDecode(bytes) {
   return { data: toU8(img.data), width: img.width, height: img.height };
 }
 
+// --- 16-bit adapters (RGBA16 Uint16Array in/out). sharp handles 16-bit natively. ---
+// Pass Uint16Array directly so sharp infers 'ushort' depth (NOT Buffer/Uint8Array byte-view).
+const sharpRaw16 = (rgba16, w, h) =>
+  sharp(rgba16, { raw: { width: w, height: h, channels: 4 } });
+
+async function decodeSharp16(bytes) {
+  const { data, info } = await sharp(Buffer.from(bytes))
+    .ensureAlpha()
+    .toColourspace("rgb16")
+    .raw({ depth: "ushort" })
+    .toBuffer({ resolveWithObject: true });
+  const u16 = new Uint16Array(data.buffer, data.byteOffset, data.byteLength >> 1);
+  return { data: u16, width: info.width, height: info.height };
+}
+
+export const ADAPTERS16 = [
+  {
+    key: "avif16", runtime: "native", lossless: false,
+    async encode(rgba16, w, h, quality) {
+      const bitdepth = 12; // 10 also valid; libaom high-bit-depth
+      return toU8(await sharpRaw16(rgba16, w, h).toColourspace("rgb16").avif({ quality, bitdepth, chromaSubsampling: "4:4:4" }).toBuffer());
+    },
+    decode: decodeSharp16,
+  },
+  {
+    key: "png16", runtime: "native", lossless: true,
+    async encode(rgba16, w, h) {
+      return toU8(await sharpRaw16(rgba16, w, h).toColourspace("rgb16").png().toBuffer());
+    },
+    decode: decodeSharp16,
+  },
+];
+
 export const ADAPTERS = [
   sharpAdapter("jpeg_native", "jpeg", (p, q) => p.jpeg({ quality: q, chromaSubsampling: "4:4:4" })),
   sharpAdapter("webp_native", "webp", (p, q) => p.webp({ quality: q, smartSubsample: true })),
