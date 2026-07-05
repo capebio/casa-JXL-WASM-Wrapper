@@ -75,6 +75,7 @@ fn probe_fps(video: &str) -> (u32, u32) {
 }
 
 fn extract_png_frames(video: &str, dim: &str) -> Vec<u8> {
+    use std::io::Read;
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-i", video]);
     if dim != "exact" {
@@ -93,13 +94,52 @@ fn extract_png_frames(video: &str, dim: &str) -> Vec<u8> {
     cmd.args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
-    match cmd.output() {
-        Ok(o) => o.stdout,
+    // Stream stdout instead of one opaque `output()`: count PNG signatures as
+    // frames arrive so the UI shows extraction advancing (ffmpeg gives no
+    // upfront frame total, so `total` stays 0 → indeterminate bar with a live
+    // count). stderr is null, so draining only stdout can't deadlock.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
         Err(e) => {
             eprintln!("casv_encode: ffmpeg failed: {e}");
             std::process::exit(1);
         }
+    };
+    let mut out = child.stdout.take().expect("ffmpeg stdout piped");
+    let mut data: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut scan = 0usize; // next index to test for a signature (monotonic)
+    let mut frames = 0usize;
+    let mut reported = 0usize;
+    loop {
+        match out.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                data.extend_from_slice(&buf[..n]);
+                // Advance a monotonic cursor: never rescans, and a signature
+                // split across two reads is found once (cursor waits for bytes).
+                while scan + PNG_MAGIC.len() <= data.len() {
+                    if data[scan..scan + PNG_MAGIC.len()] == *PNG_MAGIC {
+                        frames += 1;
+                        scan += PNG_MAGIC.len();
+                    } else {
+                        scan += 1;
+                    }
+                }
+                // Throttle stderr: report every 4th new frame.
+                if frames >= reported + 4 {
+                    progress("extract", frames, 0);
+                    reported = frames;
+                }
+            }
+            Err(e) => {
+                eprintln!("casv_encode: ffmpeg read failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
+    let _ = child.wait();
+    data
 }
 
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
