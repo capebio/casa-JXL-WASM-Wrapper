@@ -122,8 +122,8 @@ assert(
 );
 
 // ── Downscale + RGBA pack ────────────────────────────────────────────────────
-const tw = width >= height ? 1920 : Math.round(width * 1920 / height);
-const th = width >= height ? Math.round(height * 1920 / width) : 1920;
+const tw = width >= height ? TARGET_LONG_EDGE : Math.round(width * TARGET_LONG_EDGE / height);
+const th = width >= height ? Math.round(height * TARGET_LONG_EDGE / width) : TARGET_LONG_EDGE;
 const downscaled = raw.downscale_rgb16_pub(rgb16, disp16_w, disp16_h, tw, th);
 assert(
   downscaled instanceof Uint16Array,
@@ -141,6 +141,9 @@ assert(
 );
 assert(rgba16.length === tw * th * 4, `rgba16.length ${rgba16.length} !== tw*th*4 = ${tw*th*4}`);
 assert(rgba16[3] === 0xFFFF, `rgba16[3] alpha should be 0xFFFF, got ${rgba16[3]}`);
+// second alpha sample mid-buffer catches a stride/partial-fill bug the first-pixel check would miss
+const midA = (Math.floor(tw * th / 2) * 4) + 3;
+assert(rgba16[midA] === 0xFFFF, `rgba16 mid alpha should be 0xFFFF, got ${rgba16[midA]}`);
 
 console.log(
   `OK 16-bit disp: ${width}x${height} -> ${tw}x${th}, max=${maxSample}, consistency bad-frac=${(badFrac * 100).toFixed(4)}%`
