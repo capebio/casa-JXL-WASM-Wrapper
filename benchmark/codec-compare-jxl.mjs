@@ -48,7 +48,6 @@ export async function butteraugliDistance(refRgba, testRgba, w, h) {
   return facade.computeButteraugli(refRgba, testRgba, w, h);
 }
 
-// JXL adapter — distance 1.0 anchor. Encode/decode settings mirror encodeJxl/decodeJxl in the standard test.
 // ── 16-bit helpers ──────────────────────────────────────────────────────────
 
 // Load a RAW file and return a display-referred, oriented, full-range RGBA16
@@ -166,6 +165,7 @@ export async function butteraugliDistance16(refRgba16, testRgba16, w, h) {
 
 // ── 8-bit adapter ────────────────────────────────────────────────────────────
 
+// JXL adapter — distance 1.0 anchor. Encode/decode settings mirror encodeJxl/decodeJxl in the standard test.
 export function makeJxlAdapter() {
   return {
     key: "jxl", runtime: "wasm", lossless: false,
@@ -232,7 +232,7 @@ export function makeJxlAdapter() {
         for await (const e of decoder.events()) {
           if (e.type === "progress" || e.type === "final") {
             if (firstFrameMs === null) firstFrameMs = performance.now() - t0;
-            if (e.pixels) { pixels = e.pixels; width = e.width ?? width; height = e.height ?? height; }
+            if (e.pixels) { pixels = e.pixels; width = e.info?.width ?? width; height = e.info?.height ?? height; }
           } else if (e.type === "error") throw new Error(`${e.code}: ${e.message}`);
         }
       })();
