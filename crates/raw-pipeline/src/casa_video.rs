@@ -327,6 +327,28 @@ pub fn encode_casv_video_with_audio_progress(
     Ok(buf)
 }
 
+/// Like [`encode_casv_video_with_audio_progress`] but pulls frames from a lazy
+/// `src` instead of a resident slice — so a caller that decodes frames on demand
+/// (e.g. from a video stream) keeps peak memory at ~2 frames rather than the
+/// whole clip. Byte-identical output for the same frame sequence (both feed the
+/// same streaming encoder). Same footer format + CSAU insertion.
+pub fn encode_casv_video_streaming_with_audio_progress(
+    src: &mut dyn VideoFrameSource,
+    opts: &CasaVideoOptions,
+    ogg_opus: Option<&[u8]>,
+    on_frame: &mut dyn FnMut(usize),
+) -> Result<Vec<u8>, VideoError> {
+    let mut buf = Vec::new();
+    encode_casv_video_streaming_to_progress(src, opts, &mut buf, on_frame)?;
+    if let Some(audio) = ogg_opus {
+        // Insert CSAU between the CASR box and the 32-byte footer.
+        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
+        write_csau_box(&mut buf, audio);
+        buf.extend_from_slice(&footer);
+    }
+    Ok(buf)
+}
+
 /// Trailing footer of a streaming `.casv`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CasvFooter {
@@ -3310,6 +3332,62 @@ mod tests {
             v2.len() as f64 / v1.len() as f64,
             m1 / m2
         );
+    }
+
+    #[test]
+    fn streaming_source_with_audio_matches_slice_batch() {
+        // A lazy pull source must produce byte-identical output to the resident
+        // slice path for the same frames (both feed encode_casv_video_streaming_
+        // to_progress + the same CSAU insertion). Guards the sidecar's lazy-decode
+        // memory optimization.
+        struct VF {
+            f: Vec<Vec<u8>>,
+            i: usize,
+            w: u32,
+            h: u32,
+        }
+        impl VideoFrameSource for VF {
+            fn dims(&self) -> (u32, u32) {
+                (self.w, self.h)
+            }
+            fn fps(&self) -> (u32, u32) {
+                (24, 1)
+            }
+            fn next_frame(&mut self) -> Option<Vec<u8>> {
+                if self.i < self.f.len() {
+                    let v = self.f[self.i].clone();
+                    self.i += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        }
+        let (w, h) = (32u32, 24u32);
+        let frames: Vec<Vec<u8>> = (0..7).map(|s| gradient(w, h, (s * 30) as u8)).collect();
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            skip: SkipMode::Tile,
+            gop_len: 3,
+            tile: 16,
+            effort: 3,
+            thresh: Some(8),
+            rate_control: None,
+        };
+        let audio = b"OggS fake opus payload".as_slice();
+        let batch = encode_casv_video_with_audio_progress(
+            &frames, w, h, 24, 1, &opts, Some(audio), &mut |_| {},
+        )
+        .unwrap();
+        let mut src = VF { f: frames.clone(), i: 0, w, h };
+        let streamed = encode_casv_video_streaming_with_audio_progress(
+            &mut src, &opts, Some(audio), &mut |_| {},
+        )
+        .unwrap();
+        // Byte-identical to the already-shipping slice path is the guarantee
+        // (both emit footer-format + CSAU); decode is covered by the footer
+        // roundtrip tests.
+        assert_eq!(batch, streamed, "lazy source must byte-match the slice batch");
     }
 
     #[test]
