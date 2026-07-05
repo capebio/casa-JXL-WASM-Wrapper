@@ -70,6 +70,26 @@ export function makeJxlAdapter() {
       const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
       return out;
     },
+    // Lossless encode (JXL's strength). Tries facade lossless flags; throws if unsupported (caller skips).
+    async encodeLossless(rgba, w, h) {
+      const opts = { format: "rgba8", width: w, height: h, hasAlpha: true, iccProfile: null, exif: null, xmp: null, effort: 3, chunked: true };
+      for (const extra of [{ lossless: true }, { distance: 0 }, { quality: 100, distance: 0 }]) {
+        try {
+          const encoder = facade.createEncoder({ ...opts, ...extra });
+          const chunks = [];
+          const collect = (async () => { for await (const c of encoder.chunks()) chunks.push(c instanceof Uint8Array ? c : new Uint8Array(c)); })();
+          await encoder.pushPixels(exactBuffer(rgba));
+          await encoder.finish();
+          await collect;
+          await encoder.dispose();
+          let n = 0; for (const c of chunks) n += c.length;
+          if (n === 0) continue;
+          const out = new Uint8Array(n); let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+          return out;
+        } catch (_) { /* try next flag combo */ }
+      }
+      throw new Error("facade lossless unsupported");
+    },
     async encodeAnchor(rgba, w, h) {
       const encoder = facade.createEncoder({
         format: "rgba8", width: w, height: h, hasAlpha: true,

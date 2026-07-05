@@ -73,6 +73,19 @@ const ensureJxlDec = onceInit(initJxlDec, "@jsquash/jxl/decode.js", "codec/dec/j
 // Chroma fairness: JPEG forced to 4:4:4 (native + mozjpeg) so its quality isn't capped by default 4:2:0.
 // WebP lossy is inherently 4:2:0 in libwebp (no 4:4:4) — left as-is; smartSubsample sharpens chroma edges.
 // AVIF defaults to 4:4:4 in both sharp and @jsquash.
+// True lossless JXL via reference libjxl (@jsquash/jxl lossless:true). Returns Uint8Array.
+export async function jxlOrigLossless(rgba, w, h) {
+  await ensureJxlEnc();
+  const img = { data: new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength), width: w, height: h };
+  return toU8(await jxlEnc(img, { lossless: true, effort: 3 }));
+}
+export async function jxlOrigDecode(bytes) {
+  await ensureJxlDec();
+  const ab = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  const img = await jxlDec(ab);
+  return { data: toU8(img.data), width: img.width, height: img.height };
+}
+
 export const ADAPTERS = [
   sharpAdapter("jpeg_native", "jpeg", (p, q) => p.jpeg({ quality: q, chromaSubsampling: "4:4:4" })),
   sharpAdapter("webp_native", "webp", (p, q) => p.webp({ quality: q, smartSubsample: true })),
