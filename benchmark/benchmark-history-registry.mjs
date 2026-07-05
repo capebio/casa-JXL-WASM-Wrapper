@@ -1,5 +1,6 @@
 const FAMILY_LABEL_OVERRIDES = new Map([
   ["standard-multifile", "Standard Multifile"],
+  ["multifileab-previewfirst", "Multifile A/B (previewFirst)"],
   ["policy-ab", "Policy A/B"],
   ["policy-matrix", "Policy Matrix"],
   ["effort-sweep-benchmark", "Effort Sweep"],
@@ -21,6 +22,7 @@ const FAMILY_LABEL_OVERRIDES = new Map([
 
 const FAMILY_COLOR_OVERRIDES = new Map([
   ["standard-multifile", "#7dd3fc"],
+  ["multifileab-previewfirst", "#fbbf24"],
   ["policy-ab", "#f59e0b"],
   ["policy-matrix", "#f97316"],
   ["effort-sweep", "#34d399"],
@@ -73,6 +75,7 @@ export function deriveFamilyIdFromArtifactName(fileName, testName = "") {
     stem.replace(/^\d{4}-\d{2}-\d{2}t\d{2}-\d{2}-\d{2}-\d{3}z/i, ""),
   ].map(normalizeFamilyId);
 
+  if (candidates.some((value) => value.includes("multifileab-previewfirst"))) return "multifileab-previewfirst";
   if (candidates.some((value) => value.includes("standardmultifiletest"))) return "standard-multifile";
   if (candidates.some((value) => value.includes("policy-ab"))) return "policy-ab";
   if (candidates.some((value) => value.includes("policy-matrix"))) return "policy-matrix";
