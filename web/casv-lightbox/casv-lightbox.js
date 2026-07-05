@@ -14,7 +14,7 @@ import { CasvReader, playCasv } from '@casabio/casv-web';
 import {
   PRESETS, frameKindLabel, formatRate, fpsOf, timecode,
   suggestExportName, buildEncodeRequest, classifyDroppedEncodePaths,
-  shouldHandleEncodeDrop,
+  shouldHandleEncodeDrop, speedToSettings, PROXY_PRESET,
 } from './casv-lightbox-core.js';
 import {
   isTauri, makeBrowserJxlDecoder, prewarmJxl, pickCasvFile,
@@ -130,6 +130,8 @@ export class CasvLightbox {
       });
     }
     this.el.preset.addEventListener('change', () => this._applyPreset(this.el.preset.value));
+    if (this.el.encSpeed) this.el.encSpeed.addEventListener('input', () => this._applySpeed(this.el.encSpeed.value));
+    if (this.el.proxyBtn) this.el.proxyBtn.addEventListener('click', () => this._applyProxy());
     this.el.sourceKind.addEventListener('change', () => this._setEncodeSource(this.el.sourceKind.value));
     this.el.autoFps.addEventListener('change', () => this._reflectFpsMode());
     this.el.pickImages.addEventListener('click', () => this._onPickEncodeSource());
@@ -465,6 +467,38 @@ export class CasvLightbox {
     this._curPreset = name;
   }
 
+  /** One-knob quality↔speed: drives the effort + distance inputs from a 0..100
+   *  slider (see speedToSettings). Implies the lossy tier. */
+  _applySpeed(speed) {
+    const s = speedToSettings(speed);
+    if (this._curPreset === 'archive') this._curPreset = 'balanced';
+    this.el.distance.value = String(s.distance);
+    this.el.effort.value = String(s.effort);
+    this.el.thresh.value = '';          // blank = auto from distance
+    this.el.distance.disabled = false;
+    this.el.preset.value = 'balanced';  // reflect a lossy custom state
+    if (this.el.encSpeedHelp) {
+      this.el.encSpeedHelp.textContent =
+        `effort ${s.effort}, distance ${s.distance} — right = faster & lower quality.`;
+    }
+    if (this.el.presetHelp) this.el.presetHelp.textContent = 'Custom speed (slider).';
+  }
+
+  /** Fast low-res proxy for scrubbing / live editing (PROXY_PRESET): 720p via
+   *  the `dim` downscale + fastest effort + coarse distance. Lossy. */
+  _applyProxy() {
+    const p = PROXY_PRESET;
+    if (this._curPreset === 'archive') this._curPreset = 'balanced';
+    this.el.distance.value = String(p.distance);
+    this.el.effort.value = String(p.effort);
+    this.el.skip.value = p.skip;
+    this.el.tile.value = String(p.tile);
+    this.el.distance.disabled = false;
+    this.el.preset.value = 'balanced';
+    if (this.encodeSourceKind === 'video' && p.dim) this.el.dim.value = p.dim;
+    if (this.el.presetHelp) this.el.presetHelp.textContent = p.hint;
+  }
+
   _setEncodeSource(kind) {
     this.encodeSourceKind = kind === 'images' ? 'images' : 'video';
     this.encodeInputs = [];
@@ -788,6 +822,15 @@ const TEMPLATE = `
     </select>
     <span class="casv-lb__help" data-el="presetHelp"></span>
   </label>
+
+  <label class="casv-lb__field">2b · Encode speed <small>quality ←→ speed</small>
+    <input data-el="encSpeed" type="range" min="0" max="100" step="5" value="50">
+    <span class="casv-lb__help" data-el="encSpeedHelp">One knob over effort + distance. Right = faster encode, lower quality.</span>
+  </label>
+
+  <div class="casv-lb__encode-actions">
+    <button data-el="proxyBtn" class="casv-lb__btn" type="button" title="Fast 720p proxy for scrubbing / live editing — re-encode full-res for the final file">&#9889; Preview proxy — 720p, fastest</button>
+  </div>
 
   <details class="casv-lb__adv">
     <summary>Advanced options <span class="casv-lb__advhint">(set by the preset — override only if you know what they do)</span></summary>

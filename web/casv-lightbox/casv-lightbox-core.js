@@ -24,6 +24,44 @@ export function defaultThreshForDistance(distance) {
   return Math.max(0, Math.min(16, t));
 }
 
+const _clamp01to100 = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 50;
+  return Math.max(0, Math.min(100, n));
+};
+
+/**
+ * Map a single 0..100 "encode speed" slider to the underlying quality/time
+ * knobs. 0 = best quality (slow); 100 = fastest (lowest quality). The slider
+ * spans the *existing* preset range — Quality (d0.5, effort 4) ↔ Realtime
+ * (d2.0, effort 1) — so its midpoint sits near Balanced and it never drops
+ * below the established Realtime floor. Effort 4→1 and distance 0.5→2.0 are
+ * both monotone in wall-clock over this band (the wider 0.5→3.0 / effort-7
+ * range was measured non-monotone: libjxl effort 7 can beat effort 6 at low
+ * distance). Resolution is a separate control (`dim` downscale) — libjxl
+ * RESAMPLING=2 is a size-not-speed lever (upsample-aware encode ~5x slower,
+ * measured) and true chroma subsampling is not a public libjxl knob.
+ */
+export function speedToSettings(speed) {
+  const s = _clamp01to100(speed);
+  const effort = Math.round(4 - (s / 100) * 3); // 4 (quality) → 1 (fast)
+  const distance = Number((0.5 + (s / 100) * 1.5).toFixed(2)); // 0.5 → 2.0
+  return { effort, distance, thresh: defaultThreshForDistance(distance) };
+}
+
+/**
+ * Fast low-resolution **proxy** encode for scrubbing / live editing in a video
+ * editor: quarter-ish resolution via the existing `dim` downscale + fastest
+ * effort + coarse distance + tile replace-skip. The final export re-encodes at
+ * full settings. This is the "real-time preview" tier — decode of a 720p
+ * fast-effort stream is well inside the ~41ms/frame @24fps budget.
+ */
+export const PROXY_PRESET = {
+  label: 'Preview proxy', rate: 'lossy', distance: 2.0, effort: 1,
+  skip: 'tile', tile: 32, dim: '720',
+  hint: 'Fast low-resolution proxy for scrubbing and live editing. Re-encode at full resolution for the final file.',
+};
+
 /** Short badge for a frame's container entry (from casv-web CasvFrameEntry). */
 export function frameKindLabel(entry) {
   if (!entry || !entry.isPFrame) return 'I';

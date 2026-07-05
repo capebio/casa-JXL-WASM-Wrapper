@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
   PRESETS, defaultThreshForDistance, frameKindLabel, formatRate,
   fpsOf, timecode, suggestExportName, suggestEncodeName, buildEncodeRequest,
-  classifyDroppedEncodePaths, shouldHandleEncodeDrop,
+  classifyDroppedEncodePaths, shouldHandleEncodeDrop, speedToSettings, PROXY_PRESET,
 } from './casv-lightbox-core.js';
 
 test('presets carry the documented distance/effort', () => {
@@ -15,6 +15,31 @@ test('presets carry the documented distance/effort', () => {
   assert.equal(PRESETS.quality.distance, 0.5);
   assert.equal(PRESETS.quality.effort, 4);
   assert.equal(PRESETS.archive.rate, 'lossless');
+});
+
+test('speedToSettings maps 0..100 to monotone effort/distance', () => {
+  const slow = speedToSettings(0);   // best quality
+  const mid = speedToSettings(50);
+  const fast = speedToSettings(100); // fastest
+  assert.equal(slow.effort, 4);
+  assert.equal(slow.distance, 0.5);
+  assert.equal(fast.effort, 1);
+  assert.equal(fast.distance, 2.0);
+  // higher speed → lower effort (faster) and higher distance (lower quality)
+  assert.ok(fast.effort < mid.effort && mid.effort < slow.effort);
+  assert.ok(fast.distance > mid.distance && mid.distance > slow.distance);
+  // threshold is derived from distance
+  assert.equal(mid.thresh, defaultThreshForDistance(mid.distance));
+  // out-of-range / NaN clamps to the midpoint
+  assert.deepEqual(speedToSettings(999), speedToSettings(100));
+  assert.deepEqual(speedToSettings('x'), speedToSettings(50));
+});
+
+test('PROXY_PRESET is a fast lossy 720p tile proxy', () => {
+  assert.equal(PROXY_PRESET.rate, 'lossy');
+  assert.equal(PROXY_PRESET.effort, 1);
+  assert.equal(PROXY_PRESET.dim, '720');
+  assert.equal(PROXY_PRESET.skip, 'tile');
 });
 
 test('defaultThreshForDistance = distance*4 clamped to 16', () => {
