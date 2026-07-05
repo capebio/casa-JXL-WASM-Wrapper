@@ -84,9 +84,10 @@ function emitAndDeliver(data, corpus, runTimestamp) {
     const pct = (a, b, k) => avg(a, r => r[k]) / avg(b, r => r[k]) * 100;
     const oursVsOrig = (ours.length && orig.length) ? { size: pct(ours, orig, "bytes"), encX: 100 / pct(ours, orig, "enc_ms"), decX: 100 / pct(ours, orig, "dec_ms") } : null;
     writeGalleryFull({ outDir: OUT_DIR, files, perFile, bdRows, baselines, oursVsOrig, capability: CAPABILITY, corpusInfo: `Corpus: ${corpus.filter(c => c.class === "standard").length} Kodak photographic + ${corpus.filter(c => c.class === "raw").length} RAW-derived (ORF/CR2/DNG @1920)` });
-    // data toon (compact)
+    // data toon (compact) + full JSON dump (enables regen + new metrics without re-running)
     const stamp = runTimestamp.replace(/[:.]/g, "-");
     writeFileSync(join(OUT_DIR, `${stamp}-CodecPaperFull-general.toon`), `TestName: CodecPaperFull - general\nRunTimestamp: ${runTimestamp}\nsweep_rows: ${sweep.length}\ntimed_rows: ${timed.length}\nfixed_rows: ${fixed.length}\nlossless_rows: ${lossless.length}\n`);
+    writeFileSync(join(OUT_DIR, "data.json"), JSON.stringify({ runTimestamp, sweep, timed, fixed, lossless }));
     // deliver to Jose
     try {
       mkdirSync(join(JOSE, "figures"), { recursive: true });
