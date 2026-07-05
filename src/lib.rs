@@ -1145,6 +1145,9 @@ fn process_orf_impl(
             (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         } else {
             let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            // Note: without OUT_FULL_RGB8 no unsharp/clarity pass runs here, so this disp16 render
+            // is pre-unsharp — consistent with rgb16_full on this same branch. The benchmark uses
+            // default look params (texture/clarity = 0), so this matches the 8-bit render exactly.
             let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
                 let disp = pipeline::process_16bit(&rgb16, &params);
                 if skip_orient || info.orientation == 1 {
@@ -1562,7 +1565,11 @@ pub fn downscale_rgb16_pub(
     dst_h: u32,
 ) -> Result<Vec<u16>, JsError> {
     let (sw, sh, dw, dh) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
-    if src.len() != sw * sh * 3 {
+    let expected_len = sw
+        .checked_mul(sh)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| JsError::new("downscale_rgb16_pub: dimensions overflow"))?;
+    if src.len() != expected_len {
         return Err(JsError::new("downscale_rgb16_pub: src len != src_w*src_h*3"));
     }
     if dw == 0 || dh == 0 || dw > sw || dh > sh {
@@ -1907,8 +1914,8 @@ pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
 }
 
 /// Convert interleaved RGB16 → RGBA16 (alpha = 0xFFFF). Returns a `Uint16Array`-compatible
-/// `Vec<u16>` from JS. Suitable as input to `createImageBitmap` with an ImageData constructed
-/// over a Uint16Array (or as a source for a 16-bit PNG/JXL encoder).
+/// `Vec<u16>` from JS. Intended as a source buffer for a 16-bit PNG/JXL encoder.
+/// Scalar loop: called once per encode (not a hot path); no SIMD twin until it appears in profiles.
 #[wasm_bindgen]
 pub fn rgb16_to_rgba16(rgb: &[u16]) -> Vec<u16> {
     let n = rgb.len() / 3;
@@ -2826,6 +2833,9 @@ fn process_dng_impl(
             (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         } else {
             let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            // Note: without OUT_FULL_RGB8 no unsharp/clarity pass runs here, so this disp16 render
+            // is pre-unsharp — consistent with rgb16_full on this same branch. The benchmark uses
+            // default look params (texture/clarity = 0), so this matches the 8-bit render exactly.
             let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
                 let disp = pipeline::process_16bit(&rgb16, &params);
                 if skip_orient || orientation == 1 {
