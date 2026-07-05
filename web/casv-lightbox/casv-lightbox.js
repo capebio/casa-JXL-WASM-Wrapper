@@ -70,8 +70,14 @@ export class CasvLightbox {
       pickImages: $('pickImages'), encodeGo: $('encodeGo'), encodeInputs: $('encodeInputs'),
       encodeProgress: $('encodeProgress'), encodeBar: $('encodeBar'), encodeProgressLabel: $('encodeProgressLabel'),
       hostBadge: $('hostBadge'),
+      consoleWrap: $('consoleWrap'), consoleBody: $('consoleBody'),
+      consoleToggle: $('consoleToggle'), consoleClear: $('consoleClear'), consoleCopy: $('consoleCopy'),
     };
     this.ctx = this.el.canvas.getContext('2d');
+    // Debug console: tee console.*/errors into an in-panel log so encode/decode
+    // progress is visible without opening devtools (esp. on the Tauri desktop app).
+    this._initConsole();
+    this._log(`lightbox mounted · host: ${isTauri() ? 'tauri (desktop)' : 'browser'}`, 'info');
     // Overlap WASM compile/instantiate with the user picking a file, so the
     // first frame decode starts warm instead of paying cold-start.
     prewarmJxl();
@@ -128,6 +134,11 @@ export class CasvLightbox {
     this.el.autoFps.addEventListener('change', () => this._reflectFpsMode());
     this.el.pickImages.addEventListener('click', () => this._onPickEncodeSource());
     this.el.encodeGo.addEventListener('click', () => this._onEncode());
+    if (this.el.consoleToggle) this.el.consoleToggle.addEventListener('click', () => this._toggleConsole());
+    if (this.el.consoleClear) this.el.consoleClear.addEventListener('click', () => {
+      if (this.el.consoleBody) this.el.consoleBody.textContent = '';
+    });
+    if (this.el.consoleCopy) this.el.consoleCopy.addEventListener('click', () => this._copyConsole());
     this._wireDesktopEvents();
     this._wireDomDropGuard();
     window.addEventListener('casv-open-encode', () => this._openEncodePanel(true));
@@ -530,19 +541,49 @@ export class CasvLightbox {
     this._setStatus(this.encodeSourceKind === 'video'
       ? `Encoding video (${request.rate})...`
       : `Encoding ${request.inputPaths.length} frames (${request.rate})...`);
+    this._log(`encode request: ${JSON.stringify(request)}`, 'info');
+    // Diagnose why the bar might never advance: progress needs the Tauri event
+    // API present AND the desktop app relaying the sidecar's `CASVENC` lines.
+    const evApi = typeof window !== 'undefined' && !!(window.__TAURI__?.event?.listen);
+    this._log(`encode start · tauri=${isTauri()} · progress-event-api=${evApi}`, evApi ? 'info' : 'warn');
+    if (isTauri() && !evApi) {
+      this._log('window.__TAURI__.event.listen missing → progress events cannot arrive; '
+        + 'bar stays indeterminate until encode returns (relay unwired — see TAURI_WIRING.md).', 'warn');
+    }
     this.el.encodeGo.disabled = true;
     this._showEncodeProgress(true, 'Starting…');
+    let gotProgress = 0;
+    let lastEvt = 'starting', lastEvtAt = Date.now();
     // Subscribe before invoking so no early progress line is missed.
-    let unlisten = await onEncodeProgress((p) => this._renderEncodeProgress(p));
+    let unlisten = await onEncodeProgress((p) => {
+      gotProgress++;
+      lastEvt = `${p.stage} ${p.done}/${p.total}`;
+      lastEvtAt = Date.now();
+      this._log(`progress: ${lastEvt}`, 'info');
+      this._renderEncodeProgress(p);
+    });
+    this._log('progress listener attached; invoking encode_casv_video…', 'info');
+    const t0 = Date.now();
+    // Heartbeat: even with no progress events (relay unwired, or a long ffmpeg
+    // extract with no sub-progress) show the encode is still alive and where it
+    // last was — so a silent stage isn't mistaken for a freeze.
+    const heartbeat = setInterval(() => {
+      const el = ((Date.now() - t0) / 1000).toFixed(0);
+      const since = ((Date.now() - lastEvtAt) / 1000).toFixed(0);
+      this._log(`…still encoding · elapsed ${el}s · ${gotProgress} events · last: ${lastEvt} (${since}s ago)`, 'debug');
+    }, 3000);
     try {
       const res = await encodeAndSave(request);
       const path = res && res.path ? res.path : '(saved)';
+      this._log(`encode_casv_video returned in ${Date.now() - t0} ms · ${gotProgress} progress events · path=${path}`, 'info');
       this._setStatus(`Encoded and saved to ${path}.`, 'ok');
     } catch (e) {
+      this._log(`encode threw after ${Date.now() - t0} ms (${gotProgress} progress events): ${this._fmt(e)}`, 'error');
       this._setStatus(e.code === 'ENCODE_NATIVE_ONLY'
         ? e.message
         : `Encode failed: ${e.message}`, e.code === 'ENCODE_NATIVE_ONLY' ? 'warn' : 'error');
     } finally {
+      clearInterval(heartbeat);
       if (typeof unlisten === 'function') unlisten();
       this._showEncodeProgress(false);
       this.el.encodeGo.disabled = !isTauri();
@@ -588,6 +629,88 @@ export class CasvLightbox {
   _setStatus(msg, tone = '') {
     this.el.status.textContent = msg;
     this.el.status.dataset.tone = tone;
+    this._log(`status: ${msg}`, tone === 'error' ? 'error' : tone === 'warn' ? 'warn' : 'info');
+  }
+
+  // ── Debug console ───────────────────────────────────────────────────
+  /** Tee console.* and window errors into the in-panel log (once). */
+  _initConsole() {
+    if (this._consoleInstalled) return;
+    this._consoleInstalled = true;
+    const orig = {
+      log: console.log.bind(console), info: console.info.bind(console),
+      warn: console.warn.bind(console), error: console.error.bind(console),
+      debug: (console.debug || console.log).bind(console),
+    };
+    this._origConsole = orig;
+    const tee = (level, fn) => (...args) => {
+      try { this._log(args.map((a) => this._fmt(a)).join(' '), level); } catch (_) { /* never break console */ }
+      fn(...args);
+    };
+    console.log = tee('info', orig.log);
+    console.info = tee('info', orig.info);
+    console.warn = tee('warn', orig.warn);
+    console.error = tee('error', orig.error);
+    console.debug = tee('debug', orig.debug);
+    this._onWinError = (e) =>
+      this._log(`window.onerror: ${e.message} @ ${e.filename || '?'}:${e.lineno || 0}`, 'error');
+    this._onWinRej = (e) => this._log(`unhandledrejection: ${this._fmt(e.reason)}`, 'error');
+    window.addEventListener('error', this._onWinError);
+    window.addEventListener('unhandledrejection', this._onWinRej);
+  }
+
+  /** Restore the console patch (used by unmount, if any). */
+  _teardownConsole() {
+    if (!this._consoleInstalled) return;
+    Object.assign(console, this._origConsole);
+    window.removeEventListener('error', this._onWinError);
+    window.removeEventListener('unhandledrejection', this._onWinRej);
+    this._consoleInstalled = false;
+  }
+
+  _fmt(a) {
+    if (a instanceof Error) return a.stack || `${a.name}: ${a.message}`;
+    if (typeof a === 'object' && a !== null) {
+      try { return JSON.stringify(a); } catch (_) { return String(a); }
+    }
+    return String(a);
+  }
+
+  /** Append one line to the console panel (timestamped, level-coloured). */
+  _log(msg, level = 'info') {
+    const body = this.el && this.el.consoleBody;
+    if (!body) return;
+    const t = new Date();
+    const pad = (n, w = 2) => String(n).padStart(w, '0');
+    const ts = `${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}.${pad(t.getMilliseconds(), 3)}`;
+    // Autoscroll only if already pinned to the bottom (don't yank the user back
+    // while they're scrolled up reading).
+    const pinned = body.scrollTop + body.clientHeight >= body.scrollHeight - 4;
+    const line = document.createElement('div');
+    line.className = 'casv-lb__log-line';
+    line.dataset.level = level;
+    line.textContent = `${ts}  ${msg}`;
+    body.appendChild(line);
+    while (body.childElementCount > 800) body.firstElementChild.remove();
+    if (pinned) body.scrollTop = body.scrollHeight;
+  }
+
+  _toggleConsole() {
+    if (!this.el.consoleWrap) return;
+    const collapsed = this.el.consoleWrap.dataset.collapsed === '1';
+    this.el.consoleWrap.dataset.collapsed = collapsed ? '0' : '1';
+    this.el.consoleToggle.textContent = collapsed ? 'Hide' : 'Show';
+  }
+
+  async _copyConsole() {
+    if (!this.el.consoleBody) return;
+    const text = Array.from(this.el.consoleBody.children).map((n) => n.textContent).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      this._log('console copied to clipboard', 'info');
+    } catch (e) {
+      this._log(`copy failed: ${this._fmt(e)}`, 'warn');
+    }
   }
 }
 
@@ -631,6 +754,16 @@ const TEMPLATE = `
 </div>
 
 <div class="casv-lb__status" data-el="status"></div>
+
+<div class="casv-lb__console" data-el="consoleWrap" data-collapsed="0">
+  <div class="casv-lb__console-bar">
+    <span class="casv-lb__console-title">Console</span>
+    <button data-el="consoleCopy" class="casv-lb__console-btn" title="Copy log">Copy</button>
+    <button data-el="consoleClear" class="casv-lb__console-btn" title="Clear log">Clear</button>
+    <button data-el="consoleToggle" class="casv-lb__console-btn" title="Show/hide log">Hide</button>
+  </div>
+  <div class="casv-lb__console-body" data-el="consoleBody" role="log" aria-live="polite"></div>
+</div>
 
 <dl class="casv-lb__meta" data-el="meta"></dl>
 
