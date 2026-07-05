@@ -281,6 +281,11 @@ pub struct ProcessResult {
     pub full16_w: u32,
     #[wasm_bindgen(readonly)]
     pub full16_h: u32,
+    rgb16_disp: Vec<u16>,
+    #[wasm_bindgen(readonly)]
+    pub disp16_w: u32,
+    #[wasm_bindgen(readonly)]
+    pub disp16_h: u32,
     color_matrix_flat: [f32; 9],
     // EXIF / metadata exposed for the lightbox info panel.
     lens: String,
@@ -381,6 +386,12 @@ impl ProcessResult {
         }
         pack_rgb16_full(&v, self.full16_w as usize, self.full16_h as usize)
         // v drops here, freeing the 16-bit master buffer.
+    }
+
+    /// Display-referred, oriented, full-res RGB16 (interleaved, [0,65535]). Empty after first call
+    /// or if OUT_FULL_DISP16 was not requested.
+    pub fn take_rgb16_disp(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.rgb16_disp)
     }
 
     /// Move the RGBA8 buffer out. Caller owns the bytes.
@@ -722,6 +733,8 @@ const OUT_FULL_16: u32 = 8; // full-resolution RGB16 (M3: RAW {2048,full} pyrami
 // pass 7 = RGB8|LIGHTBOX|THUMB), so this changed no behavior. The mhc three-sweep review
 // and the lib.rs review caught this independently and both corrected it to 16.
 const OUT_NO_ORIENT: u32 = 16;
+/// Full-resolution display-referred RGB16 (post WB/matrix/tone, oriented, full-range [0,65535]).
+const OUT_FULL_DISP16: u32 = 32;
 
 /// Olympus 12-bit sensor black pedestal (counts). Subtracted before WB so the
 /// per-channel multipliers don't inflate the pedestal into a magenta cast. See
@@ -818,7 +831,7 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
         let (lb_w, lb_h) = target_dims(w, h, 1800);
         let (thumb_w, thumb_h) = target_dims(w, h, 360);
         let need_previews = output_flags & (OUT_LIGHTBOX | OUT_THUMB) != 0;
-        let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16) != 0;
+        let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
         let wb_from_camera = info.wb_r.is_some() && info.wb_b.is_some();
         if should_stream_previews(need_previews, need_full_rgb, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
             let t = now_ms();
@@ -955,7 +968,7 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
 
     // Gate MHC demosaic: only needed when full-resolution output is requested.
     // Preview paths (OUT_LIGHTBOX/THUMB) use the planar bilinear demosaic above.
-    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16) != 0;
+    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
     let t = now_ms();
     let mut rgb16 = if need_full_rgb {
         demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| JsError::new(&e))?
@@ -1038,6 +1051,7 @@ fn process_orf_impl(
     // out, no copy) instead of packing a second full-res buffer here while rgb16 is still
     // live. Packed to LE bytes lazily in take_rgb16_full; output bytes are unchanged.
     let want_full16 = output_flags & OUT_FULL_16 != 0;
+    let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
     let (out_full16_w, out_full16_h) = if want_full16 {
         (w as u32, h as u32)
     } else {
@@ -1078,7 +1092,7 @@ fn process_orf_impl(
     );
 
     let t = now_ms();
-    let (final_rgb, final_w, final_h, tonemap_ms, orient_ms, rgb16_full) =
+    let (final_rgb, final_w, final_h, tonemap_ms, orient_ms, rgb16_full, rgb16_disp, disp16_w, disp16_h) =
         if output_flags & OUT_FULL_RGB8 != 0 {
             // Unsharp mutates rgb16 in place; the 16-bit master export is the *pre-unsharp*
             // image (as the former eager pack was), so snapshot before mutating in that
@@ -1099,6 +1113,19 @@ fn process_orf_impl(
             // scalar parity path only for perceptual_constancy. The big full-res win.
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
             let tonemap_ms = now_ms() - t;
+            // Compute display-referred 16-bit BEFORE moving rgb16 (borrow must end before move).
+            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+                let disp = pipeline::process_16bit(&rgb16, &params);
+                if skip_orient || info.orientation == 1 {
+                    (disp, w as u32, h as u32)
+                } else {
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, info.orientation);
+                    (d, dw as u32, dh as u32)
+                }
+            } else {
+                (Vec::new(), 0u32, 0u32)
+            };
             // rgb16's last read is done: move it into the 16-bit master (common, no copy),
             // use the pre-unsharp snapshot, or release it. Freed before orientation either way.
             let rgb16_full = if want_full16 {
@@ -1110,16 +1137,27 @@ fn process_orf_impl(
             let t2 = now_ms();
             // OUT_NO_ORIENT lets the encoder use JXL's basic-info orientation field
             // — no CPU rotate, no 60–200 MB intermediate buffer.
-            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
             let (fr, fw, fh) = if skip_orient || info.orientation == 1 {
                 (rgb8, w, h)
             } else {
                 pipeline::apply_orientation(rgb8, w, h, info.orientation)
             };
-            (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full)
+            (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         } else {
+            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+                let disp = pipeline::process_16bit(&rgb16, &params);
+                if skip_orient || info.orientation == 1 {
+                    (disp, w as u32, h as u32)
+                } else {
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, info.orientation);
+                    (d, dw as u32, dh as u32)
+                }
+            } else {
+                (Vec::new(), 0u32, 0u32)
+            };
             let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
-            (vec![], 0, 0, 0.0, 0.0, rgb16_full)
+            (vec![], 0, 0, 0.0, 0.0, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         };
 
     Ok(ProcessResult {
@@ -1149,6 +1187,9 @@ fn process_orf_impl(
         rgb16_full,
         full16_w: out_full16_w,
         full16_h: out_full16_h,
+        rgb16_disp,
+        disp16_w,
+        disp16_h,
         color_matrix_flat,
         lens: info.lens,
         datetime: info.datetime,
@@ -1510,6 +1551,26 @@ pub fn downscale_rgb(
     Ok(out)
 }
 
+/// Box-filter downscale a 16-bit RGB buffer (u16 interleaved, 3 channels).
+/// Returns a `Uint16Array`-compatible `Vec<u16>` from JS.
+#[wasm_bindgen]
+pub fn downscale_rgb16_pub(
+    src: &[u16],
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+) -> Result<Vec<u16>, JsError> {
+    let (sw, sh, dw, dh) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+    if src.len() != sw * sh * 3 {
+        return Err(JsError::new("downscale_rgb16_pub: src len != src_w*src_h*3"));
+    }
+    if dw == 0 || dh == 0 || dw > sw || dh > sh {
+        return Err(JsError::new("downscale_rgb16_pub: invalid target dims"));
+    }
+    Ok(pipeline::downscale_rgb16(src, sw, sh, dw, dh))
+}
+
 /// wasm simd128 integer-path RGBA downscale (deferred DS-SIMD item).
 ///
 /// RGBA channels stay lane-aligned every 4 bytes, so a row segment of the
@@ -1841,6 +1902,22 @@ pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
         out[di + 2] = rgb[si + 2];
         si += 3;
         di += 4;
+    }
+    out
+}
+
+/// Convert interleaved RGB16 → RGBA16 (alpha = 0xFFFF). Returns a `Uint16Array`-compatible
+/// `Vec<u16>` from JS. Suitable as input to `createImageBitmap` with an ImageData constructed
+/// over a Uint16Array (or as a source for a 16-bit PNG/JXL encoder).
+#[wasm_bindgen]
+pub fn rgb16_to_rgba16(rgb: &[u16]) -> Vec<u16> {
+    let n = rgb.len() / 3;
+    let mut out = vec![0u16; n * 4];
+    for i in 0..n {
+        out[i * 4]     = rgb[i * 3];
+        out[i * 4 + 1] = rgb[i * 3 + 1];
+        out[i * 4 + 2] = rgb[i * 3 + 2];
+        out[i * 4 + 3] = 0xFFFF;
     }
     out
 }
@@ -2490,7 +2567,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     // (~14× lower peak for comp=7, ~3.5× for comp=1). Falls through to the full-MHC
     // path on any unsupported case (compression/CFA/dims). See design spec.
     let need_previews = output_flags & (OUT_LIGHTBOX | OUT_THUMB) != 0;
-    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16) != 0;
+    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
     if need_previews && !need_full_rgb {
         if let Ok(src) = raw_pipeline::dng::DngRowSource::new(data) {
             let (w, h) = { let m = src.meta(); (m.width, m.height) };
@@ -2645,6 +2722,7 @@ fn process_dng_impl(
     // M3 full-res 16-bit (DNG/CR2 path). A-5: capture after tone (move, no copy) and pack
     // lazily in take_rgb16_full instead of a second full-res buffer here. Byte-identical.
     let want_full16 = output_flags & OUT_FULL_16 != 0;
+    let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
     let (out_full16_w, out_full16_h) = if want_full16 {
         (aw as u32, ah as u32)
     } else {
@@ -2702,7 +2780,7 @@ fn process_dng_impl(
     );
 
     let t = now_ms();
-    let (final_rgb, final_w, final_h, tonemap_ms, orient_ms, rgb16_full) =
+    let (final_rgb, final_w, final_h, tonemap_ms, orient_ms, rgb16_full, rgb16_disp, disp16_w, disp16_h) =
         if output_flags & OUT_FULL_RGB8 != 0 {
             // 16-bit master export is the pre-unsharp image; snapshot only when unsharp
             // would mutate rgb16 (rare). Common path moves rgb16 out for free.
@@ -2718,6 +2796,19 @@ fn process_dng_impl(
             // Chapter 1: SIMD bulk tone (DNG + CR2 share this impl). See process_into_auto.
             let rgb8 = pipeline::process_auto(&rgb16, &params);
             let tonemap_ms = now_ms() - t;
+            // Compute display-referred 16-bit BEFORE moving rgb16 (borrow must end before move).
+            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+                let disp = pipeline::process_16bit(&rgb16, &params);
+                if skip_orient || orientation == 1 {
+                    (disp, aw as u32, ah as u32)
+                } else {
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, aw, ah, orientation);
+                    (d, dw as u32, dh as u32)
+                }
+            } else {
+                (Vec::new(), 0u32, 0u32)
+            };
             // rgb16's last read is done: move it into the 16-bit master (common, no copy),
             // use the pre-unsharp snapshot, or release it. Freed before orientation either way.
             let rgb16_full = if want_full16 {
@@ -2727,16 +2818,27 @@ fn process_dng_impl(
                 Vec::new()
             };
             let t2 = now_ms();
-            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
             let (fr, fw, fh) = if skip_orient || orientation == 1 {
                 (rgb8, aw, ah)
             } else {
                 pipeline::apply_orientation(rgb8, aw, ah, orientation)
             };
-            (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full)
+            (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         } else {
+            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+                let disp = pipeline::process_16bit(&rgb16, &params);
+                if skip_orient || orientation == 1 {
+                    (disp, aw as u32, ah as u32)
+                } else {
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, aw, ah, orientation);
+                    (d, dw as u32, dh as u32)
+                }
+            } else {
+                (Vec::new(), 0u32, 0u32)
+            };
             let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
-            (vec![], 0, 0, 0.0, 0.0, rgb16_full)
+            (vec![], 0, 0, 0.0, 0.0, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         };
 
     Ok(ProcessResult {
@@ -2766,6 +2868,9 @@ fn process_dng_impl(
         rgb16_full,
         full16_w: out_full16_w,
         full16_h: out_full16_h,
+        rgb16_disp,
+        disp16_w,
+        disp16_h,
         color_matrix_flat,
         lens: String::new(),
         datetime: String::new(),
