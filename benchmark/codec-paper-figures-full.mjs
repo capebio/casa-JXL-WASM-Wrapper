@@ -2,8 +2,8 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { rdCurve, scatterPlot, barChart } from "./svg-figures.mjs";
 
-const PALETTE = { jxl: "#e11d48", jxl_orig: "#0ea5e9", jpeg_native: "#f59e0b", jpeg_wasm: "#fbbf24", webp_native: "#10b981", webp_wasm: "#34d399", avif_native: "#8b5cf6", avif_wasm: "#a78bfa", png_native: "#6b7280" };
-const CODEC_ORDER = ["jxl", "jxl_orig", "avif_native", "avif_wasm", "webp_native", "webp_wasm", "jpeg_native", "jpeg_wasm", "png_native"];
+const PALETTE = { jxl: "#e11d48", jxl_orig: "#0ea5e9", jpeg_native: "#f59e0b", jpeg_wasm: "#fbbf24", webp_native: "#10b981", webp_wasm: "#34d399", avif_native: "#8b5cf6", avif_wasm: "#a78bfa", avif16: "#6d28d9", png_native: "#6b7280" };
+const CODEC_ORDER = ["jxl", "jxl_orig", "avif_native", "avif_wasm", "avif16", "webp_native", "webp_wasm", "jpeg_native", "jpeg_wasm", "png_native"];
 const orderIdx = (c) => { const i = CODEC_ORDER.indexOf(c); return i < 0 ? 999 : i; };
 const byFamily = (a, b) => orderIdx(a) - orderIdx(b);
 const avg = (arr, sel) => arr.length ? arr.reduce((s, x) => s + sel(x), 0) / arr.length : 0;
@@ -26,7 +26,7 @@ function seriesBy(rows, xKey, yKey, transform = (v) => v) {
   return out;
 }
 
-export function writeFiguresFull({ outDir, sweep, timed, fixed, lossless, corpus }) {
+export function writeFiguresFull({ outDir, sweep, timed, fixed, lossless, corpus, sweep16 = [] }) {
   const figDir = join(outDir, "figures");
   mkdirSync(figDir, { recursive: true });
   const files = {};
@@ -78,6 +78,16 @@ export function writeFiguresFull({ outDir, sweep, timed, fixed, lossless, corpus
     files["lossless-enc-ms.svg"] = barChart({ bars: lc.map(c => ({ label: c, value: avg(lossless.filter(p => p.codec === c), r => r.enc_ms), color: PALETTE[c] || "#000" })), yLabel: "lossless encode ms (within-runtime)" });
   }
 
+  // 12-14. 16-bit / HDR RD curves (JXL + AVIF-10/12; PSNR peak 65535; SSIM on 16-bit luma)
+  if (sweep16.length) {
+    files["rd-psnr-16bit.svg"] = rdCurve({ series: seriesBy(sweep16, "bpp", "psnr16"), xLabel: "bits per pixel (bpp)", yLabel: "PSNR dB — 16-bit (peak 65535, higher = better)" });
+    files["rd-ssim-16bit.svg"] = rdCurve({ series: seriesBy(sweep16, "bpp", "ssim16", toDb), xLabel: "bits per pixel (bpp)", yLabel: "SSIM dB — 16-bit (higher = better)" });
+    if (sweep16.some(r => r.butteraugli16 != null)) {
+      const bt = sweep16.filter(r => r.butteraugli16 != null);
+      files["rd-butteraugli-16bit.svg"] = rdCurve({ series: seriesBy(bt, "bpp", "butteraugli16"), xLabel: "bits per pixel (bpp)", yLabel: "butteraugli — 16-bit (lower = better)" });
+    }
+  }
+
   for (const [name, svg] of Object.entries(files)) writeFileSync(join(figDir, name), svg);
   return { files: Object.keys(files), figDir };
 }
@@ -119,6 +129,9 @@ const CAPTIONS = {
   "rd-butteraugli-raw.svg": "Rate–distortion on our <b>RAW-derived</b> renders (ORF/CR2/DNG @1920) only — the real pipeline output.",
   "lossless-size.svg": "<b>Lossless</b> compression: mean bpp per codec (JXL / WebP / AVIF / PNG lossless). Lower = smaller.",
   "lossless-enc-ms.svg": "<b>Lossless</b> encode time per codec (within-runtime).",
+  "rd-psnr-16bit.svg": "16-bit RD — <b>PSNR</b> (RAW-derived). Only JXL and AVIF-10/12-bit participate (JPEG and WebP are 8-bit-only). PSNR peak = 65535; higher = better.",
+  "rd-ssim-16bit.svg": "16-bit RD — <b>SSIM</b> (RAW-derived), shown in dB on 16-bit luma. Only JXL and AVIF-10/12-bit participate.",
+  "rd-butteraugli-16bit.svg": "16-bit RD — <b>Butteraugli</b> (RAW-derived). Only JXL and AVIF-10/12-bit participate. Omitted when the WASM bridge metric is unavailable.",
 };
 
 const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -145,6 +158,7 @@ ${["summary-savings-vs-jpeg.svg"].filter(n=>files.includes(n)).map(n=>`<figure><
 <h2>Speed</h2>${["enc-speed-vs-quality.svg","dec-speed-vs-quality.svg","decode-fps-vs-bpp.svg","pareto-enc.svg","pareto-dec.svg","bars-enc-time.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||"Encode time per codec with ±σ error bars over "+"repeated runs (within-runtime only)."}</figcaption></figure>`).join("\n")}
 <h2>Size at matched quality</h2>${["bars-size.svg"].filter(n=>files.includes(n)).map(n=>`<figure><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")}
 <h2>Lossless</h2>${["lossless-size.svg","lossless-enc-ms.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")||"<p>(lossless pass not present)</p>"}
+<h2>16-bit / HDR Rate-Distortion</h2>${["rd-psnr-16bit.svg","rd-ssim-16bit.svg","rd-butteraugli-16bit.svg"].filter(n=>files.includes(n)).map(n=>`<figure><h3>${n.replace(".svg","")}</h3><img src="figures/${n}"><figcaption>${CAPTIONS[n]||""}</figcaption></figure>`).join("\n")||"<p>(16-bit sweep not present)</p>"}
 <h2>Per-file summary (butteraugli ≈ 1.5)</h2>
 <figcaption>Per-image file size, our-JXL saving vs JPEG, and our JXL encode/decode ms. "best" = smallest-file codec at matched quality.</figcaption>
 <table><tr><th>image</th><th>class</th><th>JXL KB</th><th>JPEG KB</th><th>JXL saving</th><th>JXL enc ms</th><th>JXL dec ms</th><th>best</th></tr>${perFileRows}</table>
