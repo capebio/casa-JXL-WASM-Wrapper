@@ -8,7 +8,7 @@ import type { MsgDecodeStart } from "@casabio/jxl-core/protocol";
 
 function decodeStart(sessionId: string): MsgDecodeStart {
   return { type: "decode_start", sessionId, format: "rgba8", region: null, downsample: 1,
-    progressionTarget: "final", emitEveryPass: true, progressiveDetail: null, preserveIcc: true,
+    progressionTarget: "final", emitEveryPass: true, progressiveDetail: null, suppressDuplicateProgress: false, preserveIcc: true,
     preserveMetadata: true, priority: "visible", budgetMs: null, targetWidth: null,
     targetHeight: null, fitMode: null } as MsgDecodeStart;
 }

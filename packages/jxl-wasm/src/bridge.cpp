@@ -115,6 +115,11 @@ struct JxlWasmDecState {
   size_t   flushed_capacity;
   bool flushed_ready;
   uint32_t flush_count;     // number of successful TryFlushProgressiveImage calls
+  uint32_t flush_attempts;   // number of JxlDecoderFlushImage calls
+  uint32_t flush_successes;  // number of emitted progressive snapshots
+  uint32_t flush_zero_skips;
+  uint32_t flush_duplicate_skips;
+  double flush_image_ms;
   bool suppress_duplicate_progress;
   bool last_progress_hash_valid;
   uint64_t last_progress_hash;
@@ -2263,7 +2268,11 @@ static bool TryFlushProgressiveImage(JxlWasmDecState* s) {
   // borrowed snapshot from s->pixels before the next ProcessInput call. The main s->pixels
   // buffer keeps accumulating groups across subsequent FlushImage + ProcessInput calls,
   // with libjxl free to overwrite earlier-decoded pixels at higher quality per its contract.
-  if (JxlDecoderFlushImage(s->dec) != JXL_DEC_SUCCESS) return false;
+  s->flush_attempts++;
+  const double flush_t0 = emscripten_get_now();
+  const JxlDecoderStatus flush_status = JxlDecoderFlushImage(s->dec);
+  s->flush_image_ms += emscripten_get_now() - flush_t0;
+  if (flush_status != JXL_DEC_SUCCESS) return false;
 
   // All-zero guard: skip after first successful flush — once real pixels have been emitted
   // the buffer cannot regress to all-zero. Avoids scanning 82+ MB per pass on every flush.
@@ -2279,7 +2288,10 @@ static bool TryFlushProgressiveImage(JxlWasmDecState* s) {
         if (s->pixels[i] != 0) { any_nonzero = true; break; }
       }
     }
-    if (!any_nonzero) return false;
+    if (!any_nonzero) {
+      s->flush_zero_skips++;
+      return false;
+    }
   }
 
   if (s->suppress_duplicate_progress) {
@@ -2287,6 +2299,7 @@ static bool TryFlushProgressiveImage(JxlWasmDecState* s) {
     if (s->last_progress_hash_valid &&
         s->last_progress_size == s->pixels_size &&
         s->last_progress_hash == h) {
+      s->flush_duplicate_skips++;
       return false;
     }
     s->last_progress_hash = h;
@@ -2296,6 +2309,7 @@ static bool TryFlushProgressiveImage(JxlWasmDecState* s) {
 
   s->flushed_size = s->pixels_size;
   s->flushed_ready = true;
+  s->flush_successes++;
   s->flush_count++;
   return true;
 }
@@ -2614,6 +2628,26 @@ uint32_t jxl_wasm_dec_height(const JxlWasmDecState* s) {
 
 int jxl_wasm_dec_error(const JxlWasmDecState* s) {
   return s != nullptr ? s->error_code : -1;
+}
+
+uint32_t jxl_wasm_dec_flush_attempts(const JxlWasmDecState* s) {
+  return s != nullptr ? s->flush_attempts : 0u;
+}
+
+uint32_t jxl_wasm_dec_flush_successes(const JxlWasmDecState* s) {
+  return s != nullptr ? s->flush_successes : 0u;
+}
+
+uint32_t jxl_wasm_dec_flush_zero_skips(const JxlWasmDecState* s) {
+  return s != nullptr ? s->flush_zero_skips : 0u;
+}
+
+uint32_t jxl_wasm_dec_flush_duplicate_skips(const JxlWasmDecState* s) {
+  return s != nullptr ? s->flush_duplicate_skips : 0u;
+}
+
+double jxl_wasm_dec_flush_image_ms(const JxlWasmDecState* s) {
+  return s != nullptr ? s->flush_image_ms : 0.0;
 }
 
 // Crop + nearest-downsample the full-frame s->pixels into s->roi_buf, byte-exact with the JS

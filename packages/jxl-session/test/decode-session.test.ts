@@ -23,6 +23,7 @@ describe("DecodeSessionImpl lifecycle", () => {
       progressionTarget: "dc",
       downsample: 4,
       priority: "near",
+      suppressDuplicateProgress: true,
     });
     const worker = await waitForWorker(workers);
     const start = worker.messages[0];
@@ -31,6 +32,7 @@ describe("DecodeSessionImpl lifecycle", () => {
     assert.equal(start && "progressionTarget" in start ? start.progressionTarget : null, "dc");
     assert.equal(start && "downsample" in start ? start.downsample : null, 4);
     assert.equal(start && "priority" in start ? start.priority : null, "near");
+    assert.equal(start && "suppressDuplicateProgress" in start ? start.suppressDuplicateProgress : null, true);
     await session.cancel();
     await scheduler.shutdown();
   });
@@ -48,6 +50,7 @@ describe("DecodeSessionImpl lifecycle", () => {
       assert.equal(start.preserveMetadata, true);
       assert.equal(start.downsample, 1);
       assert.equal(start.priority, "visible");
+      assert.equal(start.suppressDuplicateProgress, false);
       assert.equal(start.budgetMs, null);
       assert.equal(start.region, null);
     }

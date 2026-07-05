@@ -75,6 +75,8 @@ export interface DecodeOptions {
    * otherwise "dc". Ignored when progressionTarget="final" and emitEveryPass=false (no subscription).
    */
   progressiveDetail?: "dc" | "lastPasses" | "passes" | "dcProgressive";
+  /** Experimental bridge gate: suppress byte-identical progressive frames after flush. Default false. */
+  suppressDuplicateProgress?: boolean;
   // Scheduling
   priority?: "visible" | "near" | "background";
   budgetMs?: number;
@@ -326,6 +328,7 @@ export type CodecMetric =
   | { name: "input_bytes"; value: number }
   | { name: "output_bytes"; value: number }
   | { name: "encode_total_ms"; value: number }
+  | { name: "encode_finish_ms"; value: number }
   | { name: "peak_memory_bytes"; value: number }
   | { name: "format_downcast"; value: number }      // emitted when output bpc < source bpc
   | { name: "region_fallback_full_frame"; value: 1 } // emitted when region decode falls back
@@ -334,6 +337,11 @@ export type CodecMetric =
   | { name: "source_pixels_decoded"; value: number }
   | { name: "copy_to_transfer_ms"; value: number }
   | { name: "copied_bytes"; value: number }
+  | { name: "bridge_flush_attempts"; value: number }
+  | { name: "bridge_flush_successes"; value: number }
+  | { name: "bridge_flush_zero_skips"; value: number }
+  | { name: "bridge_flush_duplicate_skips"; value: number }
+  | { name: "bridge_flush_image_ms"; value: number }
   | { name: "dropped_due_to_budget"; value: 1 }
   | { name: "dropped_due_to_cancel"; value: 1 }
   // Scheduler-level wait (populated by jxl-scheduler when a job had to queue for a worker slot).

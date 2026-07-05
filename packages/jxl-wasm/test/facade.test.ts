@@ -586,6 +586,36 @@ describe("@casabio/jxl-wasm facade", () => {
     await decoder.dispose();
   });
 
+  test("progressive decoder emits bridge flush metrics when accessors are present", async () => {
+    const module = createFakeDrainingProgressiveLibjxlModule() as any;
+    module._jxl_wasm_dec_flush_attempts = () => 3;
+    module._jxl_wasm_dec_flush_successes = () => 2;
+    module._jxl_wasm_dec_flush_zero_skips = () => 1;
+    module._jxl_wasm_dec_flush_duplicate_skips = () => 4;
+    module._jxl_wasm_dec_flush_image_ms = () => 12.5;
+    setJxlModuleFactoryForTesting(async () => module);
+    const metrics: Record<string, number> = {};
+
+    const decoder = createDecoder({
+      ...decodeOptions,
+      emitEveryPass: true,
+      onMetric: (name, value) => { metrics[name] = value; },
+    });
+    decoder.push(new Uint8Array([1, 2, 3, 4]).buffer);
+    decoder.close();
+
+    for await (const _event of decoder.events()) {}
+
+    expect(metrics).toMatchObject({
+      bridge_flush_attempts: 3,
+      bridge_flush_successes: 2,
+      bridge_flush_zero_skips: 1,
+      bridge_flush_duplicate_skips: 4,
+      bridge_flush_image_ms: 12.5,
+    });
+    await decoder.dispose();
+  });
+
   test("progressive decoder copies flushed pixels before freeing WASM handle", async () => {
     setJxlModuleFactoryForTesting(async () => createFakeFreedViewProgressiveLibjxlModule());
 

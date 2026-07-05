@@ -13,6 +13,7 @@ const baseDecodeStart: MsgDecodeStart = {
   downsample: 1,
   progressionTarget: "final",
   emitEveryPass: true,
+  suppressDuplicateProgress: false,
   preserveIcc: true,
   preserveMetadata: true,
   priority: "visible",
@@ -288,7 +289,7 @@ describe("node codec handlers", () => {
     await waitFor(() => ended.length === 1);
 
     const metrics = messages.filter((msg) => msg.type === "metric") as Array<{ type: "metric"; metric: { name: string; value: number } }>;
-    expect(metrics.length).toBe(3);
+    expect(metrics.length).toBe(4);
 
     const firstByteMetric = metrics.find((m) => m.metric.name === "time_to_first_byte_ms");
     expect(firstByteMetric).toBeDefined();
@@ -301,6 +302,10 @@ describe("node codec handlers", () => {
     const totalTimeMetric = metrics.find((m) => m.metric.name === "encode_total_ms");
     expect(totalTimeMetric).toBeDefined();
     expect(totalTimeMetric!.metric.value >= 0).toBe(true);
+
+    const finishMetric = metrics.find((m) => m.metric.name === "encode_finish_ms");
+    expect(finishMetric).toBeDefined();
+    expect(finishMetric!.metric.value >= 0).toBe(true);
   });
 });
 
