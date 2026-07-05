@@ -21,6 +21,7 @@ export class DecoderPool {
             progressionTarget: opts.progressionTarget ?? "final",
             emitEveryPass: opts.emitEveryPass ?? true,
             progressiveDetail: opts.progressiveDetail ?? null,
+            suppressDuplicateProgress: opts.suppressDuplicateProgress ?? false,
             preserveIcc: opts.preserveIcc ?? true,
             preserveMetadata: opts.preserveMetadata ?? true,
             fitMode: opts.fitMode ?? null,

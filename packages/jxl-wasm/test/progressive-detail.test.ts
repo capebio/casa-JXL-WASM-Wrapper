@@ -144,6 +144,38 @@ test('duplicate progressive flush suppression is opt-in experiment only', () => 
   expect(bridge).toContain('last_progress_hash');
 });
 
+test('progressive bridge exposes flush metrics to facade', () => {
+  expect(bridge).toContain('flush_attempts');
+  expect(bridge).toContain('flush_successes');
+  expect(bridge).toContain('flush_zero_skips');
+  expect(bridge).toContain('flush_duplicate_skips');
+  expect(bridge).toContain('flush_image_ms');
+  expect(bridge).toContain('jxl_wasm_dec_flush_attempts');
+  expect(bridge).toContain('jxl_wasm_dec_flush_successes');
+  expect(bridge).toContain('jxl_wasm_dec_flush_zero_skips');
+  expect(bridge).toContain('jxl_wasm_dec_flush_duplicate_skips');
+  expect(bridge).toContain('jxl_wasm_dec_flush_image_ms');
+  expect(facade).toContain('bridge_flush_attempts');
+  expect(facade).toContain('bridge_flush_successes');
+  expect(facade).toContain('bridge_flush_zero_skips');
+  expect(facade).toContain('bridge_flush_duplicate_skips');
+  expect(facade).toContain('bridge_flush_image_ms');
+  const exportsDec = readFileSync(new URL('../exports-dec.txt', import.meta.url), 'utf8');
+  const exportsEnc = readFileSync(new URL('../exports-enc.txt', import.meta.url), 'utf8');
+  const exportsMono = readFileSync(new URL('../exports.txt', import.meta.url), 'utf8');
+  for (const name of [
+    '_jxl_wasm_dec_flush_attempts',
+    '_jxl_wasm_dec_flush_successes',
+    '_jxl_wasm_dec_flush_zero_skips',
+    '_jxl_wasm_dec_flush_duplicate_skips',
+    '_jxl_wasm_dec_flush_image_ms',
+  ]) {
+    expect(exportsDec).toContain(name);
+    expect(exportsEnc).toContain(name);
+    expect(exportsMono).toContain(name);
+  }
+});
+
 test('progressive paint-target knob is wired core -> C API -> bridge -> facade', () => {
   const decFrameH = readFileSync(new URL('../../../external/libjxl-012/lib/jxl/dec_frame.h', import.meta.url), 'utf8');
   const decodeCc = readFileSync(new URL('../../../external/libjxl-012/lib/jxl/decode.cc', import.meta.url), 'utf8');

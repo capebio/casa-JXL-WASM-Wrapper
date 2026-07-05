@@ -254,6 +254,7 @@ export class DecodeHandler {
           progressionTarget: this.opts.progressionTarget,
           emitEveryPass: this.opts.emitEveryPass,
           progressiveDetail: this.opts.progressiveDetail,
+          suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
           preserveIcc: this.opts.preserveIcc,
           preserveMetadata: this.opts.preserveMetadata,
           targetWidth: this.opts.targetWidth,
@@ -268,6 +269,7 @@ export class DecodeHandler {
           progressionTarget: this.opts.progressionTarget,
           emitEveryPass: this.opts.emitEveryPass,
           ...(this.opts.progressiveDetail !== null ? { progressiveDetail: this.opts.progressiveDetail } : {}),
+          suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
           preserveIcc: this.opts.preserveIcc,
           preserveMetadata: this.opts.preserveMetadata,
           targetWidth: this.opts.targetWidth,
@@ -339,23 +341,8 @@ export class DecodeHandler {
     const decoder = this.decoder;
     if (decoder === null) return Promise.resolve();
     this.decoder = null;
-    // Release to pool if available; otherwise dispose
-    this.disposePromise = (this.decoderPool
-      ? this.decoderPool.release(decoder, {
-          format: this.opts.format,
-          region: this.opts.region,
-          downsample: this.opts.downsample,
-          progressionTarget: this.opts.progressionTarget,
-          emitEveryPass: this.opts.emitEveryPass,
-          progressiveDetail: this.opts.progressiveDetail,
-          preserveIcc: this.opts.preserveIcc,
-          preserveMetadata: this.opts.preserveMetadata,
-          targetWidth: this.opts.targetWidth,
-          targetHeight: this.opts.targetHeight,
-          fitMode: this.opts.fitMode,
-        })
-      : Promise.resolve(decoder.dispose())
-    ).catch((e: unknown) => {
+    // Facade decoders are one-shot: events() may only be consumed once and state is not resettable.
+    this.disposePromise = Promise.resolve(decoder.dispose()).catch((e: unknown) => {
       console.error('[jxl-worker] disposeActiveDecoder failed:', e);
     });
     return this.disposePromise;
@@ -718,9 +705,8 @@ function toTransferablePixels(value: ArrayBuffer | Uint8Array): { buffer: ArrayB
   if (typeof SharedArrayBuffer !== "undefined" && buf instanceof SharedArrayBuffer) {
     return { buffer: buf as unknown as ArrayBuffer, copied: false };
   }
-  if (value.byteOffset === 0 && value.byteLength === buf.byteLength) {
-    return { buffer: buf as ArrayBuffer, copied: false };
-  }
+  // Uint8Array frames may alias WASM/facade-owned storage across progressive passes.
+  // Transferring that backing ArrayBuffer detaches it and can break the next pass.
   return {
     buffer: buf.slice(value.byteOffset, value.byteOffset + value.byteLength) as ArrayBuffer,
     copied: true,

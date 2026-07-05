@@ -60,6 +60,7 @@ export class DecodeSessionImpl {
             progressionTarget: opts.progressionTarget ?? "final",
             emitEveryPass: opts.emitEveryPass ?? true,
             progressiveDetail: opts.progressiveDetail ?? null,
+            suppressDuplicateProgress: opts.suppressDuplicateProgress ?? false,
             preserveIcc: opts.preserveIcc ?? true,
             preserveMetadata: opts.preserveMetadata ?? true,
             priority: opts.priority ?? "visible",
@@ -397,6 +398,15 @@ export class DecodeSessionImpl {
      *   and onMessage handler are never released by the normal terminal path — we must
      *   release them here via completeSession().
      *   False/absent on the normal decode_final path where the scheduler cleans up itself.
+     *
+     *   completeSession() (not cancelSession()) is deliberate
+     *   (DS-SINGLEPASS-SLOT-01 verified stale): the WORKER also self-stops on
+     *   these targets (decode-handler finishSession at the "header" /
+     *   non-final-target branches), so the slot being freed belongs to an idle
+     *   worker — nothing keeps decoding. cancelSession() here would send
+     *   decode_cancel for a session the worker already ended, which the worker
+     *   drops without an ack (routeDecodeMessage: no handler, not pending) and
+     *   the scheduler record would hang in "cancelling" forever.
      */
     finish(info, localEarlyFinish = false) {
         if (this.terminated)

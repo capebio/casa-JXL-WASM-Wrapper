@@ -12,6 +12,7 @@ interface PoolableDecoderOpts {
   progressionTarget?: string;
   emitEveryPass?: boolean;
   progressiveDetail?: string | null | undefined;
+  suppressDuplicateProgress?: boolean;
   preserveIcc?: boolean;
   preserveMetadata?: boolean;
   targetWidth?: number | null;
@@ -49,6 +50,7 @@ export class DecoderPool {
       progressionTarget: opts.progressionTarget ?? "final",
       emitEveryPass: opts.emitEveryPass ?? true,
       progressiveDetail: opts.progressiveDetail ?? null,
+      suppressDuplicateProgress: opts.suppressDuplicateProgress ?? false,
       preserveIcc: opts.preserveIcc ?? true,
       preserveMetadata: opts.preserveMetadata ?? true,
       fitMode: opts.fitMode ?? null,
