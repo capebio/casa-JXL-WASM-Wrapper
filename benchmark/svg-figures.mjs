@@ -42,6 +42,42 @@ export function rdCurve({ series, xLabel = "bpp", yLabel = "butteraugli", width 
 
 export function paretoPlot(opts) { return rdCurve({ ...opts, xLabel: opts.xLabel || "encode ms", yLabel: opts.yLabel || "bpp" }); }
 
+// Scatter of labelled points (no connecting lines). points = [{x,y,label,color}].
+export function scatterPlot({ points, xLabel = "x", yLabel = "y", width = 800, height = 500 }) {
+  const f = frame(width, height, xLabel, yLabel);
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  const xmin = Math.min(...xs), xmax = Math.max(...xs), ymin = Math.min(...ys), ymax = Math.max(...ys);
+  const px = (x) => PAD.l + (xmax===xmin?0.5:(x-xmin)/(xmax-xmin))*f.plotW;
+  const py = (y) => PAD.t + (ymax===ymin?0.5:(1-(y-ymin)/(ymax-ymin)))*f.plotH;
+  let body = axes(f, ticks(xmin, xmax, 5, v=>({px:px(v)})), ticks(ymin, ymax, 5, v=>({py:py(v)})));
+  for (const p of points) {
+    const cx = px(p.x), cy = py(p.y);
+    body += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="5" fill="${p.color||'#333'}" stroke="#fff"/>`;
+    body += `<text x="${(cx+8).toFixed(1)}" y="${(cy+4).toFixed(1)}" font-size="11" fill="#111">${esc(p.label)}</text>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" font-family="sans-serif"><rect width="${width}" height="${height}" fill="#fff"/>${body}</svg>`;
+}
+
+// Slopegraph: left column = baseline (100), right column = each metric's value. metrics=[{label,value,color}].
+export function slopeChart({ metrics, leftLabel = "original", rightLabel = "ours", baseline = 100, yLabel = "% of original", width = 700, height = 440 }) {
+  const f = frame(width, height, "", yLabel);
+  const vals = [baseline, ...metrics.map(m => m.value)];
+  const vmin = Math.min(...vals) * 0.95, vmax = Math.max(...vals) * 1.05;
+  const py = (v) => PAD.t + (1 - (v - vmin) / (vmax - vmin)) * f.plotH;
+  const xL = PAD.l + f.plotW * 0.25, xR = PAD.l + f.plotW * 0.75;
+  let body = axes(f, [], ticks(vmin, vmax, 5, v=>({py:py(v)}), v=>v.toFixed(0)+"%"));
+  body += `<text x="${xL}" y="${PAD.t-8}" font-size="13" text-anchor="middle" fill="#111">${esc(leftLabel)}</text>`;
+  body += `<text x="${xR}" y="${PAD.t-8}" font-size="13" text-anchor="middle" fill="#111">${esc(rightLabel)}</text>`;
+  body += `<line x1="${xL}" y1="${py(baseline)}" x2="${xR}" y2="${py(baseline)}" stroke="#bbb" stroke-dasharray="4 3"/>`;
+  for (const m of metrics) {
+    const yR = py(m.value);
+    body += `<line x1="${xL}" y1="${py(baseline)}" x2="${xR}" y2="${yR}" stroke="${m.color}" stroke-width="2.5"/>`;
+    body += `<circle cx="${xL}" cy="${py(baseline)}" r="4" fill="${m.color}"/><circle cx="${xR}" cy="${yR}" r="4" fill="${m.color}"/>`;
+    body += `<text x="${xR+10}" y="${(yR+4).toFixed(1)}" font-size="12" fill="#111">${esc(m.label)}: ${m.value.toFixed(0)}%</text>`;
+  }
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" font-family="sans-serif"><rect width="${width}" height="${height}" fill="#fff"/>${body}</svg>`;
+}
+
 export function barChart({ bars, yLabel = "value", xLabel = "", width = 600, height = 400 }) {
   const f = frame(width, height, xLabel, yLabel);
   const max = Math.max(...bars.map(b => b.value), 1);
@@ -52,7 +88,10 @@ export function barChart({ bars, yLabel = "value", xLabel = "", width = 600, hei
     const x = PAD.l + (i + 0.25) * (f.plotW / bars.length);
     const y = py(b.value), h = (f.height - PAD.b) - y;
     body += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="${b.color}"/>`;
-    body += `<text x="${(x+bw/2).toFixed(1)}" y="${f.height-PAD.b+18}" font-size="11" text-anchor="middle" fill="#333">${esc(b.label)}</text>`;
+    // stagger labels up/down on alternating bars so long names don't overlap
+    const labelY = f.height - PAD.b + 18 + (i % 2) * 15;
+    body += `<line x1="${(x+bw/2).toFixed(1)}" y1="${f.height-PAD.b}" x2="${(x+bw/2).toFixed(1)}" y2="${labelY-9}" stroke="#ccc"/>`;
+    body += `<text x="${(x+bw/2).toFixed(1)}" y="${labelY}" font-size="11" text-anchor="middle" fill="#333">${esc(b.label)}</text>`;
   });
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${width} ${height}" font-family="sans-serif"><rect width="${width}" height="${height}" fill="#fff"/>${body}</svg>`;
 }
