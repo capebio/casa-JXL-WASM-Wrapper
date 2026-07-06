@@ -736,6 +736,56 @@ const OUT_NO_ORIENT: u32 = 16;
 /// Full-resolution display-referred RGB16 (post WB/matrix/tone, oriented, full-range [0,65535]).
 const OUT_FULL_DISP16: u32 = 32;
 
+// S3: keep these private flag bits in lock-step with the estimator's mirror in
+// `raw_pipeline::mem_budget`. Any drift is a compile error, so the preflight
+// projection can never silently model the wrong flag layout.
+const _: () = {
+    assert!(OUT_FULL_RGB8 == raw_pipeline::mem_budget::OUT_FULL_RGB8);
+    assert!(OUT_LIGHTBOX == raw_pipeline::mem_budget::OUT_LIGHTBOX);
+    assert!(OUT_THUMB == raw_pipeline::mem_budget::OUT_THUMB);
+    assert!(OUT_FULL_16 == raw_pipeline::mem_budget::OUT_FULL_16);
+    assert!(OUT_NO_ORIENT == raw_pipeline::mem_budget::OUT_NO_ORIENT);
+    assert!(OUT_FULL_DISP16 == raw_pipeline::mem_budget::OUT_FULL_DISP16);
+};
+
+/// S3 preflight: project the peak / retained working-set of a RAW decode from
+/// dimensions + output flags, WITHOUT decoding. Behavior-neutral (changes no
+/// decode output). Fields are byte counts as `f64` (exact for all realistic
+/// sizes — well under 2^53). Browser callers use `peak_bytes` for pre-decode
+/// admission control against the WASM heap / memory budget, and `retained_bytes`
+/// for `AssetStore` accounting of the buffers a held `ProcessResult` keeps.
+/// See the model derivation in `raw_pipeline::mem_budget` / the memory-budget ADR.
+#[wasm_bindgen]
+pub struct DecodePeakEstimate {
+    #[wasm_bindgen(readonly)]
+    pub pixels: f64,
+    #[wasm_bindgen(readonly)]
+    pub retained_bytes: f64,
+    #[wasm_bindgen(readonly)]
+    pub peak_bytes: f64,
+}
+
+/// Project the decode peak/retained working set for `width`×`height` (active-area,
+/// pre-orientation) pixels and the given `output_flags` bitset (same bits as
+/// `process_orf_with_flags` / `process_dng_with_flags`). Pure — allocates nothing
+/// beyond the tiny result and touches no image data.
+#[wasm_bindgen]
+pub fn estimate_decode_peak(width: u32, height: u32, output_flags: u32) -> DecodePeakEstimate {
+    let e = raw_pipeline::mem_budget::estimate_decode_peak(width, height, output_flags);
+    DecodePeakEstimate {
+        pixels: e.pixels as f64,
+        retained_bytes: e.retained_bytes as f64,
+        peak_bytes: e.peak_bytes as f64,
+    }
+}
+
+/// Convenience scalar form: the transient peak-bytes projection only. Matches the
+/// `estimate_decode_peak_bytes()` name from the Wave-2 strategic map.
+#[wasm_bindgen]
+pub fn estimate_decode_peak_bytes(width: u32, height: u32, output_flags: u32) -> f64 {
+    raw_pipeline::mem_budget::estimate_decode_peak_bytes(width, height, output_flags) as f64
+}
+
 /// Olympus 12-bit sensor black pedestal (counts). Subtracted before WB so the
 /// per-channel multipliers don't inflate the pedestal into a magenta cast. See
 /// the rationale block in `decode_orf_raw`. Canonical Olympus value; the raw

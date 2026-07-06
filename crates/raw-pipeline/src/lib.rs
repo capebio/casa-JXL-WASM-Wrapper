@@ -25,6 +25,9 @@ pub mod frame_pipeline;
 pub mod frame_stats;
 pub mod image_formats;
 pub mod ljpeg;
+// S3: additive, behavior-neutral memory preflight (peak/retained working-set
+// projection from dims + output flags). Pure; native + wasm.
+pub mod mem_budget;
 pub mod perceptual;
 pub mod pipeline;
 pub mod stream_preview;
