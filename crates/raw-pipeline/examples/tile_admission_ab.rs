@@ -1,23 +1,31 @@
 //! tile_admission_ab — real-footage A/B of confidence-scheduled tile admission.
 //!
 //! Extracts `seconds` of a video via ffmpeg (rgb24 pipe, scaled to `max_px`
-//! longest edge), then encodes the same frames three ways:
+//! longest edge), then encodes the same frames through multiple passes:
 //!
-//!   fixed  — lossy d=1.0, tile skip, no rate control (measures content rate)
-//!   rc     — JOLT distance-only rate control at `target_frac` × fixed rate
-//!   admit  — same target, plus confidence-scheduled tile admission
+//!   fixed    — lossy d=1.0, tile skip, no rate control (measures content rate)
+//!   quality  — JOLT Quality preset (d=0.5, e=4), no rate control
+//!   rc       — JOLT distance-only rate control at `target_frac` × fixed rate
+//!   admit    — same target, plus confidence-scheduled tile admission
+//!   lossless — FableBraid (braided-rANS) lossless at 480px / 5 s
 //!
 //! Prints per-pass totals, rate adherence (average and worst 1-second window),
 //! per-frame peaks, tiles-per-P-frame, decode quality vs source, wall time.
 //!
-//! With a 5th arg, also writes a side-by-side demo (rc | admit decoded output
-//! composited into one mp4 for exact sync) plus a stats page to that directory.
+//! With a 5th arg, writes a demo directory containing:
+//!   source_15s.mp4   — ffmpeg clip of the source
+//!   pass_*.mp4       — each pass decoded and re-encoded as H.264 for browser
+//!   orig_vs_rc.mp4   — legacy side-by-side composite (original | rc)
+//!   rc_vs_admit.mp4  — legacy side-by-side composite (rc | admit)
+//!   stats.json       — compression metrics for the HTML info panel
+//!   index.html       — NOT overwritten (edit separately; loads stats.json)
 //!
-//! Usage: tile_admission_ab <video> [seconds=10] [max_px=640] [target_frac=0.35] [demo_dir]
+//! Usage: tile_admission_ab <video> [seconds=15] [max_px=960] [target_frac=0.35] [demo_dir]
 
 use raw_pipeline::casa_video::{
     casv_frame_info, casv_frame_is_tile, casv_frame_slice, decode_casv_all_rgb8,
-    encode_casv_video_streaming, parse_casv_header, CasaVideoOptions, VideoFrameSource,
+    encode_casv_video_streaming, parse_casv_header, CasaVideoOptions, JoltPreset,
+    VideoFrameSource,
 };
 use std::io::Read;
 use std::time::Instant;
@@ -161,11 +169,11 @@ fn run_pass(
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        fail("usage: tile_admission_ab <video> [seconds=10] [max_px=640] [target_frac=0.35]");
+        fail("usage: tile_admission_ab <video> [seconds=15] [max_px=960] [target_frac=0.35] [demo_dir]");
     }
     let video = &args[1];
-    let seconds: f64 = args.get(2).map_or(10.0, |s| s.parse().unwrap_or(10.0));
-    let max_px: u32 = args.get(3).map_or(640, |s| s.parse().unwrap_or(640));
+    let seconds: f64 = args.get(2).map_or(15.0, |s| s.parse().unwrap_or(15.0));
+    let max_px: u32 = args.get(3).map_or(960, |s| s.parse().unwrap_or(960));
     let target_frac: f64 = args.get(4).map_or(0.35, |s| s.parse().unwrap_or(0.35));
 
     // Probe source geometry + fps, compute even-sized scaled dims.
@@ -224,7 +232,7 @@ fn main() {
     }
     let secs = frames.len() as f64 * fps.1 as f64 / fps.0 as f64;
     println!(
-        "clip: {video}\n  {w}x{h} @ {}/{} fps, {} frames ({secs:.1} s), gop 30, tile 32, d=1.0 e3",
+        "clip: {video}\n  {w}x{h} @ {}/{} fps, {} frames ({secs:.1} s)",
         fps.0,
         fps.1,
         frames.len()
@@ -233,60 +241,95 @@ fn main() {
     let mut base_opts = CasaVideoOptions::streaming(1.0);
     base_opts.gop_len = 30;
 
-    // Pass 1: fixed distance — measures what the content wants to spend.
-    let (_, fixed) = run_pass("fixed", &frames, w, h, fps, &base_opts, secs);
+    // Pass 1: fixed quality (d=1.0 balanced, no RC) — measures natural content rate.
+    let (fixed_out, fixed) = run_pass("fixed", &frames, w, h, fps, &base_opts, secs);
     let target = (fixed.bytes_per_sec * target_frac) as u32;
     println!(
-        "  fixed rate {:.0} B/s -> starved target {} B/s ({}%)\n",
+        "  fixed rate {:.0} B/s -> JOLT target {} B/s ({:.0}%)\n",
         fixed.bytes_per_sec,
         target,
-        (target_frac * 100.0) as u32
+        target_frac * 100.0,
     );
 
-    // Pass 2: distance-only JOLT. Pass 3: + tile admission.
+    // Pass 2: JOLT Quality preset (d=0.5, e=4) — visually transparent, no RC.
+    let quality_opts = CasaVideoOptions::jolt(JoltPreset::Quality);
+    let (quality_out, quality) = run_pass("quality", &frames, w, h, fps, &quality_opts, secs);
+
+    // Pass 3: distance-only JOLT RC.
     let mut rc_opts = CasaVideoOptions::streaming_bitrate(1.0, target);
     rc_opts.gop_len = 30;
     let (rc_out, rc) = run_pass("rc", &frames, w, h, fps, &rc_opts, secs);
+
+    // Pass 4: JOLT + confidence-scheduled tile admission.
     let mut adm_opts = CasaVideoOptions::streaming_bitrate_admitted(1.0, target);
     adm_opts.gop_len = 30;
     let (adm_out, adm) = run_pass("admit", &frames, w, h, fps, &adm_opts, secs);
 
+    // Pass 5: FableBraid lossless — small clip & dim to keep file size manageable.
+    let ll_max_px = 480u32;
+    let ll_scale = (ll_max_px as f64 / sw.max(sh) as f64).min(1.0);
+    let (ll_w, ll_h) = (((sw as f64 * ll_scale) as u32) & !1, ((sh as f64 * ll_scale) as u32) & !1);
+    let ll_secs = seconds.min(5.0);
+    let ll_want = (ll_secs * fps.0 as f64 / fps.1 as f64).round() as usize;
+    let mut ll_child = std::process::Command::new("ffmpeg")
+        .args(["-v","error","-t",&format!("{ll_secs}"),"-i",video,
+               "-vf",&format!("scale={ll_w}:{ll_h}"),"-f","rawvideo","-pix_fmt","rgb24","pipe:1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| fail(format!("ffmpeg lossless extract: {e}")));
+    let ll_frame_bytes = (ll_w * ll_h * 3) as usize;
+    let mut ll_stdout = ll_child.stdout.take().unwrap();
+    let mut ll_frames: Vec<Vec<u8>> = Vec::with_capacity(ll_want);
+    loop {
+        let mut buf = vec![0u8; ll_frame_bytes];
+        let mut got = 0;
+        while got < ll_frame_bytes {
+            match ll_stdout.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(k) => got += k,
+                Err(e) => fail(format!("lossless pipe: {e}")),
+            }
+        }
+        if got < ll_frame_bytes { break; }
+        ll_frames.push(buf);
+    }
+    let _ = ll_child.wait();
+    let ll_secs_actual = ll_frames.len() as f64 * fps.1 as f64 / fps.0 as f64;
+    let ll_opts = CasaVideoOptions::lossless_archive();
+    let (lossless_out, lossless) = run_pass("lossless", &ll_frames, ll_w, ll_h, fps, &ll_opts, ll_secs_actual);
+
+    let all_passes: &[(&str, &PassStats)] = &[
+        ("fixed",   &fixed),
+        ("quality", &quality),
+        ("rc",      &rc),
+        ("admit",   &adm),
+        ("lossless",&lossless),
+    ];
+
     println!(
-        "{:<6} {:>9} {:>9} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8}",
+        "{:<8} {:>9} {:>9} {:>7} {:>10} {:>7} {:>9} {:>6} {:>9} {:>8}",
         "pass", "bytes", "B/s", "vs tgt", "worst-1s", "vs tgt", "worst-Pf", "tiles", "skip-fr", "wall-ms"
     );
-    for s in [&fixed, &rc, &adm] {
-        let vs = if s.label == "fixed" {
-            "-".to_string()
-        } else {
-            format!("{:.2}x", s.bytes_per_sec / target as f64)
-        };
-        let wvs = if s.label == "fixed" {
-            "-".to_string()
-        } else {
-            format!("{:.2}x", s.worst_window_bps / target as f64)
-        };
+    for (_, s) in all_passes {
+        let is_rc = s.label == "rc" || s.label == "admit";
+        let vs = if !is_rc { "-".to_string() } else { format!("{:.2}×", s.bytes_per_sec / target as f64) };
+        let wvs = if !is_rc { "-".to_string() } else { format!("{:.2}×", s.worst_window_bps / target as f64) };
         println!(
-            "{:<6} {:>9} {:>9.0} {:>7} {:>10.0} {:>7} {:>9} {:>6.1} {:>9} {:>8}",
-            s.label,
-            s.total,
-            s.bytes_per_sec,
-            vs,
-            s.worst_window_bps,
-            wvs,
-            s.worst_pframe,
-            s.avg_tiles,
-            s.skip_frames,
-            s.wall_ms
+            "{:<8} {:>9} {:>9.0} {:>7} {:>10.0} {:>7} {:>9} {:>6.1} {:>9} {:>8}",
+            s.label, s.total, s.bytes_per_sec, vs, s.worst_window_bps, wvs,
+            s.worst_pframe, s.avg_tiles, s.skip_frames, s.wall_ms
         );
     }
-    println!("\nquality (mean abs diff vs source, 3 sampled frames):");
-    for s in [&fixed, &rc, &adm] {
-        println!("  {:<6} {:.2}", s.label, s.mean_diff);
-    }
+    println!("\nquality (mean |diff| vs source):");
+    for (_, s) in all_passes { println!("  {:<8} {:.2}", s.label, s.mean_diff); }
 
     if let Some(dir) = args.get(5) {
-        write_demo(dir, &frames, &rc_out, &adm_out, w, h, fps, target, secs, &rc, &adm);
+        write_demo(
+            dir, video, &frames, &fixed_out, &quality_out, &rc_out, &adm_out,
+            &lossless_out, &ll_frames, w, h, ll_w, ll_h, fps, target, secs,
+            &fixed, &quality, &rc, &adm, &lossless,
+        );
     }
 }
 
@@ -339,85 +382,143 @@ fn mux_side_by_side(
     }
 }
 
-/// Decode both streams, write two synced composites — original vs rc, and
-/// rc vs admit — plus an HTML page with the run's numbers baked in.
+/// Decode one CASV stream and write its frames as an H.264 MP4 for browser playback.
+fn write_to_mp4(path: &str, casv: &[u8], w: u32, h: u32, fps: (u32, u32)) {
+    use std::io::Write;
+    let dec = decode_casv_all_rgb8(casv).unwrap_or_else(|| fail(format!("decode for {path}")));
+    let mut child = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", &format!("{w}x{h}"),
+            "-r", &format!("{}/{}", fps.0, fps.1),
+            "-i", "pipe:0",
+            "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            path,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| fail(format!("ffmpeg {path}: {e}")));
+    let mut stdin = child.stdin.take().unwrap();
+    for f in &dec {
+        stdin.write_all(&f.0).unwrap_or_else(|e| fail(format!("ffmpeg write: {e}")));
+    }
+    drop(stdin);
+    child.wait().unwrap_or_else(|e| fail(format!("ffmpeg wait: {e}")));
+    println!("  wrote {path} ({} frames)", dec.len());
+}
+
+/// Write source clip (first `secs` s) as H.264 MP4 via ffmpeg stream copy.
+fn write_source_clip(dir: &str, video: &str, secs: f64) {
+    let path = format!("{dir}/source_15s.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error", "-y",
+            "-t", &format!("{secs}"),
+            "-i", video,
+            "-c:v", "libx264", "-crf", "15", "-preset", "fast",
+            "-c:a", "aac", "-b:a", "64k",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            &path,
+        ])
+        .status()
+        .unwrap_or_else(|e| fail(format!("ffmpeg source clip: {e}")));
+    if !status.success() { fail("ffmpeg source clip failed"); }
+    println!("  wrote {path}");
+}
+
+/// Serialise one pass's stats as a JSON object fragment (no outer braces).
+fn pass_json(s: &PassStats, target: u32) -> String {
+    let bps = s.bytes_per_sec;
+    let kbps = bps * 8.0 / 1000.0;
+    let mb = s.total as f64 / 1_048_576.0;
+    let vs = if target > 0 { bps / target as f64 } else { 0.0 };
+    let wvs = if target > 0 { s.worst_window_bps / target as f64 } else { 0.0 };
+    format!(
+        r#"{{"brKbps":{kbps:.0},"sizeMB":{mb:.2},"wallMs":{wall},"meanDiff":{md:.3},"worstWin":{wvs:.3},"vsTarget":{vs:.3},"avgTiles":{at:.2}}}"#,
+        kbps = kbps, mb = mb, wall = s.wall_ms, md = s.mean_diff,
+        wvs = wvs, vs = vs, at = s.avg_tiles,
+    )
+}
+
+/// All pass outputs + info → demo directory.
 #[allow(clippy::too_many_arguments)]
 fn write_demo(
     dir: &str,
+    video: &str,
     src_frames: &[Vec<u8>],
+    fixed_out: &[u8],
+    quality_out: &[u8],
     rc_out: &[u8],
     adm_out: &[u8],
+    lossless_out: &[u8],
+    ll_frames: &[Vec<u8>],
     w: u32,
     h: u32,
+    ll_w: u32,
+    ll_h: u32,
     fps: (u32, u32),
     target: u32,
     secs: f64,
+    fixed: &PassStats,
+    quality: &PassStats,
     rc: &PassStats,
     adm: &PassStats,
+    lossless: &PassStats,
 ) {
     std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("mkdir {dir}: {e}")));
-    let rc_dec = decode_casv_all_rgb8(rc_out).unwrap_or_else(|| fail("decode rc"));
+    println!("\nwriting demo to {dir}/");
+
+    // Source clip (stream-copy, fast)
+    write_source_clip(dir, video, secs);
+
+    // Individual pass MP4s
+    write_to_mp4(&format!("{dir}/pass_fixed.mp4"),   fixed_out,   w,    h,    fps);
+    write_to_mp4(&format!("{dir}/pass_quality.mp4"), quality_out, w,    h,    fps);
+    write_to_mp4(&format!("{dir}/pass_jolt_rc.mp4"), rc_out,      w,    h,    fps);
+    write_to_mp4(&format!("{dir}/pass_jolt_admit.mp4"), adm_out,  w,    h,    fps);
+    write_to_mp4(&format!("{dir}/pass_lossless.mp4"), lossless_out, ll_w, ll_h, fps);
+
+    // Legacy side-by-side composites (kept for backward compat)
+    let rc_dec  = decode_casv_all_rgb8(rc_out).unwrap_or_else(|| fail("decode rc"));
     let adm_dec = decode_casv_all_rgb8(adm_out).unwrap_or_else(|| fail("decode admit"));
     let src: Vec<&[u8]> = src_frames.iter().map(|f| f.as_slice()).collect();
-    let rcf: Vec<&[u8]> = rc_dec.iter().map(|f| f.0.as_slice()).collect();
+    let rcf: Vec<&[u8]>  = rc_dec.iter().map(|f| f.0.as_slice()).collect();
     let admf: Vec<&[u8]> = adm_dec.iter().map(|f| f.0.as_slice()).collect();
+    println!("  writing orig_vs_rc.mp4");
     mux_side_by_side(&format!("{dir}/orig_vs_rc.mp4"), &src, &rcf, w, h, fps);
+    println!("  writing rc_vs_admit.mp4");
     mux_side_by_side(&format!("{dir}/rc_vs_admit.mp4"), &rcf, &admf, w, h, fps);
 
-    let kbps = |b: f64| b * 8.0 / 1000.0;
-    let html = format!(
-        r#"<!doctype html>
-<meta charset="utf-8">
-<title>CASV tile admission — side by side</title>
-<style>
-  body {{ background:#111; color:#ddd; font:14px/1.5 system-ui, sans-serif;
-         max-width: 1400px; margin: 24px auto; padding: 0 16px; }}
-  h1 {{ font-size:18px; font-weight:600; }}
-  .labels {{ display:flex; margin-bottom:6px; font-weight:600; }}
-  .labels div {{ flex:1; text-align:center; }}
-  .src {{ color:#7fb3e6; }} .rc {{ color:#e6a23c; }} .adm {{ color:#6fcf7c; }}
-  video {{ width:100%; display:block; background:#000; }}
-  table {{ border-collapse:collapse; margin-top:16px; }}
-  td, th {{ padding:4px 14px; border-bottom:1px solid #333; text-align:right; }}
-  th:first-child, td:first-child {{ text-align:left; }}
-  .note {{ color:#999; margin-top:12px; max-width:70em; }}
-</style>
-<h1>JOLT rate control at {target_kbps:.0} kbit/s ({secs:.0} s clip, {w}×{h} @ {fpsn}/{fpsd} fps)</h1>
-<div class="labels"><div class="src">original</div><div class="rc">distance-only (rc)</div></div>
-<video src="orig_vs_rc.mp4" autoplay muted loop controls></video>
-<div class="labels" style="margin-top:24px"><div class="rc">distance-only (rc)</div><div class="adm">+ tile admission</div></div>
-<video src="rc_vs_admit.mp4" muted loop controls></video>
-<table>
-<tr><th>pass</th><th>kbit/s (avg)</th><th>vs target</th><th>worst 1-s window</th><th>tiles / P-frame</th><th>encode wall</th><th>mean |diff| vs source</th></tr>
-<tr><td class="rc">distance-only</td><td>{rc_kbps:.0}</td><td>{rc_vs:.2}×</td><td>{rc_win:.2}×</td><td>{rc_tiles:.1}</td><td>{rc_ms} ms</td><td>{rc_q:.2}</td></tr>
-<tr><td class="adm">tile admission</td><td>{adm_kbps:.0}</td><td>{adm_vs:.2}×</td><td>{adm_win:.2}×</td><td>{adm_tiles:.1}</td><td>{adm_ms} ms</td><td>{adm_q:.2}</td></tr>
-</table>
-<p class="note">Same source, same byte target. Left pays for overload in bitrate
-spikes (worst-window overshoot) and uniform softening; right holds the byte
-ceiling per frame by deferring the least-visible tile updates — watch for
-briefly-stale regions during fast motion instead of rate spikes. Divider is
-cosmetic; both halves decode from real .casv streams.</p>
-"#,
-        target_kbps = kbps(target as f64),
-        secs = secs,
-        w = w,
-        h = h,
-        fpsn = fps.0,
-        fpsd = fps.1,
-        rc_kbps = kbps(rc.bytes_per_sec),
-        rc_vs = rc.bytes_per_sec / target as f64,
-        rc_win = rc.worst_window_bps / target as f64,
-        rc_tiles = rc.avg_tiles,
-        rc_ms = rc.wall_ms,
-        rc_q = rc.mean_diff,
-        adm_kbps = kbps(adm.bytes_per_sec),
-        adm_vs = adm.bytes_per_sec / target as f64,
-        adm_win = adm.worst_window_bps / target as f64,
-        adm_tiles = adm.avg_tiles,
-        adm_ms = adm.wall_ms,
-        adm_q = adm.mean_diff,
+    // stats.json — loaded by index.html for real numbers in the info panel
+    let _ll_secs = ll_frames.len() as f64 * fps.1 as f64 / fps.0 as f64;
+    let ll_mb   = lossless_out.len() as f64 / 1_048_576.0;
+    let stats_json = format!(
+        r#"{{
+  "clip": {{"width":{w},"height":{h},"fps_num":{fpn},"fps_den":{fpd},"seconds":{secs:.1},"target_bps":{target}}},
+  "passes": {{
+    "pass_fixed":   {fixed_j},
+    "pass_quality": {qual_j},
+    "pass_jolt_rc": {rc_j},
+    "pass_jolt_admit": {adm_j},
+    "pass_lossless": {{"brKbps":{ll_kbps:.0},"sizeMB":{ll_mb:.2},"wallMs":{ll_wall},"meanDiff":{ll_md:.3},"worstWin":null,"vsTarget":null,"avgTiles":{ll_at:.2}}}
+  }}
+}}"#,
+        w = w, h = h, fpn = fps.0, fpd = fps.1,
+        fixed_j  = pass_json(fixed,   0),
+        qual_j   = pass_json(quality, 0),
+        rc_j     = pass_json(rc,      target),
+        adm_j    = pass_json(adm,     target),
+        ll_kbps  = lossless.bytes_per_sec * 8.0 / 1000.0,
+        ll_mb    = ll_mb,
+        ll_wall  = lossless.wall_ms,
+        ll_md    = lossless.mean_diff,
+        ll_at    = lossless.avg_tiles,
     );
-    let page = format!("{dir}/index.html");
-    std::fs::write(&page, html).unwrap_or_else(|e| fail(format!("write {page}: {e}")));
-    println!("\ndemo written: {page}");
+    let stats_path = format!("{dir}/stats.json");
+    std::fs::write(&stats_path, stats_json).unwrap_or_else(|e| fail(format!("write stats.json: {e}")));
+    println!("  wrote {stats_path}");
+    println!("\nDemo ready — open {dir}/index.html in a browser.");
 }
