@@ -404,7 +404,7 @@ mod tests {
         let mut p = pipeline::PipelineParams::default_olympus();
         p.black = 256;
         p.white = 4095;
-        p.color_matrix = Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        p.color_matrix = pipeline::ColorMatrix::Identity; // was Some(identity); byte-identical
         let mut look = RawVideoLook::default();
         look.exposure_ev = 0.5;
         look.contrast = 0.3;
@@ -416,7 +416,7 @@ mod tests {
         // sensor fields untouched
         assert_eq!(p.black, 256);
         assert_eq!(p.white, 4095);
-        assert!(p.color_matrix.is_some());
+        assert!(p.color_matrix.to_option().is_some());
     }
 
     #[test]
