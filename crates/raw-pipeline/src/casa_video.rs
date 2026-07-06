@@ -448,6 +448,13 @@ pub struct RateControl {
     pub max_distance: f32,
     /// Leaky-bucket capacity in seconds of target rate (burst tolerance).
     pub vbv_seconds: f32,
+    /// Confidence-scheduled tile admission (streaming [`SkipMode::Tile`] tier
+    /// only): when a frame's changed tiles would overspend the bucket, encode
+    /// only the highest-SAD tiles now and defer the rest. Deferred tiles are
+    /// detected against the last-*sent* state, so they deliver as the bucket
+    /// refills instead of being silently dropped. Off by default — the
+    /// distance feedback loop alone reproduces the previous behavior exactly.
+    pub tile_admission: bool,
 }
 
 impl RateControl {
@@ -459,7 +466,15 @@ impl RateControl {
             min_distance: 0.3,
             max_distance: 8.0,
             vbv_seconds: 2.0,
+            tile_admission: false,
         }
+    }
+
+    /// Enable confidence-scheduled tile admission (see
+    /// [`RateControl::tile_admission`]).
+    pub fn with_tile_admission(mut self) -> Self {
+        self.tile_admission = true;
+        self
     }
 }
 
@@ -752,6 +767,25 @@ struct StreamCtx {
     bitmap: Vec<u8>,
     atlas: Vec<u8>,
     crop: Vec<u8>,
+    /// Confidence-scheduled tile admission (None = classic behavior).
+    admission: Option<TileAdmission>,
+}
+
+/// Confidence-scheduled tile admission state for the streaming Tile tier:
+/// rank changed tiles by SAD, encode what the byte budget affords, defer the
+/// rest against a last-SENT reference (DSpark-style "verify smarter").
+struct TileAdmission {
+    /// Source pixels as of the last *sent* state: I-frames and admitted tiles
+    /// blit `cur` in; deferred tiles keep the older content so they stay
+    /// "changed" until actually delivered (self-healing — no pending list).
+    ref_frame: Vec<u8>,
+    /// EMA of encoded payload bytes per admitted tile, measured on prior
+    /// frames only — the causal cost table that sizes each new admission.
+    /// `None` until the first tile P-frame (measurement frame: admit all).
+    est_tile_bytes: Option<f64>,
+    /// This frame's byte allowance (frame budget + bucket fullness), set by
+    /// the streaming loop before each frame.
+    allowed: f64,
 }
 
 fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<StreamCtx, VideoError> {
@@ -777,6 +811,14 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
         bitmap: Vec::new(),
         atlas: Vec::new(),
         crop: Vec::new(),
+        admission: opts
+            .rate_control
+            .filter(|c| c.tile_admission && matches!(opts.skip, SkipMode::Tile))
+            .map(|_| TileAdmission {
+                ref_frame: Vec::new(),
+                est_tile_bytes: None,
+                allowed: f64::INFINITY,
+            }),
     })
 }
 
@@ -850,6 +892,35 @@ impl RateState {
     }
 }
 
+/// How many changed tiles this frame may encode under its byte allowance.
+/// `allowed` = frame budget + bucket fullness (negative in debt); `est` = EMA
+/// bytes per encoded tile, `None` until the first tile P-frame is measured
+/// (measurement frame: admit everything). Debt admits nothing (legal pure-skip
+/// frame); credit admits at least one tile so the VBV refill guarantees
+/// progress at any rate target.
+fn admit_count(allowed: f64, est: Option<f64>, changed: usize) -> usize {
+    if changed == 0 {
+        return 0;
+    }
+    let Some(est) = est else { return changed };
+    if allowed <= 0.0 {
+        return 0;
+    }
+    ((allowed / est.max(1.0)) as usize).clamp(1, changed)
+}
+
+/// Indices of the `n` highest-SAD tiles, returned ascending — the encoder's
+/// changed list and the decoder's bitmap walk share ascending order (see
+/// `apply_pframe`). Ties resolve to the lower tile index.
+fn rank_admit(sads: &[(usize, u64)], n: usize) -> Vec<usize> {
+    let n = n.min(sads.len());
+    let mut order = sads.to_vec();
+    order.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut keep: Vec<usize> = order[..n].iter().map(|&(i, _)| i).collect();
+    keep.sort_unstable();
+    keep
+}
+
 /// Encode one streaming frame into `payload` (cleared by the caller). I-frame via
 /// the chunked constant-peak encoder, P-frame via bbox/tile replace-skip. Returns
 /// the index flag bits. Shared by the buffered and stream-to-sink encoders.
@@ -871,16 +942,64 @@ fn encode_stream_frame(
             width: width as usize,
         };
         encode_chunked(width, height, ctx.distance, ctx.effort, &mut isrc, payload)?;
+        if let Some(adm) = ctx.admission.as_mut() {
+            // Whole frame sent: the sent-state reference becomes the source.
+            adm.ref_frame.clear();
+            adm.ref_frame.extend_from_slice(px);
+        }
         return Ok(0);
     }
     if matches!(ctx.skip, SkipMode::Tile) {
         let t = ctx.tile.max(1);
         let (txn, _tyn) = tile_grid(width, height, t);
         let (wus, ts) = (width as usize, t as usize);
-        let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
+        // Admission mode detects vs the last-SENT state (not the previous
+        // source frame) so a deferred tile stays "changed" until delivered.
+        let reference: &[u8] = match ctx.admission.as_ref() {
+            Some(adm) => &adm.ref_frame,
+            None => prev_src,
+        };
+        let map = changed_tile_map_thresh(px, reference, width, height, t, ctx.thresh);
         ctx.changed.clear();
         ctx.changed
             .extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
+        if let Some(adm) = ctx.admission.as_mut() {
+            let tile_rows = |i: usize| {
+                let tx = (i as u32 % txn) as usize;
+                let ty = (i as u32 / txn) as usize;
+                let bw = ts.min(wus - tx * ts);
+                let bh = ts.min(height as usize - ty * ts);
+                (tx, ty, bw, bh)
+            };
+            let n = admit_count(adm.allowed, adm.est_tile_bytes, ctx.changed.len());
+            if n < ctx.changed.len() {
+                // Over budget: score the changed tiles (SAD vs the sent state)
+                // and keep the top n. Scoring runs only on this path, so an
+                // ample-budget stream never pays for it.
+                let sads: Vec<(usize, u64)> = ctx
+                    .changed
+                    .iter()
+                    .map(|&i| {
+                        let (tx, ty, bw, bh) = tile_rows(i);
+                        let mut sad = 0u64;
+                        for row in 0..bh {
+                            let s = ((ty * ts + row) * wus + tx * ts) * 3;
+                            sad += sad_bytes(&px[s..s + bw * 3], &adm.ref_frame[s..s + bw * 3]);
+                        }
+                        (i, sad)
+                    })
+                    .collect();
+                ctx.changed = rank_admit(&sads, n);
+            }
+            // Admitted tiles become part of the sent state.
+            for &i in &ctx.changed {
+                let (tx, ty, bw, bh) = tile_rows(i);
+                for row in 0..bh {
+                    let s = ((ty * ts + row) * wus + tx * ts) * 3;
+                    adm.ref_frame[s..s + bw * 3].copy_from_slice(&px[s..s + bw * 3]);
+                }
+            }
+        }
         // JE-8: square-atlas (v2) layout, signalled by the tile-size high bit.
         // The old t-wide sliver atlas (one t×t slot per row) is the shape that
         // made multi-threaded encode SLOWER (CV-E6: 32px-wide strips starve
@@ -918,6 +1037,17 @@ fn encode_stream_frame(
                 &Frame::rgb(ctx.atlas.as_slice(), aw as u32, ah as u32),
                 payload,
             )?;
+        }
+        if let Some(adm) = ctx.admission.as_mut() {
+            if !ctx.changed.is_empty() {
+                // Causal cost table: this frame's measured bytes/tile sizes
+                // only FUTURE admissions (never its own).
+                let per = payload.len() as f64 / ctx.changed.len() as f64;
+                adm.est_tile_bytes = Some(match adm.est_tile_bytes {
+                    Some(e) => 0.7 * e + 0.3 * per,
+                    None => per,
+                });
+            }
         }
         return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
     }
@@ -991,6 +1121,11 @@ pub fn encode_casv_video_streaming(
             }
         }
         payload.clear();
+        if let (Some(rc), Some(adm)) = (rc.as_ref(), ctx.admission.as_mut()) {
+            // This frame's allowance: per-frame refill plus bucket fullness
+            // (negative in debt → pure-skip frame).
+            adm.allowed = rc.frame_budget + rc.bucket;
+        }
         let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
         if let Some(rc) = rc.as_mut() {
             rc.on_frame(payload.len());
@@ -1083,6 +1218,11 @@ pub fn encode_casv_video_streaming_to_progress<W: std::io::Write>(
             }
         }
         payload.clear();
+        if let (Some(rc), Some(adm)) = (rc.as_ref(), ctx.admission.as_mut()) {
+            // This frame's allowance: per-frame refill plus bucket fullness
+            // (negative in debt → pure-skip frame).
+            adm.allowed = rc.frame_budget + rc.bucket;
+        }
         let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
         if let Some(rc) = rc.as_mut() {
             rc.on_frame(payload.len());
@@ -1709,6 +1849,54 @@ unsafe fn any_exceeds_avx2(cur: &[u8], prev: &[u8], thresh: u8) -> bool {
         i += 1;
     }
     false
+}
+
+/// Sum of absolute byte differences (SAD) over the common prefix of `a`/`b`.
+/// The tile-admission "confidence" signal: computed only for changed tiles and
+/// only when the frame is over its byte budget. SIMD result is identical to
+/// the scalar sum (integer SAD, order-independent).
+fn sad_bytes(a: &[u8], b: &[u8]) -> u64 {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by runtime AVX2 detection.
+            return unsafe { sad_bytes_avx2(a, b) };
+        }
+    }
+    sad_bytes_scalar(a, b)
+}
+
+fn sad_bytes_scalar(a: &[u8], b: &[u8]) -> u64 {
+    let n = a.len().min(b.len());
+    a[..n]
+        .iter()
+        .zip(&b[..n])
+        .map(|(&x, &y)| x.abs_diff(y) as u64)
+        .sum()
+}
+
+/// AVX2: `psadbw` sums |a-b| per 8-byte group into four u64 lanes — the exact
+/// integer SAD, so lane-accumulate + scalar tail equals the scalar sum.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[target_feature(enable = "avx2")]
+unsafe fn sad_bytes_avx2(a: &[u8], b: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+
+    let n = a.len().min(b.len());
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        let va = _mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i);
+        let vb = _mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i);
+        acc = _mm256_add_epi64(acc, _mm256_sad_epu8(va, vb));
+        i += 32;
+    }
+    let mut lanes = [0u64; 4];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+    lanes.iter().sum::<u64>() + sad_bytes_scalar(&a[i..n], &b[i..n])
 }
 
 /// Tight bounding box `(x, y, w, h)` of pixels whose max channel difference
@@ -3574,6 +3762,222 @@ mod tests {
         );
         assert_eq!(decode_casv_all_rgb8(&starved).unwrap().len(), 36);
         assert_eq!(decode_casv_all_rgb8(&flooded).unwrap().len(), 36);
+    }
+
+    /// Tile-admission count: measurement frame admits all, debt admits none,
+    /// credit admits at least one, otherwise floor(allowed/est) capped at n.
+    #[test]
+    fn admit_count_math() {
+        assert_eq!(admit_count(1_000.0, None, 12), 12); // no estimate yet: measurement frame
+        assert_eq!(admit_count(-5.0, Some(100.0), 12), 0); // debt: pure-skip frame
+        assert_eq!(admit_count(0.0, Some(100.0), 12), 0);
+        assert_eq!(admit_count(50.0, Some(100.0), 12), 1); // credit floor: progress
+        assert_eq!(admit_count(350.0, Some(100.0), 12), 3);
+        assert_eq!(admit_count(5_000.0, Some(100.0), 12), 12); // capped at changed count
+        assert_eq!(admit_count(500.0, Some(100.0), 0), 0); // nothing changed
+    }
+
+    #[test]
+    fn sad_bytes_matches_scalar_oracle() {
+        assert_eq!(sad_bytes(&[0, 10, 255], &[5, 0, 0]), 270);
+        assert_eq!(sad_bytes(&[], &[]), 0);
+        let mut s: u32 = 0xdead_beef;
+        for len in [1usize, 31, 32, 33, 97, 3 * 1024] {
+            let a: Vec<u8> = (0..len).map(|_| lcg(&mut s)).collect();
+            let b: Vec<u8> = (0..len).map(|_| lcg(&mut s)).collect();
+            let oracle: u64 = a.iter().zip(&b).map(|(&x, &y)| x.abs_diff(y) as u64).sum();
+            assert_eq!(sad_bytes_scalar(&a, &b), oracle, "scalar len {len}");
+            assert_eq!(sad_bytes(&a, &b), oracle, "dispatch len {len}");
+        }
+    }
+
+    /// Highest-SAD tiles win; result must be ascending (atlas slot order).
+    #[test]
+    fn rank_admit_picks_top_sad_in_ascending_index_order() {
+        let sads = [(0usize, 5u64), (3, 50), (7, 20), (9, 90)];
+        assert_eq!(rank_admit(&sads, 2), vec![3, 9]);
+        assert_eq!(rank_admit(&sads, 0), Vec::<usize>::new());
+        assert_eq!(rank_admit(&sads, 9), vec![0, 3, 7, 9]);
+        let ties = [(1usize, 10u64), (2, 10), (4, 10)];
+        assert_eq!(rank_admit(&ties, 2), vec![1, 2]); // stable: lower index wins ties
+    }
+
+    /// Set tile indices of frame `index`'s changed-tile bitmap (tile P-frames).
+    fn tile_bitmap_set(data: &[u8], index: usize, ntiles: usize) -> Vec<usize> {
+        if casv_frame_is_tile(data, index) != Some(true) {
+            return Vec::new();
+        }
+        let (_, slice) = casv_frame_info(data, index).unwrap();
+        let bm = &slice[2..2 + ntiles.div_ceil(8)];
+        (0..ntiles)
+            .filter(|&i| bm[i / 8] & (1 << (i % 8)) != 0)
+            .collect()
+    }
+
+    /// DSpark-style admission: an over-budget frame sends only its highest-SAD
+    /// tiles; deferred tiles are re-detected against the last-SENT state and
+    /// delivered as the bucket refills — never silently stranded.
+    #[test]
+    fn tile_admission_defers_and_heals() {
+        let (w, h, t) = (128u32, 128u32, 32u32);
+        let ntiles = 16usize; // 4x4 grid
+        // Noise content: changed tiles cost real bytes (a flat corpus encodes
+        // tiles to ~4 bytes — indistinguishable from the empty-frame overhead,
+        // so the bucket never refills a full tile and nothing ever admits).
+        let mut s0: u32 = 0xc0ffee;
+        let base: Vec<u8> = (0..(w * h * 3) as usize).map(|_| lcg(&mut s0)).collect();
+        // Overwrite tile `ti` with fresh noise from `seed`.
+        let paint = |img: &mut [u8], ti: usize, seed: u32| {
+            let mut s = seed;
+            let (tx, ty) = ((ti % 4) as u32, (ti / 4) as u32);
+            for y in ty * t..(ty + 1) * t {
+                for x in tx * t..(tx + 1) * t {
+                    let o = ((y * w + x) * 3) as usize;
+                    for c in 0..3 {
+                        img[o + c] = lcg(&mut s);
+                    }
+                }
+            }
+        };
+        let burst_b: Vec<usize> = (2..14).collect();
+        let mut fa = base.clone(); // burst A: est-measurement frame
+        for i in 0..12 {
+            paint(&mut fa, i, 100 + i as u32);
+        }
+        let mut fb = fa.clone(); // burst B: what admission must ration
+        for &i in &burst_b {
+            paint(&mut fb, i, 200 + i as u32);
+        }
+        // f0=I, f1=burst A, f2..f16 static (bucket refills to +cap),
+        // f17=burst B, f18..f25 static (healing window).
+        let mut frames = vec![base.clone(), fa.clone()];
+        frames.extend(std::iter::repeat_with(|| fa.clone()).take(15));
+        frames.extend(std::iter::repeat_with(|| fb.clone()).take(9));
+        let n_frames = frames.len(); // 26
+
+        let mk = |target: Option<u32>| -> CasaVideoOptions {
+            let mut o = CasaVideoOptions::streaming(1.0);
+            o.skip = SkipMode::Tile;
+            o.tile = t;
+            o.gop_len = 1000; // single I-frame: distance never retargets
+            if let Some(tb) = target {
+                let mut rc = RateControl::targeting(tb).with_tile_admission();
+                rc.vbv_seconds = 0.25; // small burst credit so deferral must occur
+                o.rate_control = Some(rc);
+            }
+            o
+        };
+        let run = |o: &CasaVideoOptions| {
+            let mut fs = VecFrames {
+                frames: frames.clone(),
+                i: 0,
+                w,
+                h,
+            };
+            encode_casv_video_streaming(&mut fs, o).unwrap()
+        };
+
+        // Calibrate: bytes/tile measured from an admission-off run's burst A
+        // (the admission-on run learns the same estimate from its own frame 1).
+        let off = run(&mk(None));
+        let est = casv_frame_slice(&off, 1).unwrap().len() as f64 / 12.0;
+        // frame budget = est (1 tile/frame refill), bucket cap = 6 est.
+        let on = run(&mk(Some((est * 24.0) as u32)));
+
+        // Static frames never resend (detection is vs last-sent state).
+        for i in 2..17 {
+            assert!(
+                tile_bitmap_set(&on, i, ntiles).is_empty(),
+                "static frame {i} must be pure-skip"
+            );
+        }
+        // Burst B must be admitted as a strict subset...
+        let first = tile_bitmap_set(&on, 17, ntiles);
+        assert!(
+            !first.is_empty() && first.len() < burst_b.len(),
+            "frame 17 must admit a non-empty strict subset, got {first:?}"
+        );
+        // ...of exactly the highest-SAD tiles (oracle: same SAD, same data).
+        let sad_oracle: Vec<(usize, u64)> = burst_b
+            .iter()
+            .map(|&ti| {
+                let (tx, ty) = (ti % 4, ti / 4);
+                let sad: u64 = (0..t as usize)
+                    .map(|row| {
+                        let o = ((ty * t as usize + row) * w as usize + tx * t as usize) * 3;
+                        sad_bytes(&fb[o..o + t as usize * 3], &fa[o..o + t as usize * 3])
+                    })
+                    .sum();
+                (ti, sad)
+            })
+            .collect();
+        let expect = rank_admit(&sad_oracle, first.len());
+        assert_eq!(first, expect, "admission must pick the highest-SAD tiles");
+        // Every deferred tile is delivered exactly once as the bucket refills.
+        let mut seen: Vec<usize> = Vec::new();
+        for i in 17..n_frames {
+            seen.extend(tile_bitmap_set(&on, i, ntiles));
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, burst_b,
+            "all burst-B tiles delivered exactly once, got {seen:?}"
+        );
+        // Heal completeness: every burst-B tile of the decoded last frame is
+        // near the source (delivered ⇒ lossy error, mean ≲ 15 on noise at d=1;
+        // stranded ⇒ independent noise, mean ≈ 85).
+        let dec = decode_casv_all_rgb8(&on).unwrap();
+        assert_eq!(dec.len(), n_frames);
+        let last = &dec.last().unwrap().0;
+        let src = &frames[n_frames - 1];
+        for &ti in &burst_b {
+            let (tx, ty) = (ti % 4, ti / 4);
+            let mut sum = 0u64;
+            for row in 0..t as usize {
+                let o = ((ty * t as usize + row) * w as usize + tx * t as usize) * 3;
+                sum += sad_bytes(&last[o..o + t as usize * 3], &src[o..o + t as usize * 3]);
+            }
+            let mean = sum as f64 / (t as f64 * t as f64 * 3.0);
+            assert!(mean <= 40.0, "tile {ti} stale: mean abs diff {mean:.1}");
+        }
+    }
+
+    /// Admission on real-ish overload traffic: stream stays valid, decodes to
+    /// the full frame count, and never spends more than the admission-off run.
+    #[test]
+    fn tile_admission_survives_overload_and_spends_less() {
+        let (w, h) = (128u32, 128u32);
+        let frames = textured_motion(w, h, 48);
+        let run = |admission: bool, target: u32| {
+            let mut o = CasaVideoOptions::streaming_bitrate(1.5, target);
+            o.skip = SkipMode::Tile;
+            o.tile = 32;
+            o.gop_len = 12;
+            if admission {
+                let rc = o.rate_control.take().unwrap();
+                o.rate_control = Some(rc.with_tile_admission());
+            }
+            let mut fs = VecFrames {
+                frames: frames.clone(),
+                i: 0,
+                w,
+                h,
+            };
+            encode_casv_video_streaming(&mut fs, &o).unwrap()
+        };
+        // Overload: target well below what the content needs at d=1.5.
+        let probe = run(false, u32::MAX);
+        let starved_target = (probe.len() as f64 / 2.0 * 0.3) as u32; // 2 s clip
+        let off = run(false, starved_target);
+        let on = run(true, starved_target);
+        assert_eq!(decode_casv_all_rgb8(&on).unwrap().len(), 48);
+        assert!(
+            (on.len() as f64) <= 1.05 * off.len() as f64,
+            "admission must not spend more than distance-only control: {} vs {}",
+            on.len(),
+            off.len()
+        );
     }
 
     #[test]
