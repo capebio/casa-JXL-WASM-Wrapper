@@ -63,7 +63,7 @@ fn main() {
         p.white = img.white;
         p.wb_r = img.wb_r;
         p.wb_b = img.wb_b;
-        p.color_matrix = img.color_matrix;
+        p.color_matrix = img.color_matrix.into();
         let rgb = raw_pipeline::pipeline::process_rgb(&rgb16, &p);
         images.push(("realdng".into(), img.width, img.height, rgb));
     } else {

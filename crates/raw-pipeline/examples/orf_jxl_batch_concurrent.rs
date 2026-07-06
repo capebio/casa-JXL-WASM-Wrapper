@@ -81,7 +81,7 @@ fn decode_orf(data: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     p.wb_r = info.wb_r.unwrap_or(1.797);
     p.wb_g = 1.0;
     p.wb_b = info.wb_b.unwrap_or(1.797);
-    p.color_matrix = info.color_matrix;
+    p.color_matrix = info.color_matrix.into();
     let mut rgb8 = vec![0u8; w * h * 3];
     pipeline::process_into_auto(&rgb16, &p, &mut rgb8);
     Ok((rgb8, w, h))

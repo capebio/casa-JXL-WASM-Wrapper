@@ -926,10 +926,10 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
             params.black = OLYMPUS_BLACK_LEVEL;
             if let Some(r) = info.wb_r { params.wb_r = r; }
             if let Some(b) = info.wb_b { params.wb_b = b; }
-            if let Some(m) = info.color_matrix { params.color_matrix = Some(m); }
+            if let Some(m) = info.color_matrix { params.color_matrix = Some(m).into(); }
             let color_matrix_from_mn = info.color_matrix.is_some();
             let color_matrix_flat: [f32; 9] = {
-                let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+                let m = params.color_matrix.matrix();
                 [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
             };
 
@@ -1033,11 +1033,11 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
     }
     let color_matrix_from_mn = info.color_matrix.is_some();
     if let Some(m) = info.color_matrix {
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
 
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+        let m = params.color_matrix.matrix();
         [
             m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         ]
@@ -1943,7 +1943,7 @@ pub fn apply_look(
                 m[r][c] = color_matrix_flat[r * 3 + c];
             }
         }
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
     raw_pipeline::pipeline::apply_look_params(
         &mut params,
@@ -2488,7 +2488,7 @@ impl LookRenderer {
         if wb_b.is_finite() && wb_b > 0.0 {
             params.wb_b = wb_b;
         }
-        params.color_matrix = Some(self.color_matrix);
+        params.color_matrix = Some(self.color_matrix).into();
         raw_pipeline::pipeline::apply_look_params(
             &mut params,
             exposure_ev,
@@ -2697,9 +2697,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 params.white = white;
                 params.wb_r = wb_r;
                 params.wb_b = wb_b;
-                params.color_matrix = color_matrix;
+                params.color_matrix = color_matrix.into();
                 let color_matrix_flat: [f32; 9] = {
-                    let mm = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+                    let mm = params.color_matrix.matrix();
                     [mm[0][0], mm[0][1], mm[0][2], mm[1][0], mm[1][1], mm[1][2], mm[2][0], mm[2][1], mm[2][2]]
                 };
                 let t = now_ms();
@@ -2761,9 +2761,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
-    params.color_matrix = img.color_matrix;
+    params.color_matrix = img.color_matrix.into();
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+        let m = params.color_matrix.matrix();
         [
             m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         ]
@@ -2968,7 +2968,7 @@ fn process_dng_impl(
         wb_r_used: params.wb_r,
         wb_b_used: params.wb_b,
         black_used: params.black,
-        color_matrix_from_mn: params.color_matrix.is_some(),
+        color_matrix_from_mn: params.color_matrix.to_option().is_some(),
         make,
         model,
         rgb16_lb,
@@ -3248,9 +3248,9 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     params.white = cr2.white;
     params.wb_r = cr2.wb_r;
     params.wb_b = cr2.wb_b;
-    params.color_matrix = cr2.color_matrix;
+    params.color_matrix = cr2.color_matrix.into();
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.unwrap_or(CANON_CAM_TO_SRGB);
+        let m = params.color_matrix.to_option().unwrap_or(CANON_CAM_TO_SRGB);
         [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
     };
 
