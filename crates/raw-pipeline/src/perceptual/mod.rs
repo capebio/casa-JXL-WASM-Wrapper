@@ -195,12 +195,19 @@ impl Comparer {
             ref_rgba, // CRAWL C-7: moved in (was ref_rgba.to_vec() — a full n*4 copy)
             ssim_sb,
             ssim_sbb,
-            tx: vec![0f32; n],
-            ty: vec![0f32; n],
-            tb: vec![0f32; n],
-            dx: vec![0f32; n],
-            dy: vec![0f32; n],
-            db: vec![0f32; n],
+            // PERC-13: uninit, not zeroed — 6·n·4 B of dead memset (~576 MB @24MP)
+            // under the same write-before-read contracts already trusted above:
+            // tx/ty/tb are fully written by fill_test_xyb (convert_xyb, the rx/ry/rb
+            // precedent) at the top of every butteraugli() call before any read;
+            // dx/dy/db are only ever downsample_one targets (the nx/ny/nb precedent)
+            // written before the tx↔dx swap exposes them. All six fields are private
+            // and no public method reads them before those writes.
+            tx: uninit_f32_vec(n),
+            ty: uninit_f32_vec(n),
+            tb: uninit_f32_vec(n),
+            dx: uninit_f32_vec(n),
+            dy: uninit_f32_vec(n),
+            db: uninit_f32_vec(n),
         }
     }
 
