@@ -1,3 +1,17 @@
+### 16-bit / HDR, Measured Honestly: the Codec Comparison Now Runs at Full Bit Depth (2026-07-05)
+
+*Files: src/lib.rs, crates/raw-pipeline/src/pipeline.rs, packages/jxl-wasm/src/bridge.cpp, benchmark/metrics16.mjs, benchmark/codec-adapters.mjs, CodecPaperFullTest.mjs*
+
+Until now, the tool that compares image formats — JPEG XL against JPEG, WebP, AVIF and PNG — only ever looked at ordinary 8-bit pictures. "16-bit / HDR" was a single tick in a capability table: a claim that the formats *can* carry high-bit-depth imagery, with no actual measurement behind it. That gap matters for exactly the images this project exists to serve — RAW camera captures, whose sensors record far more tonal gradation than an 8-bit screen can show, and where the subtle shading in a petal or a sky is the part you least want to throw away.
+
+The obstacle was subtle. You cannot judge 16-bit quality with an 8-bit ruler: a score that only understands 256 brightness levels quantises the extra detail away before it measures anything, so a "16-bit" comparison built on 8-bit tools would just be the 8-bit comparison wearing a hat — the same numbers, no new information. The whole path had to learn to work at full depth, from the source picture to the final score.
+
+It now does, end to end. The source is the converter's own RAW render, which already computes in high precision internally and only rounds to 8 bits at the very last step — so producing a true 16-bit picture was a matter of *not* discarding those low bits. We checked this the strict way: reduce the new 16-bit render back to 8 bits and it matches the shipped 8-bit output for **99.9999%** of colour values (the remainder off by a single unit of rounding). The high-bit-depth picture is then encoded four ways — our JPEG XL in 16-bit mode, AVIF at 10- and 12-bit, and PNG-16 as a **bit-exact lossless** floor — and scored by three full-depth metrics: 16-bit PSNR, 16-bit SSIM, and a 16-bit version of the perceptual "Butteraugli" distance.
+
+That last metric is the delicate one. Rather than re-derive it, we cloned the existing, trusted 8-bit scorer and changed exactly one thing — the step that reads a pixel's colour — leaving every downstream calculation untouched. The proof that the clone is faithful: feed both versions the *same* picture (an 8-bit image promoted to 16-bit without adding or losing any information) and they return **byte-identical scores** — a relative difference of **0.0000**. A picture compared against itself scores exactly zero, as it must.
+
+The build was designed so the risky part can never sink the ship. The 16-bit perceptual scorer needs a full rebuild of the compression engine — the step most likely to go wrong on a given machine. It was made *additive*: if that rebuilt engine isn't present, the perceptual score is simply left out and the comparison carries on with 16-bit PSNR and SSIM, which need no rebuild at all. There is no single point of failure, and the result — real rate-distortion curves for high-bit-depth imagery, with a lossless PNG-16 floor beneath them — comes out either way. True HDR (the wide-gamut, extreme-brightness kind with PQ/HLG signalling) is the next step and is written up as a follow-up; the floating-point plumbing it needs is already in place.
+
 ### A Fast, Full-Size "Preview Proxy" for Video Editing — and a 5× Encoder Slowdown Fixed Underneath (2026-07-05)
 
 *Files: crates/raw-pipeline/src/jxl_casaencoder.rs, crates/raw-pipeline/src/casa_video.rs, crates/raw-pipeline/src/bin/casv_encode.rs, web/casv-lightbox/*

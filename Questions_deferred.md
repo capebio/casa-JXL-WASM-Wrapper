@@ -1885,3 +1885,400 @@ ALL browsers with SAB+Worker (not just those passing `probeRelaxedSimd()`). The
 `assert-no-relaxed-simd.mjs` build gate enforces 0 relaxed opcodes in the artifact,
 making it safe on Firefox/Safari. Change landed in facade.ts + dist/facade.js.
   (decompress.rs q8z) which proved the pattern byte-exact there.
+
+## JXL-LOWLEVEL video-codec reframe — DEFERRED (no still-image consumer) (2026-07-05)
+
+**Context:** Optimisation pass on `raw-converter-tauri/raw-pipeline/src/jxl_lowlevel.rs`
+(branch `jxl-lowlevel-borrow-surface-lepack-20260705`). A multi-pass analysis proposed
+reframing the low-level JXL decoder as a streaming/video surface pump. Landed the grounded,
+real-consumer wins (see below); deferred the architecture because this pipeline decodes
+single stills (RAW→JXL) and has no animation/streaming/wgpu consumer yet. Building the
+session/scheduler now = speculative abstraction.
+
+**LANDED (this branch):**
+- Borrowed progressive surface: `ProgressiveFrame<'a> { rgba: &'a [u8] }` — killed the
+  per-pass `out_buf.clone()` (up to ~full-frame RGBA copy per flush). Sole hot consumer
+  `pipeline.rs::prefill_jxl_lightbox_progressive` clones-then-discards (rgba→rgb8→downscale),
+  so borrow is a pure win. Owned retention now caller-explicit (`rgba.to_vec()`).
+- Metric bug fix: `first_ms.unwrap_or(0.0)` → `unwrap_or(total_ms)`. Non-progressive/
+  final-only files were reporting a false 0.0 ms time-to-first-pixel.
+- FFI hardening: `JxlDecoderSetImageOutBuffer` / `ImageOutBufferSize` failures now fatal
+  (were silently `let _ =`) — an unbound-buffer decode produced meaningless timings.
+- Micro: dropped needless `unsafe fn`/redundant `pf` reassignment/nested `unsafe`
+  (`ptr::read`→`assume_init_read`), `#[inline] ms`, `std::ffi::c_int`.
+
+**DEFERRED (revisit when a consumer exists):**
+- **Temporal-frame model.** `FullImage` is per-displayed-frame, not end-of-stream; both
+  loops break on it. Correct for stills (one frame, then Success), WRONG for animated JXL.
+  Split `FrameComplete` vs `StreamComplete` + frame index only when animated JXL is a use case.
+- **Reusable decode session / RAII `DecoderHandle` / decoder pool** — keep-alive across
+  chunks, reuse scratch buffers. Needs a repeat-decode caller (grid/video); today it's
+  one-shot per file.
+- **Streaming input** — treat `NeedMoreInput` as suspend+resume (ReleaseInput/retain
+  tail/SetInput), `CloseInput` for complete in-memory assets. Needs network/chunk source.
+- **Parallel runner + global thread budget** — `JxlDecoderCreate(null)` = single-threaded;
+  add runner only with a scheduler to avoid oversubscription across grid/prefetch/foreground.
+- **Quality metadata** — replace `is_final: bool` with downsampling-ratio so callers can
+  gate GPU uploads (skip full-res upload for a 1/8 DC preview). Needs a wgpu upload path.
+- **Output-side ROI (scanline callback) + coalescing modes + GPU delta composition** —
+  pre-crop transport before real `SetCropEnabled`/JXTC bindings land (still absent in
+  jpegxl-sys 0.10, per file header).
+- **Emit policy / frame-drop / cancellation** callback control (`Continue/Stop/Skip`) +
+  decode byte limits — needs deadline-driven playback or hostile-input threat model.
+- **RGB8 (drop alpha) / orientation-preserve fast paths** — profile-dependent; RGBA8 is
+  the stable GPU/UI format here.
+
+**Note on flipflop (rule 9):** the clone→borrow change is dead-work removal, not an
+algorithmic A/B — borrow strictly dominates clone-then-discard (fewer allocs + no memcpy),
+so an interleaved timing tournament would be degenerate. Verified via the existing
+`jxl_lowlevel_progressive` integration test (real encode→decode) instead. Per rule 10,
+newer method chosen: strictly better memory+speed, no regression path.
+
+## DECOMPRESS-HOLO: Olympus decompress.rs — deferred follow-ups (2026-07-05)
+
+**Landed (branch `decompress-holo-lz-20260705-q7x`, raw-converter-tauri):** table-free Huffman (12-bit prefix table ≡ unary rule, `clz(prefix)-19`), branchless adaptive width (`32 - carry_lo.leading_zeros()`, exact over all 65 536 carry values × both stability classes), edge/interior kernel split, paired even/odd interior loop with west+north-west held in registers (3 neighbour loads → 1). New `decompress_into(&mut [u16])` for buffer reuse; `decompress()` signature unchanged. Byte-exact vs baseline on 2 real 20 MP ORFs, +17.9% / +19.2% (interleaved A/B flip, B<A 20/20 & 19/20).
+
+**DEFERRED (revisit when a consumer/threat-model exists):**
+- **EOF-error hardening** — `BitReader::fill` still zero-pads past end-of-data (dcraw-faithful). Rejecting truncated streams (return `Truncated`) + a pre-alloc min-bits dimension check + `try_reserve_exact` is a real DoS-hardening item, but it changes the error contract and wants fuzz coverage. Belongs to a dedicated hardening pass, not the perf branch. No perf value.
+- **Zero-fill elimination in the allocating wrapper** — `decompress()` still `vec![0u16; n]` then fully overwrites. Skipping the memset (MaybeUninit / `set_len`) is sound (every pixel written before read, proven) but needs `unsafe` for a marginal gain (~memset of 40 MB ≈ a few % of a ~600 ms decode). The higher-value mechanism — `decompress_into` with a pooled buffer — already exists; adopt that in the pipeline first.
+- **Pipeline adoption of `decompress_into` + bounded frame-buffer pool** — the real memory/throughput win for a batch/video ORF→JXL path is reusing one raw buffer across frames (no per-frame 40 MB alloc+zero). Needs `pipeline.rs` / batch-loop changes (out of the single-file scope). Mechanism is now in place.
+- **Delta-based predictor rewrite** (`dw=w-nw; dn=n-nw; between = (dw^dn)<0 && dw!=0 && dn!=0`) — kept the proven byte-identical ordered-comparison form. The delta form's equivalence was only *claimed*, not verified, and the gain is CPU/compiler-dependent (conditional-move vs branch). Revisit behind its own parity flip if the predictor ever shows up hot.
+- **Direct CFA-plane output mode** — decoding into 4 Bayer planes instead of an interleaved mosaic could drop a later mosaic→plane shuffle in demosaic, but it's an end-to-end decision (interleaved raster stores are very cache-friendly today). Benchmark the whole decode→demosaic→JXL path, not the decoder alone.
+- **Row/strip streaming + frame-level parallelism** — the decoder only needs current-row + row-2 history, so a strip-streaming raw intermediate could cut peak memory from O(w·h) to O(w). Parallelism belongs at the *frame* level (the bitstream is serial; per-row/per-pixel splitting is invalid). Both need demosaic/encoder co-design.
+
+---
+
+## 2026-07-05 — pipeline.rs holographic/genetics audit: deferred architecture
+
+Implemented in branch `pipeline-holo-opt-lepack-20260705-k4z9` (raw-converter-tauri): fused blur+apply (2→1 scratch frame, +42%), 16-bit LUT cache reuse (~17.5 ms/render), u16 byte-budget + channels==0 + zero-dim + downscale-overflow + 13-tap DC-gain fixes, identity-resize fast path. The following audit items were **deferred** — each is API-breaking, cross-crate, or changes the visual/scheduling contract, so it exceeds the single-file (`pipeline.rs`) scope and needs its own benchmark + caller co-design:
+
+- **CompiledLook / worker-owned RenderState renderer** — replace the global `Mutex<HashMap>` LUT cache with persistent per-worker compiled state and split the pre-LUT vs post-LUT cache keys (contrast-only edits shouldn't rebuild pre-LUTs). API + threading redesign spanning lib.rs/wasm/tauri; the current 8-entry Arc cache already covers the still path. Do behind a persistent-renderer entry point.
+- **True RGBA fusion / skip alpha when the encoder takes RGB** — `process_rgba` still builds RGB8 then copies into RGBA8. Real fix duplicates the scalar+parallel+SIMD tone loops 4-wide and needs an encoder-capability signal from the caller. Modest memory gain, large code surface.
+- **Orientation as JXL metadata** — pass EXIF orientation to the encoder instead of rotating pixels at the boundary. Encoder/caller-side (jxl_lowlevel / casabio_encode), not pipeline.rs alone.
+- **Sensor-bit-depth-aware compact pre-LUTs** (4096-entry for 12-bit sensors) — changes LUT topology + indexing; needs source bit depth plumbed through and a quality check on true-16-bit sources.
+- **Luminance-only NR + hue-preserving clarity** — blur one luma plane rather than 3 RGB channels (⅓ the convolution traffic, no chroma bleed). Changes visual output; needs perceptual validation vs the current per-channel behaviour.
+- **Resolution-first previews / linear-space downscale before tone+spatial** — the largest throughput idea (preview ~9% of full-res pixels) but a caller-side scheduling decision; moves where downscale sits in the tauri/wasm pipeline. Note the early pre-LUT `[0,1]` clamp means downscale-first ≠ full-res reference near clipped highlights.
+- **Headroom-aware scene-linear contract** — defer the pre-LUT clamp past the matrix + highlight stages so highlights are recoverable. Alters highlight rendering + embedded-JPEG match; a deliberate reference-pipeline evolution, not a patch.
+- **Tile the whole render graph** (halo-based bounded scratch) + **single-owner parallelism** (avoid nested Rayon across stages) — architecture spanning every stage and a scheduler; large.
+- **Typed colour-domain newtypes** (`CameraLinearRgb16`, `Srgb8`, `OpaqueRgba8`, …) — zero-cost enabler that enforces stage ordering; wide but mechanical, own pass.
+- **Re-evaluate the x86 SIMD tone path** after the above — the vibrance-nonzero SIMD branch (vector→array→scalar→vector) is a regression candidate; needs a native profiling harness.
+- **Temporal render epochs / smoothed auto-WB + exposure across frames** — belongs to a video/batch control layer above pipeline.rs (prevents colour/exposure flicker; also makes neighbouring frames more compressible). `auto_wb_rggb` doc says 4×4 sampling but strides 8 (one RGGB quad per 8×8) — fold into that rework rather than patching in isolation.
+
+## casabio_encode.rs RAW/pyramid hardening — DEFERRED (2026-07-05, branch casabio-encode-hardening-lepack-20260705)
+
+Landed on the branch (correctness + perf, flip-verified): master-derived 16-bit full, sorted/deduped sidecar cascade, sidecars-only RAW ladder (killed a discarded full 8-bit encode), process_rgba skipped when no grid level is requested, and opaque RAW 16-bit levels kept 3ch RGB16 instead of RGBA16 (+43.9% encode time, -0.2% size, byte-identical RGB, drops the RGBA16 master copy + alpha lane — flip: raw-pipeline/examples/rgb16_vs_rgba16_flip.rs). These were deferred:
+
+- **Unsafe progressive frame-option transmute** (`enc.set_frame_option(std::mem::transmute(19i32/13i32), ..)` in encode_one, mirrored at src-tauri/src/pipeline.rs:463) — left as-is. Already tracked in QUESTIONS.md:18 under ADR `unify-jxl-encode-boundary` / BSD jxl-ffi migration; a partial local fix (safe enum, range-validate progressive_dc 0..=2 / group_order 0..=1, propagate the discarded Result) would be churn against the planned encode-boundary rewrite. Do it there, not here.
+- **Box-resampler input hardening** — box_downscale_rgba8/rgba16/rgb16 silently `return` on malformed dims (zero-filling a level that is then happily JXL-encoded); box_downscale_rgba8 lacks the `sw==0||sh==0` guard its rgba16 twin has; no explicit upscale rejection (`dw>sw||dh>sh => Err`); the rgba8 path uses u32 accumulators that could overflow for extreme source→tiny reductions. Converting these to `Result<(), EncodeError>` changes public signatures (box_downscale_rgba16 is pub, WASM-parity) and wants its own error-contract + tests. The correctness fixes (sorted cascade, master-first full) already remove the real upscale call-sites, so this is defense-in-depth, not an active bug.
+- **RGB8 (3ch) grid + variants path** — the ≤1024 grid levels and the RGBA8 variants still expand opaque RAW to 4ch via process_rgba. A 3ch RGB8 path would mirror the RGB16 win at small-level scale, but process_rgba's output contract and downstream (tiling, contenthash dedup) assume RGBA8; needs pipeline co-design. Lower value (small levels dominate neither time nor memory).
+- **resize_rgba borrow** — resize_rgba still `src.to_vec()`s to build the RgbaImage. A borrowed `ImageBuffer<Rgba<u8>, &[u8]>` input would drop that clone but depends on the pinned `image` crate API; needs compile verification. Minor (the full-size variant clone is already gone via Cow).
+- **Video-codec / temporal architecture** (the genetics-lens "4th dimension") — temporal inheritance (keyframe/residual GOP container), streaming `PyramidSink` (write each level out instead of retaining every encoded buffer in RAM), memory-budgeted scheduling (permit by estimated in-flight bytes, not thread count), and sequence-level rate control. The analysis itself notes the temporal layer must live ABOVE this file. Out of single-file scope; an architecture epic gated on a container + sequence-policy layer. Keep each stored frame independently decodable as JXL.
+
+## demosaic.rs holographic/genetics audit — DEFERRED (2026-07-05, branch demosaic-cfaborder-mhcsym-perf-20260705-o48)
+
+Landed on the branch (raw-converter-tauri, correctness + perf, flip-verified): checked w*h*3 output sizing (only w*h was guarded before) + demosaic_rggb_mhc_into now returns Err instead of assert_eq! panic; CFA-aware borders replacing colour-invalid coordinate clamping (bilinear 1px ring + MHC 2px halo now reconstruct a constant-colour mosaic exactly at every edge); symmetric MHC (added the missing B-at-R Laplacian mirroring R-at-B — no new raw loads); MhcKernel::Canonical (true Malvar-He-Cutler 8-filter, gamma=3/4) as a selectable variant for experimentation; and a branch-free, clamp-free, row-offset MHC interior (~45% serial / ~52-55% parallel faster, byte-identical to the clamped path which is retained as a #[cfg(test)] oracle — flip: raw-pipeline/examples/demosaic_flipflop.rs, journal docs/outputs/timing tests/flipflop/demosaic-interior-2026-07-05.md). The following audit items were deferred — none has a current consumer (every caller demosaics a full frame at the RGGB origin), so they build speculative infrastructure ahead of need and each needs its own benchmark + caller co-design:
+
+- **BayerView + DemosaicPlan (stride + CFA-origin phase as first-class data)** — carry input stride, active-area, and (origin_x, origin_y) parity so crops/ROIs/tiles/padded decoder buffers demosaic as zero-copy views. Enables all four Bayer patterns and tiling without a realign copy. Larger API surface spanning dng::align_to_rggb + callers; no current caller passes stride/crop/origin.
+- **All-4-CFA phase-specialised dispatch (drop align_to_rggb copy)** — replace "RGGB-only + realign" with a per-frame (pattern, origin parity) dispatch to red-row/blue-row kernels, so BGGR/GRBG/GBRG never materialise a realigned raw frame. Depends on the phase-plan above.
+- **Tiled / halo-owned parallelism** — 16-32 row tiles with a 2px raw halo emitting only the interior core, instead of per-row Rayon; better 5-row window reuse + coarser work-stealing. Must stay byte-identical to the full-frame result (tile-equivalence test) and be co-scheduled with the JXL encoder's thread budget rather than oversubscribing.
+- **Adaptive per-tile quality with temporal hysteresis** — pick bilinear vs MHC-lite vs canonical per tile from a cheap raw-gradient score, stabilised frame-to-frame to avoid shimmer. Belongs to a video/batch control layer above this file; needs the tile plan + a settled quality kernel first.
+- **Output-layout selection driven by the encoder** — emit planar RGB16 / interleaved / reduced bit-depth / streaming stripes to match what the JXL prep stage consumes, instead of always interleaved RGB16 then transposing downstream. Caller/encoder-capability co-design.
+- **SIMD interior** — only after phase branches, clamps, generic indexing and layout are settled (now done for the scalar interior). Wants the paired-Bayer-cell / planar-lane shape; native + WASM profiled separately.
+- **Bayer-plane representation ("JXL as video" — demosaic at decode)** — deinterleave the mosaic into 4 half-res planes (R, G_mean, G_delta via reversible green lifting, B), compress in the sensor domain with CFA metadata, and demosaic at decode/display. Avoids the 2->6 byte RGB expansion + encode-side demosaic entirely. The largest idea and a whole separate species: needs CFA/black/white/WB/matrix/active-area metadata plumbing, a container + sequence policy, and a quality/compression evaluation. Architecture epic, not a single-file change.
+
+**UPDATE (2026-07-05, same branch):** the "unchecked interior" lever is now LANDED
+(not deferred). Const-generic checked/unchecked flip on the two 20 MP ORFs:
++5.8% / +4.0% median, byte-exact, B<A 17/20 both. Folded to a single unchecked
+`decode_frame` (every index proven < out.len(); SAFETY docs + debug_assert).
+Absolute also dropped ~629→~410 ms on an idle box — the earlier 629 ms was
+machine-load-inflated (cv 9.9→7.4%). Remaining lever: MSVC toolchain build.
+
+## demosaic.rs SIMD interior (Phase-2 #6) — DEFERRED (2026-07-05, branch demosaic-simd-interior-20260705-s1x, off Phase-1 tip)
+
+Landed on the branch (raw-converter-tauri): the Symmetric MHC interior is now vectorised, byte-identical to the scalar oracle (guarded by simd_interior_matches_scalar + mhc_fast_matches_clamped). Native AVX2 (approach A, blend-of-consecutive) via runtime is_x86_feature_detected!("avx2"), behind the `simd` feature, scalar fallback + tail: ~2.3-2.5x serial, +34-50% parallel (20 MP parallel is memory-bandwidth-bound), flip-verified (raw-pipeline/examples/demosaic_flipflop.rs; journal docs/outputs/timing tests/flipflop/demosaic-simd-avx2-2026-07-05.md). wasm SIMD128 (i32x4, bit-exact mirror) added + dispatch wired; compiles clean for wasm32+simd128. Canonical stays scalar. The following were deferred:
+
+- **wasm SIMD128 runtime golden-check** — the wasm path is compile-verified and is a line-by-line transliteration of the native-byte-verified AVX2 kernel (same i32x4 add/sub/arithmetic-shr_s/bitselect zero-extend loads), so it is bit-exact by construction, but it was not executed in a wasm runtime here (raw-pipeline has no wasm-bindgen-test harness). The consuming wasm crate (raw-converter-wasm) should run a byte-equality golden vs the scalar demosaic once, with RUSTFLAGS=-C target-feature=+simd128.
+- **Approach B (256-bit deinterleave-to-phase AVX2)** — deprioritised, not attempted. Removes approach A's ~2x arithmetic waste but needs cross-128-lane permutes (permutevar8x32) for the ±1 neighbour shifts; expected marginal/no gain because the production case (parallel, 20 MP) is already memory-bandwidth-bound. Only worth it if a future compute-bound path (small tiles, serial) dominates. Must stay byte-identical (simd_interior_matches_scalar).
+- **Canonical-kernel SIMD** — Canonical (experimental) stays scalar; vectorise only if it becomes a shipped quality tier.
+
+### Build-wiring recommendation (NOT done — outside demosaic.rs, needs a decision)
+
+To actually activate SIMD in production the `simd` feature must be enabled and, for wasm, simd128 turned on:
+- **Tauri native build**: add `simd` to the enabled features of raw-pipeline (src-tauri dependency). AVX2 is runtime-detected so this is safe on non-AVX2 CPUs (falls back to scalar).
+- **wasm-pack build (Casabio browser)**: build the wasm crate with `RUSTFLAGS=-C target-feature=+simd128` AND enable `simd`. Without +simd128 the wasm SIMD module is cfg'd out and falls back to scalar (correct, just slower). Most 2020+ browsers support wasm SIMD; gate/detect if older browsers must be supported.
+
+## tiff.rs parser — architectural levers surfaced by hardening pass — DEFERRED (2026-07-05, branch perf/tiff-harden-gpsfix-lepack-7a3f2c, raw-converter-tauri)
+
+Context: a full "holographic/genetic" audit of `raw-converter-tauri/raw-pipeline/src/tiff.rs`.
+LANDED this pass (surgical, single-file, byte-safe): GPS inline-ASCII hemisphere fix
+(S/W were mirrored positive), parse_header short-input panic guard, Reader::slice
+overflow-safe reads, bench_decode_orf checked strip slice + checked_mul, thumbnail
+checked/validated/capped, oversized-IFD reject, ASCII 4 KiB cap, GPS zero-denominator
+reject + range-validate, IFD0 fast-path early-exit, and the JPEG-scanner single-pass
+merge (+21%/+56% flip-verified). The following are the larger levers the audit
+identified but that exceed a surgical single-file change (need cross-crate/API decisions):
+
+- **Unified `OrfIndex` / validated container map.** Turn the file from stateless
+  byte-query helpers into ONE validated parse result (endianness, orientation, dims,
+  PreviewSource range, optional RawLayout) that drives orientation/thumbnail/metadata/
+  decode. Removes repeat IFD walks across gallery intake; the single biggest structural win.
+- **Separate metadata parse from RAW-layout validation** (`parse_container_metadata`
+  vs `validate_raw_layout`). Today `parse_orf_metadata` calls full `parse`, which
+  requires valid nonzero strip tags — so a corrupt pixel strip needlessly kills
+  gallery metadata (make/model/date/GPS/thumb).
+- **Zero-copy IFD iterator** replacing `read_ifd -> Vec<IfdEntry>` (validate the
+  count*12 region once, iterate borrowed; drops the per-directory Vec allocations).
+- **Explicit multi-strip rejection.** `as_u32` returns `value_off` for LONG[count>1],
+  so a multi-strip TIFF misparses as single-strip with an array pointer as the offset.
+  Currently *contained* by the new bench strip-bounds guard (OOB → Err, no panic), but
+  should be an explicit `bail!("multiple strips unsupported")` once a strip/tile model exists.
+- **Strict scalar TIFF accessors** (`scalar_u8/u16/u32` validating dtype AND count==1);
+  in particular TIFF BYTE is not decoded for big-endian (GPS altitude ref 0x0005 works
+  on LE by truncation only). Also dedicated `as_srational -> (i32,i32)` — `as_rational`
+  currently accepts SRATIONAL (type 10) but returns unsigned.
+- **`black_level` field is inert** — declared on OrfInfo, never assigned. Parse it from
+  Olympus metadata or make it `Option<u16>` so downstream can't read a false 0.
+- **WB provenance** — legacy RedBalance/BlueBalance, top-level WB_RBLevels, and
+  ImageProcessing WB_RBLevels currently resolve by traversal order (last-tag-wins).
+  Make precedence explicit (ImageProcessing > legacy) via a `WbSource` enum.
+- **MakerNote inner byte-order.** Modern Olympus MakerNote headers carry their own II
+  marker; the nested reader inherits the outer TIFF endianness. Harmless while all ORFs
+  are LE, but a correctness risk if outer≠inner. Needs a legacy/E-system/OM fixture corpus.
+- **Borrowed preview API** (`embedded_preview_slice -> &[u8]`) so native callers decode
+  the embedded JPEG directly from the ORF backing buffer (no copy); WASM chooses its own
+  transfer/copy boundary. `find_embedded_jpeg_range` already returns a `Range`, so the
+  borrow API is one thin wrapper away.
+- **Non-allocating internal `ParseError` enum** — fast helpers format a `String` error
+  only to discard it as `None`/default; format at the public boundary only. Matters on
+  drag-and-drop folders of mixed/partial files.
+- **Preview scheduling split** — header+IFD0+direct-thumbnail-pointer are cheap enough
+  pre-semaphore; the 3 MB fallback JPEG scan and decode belong in a bounded worker queue
+  with cancellation for scrolled-away gallery items.
+- **Streaming/tiled RAW seam** (row/tile decode with a 2-row MHC halo → immediate
+  downscale/emit) to avoid holding full RAW + full RGB16 planes at once. Depends on
+  `crate::decompress` exposing rows/blocks; align tiles to JXL group sizes (VarDCT 256²).
+- **JXL-as-temporal-codec / CFA-planar reframing** (the "genetics" pass): classify ORF
+  bursts from embedded previews (scene-cut/global-motion/changed-area) BEFORE full RAW
+  decode; native JXL multi-frame for low-motion sequences, conventional video for
+  high-motion, still-JXL for singles. Highest upside + highest format/decoder complexity;
+  own-ecosystem territory, benchmark on a real burst corpus before committing.
+
+## dng.rs hardening pass — deferred (2026-07-05, tauri branch perf/dng-landing1-hardening)
+
+Landing 1 (correctness) + Landing 2 (uncompressed row-wise, +74–92%) landed. Deferred:
+
+- **MaybeUninit frame pool** — `decode_bytes` zero-inits `vec![0u16; pixels]` then fully
+  overwrites it. A reusable frame pool + `MaybeUninit<u16>` skips the zeroing memset, but
+  is only sound once *every* successful decode path is proven to write every pixel (edge
+  tiles, partial last band, error unwinds). Needs exhaustive coverage tests first.
+- **Uncompressed strip layout** — `decode_uncompressed` still bails on strip-offset DNGs
+  (tiled only). Implementing strips lets tiled+stripped share one row-oriented band
+  decoder. Doc now states the true limitation.
+- **Metadata bound to raw IFD (M4)** — AsShotNeutral / colour+forward matrices / ISO /
+  make / model / orientation are collected globally on `WalkState` (last-writer-wins by
+  traversal). Safe for standard DNGs (IFD0-carried, walked first) but a preview SubIFD
+  carrying these would clobber. Bind to the chosen `RawIfd` with explicit IFD0 fallback.
+- **`samples_per_pixel==1` invariant (M1)** — `cps` is threaded into `decode_tiles` then
+  discarded (`let _ = cps`). Either validate SPP==1 in the parsed layout or let ljpeg
+  enforce component count; don't carry a dead arg that hides a missing invariant.
+- **`width > 1000` raw-selector heuristic** — crude thumbnail filter; rejects legitimately
+  small raws. Replace with structural selection (NewSubFileType, PhotometricInterpretation,
+  SPP, CFA tags, pixel area) rather than a magic dimension threshold.
+- **IFD cycle/visited set** — `walk_depth` caps recursion depth (8) but has no visited-offset
+  set; cyclic/duplicate SubIFD offsets cause duplicate work + metadata churn. Cheap HashSet.
+- **CFA repeat-pattern validation** — `CFARepeatPatternDim` (0x828D) is ignored; a 2×2 Bayer
+  layout is assumed. Validate and reject non-2×2 explicitly instead of silently assuming.
+- **Sequence/video architecture** — no frame loop exists in `raw-pipeline` today; the
+  sequence-profile / one-owner-of-cores / band-fused DNG→demosaic→JXL pipeline from the
+  analysis is genuine future architecture, not a current bug (stages already run
+  sequentially, each owning rayon in turn — no nested oversubscription exists). See the
+  ORF-side "JXL-as-temporal-codec / CFA-planar reframing" bullet above; same territory.
+
+## ljpeg.rs LJPEG decoder — deferred (2026-07-05, branch ljpeg-hotpath-holo-20260705-h7k, raw-converter-tauri)
+
+Landed this pass: correctness hardening (oversubscribed-DHT / short-segment / category>precision
+/ point-transform-restore / SOS-reorder-reject / truncation-detect), the cps==1 fast8 kernel,
+removal of the eager 512 KB per-tile table zero-fill, and max_bits-sized lookup tables. Deferred
+because each is either measure-only, an API-contract change, or genuine future architecture:
+
+- **Top-aligned bit reservoir.** Keep valid bits in the *high* bits of the u64 so `peek16` is a
+  fixed `>>48` and `consume` drops the per-symbol mask rebuild (`bits &= (1<<nbits)-1`). Sits
+  directly on the serial entropy dependency chain — worth a dedicated native+WASM flip, but a
+  full bitreader rewrite; not folded into a correctness pass.
+- **Bulk 4/8-byte refill.** When the next N bytes contain no 0xFF, append in one op instead of
+  byte-at-a-time; keep the stuffed-byte path for the 0xFF case. Portable bounds-checked first,
+  benchmark before any unsafe unaligned load.
+- **PreparedLjpegPlan / thread-local compiled-DHT cache.** Tiled DNG rebuilds the same Huffman
+  tables + dispatch decision per tile. Cache an immutable compiled plan (Arc<CompiledHuff>,
+  scan_to_component, kernel choice) keyed by header fingerprint; bounded + thread-local, no
+  global lock. Biggest remaining structural win for tile-heavy / sequence workloads.
+- **Compact canonical long-code fallback.** Replace the max_bits lookup entirely with fast8 +
+  min_code/max_code/value_offset arrays scanned only on the rare >8-bit code. Ship only once
+  counters confirm long-code fallback is genuinely rare on the real corpus.
+- **Output-shape kernel split + edge policy.** full-tile vs right-edge (discard-decode the
+  invisible suffix: consume entropy, no predictor write) vs bottom-edge (stop after the last
+  required row in a non-strict mode). Needs an explicit strict-vs-fast decode-policy flag on the
+  public API, so it is a contract change, not a local edit.
+- **DecodeLimits / decoded-sample ceiling.** Bound total decode work so malformed dimensions
+  can't create huge work for a tiny output rect.
+- **Full SOS scan-order support.** Currently *rejected* rather than handled (real DNG/CR2 never
+  reorder). If a reordering stream ever appears, decode entropy in scan order while indexing
+  predictor/output through scan_to_component.
+- **Cold DecodeFault enum + `#[cold]` error ctors** instead of `anyhow::bail!` inside the
+  per-sample primitive — WASM code-size / i-cache. And **feature-gate LJPEG_FORCE_GENERIC** out
+  of production builds (it is an always-compiled atomic today, read once per tile).
+- **Stricter SOF/SOS acceptance:** reject non-1×1 sampling factors, non-zero SOS AC selector,
+  and DRI/restart-interval streams explicitly (today the first restart marker just ends entropy).
+- **JXL-as-temporal-codec sequence layer** — same territory as the ORF-side reframing bullet
+  above; independent .jxl masters as germline, animated/delta JXL as derived product. Future
+  architecture, not a decoder bug.
+
+## src-tauri/src/pipeline.rs — strategic/hologram/genetics analysis pass (2026-07-06, branch fix/tauri-pipeline-rgba16-wire-k7m3q)
+
+Context: strategic + "hologram/dark-room/UV" + genetics-lens review of the Tauri
+orchestration file. The one shippable *in-file* item (P0 RGBA16 wire-packing panic +
+crop checked-arithmetic hardening) was implemented on that branch. Everything below is
+real signal but crosses module/repo boundaries, so it is deferred to an integrator with
+a wider blast radius, not squeezed into a single-file edit.
+
+- **Version the pixel wire header (u16 dims → magic/version/format/u32 dims).** The
+  current 4-byte `u16 w | u16 h` header caps dims at 65535 and encodes no pixel format —
+  the frontend infers RGB8 vs packed-RGBA16 from the command name. Real improvement, but
+  the JS/TS decoder is **not in this repo**; header change must land in lockstep with the
+  web repo. Cross-repo, not a pipeline.rs-local edit. (Code already loud-fails on >u16 dims.)
+- **`mode: String` → `enum ProcessingMode { Full, Lightbox, Thumb }`.** Type-safety so a
+  drifted frontend string can't silently fall back to full materialisation. Touches the
+  serde request contract + every match site; do with the frontend enum change.
+- **Per-image `AtomicU64` render generation** replacing the shared
+  `Arc<Mutex<HashMap<u64,u64>>>` (`look_render_gens`). Removes the global slider-drag lock
+  and stale map entries after eviction; cancellation becomes a cheap atomic compare. Needs
+  the counter to live on the cache entry / `Rgb16State`, i.e. an `AppState` restructure.
+- **Foreground-first scheduling: stop synchronous DC/pyramid prefill racing ingest
+  completion.** Deliver thumb→lightbox first, then background 512/1024, then 2048/full/JXTC.
+  Multi-site (process_file ordering + scheduler); architectural.
+- **Opaque-RAW RGB path (skip RGBA end-to-end).** RAW alpha is always 255 yet the variant
+  machinery builds/resizes RGBA then strips to RGB before encode. Tone RAW straight to RGB8,
+  encode `Frame::rgb`. Spans casabio_encode + pyramid; ~25% off tone/resize/IPC for photos.
+- **Byte-budgeted weighted cache eviction** (vs count-based LRU): full RGB16 masters and
+  64 tiny previews are not equal residents. Spans the cache modules.
+- **PyramidPlan + render-fingerprint key + eliminate encode-then-discard.** Declare the exact
+  output set before rendering; key durable products by source+recipe+ABI+colour-policy+plan
+  instead of path+mtime. Spans casabio_encode / pyramid_store / ingest. (See also the ORF-side
+  pyramid bullets already in this file.)
+- **Split `PipelineParams` into SensorGenome / DevelopRecipe / RenderPolicy.** Slider moves =
+  recipe frame; compact-LUT/fast-demosaic = runtime phenotype. Different cache semantics per
+  layer. Broad refactor across raw-pipeline.
+- **Native↔WASM parity suite.** The Tauri and WASM pipelines have diverged; a fixture harness
+  comparing RGB16/RGB8 checksums, dims/orientation, peak bytes, encode/decode timing, and JXL
+  size would stop an optimisation/fix applying to only one fork. Cross-project infra.
+
+<!-- casabio.rs upload-path holographic review — 2026-07-06 -->
+- **JPEG full variant: lossless transcode instead of decode→re-encode.** `casabio_upload_file`
+  decodes JPEG masters to RGBA then re-encodes the full level lossy (Q85) via `encode_one`.
+  `jxl_native::transcode_jpeg_to_jxl` exists and the main pipeline already uses it (pipeline.rs:1845).
+  Route JPEG full through transcode (lossless, skips the largest encode); decode only for thumb/preview.
+  BLOCKED on an orientation contract: transcode preserves the original JPEG + its EXIF-orientation
+  metadata, while casabio bakes orientation into pixels — consumers must honour one convention, not both.
+  Needs a sidecars-only encoder (encode_variants always emits `full`). Spans casabio + casabio_encode + server contract.
+- **DNG/CR2/NEF decode routing.** `classify_source` tags 20 RAW extensions as `Raw`, but
+  `decode_raw_to_rgba` is ORF-only (tiff::parse + Olympus decompress + `default_olympus`, rejects
+  `compression != 1`) so compressed DNG/CR2/NEF fail with "compression X not supported" and never reach
+  the specialised (faster) DNG/CR2 kernels. Reuse pipeline.rs's multi-format DecodePlan. Correctness + perf. Cross-crate.
+- **Shared `reqwest::Client` in AppState.** `list_expeditions` and the upload path each build a fresh
+  `reqwest::Client::new()`, losing keep-alive/TLS reuse across a bulk upload batch. Hold one Client in
+  AppState. Small AppState edit (lib.rs) — deferred to keep this pass casabio-scoped.
+- **`resize_rgba` double full-frame copy.** casabio_encode.rs `resize_rgba` does `src.to_vec()` per call
+  and is invoked for both thumb and preview → the full source RGBA is copied twice (24 MP ≈ 2×96 MB churn)
+  just to build an `ImageBuffer`. Build one `RgbaImage` once, resize twice from `&img`. raw-pipeline crate; flipflop-able.
+
+### CR2 slice-scatter fix (raw-converter-tauri, cr2/slice-scatter-lepack-20260706) — deferred follow-ups
+
+Context: cr2.rs decoded sliced Canon CR2 (CR2Slices 0xC640) as flat raster → spatially
+scrambled mosaic (confirmed visually on `_MG_1744.CR2`, fixed via dcraw-style band scatter
+fused into the crop). These are the follow-ups intentionally left out of that surgical fix:
+
+- **CR2 one-buffer direct decode (peak memory P1).** The fix keeps two full buffers
+  (`raw_decoded` raster 35.8 MiB + cropped 34.2 MiB), same as before. To drop the raster
+  staging buffer, `ljpeg::decode_tile` would need a sink/callback that writes each sample
+  straight to its scattered sensor position (or a bounded slice-row stripe buffer). Touches
+  the shared ljpeg module (risky) — deferred. flipflop-able: fused-2-buffer vs direct-1-buffer.
+- **CR2 CFA as first-class.** `Cr2Image` has no `cfa` field; the consumer feeds `img.raw`
+  straight into `demosaic_rggb_mhc` assuming RGGB (DNG path calls `align_to_rggb`, CR2 doesn't).
+  The fix preserves RGGB by forcing even crop offsets (correct for the current Canon corpus).
+  General fix: carry `cfa`, shift phase by crop parity instead of forcing even, align like DNG.
+- **CR2 active area from metadata, not centered guess.** Crop offsets are `(full−active)/2`
+  rounded even (left=80, top=30 here). Real Canon margins (SensorInfo) can be asymmetric →
+  a few-px framing / phase error on some bodies. Resolve from Canon SensorInfo.
+- **CR2 body/ISO black+white levels.** Still hardcoded per precision (14→2048/15300, 12→512/4095)
+  and a single green WB coefficient (g2 discarded). Baked into the derived JXL if wrong.
+- **cps=4 CR2 uses the ljpeg generic loop.** `_MG_1744.CR2` is cps=4/prec=14, so the cps==2
+  fast8 kernel never runs on it. A cps==4 monomorphization would speed the dominant (serial
+  Huffman) stage — decode measured ~347 ms best on this file. flipflop-able vs generic.
+
+  - RESOLVED 2026-07-06 (cr2/slice-scatter-lepack-20260706): the one-buffer direct
+    decode landed. `ljpeg::decode_sliced_cr2` fuses decode+scatter+crop via a
+    `SampleSink` (RasterSink keeps DNG/cps2 byte-identical; SliceCropSink does the
+    fused CR2 write). Peak decode memory 70→34 MiB. Flip: byte-identical, ~3.8%
+    slower decode than decode-then-bulk-copy; memory-lean chosen, 2-buffer removed.
+
+## src-tauri/src/pipeline.rs — ChatGPT "hologram/genetics" audit (2026-07-06, branch pipeline-realwins-qz74k)
+
+Two ChatGPT audits proposed a demand-driven rearchitecture of the native Tauri pipeline.
+The three grounded, verifiable wins were taken (see below); the architectural moonshots are
+deferred here — each is multi-file, speculative, and needs its own spec + flipflop gate.
+**Taken this pass:** (1) RGBA16 wire-packing panic — already fixed independently on branch
+`fix/tauri-pipeline-rgba16-wire-k7m3q` (not re-done). (2) channel layout inferred via
+`jxl_source_rgb.len() % 4 == 0` → replaced with the mode-known count returned from
+`process_post_demosaic_for_mode` (thumb=3/full=4); the old heuristic mis-labels any even-area
+RGB8 buffer as RGBA. (3) per-file `local_pool` sized off the `FILE_CONCURRENCY` **const**
+(fixed `.max(2)` → 2 threads regardless of load) → now sizes off the **live** `PrioritySem::max()`
+so `set_concurrency` is honoured and default 12× yields the benchmarked 1 thread/file (de-oversub).
+(4) slider `apply_look_stream` spawned a full render per drag, discarding stale frames only
+after paying render cost → latest-wins coalescer (≤1 render/image, newest pending wins).
+
+Deferred architectural ideas (real, but out of scope for a pipeline.rs-local hardening pass):
+
+- **In-flight singleflight dedup.** Coalesce concurrent decode/resize/JXL-decode requests for
+  the same render fingerprint (thumbnail vs lightbox vs pyramid vs prefill arriving before the
+  first completes) so a source isn't decoded/toned more than once. Highest-value idea; needs a
+  per-image job registry keyed by a render fingerprint. flipflop-able: cold-gallery-open latency
+  + duplicate-decode count with/without the registry.
+- **Output-plan lattice (ThumbOnly / Lightbox / Master / Pyramid).** Replace the `mode` string +
+  independent `skip_jxl`/`include_jxl`/`use_tiled_jxl` flags with an explicit output-dependency
+  graph, and let a thumbnail job be *promoted* to a lightbox/master job instead of restarting
+  from source. Also fixes the latent thumb-mode-3ch-into-encoder fragility structurally (the
+  `src_channels` return is the tactical fix already landed).
+- **Thumb mode truly thumb-only.** `mode="thumb"` still derives the 1800px RGB16 lightbox state,
+  ingests a pyramid, and can pre-encode a lightbox JXL. A genuine gallery-prefetch path would
+  decode at the smallest sensible scale and skip 1800 RGB16 / pyramid / JXL prefill. flipflop-able:
+  first-360px-thumb latency + peak RSS, thumb-only vs current.
+- **Cancellable, priority-bound JXL decode prefill.** After encode, the file synchronously
+  DC-decodes and schedules a full/lightbox JXL prefill for *every* item, off-queue. Gate it to
+  the selected image + viewport neighbourhood, pause under visible/interactive/encode load, cancel
+  on viewport exit. flipflop-able: prefill-jobs-completed vs actually-consumed.
+- **Weighted byte-budget cache + hot/warm/cold tiers.** Today there are ~8 independent 25-entry
+  LRUs (RGB16, lightbox RGB8, thumb, full JXL, lightbox JXL, decoded JXL lightbox, fast-thumb) +
+  a 100-entry subject-crop cache, none byte-budgeted or coordinated by image id. Replace with a
+  weighted per-image bundle evicted by total resident bytes and active/nearby status; demote RGB16
+  after interaction ends, retain compressed JXL. Needs peak-RSS instrumentation first.
+- **Memory-aware self-shrinking RGB16 pool.** `pool::u16_pool()` can retain an unusually large
+  RAW buffer's capacity for the process lifetime (looks like a leak). Add capacity classes, max
+  pooled bytes, idle expiry, and immediate return of outsized (panorama/stitched) buffers.
+- **Stage-aware admission / back-pressure.** The file semaphore caps job *count* but not job
+  *stage*; 12 files can all hit RGB16-heavy or JXL-heavy stages at once (bursty RSS). Bounded
+  per-stage lanes (decode / demosaic / transform / encode / pyramid / prefill) with shared CPU +
+  memory permits, visible work outranking speculation.
+- **Render-provenance (genome) keys.** Content-address artifacts by source hash + decoder/develop/
+  color/encoder revisions + orientation + crop + output size + layout, so caches/disk artifacts are
+  lineage-correct after edits and dedup-able across native/WASM. Prereq for a persistent disk cache
+  of compressed artifacts (thumb / lightbox JXL / master JXL / pyramid tiles — not RGB16).
+- **JXL-as-temporal-container (CASV).** SequenceEncoder distinct from the single-frame Encoder
+  (no `JxlEncoderReset` per frame); start with an all-intra JXL baseline, then measure animated-JXL
+  frame semantics, then a CASV manifest with tile/region inheritance (hold frames + changed tiles +
+  content hashes before any motion estimation). Genuinely large; own project.
+- **Pool-sizing full batch A/B (follow-up to the landed #3 fix).** The live-`sem_max` pool sizing
+  was justified by the existing ORF sweep (12×1 optimum, thread-heavy configs cratered) + removing
+  the const/runtime disconnect, NOT by a fresh end-to-end batch run — the batch `process_file` path
+  isn't cheaply isolable in flipflop (it needs Tauri `State`). Deferred: extend `lightbox_bench.rs`/
+  `strategy_bench.rs` to exercise the real `local_pool` under `PrioritySem` and A/B `.max(1)` vs
+  `.max(2)` vs live-sem at c∈{1,3,6,12}. Expected: parity-or-better at 12×, wins at lowered c.

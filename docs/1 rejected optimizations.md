@@ -1784,3 +1784,98 @@ Update: user asked to attempt it anyway. The filed placement was wrong but a byt
 - **CASA-ENC D1 variant-half / D4(a) / full-res chunked tier + 000-performance-16 (rgb16 clone)** — all landed in the jul02 campaign (commits 0420a240 / 73cd1858 / 8da8e736).
 - **GLUE-003 tiled-decode worker protocol (003.B1-B3)** — NOT dead: `web/lightbox/tiled-decode-worker.js` already speaks the v1 pool protocol (ready/load/decode-reply, bytesId + SAB, `format` param). No rewrite needed.
 - **Scheduler earlyCompleteSession (DS-SINGLEPASS-SLOT-01)** — verified stale: the worker self-stops on header/non-final targets (decode-handler finishSession), so `finish(localEarlyFinish)` frees an idle worker's slot; `completeSession()` (not `cancelSession()`) is correct — a decode_cancel for an already-ended session is dropped by the worker with no ack and would hang the record in "cancelling". Doc comment added; no code change.
+
+## DECOMPRESS-HOLO: Olympus decompress.rs hardening claims — REJECTED as regressions/N-A (2026-07-05)
+
+**Target:** `raw-converter-tauri/raw-pipeline/src/decompress.rs` (`olympus_load_raw` port). Context: a "holographic" analysis pass proposed several hardening changes alongside the perf work. The perf wins (table-free Huffman via clz, branchless adaptive-width via clz, edge/interior split, register-resident W/NW) LANDED byte-exact (+18%, flip-verified). These two hardening claims were rejected:
+
+- **12-bit out-of-range sample rejection** (`if v > 0x0FFF { return Err(OutOfRangeSample) }`). Rejected: dcraw's legacy `olympus_load_raw()` does NOT range-check — it stores `pred + ((diff<<2)|low)` and lets the `ushort` image array mask to 16 bits (exactly our `(v & 0xFFFF) as u16`). Adding a 12-bit gate would reject valid frames whenever the predictor legitimately overshoots then wraps (the algorithm is self-correcting across the row, not per-pixel bounded). It is a correctness regression vs the reference, not a hardening win. The existing `& 0xFFFF` mask is the dcraw-faithful behaviour and is kept.
+- **`raw_width` vs `visible_width` API split** (decode raw stride, store only visible cols). Rejected as not-applicable to this codec. All callers (`pipeline.rs`, `bench.rs`, `casabio.rs`, `tiff.rs`, `lib.rs`) pass `info.width` = TIFF ImageWidth (tag 0x0100), which for ORF IS the encoded raw stride — dcraw's legacy Olympus path has no separate visible-width crop (the `if (col >= width) continue` pattern belongs to a different LibRaw codec). There is no width conflation to fix here; adding a 4th param would be dead complexity rippling through 5 call sites.
+
+## demosaic.rs SIMD interior — approach B (deinterleave-to-phase AVX2) — REJECTED (2026-07-05, branch demosaic-simd-interior-20260705-s1x)
+
+Tried the 256-bit deinterleave-to-phase AVX2 kernel as an alternative to the shipped approach A (blend-of-consecutive). B splits 16 interior cols/chunk into even/odd column streams via AND 0xFFFF (even u16->i32) + srli 16 (odd) — no cross-lane permutes — and computes each phase once on its 8 pixels (no wasted arithmetic, fewer loads/px than A). Implemented and byte-identical to the scalar oracle (simd_interior_matches_scalar extended to B passed).
+
+REJECTED — B does not beat A. 3-way interleaved flipflop (scalar/A/B, warm median): serial B ties A (±1-4%, one noisy 1024^2 outlier); PARALLEL (the production path) B is consistently ~1-4.5% SLOWER than A. Root cause: both kernels are store-bound, not arithmetic-bound — the bottleneck is the per-pixel scalar lane-extract + interleaved-RGB16 u16 write, identical for A and B, so B's arithmetic dedup is invisible. B added ~150 lines of intricate unsafe for zero gain (slight prod regression). Kept A; reverted B (git checkout to the S4 commit). Journal: docs/outputs/timing tests/flipflop/demosaic-simd-approachB-rejected-2026-07-05.md. If a further SIMD lever is ever wanted, it is a VECTORISED interleaved RGB16 store (helps A too), not deinterleave.
+
+## tiff.rs parser — micro-ops rejected as complexity-without-payoff (2026-07-05, branch perf/tiff-harden-gpsfix-lepack-7a3f2c, raw-converter-tauri)
+
+Audit of `raw-converter-tauri/raw-pipeline/src/tiff.rs`. The scanner merge and safety
+fixes landed; these proposed micro-optimisations were rejected — the parser's data is
+tiny and branchy, so the workload does not justify them:
+
+- **SIMD for IFD / TIFF tag parsing.** Directories are a few hundred 12-byte entries of
+  branchy typed reads. SIMD effort belongs in decompress/demosaic/colour/scaling, not here.
+- **HashMap tag lookup.** Directories are tiny and walked once; a linear match over
+  entries beats hashing (build + hash cost dominates for <512 entries).
+- **unsafe unaligned loads / function-pointer endian dispatch.** The `self.le` branch is
+  perfectly predictable; replacing bounds-checked `slice()` + `from_*_bytes` with unsafe
+  loads trades the (now overflow-safe) trust boundary for no measurable gain.
+- **Multithreading the JPEG fallback scanner.** Per-file work is a single ≤3 MB linear
+  pass (now single-pass, no alloc); thread spin-up costs more than it saves. Parallelise
+  ACROSS files with bounded concurrency instead — which is a scheduler concern, not tiff.rs.
+
+## ljpeg.rs LJPEG decoder — micro-ops rejected (2026-07-05, branch ljpeg-hotpath-holo-20260705-h7k, raw-converter-tauri)
+
+Landed the fast8 cps==1/cps==2 kernels, max_bits-sized tables, and correctness hardening.
+These further proposals were rejected — the decoder's bottleneck is a strictly serial
+Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tricks:
+
+- **Inner-loop SIMD / multithreading the predictor.** Predictor-1 reconstruction is serial
+  (each sample depends on its left neighbour) and Huffman codes are variable-length; there is
+  no independent lane to fill. Parallelism belongs one level up — independent DNG tiles and
+  frames — where it already lives (par_chunks_mut over tile-rows). Measured cps2 win came from
+  fast8 + register-residency, not vectorisation.
+- **Packed u32 store of two u16 samples.** Possible for the cps==2 layout, but the store is not
+  the bottleneck — entropy decode is — so it would not move wall time, and it complicates the
+  edge-clipping guards. Below the noise floor.
+- **Precision-specialised kernel family (c1_p12, c1_p14, …).** Once base_pred and the point
+  transform are resolved, precision is out of the per-sample arithmetic already; monomorphising
+  on it only bloats code size (bad for WASM) for no per-sample saving. One runtime cps==1 kernel
+  captures the value.
+- **unsafe pointer arithmetic in the sample loop.** The safe bounded row-slice / register-chain
+  form already lets the compiler elide bounds checks on the hot path; trading the memory-safety
+  boundary for no measured gain is not justified in a decoder that parses untrusted input.
+
+## src-tauri/src/pipeline.rs — analysis pass (2026-07-06, branch fix/tauri-pipeline-rgba16-wire-k7m3q)
+
+- **"Make `pack_rgb_response_arc` truly zero-copy" (copy_within / cache header-prefixed
+  buffer).** The Tauri `ipc::Response` takes one contiguous `Vec<u8>` laid out as
+  `[u16 w | u16 h | body]`; a `Vec` cannot prepend a 4-byte header without shifting the
+  whole payload, and `copy_within` would still memmove the entire frame. The existing
+  `Arc::try_unwrap` fast path already removes the refcount **clone**; `out.append(&mut body)`
+  then moves the body elements exactly once, which is the minimum given the API. The only way
+  to avoid that move is to reserve 4 leading header bytes when the buffer is *first* allocated
+  (upstream, cross-module) for a speculative, unmeasured win. Rejected as a pipeline.rs-local
+  micro-op — the comment claiming "zero-copy" overstates it, but no faster correct form exists here.
+- **Drop the per-row bounds check in `crop_rgba16_packed` for branch-prediction.** After the new
+  single upfront `packed.len() == src_w×src_h×8` validation the per-row `end > packed.len()`
+  guard is provably redundant, but `copy_from_slice` (a memcpy) dominates each row — the branch
+  is far below the noise floor and removing it trades a defensive guard on IPC-facing decode
+  output for no measurable gain. Kept the guard; no flipflop warranted (correctness-only change).
+
+## src-tauri/src/pipeline.rs — ChatGPT "hologram/genetics" audit (2026-07-06, branch pipeline-realwins-qz74k)
+
+- **"24 Rayon workers defeat the measured 12×1 ORF optimum" (change `.max(2)` → `.max(1)` on the
+  encoder threads).** Rejected as a misdiagnosis: it conflates two independent thread budgets. The
+  **libjxl encoder** threads are `(cores / FILE_CONCURRENCY).max(1)` (pipeline.rs ~L455) and already
+  match the documented 12×1 optimum. The `.max(2)` is a *separate* Rayon `local_pool` for
+  decode/demosaic/tone, not the encoder. So the specific claim ("defeats the 12×1 encode optimum")
+  is false. The real sub-issue — the pool sized off the compile-time `FILE_CONCURRENCY` **const**,
+  ignoring `set_concurrency` (fixed 2 threads/file at any load) — WAS valid and is fixed by sizing
+  off the live `PrioritySem::max()` (default 12× → 1 thread/file; lower c widens t). Accepted the
+  real fix, rejected the framing.
+- **"Typed `PixelFrame { pixels, width, height, layout }` + versioned pixel-response format with
+  channel count / sample type" to fix the `len() % 4` channel inference.** Rejected as
+  over-engineering for this pass. `process_post_demosaic_for_mode` already *knows* the layout
+  (thumb→`process`=RGB8/3, full→`process_rgba`=RGBA8/4); returning that `usize` and threading it to
+  the three encode-site call spots removes every `len() % 4` guess with zero perf cost and no wire/
+  API churn. A full typed-frame + versioned-response refactor touches the frontend wire decoder
+  (out of this repo) and many call sites — deferred to the output-plan-lattice work
+  (see Questions_deferred.md), not done speculatively here.
+- **"`skip_jxl` should be derived from `mode` / thumb mode should force skip_jxl."** Not taken as a
+  behavioural change. `mode` and `skip_jxl` are intentionally independent flags; coupling them is a
+  scheduling-policy decision that belongs to the deferred output-plan lattice, not a correctness fix.
+  The latent hazard it guarded against (thumb-mode 3ch buffer reaching the encoder, mislabelled 4ch)
+  is instead removed at the root by the `src_channels` return, which is correct under *any* mode/flag
+  combination.
