@@ -235,6 +235,59 @@ pub unsafe fn ssim_moments_avx2_cal(
         a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_avx2_cal: a.len() and b.len() must be >= np*4"
     );
+    // Pixel-band parallelism: the moments are u64 INTEGER sums, so any band
+    // split reduces to the exact same totals (integer addition is associative
+    // and commutative — unlike the f32 kernels, bit-exactness is unconditional,
+    // not an op-order argument). Bands are read-only map tasks reduced by
+    // element-wise add; no shared mutable state. Gated ≥2M px (bench:
+    // examples/ssim_moments_mt_flip.rs); small compares stay serial.
+    #[cfg(feature = "parallel")]
+    {
+        const BAND_PX: usize = 1 << 20;
+        if np >= SSIM_PAR_MIN_PIXELS {
+            use rayon::prelude::*;
+            let bands = np.div_ceil(BAND_PX);
+            return (0..bands)
+                .into_par_iter()
+                .map(|k| {
+                    let p0 = k * BAND_PX;
+                    let p1 = (p0 + BAND_PX).min(np);
+                    // SAFETY: avx2 verified by the dispatching caller (same
+                    // contract as the enclosing #[target_feature] fn).
+                    unsafe { ssim_moments_band_avx2(a, b, p0, p1) }
+                })
+                .reduce(
+                    || ([0u64; 3], [0u64; 3], [0u64; 3]),
+                    |(mut sa, mut saa, mut sab), (xa, xaa, xab)| {
+                        for c in 0..3 {
+                            sa[c] += xa[c];
+                            saa[c] += xaa[c];
+                            sab[c] += xab[c];
+                        }
+                        (sa, saa, sab)
+                    },
+                );
+        }
+    }
+    ssim_moments_band_avx2(a, b, 0, np)
+}
+
+/// Engage the parallel SSIM-moments pass only at ≥2M pixels.
+#[cfg(feature = "parallel")]
+const SSIM_PAR_MIN_PIXELS: usize = 1 << 21;
+
+/// Channel-as-lane moment sums over the pixel range `[p0, p1)` — exactly the
+/// original `ssim_moments_avx2_cal` loop with band bounds (2-px vector groups,
+/// FLUSH-drained i32 lanes, scalar tail for an odd trailing pixel).
+///
+/// SAFETY: caller guarantees avx2 and `a.len()/4 >= p1 && b.len()/4 >= p1`.
+#[target_feature(enable = "avx2")]
+unsafe fn ssim_moments_band_avx2(
+    a: &[u8],
+    b: &[u8],
+    p0: usize,
+    p1: usize,
+) -> ([u64; 3], [u64; 3], [u64; 3]) {
     let mut sa = [0u64; 3];
     let mut saa = [0u64; 3];
     let mut sab = [0u64; 3];
@@ -244,8 +297,8 @@ pub unsafe fn ssim_moments_avx2_cal(
     // Each i32 lane gains ≤255² per iter; drain at 32000 (< 33025 i32 ceiling).
     const FLUSH: usize = 32000;
     let mut fc = 0usize;
-    let groups = np / 2;
-    let mut p = 0usize;
+    let groups = (p1 - p0) / 2;
+    let mut p = p0;
     let mut g = 0usize;
     while g < groups {
         let off = p * 4;
@@ -273,7 +326,7 @@ pub unsafe fn ssim_moments_avx2_cal(
     drain8_rgb(vaa, &mut saa);
     drain8_rgb(vab, &mut sab);
     let mut j = p * 4;
-    while p < np {
+    while p < p1 {
         for c in 0..3 {
             let x = a[j + c] as u64;
             let y = b[j + c] as u64;
@@ -964,6 +1017,23 @@ mod reduction_tests {
             return;
         }
         let np = 1000usize + 1; // odd → exercise the 2-px-group scalar tail
+        let a: Vec<u8> = (0..np * 4).map(|i| (i * 13 % 255) as u8).collect();
+        let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
+        let want = unsafe { ssim_moments_avx2(&a, &b, np) };
+        let got = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
+        assert_eq!(want, got);
+    }
+
+    /// Same oracle check at a pixel count crossing SSIM_PAR_MIN_PIXELS (2M), so
+    /// under the default `parallel` feature this exercises the band map-reduce
+    /// path (3 bands incl. a partial last band + odd trailing pixel) and proves
+    /// it exactly equal to the scalar walk (u64 integer sums — unconditional).
+    #[test]
+    fn ssim_moments_cal_parallel_bands_match_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let np = (1usize << 21) + (1 << 19) + 1; // 2.62M px, odd
         let a: Vec<u8> = (0..np * 4).map(|i| (i * 13 % 255) as u8).collect();
         let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
         let want = unsafe { ssim_moments_avx2(&a, &b, np) };
