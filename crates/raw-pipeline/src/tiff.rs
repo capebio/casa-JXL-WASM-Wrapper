@@ -472,6 +472,17 @@ fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
 }
 
 fn parse_header(data: &[u8]) -> Result<(bool, u32)> {
+    // Guard here so every caller (including the fast pre-semaphore orientation
+    // helpers `parse_orientation` / `parse_orientation_and_dims`, which skip
+    // their own length check) is panic-safe on truncated input. A valid TIFF/ORF
+    // header is 8 bytes (4-byte magic + 4-byte IFD0 offset); real files always
+    // exceed this, so this is behavior-neutral for valid input. Ported from the
+    // old-lineage `tiffharden` win (holo 3748646) — the only new effect is turning
+    // an out-of-bounds slice panic into a clean `Err` (matters for the WASM path,
+    // where a panic aborts). S1 holo port; keeps the original no-panic proof gate.
+    if data.len() < 8 {
+        bail!("file too small ({}B)", data.len());
+    }
     let magic = &data[0..4];
     let le = match magic {
         b"IIRO" | b"IIRS" | b"IIUS" => true,
@@ -1272,4 +1283,36 @@ pub fn bench_tone_stage_3way_orf(data: &[u8]) -> Result<(f64, f64, f64)> {
     let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
     let params = crate::pipeline::PipelineParams::default_olympus();
     Ok(crate::pipeline::bench_tone_stage_3way(&rgb16, &params))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // S1 holo port (from old-lineage `tiffharden`, commit 3748646): the fast
+    // pre-semaphore orientation helpers call `parse_header`, which used to index
+    // `data[0..4]` unguarded and panic on truncated input. The guard turns that
+    // into a clean default return. These are the win's original proof gate.
+    #[test]
+    fn parse_orientation_short_input_no_panic() {
+        assert_eq!(parse_orientation(&[]), 1);
+        assert_eq!(parse_orientation(&[0x49]), 1);
+        assert_eq!(parse_orientation(&[0x49, 0x49, 0x2A]), 1);
+    }
+
+    #[test]
+    fn parse_orientation_and_dims_short_input_no_panic() {
+        assert_eq!(parse_orientation_and_dims(&[]), (1, 0, 0));
+        assert_eq!(parse_orientation_and_dims(&[0x49, 0x49]), (1, 0, 0));
+        assert_eq!(parse_orientation_and_dims(&[0x49, 0x49, 0x2A, 0x00]), (1, 0, 0));
+    }
+
+    // Valid 8-byte headers must still parse (guard is behavior-neutral above the
+    // 8-byte floor): little-endian standard TIFF magic + IFD0 offset = 8.
+    #[test]
+    fn parse_header_min_valid_len_ok() {
+        // II*\0 magic, IFD0 offset = 8 (LE). Exactly 8 bytes — must not be rejected.
+        let hdr = [0x49u8, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
+        assert!(parse_header(&hdr).is_ok());
+    }
 }
