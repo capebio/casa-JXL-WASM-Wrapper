@@ -456,7 +456,7 @@ fn run_video_mode(args: &[String]) -> ! {
     // format, no audio yet). Lossy skip=none stays invalid (VarDCT residual is broken).
     let streaming_capable = (matches!(rate, VideoRate::Lossy(_))
         && !matches!(skip, SkipMode::None))
-        || (matches!(rate, VideoRate::Lossless) && matches!(skip, SkipMode::None));
+        || (matches!(rate, VideoRate::Lossless) && !matches!(skip, SkipMode::Tile));
     if !streaming_capable {
         let frames = drain_all(&mut src, probed);
         let n = frames.len();

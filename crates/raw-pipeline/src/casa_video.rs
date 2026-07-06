@@ -848,8 +848,9 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
     if !lossless && matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
-    if lossless && !matches!(opts.skip, SkipMode::None) {
-        // Only whole-frame residual is wired for streaming lossless so far.
+    if lossless && matches!(opts.skip, SkipMode::Tile) {
+        // Lossless tile (residual atlas) streaming is a follow-up; None (whole-frame
+        // residual) and Bbox (residual crop) are wired.
         return Err(VideoError::Unsupported);
     }
     let enc_threads = resolve_enc_threads();
@@ -1035,22 +1036,58 @@ fn encode_stream_frame(
         return Ok(0);
     }
     if ctx.lossless {
-        // K5 lossless P-frame: whole-frame additive 16-bit residual vs the previous
-        // SOURCE frame (byte-identical to the batch `encode_residual16` payload —
-        // `encode_casv_delta_rgb8`). No REPLACE flag: the decoder ADDS the residual
-        // (`apply_pframe` whole-frame path). Drift-free because a lossless decode
-        // reproduces the source exactly, so encoder-side source == decoder-side prev.
-        let n = px.len();
-        ctx.resid16.clear();
-        ctx.resid16.reserve(n);
-        ctx.resid16.extend(
-            px.iter()
-                .zip(prev_src)
-                .map(|(&c, &p)| ((c as i32 - p as i32) + 32768) as u16),
-        );
-        ctx.enc
-            .encode_into(&Frame::rgb(ctx.resid16.as_slice(), width, height), payload)?;
-        return Ok(CASV_PFRAME_FLAG);
+        // K5 lossless P-frame: additive 16-bit residual vs the previous SOURCE frame
+        // (NO REPLACE flag — the decoder ADDS the residual via `apply_pframe`).
+        // Drift-free because a lossless decode reproduces the source exactly, so
+        // encoder-side source == decoder-side prev. Payloads are byte-identical to
+        // the batch tiers (`encode_casv_delta_rgb8` / `_bbox`).
+        let (width_us, run_full) = (width as usize, px.len());
+        match ctx.skip {
+            SkipMode::Bbox => {
+                // Exact changed rect (lossless skipping is always exact), residual crop.
+                match changed_bbox(px, prev_src, width, height) {
+                    None => {
+                        // No change → 4 zero u16 markers (matches the batch bbox path).
+                        for _ in 0..4 {
+                            payload.extend_from_slice(&0u16.to_le_bytes());
+                        }
+                    }
+                    Some((x, y, bw, bh)) => {
+                        let run = bw as usize * 3;
+                        ctx.resid16.clear();
+                        ctx.resid16.reserve(bh as usize * run);
+                        for row in 0..bh as usize {
+                            let base = ((y as usize + row) * width_us + x as usize) * 3;
+                            for k in 0..run {
+                                let c = px[base + k] as i32;
+                                let p = prev_src[base + k] as i32;
+                                ctx.resid16.push(((c - p) + 32768) as u16);
+                            }
+                        }
+                        payload.extend_from_slice(&(x as u16).to_le_bytes());
+                        payload.extend_from_slice(&(y as u16).to_le_bytes());
+                        payload.extend_from_slice(&(bw as u16).to_le_bytes());
+                        payload.extend_from_slice(&(bh as u16).to_le_bytes());
+                        ctx.enc
+                            .encode_into(&Frame::rgb(ctx.resid16.as_slice(), bw, bh), payload)?;
+                    }
+                }
+                return Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG);
+            }
+            // SkipMode::None (Tile is rejected in stream_ctx for lossless).
+            _ => {
+                ctx.resid16.clear();
+                ctx.resid16.reserve(run_full);
+                ctx.resid16.extend(
+                    px.iter()
+                        .zip(prev_src)
+                        .map(|(&c, &p)| ((c as i32 - p as i32) + 32768) as u16),
+                );
+                ctx.enc
+                    .encode_into(&Frame::rgb(ctx.resid16.as_slice(), width, height), payload)?;
+                return Ok(CASV_PFRAME_FLAG);
+            }
+        }
     }
     if matches!(ctx.skip, SkipMode::Tile) {
         let t = ctx.tile.max(1);
@@ -3233,6 +3270,70 @@ mod tests {
     }
 
     #[test]
+    fn streaming_lossless_bbox_decodes_to_source_byte_exact() {
+        // Localized motion: only a small rect changes each frame, so the bbox
+        // residual path (Some) is exercised, plus an identical frame for the
+        // no-change marker path (None). Lossless ⇒ every frame reconstructs exactly.
+        let (w, h) = (64u32, 48u32);
+        let wus = w as usize;
+        let base = gradient(w, h, 0);
+        let paint = |f: &mut [u8], r: u8, g: u8, b: u8| {
+            for row in 0..8usize {
+                for col in 0..10usize {
+                    let i = ((10 + row) * wus + (12 + col)) * 3;
+                    f[i] = r;
+                    f[i + 1] = g;
+                    f[i + 2] = b;
+                }
+            }
+        };
+        let mut f1 = base.clone();
+        paint(&mut f1, 200, 40, 10);
+        let mut f2 = base.clone();
+        paint(&mut f2, 20, 180, 90);
+        // f3 == f2 → changed_bbox None → zero-marker P-frame.
+        let frames: Vec<Vec<u8>> = vec![base.clone(), f1, f2.clone(), f2];
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: 4, // frame 0 = I, frames 1..3 = bbox P-frames
+            skip: SkipMode::Bbox,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        };
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let bytes = encode_casv_video_streaming(&mut src, &opts).expect("streaming lossless bbox");
+        let decoded = decode_casv_all_rgb8(&bytes).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "bbox frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_tile_still_rejected() {
+        // Lossless tile (residual atlas) streaming is a documented follow-up.
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: 2,
+            skip: SkipMode::Tile,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        };
+        assert!(matches!(stream_ctx(32, 32, &opts), Err(VideoError::Unsupported)));
+    }
+
+    #[test]
     fn streaming_lossy_still_rejects_skip_none() {
         // Lossy whole-frame residual through VarDCT is broken — must stay rejected.
         let opts = CasaVideoOptions {
@@ -5109,7 +5210,9 @@ mod tests {
             );
         }
 
-        // Unsupported tier rejected.
+        // Unsupported tier rejected. (Lossless bbox/none now stream — K5 — so the
+        // still-unsupported streaming case is lossless TILE, the residual-atlas
+        // follow-up.)
         let mut fs3 = VecFrames {
             frames: low_motion(w, h, 2),
             i: 0,
@@ -5118,6 +5221,7 @@ mod tests {
         };
         let bad = CasaVideoOptions {
             rate: VideoRate::Lossless,
+            skip: SkipMode::Tile,
             ..opts
         };
         assert!(matches!(
