@@ -286,7 +286,7 @@ pub fn ssim_moments_wasm(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], 
     // assert! (not debug_assert!) to match ssim_moments_avx2 — a short buffer would
     // OOB the v128_load32_zero in a release WASM build (silent UB).
     assert!(
-        a.len() >= np * 4 && b.len() >= np * 4,
+        a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_wasm: a.len() and b.len() must be >= np*4"
     );
     let mut sa = [0u64; 3];
@@ -347,7 +347,7 @@ pub fn pixels_to_xyb_wasm(
     // builds are the primary production target and must be guarded so OOB reads via
     // get_unchecked are a defined panic, not silent UB in WASM linear memory.
     assert!(
-        px.len() >= n * 4 && x.len() >= n && y.len() >= n && b.len() >= n,
+        px.len() / 4 >= n && x.len() >= n && y.len() >= n && b.len() >= n,
         "pixels_to_xyb_wasm: px shorter than n*4 or an output plane shorter than n"
     );
     let half = f32x4_splat(0.5);

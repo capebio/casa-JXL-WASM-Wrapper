@@ -232,7 +232,7 @@ pub unsafe fn ssim_moments_avx2_cal(
     np: usize,
 ) -> ([u64; 3], [u64; 3], [u64; 3]) {
     assert!(
-        a.len() >= np * 4 && b.len() >= np * 4,
+        a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_avx2_cal: a.len() and b.len() must be >= np*4"
     );
     let mut sa = [0u64; 3];
@@ -304,7 +304,7 @@ pub unsafe fn ssim_moments_avx2(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u6
     // buffer would otherwise index-OOB with no descriptive message. No-op for
     // the sized caller.
     assert!(
-        a.len() >= np * 4 && b.len() >= np * 4,
+        a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_avx2: a.len() and b.len() must be >= np*4"
     );
     // Scalar-clean deinterleave is hard to beat for correctness here; use a
@@ -356,7 +356,7 @@ pub unsafe fn pixels_to_xyb_avx2(
     // bulk storeu writes index up to n-1, so a short px / x / y / b would be an
     // OOB read/write (UB). No-op for the sized caller; defined panic otherwise.
     assert!(
-        px.len() >= n * 4 && x.len() >= n && y.len() >= n && b.len() >= n,
+        px.len() / 4 >= n && x.len() >= n && y.len() >= n && b.len() >= n,
         "pixels_to_xyb_avx2: px.len() must be >= n*4 and x/y/b len >= n"
     );
     let half = _mm256_set1_ps(0.5);
@@ -443,7 +443,7 @@ pub unsafe fn pixels_to_xyb_avx2_scalar_lut(
     b: &mut [f32],
 ) {
     assert!(
-        px.len() >= n * 4 && x.len() >= n && y.len() >= n && b.len() >= n,
+        px.len() / 4 >= n && x.len() >= n && y.len() >= n && b.len() >= n,
         "pixels_to_xyb_avx2_scalar_lut: px.len() must be >= n*4 and x/y/b len >= n"
     );
     let half = _mm256_set1_ps(0.5);

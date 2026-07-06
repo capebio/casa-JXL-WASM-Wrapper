@@ -153,7 +153,7 @@ pub unsafe fn pixels_to_xyb_avx512(
     // to n-1. Use assert! (not debug_assert!) to match avx2.rs:210-213 — release
     // builds must be guarded so OOB via get_unchecked is a defined panic, not UB.
     assert!(
-        px.len() >= n * 4 && x.len() >= n && y.len() >= n && b.len() >= n,
+        px.len() / 4 >= n && x.len() >= n && y.len() >= n && b.len() >= n,
         "pixels_to_xyb_avx512: px or an output plane is shorter than required for n"
     );
     let half = _mm512_set1_ps(0.5);
@@ -249,7 +249,7 @@ pub unsafe fn ssim_moments_avx512(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [
     // assert! (not debug_assert!) to match ssim_moments_avx2 — a short buffer would
     // OOB the 128-bit load below in a release build (silent UB).
     assert!(
-        a.len() >= np * 4 && b.len() >= np * 4,
+        a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_avx512: a.len() and b.len() must be >= np*4"
     );
     let mut sa = [0u64; 3];
