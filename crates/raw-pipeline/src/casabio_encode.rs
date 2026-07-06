@@ -1134,7 +1134,7 @@ fn box_downscale_rgba8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh
 /// the alpha plane's averaging+store (≈25% of the inner-loop traffic) and, paired with the
 /// pyramid's RGB-native path, the per-level strip allocation. Proven equal across sizes in
 /// `examples/box_downscale_rgb_parity_flip.rs`.
-fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) -> bool {
+pub(crate) fn box_downscale_rgb8(src: &[u8], sw: u32, sh: u32, dst: &mut [u8], dw: u32, dh: u32) -> bool {
     if dw == 0 || dh == 0 {
         return false;
     }

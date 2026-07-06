@@ -31,6 +31,7 @@ use raw_pipeline::casa_video::{
     VideoFrameSource, VideoRate,
 };
 use raw_pipeline::jxl_casaencoder::EncodeOptions;
+use raw_pipeline::raw_video::{RawVideoLook, RawVideoSource};
 
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("casv_encode: {msg}");
@@ -494,6 +495,118 @@ fn run_video_mode(args: &[String]) -> ! {
     std::process::exit(0);
 }
 
+/// RAW time-lapse mode: encode a sequence of RAW stills (ORF/DNG/CR2) directly into
+/// a `.casv`, no ffmpeg. Frames are decoded on demand with a fixed neutral look and
+/// downscaled to the target dims — peak ≈ one full-res RGB8 transient + 2 ping-pong.
+///
+/// ```text
+/// casv_encode --raw-frames <out> <fps_num> <fps_den> <rate> <distance> <effort> \
+///             <gop> <skip> <tile> <thresh|auto> <dim> <file...>
+///   rate = lossy | lossless        skip = none | bbox | tile
+///   dim  = <max_px> | exact        thresh = 0..255 | auto
+/// ```
+/// (Look is neutral in the CLI; programmatic callers pass a full `RawVideoLook` to
+/// `RawVideoSource::new`.)
+fn run_raw_frames_mode(args: &[String]) -> ! {
+    // args[0] == "--raw-frames"; args[12..] = RAW files
+    if args.len() < 13 {
+        fail("usage: casv_encode --raw-frames <out> <fps_num> <fps_den> <rate> <d> <e> <gop> <skip> <tile> <thresh|auto> <dim> <file...>");
+    }
+    let out_casv = &args[1];
+    let fps_num: u32 = args[2].parse().unwrap_or_else(|_| fail("bad fps_num"));
+    let fps_den: u32 = args[3].parse().unwrap_or_else(|_| fail("bad fps_den"));
+    let distance: f32 = args[5].parse().unwrap_or_else(|_| fail("bad distance"));
+    let effort: u8 = args[6].parse().unwrap_or_else(|_| fail("bad effort"));
+    let gop: u32 = args[7].parse().unwrap_or_else(|_| fail("bad gop"));
+    let skip = match args[8].as_str() {
+        "bbox" => SkipMode::Bbox,
+        "tile" => SkipMode::Tile,
+        "none" | "0" => SkipMode::None,
+        other => fail(format!("bad skip '{other}'")),
+    };
+    let tile: u32 = args[9].parse().unwrap_or(32).max(8);
+    let thresh: Option<u8> = if args[10] == "auto" {
+        None
+    } else {
+        Some(args[10].parse().unwrap_or_else(|_| fail("bad thresh")))
+    };
+    let max_px: Option<u32> = if args[11] == "exact" {
+        None
+    } else {
+        Some(args[11].parse().unwrap_or_else(|_| fail("bad dim (expected <max_px> | exact)")))
+    };
+    let files: Vec<std::path::PathBuf> = args[12..].iter().map(std::path::PathBuf::from).collect();
+    if files.is_empty() {
+        fail("no RAW files supplied");
+    }
+    let total = files.len();
+
+    let rate = match args[4].as_str() {
+        "lossless" => VideoRate::Lossless,
+        _ => VideoRate::Lossy(distance),
+    };
+    let opts = CasaVideoOptions {
+        rate,
+        gop_len: gop.max(1),
+        skip,
+        tile,
+        effort: effort.clamp(1, 10),
+        thresh: Some(thresh.unwrap_or_else(|| default_thresh_for_distance(distance))),
+        rate_control: None,
+    };
+
+    // Neutral look; scene-cut disabled (opt-in). Programmatic callers pass a full look.
+    progress("decode", 0, total);
+    let mut src = RawVideoSource::new(
+        files,
+        RawVideoLook::default(),
+        0.0,
+        fps_num.max(1),
+        fps_den.max(1),
+        max_px,
+        None,
+    )
+    .unwrap_or_else(|e| fail(format!("raw source: {e}")));
+    let (w, h) = src.dims();
+
+    // Streaming lossy bbox/tile: fused decode+encode, ~2 frames + band resident.
+    // Lossless / skip=none route through the batch dispatcher (all frames resident —
+    // the memory win is lost for those tiers; documented).
+    let streaming_capable =
+        matches!(rate, VideoRate::Lossy(_)) && !matches!(skip, SkipMode::None);
+    let bytes = if streaming_capable {
+        progress("encode", 0, total);
+        let r = encode_casv_video_streaming_with_audio_progress(
+            &mut src,
+            &opts,
+            None,
+            &mut |done| progress("encode", done, total),
+        );
+        // A mid-stream decode failure ends the pull early (the trait can't error);
+        // surface it instead of silently truncating the video.
+        if let Some(err) = src.take_error() {
+            fail(format!("raw frame decode: {err}"));
+        }
+        r.unwrap_or_else(|e| fail(format!("encode failed: {e:?}")))
+    } else {
+        let frames = drain_all(&mut src, total);
+        if let Some(err) = src.take_error() {
+            fail(format!("raw frame decode: {err}"));
+        }
+        let n = frames.len();
+        progress("encode", 0, n);
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let b = encode_casv_video(&refs, w, h, fps_num.max(1), fps_den.max(1), &opts)
+            .unwrap_or_else(|e| fail(format!("encode failed: {e:?}")));
+        progress("encode", n, n);
+        b
+    };
+
+    std::fs::write(out_casv, &bytes).unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
+    println!("OK {} {}", bytes.len(), out_casv);
+    std::process::exit(0);
+}
+
 /// Decode one PNG frame to interleaved RGB8, or exit with a message.
 fn decode_png_rgb(png: &[u8]) -> Vec<u8> {
     image::load_from_memory(png)
@@ -509,6 +622,10 @@ fn main() {
 
     if args.first().map(|s| s.as_str()) == Some("--video") {
         run_video_mode(&args);
+    }
+
+    if args.first().map(|s| s.as_str()) == Some("--raw-frames") {
+        run_raw_frames_mode(&args);
     }
 
     if args.len() < 11 {

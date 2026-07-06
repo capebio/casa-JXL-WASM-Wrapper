@@ -129,6 +129,8 @@ pub enum VideoError {
     Unsupported,
     #[error("sink write failed")]
     Io,
+    #[error("raw decode: {0}")]
+    Raw(String),
 }
 
 /// Parsed 32-byte CasaVideo header.
@@ -744,6 +746,14 @@ pub trait VideoFrameSource {
             None => false,
         }
     }
+    /// Whether the source requests that the frame just filled by `next_frame_into`
+    /// be encoded as an I-frame regardless of the GOP schedule (e.g. a detected
+    /// scene cut). Read AFTER the frame is filled. Default: never. REPLACE P-frames
+    /// reference only the immediately-previous frame, so an extra I-frame is always
+    /// safe and needs no GOP-counter rework.
+    fn force_iframe(&self) -> bool {
+        false
+    }
 }
 
 /// **Streaming** lossy-tier encode: pulls frames one at a time from `src` and
@@ -1166,8 +1176,13 @@ pub fn encode_casv_video_streaming(
                 got: cur.len(),
             });
         }
-        let is_iframe = idx % gop == 0;
-        if is_iframe && idx > 0 {
+        // GOP schedule vs source-forced I-frame (scene cut). Rate control steps
+        // only on the natural GOP boundary so a forced I-frame does not perturb the
+        // lossy distance feedback — for sources that never force (all existing
+        // sources), `is_iframe == at_gop` and the encode is byte-identical.
+        let at_gop = idx % gop == 0;
+        let is_iframe = at_gop || (idx > 0 && src.force_iframe());
+        if at_gop && idx > 0 {
             if let Some(rc) = rc.as_mut() {
                 let d = rc.next_gop_distance(ctx.distance);
                 ctx.set_distance(d, opts)?;
@@ -1263,8 +1278,11 @@ pub fn encode_casv_video_streaming_to_progress<W: std::io::Write>(
                 got: cur.len(),
             });
         }
-        let is_iframe = idx % gop == 0;
-        if is_iframe && idx > 0 {
+        // GOP schedule vs source-forced I-frame (scene cut) — see the buffered
+        // encoder for the byte-identity rationale (rate control steps on `at_gop`).
+        let at_gop = idx % gop == 0;
+        let is_iframe = at_gop || (idx > 0 && src.force_iframe());
+        if at_gop && idx > 0 {
             if let Some(rc) = rc.as_mut() {
                 let d = rc.next_gop_distance(ctx.distance);
                 ctx.set_distance(d, opts)?;

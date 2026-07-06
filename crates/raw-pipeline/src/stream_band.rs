@@ -103,6 +103,16 @@ impl<S: RawRowSource> StreamingBandSource<S> {
         self.h
     }
 
+    /// Mutable access to the pipeline params. Lets a fixed-look consumer (e.g. the
+    /// RAW→video source) overwrite the look fields after construction while keeping
+    /// the per-file sensor metadata (black/white/WB/matrix/phase) the `from_*_bytes`
+    /// builders derived. The tone LUTs are built lazily on the first `band()` call,
+    /// so a mutation here before any pull is honored.
+    #[inline]
+    pub fn params_mut(&mut self) -> &mut PipelineParams {
+        &mut self.params
+    }
+
     /// Materialize toned RGB8 rows for [xpos, ypos, xsize×ysize] and return a pointer to the
     /// first requested pixel plus the row stride in bytes. Pulls MUST be monotonic in `ypos`
     /// (rows below `ypos` are front-dropped). The returned pointer is valid until the next call.
