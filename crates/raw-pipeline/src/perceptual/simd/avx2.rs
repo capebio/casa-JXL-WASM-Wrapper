@@ -601,14 +601,77 @@ pub unsafe fn box_blur_avx2(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f3
     // Horizontal pass: shared scalar recurrence (identical to box_blur).
     box_blur_h(src, &mut tmp, w, h, r, inv);
 
-    // Vertical pass: 8 columns per iteration in one 256-bit lane group.
+    // Vertical pass. Column bands are fully independent (each column's
+    // recurrence reads only tmp and writes only its own dst column), so on
+    // large planes the bands run in parallel under the `parallel` feature —
+    // bit-identical to the serial walk by construction (identical per-column
+    // op order; only which thread executes a band changes). Bench-gated via
+    // examples/box_blur_vpar_flip.rs; small planes keep the serial call to
+    // avoid rayon task overhead on the quarter-res pyramid levels.
+    #[cfg(feature = "parallel")]
+    {
+        if n >= V_PAR_MIN_PIXELS && w >= 2 * V_BAND_COLS {
+            use rayon::prelude::*;
+            // Raw-pointer wrapper: bands write disjoint dst columns, tmp is
+            // shared read-only. Sync is sound because no two bands overlap.
+            struct DstPtr(*mut f32);
+            unsafe impl Sync for DstPtr {}
+            let dp = DstPtr(dst.as_mut_ptr());
+            // Borrow the WRAPPER (not the raw field): edition-2021 disjoint
+            // capture would otherwise capture the non-Sync `*mut f32` itself.
+            let dp = &dp;
+            let tmp_ref = &tmp;
+            let bands = w.div_ceil(V_BAND_COLS);
+            (0..bands).into_par_iter().for_each(|b| {
+                let x0 = b * V_BAND_COLS;
+                let x1 = (x0 + V_BAND_COLS).min(w);
+                // SAFETY: avx2 verified by the dispatching caller; the band
+                // writes only dst columns [x0,x1) — disjoint across tasks.
+                unsafe { box_blur_v_band_avx2(tmp_ref, dp.0, w, h, r, inv, x0, x1) };
+            });
+            return dst;
+        }
+    }
+    // Serial: one band covering every column — the original loop, verbatim.
+    box_blur_v_band_avx2(&tmp, dst.as_mut_ptr(), w, h, r, inv, 0, w);
+    dst
+}
+
+/// Column-band width for the parallel vertical pass — a multiple of 8 so every
+/// interior band is fully vectorised; only the final band can carry a scalar
+/// remainder (same columns the serial walk leaves for its remainder loop).
+const V_BAND_COLS: usize = 256;
+/// Engage the parallel vertical pass only at ≥2 MP (bench-gated,
+/// examples/box_blur_vpar_flip.rs): below that the plane fits caches and rayon
+/// task overhead outweighs the win — covers the half/quarter-res mask levels.
+#[cfg(feature = "parallel")]
+const V_PAR_MIN_PIXELS: usize = 1 << 21;
+
+/// Vertical box-blur pass over columns `[x0, x1)`: 8-wide vector groups plus a
+/// scalar remainder for the trailing `< 8` columns of the band. Exactly the
+/// original `box_blur_avx2` vertical loop with band bounds; per-column float op
+/// order is identical for every band split, so any banding (including the
+/// serial `0..w` call) produces bit-identical output.
+///
+/// SAFETY: caller guarantees avx2, `tmp.len() == w*h`, and exclusive write
+/// access to dst columns `[x0, x1)` behind `dp` (rows `0..h`, row stride `w`).
+#[target_feature(enable = "avx2")]
+unsafe fn box_blur_v_band_avx2(
+    tmp: &[f32],
+    dp: *mut f32,
+    w: usize,
+    h: usize,
+    r: usize,
+    inv: f32,
+    x0: usize,
+    x1: usize,
+) {
     let rp1 = _mm256_set1_ps(r as f32 + 1.0);
     let inv_v = _mm256_set1_ps(inv);
     let h_max = h - 1;
     let tp = tmp.as_ptr();
-    let dp = dst.as_mut_ptr();
-    let mut x = 0usize;
-    while x + 8 <= w {
+    let mut x = x0;
+    while x + 8 <= x1 {
         // seed the window: tmp[x..x+8]*(r+1) + Σ_{k=1..=r} tmp[k.min(h_max)*w + x..]
         let mut sums = _mm256_mul_ps(_mm256_loadu_ps(tp.add(x)), rp1);
         for k in 1..=r {
@@ -627,19 +690,18 @@ pub unsafe fn box_blur_avx2(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f3
         x += 8;
     }
     // Scalar remainder for the < 8 trailing columns — identical to box_blur.
-    for col in x..w {
+    for col in x..x1 {
         let mut sum = tmp[col] * (r as f32 + 1.0);
         for k in 1..=r {
             sum += tmp[k.min(h_max) * w + col];
         }
         for y in 0..h {
-            dst[y * w + col] = sum * inv;
+            *dp.add(y * w + col) = sum * inv;
             let add = tmp[(y + r + 1).min(h_max) * w + col];
             let sub = tmp[y.saturating_sub(r) * w + col];
             sum += add - sub;
         }
     }
-    dst
 }
 
 #[cfg(test)]
@@ -752,6 +814,27 @@ mod blur_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Same oracle check but at a size crossing V_PAR_MIN_PIXELS (2 MP), so under
+    /// the default `parallel` feature this exercises the column-band rayon path
+    /// (2049 columns → 9 bands incl. a scalar-remainder tail band) and proves it
+    /// bit-identical to the scalar serial walk.
+    #[test]
+    fn box_blur_avx2_parallel_bands_bit_identical_to_scalar() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let (w, h, r) = (2049usize, 1100usize, 8usize); // 2.25 MP ≥ 1<<21
+        let src: Vec<f32> = (0..w * h)
+            .map(|i| ((i * 37 % 251) as f32 * 0.013).sin() * 4.2)
+            .collect();
+        let want = box_blur(&src, w, h, r);
+        let got = unsafe { box_blur_avx2(&src, w, h, r) };
+        assert_eq!(want.len(), got.len());
+        for i in 0..want.len() {
+            assert_eq!(want[i].to_bits(), got[i].to_bits(), "[{i}]");
         }
     }
 }
