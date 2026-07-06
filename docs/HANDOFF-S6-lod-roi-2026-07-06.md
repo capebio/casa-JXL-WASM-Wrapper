@@ -124,11 +124,32 @@ DEFERRED file.
 - Version negotiation: the reader dispatches on the container version field; v1 bytes parse
   bit-identically through the v1 path.
 
-## Verification
+## Verification (as run, 2026-07-07)
 
-See the "Verified" section at the bottom (filled after the run). Rust: `cargo test`
-in `crates/raw-pipeline` with `--no-default-features` (no libjxl). TS: `node --test` for
-progressive, `bun test` for pyramid.
+Rust (from `crates/raw-pipeline`, MSVC default toolchain, no libjxl):
+
+- `cargo test --no-default-features --lib region_tests` → **4 passed** (full-frame region
+  == `process(full)` byte-identical; sub-rect == crop of full; lod=2 subsample; zero-area).
+- `cargo test --no-default-features --lib casv_container` → **5 passed** (v1 back-compat
+  parse; v2 write/read round-trip + seek table; offset-cap lift; malformed rejection;
+  casv-format.json single-source pin).
+- `cargo test --no-default-features --lib` (whole crate) → **215 passed, 0 failed, 12
+  ignored** (ignored = real-file integration tests, files absent on this machine). No
+  regressions.
+
+TypeScript:
+
+- `node --test` (progressive) on `manifest.test.js`, `manifest-v2.test.js`,
+  `lod-resolver.test.js`, `offsets-tiers.test.js` → **52 passed, 0 failed**.
+- `bun test` (pyramid) on `manifest-capabilities.test.js`, `manifest-validate.test.js`,
+  `manifest.test.js` → **38 passed, 0 failed**.
+
+Pre-existing env caveats (NOT caused by this work): in the fresh worktree, `@casabio/*`
+workspace deps and some devDeps (`fast-check`) are unlinked, so `scheduler.test`/
+`stream.test` (progressive) and `choose-level.test` (pyramid) fail on
+`ERR_MODULE_NOT_FOUND` before any assertion. Every test that imports only local `./`
+modules — i.e. all the S6-touched files — passes. `tsc -p tsconfig.test.json` still emits
+JS despite a `TS2688 'node'` type-def resolution error (same as baseline).
 
 ## Deferred / remaining (see `docs/WAVE2-QUESTIONS-DEFERRED.md` §S6)
 
