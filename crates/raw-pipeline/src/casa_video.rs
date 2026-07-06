@@ -848,11 +848,8 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
     if !lossless && matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
-    if lossless && matches!(opts.skip, SkipMode::Tile) {
-        // Lossless tile (residual atlas) streaming is a follow-up; None (whole-frame
-        // residual) and Bbox (residual crop) are wired.
-        return Err(VideoError::Unsupported);
-    }
+    // Lossless streams every skip mode: None (whole-frame residual), Bbox (residual
+    // crop), Tile (residual atlas). Only lossy skip=none stays rejected (above).
     let enc_threads = resolve_enc_threads();
     let enc = if lossless {
         Encoder::new(EncodeOptions::lossless().with_effort(opts.effort))?
@@ -1074,8 +1071,57 @@ fn encode_stream_frame(
                 }
                 return Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG);
             }
-            // SkipMode::None (Tile is rejected in stream_ctx for lossless).
-            _ => {
+            SkipMode::Tile => {
+                // Residual atlas: same v2 square-atlas layout as the lossy tile arm,
+                // but each slot holds the changed tile's 16-bit additive residual
+                // (cur - prev + 32768) instead of fresh pixels. Decoder ADDs it
+                // (apply_pframe tile residual path). Exact change detection (thresh
+                // is 0 for lossless). No tile admission (that is a lossy rate lever).
+                let t = ctx.tile.max(1);
+                let (txn, _tyn) = tile_grid(width, height, t);
+                let ts = t as usize;
+                let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
+                ctx.changed.clear();
+                ctx.changed
+                    .extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
+                payload.extend_from_slice(&((t as u16) | CASV_TILE_V2_BIT).to_le_bytes());
+                let bitmap_len = map.len().div_ceil(8);
+                ctx.bitmap.clear();
+                ctx.bitmap.resize(bitmap_len, 0);
+                for &i in &ctx.changed {
+                    ctx.bitmap[i / 8] |= 1 << (i % 8);
+                }
+                payload.extend_from_slice(&ctx.bitmap);
+                if !ctx.changed.is_empty() {
+                    let (cols, rows) = atlas_grid_v2(ctx.changed.len());
+                    let (aw, ah) = (cols * ts, rows * ts);
+                    ctx.resid16.clear();
+                    ctx.resid16.resize(aw * ah * 3, 0);
+                    for (slot, &i) in ctx.changed.iter().enumerate() {
+                        let tx = (i as u32 % txn) as usize;
+                        let ty = (i as u32 / txn) as usize;
+                        let bw = ts.min(width_us - tx * ts);
+                        let bh = ts.min(height as usize - ty * ts);
+                        let (sx, sy) = (slot % cols, slot / cols);
+                        for row in 0..bh {
+                            let s = ((ty * ts + row) * width_us + tx * ts) * 3;
+                            let d = ((sy * ts + row) * aw + sx * ts) * 3;
+                            for k in 0..bw * 3 {
+                                let c = px[s + k] as i32;
+                                let p = prev_src[s + k] as i32;
+                                ctx.resid16[d + k] = ((c - p) + 32768) as u16;
+                            }
+                        }
+                    }
+                    ctx.enc.encode_into(
+                        &Frame::rgb(ctx.resid16.as_slice(), aw as u32, ah as u32),
+                        payload,
+                    )?;
+                }
+                return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG);
+            }
+            // SkipMode::None
+            SkipMode::None => {
                 ctx.resid16.clear();
                 ctx.resid16.reserve(run_full);
                 ctx.resid16.extend(
@@ -3319,18 +3365,50 @@ mod tests {
     }
 
     #[test]
-    fn streaming_lossless_tile_still_rejected() {
-        // Lossless tile (residual atlas) streaming is a documented follow-up.
+    fn streaming_lossless_tile_decodes_to_source_byte_exact() {
+        // Lossless tile (residual atlas): localized motion changes a few tiles, plus
+        // an identical frame (empty tile set). Every frame reconstructs byte-exact.
+        let (w, h) = (64u32, 64u32);
+        let wus = w as usize;
+        let base = gradient(w, h, 0);
+        let paint_tile = |f: &mut [u8], tx: usize, ty: usize, c: [u8; 3]| {
+            for row in 0..16usize {
+                for col in 0..16usize {
+                    let i = ((ty * 16 + row) * wus + (tx * 16 + col)) * 3;
+                    f[i] = c[0];
+                    f[i + 1] = c[1];
+                    f[i + 2] = c[2];
+                }
+            }
+        };
+        let mut f1 = base.clone();
+        paint_tile(&mut f1, 1, 1, [200, 40, 10]);
+        let mut f2 = base.clone();
+        paint_tile(&mut f2, 2, 0, [20, 180, 90]);
+        let frames: Vec<Vec<u8>> = vec![base.clone(), f1, f2.clone(), f2]; // f3==f2 → empty tiles
         let opts = CasaVideoOptions {
             rate: VideoRate::Lossless,
-            gop_len: 2,
+            gop_len: 4,
             skip: SkipMode::Tile,
-            tile: 32,
+            tile: 16, // 4x4 tile grid on 64x64
             effort: 3,
             thresh: None,
             rate_control: None,
         };
-        assert!(matches!(stream_ctx(32, 32, &opts), Err(VideoError::Unsupported)));
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let bytes = encode_casv_video_streaming(&mut src, &opts).expect("streaming lossless tile");
+        let decoded = decode_casv_all_rgb8(&bytes).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "tile frame {i} not byte-exact");
+        }
     }
 
     #[test]
@@ -5210,9 +5288,9 @@ mod tests {
             );
         }
 
-        // Unsupported tier rejected. (Lossless bbox/none now stream — K5 — so the
-        // still-unsupported streaming case is lossless TILE, the residual-atlas
-        // follow-up.)
+        // Unsupported tier rejected. All lossless skip modes now stream (K5), so the
+        // only still-unsupported streaming case is LOSSY skip=none (whole-frame
+        // residual through VarDCT is broken).
         let mut fs3 = VecFrames {
             frames: low_motion(w, h, 2),
             i: 0,
@@ -5220,8 +5298,8 @@ mod tests {
             h,
         };
         let bad = CasaVideoOptions {
-            rate: VideoRate::Lossless,
-            skip: SkipMode::Tile,
+            rate: VideoRate::Lossy(1.0),
+            skip: SkipMode::None,
             ..opts
         };
         assert!(matches!(
