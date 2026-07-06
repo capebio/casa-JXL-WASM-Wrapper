@@ -286,36 +286,24 @@ fn main() {
     }
 
     if let Some(dir) = args.get(5) {
-        write_demo(dir, &rc_out, &adm_out, w, h, fps, target, secs, &rc, &adm);
+        write_demo(dir, &frames, &rc_out, &adm_out, w, h, fps, target, secs, &rc, &adm);
     }
 }
 
-/// Decode both streams, composite left|right into one mp4 (single video =
-/// exact sync), write an HTML page with the run's numbers baked in.
-#[allow(clippy::too_many_arguments)]
-fn write_demo(
-    dir: &str,
-    rc_out: &[u8],
-    adm_out: &[u8],
+/// Pipe `left | divider | right` composite frames into one x264 mp4 —
+/// a single video keeps the halves frame-locked by construction.
+fn mux_side_by_side(
+    path: &str,
+    left: &[&[u8]],
+    right: &[&[u8]],
     w: u32,
     h: u32,
     fps: (u32, u32),
-    target: u32,
-    secs: f64,
-    rc: &PassStats,
-    adm: &PassStats,
 ) {
     use std::io::Write;
-    std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("mkdir {dir}: {e}")));
-    let rc_dec = decode_casv_all_rgb8(rc_out).unwrap_or_else(|| fail("decode rc"));
-    let adm_dec = decode_casv_all_rgb8(adm_out).unwrap_or_else(|| fail("decode admit"));
-    let n = rc_dec.len().min(adm_dec.len());
-
-    // Composite geometry: [rc | 8px divider | admit], even width for yuv420.
     let (wu, hu) = (w as usize, h as usize);
     let gap = 8usize;
     let cw = wu * 2 + gap;
-    let mp4 = format!("{dir}/side_by_side.mp4");
     let mut child = std::process::Command::new("ffmpeg")
         .args([
             "-v", "error", "-y",
@@ -327,15 +315,15 @@ fn write_demo(
             "-c:v", "libx264",
             "-crf", "12",
             "-pix_fmt", "yuv420p",
-            &mp4,
+            path,
         ])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| fail(format!("ffmpeg mux: {e}")));
     let mut stdin = child.stdin.take().unwrap();
     let mut row = vec![0u8; cw * 3];
-    for i in 0..n {
-        let (l, r) = (&rc_dec[i].0, &adm_dec[i].0);
+    for i in 0..left.len().min(right.len()) {
+        let (l, r) = (left[i], right[i]);
         for y in 0..hu {
             let o = y * wu * 3;
             row[..wu * 3].copy_from_slice(&l[o..o + wu * 3]);
@@ -349,6 +337,32 @@ fn write_demo(
     if !status.success() {
         fail("ffmpeg mux failed");
     }
+}
+
+/// Decode both streams, write two synced composites — original vs rc, and
+/// rc vs admit — plus an HTML page with the run's numbers baked in.
+#[allow(clippy::too_many_arguments)]
+fn write_demo(
+    dir: &str,
+    src_frames: &[Vec<u8>],
+    rc_out: &[u8],
+    adm_out: &[u8],
+    w: u32,
+    h: u32,
+    fps: (u32, u32),
+    target: u32,
+    secs: f64,
+    rc: &PassStats,
+    adm: &PassStats,
+) {
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(format!("mkdir {dir}: {e}")));
+    let rc_dec = decode_casv_all_rgb8(rc_out).unwrap_or_else(|| fail("decode rc"));
+    let adm_dec = decode_casv_all_rgb8(adm_out).unwrap_or_else(|| fail("decode admit"));
+    let src: Vec<&[u8]> = src_frames.iter().map(|f| f.as_slice()).collect();
+    let rcf: Vec<&[u8]> = rc_dec.iter().map(|f| f.0.as_slice()).collect();
+    let admf: Vec<&[u8]> = adm_dec.iter().map(|f| f.0.as_slice()).collect();
+    mux_side_by_side(&format!("{dir}/orig_vs_rc.mp4"), &src, &rcf, w, h, fps);
+    mux_side_by_side(&format!("{dir}/rc_vs_admit.mp4"), &rcf, &admf, w, h, fps);
 
     let kbps = |b: f64| b * 8.0 / 1000.0;
     let html = format!(
@@ -361,7 +375,7 @@ fn write_demo(
   h1 {{ font-size:18px; font-weight:600; }}
   .labels {{ display:flex; margin-bottom:6px; font-weight:600; }}
   .labels div {{ flex:1; text-align:center; }}
-  .rc {{ color:#e6a23c; }} .adm {{ color:#6fcf7c; }}
+  .src {{ color:#7fb3e6; }} .rc {{ color:#e6a23c; }} .adm {{ color:#6fcf7c; }}
   video {{ width:100%; display:block; background:#000; }}
   table {{ border-collapse:collapse; margin-top:16px; }}
   td, th {{ padding:4px 14px; border-bottom:1px solid #333; text-align:right; }}
@@ -369,8 +383,10 @@ fn write_demo(
   .note {{ color:#999; margin-top:12px; max-width:70em; }}
 </style>
 <h1>JOLT rate control at {target_kbps:.0} kbit/s ({secs:.0} s clip, {w}×{h} @ {fpsn}/{fpsd} fps)</h1>
-<div class="labels"><div class="rc">distance-only (rc)</div><div class="adm">+ tile admission</div></div>
-<video src="side_by_side.mp4" autoplay muted loop controls></video>
+<div class="labels"><div class="src">original</div><div class="rc">distance-only (rc)</div></div>
+<video src="orig_vs_rc.mp4" autoplay muted loop controls></video>
+<div class="labels" style="margin-top:24px"><div class="rc">distance-only (rc)</div><div class="adm">+ tile admission</div></div>
+<video src="rc_vs_admit.mp4" muted loop controls></video>
 <table>
 <tr><th>pass</th><th>kbit/s (avg)</th><th>vs target</th><th>worst 1-s window</th><th>tiles / P-frame</th><th>encode wall</th><th>mean |diff| vs source</th></tr>
 <tr><td class="rc">distance-only</td><td>{rc_kbps:.0}</td><td>{rc_vs:.2}×</td><td>{rc_win:.2}×</td><td>{rc_tiles:.1}</td><td>{rc_ms} ms</td><td>{rc_q:.2}</td></tr>
