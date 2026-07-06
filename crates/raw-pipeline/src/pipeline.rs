@@ -107,6 +107,14 @@ pub fn validate_pixel_buffer_u16(
 ) -> Result<(), String> {
     validate_pixel_dims(width, height, channels)?;
     let expected = width * height * channels;
+    // u16 elements are 2 bytes each — validate_pixel_dims only checked element
+    // count against the byte budget, which is off by 2× for u16 buffers.
+    let byte_count = expected.saturating_mul(2);
+    if byte_count > MAX_PIXEL_BUFFER_BYTES {
+        return Err(format!(
+            "u16 pixel buffer {byte_count} bytes exceeds {MAX_PIXEL_BUFFER_BYTES} byte limit ({width}×{height}×{channels})"
+        ));
+    }
     if buffer.len() != expected {
         return Err(format!(
             "pixel buffer length mismatch: got {} expected {} ({width}×{height}×{channels})",
@@ -1174,140 +1182,172 @@ pub fn apply_unsharp_masks(
     height: usize,
     params: &PipelineParams,
 ) {
-    if params.texture == 0.0 && params.clarity == 0.0 {
+    let texture = if params.texture.is_finite() { params.texture } else { 0.0 };
+    let clarity  = if params.clarity.is_finite()  { params.clarity  } else { 0.0 };
+    if texture == 0.0 && clarity == 0.0 {
         return;
     }
-    // PIPE-003: When both texture and clarity are active, each must operate on the original
-    // (pre-unsharp) image.  Previously this called rgb16.to_vec() here (full-frame allocation,
-    // ~144 MB at 24 MP on every slider tick).  Instead we reuse the third BLUR_SCRATCH slot
-    // so the allocation is amortised after the first call.
-    BLUR_SCRATCH.with(|scratch| {
-        let (ref mut temp, ref mut blurred, ref mut snap_buf) = *scratch.borrow_mut();
-        let need_snap = params.texture != 0.0 && params.clarity != 0.0;
-        if need_snap {
+
+    let both = texture != 0.0 && clarity != 0.0;
+
+    if both {
+        // PIPE-003: both passes must each see the original (pre-unsharp) pixels.
+        // Texture pass: fused (no separate blurred frame). Clarity pass still
+        // needs the original snapshot to compute the luminance-weighted delta.
+        BLUR_SCRATCH.with(|scratch| {
+            let (ref mut temp, ref mut blurred, ref mut snap_buf) = *scratch.borrow_mut();
             snap_buf.resize(rgb16.len(), 0u16);
             snap_buf.copy_from_slice(rgb16);
-        }
-        // `pre_snap` is Some only when both sliders are active.
-        let has_snap = need_snap;
-        if params.texture != 0.0 {
-            separable_blur_with_bufs(rgb16, width, height, &gaussian_kernel_5(), temp, blurred);
+
+            // Texture: fused — one temp frame, no blurred frame.
+            separable_blur_apply(rgb16, width, height, &gaussian_kernel_5(), temp, |orig, blur| {
+                (orig + (texture * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16
+            });
+
+            // Clarity: blur snap_buf (original), add delta to texture-sharpened rgb16.
+            separable_blur_with_bufs(snap_buf, width, height, &gaussian_kernel_13(), temp, blurred);
             #[cfg(feature = "parallel")]
             rgb16
                 .par_chunks_mut(width * 3)
+                .zip(snap_buf.par_chunks(width * 3))
                 .zip(blurred.par_chunks(width * 3))
-                .for_each(|(r_row, b_row)| {
+                .for_each(|((r_row, o_row), b_row)| {
                     for i in 0..r_row.len() {
-                        let orig = r_row[i] as i32;
+                        let orig = o_row[i] as i32;
                         let blur = b_row[i] as i32;
-                        r_row[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32)
+                        let v = orig as f32 / 65535.0;
+                        let w = 4.0 * v * (1.0 - v);
+                        r_row[i] = (r_row[i] as i32
+                            + (clarity * w * (orig - blur) as f32).round() as i32)
                             .clamp(0, 65535) as u16;
                     }
                 });
             #[cfg(not(feature = "parallel"))]
-            {
-                let n = rgb16.len();
-                let mut i = 0;
-                while i < n {
-                    let orig = rgb16[i] as i32;
-                    let blur = blurred[i] as i32;
-                    rgb16[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32)
-                        .clamp(0, 65535) as u16;
-                    i += 1;
-                }
+            for i in 0..rgb16.len() {
+                let orig = snap_buf[i] as i32;
+                let blur = blurred[i] as i32;
+                let v = orig as f32 / 65535.0;
+                let w = 4.0 * v * (1.0 - v);
+                rgb16[i] = (rgb16[i] as i32
+                    + (clarity * w * (orig - blur) as f32).round() as i32)
+                    .clamp(0, 65535) as u16;
+            }
+        });
+    } else if texture != 0.0 {
+        // Texture-only: fully fused, one frame scratch.
+        BLUR_SCRATCH.with(|scratch| {
+            let (ref mut temp, _, _) = *scratch.borrow_mut();
+            separable_blur_apply(rgb16, width, height, &gaussian_kernel_5(), temp, |orig, blur| {
+                (orig + (texture * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16
+            });
+        });
+    } else {
+        // Clarity-only: fully fused, one frame scratch.
+        // Midtone mask w = 4·v·(1−v), peaks at v=0.5.
+        BLUR_SCRATCH.with(|scratch| {
+            let (ref mut temp, _, _) = *scratch.borrow_mut();
+            separable_blur_apply(rgb16, width, height, &gaussian_kernel_13(), temp, |orig, blur| {
+                let v = orig as f32 / 65535.0;
+                let w = 4.0 * v * (1.0 - v);
+                (orig + (clarity * w * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16
+            });
+        });
+    }
+}
+
+/// Separable blur **fused** with a per-element apply closure.
+///
+/// Horizontal pass fills `temp` (one full-frame scratch). Vertical pass
+/// immediately folds each blurred sample into `rgb16` via `apply(orig, blur)`.
+/// The vertical pass reads from `temp` exclusively — never `rgb16` — so reading
+/// `rgb16[i]` for `orig` and writing the result back in place is race-free.
+///
+/// Peak scratch: ONE frame (`temp` only). Eliminating the old separate `blurred`
+/// output frame saves ~120 MB at 20 MP on every unsharp/NR call.
+fn separable_blur_apply(
+    rgb16: &mut [u16],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    temp: &mut Vec<u16>,
+    apply: impl Fn(i32, i32) -> u16 + Sync,
+) {
+    let n = width * height * 3;
+    temp.resize(n, 0);
+    separable_blur_into(rgb16, width, height, kernel, temp);
+    let half = kernel.len() / 2;
+    let temp_slice = temp.as_slice();
+
+    #[cfg(feature = "parallel")]
+    rgb16
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            blur_apply_row(row, y, width, height, half, kernel, temp_slice, &apply);
+        });
+
+    #[cfg(not(feature = "parallel"))]
+    for (y, row) in rgb16.chunks_mut(width * 3).enumerate() {
+        blur_apply_row(row, y, width, height, half, kernel, temp_slice, &apply);
+    }
+}
+
+/// Vertical-pass tile worker for [`separable_blur_apply`].
+/// De-interleaved VTILE=128 structure mirrors `separable_blur_with_bufs` so
+/// the accumulation loops auto-vectorise identically. Writes `apply(orig, blur)`
+/// in place: `row[o]` holds the untouched original until overwritten.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn blur_apply_row(
+    row: &mut [u16],
+    y: usize,
+    width: usize,
+    height: usize,
+    half: usize,
+    kernel: &[f32],
+    temp: &[u16],
+    apply: &(impl Fn(i32, i32) -> u16 + Sync),
+) {
+    const VTILE: usize = 128;
+    let klen = kernel.len();
+    let mut acc_r = [0f32; VTILE];
+    let mut acc_g = [0f32; VTILE];
+    let mut acc_b = [0f32; VTILE];
+    let mut r_tap = [0f32; VTILE];
+    let mut g_tap = [0f32; VTILE];
+    let mut b_tap = [0f32; VTILE];
+    for x0 in (0..width).step_by(VTILE) {
+        let x1 = (x0 + VTILE).min(width);
+        let tile = x1 - x0;
+        for xi in 0..tile {
+            acc_r[xi] = 0.0;
+            acc_g[xi] = 0.0;
+            acc_b[xi] = 0.0;
+        }
+        for ki in 0..klen {
+            let kv = kernel[ki];
+            let yi = (y as isize + ki as isize - half as isize)
+                .clamp(0, height as isize - 1) as usize;
+            let row_base = yi * width * 3;
+            for xi in 0..tile {
+                let b = row_base + (x0 + xi) * 3;
+                r_tap[xi] = temp[b] as f32;
+                g_tap[xi] = temp[b + 1] as f32;
+                b_tap[xi] = temp[b + 2] as f32;
+            }
+            for xi in 0..tile {
+                acc_r[xi] = bfma(r_tap[xi], kv, acc_r[xi]);
+                acc_g[xi] = bfma(g_tap[xi], kv, acc_g[xi]);
+                acc_b[xi] = bfma(b_tap[xi], kv, acc_b[xi]);
             }
         }
-        if params.clarity != 0.0 {
-            // Clarity blurs the original image (not the texture-sharpened output).
-            // When has_snap (both passes active), blur the snapshot in snap_buf; else blur rgb16 as usual.
-            if has_snap {
-                separable_blur_with_bufs(
-                    snap_buf,
-                    width,
-                    height,
-                    &gaussian_kernel_13(),
-                    temp,
-                    blurred,
-                );
-                // Apply clarity: orig from snap_buf, delta from snap blur, added to texture-sharpened rgb16.
-                #[cfg(feature = "parallel")]
-                rgb16
-                    .par_chunks_mut(width * 3)
-                    .zip(snap_buf.par_chunks(width * 3))
-                    .zip(blurred.par_chunks(width * 3))
-                    .for_each(|((r_row, o_row), b_row)| {
-                        for i in 0..r_row.len() {
-                            let orig = o_row[i] as i32;
-                            let blur = b_row[i] as i32;
-                            let v = orig as f32 / 65535.0;
-                            let w = 4.0 * v * (1.0 - v);
-                            r_row[i] = (r_row[i] as i32
-                                + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                                .clamp(0, 65535) as u16;
-                        }
-                    });
-                #[cfg(not(feature = "parallel"))]
-                {
-                    let n = rgb16.len();
-                    let mut i = 0;
-                    while i < n {
-                        let orig = snap_buf[i] as i32;
-                        let blur = blurred[i] as i32;
-                        let v = orig as f32 / 65535.0;
-                        let w = 4.0 * v * (1.0 - v);
-                        rgb16[i] = (rgb16[i] as i32
-                            + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                            .clamp(0, 65535) as u16;
-                        i += 1;
-                    }
-                }
-            } else {
-                // Only clarity is active (no texture pass ran): blur rgb16 directly as before.
-                separable_blur_with_bufs(
-                    rgb16,
-                    width,
-                    height,
-                    &gaussian_kernel_13(),
-                    temp,
-                    blurred,
-                );
-                #[cfg(feature = "parallel")]
-                rgb16
-                    .par_chunks_mut(width * 3)
-                    .zip(blurred.par_chunks(width * 3))
-                    .for_each(|(r_row, b_row)| {
-                        for i in 0..r_row.len() {
-                            let orig = r_row[i] as i32;
-                            let blur = b_row[i] as i32;
-                            let v = orig as f32 / 65535.0;
-                            let w = 4.0 * v * (1.0 - v);
-                            r_row[i] = (orig
-                                + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                                .clamp(0, 65535) as u16;
-                        }
-                    });
-                #[cfg(not(feature = "parallel"))]
-                {
-                    let n = rgb16.len();
-                    let mut i = 0;
-                    let clarity_factor = params.clarity;
-                    while i < n {
-                        let orig = rgb16[i] as i32;
-                        let blur = blurred[i] as i32;
-                        // Midtone mask w = 4·v·(1−v), v = orig/65535 — peaks at v=0.5.
-                        // (The previous hoisted form folded the 4 into v as 4·orig/65535,
-                        // which computes 4v(1−4v): wrong sign and 2× magnitude at midtones.
-                        // Matches the parallel closure and the has_snap serial branch above.)
-                        let v = orig as f32 / 65535.0;
-                        let w = 4.0 * v * (1.0 - v);
-                        let delta = clarity_factor * w * (orig - blur) as f32;
-                        rgb16[i] = (orig as f32 + delta).round().clamp(0.0, 65535.0) as i32 as u16;
-                        i += 1;
-                    }
-                }
-            }
+        for xi in 0..tile {
+            let o = (x0 + xi) * 3;
+            row[o]     = apply(row[o]     as i32, acc_r[xi].round() as i32);
+            row[o + 1] = apply(row[o + 1] as i32, acc_g[xi].round() as i32);
+            row[o + 2] = apply(row[o + 2] as i32, acc_b[xi].round() as i32);
         }
-    });
+    }
 }
 
 /// Core per-pixel tone-mapping math (matrix + sat/vibrance around luma).
@@ -2631,28 +2671,14 @@ pub fn apply_luminance_nr(rgb16: &mut [u16], width: usize, height: usize, streng
     }
     let s = strength.clamp(0.0, 1.0);
     let kernel = gaussian_kernel_5();
+    // Fused: single temp frame, no separate blurred frame (~120 MB saved at 20 MP).
+    // Flipflop bench (2026-06-18): serial 130ms, parallel 20ms → 6.6× speedup on 12MP.
     BLUR_SCRATCH.with(|scratch| {
-        let (ref mut temp, ref mut blurred, _) = *scratch.borrow_mut();
-        separable_blur_with_bufs(rgb16, width, height, &kernel, temp, blurred);
-        // Flipflop bench (2026-06-18): serial 130ms, parallel 20ms → 6.6× speedup on 12MP.
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            rgb16
-                .par_iter_mut()
-                .zip(blurred.par_iter())
-                .for_each(|(o, &b)| {
-                    let ov = *o as f32;
-                    *o = (ov + (b as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16;
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for (o, &b) in rgb16.iter_mut().zip(blurred.iter()) {
-                let ov = *o as f32;
-                *o = (ov + (b as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16;
-            }
-        }
+        let (ref mut temp, _, _) = *scratch.borrow_mut();
+        separable_blur_apply(rgb16, width, height, &kernel, temp, |orig, blur| {
+            let ov = orig as f32;
+            (ov + (blur as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16
+        });
     });
 }
 
