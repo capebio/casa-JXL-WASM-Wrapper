@@ -1262,6 +1262,81 @@ pub fn encode_casv_video_streaming(
     Ok(out)
 }
 
+/// K5: streaming **FableBraid** encode (header-indexed, buffered). Pulls frames one
+/// at a time — I-frames every `gop_len`, P-frames as full-frame temporal deltas vs
+/// the previous SOURCE frame — holding only prev+cur (vs the batch
+/// [`encode_casv_fable_rgb8`], which needs all frames resident). Fable is lossless,
+/// so residual-vs-source is drift-free.
+///
+/// Because the fable codec is stateless per frame pair, the per-frame payloads are
+/// byte-identical to the batch tier's — so this produces a WHOLE-FILE byte-identical
+/// `.casv` for the same frames + gop. Decodes via the header-path fable branch of
+/// [`decode_casv_all_rgb8`] (a [`crate::fable_braid::DeltaDecodeSession`]).
+pub fn encode_casv_fable_streaming(
+    src: &mut dyn VideoFrameSource,
+    gop_len: u32,
+) -> Result<Vec<u8>, VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let gop = gop_len.max(1) as usize;
+    let expected = (width as usize) * (height as usize) * 3;
+
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
+    let mut data: Vec<u8> = Vec::new();
+    // Ping-pong frame buffers (see encode_casv_video_streaming).
+    let mut cur: Vec<u8> = Vec::new();
+    let mut prev_src: Vec<u8> = Vec::new();
+    let mut idx = 0usize;
+
+    loop {
+        std::mem::swap(&mut cur, &mut prev_src);
+        if !src.next_frame_into(&mut cur) {
+            break;
+        }
+        if cur.len() != expected {
+            return Err(VideoError::FrameSize {
+                idx,
+                expected,
+                got: cur.len(),
+            });
+        }
+        let (flags, payload) = if idx % gop == 0 {
+            (0u32, crate::fable_braid::encode_rgb8(&cur, width, height))
+        } else {
+            (
+                CASV_PFRAME_FLAG,
+                crate::fable_braid::encode_rgb8_delta(&cur, &prev_src, width, height),
+            )
+        };
+        index.push((flags, payload.len() as u32));
+        data.extend_from_slice(&payload);
+        idx += 1;
+    }
+    if index.is_empty() {
+        return Err(VideoError::Empty);
+    }
+
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: index.len() as u32,
+        fps_num,
+        fps_den,
+        flags: CASV_HDR_FABLE_FLAG,
+    };
+    let data_start = CASV_HEADER_BYTES + index.len() * CASV_INDEX_ENTRY_BYTES;
+    let mut out = Vec::with_capacity(data_start + data.len());
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for (flags, len) in &index {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(len | flags).to_le_bytes());
+        offset += *len as usize;
+    }
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
 /// **Streaming to a sink** (footer-indexed): identical encode to
 /// [`encode_casv_video_streaming`] but writes each frame's codestream straight to
 /// `sink` as produced, buffering only the tiny index (8 bytes/frame), then appends
@@ -3170,6 +3245,49 @@ mod tests {
             rate_control: None,
         };
         assert!(matches!(stream_ctx(32, 32, &opts), Err(VideoError::Unsupported)));
+    }
+
+    #[test]
+    fn fable_streaming_matches_batch_byte_identical() {
+        // Fable is stateless per frame pair, so the streaming encoder (2-frame
+        // residence) must produce a WHOLE-FILE byte-identical .casv to the batch
+        // (all-frames-resident) encoder for the same frames + gop.
+        let (w, h) = (64u32, 48u32);
+        let frames: Vec<Vec<u8>> = (0..5).map(|k| gradient(w, h, (k * 29 + 3) as u8)).collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let batch = encode_casv_fable_rgb8(&refs, w, h, 24, 1, 3).expect("batch fable");
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let streamed = encode_casv_fable_streaming(&mut src, 3).expect("streaming fable");
+        assert_eq!(streamed, batch, "streaming fable != batch (must be byte-identical)");
+    }
+
+    #[test]
+    fn fable_streaming_decodes_to_source_byte_exact() {
+        // Fable is lossless → decode-equality: every SOURCE frame reconstructs exactly
+        // through the header-path fable branch (DeltaDecodeSession).
+        let (w, h) = (48u32, 40u32);
+        let frames: Vec<Vec<u8>> = (0..4).map(|k| gradient(w, h, (k * 41 + 7) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 30,
+            fps_den: 1,
+        };
+        let streamed = encode_casv_fable_streaming(&mut src, 2).expect("streaming fable");
+        let decoded = decode_casv_all_rgb8(&streamed).expect("fable decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "fable frame {i} not byte-exact");
+        }
     }
 
     #[test]
