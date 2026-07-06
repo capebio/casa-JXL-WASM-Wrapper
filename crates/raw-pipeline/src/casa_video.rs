@@ -175,6 +175,33 @@ pub fn build_casv_header(h: &CasvHeader) -> [u8; CASV_HEADER_BYTES] {
     b
 }
 
+/// K5 FrameSink (header format): the single source of the header-container byte
+/// layout `[32B header][index][data]`. Each index entry is `[u32 absolute_offset]
+/// [u32 len | flags]`; payloads follow in frame order. `entries` is `(flags, len)`
+/// per frame; `total_data_len` is the summed payload bytes (for one exact
+/// `Vec::with_capacity`); `write_data` appends the payloads (one copy, per-site — so
+/// no double-buffering). This centralizes the absolute-offset math that was
+/// hand-written at ~10 call sites (the bounds-drift bug class). Byte-identical to
+/// each former hand-rolled tail.
+fn assemble_header_casv<F: FnOnce(&mut Vec<u8>)>(
+    header: &CasvHeader,
+    entries: &[(u32, u32)],
+    total_data_len: usize,
+    write_data: F,
+) -> Vec<u8> {
+    let data_start = CASV_HEADER_BYTES + entries.len() * CASV_INDEX_ENTRY_BYTES;
+    let mut out = Vec::with_capacity(data_start + total_data_len);
+    out.extend_from_slice(&build_casv_header(header));
+    let mut offset = data_start;
+    for &(flags, len) in entries {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(len | flags).to_le_bytes());
+        offset += len as usize;
+    }
+    write_data(&mut out);
+    out
+}
+
 /// Parse and validate the header. `None` on bad magic/version/zero dims.
 pub fn parse_casv_header(data: &[u8]) -> Option<CasvHeader> {
     if data.len() < CASV_HEADER_BYTES {
@@ -215,6 +242,18 @@ pub fn write_csau_box(out: &mut Vec<u8>, ogg_opus: &[u8]) {
     out.extend_from_slice(&CASV_AUDIO_BOX_MAGIC.to_le_bytes());
     out.extend_from_slice(&(ogg_opus.len() as u32).to_le_bytes());
     out.extend_from_slice(ogg_opus);
+}
+
+/// K5 FrameSink (footer audio): splice a CSAU box between the CASR box and the
+/// trailing 32-byte footer of a footer-format `.casv` buffer (as produced by
+/// [`encode_casv_video_streaming_to_progress`]). No-op when `ogg_opus` is `None`.
+/// Single source of the splice both audio wrappers used to hand-roll.
+fn splice_csau_before_footer(buf: &mut Vec<u8>, ogg_opus: Option<&[u8]>) {
+    if let Some(audio) = ogg_opus {
+        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
+        write_csau_box(buf, audio);
+        buf.extend_from_slice(&footer);
+    }
 }
 
 /// Extract the Ogg/Opus payload from a footer-format `.casv` that contains a CSAU box.
@@ -319,12 +358,7 @@ pub fn encode_casv_video_with_audio_progress(
     let mut buf = Vec::new();
     // Use the footer-format sink encoder: writes [frames][index][CASR][footer].
     encode_casv_video_streaming_to_progress(&mut src, opts, &mut buf, on_frame)?;
-    if let Some(audio) = ogg_opus {
-        // Insert CSAU between the CASR box and the 32-byte footer.
-        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
-        write_csau_box(&mut buf, audio);
-        buf.extend_from_slice(&footer);
-    }
+    splice_csau_before_footer(&mut buf, ogg_opus);
     Ok(buf)
 }
 
@@ -341,12 +375,7 @@ pub fn encode_casv_video_streaming_with_audio_progress(
 ) -> Result<Vec<u8>, VideoError> {
     let mut buf = Vec::new();
     encode_casv_video_streaming_to_progress(src, opts, &mut buf, on_frame)?;
-    if let Some(audio) = ogg_opus {
-        // Insert CSAU between the CASR box and the 32-byte footer.
-        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
-        write_csau_box(&mut buf, audio);
-        buf.extend_from_slice(&footer);
-    }
+    splice_csau_before_footer(&mut buf, ogg_opus);
     Ok(buf)
 }
 
@@ -1332,17 +1361,9 @@ pub fn encode_casv_video_streaming(
         fps_den,
         flags: casv_rate_flags(opts),
     };
-    let data_start = CASV_HEADER_BYTES + index.len() * CASV_INDEX_ENTRY_BYTES;
-    let mut out = Vec::with_capacity(data_start + data.len());
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, len) in &index {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(len | flags).to_le_bytes());
-        offset += *len as usize;
-    }
-    out.extend_from_slice(&data);
-    Ok(out)
+    Ok(assemble_header_casv(&header, &index, data.len(), |out| {
+        out.extend_from_slice(&data);
+    }))
 }
 
 /// K5: streaming **FableBraid** encode (header-indexed, buffered). Pulls frames one
@@ -1407,17 +1428,9 @@ pub fn encode_casv_fable_streaming(
         fps_den,
         flags: CASV_HDR_FABLE_FLAG,
     };
-    let data_start = CASV_HEADER_BYTES + index.len() * CASV_INDEX_ENTRY_BYTES;
-    let mut out = Vec::with_capacity(data_start + data.len());
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, len) in &index {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(len | flags).to_le_bytes());
-        offset += *len as usize;
-    }
-    out.extend_from_slice(&data);
-    Ok(out)
+    Ok(assemble_header_casv(&header, &index, data.len(), |out| {
+        out.extend_from_slice(&data);
+    }))
 }
 
 /// **Streaming to a sink** (footer-indexed): identical encode to
@@ -1600,25 +1613,13 @@ pub fn encode_casv_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-
-    let total: usize = data_start + streams.iter().map(|s| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    // Index: absolute offsets from file start.
-    let mut offset = data_start;
-    for s in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        offset += s.len();
-    }
-    // Data.
-    for s in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams.iter().map(|s| (0u32, s.len() as u32)).collect();
+    let total_data: usize = streams.iter().map(|s| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for s in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Encode a **full-dimensioned low-resolution proxy** `.casv`: every frame is an
@@ -1670,21 +1671,13 @@ pub fn encode_casv_proxy_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|s| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for s in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        offset += s.len();
-    }
-    for s in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams.iter().map(|s| (0u32, s.len() as u32)).collect();
+    let total_data: usize = streams.iter().map(|s| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for s in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Encode a **16-bit-offset** residual (`cur - prev + 32768`) of a `w×h` RGB8
@@ -1757,26 +1750,16 @@ pub fn encode_casv_delta_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    let mut offset = data_start;
-    for (is_p, s) in &streams {
-        let mut len_field = s.len() as u32;
-        if *is_p {
-            len_field |= CASV_PFRAME_FLAG;
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(is_p, s)| (if *is_p { CASV_PFRAME_FLAG } else { 0 }, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
         }
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&len_field.to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    }))
 }
 
 // LOSSY inter-frame findings:
@@ -1888,21 +1871,16 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, s) in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(flags, s)| (*flags, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Lossy streaming tier, tile granularity: like `encode_casv_delta_lossy_bbox_rgb8`
@@ -2004,21 +1982,16 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, s) in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(flags, s)| (*flags, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Borrow the JXL codestream bytes for frame `index`, validated against the
@@ -2515,26 +2488,21 @@ pub fn encode_casv_delta_tiled_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    let mut offset = data_start;
-    for (is_p, s) in &streams {
-        let mut len_field = s.len() as u32;
-        if *is_p {
-            len_field |= CASV_PFRAME_FLAG | CASV_TILE_FLAG;
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(is_p, s)| {
+            (
+                if *is_p { CASV_PFRAME_FLAG | CASV_TILE_FLAG } else { 0 },
+                s.len() as u32,
+            )
+        })
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
         }
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&len_field.to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    }))
 }
 
 /// Encode RGB8 frames with GOP + **bounding-box** P-frames: each P-frame stores
@@ -2602,29 +2570,25 @@ pub fn encode_casv_delta_bbox_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, _, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    let mut offset = data_start;
-    for (is_p, is_bbox, s) in &streams {
-        let mut len_field = s.len() as u32;
-        if *is_p {
-            len_field |= CASV_PFRAME_FLAG;
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(is_p, is_bbox, s)| {
+            let mut flags = 0u32;
+            if *is_p {
+                flags |= CASV_PFRAME_FLAG;
+            }
+            if *is_bbox {
+                flags |= CASV_BBOX_FLAG;
+            }
+            (flags, s.len() as u32)
+        })
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, _, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, _, s) in &streams {
+            out.extend_from_slice(s);
         }
-        if *is_bbox {
-            len_field |= CASV_BBOX_FLAG;
-        }
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&len_field.to_le_bytes());
-        offset += s.len();
-    }
-    for (_, _, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    }))
 }
 
 /// Zero-copy view over a parsed CASV container, header-indexed or
@@ -2817,21 +2781,16 @@ pub fn encode_casv_fable_rgb8(
         fps_den,
         flags: CASV_HDR_FABLE_FLAG,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, s) in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(flags, s)| (*flags, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Reconstruct a P-frame in place: `prev` holds the previous reconstructed frame
