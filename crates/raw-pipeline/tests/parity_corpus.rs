@@ -63,20 +63,38 @@ fn orf_rgba8_sanity() {
     println!("ORF rgba8  {w}×{h}  hash={:#018x}", buf_hash(&rgba8));
 }
 
-/// process() (rgb8 path, no width arg) via bench_pipeline_orf.
+/// process() (rgb8 path, no width arg) via bench_pipeline_orf — 3 runs, reports avg.
 #[test]
-fn orf_process_rgb8_sanity() {
+fn orf_process_rgb8_timing() {
     let data = match find_orf() {
         Some(d) => d,
         None => { eprintln!("SKIP: ORF fixture not found"); return; }
     };
 
-    let bench = tiff::bench_pipeline_orf(&data).expect("bench_pipeline_orf");
-    assert!(bench.width > 0 && bench.height > 0);
+    const RUNS: usize = 3;
+    let mut dec_sum = 0f64;
+    let mut dem_sum = 0f64;
+    let mut tone_sum = 0f64;
+    let mut w = 0u32;
+    let mut h = 0u32;
+
+    for _ in 0..RUNS {
+        let bench = tiff::bench_pipeline_orf(&data).expect("bench_pipeline_orf");
+        dec_sum += bench.decompress_ms;
+        dem_sum += bench.demosaic_ms;
+        tone_sum += bench.tone_ms;
+        w = bench.width;
+        h = bench.height;
+    }
+
+    let (d, dm, t, total) = (
+        dec_sum / RUNS as f64,
+        dem_sum / RUNS as f64,
+        tone_sum / RUNS as f64,
+        (dec_sum + dem_sum + tone_sum) / RUNS as f64,
+    );
     println!(
-        "ORF rgb8 pipeline  {w}×{h}  decompress={d:.1}ms  demosaic={dm:.1}ms  tone={t:.1}ms",
-        w = bench.width, h = bench.height,
-        d = bench.decompress_ms, dm = bench.demosaic_ms, t = bench.tone_ms,
+        "CANONICAL  {w}×{h}  decompress={d:.1}ms  demosaic={dm:.1}ms  tone={t:.1}ms  total={total:.1}ms  (avg {RUNS} runs)"
     );
 }
 
@@ -160,7 +178,6 @@ fn dng_align_to_rggb_infallible() {
     };
 
     let img = dng::decode_bytes(&data).expect("decode_bytes");
-    // API shape: no unwrap/? needed — returns (Cow<[u16]>, usize, usize) directly.
     let (_slice, w, h) = dng::align_to_rggb(&img.raw, img.width, img.height, img.cfa);
     assert!(w > 0 && h > 0);
     println!("align_to_rggb infallible OK  {w}×{h}");
