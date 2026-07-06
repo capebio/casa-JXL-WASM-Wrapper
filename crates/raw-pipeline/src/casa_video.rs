@@ -177,6 +177,33 @@ pub fn build_casv_header(h: &CasvHeader) -> [u8; CASV_HEADER_BYTES] {
     b
 }
 
+/// K5 FrameSink (header format): the single source of the header-container byte
+/// layout `[32B header][index][data]`. Each index entry is `[u32 absolute_offset]
+/// [u32 len | flags]`; payloads follow in frame order. `entries` is `(flags, len)`
+/// per frame; `total_data_len` is the summed payload bytes (for one exact
+/// `Vec::with_capacity`); `write_data` appends the payloads (one copy, per-site — so
+/// no double-buffering). This centralizes the absolute-offset math that was
+/// hand-written at ~10 call sites (the bounds-drift bug class). Byte-identical to
+/// each former hand-rolled tail.
+fn assemble_header_casv<F: FnOnce(&mut Vec<u8>)>(
+    header: &CasvHeader,
+    entries: &[(u32, u32)],
+    total_data_len: usize,
+    write_data: F,
+) -> Vec<u8> {
+    let data_start = CASV_HEADER_BYTES + entries.len() * CASV_INDEX_ENTRY_BYTES;
+    let mut out = Vec::with_capacity(data_start + total_data_len);
+    out.extend_from_slice(&build_casv_header(header));
+    let mut offset = data_start;
+    for &(flags, len) in entries {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(len | flags).to_le_bytes());
+        offset += len as usize;
+    }
+    write_data(&mut out);
+    out
+}
+
 /// Parse and validate the header. `None` on bad magic/version/zero dims.
 pub fn parse_casv_header(data: &[u8]) -> Option<CasvHeader> {
     if data.len() < CASV_HEADER_BYTES {
@@ -217,6 +244,18 @@ pub fn write_csau_box(out: &mut Vec<u8>, ogg_opus: &[u8]) {
     out.extend_from_slice(&CASV_AUDIO_BOX_MAGIC.to_le_bytes());
     out.extend_from_slice(&(ogg_opus.len() as u32).to_le_bytes());
     out.extend_from_slice(ogg_opus);
+}
+
+/// K5 FrameSink (footer audio): splice a CSAU box between the CASR box and the
+/// trailing 32-byte footer of a footer-format `.casv` buffer (as produced by
+/// [`encode_casv_video_streaming_to_progress`]). No-op when `ogg_opus` is `None`.
+/// Single source of the splice both audio wrappers used to hand-roll.
+fn splice_csau_before_footer(buf: &mut Vec<u8>, ogg_opus: Option<&[u8]>) {
+    if let Some(audio) = ogg_opus {
+        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
+        write_csau_box(buf, audio);
+        buf.extend_from_slice(&footer);
+    }
 }
 
 /// Extract the Ogg/Opus payload from a footer-format `.casv` that contains a CSAU box.
@@ -321,12 +360,7 @@ pub fn encode_casv_video_with_audio_progress(
     let mut buf = Vec::new();
     // Use the footer-format sink encoder: writes [frames][index][CASR][footer].
     encode_casv_video_streaming_to_progress(&mut src, opts, &mut buf, on_frame)?;
-    if let Some(audio) = ogg_opus {
-        // Insert CSAU between the CASR box and the 32-byte footer.
-        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
-        write_csau_box(&mut buf, audio);
-        buf.extend_from_slice(&footer);
-    }
+    splice_csau_before_footer(&mut buf, ogg_opus);
     Ok(buf)
 }
 
@@ -343,12 +377,7 @@ pub fn encode_casv_video_streaming_with_audio_progress(
 ) -> Result<Vec<u8>, VideoError> {
     let mut buf = Vec::new();
     encode_casv_video_streaming_to_progress(src, opts, &mut buf, on_frame)?;
-    if let Some(audio) = ogg_opus {
-        // Insert CSAU between the CASR box and the 32-byte footer.
-        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
-        write_csau_box(&mut buf, audio);
-        buf.extend_from_slice(&footer);
-    }
+    splice_csau_before_footer(&mut buf, ogg_opus);
     Ok(buf)
 }
 
@@ -820,6 +849,12 @@ struct StreamCtx {
     crop: Vec<u8>,
     /// Confidence-scheduled tile admission (None = classic behavior).
     admission: Option<TileAdmission>,
+    /// K5: lossless tier. I-frames encode at distance 0 (modular lossless);
+    /// P-frames are additive 16-bit residuals vs the previous SOURCE frame (NOT
+    /// REPLACE) — drift-free because a lossless decode reproduces the source exactly.
+    lossless: bool,
+    /// Reused u16 residual scratch for the lossless P-frame path (whole-frame).
+    resid16: Vec<u16>,
 }
 
 /// Confidence-scheduled tile admission state for the streaming Tile tier:
@@ -840,14 +875,26 @@ struct TileAdmission {
 }
 
 fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<StreamCtx, VideoError> {
-    let distance = match opts.rate {
-        VideoRate::Lossy(d) => d,
-        VideoRate::Lossless => return Err(VideoError::Unsupported),
+    // K5: the lossless tier now streams (whole-frame additive residual P-frames).
+    // Lossy keeps rejecting SkipMode::None (lossy whole-frame residual through VarDCT
+    // is broken — see the LOSSY inter-frame findings). Lossless requires None in this
+    // streaming path (residual bbox/tile streaming is a follow-up); lossless I-frames
+    // encode at distance 0.
+    let (distance, lossless) = match opts.rate {
+        VideoRate::Lossy(d) => (d, false),
+        VideoRate::Lossless => (0.0, true),
     };
-    if matches!(opts.skip, SkipMode::None) {
+    if !lossless && matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
+    // Lossless streams every skip mode: None (whole-frame residual), Bbox (residual
+    // crop), Tile (residual atlas). Only lossy skip=none stays rejected (above).
     let enc_threads = resolve_enc_threads();
+    let enc = if lossless {
+        Encoder::new(EncodeOptions::lossless().with_effort(opts.effort))?
+    } else {
+        Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?
+    };
     Ok(StreamCtx {
         width,
         height,
@@ -860,7 +907,7 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
             .unwrap_or_else(|| default_thresh_for_distance(distance)),
         // P-frame atlas encoder stays single-threaded on purpose (see
         // `resolve_enc_threads`): tiny sub-group atlases lose to fork-join sync.
-        enc: Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?,
+        enc,
         enc_threads,
         changed: Vec::new(),
         bitmap: Vec::new(),
@@ -874,6 +921,8 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
                 est_tile_bytes: None,
                 allowed: f64::INFINITY,
             }),
+        lossless,
+        resid16: Vec::new(),
     })
 }
 
@@ -883,7 +932,9 @@ impl StreamCtx {
     /// malloc + struct init) and re-derives the auto change threshold so
     /// detection stays matched to the quantization error.
     fn set_distance(&mut self, d: f32, opts: &CasaVideoOptions) -> Result<(), VideoError> {
-        if d == self.distance {
+        // Lossless has no distance to steer — the rate controller never runs for it,
+        // but guard anyway so a future caller can't silently un-lossless the encoder.
+        if self.lossless || d == self.distance {
             return Ok(());
         }
         self.distance = d;
@@ -992,6 +1043,14 @@ fn encode_stream_frame(
 ) -> Result<u32, VideoError> {
     let (width, height) = (ctx.width, ctx.height);
     if is_iframe {
+        if ctx.lossless {
+            // Bit-exact lossless I-frame via the held Rate::Lossless encoder — matches
+            // the batch tier (encode_rgb8 with lossless opts). Lossless has no tile
+            // admission, so no ref-frame bookkeeping.
+            ctx.enc
+                .encode_into(&Frame::rgb(px, width, height), payload)?;
+            return Ok(0);
+        }
         let mut isrc = WholeImageSource {
             data: px,
             width: width as usize,
@@ -1011,6 +1070,109 @@ fn encode_stream_frame(
             adm.ref_frame.extend_from_slice(px);
         }
         return Ok(0);
+    }
+    if ctx.lossless {
+        // K5 lossless P-frame: additive 16-bit residual vs the previous SOURCE frame
+        // (NO REPLACE flag — the decoder ADDS the residual via `apply_pframe`).
+        // Drift-free because a lossless decode reproduces the source exactly, so
+        // encoder-side source == decoder-side prev. Payloads are byte-identical to
+        // the batch tiers (`encode_casv_delta_rgb8` / `_bbox`).
+        let (width_us, run_full) = (width as usize, px.len());
+        match ctx.skip {
+            SkipMode::Bbox => {
+                // Exact changed rect (lossless skipping is always exact), residual crop.
+                match changed_bbox(px, prev_src, width, height) {
+                    None => {
+                        // No change → 4 zero u16 markers (matches the batch bbox path).
+                        for _ in 0..4 {
+                            payload.extend_from_slice(&0u16.to_le_bytes());
+                        }
+                    }
+                    Some((x, y, bw, bh)) => {
+                        let run = bw as usize * 3;
+                        ctx.resid16.clear();
+                        ctx.resid16.reserve(bh as usize * run);
+                        for row in 0..bh as usize {
+                            let base = ((y as usize + row) * width_us + x as usize) * 3;
+                            for k in 0..run {
+                                let c = px[base + k] as i32;
+                                let p = prev_src[base + k] as i32;
+                                ctx.resid16.push(((c - p) + 32768) as u16);
+                            }
+                        }
+                        payload.extend_from_slice(&(x as u16).to_le_bytes());
+                        payload.extend_from_slice(&(y as u16).to_le_bytes());
+                        payload.extend_from_slice(&(bw as u16).to_le_bytes());
+                        payload.extend_from_slice(&(bh as u16).to_le_bytes());
+                        ctx.enc
+                            .encode_into(&Frame::rgb(ctx.resid16.as_slice(), bw, bh), payload)?;
+                    }
+                }
+                return Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG);
+            }
+            SkipMode::Tile => {
+                // Residual atlas: same v2 square-atlas layout as the lossy tile arm,
+                // but each slot holds the changed tile's 16-bit additive residual
+                // (cur - prev + 32768) instead of fresh pixels. Decoder ADDs it
+                // (apply_pframe tile residual path). Exact change detection (thresh
+                // is 0 for lossless). No tile admission (that is a lossy rate lever).
+                let t = ctx.tile.max(1);
+                let (txn, _tyn) = tile_grid(width, height, t);
+                let ts = t as usize;
+                let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
+                ctx.changed.clear();
+                ctx.changed
+                    .extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
+                payload.extend_from_slice(&((t as u16) | CASV_TILE_V2_BIT).to_le_bytes());
+                let bitmap_len = map.len().div_ceil(8);
+                ctx.bitmap.clear();
+                ctx.bitmap.resize(bitmap_len, 0);
+                for &i in &ctx.changed {
+                    ctx.bitmap[i / 8] |= 1 << (i % 8);
+                }
+                payload.extend_from_slice(&ctx.bitmap);
+                if !ctx.changed.is_empty() {
+                    let (cols, rows) = atlas_grid_v2(ctx.changed.len());
+                    let (aw, ah) = (cols * ts, rows * ts);
+                    ctx.resid16.clear();
+                    ctx.resid16.resize(aw * ah * 3, 0);
+                    for (slot, &i) in ctx.changed.iter().enumerate() {
+                        let tx = (i as u32 % txn) as usize;
+                        let ty = (i as u32 / txn) as usize;
+                        let bw = ts.min(width_us - tx * ts);
+                        let bh = ts.min(height as usize - ty * ts);
+                        let (sx, sy) = (slot % cols, slot / cols);
+                        for row in 0..bh {
+                            let s = ((ty * ts + row) * width_us + tx * ts) * 3;
+                            let d = ((sy * ts + row) * aw + sx * ts) * 3;
+                            for k in 0..bw * 3 {
+                                let c = px[s + k] as i32;
+                                let p = prev_src[s + k] as i32;
+                                ctx.resid16[d + k] = ((c - p) + 32768) as u16;
+                            }
+                        }
+                    }
+                    ctx.enc.encode_into(
+                        &Frame::rgb(ctx.resid16.as_slice(), aw as u32, ah as u32),
+                        payload,
+                    )?;
+                }
+                return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG);
+            }
+            // SkipMode::None
+            SkipMode::None => {
+                ctx.resid16.clear();
+                ctx.resid16.reserve(run_full);
+                ctx.resid16.extend(
+                    px.iter()
+                        .zip(prev_src)
+                        .map(|(&c, &p)| ((c as i32 - p as i32) + 32768) as u16),
+                );
+                ctx.enc
+                    .encode_into(&Frame::rgb(ctx.resid16.as_slice(), width, height), payload)?;
+                return Ok(CASV_PFRAME_FLAG);
+            }
+        }
     }
     if matches!(ctx.skip, SkipMode::Tile) {
         let t = ctx.tile.max(1);
@@ -1214,17 +1376,167 @@ pub fn encode_casv_video_streaming(
         fps_den,
         flags: casv_rate_flags(opts),
     };
-    let data_start = CASV_HEADER_BYTES + index.len() * CASV_INDEX_ENTRY_BYTES;
-    let mut out = Vec::with_capacity(data_start + data.len());
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, len) in &index {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(len | flags).to_le_bytes());
-        offset += *len as usize;
+    Ok(assemble_header_casv(&header, &index, data.len(), |out| {
+        out.extend_from_slice(&data);
+    }))
+}
+
+/// K5: streaming **FableBraid** encode (header-indexed, buffered). Pulls frames one
+/// at a time — I-frames every `gop_len`, P-frames as full-frame temporal deltas vs
+/// the previous SOURCE frame — holding only prev+cur (vs the batch
+/// [`encode_casv_fable_rgb8`], which needs all frames resident). Fable is lossless,
+/// so residual-vs-source is drift-free.
+///
+/// Because the fable codec is stateless per frame pair, the per-frame payloads are
+/// byte-identical to the batch tier's — so this produces a WHOLE-FILE byte-identical
+/// `.casv` for the same frames + gop. Decodes via the header-path fable branch of
+/// [`decode_casv_all_rgb8`] (a [`crate::fable_braid::DeltaDecodeSession`]).
+pub fn encode_casv_fable_streaming(
+    src: &mut dyn VideoFrameSource,
+    gop_len: u32,
+) -> Result<Vec<u8>, VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let gop = gop_len.max(1) as usize;
+    let expected = (width as usize) * (height as usize) * 3;
+
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
+    let mut data: Vec<u8> = Vec::new();
+    // Ping-pong frame buffers (see encode_casv_video_streaming).
+    let mut cur: Vec<u8> = Vec::new();
+    let mut prev_src: Vec<u8> = Vec::new();
+    let mut idx = 0usize;
+
+    loop {
+        std::mem::swap(&mut cur, &mut prev_src);
+        if !src.next_frame_into(&mut cur) {
+            break;
+        }
+        if cur.len() != expected {
+            return Err(VideoError::FrameSize {
+                idx,
+                expected,
+                got: cur.len(),
+            });
+        }
+        let (flags, payload) = if idx % gop == 0 {
+            (0u32, crate::fable_braid::encode_rgb8(&cur, width, height))
+        } else {
+            (
+                CASV_PFRAME_FLAG,
+                crate::fable_braid::encode_rgb8_delta(&cur, &prev_src, width, height),
+            )
+        };
+        index.push((flags, payload.len() as u32));
+        data.extend_from_slice(&payload);
+        idx += 1;
     }
-    out.extend_from_slice(&data);
-    Ok(out)
+    if index.is_empty() {
+        return Err(VideoError::Empty);
+    }
+
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: index.len() as u32,
+        fps_num,
+        fps_den,
+        flags: CASV_HDR_FABLE_FLAG,
+    };
+    Ok(assemble_header_casv(&header, &index, data.len(), |out| {
+        out.extend_from_slice(&data);
+    }))
+}
+
+/// K5: streaming **FableBraid** encode in the **footer format**, straight to a sink
+/// (constant peak; the header-format [`encode_casv_fable_streaming`] buffers all
+/// payloads). The fable signal rides the optional CASR box (bit 1) since the 32-byte
+/// footer has no flags field — legacy readers skip the box, and the footer decoders
+/// ([`decode_casv_footer_all_rgb8`] / `_for_each`) read it to route frames through a
+/// `DeltaDecodeSession`. This is the tier that carries CSAU audio for fable (splice
+/// with [`encode_casv_fable_streaming_with_audio`]).
+pub fn encode_casv_fable_streaming_to_progress<W: std::io::Write>(
+    src: &mut dyn VideoFrameSource,
+    gop_len: u32,
+    sink: &mut W,
+    on_frame: &mut dyn FnMut(usize),
+) -> Result<(), VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let gop = gop_len.max(1) as usize;
+    let expected = (width as usize) * (height as usize) * 3;
+
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (rel_offset, len | flags)
+    let mut cur: Vec<u8> = Vec::new();
+    let mut prev_src: Vec<u8> = Vec::new();
+    let mut idx = 0usize;
+    let mut offset: u64 = 0;
+
+    loop {
+        std::mem::swap(&mut cur, &mut prev_src);
+        if !src.next_frame_into(&mut cur) {
+            break;
+        }
+        if cur.len() != expected {
+            return Err(VideoError::FrameSize {
+                idx,
+                expected,
+                got: cur.len(),
+            });
+        }
+        let (flags, payload) = if idx % gop == 0 {
+            (0u32, crate::fable_braid::encode_rgb8(&cur, width, height))
+        } else {
+            (
+                CASV_PFRAME_FLAG,
+                crate::fable_braid::encode_rgb8_delta(&cur, &prev_src, width, height),
+            )
+        };
+        sink.write_all(&payload).map_err(|_| VideoError::Io)?;
+        index.push((offset as u32, (payload.len() as u32) | flags));
+        offset += payload.len() as u64;
+        idx += 1;
+        on_frame(idx);
+    }
+    if index.is_empty() {
+        return Err(VideoError::Empty);
+    }
+
+    let index_offset = offset;
+    for (off, lenf) in &index {
+        sink.write_all(&off.to_le_bytes()).map_err(|_| VideoError::Io)?;
+        sink.write_all(&lenf.to_le_bytes()).map_err(|_| VideoError::Io)?;
+    }
+    // CASR box carrying ONLY the fable flag (no lossy bit) so footer decoders route
+    // to the fable session. Same box slot the JOLT rate encoder uses.
+    sink.write_all(&CASV_RATE_BOX_MAGIC.to_le_bytes())
+        .map_err(|_| VideoError::Io)?;
+    sink.write_all(&CASV_HDR_FABLE_FLAG.to_le_bytes())
+        .map_err(|_| VideoError::Io)?;
+    let footer = build_casv_footer(&CasvFooter {
+        index_offset,
+        width,
+        height,
+        frame_count: index.len() as u32,
+        fps_num,
+        fps_den,
+    });
+    sink.write_all(&footer).map_err(|_| VideoError::Io)?;
+    Ok(())
+}
+
+/// Buffered footer-format fable encode with optional CSAU audio spliced in — the
+/// fable analogue of [`encode_casv_video_streaming_with_audio_progress`].
+pub fn encode_casv_fable_streaming_with_audio(
+    src: &mut dyn VideoFrameSource,
+    gop_len: u32,
+    ogg_opus: Option<&[u8]>,
+    on_frame: &mut dyn FnMut(usize),
+) -> Result<Vec<u8>, VideoError> {
+    let mut buf = Vec::new();
+    encode_casv_fable_streaming_to_progress(src, gop_len, &mut buf, on_frame)?;
+    splice_csau_before_footer(&mut buf, ogg_opus);
+    Ok(buf)
 }
 
 /// **Streaming to a sink** (footer-indexed): identical encode to
@@ -1410,25 +1722,13 @@ pub fn encode_casv_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-
-    let total: usize = data_start + streams.iter().map(|s| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    // Index: absolute offsets from file start.
-    let mut offset = data_start;
-    for s in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        offset += s.len();
-    }
-    // Data.
-    for s in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams.iter().map(|s| (0u32, s.len() as u32)).collect();
+    let total_data: usize = streams.iter().map(|s| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for s in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Encode a **full-dimensioned low-resolution proxy** `.casv`: every frame is an
@@ -1480,21 +1780,13 @@ pub fn encode_casv_proxy_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|s| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for s in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        offset += s.len();
-    }
-    for s in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams.iter().map(|s| (0u32, s.len() as u32)).collect();
+    let total_data: usize = streams.iter().map(|s| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for s in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Encode a **16-bit-offset** residual (`cur - prev + 32768`) of a `w×h` RGB8
@@ -1567,26 +1859,16 @@ pub fn encode_casv_delta_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    let mut offset = data_start;
-    for (is_p, s) in &streams {
-        let mut len_field = s.len() as u32;
-        if *is_p {
-            len_field |= CASV_PFRAME_FLAG;
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(is_p, s)| (if *is_p { CASV_PFRAME_FLAG } else { 0 }, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
         }
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&len_field.to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    }))
 }
 
 // LOSSY inter-frame findings:
@@ -1698,21 +1980,16 @@ pub fn encode_casv_delta_lossy_bbox_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, s) in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(flags, s)| (*flags, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Lossy streaming tier, tile granularity: like `encode_casv_delta_lossy_bbox_rgb8`
@@ -1814,21 +2091,16 @@ pub fn encode_casv_delta_lossy_tiled_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, s) in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(flags, s)| (*flags, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Borrow the JXL codestream bytes for frame `index`, validated against the
@@ -2325,26 +2597,21 @@ pub fn encode_casv_delta_tiled_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    let mut offset = data_start;
-    for (is_p, s) in &streams {
-        let mut len_field = s.len() as u32;
-        if *is_p {
-            len_field |= CASV_PFRAME_FLAG | CASV_TILE_FLAG;
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(is_p, s)| {
+            (
+                if *is_p { CASV_PFRAME_FLAG | CASV_TILE_FLAG } else { 0 },
+                s.len() as u32,
+            )
+        })
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
         }
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&len_field.to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    }))
 }
 
 /// Encode RGB8 frames with GOP + **bounding-box** P-frames: each P-frame stores
@@ -2412,29 +2679,25 @@ pub fn encode_casv_delta_bbox_rgb8(
         fps_den,
         flags: 0,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, _, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-
-    let mut offset = data_start;
-    for (is_p, is_bbox, s) in &streams {
-        let mut len_field = s.len() as u32;
-        if *is_p {
-            len_field |= CASV_PFRAME_FLAG;
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(is_p, is_bbox, s)| {
+            let mut flags = 0u32;
+            if *is_p {
+                flags |= CASV_PFRAME_FLAG;
+            }
+            if *is_bbox {
+                flags |= CASV_BBOX_FLAG;
+            }
+            (flags, s.len() as u32)
+        })
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, _, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, _, s) in &streams {
+            out.extend_from_slice(s);
         }
-        if *is_bbox {
-            len_field |= CASV_BBOX_FLAG;
-        }
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&len_field.to_le_bytes());
-        offset += s.len();
-    }
-    for (_, _, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    }))
 }
 
 /// Zero-copy view over a parsed CASV container, header-indexed or
@@ -2454,6 +2717,9 @@ struct CasvView<'a> {
     min_offset: usize,
     /// Frame slices must end at or before this (footer layout: the index start).
     max_end: usize,
+    /// FableBraid tier (header flag for header layout; CASR-box flag for footer
+    /// layout). When true, frames decode through a `DeltaDecodeSession`, not libjxl.
+    fable: bool,
 }
 
 impl<'a> CasvView<'a> {
@@ -2467,6 +2733,7 @@ impl<'a> CasvView<'a> {
             index_pos: CASV_HEADER_BYTES,
             min_offset: CASV_HEADER_BYTES,
             max_end: data.len(),
+            fable: hdr.flags & CASV_HDR_FABLE_FLAG != 0,
         })
     }
 
@@ -2484,6 +2751,10 @@ impl<'a> CasvView<'a> {
             let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
             off.checked_add(delta)?;
         }
+        // Footer layout has no header flags word; the fable signal rides the
+        // optional CASR box (bit 1, disjoint from the lossy bit 0). Legacy readers
+        // skip the box, so this stays backward-compatible.
+        let fable = parse_casv_rate_box(data).is_some_and(|fl| fl & CASV_HDR_FABLE_FLAG != 0);
         Some(CasvView {
             data,
             width: f.width,
@@ -2492,6 +2763,7 @@ impl<'a> CasvView<'a> {
             index_pos: idx_start,
             min_offset: 0,
             max_end: idx_start,
+            fable,
         })
     }
 
@@ -2627,21 +2899,16 @@ pub fn encode_casv_fable_rgb8(
         fps_den,
         flags: CASV_HDR_FABLE_FLAG,
     };
-    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
-    let data_start = CASV_HEADER_BYTES + index_bytes;
-    let total: usize = data_start + streams.iter().map(|(_, s)| s.len()).sum::<usize>();
-    let mut out = Vec::with_capacity(total);
-    out.extend_from_slice(&build_casv_header(&header));
-    let mut offset = data_start;
-    for (flags, s) in &streams {
-        out.extend_from_slice(&(offset as u32).to_le_bytes());
-        out.extend_from_slice(&((s.len() as u32) | flags).to_le_bytes());
-        offset += s.len();
-    }
-    for (_, s) in &streams {
-        out.extend_from_slice(s);
-    }
-    Ok(out)
+    let entries: Vec<(u32, u32)> = streams
+        .iter()
+        .map(|(flags, s)| (*flags, s.len() as u32))
+        .collect();
+    let total_data: usize = streams.iter().map(|(_, s)| s.len()).sum();
+    Ok(assemble_header_casv(&header, &entries, total_data, |out| {
+        for (_, s) in &streams {
+            out.extend_from_slice(s);
+        }
+    }))
 }
 
 /// Reconstruct a P-frame in place: `prev` holds the previous reconstructed frame
@@ -2926,9 +3193,41 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
 
 /// GOP-parallel batch decode over either container layout (see
 /// [`decode_casv_all_rgb8`] for the parallelism contract).
+/// Decode every frame of a FABLE-tier view serially: one `DeltaDecodeSession`
+/// carries the P-chain (decode_intra resets it at each I-frame), lending
+/// `(index, pixels)` to `sink`. Shared by the all-frames and for-each footer
+/// decoders (header-layout fable is handled in decode_casv_all_rgb8 directly).
+fn decode_casv_view_fable(view: &CasvView, mut sink: impl FnMut(usize, &[u8])) -> Option<()> {
+    let (w, h) = (view.width, view.height);
+    let mut sess = crate::fable_braid::DeltaDecodeSession::new();
+    let mut prev: Option<Vec<u8>> = None;
+    for i in 0..view.frame_count {
+        let (flags, slice) = view.entry(i)?;
+        let px = if flags & CASV_PFRAME_FLAG != 0 {
+            let p = prev.take()?;
+            sess.decode_delta(slice, &p, w, h)?
+        } else {
+            let (px, dw, dh) = sess.decode_intra(slice)?;
+            if (dw, dh) != (w, h) {
+                return None;
+            }
+            px
+        };
+        sink(i, &px);
+        prev = Some(px);
+    }
+    Some(())
+}
+
 fn decode_casv_view_all_rgb8(view: &CasvView) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let (w, h) = (view.width, view.height);
     let n = view.frame_count;
+    if view.fable {
+        // Footer-layout fable: serial DeltaDecodeSession (no libjxl).
+        let mut out = Vec::with_capacity(n);
+        decode_casv_view_fable(view, |_, px| out.push((px.to_vec(), w, h)))?;
+        return Some(out);
+    }
     // GOP boundaries = I-frame positions. The scan also validates every index
     // entry up front (any malformed entry fails the whole decode, exactly as
     // the serial loop's lazy per-frame parse would).
@@ -3018,6 +3317,11 @@ fn decode_casv_view_for_each(
     mut f: impl FnMut(usize, &[u8], u32, u32),
 ) -> Option<usize> {
     let (w, h) = (view.width, view.height);
+    if view.fable {
+        // Footer-layout fable: serial DeltaDecodeSession (no libjxl threads).
+        decode_casv_view_fable(view, |i, px| f(i, px, w, h))?;
+        return Some(view.frame_count);
+    }
     let mut sess = CasvDecodeSession::with_threads(num_threads)?;
     let mut recon: Vec<u8> = Vec::new();
     decode_casv_range(
@@ -3063,6 +3367,281 @@ mod tests {
             }
         }
         v
+    }
+
+    fn lossless_none_opts(gop: u32) -> CasaVideoOptions {
+        CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: gop,
+            skip: SkipMode::None,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_none_decodes_to_source_byte_exact() {
+        // K5 decode-equality contract: streaming lossless (whole-frame residual)
+        // reconstructs every SOURCE frame byte-exact. Motion across frames (varying
+        // seed) exercises the residual P-frames, and gop=3 exercises I/P mix.
+        let (w, h) = (64u32, 48u32);
+        let frames: Vec<Vec<u8>> = (0..5).map(|k| gradient(w, h, (k * 37) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let bytes = encode_casv_video_streaming(&mut src, &lossless_none_opts(3))
+            .expect("streaming lossless encode");
+        let decoded = decode_casv_all_rgb8(&bytes).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, dw, dh)) in decoded.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
+            assert_eq!(px, &frames[i], "frame {i} not byte-exact (lossless decode-equality)");
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_footer_decodes_to_source_byte_exact() {
+        // Same contract through the FOOTER format (the one that carries CSAU audio).
+        let (w, h) = (48u32, 32u32);
+        let frames: Vec<Vec<u8>> = (0..4).map(|k| gradient(w, h, (k * 53 + 1) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 30,
+            fps_den: 1,
+        };
+        let mut sink: Vec<u8> = Vec::new();
+        encode_casv_video_streaming_to(&mut src, &lossless_none_opts(2), &mut sink)
+            .expect("streaming lossless footer encode");
+        let decoded = decode_casv_footer_all_rgb8(&sink).expect("footer decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "footer frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_bbox_decodes_to_source_byte_exact() {
+        // Localized motion: only a small rect changes each frame, so the bbox
+        // residual path (Some) is exercised, plus an identical frame for the
+        // no-change marker path (None). Lossless ⇒ every frame reconstructs exactly.
+        let (w, h) = (64u32, 48u32);
+        let wus = w as usize;
+        let base = gradient(w, h, 0);
+        let paint = |f: &mut [u8], r: u8, g: u8, b: u8| {
+            for row in 0..8usize {
+                for col in 0..10usize {
+                    let i = ((10 + row) * wus + (12 + col)) * 3;
+                    f[i] = r;
+                    f[i + 1] = g;
+                    f[i + 2] = b;
+                }
+            }
+        };
+        let mut f1 = base.clone();
+        paint(&mut f1, 200, 40, 10);
+        let mut f2 = base.clone();
+        paint(&mut f2, 20, 180, 90);
+        // f3 == f2 → changed_bbox None → zero-marker P-frame.
+        let frames: Vec<Vec<u8>> = vec![base.clone(), f1, f2.clone(), f2];
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: 4, // frame 0 = I, frames 1..3 = bbox P-frames
+            skip: SkipMode::Bbox,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        };
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let bytes = encode_casv_video_streaming(&mut src, &opts).expect("streaming lossless bbox");
+        let decoded = decode_casv_all_rgb8(&bytes).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "bbox frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_tile_decodes_to_source_byte_exact() {
+        // Lossless tile (residual atlas): localized motion changes a few tiles, plus
+        // an identical frame (empty tile set). Every frame reconstructs byte-exact.
+        let (w, h) = (64u32, 64u32);
+        let wus = w as usize;
+        let base = gradient(w, h, 0);
+        let paint_tile = |f: &mut [u8], tx: usize, ty: usize, c: [u8; 3]| {
+            for row in 0..16usize {
+                for col in 0..16usize {
+                    let i = ((ty * 16 + row) * wus + (tx * 16 + col)) * 3;
+                    f[i] = c[0];
+                    f[i + 1] = c[1];
+                    f[i + 2] = c[2];
+                }
+            }
+        };
+        let mut f1 = base.clone();
+        paint_tile(&mut f1, 1, 1, [200, 40, 10]);
+        let mut f2 = base.clone();
+        paint_tile(&mut f2, 2, 0, [20, 180, 90]);
+        let frames: Vec<Vec<u8>> = vec![base.clone(), f1, f2.clone(), f2]; // f3==f2 → empty tiles
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: 4,
+            skip: SkipMode::Tile,
+            tile: 16, // 4x4 tile grid on 64x64
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        };
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let bytes = encode_casv_video_streaming(&mut src, &opts).expect("streaming lossless tile");
+        let decoded = decode_casv_all_rgb8(&bytes).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "tile frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn streaming_lossy_still_rejects_skip_none() {
+        // Lossy whole-frame residual through VarDCT is broken — must stay rejected.
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 2,
+            skip: SkipMode::None,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        };
+        assert!(matches!(stream_ctx(32, 32, &opts), Err(VideoError::Unsupported)));
+    }
+
+    #[test]
+    fn fable_streaming_matches_batch_byte_identical() {
+        // Fable is stateless per frame pair, so the streaming encoder (2-frame
+        // residence) must produce a WHOLE-FILE byte-identical .casv to the batch
+        // (all-frames-resident) encoder for the same frames + gop.
+        let (w, h) = (64u32, 48u32);
+        let frames: Vec<Vec<u8>> = (0..5).map(|k| gradient(w, h, (k * 29 + 3) as u8)).collect();
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let batch = encode_casv_fable_rgb8(&refs, w, h, 24, 1, 3).expect("batch fable");
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let streamed = encode_casv_fable_streaming(&mut src, 3).expect("streaming fable");
+        assert_eq!(streamed, batch, "streaming fable != batch (must be byte-identical)");
+    }
+
+    #[test]
+    fn fable_streaming_decodes_to_source_byte_exact() {
+        // Fable is lossless → decode-equality: every SOURCE frame reconstructs exactly
+        // through the header-path fable branch (DeltaDecodeSession).
+        let (w, h) = (48u32, 40u32);
+        let frames: Vec<Vec<u8>> = (0..4).map(|k| gradient(w, h, (k * 41 + 7) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 30,
+            fps_den: 1,
+        };
+        let streamed = encode_casv_fable_streaming(&mut src, 2).expect("streaming fable");
+        let decoded = decode_casv_all_rgb8(&streamed).expect("fable decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "fable frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn footer_fable_decodes_to_source_byte_exact() {
+        // K5 step 5: fable in the FOOTER format. The fable signal rides the CASR box;
+        // the footer decoders (all + for_each) route to DeltaDecodeSession and
+        // reconstruct every SOURCE frame byte-exact (fable is lossless).
+        let (w, h) = (48u32, 40u32);
+        let frames: Vec<Vec<u8>> = (0..5).map(|k| gradient(w, h, (k * 23 + 9) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let mut buf = Vec::new();
+        encode_casv_fable_streaming_to_progress(&mut src, 3, &mut buf, &mut |_| {})
+            .expect("footer fable encode");
+        // The CASR box carries the fable flag.
+        assert_eq!(
+            parse_casv_rate_box(&buf).map(|f| f & CASV_HDR_FABLE_FLAG != 0),
+            Some(true),
+            "footer fable must set the CASR fable bit"
+        );
+        let decoded = decode_casv_footer_all_rgb8(&buf).expect("footer fable decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "footer fable frame {i} not byte-exact");
+        }
+        // The for_each footer decoder routes fable too.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        decode_casv_footer_for_each_rgb8(&buf, |_, px, _, _| got.push(px.to_vec()))
+            .expect("footer fable for_each");
+        assert_eq!(got, frames);
+    }
+
+    #[test]
+    fn footer_fable_with_audio_roundtrips() {
+        // Fable footer + CSAU audio: the whole point of the footer format for fable
+        // (the header format can't carry audio). Audio recovers; frames stay exact.
+        let (w, h) = (32u32, 32u32);
+        let frames: Vec<Vec<u8>> = (0..3).map(|k| gradient(w, h, (k * 61 + 2) as u8)).collect();
+        let audio = vec![0xAAu8; 64]; // stand-in Ogg/Opus payload
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 30,
+            fps_den: 1,
+        };
+        let buf = encode_casv_fable_streaming_with_audio(&mut src, 2, Some(&audio), &mut |_| {})
+            .expect("fable footer + audio");
+        assert_eq!(parse_casv_audio_box(&buf), Some(audio.as_slice()), "CSAU audio must survive");
+        let decoded = decode_casv_footer_all_rgb8(&buf).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "fable+audio frame {i} not byte-exact");
+        }
     }
 
     #[test]
@@ -4884,7 +5463,9 @@ mod tests {
             );
         }
 
-        // Unsupported tier rejected.
+        // Unsupported tier rejected. All lossless skip modes now stream (K5), so the
+        // only still-unsupported streaming case is LOSSY skip=none (whole-frame
+        // residual through VarDCT is broken).
         let mut fs3 = VecFrames {
             frames: low_motion(w, h, 2),
             i: 0,
@@ -4892,7 +5473,8 @@ mod tests {
             h,
         };
         let bad = CasaVideoOptions {
-            rate: VideoRate::Lossless,
+            rate: VideoRate::Lossy(1.0),
+            skip: SkipMode::None,
             ..opts
         };
         assert!(matches!(
