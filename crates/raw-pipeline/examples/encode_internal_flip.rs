@@ -392,7 +392,7 @@ mod real_encoder {
         let pixels: Vec<Vec<u8>> = (0..ANIM_FRAMES)
             .map(|i| mkpix(FRAME_W, FRAME_H, i as u64 * 0x9e3779b97f4a7c15))
             .collect();
-        let frames: Vec<Frame> = pixels
+        let frames: Vec<Frame<u8>> = pixels
             .iter()
             .map(|p| Frame::rgb(p, FRAME_W, FRAME_H))
             .collect();
