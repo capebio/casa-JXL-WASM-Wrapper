@@ -18,6 +18,7 @@ pub mod demosaic;
 pub mod dng;
 pub mod exif;
 pub mod fable_braid;
+pub mod frame_pipeline;
 pub mod frame_stats;
 pub mod image_formats;
 pub mod ljpeg;

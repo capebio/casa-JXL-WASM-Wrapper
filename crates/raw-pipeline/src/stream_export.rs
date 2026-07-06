@@ -7,6 +7,7 @@
 //! DNG (`DngRowSource`, phased).
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
+use crate::cr2::Cr2RowSource;
 use crate::decompress::{OrfRowDecoder, RawRowSource};
 use crate::jxl_casaencoder::{encode_chunked, ChunkedColorSource};
 use crate::pipeline::PipelineParams;
@@ -52,6 +53,22 @@ pub fn export_orf_jxl_streaming(
     out: &mut Vec<u8>,
 ) -> Result<(usize, usize), String> {
     let mut s = StreamingBandSource::from_orf_bytes(orf, 0.0)?;
+    let (w, h) = (s.width(), s.height());
+    encode_chunked(w as u32, h as u32, distance, effort, &mut s, out)
+        .map_err(|e| format!("{e:?}"))?;
+    Ok((w, h))
+}
+
+/// Export a full-res JXL from CR2 container bytes. Decodes LJPEG mosaic upfront
+/// (resident buffer) then streams bands — peak ≈ mosaic + one band vs the batch
+/// path which holds mosaic + rgb16 + rgb8 simultaneously.
+pub fn export_cr2_jxl_streaming(
+    cr2: &[u8],
+    distance: f32,
+    effort: i64,
+    out: &mut Vec<u8>,
+) -> Result<(usize, usize), String> {
+    let mut s = StreamingBandSource::<Cr2RowSource>::from_cr2_bytes(cr2, 0.0)?;
     let (w, h) = (s.width(), s.height());
     encode_chunked(w as u32, h as u32, distance, effort, &mut s, out)
         .map_err(|e| format!("{e:?}"))?;

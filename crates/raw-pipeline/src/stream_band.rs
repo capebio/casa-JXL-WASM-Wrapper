@@ -13,6 +13,7 @@
 //!   - rgb8 window: toned output rows [win_first, produced).
 //! Demosaic (+ spatial ops) + tone run in 256-row sub-chunks so the rgb16 transient stays bounded.
 
+use crate::cr2::Cr2RowSource;
 use crate::decompress::{OrfRowDecoder, RawRowSource};
 use crate::demosaic::demosaic_bayer_mhc_band;
 use crate::dng::DngRowSource;
@@ -399,6 +400,24 @@ impl<'a> StreamingBandSource<DngRowSource<'a>> {
         params.wb_r = wb_r;
         params.wb_b = wb_b;
         params.color_matrix = cm;
+        Ok(Self::new(src, w, h, params, nr_strength, phase))
+    }
+}
+
+/// Build a band producer from CR2 container bytes. Unlike ORF/DNG sources,
+/// `Cr2RowSource` owns the decoded mosaic (no lifetime parameter), so no `'a`.
+impl StreamingBandSource<Cr2RowSource> {
+    pub fn from_cr2_bytes(cr2: &[u8], nr_strength: f32) -> Result<Self, String> {
+        let src = crate::cr2::cr2_row_source(cr2).map_err(|e| format!("{e:?}"))?;
+        let w = src.width();
+        let h = src.height();
+        let phase = src.cfa_phase;
+        let mut params = PipelineParams::default_olympus();
+        params.black = src.black;
+        params.white = src.white;
+        params.wb_r = src.wb_r;
+        params.wb_b = src.wb_b;
+        params.color_matrix = src.color_matrix;
         Ok(Self::new(src, w, h, params, nr_strength, phase))
     }
 }
