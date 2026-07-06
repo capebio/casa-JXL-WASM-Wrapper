@@ -147,11 +147,58 @@ describe("casv-web player vs native decode", () => {
     }
   });
 
-  test("fable-flagged files are rejected", async () => {
+  test("fable-flagged files without a session are rejected", async () => {
     const bytes = fixture("tile_v2.casv").slice();
     // Set the Fable bit in the header flags word (bytes 28..32 LE).
     bytes[28] = bytes[28]! | CASV_HDR_FABLE_FLAG;
-    await expect(decodeCasvAll(bytes, decodeJxl)).rejects.toThrow(/native-only/);
+    // No fableSession provided → clear error (not a silent JXL-decode attempt).
+    await expect(decodeCasvAll(bytes, decodeJxl)).rejects.toThrow(/fableSession/);
+  });
+
+  test("fable-flagged files play through an injected FableSession (K6#4)", async () => {
+    const bytes = fixture("tile_v2.casv").slice();
+    bytes[28] = bytes[28]! | CASV_HDR_FABLE_FLAG;
+    const reader = CasvReader.parse(bytes);
+    const { width, height } = reader.header;
+    const rgbBytes = width * height * 3;
+    let intra = 0;
+    let delta = 0;
+    // Mock session: verifies playFable routes intra→frame 0, delta→P-frames with
+    // the previous RGB8 as `prev`. Payload content is irrelevant to the routing.
+    const factory = () => ({
+      decodeIntra(_b: Uint8Array): Uint8Array {
+        intra++;
+        return new Uint8Array(rgbBytes).fill(7);
+      },
+      decodeDelta(_b: Uint8Array, prev: Uint8Array, w: number, h: number): Uint8Array {
+        delta++;
+        expect(prev.length).toBe(rgbBytes); // prev = session's previous RGB8
+        expect(w).toBe(width);
+        expect(h).toBe(height);
+        return new Uint8Array(rgbBytes).fill(9);
+      },
+    });
+    // Expected routing is per-entry: I-frames (isPFrame=false) → decodeIntra,
+    // P-frames → decodeDelta. The fixture may carry periodic keyframes.
+    let expIntra = 0;
+    let expDelta = 0;
+    for (let i = 0; i < reader.frameCount; i++) {
+      if (reader.entry(i).isPFrame) expDelta++;
+      else expIntra++;
+    }
+    const indices: number[] = [];
+    let firstPixel = -1;
+    for await (const f of playCasv(bytes, decodeJxl, { fableSession: factory })) {
+      expect(f.rgba.length).toBe(width * height * 4);
+      expect(f.rgba[3]).toBe(255); // alpha filled by rgb8ToRgba
+      if (f.index === 0) firstPixel = f.rgba[0]!;
+      indices.push(f.index);
+    }
+    expect(indices).toEqual(Array.from({ length: reader.frameCount }, (_, i) => i));
+    expect(intra).toBe(expIntra);
+    expect(delta).toBe(expDelta);
+    expect(intra).toBeGreaterThanOrEqual(1); // at least frame 0
+    expect(firstPixel).toBe(7); // frame 0 is an I-frame → decodeIntra (7)
   });
 
   test("residual (non-REPLACE) P-frames are rejected with a clear error", async () => {
