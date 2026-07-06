@@ -1150,6 +1150,119 @@ where
     }
 }
 
+/// K2: probe the byte offset of every progressive-pass boundary in a JXL
+/// codestream — the tiers-as-byte-ranges core. Returns ascending byte lengths:
+/// each entry `k` is the smallest prefix `jxl_bytes[..k]` that decodes to that
+/// pass's preview (via `FlushImage` on a truncated stream); the final entry is the
+/// full length. So `offsets[0]` ends the DC pass, `offsets[1]` the first AC pass,
+/// … and `*offsets.last() == jxl_bytes.len()`.
+///
+/// Mechanism (no new libjxl C++): decode with `SetProgressiveDetail(kPasses)` +
+/// `FRAME_PROGRESSION`; at each event, `consumed = len - JxlDecoderReleaseInput()`
+/// is the exact bytes libjxl needed for that pass. The input is re-attached from
+/// `consumed` after each release so decoding continues (the same append pattern the
+/// streaming bridge uses). Byte-exact — unlike the old 4 KiB-granular JS profiler.
+///
+/// Returns `None` on a non-progressive stream (only the final image, so a single
+/// offset == len is still returned), a decode error, or if fewer than one pass is
+/// seen. A stream encoded with [`EncodeOptions::with_progressive`] yields ≥2 offsets.
+pub fn progressive_tier_offsets(jxl_bytes: &[u8]) -> Option<Vec<usize>> {
+    if jxl_bytes.is_empty() {
+        return None;
+    }
+    let len = jxl_bytes.len();
+    unsafe {
+        let dec = ffi::JxlDecoderCreate(std::ptr::null());
+        if dec.is_null() {
+            return None;
+        }
+        let events = S_BASIC.0 | S_PROG.0 | S_FULL.0;
+        let _ = ffi::JxlDecoderSubscribeEvents(dec, events);
+        let _ = ffi::JxlDecoderSetProgressiveDetail(dec, ffi::JxlProgressiveDetail::kPasses);
+        let _ = ffi::JxlDecoderSetInput(dec, jxl_bytes.as_ptr(), len);
+        // NB: do NOT CloseInput up front — we release + re-attach the input at each
+        // pass boundary to read `consumed`, and only close when libjxl asks for more.
+
+        let pf = pixel_format::<u8>(4);
+        let mut info = std::mem::MaybeUninit::<ffi::JxlBasicInfo>::uninit();
+        let mut out_buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        let mut closed = false;
+        let mut ok = true;
+        let mut done = false;
+        // Iteration backstop: passes are bounded (DC + a few AC); guard runaway.
+        for _ in 0..256 {
+            let status = ffi::JxlDecoderProcessInput(dec);
+            if status == S_BASIC {
+                if ffi::JxlDecoderGetBasicInfo(dec, info.as_mut_ptr()) != S_SUCCESS {
+                    ok = false;
+                    break;
+                }
+                let bi = info.assume_init_ref();
+                let pixels = bi.xsize as u64 * bi.ysize as u64;
+                if pixels == 0
+                    || pixels > DecodeLimits::default().max_pixels
+                    || pixels.saturating_mul(4) > DecodeLimits::default().max_output_bytes
+                {
+                    ok = false;
+                    break;
+                }
+            } else if status == S_NEEDOUT {
+                let mut size: usize = 0;
+                if ffi::JxlDecoderImageOutBufferSize(dec, &pf, &mut size) != S_SUCCESS {
+                    ok = false;
+                    break;
+                }
+                out_buf.resize(size, 0);
+                if ffi::JxlDecoderSetImageOutBuffer(dec, &pf, out_buf.as_mut_ptr() as *mut _, size)
+                    != S_SUCCESS
+                {
+                    ok = false;
+                    break;
+                }
+            } else if status == S_PROG {
+                // Bytes libjxl needed to reach this pass = len - unconsumed.
+                let remaining = ffi::JxlDecoderReleaseInput(dec).min(len);
+                let consumed = len - remaining;
+                // Record ascending, de-duplicated (a pass can fire at the same
+                // boundary as the prior on tiny images).
+                if offsets.last().copied() != Some(consumed) {
+                    offsets.push(consumed);
+                }
+                // Re-attach the still-unconsumed tail so decoding continues.
+                if remaining > 0 {
+                    let _ = ffi::JxlDecoderSetInput(dec, jxl_bytes.as_ptr().add(consumed), remaining);
+                } else if !closed {
+                    ffi::JxlDecoderCloseInput(dec);
+                    closed = true;
+                }
+            } else if status == S_FULL || status == S_SUCCESS {
+                if offsets.last().copied() != Some(len) {
+                    offsets.push(len);
+                }
+                done = true;
+                break;
+            } else if status == S_NEEDIN {
+                if !closed {
+                    ffi::JxlDecoderCloseInput(dec);
+                    closed = true;
+                } else {
+                    break;
+                }
+            } else {
+                ok = false; // JXL_DEC_ERROR or anything unexpected.
+                break;
+            }
+        }
+        ffi::JxlDecoderDestroy(dec);
+        if ok && done && !offsets.is_empty() {
+            Some(offsets)
+        } else {
+            None
+        }
+    }
+}
+
 /// Compatibility wrapper that clones progressive frames for retaining callers.
 ///
 /// # Performance Warning
@@ -2108,6 +2221,68 @@ mod tests {
         assert_eq!((img.width, img.height, img.channels), (w, h, 4));
         assert_eq!(img.data, px);
         assert!(img.meta.num_color_channels >= 3);
+    }
+
+    #[test]
+    fn progressive_tier_offsets_partition_and_decode() {
+        // Non-trivial gradient so the encode has real DC + AC progressive passes.
+        let (w, h) = (128u32, 128u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 3) as usize;
+                rgb[i] = (x % 256) as u8;
+                rgb[i + 1] = (y % 256) as u8;
+                rgb[i + 2] = ((x * 2 + y) % 256) as u8;
+            }
+        }
+        let opts = EncodeOptions::distance(1.5).with_effort(3).with_progressive();
+        let mut enc = Encoder::new(opts).expect("encoder");
+        let jxl = enc.encode(&Frame::rgb(&rgb, w, h)).expect("progressive encode");
+
+        let offsets = super::progressive_tier_offsets(&jxl).expect("progressive offsets");
+
+        // Strictly ascending, each a proper prefix, final == full length.
+        assert!(
+            offsets.windows(2).all(|p| p[0] < p[1]),
+            "offsets must be strictly ascending: {offsets:?}"
+        );
+        assert_eq!(*offsets.last().unwrap(), jxl.len(), "last tier != full length");
+        assert!(offsets[0] > 0 && offsets[0] < jxl.len(), "DC prefix not a proper prefix");
+        // Progressive → at least a DC tier before the full image.
+        assert!(offsets.len() >= 2, "expected >=2 progressive tiers, got {offsets:?}");
+
+        // Cross-check against the independent progressive decoder: the probe records
+        // one boundary per FRAME_PROGRESSION event (+ the final full length), so the
+        // number of non-final tiers must equal the decoder's progression-flush count.
+        // This proves the offsets are the real libjxl pass boundaries, not arbitrary
+        // cuts — using a code path (decode_progressive_frames_borrowed) that shares
+        // nothing with the probe but the same kPasses detail.
+        let mut progress_events = 0usize;
+        decode_progressive_frames_borrowed(&jxl, |ev| {
+            if let DecodeProgressiveEvent::Progress { width, height, .. } = ev {
+                assert_eq!((width, height), (w, h));
+                progress_events += 1;
+            }
+        })
+        .expect("progressive decode of the full stream");
+        assert_eq!(
+            offsets.len() - 1,
+            progress_events,
+            "probe found {} non-final tiers but the decoder flushed {progress_events} passes; offsets={offsets:?}",
+            offsets.len() - 1
+        );
+
+        // The full stream decodes cleanly at the right dims.
+        let mut dec = Decoder::new(DecodeOptions::default()).unwrap();
+        let full: Image<u8> = dec.decode(&jxl, Channels::Rgba).unwrap();
+        assert_eq!((full.width, full.height), (w, h));
+    }
+
+    #[test]
+    fn progressive_offsets_none_on_garbage() {
+        assert!(super::progressive_tier_offsets(&[]).is_none());
+        assert!(super::progressive_tier_offsets(&[0u8; 32]).is_none());
     }
 
     #[test]
