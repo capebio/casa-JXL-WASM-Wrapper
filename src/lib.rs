@@ -4131,3 +4131,80 @@ pub fn fable_decode_rgb8_delta(
     raw_pipeline::fable_braid::decode_rgb8_delta(bytes, prev, width, height)
         .ok_or_else(|| JsValue::from_str("fable: corrupt delta stream"))
 }
+
+/// K6#4: stateful FableBraid decode session for browser CASV playback. Mirrors the
+/// native `DeltaDecodeSession` (`fable_braid.rs`): decode an intra keyframe, then
+/// temporal-delta frames against the previous frame this session returned. The
+/// stateless `fable_decode_rgb8*` fns above are pure functions; the fable video
+/// tier is a whole-frame temporal chain, so browser playback needs this session.
+///
+/// `decode_intra` sets `width`/`height`; `decode_delta` takes the current dims and
+/// the previous frame's RGB8 (the value this session last returned).
+#[wasm_bindgen]
+pub struct FableDeltaSession {
+    inner: raw_pipeline::fable_braid::DeltaDecodeSession,
+    last_w: u32,
+    last_h: u32,
+}
+
+#[wasm_bindgen]
+impl FableDeltaSession {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> FableDeltaSession {
+        FableDeltaSession {
+            inner: raw_pipeline::fable_braid::DeltaDecodeSession::new(),
+            last_w: 0,
+            last_h: 0,
+        }
+    }
+
+    /// Decode an intra (keyframe) fable frame; caches its planes for subsequent
+    /// `decode_delta` calls. Updates `width`/`height`. Returns interleaved RGB8.
+    pub fn decode_intra(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+        match self.inner.decode_intra(bytes) {
+            Some((px, w, h)) => {
+                self.last_w = w;
+                self.last_h = h;
+                Ok(px)
+            }
+            None => Err(JsError::new(
+                "fable decode_intra failed (corrupt container or non-subtract-green RCT)",
+            )),
+        }
+    }
+
+    /// Decode a temporal-delta fable frame against `prev` (the RGB8 this session
+    /// returned for the previous frame). `w`/`h` are the current frame dims.
+    pub fn decode_delta(
+        &mut self,
+        bytes: &[u8],
+        prev: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, JsError> {
+        match self.inner.decode_delta(bytes, prev, w, h) {
+            Some(px) => {
+                self.last_w = w;
+                self.last_h = h;
+                Ok(px)
+            }
+            None => Err(JsError::new("fable decode_delta failed (corrupt stream or dim mismatch)")),
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.last_w
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.last_h
+    }
+}
+
+impl Default for FableDeltaSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
