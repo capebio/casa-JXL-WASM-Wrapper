@@ -1,0 +1,18 @@
+{
+  "_source": "crates/raw-pipeline/src/casa_video.rs — CASAVA (.casv) container constants. K6#3 single source of truth: crates/raw-pipeline tests pin the Rust consts to this file; packages/casv-web tests pin the TS consts to it. A drift on either side fails its parity test.",
+  "CASV_MAGIC": 1447121731,
+  "CASV_VERSION": 1,
+  "CASV_HEADER_BYTES": 32,
+  "CASV_INDEX_ENTRY_BYTES": 8,
+  "CASV_PFRAME_FLAG": 2147483648,
+  "CASV_BBOX_FLAG": 1073741824,
+  "CASV_TILE_FLAG": 536870912,
+  "CASV_REPLACE_FLAG": 268435456,
+  "CASV_HDR_FABLE_FLAG": 2,
+  "CASV_TILE_V2_BIT": 32768,
+  "CASV_HDRFLAG_LOSSY": 1,
+  "CASV_FOOTER_MAGIC": 1179861315,
+  "CASV_FOOTER_BYTES": 32,
+  "CASV_AUDIO_BOX_MAGIC": 1430344515,
+  "CASV_RATE_BOX_MAGIC": 1381187907
+}

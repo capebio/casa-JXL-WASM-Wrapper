@@ -3034,6 +3034,49 @@ pub fn decode_casv_all_rgb8_threaded(
 mod tests {
     use super::*;
 
+    /// K6#3: the checked-in `casv-format.json` (repo root) is the single source of
+    /// truth for the CASAVA container constants shared with `packages/casv-web`.
+    /// This test pins the Rust consts to it; the casv-web parity test pins the TS
+    /// consts to it. A change on either side without updating the JSON fails here or
+    /// there. Values are compared as substrings so no JSON-parser dep is needed.
+    #[test]
+    fn casv_format_json_is_single_source() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../casv-format.json");
+        let json = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let pairs: [(&str, u64); 15] = [
+            ("CASV_MAGIC", CASV_MAGIC as u64),
+            ("CASV_VERSION", CASV_VERSION as u64),
+            ("CASV_HEADER_BYTES", CASV_HEADER_BYTES as u64),
+            ("CASV_INDEX_ENTRY_BYTES", CASV_INDEX_ENTRY_BYTES as u64),
+            ("CASV_PFRAME_FLAG", CASV_PFRAME_FLAG as u64),
+            ("CASV_BBOX_FLAG", CASV_BBOX_FLAG as u64),
+            ("CASV_TILE_FLAG", CASV_TILE_FLAG as u64),
+            ("CASV_REPLACE_FLAG", CASV_REPLACE_FLAG as u64),
+            ("CASV_HDR_FABLE_FLAG", CASV_HDR_FABLE_FLAG as u64),
+            ("CASV_TILE_V2_BIT", CASV_TILE_V2_BIT as u64),
+            ("CASV_HDRFLAG_LOSSY", CASV_HDRFLAG_LOSSY as u64),
+            ("CASV_FOOTER_MAGIC", CASV_FOOTER_MAGIC as u64),
+            ("CASV_FOOTER_BYTES", CASV_FOOTER_BYTES as u64),
+            ("CASV_AUDIO_BOX_MAGIC", CASV_AUDIO_BOX_MAGIC as u64),
+            ("CASV_RATE_BOX_MAGIC", CASV_RATE_BOX_MAGIC as u64),
+        ];
+        for (name, val) in pairs {
+            let needle = format!("\"{name}\": {val}");
+            assert!(
+                json.contains(&needle),
+                "casv-format.json missing/mismatched `{needle}` — regenerate it from casa_video.rs"
+            );
+        }
+        // Exactly these 15 CASV_ keys — catches a key added/renamed/removed on
+        // either side of the contract.
+        let key_count = json.matches("\"CASV_").count();
+        assert_eq!(
+            key_count, 15,
+            "casv-format.json has {key_count} CASV_ keys, expected 15 (drift)"
+        );
+    }
+
     // Deterministic gradient RGB8 frame; `seed` shifts colours so frames differ.
     fn gradient(w: u32, h: u32, seed: u8) -> Vec<u8> {
         let mut v = Vec::with_capacity((w * h * 3) as usize);
