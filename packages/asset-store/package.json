@@ -1,0 +1,20 @@
+{
+  "name": "@casabio/asset-store",
+  "version": "0.1.0",
+  "description": "Memory-governed, content-addressed asset store: one byte-budget + LRU + QuotaExceededError policy governing the browser's ad-hoc caches (S3)",
+  "type": "module",
+  "sideEffects": false,
+  "main": "src/index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": ["src", "index.d.ts"],
+  "scripts": {
+    "test": "node --test --test-force-exit test/*.test.js",
+    "typecheck": "echo \"(plain ESM + hand-written index.d.ts; no build)\""
+  }
+}
