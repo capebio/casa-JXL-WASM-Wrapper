@@ -351,6 +351,20 @@ impl EncodeOptions {
         self
     }
 
+    /// K2: enable progressive encoding — DC + quantized-AC passes + responsive
+    /// ordering — so the codestream decodes to progressively better previews from
+    /// byte-range prefixes. Mirrors the WASM bridge's progressive frame settings
+    /// (`bridge.cpp` `ApplyProgressiveFrameSettings`: PROGRESSIVE_DC + QPROGRESSIVE_AC
+    /// + RESPONSIVE). Pair with [`progressive_tier_offsets`] on the encoded bytes to
+    /// recover the exact prefix length of each pass (the tiers-as-byte-ranges core).
+    /// Pass `Some(1)` group-order center-out for the most useful early bytes.
+    pub fn with_progressive(mut self) -> Self {
+        self.progressive_dc = Some(1);
+        self.extra.push((FrameSettingId::QprogressiveAc, 1));
+        self.extra.push((FrameSettingId::Responsive, 1));
+        self
+    }
+
     /// Validate option ranges before calling libjxl. Called automatically by
     /// [`Encoder::encode`]. Exposed so callers can catch bad options early.
     pub fn validate(&self) -> Result<(), EncodeError> {

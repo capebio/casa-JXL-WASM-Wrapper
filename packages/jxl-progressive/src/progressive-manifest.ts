@@ -35,6 +35,56 @@ export interface ManifestTier {
   score?: TierScore;
 }
 
+/**
+ * K2: build progressive tiers directly from encoder-derived byte offsets — the
+ * exact progressive-pass boundaries of a SINGLE codestream (raw-pipeline's
+ * `progressive_tier_offsets` / `VariantSet.full_offsets`), instead of the old
+ * 4 KiB-granular re-decode profiler. `offsets` is strictly ascending with
+ * `offsets.at(-1) === jxlByteLength`. Always emits `dc` (offsets[0]) and `full`
+ * (the last offset); emits `preview` only when a distinct pass boundary at or below
+ * ~70% of the file exists strictly between them. Tiers are cumulative from byte 0
+ * (consumers `Range`-fetch `bytes=0-{byteEnd-1}`), so `byteStart` is always 0.
+ */
+export function buildTiersFromOffsets(offsets: readonly number[]): ManifestTier[] {
+  if (offsets.length < 2) {
+    throw new Error(`progressive offsets need >=2 entries (dc + full), got ${offsets.length}`);
+  }
+  for (let i = 1; i < offsets.length; i++) {
+    if (offsets[i]! <= offsets[i - 1]!) {
+      throw new Error(`progressive offsets must be strictly ascending: ${JSON.stringify(offsets)}`);
+    }
+  }
+  const full = offsets[offsets.length - 1]!;
+  const dcEnd = offsets[0]!;
+  const tiers: ManifestTier[] = [
+    { name: "dc", byteStart: 0, byteEnd: dcEnd, progressionIndex: 0, intendedUse: "thumbnail" },
+  ];
+  // preview = the last pass boundary at or below 70% of the file, strictly between
+  // dc and full (mirrors the re-decode profiler's preview selection).
+  const threshold = full * 0.7;
+  let previewIdx = -1;
+  for (let i = 1; i < offsets.length - 1; i++) {
+    if (offsets[i]! <= threshold) previewIdx = i;
+  }
+  if (previewIdx > 0 && offsets[previewIdx]! > dcEnd && offsets[previewIdx]! < full) {
+    tiers.push({
+      name: "preview",
+      byteStart: 0,
+      byteEnd: offsets[previewIdx]!,
+      progressionIndex: previewIdx,
+      intendedUse: "visible-card",
+    });
+  }
+  tiers.push({
+    name: "full",
+    byteStart: 0,
+    byteEnd: full,
+    progressionIndex: "final",
+    intendedUse: "zoom-export",
+  });
+  return tiers;
+}
+
 export interface ScaleFrontierEntry {
   /** Longest-edge display pixels this entry covers (inclusive upper bound). */
   maxDisplayPx: number;

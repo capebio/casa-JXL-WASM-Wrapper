@@ -38,6 +38,13 @@ pub struct VariantSet {
     /// True if the input RGBA had any pixel with alpha < 255.
     /// When false the three encoded variants are RGB (no extra channel).
     pub has_alpha: bool,
+    /// K2 fused mode: when non-empty, `full` is a single PROGRESSIVE codestream and
+    /// these are the byte-range ends of its tiers (ascending; `[0]` ends the DC pass,
+    /// `[1]` the first AC pass, …, last == `full.len()`). In fused mode `preview_1080`
+    /// is EMPTY — the preview is the byte range `full[..full_offsets[k]]` decoded
+    /// progressively (full-res, low quality), not a downscaled standalone image.
+    /// Empty for the classic three-independent-encodes path.
+    pub full_offsets: Vec<u32>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -139,6 +146,173 @@ pub fn encode_variants_progressive_opts(
         opts,
         &AtomicBool::new(false),
     )
+}
+
+/// K2 fused encode: a physical ≤300px thumb (separate small e1 encode) plus ONE
+/// PROGRESSIVE full-res codestream whose DC/AC prefixes serve as the preview —
+/// three independent encodes collapse to two, and the expensive full-res encode is
+/// single. The returned [`VariantSet`] carries `full_offsets` (the tier byte-range
+/// ends within `full`) and an EMPTY `preview_1080`: the preview is
+/// `full[..full_offsets[k]]` decoded progressively (full-res, low quality). The
+/// classic three-independent-encodes path stays available via `encode_variants*`
+/// for A/B + migration.
+///
+/// Alpha inputs fall back to the classic path (the progressive-preview shape is
+/// defined for the opaque RAW/photo ingest case); the result is still a valid
+/// `VariantSet` with `full_offsets` empty.
+pub fn encode_variants_fused(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    source: SourceType,
+    hq_override: bool,
+    opts: ProgressiveOpts,
+) -> Result<VariantSet, EncodeError> {
+    encode_variants_fused_cancellable(
+        rgba,
+        width,
+        height,
+        source,
+        hq_override,
+        opts,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Cancellable [`encode_variants_fused`].
+pub fn encode_variants_fused_cancellable(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    source: SourceType,
+    hq_override: bool,
+    opts: ProgressiveOpts,
+    cancel: &AtomicBool,
+) -> Result<VariantSet, EncodeError> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|wh| wh.checked_mul(4));
+    if width == 0 || height == 0 || expected != Some(rgba.len()) {
+        return Err(EncodeError::Input {
+            expected: expected.unwrap_or(usize::MAX),
+            got: rgba.len(),
+        });
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err(EncodeError::Cancelled);
+    }
+
+    // Alpha keeps the classic three-encode path (progressive preview is defined for
+    // opaque ingest). Everything below is RGB-native.
+    if has_meaningful_alpha(rgba) {
+        return encode_variants_cancellable(rgba, width, height, source, hq_override, opts, cancel);
+    }
+    let rgb = strip_rgba_to_rgb(rgba);
+
+    let full_quality: u8 = if hq_override {
+        95
+    } else if source == SourceType::Raw {
+        90
+    } else {
+        85
+    };
+
+    // ── Physical thumb: same full→1080→300 cascade as the classic RGB path so the
+    // gallery card is unchanged, then a standalone Lightning-effort encode. ──
+    let max_dim = width.max(height);
+    let (preview_rgb, pw, ph) = if max_dim > 1080 {
+        let scale = 1080.0 / max_dim as f32;
+        let dw = (width as f32 * scale).round().max(1.0) as u32;
+        let dh = (height as f32 * scale).round().max(1.0) as u32;
+        (Some(resize_rgb(&rgb, width, height, dw, dh)?), dw, dh)
+    } else {
+        (None, width, height)
+    };
+    if cancel.load(Ordering::Acquire) {
+        return Err(EncodeError::Cancelled);
+    }
+    let preview_src: &[u8] = preview_rgb.as_deref().unwrap_or(&rgb);
+    let preview_long = pw.max(ph);
+    let (thumb_rgb, tw, th) = if preview_long > 300 {
+        let scale = 300.0 / preview_long as f32;
+        let dw = (pw as f32 * scale).round().max(1.0) as u32;
+        let dh = (ph as f32 * scale).round().max(1.0) as u32;
+        (Some(resize_rgb_fast(preview_src, pw, ph, dw, dh)?), dw, dh)
+    } else {
+        (None, pw, ph)
+    };
+    let thumb_src: &[u8] = thumb_rgb.as_deref().unwrap_or(preview_src);
+    let thumb_300 = encode_variant_rgb(
+        thumb_src,
+        tw,
+        th,
+        85,
+        EFFORT_THUMB,
+        ProgressiveOpts::default(),
+        width,
+        height,
+    )?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(EncodeError::Cancelled);
+    }
+
+    // ── One progressive full-res encode; probe its tier byte boundaries. ──
+    let full = encode_full_progressive_rgb(&rgb, width, height, full_quality, opts)?;
+    let offsets = crate::jxl_casadecoder::progressive_tier_offsets(&full).ok_or_else(|| {
+        EncodeError::Jxl("progressive tier-offset probe found no passes".to_string())
+    })?;
+    // A progressive stream must expose at least one preview tier before the full
+    // image, else the fused shape has no preview to serve.
+    if offsets.len() < 2 {
+        return Err(EncodeError::Jxl(format!(
+            "progressive full has {} tier(s); expected >=2 (DC + full)",
+            offsets.len()
+        )));
+    }
+    let full_offsets: Vec<u32> = offsets.iter().map(|&o| o as u32).collect();
+
+    Ok(VariantSet {
+        thumb_300,
+        preview_1080: Vec::new(), // fused: preview is a byte range of `full`
+        full,
+        width,
+        height,
+        thumb_w: tw,
+        thumb_h: th,
+        // The progressive preview is full-resolution (low quality), not downscaled.
+        preview_w: width,
+        preview_h: height,
+        full_quality,
+        has_alpha: false,
+        full_offsets,
+    })
+}
+
+/// Encode the full-res tier as a single progressive codestream (DC + quantized-AC +
+/// responsive), optionally center-out. Distinct from [`encode_full_tier_rgb`] (which
+/// routes default-shape tiers through the chunked encoder) — progressive frame
+/// settings need the whole-frame encoder.
+fn encode_full_progressive_rgb(
+    rgb: &[u8],
+    width: u32,
+    height: u32,
+    quality: u8,
+    opts: ProgressiveOpts,
+) -> Result<Vec<u8>, EncodeError> {
+    let mut o = EncodeOptions::quality(quality as f32)
+        .with_effort(EFFORT_FULL)
+        .with_progressive();
+    // with_progressive sets progressive_dc=1; allow a caller to request more DC layers.
+    if opts.progressive_dc > 1 {
+        o.progressive_dc = Some(opts.progressive_dc as i64);
+    }
+    if opts.group_order > 0 {
+        o.group_order = Some(GroupOrder {
+            center: opts.center.map(|(cx, cy)| (cx as i64, cy as i64)),
+        });
+    }
+    let mut enc = Encoder::new(o)?;
+    Ok(enc.encode(&Frame::rgb(rgb, width, height))?)
 }
 
 pub fn encode_variants_cancellable(
@@ -419,6 +593,7 @@ pub fn encode_variants_cancellable(
         preview_h: ph,
         full_quality,
         has_alpha,
+        full_offsets: Vec::new(),
     })
 }
 
@@ -644,6 +819,7 @@ fn encode_variants_rgb_cancellable(
         preview_h: ph,
         full_quality,
         has_alpha: false,
+        full_offsets: Vec::new(),
     })
 }
 
@@ -1669,6 +1845,79 @@ mod tests {
             px[3] = 255;
         }
         v
+    }
+
+    /// Spatially-varied opaque RGBA8 — enough entropy that a progressive encode
+    /// produces real DC + AC passes (a solid colour would not).
+    fn varied(w: u32, h: u32) -> Vec<u8> {
+        let mut v = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                v[i] = (x % 256) as u8;
+                v[i + 1] = (y % 256) as u8;
+                v[i + 2] = ((x * 2 + y) % 256) as u8;
+                v[i + 3] = 255;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn fused_progressive_variant_partitions_and_decodes() {
+        let (w, h) = (400u32, 400u32);
+        let rgba = varied(w, h);
+        let vs = encode_variants_fused(&rgba, w, h, SourceType::Raw, false, ProgressiveOpts::default())
+            .expect("fused encode");
+
+        // Fused shape: the preview is a byte range of `full`, not a standalone encode.
+        assert!(vs.preview_1080.is_empty(), "fused preview_1080 must be empty");
+        assert!(!vs.full_offsets.is_empty(), "fused full_offsets must be set");
+        // The progressive preview is full-resolution (low quality), not downscaled.
+        assert_eq!((vs.preview_w, vs.preview_h), (w, h));
+        // Tier ranges partition `full`: strictly ascending, last == full length, >=2.
+        assert!(
+            vs.full_offsets.windows(2).all(|p| p[0] < p[1]),
+            "offsets not ascending: {:?}",
+            vs.full_offsets
+        );
+        assert_eq!(*vs.full_offsets.last().unwrap() as usize, vs.full.len());
+        assert!(vs.full_offsets.len() >= 2, "need >=2 tiers: {:?}", vs.full_offsets);
+        // Offsets equal a fresh probe of `full`.
+        let probe: Vec<u32> = crate::jxl_casadecoder::progressive_tier_offsets(&vs.full)
+            .unwrap()
+            .iter()
+            .map(|&o| o as u32)
+            .collect();
+        assert_eq!(vs.full_offsets, probe);
+        // Physical thumb is <=300px and decodes; the progressive full decodes to (w,h).
+        assert!(vs.thumb_w <= 300 && vs.thumb_h <= 300, "thumb {}x{}", vs.thumb_w, vs.thumb_h);
+        let (_, tw, th) = crate::jxl_decode::decode_jxl_rgba8(&vs.thumb_300).expect("thumb decode");
+        assert_eq!((tw, th), (vs.thumb_w, vs.thumb_h));
+        let (_, fw, fh) = crate::jxl_decode::decode_jxl_rgba8(&vs.full).expect("full decode");
+        assert_eq!((fw, fh), (w, h));
+    }
+
+    #[test]
+    fn classic_path_leaves_full_offsets_empty() {
+        // The classic three-encode path is unchanged: full_offsets empty, preview
+        // is a real standalone JXL.
+        let rgba = varied(200, 200);
+        let vs = encode_variants(&rgba, 200, 200, SourceType::Raw, false).unwrap();
+        assert!(vs.full_offsets.is_empty(), "classic full_offsets must be empty");
+        assert!(!vs.preview_1080.is_empty(), "classic preview must be standalone");
+    }
+
+    #[test]
+    fn fused_falls_back_to_classic_on_alpha() {
+        // Alpha input → classic path (full_offsets empty, standalone preview).
+        let (w, h) = (128u32, 128u32);
+        let mut rgba = varied(w, h);
+        rgba[3] = 0; // one transparent pixel → has_meaningful_alpha
+        let vs = encode_variants_fused(&rgba, w, h, SourceType::Other, false, ProgressiveOpts::default())
+            .expect("fused-with-alpha falls back");
+        assert!(vs.full_offsets.is_empty(), "alpha fallback must use the classic path");
+        assert!(vs.has_alpha, "alpha must be preserved on the fallback");
     }
 
     #[test]
