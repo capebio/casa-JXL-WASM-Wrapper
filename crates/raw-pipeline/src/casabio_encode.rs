@@ -89,6 +89,20 @@ const EFFORT_THUMB: u8 = 1; // Lightning
 const EFFORT_PREVIEW: u8 = 3; // Falcon
 const EFFORT_FULL: u8 = 3; // Falcon
 
+/// Compat shim for S1 Tauri app migration: encode RGBA16 pixels to JXL.
+/// Maps the old `jpegxl-rs`-backed signature to `jxl_casaencoder`.
+pub fn encode_rgba16(
+    rgba16: &[u16],
+    width: u32,
+    height: u32,
+    distance: f32,
+    effort: u8,
+) -> Result<Vec<u8>, crate::jxl_casaencoder::EncodeError> {
+    use crate::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
+    Encoder::new(EncodeOptions::distance(distance).with_effort(effort))?
+        .encode(&Frame::rgba(rgba16, width, height))
+}
+
 pub fn encode_variants(
     rgba: &[u8],
     width: u32,
