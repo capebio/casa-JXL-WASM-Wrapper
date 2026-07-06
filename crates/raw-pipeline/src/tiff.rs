@@ -130,7 +130,11 @@ pub fn extract_thumbnail_jpeg(data: &[u8]) -> Option<Vec<u8>> {
     let r = Reader { data, le };
     // Skip past IFD0 entries to reach the next-IFD pointer.
     let off = ifd0_offset as usize;
-    let count = (r.u16(off).ok()? as usize).min(512);
+    let count = {
+        let n = r.u16(off).ok()? as usize;
+        if n > MAX_IFD_ENTRIES { return None; }
+        n
+    };
     let next_ptr_off = off + 2 + count * 12;
     let ifd1_offset = r.u32(next_ptr_off).ok()?;
     if ifd1_offset == 0 {
@@ -652,9 +656,19 @@ impl IfdEntry {
     }
 }
 
+/// Maximum IFD entries accepted from any single IFD block. Real TIFF/ORF files
+/// have ≤ ~60 entries; 512 is already far above any legitimate value. Reject
+/// (not clamp) in read_ifd so crafted files are refused rather than silently
+/// truncated — callers propagate the Result error gracefully.
+const MAX_IFD_ENTRIES: usize = 512;
+
 fn read_ifd(r: &Reader, offset: u32) -> Result<Vec<IfdEntry>> {
     let off = offset as usize;
-    let count = (r.u16(off)? as usize).min(512); // cap to prevent DoS from crafted files
+    let raw = r.u16(off)? as usize;
+    if raw > MAX_IFD_ENTRIES {
+        bail!("IFD entry count {raw} exceeds MAX_IFD_ENTRIES ({MAX_IFD_ENTRIES})");
+    }
+    let count = raw;
     let mut entries = Vec::with_capacity(count);
     for i in 0..count {
         let e = off + 2 + i * 12;
@@ -713,7 +727,7 @@ pub(crate) fn visit_ifd<F: FnMut(u16, u16, u32, u32, usize)>(
     if off.checked_add(2).map_or(true, |e| e > data.len()) {
         return 0;
     }
-    let count = (ifd_u16(data, off, le) as usize).min(512);
+    let count = (ifd_u16(data, off, le) as usize).min(MAX_IFD_ENTRIES);
     for i in 0..count {
         let e = off + 2 + i * 12;
         if e.checked_add(12).map_or(true, |end| end > data.len()) {
