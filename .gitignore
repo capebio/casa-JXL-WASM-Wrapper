@@ -102,3 +102,18 @@ packages/jxl-test-corpus/**/*.ppm
 
 pkg-fbench-*/
 docs/outputs/codec-paper/corpus/
+
+# ============================================================================
+# S4 hygiene (2026-07-07): scratch dirs/files that were accidentally committed
+# before an ignore rule existed. Removed from the index this pass; these patterns
+# stop them re-entering. All are regenerable build output or tool scratch.
+# ============================================================================
+# Alternate Cargo target dirs used by codex/agent runs (root `target/` already
+# ignored; these sibling variants slipped through).
+target-codex*/
+# EpicCodeReview output written to a literal "undefined/" path when its output-dir
+# variable was unset (a tool bug). Real review artifacts live in docs/ + root *.md.
+/undefined/
+# flipflop journal output files dropped at repo root (the .flipflop/ dir is already
+# ignored; these are the same generated TOON journals with a different name shape).
+.flipflop-*-out.txt
