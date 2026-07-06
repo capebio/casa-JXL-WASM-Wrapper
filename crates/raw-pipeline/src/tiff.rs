@@ -51,6 +51,11 @@ pub struct RawImageMeta {
     pub wb_r: f32,
     pub wb_g: f32,
     pub wb_b: f32,
+    /// `true` when the white balance came from camera metadata
+    /// (AsShotNeutral / WB_RBLevels / MakerNote 0x4001); `false` when the
+    /// per-format hardcoded fallback fired (ORF 1.0, DNG 1.0, CR2 2.0/1.7).
+    /// Purely informational — it does NOT change any WB math.
+    pub wb_from_camera: bool,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub orientation: u16,
     pub make: String,
@@ -65,6 +70,7 @@ impl OrfInfo {
             wb_r: self.wb_r.unwrap_or(1.0),
             wb_g: 1.0,
             wb_b: self.wb_b.unwrap_or(1.0),
+            wb_from_camera: self.wb_r.is_some() && self.wb_b.is_some(),
             color_matrix: self.color_matrix,
             orientation: self.orientation,
             make: self.make.clone(),

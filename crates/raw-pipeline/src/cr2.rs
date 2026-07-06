@@ -36,6 +36,9 @@ pub struct Cr2Image {
     pub wb_r: f32,
     pub wb_g: f32,
     pub wb_b: f32,
+    /// `true` when WB came from Canon MakerNote 0x4001 (WB_RGGBLevels);
+    /// `false` = the 2.0/1.7 fallback fired. Informational; no WB-math change.
+    pub wb_from_camera: bool,
     pub iso: Option<u32>,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub make: String,
@@ -57,6 +60,7 @@ impl Cr2Image {
             wb_r: self.wb_r,
             wb_g: self.wb_g,
             wb_b: self.wb_b,
+            wb_from_camera: self.wb_from_camera,
             color_matrix: self.color_matrix,
             orientation: self.orientation,
             make: self.make.clone(),
@@ -921,6 +925,7 @@ fn decode_impl(
     // (0x00E0, true active-area borders) in the same single visit.
     let mut wb_r: f32 = 2.0;
     let mut wb_b: f32 = 1.7;
+    let mut wb_from_camera = false;
     let mut sensor_info: Option<SensorInfo> = None;
 
     if makernote_off > 0 && makernote_len >= 2 {
@@ -935,6 +940,7 @@ fn decode_impl(
                     if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le) {
                         wb_r = r;
                         wb_b = b;
+                        wb_from_camera = true;
                     }
                 }
                 0x00E0 => {
@@ -1273,6 +1279,7 @@ fn decode_impl(
             wb_r,
             wb_g: 1.0,
             wb_b,
+            wb_from_camera,
             iso,
             color_matrix: canon_color_matrix(&make, &model),
             make,
