@@ -1,10 +1,10 @@
 // BSD-clean own-FFI JXL codec (replaces GPL jpegxl-rs/jpegxl-sys). Native only.
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
-pub mod jxl_casaencoder;
+pub mod casa_video;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 pub mod jxl_casadecoder;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
-pub mod casa_video;
+pub mod jxl_casaencoder;
 // Back-compat alias: the BSD decoder's canonical home is `jxl_casadecoder`
 // (JXL-CASADECODER); existing call sites (`crate::jxl_decode::…`) resolve unchanged.
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
@@ -15,17 +15,17 @@ pub mod cr2;
 pub mod decompress;
 pub mod demosaic;
 // FableBraid: braided-rANS + mod-256-predictor lossless codec (native + wasm).
-pub mod fable_braid;
 pub mod dng;
 pub mod exif;
+pub mod fable_braid;
+pub mod frame_stats;
 pub mod image_formats;
 pub mod ljpeg;
-pub mod pipeline;
-pub mod tiff;
 pub mod perceptual;
-pub mod tone_simd;
-pub mod frame_stats;
+pub mod pipeline;
 pub mod stream_preview;
+pub mod tiff;
+pub mod tone_simd;
 // Codec-independent streaming pixel band producer (native + wasm). stream_export wraps it with
 // the JXL encoder (native only); the browser feeds band() into the bridge chunked encoder (P2c).
 pub mod stream_band;
@@ -33,8 +33,8 @@ pub mod stream_band;
 pub mod stream_export;
 
 // Re-export the stable B4 metadata-only public API for convenience
-pub use tiff::{parse_orf_metadata, bench_decode_orf, decode_orf_rgba8, OrfMetadata, DecodeBench};
-pub use pipeline::apply_perceptual_constancy;  // Layer 5: exposed for post-JXL / progressive pixel constancy (ties to benchmark postDecodeTransform + Cursor for early layers). Positive for vision use cases. Now takes layer for progressive awareness.
+pub use pipeline::apply_perceptual_constancy;
+pub use tiff::{bench_decode_orf, decode_orf_rgba8, parse_orf_metadata, DecodeBench, OrfMetadata}; // Layer 5: exposed for post-JXL / progressive pixel constancy (ties to benchmark postDecodeTransform + Cursor for early layers). Positive for vision use cases. Now takes layer for progressive awareness.
 
 #[cfg(test)]
 mod compile_tests {
@@ -57,8 +57,11 @@ mod compile_tests {
         let raw = vec![params.black as u16; w * h];
         let rgb16 = demosaic::demosaic_rggb(&raw, w, h).unwrap();
         let rgb8 = pipeline::process(&rgb16, &params);
-        assert!(rgb8.iter().all(|&v| v < 50),
-            "expected near-black output, got max={}", rgb8.iter().max().unwrap());
+        assert!(
+            rgb8.iter().all(|&v| v < 50),
+            "expected near-black output, got max={}",
+            rgb8.iter().max().unwrap()
+        );
     }
 
     #[test]
@@ -114,8 +117,8 @@ mod compile_tests {
 
         let w = info.width as usize;
         let h = info.height as usize;
-        let strip = &data[info.strip_offset as usize
-            ..(info.strip_offset + info.strip_byte_count) as usize];
+        let strip =
+            &data[info.strip_offset as usize..(info.strip_offset + info.strip_byte_count) as usize];
         let raw = decompress::decompress(strip, w, h).expect("decompress failed");
         assert_eq!(raw.len(), w * h, "raw pixel count wrong");
 
@@ -123,14 +126,21 @@ mod compile_tests {
         assert_eq!(rgb16.len(), w * h * 3);
 
         let mut params = pipeline::PipelineParams::default_olympus();
-        if let Some(r) = info.wb_r { params.wb_r = r; }
-        if let Some(b) = info.wb_b { params.wb_b = b; }
+        if let Some(r) = info.wb_r {
+            params.wb_r = r;
+        }
+        if let Some(b) = info.wb_b {
+            params.wb_b = b;
+        }
         let rgb8 = pipeline::process(&rgb16, &params);
         assert_eq!(rgb8.len(), w * h * 3);
 
         // Output should be non-trivial (not all-black or all-white)
         let mean: u64 = rgb8.iter().map(|&v| v as u64).sum::<u64>() / rgb8.len() as u64;
-        assert!(mean > 10 && mean < 245, "mean pixel {mean} out of expected range [10..245]");
+        assert!(
+            mean > 10 && mean < 245,
+            "mean pixel {mean} out of expected range [10..245]"
+        );
 
         let exif = exif::ExifData::from_orf_info(&info, w as u32, h as u32);
         assert!(exif.wb_from_camera, "wb_from_camera should be true");

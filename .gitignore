@@ -98,3 +98,4 @@ Papers/
 packages/jxl-test-corpus/**/*.ppm
 
 pkg-fbench-*/
+docs/outputs/codec-paper/corpus/

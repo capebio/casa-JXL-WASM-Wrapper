@@ -14,13 +14,14 @@ use raw_pipeline::cr2::{self, ReassemblyVariant, ScratchBuffers};
 use std::time::Instant;
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter\tests\_MG_1750.CR2".into()
-    });
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| r"C:\Foo\raw-converter\tests\_MG_1750.CR2".into());
     let data = std::fs::read(&path).expect("read CR2");
 
     // parity (warm pair)
-    let a0 = cr2::decode_bytes_reassembly(&data, ReassemblyVariant::SplitBulk).expect("split decode");
+    let a0 =
+        cr2::decode_bytes_reassembly(&data, ReassemblyVariant::SplitBulk).expect("split decode");
     let b0 = cr2::decode_bytes_reassembly(&data, ReassemblyVariant::Fused).expect("fused decode");
     let exact = a0.raw == b0.raw;
     let mut sc = ScratchBuffers::default();
@@ -74,10 +75,20 @@ fn main() {
     println!("file: {}", path.rsplit(['\\', '/']).next().unwrap_or(&path));
     println!("full decode, interleaved {rounds} rounds (3-arm rotation), round0 dropped:");
     println!("  A split-bulk (legacy): {ma:.1} ms");
-    println!("  B fused      (shipped): {mb:.1} ms   saved {:.1} ms ({:.1}%)", ma - mb, (ma - mb) / ma * 100.0);
-    println!("  S fused scratch (warm): {ms:.1} ms   vs split {:.1} ms ({:.1}%)", ma - ms, (ma - ms) / ma * 100.0);
-    println!("  parity: owned {}  scratch {}",
+    println!(
+        "  B fused      (shipped): {mb:.1} ms   saved {:.1} ms ({:.1}%)",
+        ma - mb,
+        (ma - mb) / ma * 100.0
+    );
+    println!(
+        "  S fused scratch (warm): {ms:.1} ms   vs split {:.1} ms ({:.1}%)",
+        ma - ms,
+        (ma - ms) / ma * 100.0
+    );
+    println!(
+        "  parity: owned {}  scratch {}",
         if exact { "EXACT" } else { "DIFF!" },
-        if scratch_exact { "EXACT" } else { "DIFF!" });
+        if scratch_exact { "EXACT" } else { "DIFF!" }
+    );
     assert!(exact && scratch_exact, "parity broken");
 }

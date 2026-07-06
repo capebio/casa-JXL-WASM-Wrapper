@@ -12,8 +12,12 @@ fn main() {
         eprintln!("usage: fable_golden <rgb-file> <w> <h> <frames> <outdir>");
         std::process::exit(1);
     }
-    let (path, w, h, count) = (&a[1], a[2].parse::<u32>().unwrap(),
-                               a[3].parse::<u32>().unwrap(), a[4].parse::<usize>().unwrap());
+    let (path, w, h, count) = (
+        &a[1],
+        a[2].parse::<u32>().unwrap(),
+        a[3].parse::<u32>().unwrap(),
+        a[4].parse::<usize>().unwrap(),
+    );
     let outdir = std::path::Path::new(&a[5]);
     std::fs::create_dir_all(outdir).unwrap();
     let flen = (w * h * 3) as usize;
@@ -35,7 +39,11 @@ fn main() {
             cat.extend_from_slice(px);
         }
         std::fs::write(outdir.join(format!("decoded_gop{gop}.rgb")), &cat).unwrap();
-        println!("gop {gop}: casv {} B, decoded {} B (all frames byte-exact)", casv.len(), cat.len());
+        println!(
+            "gop {gop}: casv {} B, decoded {} B (all frames byte-exact)",
+            casv.len(),
+            cat.len()
+        );
     }
 
     // Random access via decode_casv_frame_rgb8 (mid-GOP P-frame).
@@ -57,6 +65,10 @@ fn main() {
     std::fs::write(outdir.join("delta_f1.fbr"), &delta).unwrap();
     let dpx = raw_pipeline::fable_braid::decode_rgb8_delta(&delta, frames[0], w, h).unwrap();
     assert_eq!(dpx.as_slice(), frames[1]);
-    println!("intra {} B, delta {} B (roundtrips byte-exact)", intra.len(), delta.len());
+    println!(
+        "intra {} B, delta {} B (roundtrips byte-exact)",
+        intra.len(),
+        delta.len()
+    );
     println!("GOLDEN OK");
 }

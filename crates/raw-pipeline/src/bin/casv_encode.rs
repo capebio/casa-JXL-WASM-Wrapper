@@ -26,10 +26,11 @@
 //! Prints `OK <bytes> <out>` on success; exits non-zero with a message on error.
 
 use raw_pipeline::casa_video::{
-    default_thresh_for_distance, encode_casv_video,
+    default_thresh_for_distance, encode_casv_proxy_rgb8, encode_casv_video,
     encode_casv_video_streaming_with_audio_progress, CasaVideoOptions, RateControl, SkipMode,
     VideoFrameSource, VideoRate,
 };
+use raw_pipeline::jxl_casaencoder::EncodeOptions;
 
 fn fail(msg: impl std::fmt::Display) -> ! {
     eprintln!("casv_encode: {msg}");
@@ -101,8 +102,107 @@ fn probe_frame_count(video: &str) -> Option<usize> {
     s.trim().parse::<usize>().ok().filter(|&n| n > 0)
 }
 
-fn extract_png_frames(video: &str, dim: &str, total: usize) -> Vec<u8> {
-    use std::io::Read;
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Whole-buffer PNG splitter — the oracle the incremental [`PngChunker`] is
+/// tested against (the streaming path uses the chunker, not this).
+#[cfg(test)]
+fn split_png_frames(data: &[u8]) -> Vec<&[u8]> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i + PNG_MAGIC.len() <= data.len() {
+        if data[i..i + PNG_MAGIC.len()] == *PNG_MAGIC {
+            starts.push(i);
+            i += PNG_MAGIC.len();
+        } else {
+            i += 1;
+        }
+    }
+    starts
+        .windows(2)
+        .map(|w| &data[w[0]..w[1]])
+        .chain(starts.last().map(|&s| &data[s..]))
+        .collect()
+}
+
+/// First index at or after `from` where `PNG_MAGIC` begins, if any.
+fn find_magic(buf: &[u8], from: usize) -> Option<usize> {
+    if buf.len() < PNG_MAGIC.len() {
+        return None;
+    }
+    (from..=buf.len() - PNG_MAGIC.len()).find(|&i| buf[i..i + PNG_MAGIC.len()] == *PNG_MAGIC)
+}
+
+/// Incremental splitter for a concatenated-PNG byte stream (ffmpeg image2pipe).
+/// Fed arbitrary chunks; emits each complete PNG the moment the *next* frame's
+/// signature appears (or on `finish` for the last one). Holds at most ~one frame
+/// in flight, so the whole video need not be buffered. Byte-for-byte equivalent
+/// to [`split_png_frames`] over the full stream — proven in the unit test — so
+/// the frames handed to the encoder (and thus the `.casv`) are identical to the
+/// buffered path.
+struct PngChunker {
+    buf: Vec<u8>,
+    scan: usize,
+    started: bool,
+}
+impl PngChunker {
+    fn new() -> Self {
+        PngChunker { buf: Vec::new(), scan: 0, started: false }
+    }
+    fn push(&mut self, bytes: &[u8], out: &mut Vec<Vec<u8>>) {
+        self.buf.extend_from_slice(bytes);
+        self.drain(out);
+    }
+    /// Flush the trailing (final) frame at end of stream.
+    fn finish(&mut self, out: &mut Vec<Vec<u8>>) {
+        self.drain(out);
+        if self.started && self.buf.len() >= PNG_MAGIC.len() {
+            out.push(std::mem::take(&mut self.buf));
+        }
+    }
+    fn drain(&mut self, out: &mut Vec<Vec<u8>>) {
+        if !self.started {
+            match find_magic(&self.buf, 0) {
+                Some(p) => {
+                    self.buf.drain(..p);
+                    self.started = true;
+                    self.scan = PNG_MAGIC.len();
+                }
+                None => {
+                    // Keep only a possible straddling prefix of the signature.
+                    let keep = self.buf.len().saturating_sub(PNG_MAGIC.len() - 1);
+                    self.buf.drain(..keep);
+                    return;
+                }
+            }
+        }
+        loop {
+            let from = self.scan.max(PNG_MAGIC.len());
+            match find_magic(&self.buf, from) {
+                Some(p) => {
+                    out.push(self.buf[..p].to_vec());
+                    self.buf.drain(..p);
+                    self.scan = PNG_MAGIC.len();
+                }
+                None => {
+                    // Resume near the tail so a signature straddling the next
+                    // push is still found; never before the current frame's own.
+                    self.scan = self
+                        .buf
+                        .len()
+                        .saturating_sub(PNG_MAGIC.len() - 1)
+                        .max(PNG_MAGIC.len());
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Spawn ffmpeg to emit the video as a concatenated PNG stream on stdout
+/// (optionally downscaled). stderr is discarded so draining only stdout can't
+/// deadlock. Same invocation the buffered extractor used.
+fn spawn_ffmpeg_png(video: &str, dim: &str) -> std::process::Child {
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-i", video]);
     if dim != "exact" {
@@ -121,73 +221,109 @@ fn extract_png_frames(video: &str, dim: &str, total: usize) -> Vec<u8> {
     cmd.args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"]);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::null());
-    // Stream stdout instead of one opaque `output()`: count PNG signatures as
-    // frames arrive so the UI shows extraction advancing (ffmpeg gives no
-    // upfront frame total, so `total` stays 0 → indeterminate bar with a live
-    // count). stderr is null, so draining only stdout can't deadlock.
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("casv_encode: ffmpeg failed: {e}");
-            std::process::exit(1);
-        }
-    };
-    let mut out = child.stdout.take().expect("ffmpeg stdout piped");
-    let mut data: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
-    let mut scan = 0usize; // next index to test for a signature (monotonic)
-    let mut frames = 0usize;
-    let mut reported = 0usize;
-    loop {
-        match out.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                data.extend_from_slice(&buf[..n]);
-                // Advance a monotonic cursor: never rescans, and a signature
-                // split across two reads is found once (cursor waits for bytes).
-                while scan + PNG_MAGIC.len() <= data.len() {
-                    if data[scan..scan + PNG_MAGIC.len()] == *PNG_MAGIC {
-                        frames += 1;
-                        scan += PNG_MAGIC.len();
-                    } else {
-                        scan += 1;
-                    }
-                }
-                // Throttle stderr: report every 4th new frame. `total` from
-                // ffprobe (0 if unknown → indeterminate bar with a live count).
-                if frames >= reported + 4 {
-                    progress("extract", frames, total);
-                    reported = frames;
-                }
-            }
-            Err(e) => {
-                eprintln!("casv_encode: ffmpeg read failed: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-    let _ = child.wait();
-    data
+    cmd.spawn().unwrap_or_else(|e| fail(format!("ffmpeg spawn failed: {e}")))
 }
 
-const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+/// A pull `VideoFrameSource` over ffmpeg's PNG stdout: reads the pipe on demand,
+/// splits frames incrementally ([`PngChunker`]) and decodes each to RGB8 — so the
+/// whole video is never buffered (peak ≈ one compressed PNG + the decoded frames
+/// the consumer keeps). Frame 0 is pre-pulled to report `dims()`.
+struct FfmpegPngSource {
+    child: std::process::Child,
+    out: Option<std::process::ChildStdout>,
+    chunker: PngChunker,
+    ready: std::collections::VecDeque<Vec<u8>>,
+    first: Option<Vec<u8>>,
+    w: u32,
+    h: u32,
+    fps_num: u32,
+    fps_den: u32,
+}
 
-fn split_png_frames(data: &[u8]) -> Vec<&[u8]> {
-    let mut starts: Vec<usize> = Vec::new();
-    let mut i = 0;
-    while i + PNG_MAGIC.len() <= data.len() {
-        if data[i..i + PNG_MAGIC.len()] == *PNG_MAGIC {
-            starts.push(i);
-            i += PNG_MAGIC.len();
-        } else {
-            i += 1;
+impl FfmpegPngSource {
+    fn spawn(video: &str, dim: &str, fps_num: u32, fps_den: u32) -> Self {
+        let mut child = spawn_ffmpeg_png(video, dim);
+        let out = child.stdout.take();
+        let mut s = FfmpegPngSource {
+            child,
+            out,
+            chunker: PngChunker::new(),
+            ready: std::collections::VecDeque::new(),
+            first: None,
+            w: 0,
+            h: 0,
+            fps_num,
+            fps_den,
+        };
+        // Pre-pull + decode frame 0 for dims.
+        let png0 = s.pull_png().unwrap_or_else(|| fail("no frames extracted from video"));
+        let img = image::load_from_memory(&png0)
+            .unwrap_or_else(|e| fail(format!("decode first frame: {e}")))
+            .to_rgb8();
+        s.w = img.width();
+        s.h = img.height();
+        s.first = Some(img.into_raw());
+        s
+    }
+
+    /// Next complete raw PNG, reading more of ffmpeg's stdout as needed.
+    fn pull_png(&mut self) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut rbuf = [0u8; 64 * 1024];
+        loop {
+            if let Some(p) = self.ready.pop_front() {
+                return Some(p);
+            }
+            let Some(out) = self.out.as_mut() else {
+                return None; // stream fully drained
+            };
+            match out.read(&mut rbuf) {
+                Ok(0) => {
+                    let mut done = Vec::new();
+                    self.chunker.finish(&mut done);
+                    self.ready.extend(done);
+                    self.out = None;
+                    let _ = self.child.wait();
+                }
+                Ok(n) => {
+                    let mut done = Vec::new();
+                    self.chunker.push(&rbuf[..n], &mut done);
+                    self.ready.extend(done);
+                }
+                Err(e) => fail(format!("ffmpeg read failed: {e}")),
+            }
         }
     }
-    starts
-        .windows(2)
-        .map(|w| &data[w[0]..w[1]])
-        .chain(starts.last().map(|&s| &data[s..]))
-        .collect()
+}
+
+impl VideoFrameSource for FfmpegPngSource {
+    fn dims(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+    fn fps(&self) -> (u32, u32) {
+        (self.fps_num, self.fps_den)
+    }
+    fn next_frame(&mut self) -> Option<Vec<u8>> {
+        if let Some(f) = self.first.take() {
+            return Some(f);
+        }
+        let png = self.pull_png()?;
+        Some(decode_png_rgb(&png))
+    }
+}
+
+/// Drain a source into a resident frame vector (for the all-frames-resident batch
+/// tiers: proxy, lossless, skip=none), reporting per-frame decode progress.
+fn drain_all(src: &mut dyn VideoFrameSource, total: usize) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    while let Some(f) = src.next_frame() {
+        frames.push(f);
+        progress("decode", frames.len(), total);
+    }
+    if frames.is_empty() {
+        fail("no frames extracted from video");
+    }
+    frames
 }
 
 fn run_video_mode(args: &[String]) -> ! {
@@ -259,22 +395,40 @@ fn run_video_mode(args: &[String]) -> ! {
     };
     let _ = std::fs::remove_file(&audio_tmp);
 
-    // Extract video frames as a concatenated PNG stream, then split. ffprobe
-    // gives a best-effort frame total for a determinate extract bar.
+    // Streaming ffmpeg source: frames decoded on demand from ffmpeg's PNG stdout
+    // — the whole video is never buffered. ffprobe gives a best-effort frame
+    // total for the progress bars.
     let probed = probe_frame_count(in_video).unwrap_or(0);
     progress("extract", 0, probed);
-    let png_data = extract_png_frames(in_video, dim_str, probed);
-    let frames_png = split_png_frames(&png_data);
-    if frames_png.is_empty() {
-        fail("no frames extracted from video");
-    }
-    let n = frames_png.len();
+    let mut src = FfmpegPngSource::spawn(in_video, dim_str, fps_num.max(1), fps_den.max(1));
+    let (w, h) = src.dims();
 
-    // Dims from the first frame (decoded once; the lazy source reuses it).
-    let first_rgb = image::load_from_memory(frames_png[0])
-        .unwrap_or_else(|e| fail(format!("decode first frame: {e}")))
-        .to_rgb8();
-    let (w, h) = (first_rgb.width(), first_rgb.height());
+    // Full-dimensioned editor proxy: rate = "proxy2" / "proxy4". All-intra and
+    // frame-parallel → every frame must be resident; drain the source.
+    if let Some(factor) = args[5]
+        .strip_prefix("proxy")
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        let frames = drain_all(&mut src, probed);
+        let n = frames.len();
+        progress("encode", 0, n);
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_proxy_rgb8(
+            &refs,
+            w,
+            h,
+            fps_num.max(1),
+            fps_den.max(1),
+            factor.max(1),
+            EncodeOptions::distance(distance).with_effort(effort.clamp(1, 10)),
+        )
+        .unwrap_or_else(|e| fail(format!("proxy encode failed: {e:?}")));
+        progress("encode", n, n);
+        std::fs::write(out_casv, &bytes)
+            .unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
+        println!("OK {} {}", bytes.len(), out_casv);
+        std::process::exit(0);
+    }
 
     let rate = match args[5].as_str() {
         "lossless" => VideoRate::Lossless,
@@ -295,58 +449,42 @@ fn run_video_mode(args: &[String]) -> ! {
         rate_control,
     };
 
-    // Lazy frame source: decode each PNG on demand and drop it, so peak memory
-    // is ~2 decoded frames (encoder ping-pong) + the compressed PNG buffer,
-    // instead of every decoded RGB frame resident at once. The streaming encoder
-    // pulls frames one at a time; decode+encode are fused per frame.
-    struct LazyPngSource<'a> {
-        pngs: &'a [&'a [u8]],
-        first: Option<Vec<u8>>,
-        i: usize,
-        w: u32,
-        h: u32,
-        fps_num: u32,
-        fps_den: u32,
-    }
-    impl VideoFrameSource for LazyPngSource<'_> {
-        fn dims(&self) -> (u32, u32) {
-            (self.w, self.h)
+    // The streaming encoder is lossy-REPLACE only (`stream_ctx` rejects Lossless
+    // and skip=None — additive residual through VarDCT is invalid). Route those
+    // modes through the batch dispatcher (all-intra / additive residual / bbox /
+    // tile), which needs all frames resident and writes header format (no CSAU
+    // footer → no audio yet).
+    let streaming_capable =
+        matches!(rate, VideoRate::Lossy(_)) && !matches!(skip, SkipMode::None);
+    if !streaming_capable {
+        let frames = drain_all(&mut src, probed);
+        let n = frames.len();
+        if ogg_bytes.is_some() {
+            eprintln!(
+                "casv_encode: lossless / skip=none video does not carry audio yet \
+                 (CSAU lives in the streaming footer format) — encoding silent"
+            );
         }
-        fn fps(&self) -> (u32, u32) {
-            (self.fps_num, self.fps_den)
-        }
-        fn next_frame(&mut self) -> Option<Vec<u8>> {
-            if self.i >= self.pngs.len() {
-                return None;
-            }
-            let rgb = if self.i == 0 {
-                self.first
-                    .take()
-                    .unwrap_or_else(|| decode_png_rgb(self.pngs[0]))
-            } else {
-                decode_png_rgb(self.pngs[self.i])
-            };
-            self.i += 1;
-            Some(rgb)
-        }
+        progress("encode", 0, n);
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        let bytes = encode_casv_video(&refs, w, h, fps_num.max(1), fps_den.max(1), &opts)
+            .unwrap_or_else(|e| fail(format!("encode failed: {e:?}")));
+        progress("encode", n, n);
+        std::fs::write(out_casv, &bytes)
+            .unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
+        println!("OK {} {}", bytes.len(), out_casv);
+        std::process::exit(0);
     }
 
-    let mut src = LazyPngSource {
-        pngs: &frames_png,
-        first: Some(first_rgb.into_raw()),
-        i: 0,
-        w,
-        h,
-        fps_num: fps_num.max(1),
-        fps_den: fps_den.max(1),
-    };
-
-    progress("encode", 0, n);
+    // Lossy bbox/tile: stream straight through the encoder — decode+encode fused,
+    // ~2 frames resident, no PNG buffer. Frame count is unknown up front (the
+    // ffprobe estimate drives the bar).
+    progress("encode", 0, probed);
     let bytes = encode_casv_video_streaming_with_audio_progress(
         &mut src,
         &opts,
         ogg_bytes.as_deref(),
-        &mut |done| progress("encode", done, n),
+        &mut |done| progress("encode", done, probed),
     )
     .unwrap_or_else(|e| fail(format!("encode failed: {e:?}")));
 
@@ -441,4 +579,55 @@ fn main() {
     progress("encode", n, n);
     std::fs::write(out, &bytes).unwrap_or_else(|e| fail(format!("write {out}: {e}")));
     println!("OK {} {}", bytes.len(), out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A concatenated-PNG stream of `frame_lens` frames; each frame = the PNG
+    /// signature + a body of bytes 1..=8 (never 0x89, so bodies contain no
+    /// spurious signature — matching how the real splitter treats frame data).
+    fn fake_stream(frame_lens: &[usize]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for (fi, &len) in frame_lens.iter().enumerate() {
+            v.extend_from_slice(PNG_MAGIC);
+            for k in 0..len {
+                v.push((1 + ((k + fi) % 8)) as u8);
+            }
+        }
+        v
+    }
+
+    fn chunk_split(stream: &[u8], chunk: usize) -> Vec<Vec<u8>> {
+        let mut c = PngChunker::new();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < stream.len() {
+            let end = (i + chunk).min(stream.len());
+            c.push(&stream[i..end], &mut out);
+            i = end;
+        }
+        c.finish(&mut out);
+        out
+    }
+
+    #[test]
+    fn chunker_matches_split_over_arbitrary_chunkings() {
+        for frame_lens in [
+            vec![20usize],
+            vec![20, 5, 33, 8, 100],
+            vec![9, 9, 9],
+            vec![0, 50, 0, 7],
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 200],
+        ] {
+            let stream = fake_stream(&frame_lens);
+            let want: Vec<Vec<u8>> =
+                split_png_frames(&stream).iter().map(|s| s.to_vec()).collect();
+            for chunk in [1usize, 2, 3, 5, 7, 8, 9, 16, 64, 1024] {
+                let got = chunk_split(&stream, chunk);
+                assert_eq!(got, want, "frames {frame_lens:?} chunk {chunk}");
+            }
+        }
+    }
 }

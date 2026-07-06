@@ -421,6 +421,7 @@ interface LibjxlWasmModule {
     _jxl_wasm_encode_rgba8_with_extra_channels?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, ecDescPtr: number, numEc: number): number;
     _jxl_wasm_get_extra_channels?(inputPtr: number, inputSize: number): number;
     _jxl_wasm_butteraugli_compare?(ptr1: number, ptr2: number, width: number, height: number): number;
+    _jxl_wasm_butteraugli_compare16?(ptr1: number, ptr2: number, width: number, height: number): number;
 }
 type JxlModuleFactory = () => Promise<LibjxlWasmModule>;
 export declare class CapabilityMissing extends Error {
@@ -487,6 +488,13 @@ export declare function transcodeJpegToJxl(jpeg: ArrayBuffer | Uint8Array): Prom
  * Requires a WASM build with the butteraugli bridge (jxl_wasm_butteraugli_compare).
  */
 export declare function computeButteraugli(pixels1: ArrayBuffer | Uint8Array, pixels2: ArrayBuffer | Uint8Array, width: number, height: number): Promise<number>;
+/**
+ * Compute Butteraugli perceptual distance between two RGBA16 images.
+ * Both pixel buffers must represent the same width×height image in RGBA16 format (8 bytes/px).
+ * Returns the p3 Butteraugli distance (0 = identical, ~1.0 = imperceptible, >2.0 = noticeable).
+ * Requires a WASM build with the 16-bit butteraugli bridge (jxl_wasm_butteraugli_compare16).
+ */
+export declare function computeButteraugli16(pixels1: ArrayBuffer | Uint8Array, pixels2: ArrayBuffer | Uint8Array, width: number, height: number): Promise<number>;
 export declare class ButteraugliComparator {
     private readonly module;
     private readonly width;

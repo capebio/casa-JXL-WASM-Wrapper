@@ -3892,6 +3892,76 @@ extern "C" void jxl_wasm_butteraugli_ref_free(JxlWasmButterRef* s) {
   delete s;
 }
 
+// Butteraugli perceptual distance between two RGBA16 images (16-bit per channel).
+// img1, img2: RGBA16 buffers, width*height*4 uint16 (= width*height*8 bytes) each.
+// Returns: float distance bits packed in int32 (same encoding as the 8-bit
+//          jxl_wasm_butteraugli_compare above), or -1 on allocation/comparison failure.
+//
+// FAITHFUL CLONE of jxl_wasm_butteraugli_compare: identical memory manager, Image3F
+// construction, ButteraugliParams, ButteraugliInterfaceInPlace call, and float->int32
+// bit packing. Only two things differ:
+//   (1) input element width — uint16 instead of uint8, same RGBA stride of 4 (skip alpha);
+//   (2) linearisation — the 8-bit path uses SrgbGamma22Lut() (a 256-entry LUT with
+//       lut[i] = std::pow(i / 255, 2.2f), i.e. PURE gamma 2.2, NOT true-sRGB piecewise).
+//       A uint16 cannot index that 256-entry table, so we inline the SAME transfer over
+//       the u16-normalised value: std::pow(v / 65535, 2.2f). This reproduces the identical
+//       linear-light value the 8-bit LUT produces for the same normalised input, so scores
+//       are numerically comparable across the two paths.
+// The two local Image3F planes are named img1p/img2p (not img1/img2) solely to avoid
+// colliding with the uint16 input parameters img1/img2; everything downstream is identical.
+extern "C" int32_t jxl_wasm_butteraugli_compare16(
+    const uint16_t* img1, const uint16_t* img2,
+    uint32_t width, uint32_t height) {
+  // Use default malloc/free memory manager (nullptr fills in defaults via MemoryManagerInit)
+  JxlMemoryManager mem;
+  if (!jxl::MemoryManagerInit(&mem, nullptr)) return -1;
+
+  // Build linear-light float Image3F (planar RGB, sRGB gamma decoded)
+  auto build_image = [&](const uint16_t* data) -> jxl::StatusOr<jxl::Image3F> {
+    JXL_ASSIGN_OR_RETURN(jxl::Image3F img,
+                         jxl::Image3F::Create(&mem, width, height));
+    for (size_t y = 0; y < height; ++y) {
+      float* JXL_RESTRICT rr = img.PlaneRow(0, y);
+      float* JXL_RESTRICT gr = img.PlaneRow(1, y);
+      float* JXL_RESTRICT br = img.PlaneRow(2, y);
+      const uint16_t* src = data + y * width * 4u;
+      for (size_t x = 0; x < width; ++x) {
+        // Inline sRGB approximate gamma decode: pow(v/65535, 2.2) matches the 8-bit
+        // SrgbGamma22Lut (pow(i/255, 2.2)) over the normalised value. Linearise before
+        // butteraugli.
+        rr[x] = std::pow(static_cast<float>(src[x * 4u + 0u]) * (1.0f / 65535.0f), 2.2f);
+        gr[x] = std::pow(static_cast<float>(src[x * 4u + 1u]) * (1.0f / 65535.0f), 2.2f);
+        br[x] = std::pow(static_cast<float>(src[x * 4u + 2u]) * (1.0f / 65535.0f), 2.2f);
+      }
+    }
+    return img;
+  };
+
+  auto img1_or = build_image(img1);
+  if (!img1_or.ok()) return -1;
+  auto img2_or = build_image(img2);
+  if (!img2_or.ok()) return -1;
+  auto diffmap_or = jxl::ImageF::Create(&mem, width, height);
+  if (!diffmap_or.ok()) return -1;
+
+  // Extract values — ok() already verified above; value_() is safe to call
+  jxl::Image3F img1p = std::move(img1_or).value_();
+  jxl::Image3F img2p = std::move(img2_or).value_();
+  jxl::ImageF diffmap = std::move(diffmap_or).value_();
+
+  jxl::ButteraugliParams params;
+  double diffvalue = 0.0;
+  if (!jxl::ButteraugliInterfaceInPlace(std::move(img1p), std::move(img2p),
+                                        params, diffmap, diffvalue)) {
+    return -1;
+  }
+
+  const float dist = static_cast<float>(diffvalue);
+  int32_t bits;
+  memcpy(&bits, &dist, 4);
+  return bits;
+}
+
 // ============================================================================
 // PSNR (B3): sum squared diffs over RGB channels, result in dB as float bits.
 // Identical images → +Inf. Skips alpha channel.

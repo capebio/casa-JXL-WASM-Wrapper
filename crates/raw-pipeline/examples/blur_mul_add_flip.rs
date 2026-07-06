@@ -21,17 +21,23 @@ use std::time::Instant;
 const VTILE: usize = 128;
 
 fn k13() -> [f32; 13] {
-    [0.0185, 0.0342, 0.0563, 0.0831, 0.1097, 0.1296, 0.1372,
-     0.1296, 0.1097, 0.0831, 0.0563, 0.0342, 0.0185]
+    [
+        0.0185, 0.0342, 0.0563, 0.0831, 0.1097, 0.1296, 0.1372, 0.1296, 0.1097, 0.0831, 0.0563,
+        0.0342, 0.0185,
+    ]
 }
 
 /// Portable FMA helper — the proposed fix. Compiles to one op per target.
 #[inline(always)]
 fn bfma(a: f32, b: f32, c: f32) -> f32 {
     #[cfg(target_feature = "fma")]
-    { a.mul_add(b, c) }
+    {
+        a.mul_add(b, c)
+    }
     #[cfg(not(target_feature = "fma"))]
-    { a * b + c }
+    {
+        a * b + c
+    }
 }
 
 /// Mode-dispatched fused multiply-add. `match M` const-folds per monomorphization.
@@ -75,8 +81,14 @@ fn fir_planar<const M: u8>(plane: &[f32], kernel: &[f32], half: usize, out: &mut
     }
 }
 
-fn blur<const M: u8>(src: &[u16], width: usize, height: usize, kernel: &[f32],
-                     temp: &mut Vec<u16>, out: &mut Vec<u16>) {
+fn blur<const M: u8>(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    temp: &mut Vec<u16>,
+    out: &mut Vec<u16>,
+) {
     let half = kernel.len() / 2;
     let n = width * height * 3;
     temp.resize(n, 0);
@@ -102,7 +114,7 @@ fn blur<const M: u8>(src: &[u16], width: usize, height: usize, kernel: &[f32],
         let row = &mut temp[y * width * 3..(y + 1) * width * 3];
         for px in 0..width {
             let b = px * 3;
-            row[b]     = r_out[px].round() as u16;
+            row[b] = r_out[px].round() as u16;
             row[b + 1] = g_out[px].round() as u16;
             row[b + 2] = b_out[px].round() as u16;
         }
@@ -119,15 +131,19 @@ fn blur<const M: u8>(src: &[u16], width: usize, height: usize, kernel: &[f32],
         for x0 in (0..width).step_by(VTILE) {
             let x1 = (x0 + VTILE).min(width);
             let tile = x1 - x0;
-            for xi in 0..tile { acc_r[xi] = 0.0; acc_g[xi] = 0.0; acc_b[xi] = 0.0; }
+            for xi in 0..tile {
+                acc_r[xi] = 0.0;
+                acc_g[xi] = 0.0;
+                acc_b[xi] = 0.0;
+            }
             for ki in 0..klen {
                 let kv = kernel[ki];
-                let yi = (y as isize + ki as isize - half as isize)
-                    .clamp(0, height as isize - 1) as usize;
+                let yi = (y as isize + ki as isize - half as isize).clamp(0, height as isize - 1)
+                    as usize;
                 let row_base = yi * width * 3;
                 for xi in 0..tile {
                     let b = row_base + (x0 + xi) * 3;
-                    r_tap[xi] = temp[b]     as f32;
+                    r_tap[xi] = temp[b] as f32;
                     g_tap[xi] = temp[b + 1] as f32;
                     b_tap[xi] = temp[b + 2] as f32;
                 }
@@ -139,7 +155,7 @@ fn blur<const M: u8>(src: &[u16], width: usize, height: usize, kernel: &[f32],
             }
             for xi in 0..tile {
                 let b = (y * width + x0 + xi) * 3;
-                out[b]     = acc_r[xi].round() as u16;
+                out[b] = acc_r[xi].round() as u16;
                 out[b + 1] = acc_g[xi].round() as u16;
                 out[b + 2] = acc_b[xi].round() as u16;
             }
@@ -158,7 +174,12 @@ fn maxdiff(a: &[u16], b: &[u16]) -> (i32, usize) {
     let mut n = 0usize;
     for i in 0..a.len() {
         let d = (a[i] as i32 - b[i] as i32).abs();
-        if d > 0 { n += 1; if d > m { m = d; } }
+        if d > 0 {
+            n += 1;
+            if d > m {
+                m = d;
+            }
+        }
     }
     (m, n)
 }
@@ -197,10 +218,18 @@ fn run_case(label: &str, width: usize, height: usize, rounds: usize) {
     };
     for r in 0..rounds {
         // Rotate start order each round so drift hits all arms equally.
-        let order = match r % 3 { 0 => [0u8, 1, 2], 1 => [1, 2, 0], _ => [2, 0, 1] };
+        let order = match r % 3 {
+            0 => [0u8, 1, 2],
+            1 => [1, 2, 0],
+            _ => [2, 0, 1],
+        };
         for &w in &order {
             let dt = timed(w, &mut sink, &mut tmp, &mut out);
-            match w { 0 => ta.push(dt), 1 => tb.push(dt), _ => tc.push(dt) }
+            match w {
+                0 => ta.push(dt),
+                1 => tb.push(dt),
+                _ => tc.push(dt),
+            }
         }
     }
     std::hint::black_box(sink);

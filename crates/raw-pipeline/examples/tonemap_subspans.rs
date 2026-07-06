@@ -15,7 +15,9 @@
 //! Run BOTH (the wasm interactive path is serial — that build cost is the real slider latency):
 //!   cd crates/raw-pipeline && cargo run --release --no-default-features --example tonemap_subspans
 //!   cd crates/raw-pipeline && cargo run --release --no-default-features --features parallel --example tonemap_subspans
-use raw_pipeline::pipeline::{bench_lut_build_ms, bench_tone_stage_3way, process_simd, PipelineParams};
+use raw_pipeline::pipeline::{
+    bench_lut_build_ms, bench_tone_stage_3way, process_simd, PipelineParams,
+};
 use std::time::Instant;
 
 fn median(v: &mut [f64]) -> f64 {
@@ -36,7 +38,11 @@ fn main() {
     }
 
     let rounds = 9usize;
-    println!("tonemap_subspans  {w}×{h} = {:.1} MP  parallel={}", n as f64 / 1e6, cfg!(feature = "parallel"));
+    println!(
+        "tonemap_subspans  {w}×{h} = {:.1} MP  parallel={}",
+        n as f64 / 1e6,
+        cfg!(feature = "parallel")
+    );
 
     // (a) LUT build — median of one full rebuild (3 pre + 1 post)
     let (mut pre3, mut post) = (Vec::new(), Vec::new());
@@ -102,13 +108,20 @@ fn main() {
     println!("\n--- frames ---");
     println!("cached re-render         {cached_ms:7.2} ms   (LUT warm — full-render throughput)");
     println!("slider-drag re-render    {drag_ms:7.2} ms   (LUT rebuilt every frame)");
-    println!("  ⇒ rebuild tax          {rebuild_tax:7.2} ms   ({:.0}% of the drag frame)", rebuild_tax / drag_ms * 100.0);
+    println!(
+        "  ⇒ rebuild tax          {rebuild_tax:7.2} ms   ({:.0}% of the drag frame)",
+        rebuild_tax / drag_ms * 100.0
+    );
     println!("\n--- verdict ---");
     let inner = tone_math + pre_gather + post_pack;
     println!("inner loop (b+c)         {inner:7.2} ms");
     println!("build+copy (a+d)         {:7.2} ms", build_ms + copy_ms);
     println!(
         "interactive bottleneck: {}",
-        if build_ms + copy_ms > inner { "LUT BUILD + COPY (handoff hypothesis CONFIRMED)" } else { "inner loop" }
+        if build_ms + copy_ms > inner {
+            "LUT BUILD + COPY (handoff hypothesis CONFIRMED)"
+        } else {
+            "inner loop"
+        }
     );
 }

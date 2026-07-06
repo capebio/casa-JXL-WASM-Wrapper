@@ -27,7 +27,7 @@
 
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 mod bench {
-    use raw_pipeline::jxl_casaencoder::{Encoder, EncodeOptions, Frame};
+    use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
 
     fn mkpix_hf(w: u32, h: u32) -> Vec<u8> {
         // High-frequency checkerboard — maximises DCT4x4/DCT4x8/DCT8x4 strategy picks.
@@ -73,8 +73,15 @@ mod bench {
         v[v.len() / 2]
     }
 
-    fn time_encode(label: &str, pixels: &[u8], w: u32, h: u32, opts: &EncodeOptions,
-                   warmup: usize, iters: usize) {
+    fn time_encode(
+        label: &str,
+        pixels: &[u8],
+        w: u32,
+        h: u32,
+        opts: &EncodeOptions,
+        warmup: usize,
+        iters: usize,
+    ) {
         // warmup
         for _ in 0..warmup {
             std::hint::black_box(encode_jxl(pixels, w, h, opts));
@@ -98,8 +105,8 @@ mod bench {
         const ITERS: usize = 20;
 
         let sizes: &[(u32, u32, &str)] = &[
-            (512,  512,  "512×512"),
-            (1024, 768,  "1024×768"),
+            (512, 512, "512×512"),
+            (1024, 768, "1024×768"),
             (1920, 1080, "1920×1080"),
         ];
 
@@ -115,7 +122,15 @@ mod bench {
             let pix = mkpix_hf(w, h);
             let encoded = encode_jxl(&pix, w, h, &opts_e5);
             println!("  {label} hf encoded {}B", encoded.len());
-            time_encode(&format!("{label} hf e5"), &pix, w, h, &opts_e5, WARMUP, ITERS);
+            time_encode(
+                &format!("{label} hf e5"),
+                &pix,
+                w,
+                h,
+                &opts_e5,
+                WARMUP,
+                ITERS,
+            );
         }
 
         // ── e5 smooth gradient (mostly 8×8 — baseline, should be ~flat) ──────
@@ -124,7 +139,15 @@ mod bench {
         println!("\n--- e5 smooth gradient (mostly 8×8 — regression guard) ---");
         for &(w, h, label) in sizes {
             let pix = mkpix_grad(w, h);
-            time_encode(&format!("{label} grad e5"), &pix, w, h, &opts_e5, WARMUP, ITERS);
+            time_encode(
+                &format!("{label} grad e5"),
+                &pix,
+                w,
+                h,
+                &opts_e5,
+                WARMUP,
+                ITERS,
+            );
         }
 
         // ── e3 (no ACS — should be entirely flat, pure regression guard) ─────
@@ -133,7 +156,15 @@ mod bench {
         let opts_e3 = EncodeOptions::distance(1.0).with_effort(3);
         for &(w, h, label) in sizes {
             let pix = mkpix_hf(w, h);
-            time_encode(&format!("{label} hf e3"), &pix, w, h, &opts_e3, WARMUP, ITERS);
+            time_encode(
+                &format!("{label} hf e3"),
+                &pix,
+                w,
+                h,
+                &opts_e3,
+                WARMUP,
+                ITERS,
+            );
         }
 
         println!("\nDone.");

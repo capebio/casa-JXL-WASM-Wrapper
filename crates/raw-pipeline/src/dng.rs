@@ -76,7 +76,10 @@ pub fn decode(path: &std::path::Path) -> Result<DngImage> {
 pub fn ljpeg_tile_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
     let (_state, raw, _le) = load_dng(data)?;
     if raw.compression != 7 {
-        bail!("DNG: not LJPEG-compressed (compression={})", raw.compression);
+        bail!(
+            "DNG: not LJPEG-compressed (compression={})",
+            raw.compression
+        );
     }
     let mut ranges = Vec::with_capacity(raw.tile_offsets.len());
     for (o, c) in raw.tile_offsets.iter().zip(raw.tile_byte_counts.iter()) {
@@ -266,7 +269,9 @@ impl<'a> DngRowSource<'a> {
         }
         let cps = raw.samples_per_pixel.max(1) as usize;
         if cps != 1 {
-            return Err(format!("DNG: streaming needs single-sample Bayer (cps={cps})"));
+            return Err(format!(
+                "DNG: streaming needs single-sample Bayer (cps={cps})"
+            ));
         }
         let cfa = match raw.cfa_pattern {
             Some([0, 1, 1, 2]) => Cfa::Rggb,
@@ -287,13 +292,25 @@ impl<'a> DngRowSource<'a> {
                 }
                 let coltiles = width.div_ceil(tw);
                 let rowtiles = height.div_ceil(tl);
-                let expected = coltiles.checked_mul(rowtiles).ok_or("DNG: tile grid overflow")?;
+                let expected = coltiles
+                    .checked_mul(rowtiles)
+                    .ok_or("DNG: tile grid overflow")?;
                 if raw.tile_offsets.len() != expected || raw.tile_byte_counts.len() != expected {
                     return Err("DNG: tile count mismatch".into());
                 }
                 Ok(Self {
-                    data, raw, meta, row: 0, tiled: true, tw, tl, coltiles,
-                    band_buf: Vec::new(), band_first: 0, band_rows: 0, full: Vec::new(),
+                    data,
+                    raw,
+                    meta,
+                    row: 0,
+                    tiled: true,
+                    tw,
+                    tl,
+                    coltiles,
+                    band_buf: Vec::new(),
+                    band_first: 0,
+                    band_rows: 0,
+                    full: Vec::new(),
                 })
             }
             1 => {
@@ -304,21 +321,39 @@ impl<'a> DngRowSource<'a> {
                 decode_uncompressed(data, &raw, width, height, le, &mut full)
                     .map_err(|e| format!("DNG uncompressed: {e}"))?;
                 Ok(Self {
-                    data, raw, meta, row: 0, tiled: false, tw: 0, tl: 0, coltiles: 0,
-                    band_buf: Vec::new(), band_first: 0, band_rows: 0, full,
+                    data,
+                    raw,
+                    meta,
+                    row: 0,
+                    tiled: false,
+                    tw: 0,
+                    tl: 0,
+                    coltiles: 0,
+                    band_buf: Vec::new(),
+                    band_first: 0,
+                    band_rows: 0,
+                    full,
                 })
             }
             c => Err(format!("DNG: compression {c} not streamable")),
         }
     }
 
-    pub fn phase(&self) -> (u8, u8) { cfa_phase(self.meta.cfa) }
-    pub fn meta(&self) -> &DngMeta { &self.meta }
+    pub fn phase(&self) -> (u8, u8) {
+        cfa_phase(self.meta.cfa)
+    }
+    pub fn meta(&self) -> &DngMeta {
+        &self.meta
+    }
 }
 
 impl crate::decompress::RawRowSource for DngRowSource<'_> {
-    fn width(&self) -> usize { self.meta.width }
-    fn height(&self) -> usize { self.meta.height }
+    fn width(&self) -> usize {
+        self.meta.width
+    }
+    fn height(&self) -> usize {
+        self.meta.height
+    }
 
     fn next_row_into(&mut self, dst: &mut [u16]) -> Result<bool, String> {
         let (w, h) = (self.meta.width, self.meta.height);
@@ -333,7 +368,15 @@ impl crate::decompress::RawRowSource for DngRowSource<'_> {
                 let active_h = ((tr + 1) * self.tl).min(h) - row_start;
                 self.band_buf.resize(active_h * w, 0);
                 decode_band_into(
-                    self.data, &self.raw, w, h, self.tw, self.tl, self.coltiles, tr, &mut self.band_buf,
+                    self.data,
+                    &self.raw,
+                    w,
+                    h,
+                    self.tw,
+                    self.tl,
+                    self.coltiles,
+                    tr,
+                    &mut self.band_buf,
                 )
                 .map_err(|e| format!("DNG band {tr}: {e}"))?;
                 self.band_first = row_start;
@@ -353,8 +396,15 @@ impl crate::decompress::RawRowSource for DngRowSource<'_> {
 /// rows [tr*tl, min((tr+1)*tl, height))). Shared by `decode_tiles` (parallel full-frame
 /// blit) and the streaming `DngRowSource`. Byte-identical to the previous inline closure.
 fn decode_band_into(
-    data: &[u8], raw: &RawIfd, width: usize, height: usize,
-    tw: usize, tl: usize, coltiles: usize, tr: usize, band: &mut [u16],
+    data: &[u8],
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    tw: usize,
+    tl: usize,
+    coltiles: usize,
+    tr: usize,
+    band: &mut [u16],
 ) -> Result<()> {
     let row_start = tr * tl;
     let row_end = ((tr + 1) * tl).min(height);
@@ -363,8 +413,12 @@ fn decode_band_into(
         let idx = tr * coltiles + tc;
         let off = raw.tile_offsets[idx] as usize;
         let bc = raw.tile_byte_counts[idx] as usize;
-        let end = off.checked_add(bc).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
-        let src = data.get(off..end).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let end = off
+            .checked_add(bc)
+            .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let src = data
+            .get(off..end)
+            .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
         let col_start = tc * tw;
         let col_end = ((tc + 1) * tw).min(width);
         let active_w = col_end - col_start;
@@ -512,7 +566,9 @@ fn decode_tiles_blit(
         let bc = raw.tile_byte_counts[idx] as usize;
         // checked_add: off+bc are file-controlled and can wrap usize on wasm32,
         // defeating the OOB guard (000-security-11).
-        let end = off.checked_add(bc).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let end = off
+            .checked_add(bc)
+            .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
         let src = data
             .get(off..end)
             .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
@@ -561,13 +617,16 @@ fn decode_tiles_blit(
                 .checked_mul(width)
                 .and_then(|v| v.checked_add(td.col_start))
                 .ok_or_else(|| anyhow!("tile blit dst overflow"))?;
-            let dst = out.get_mut(dst_base..dst_base + aw)
+            let dst = out
+                .get_mut(dst_base..dst_base + aw)
                 .ok_or_else(|| anyhow!("tile blit OOB dst_base={dst_base} aw={aw}"))?;
             // Clamp the SOURCE read to the actual decoded buffer length (DNG-002b):
             // active_w/active_h are clamped to the *declared* SOF dims (buf_w/buf_h),
             // but if the decoder produced a shorter buffer than declared, src_base+aw
             // could read past td.buf. get() keeps reads inside the decoded buffer.
-            let src = td.buf.get(src_base..src_base + aw)
+            let src = td
+                .buf
+                .get(src_base..src_base + aw)
                 .ok_or_else(|| anyhow!("tile blit OOB src_base={src_base} aw={aw}"))?;
             dst.copy_from_slice(src);
         }
@@ -586,12 +645,17 @@ fn fill_u16_row(dst: &mut [u16], bytes: &[u8], le: bool) {
     if le {
         // SAFETY: write dst.len()*2 bytes into dst (u16-aligned, stricter than u8); the
         // byte count matches exactly. Only taken when the source is little-endian too.
-        let dstb = unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 2) };
+        let dstb =
+            unsafe { core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u8, dst.len() * 2) };
         dstb.copy_from_slice(bytes);
         return;
     }
     for (o, c) in dst.iter_mut().zip(bytes.chunks_exact(2)) {
-        *o = if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) };
+        *o = if le {
+            u16::from_le_bytes([c[0], c[1]])
+        } else {
+            u16::from_be_bytes([c[0], c[1]])
+        };
     }
 }
 
@@ -760,7 +824,11 @@ pub fn align_to_rggb(
     if col_off == 0 {
         // No column dropped: rows stay contiguous → zero-copy. width == stride.
         let start = row_off * stride;
-        return (Cow::Borrowed(&raw[start..start + new_h * stride]), stride, new_h);
+        return (
+            Cow::Borrowed(&raw[start..start + new_h * stride]),
+            stride,
+            new_h,
+        );
     }
     // col_off >= 1 (Grbg/Bggr): re-pack each row's [col_off .. col_off + new_w]
     // into a tight new_w-stride buffer. The last row ends exactly at
@@ -859,9 +927,8 @@ struct WalkState {
 }
 
 fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
-    let has_storage =
-        (!ifd.tile_offsets.is_empty() && !ifd.tile_byte_counts.is_empty())
-            || (!ifd.strip_offsets.is_empty() && !ifd.strip_byte_counts.is_empty());
+    let has_storage = (!ifd.tile_offsets.is_empty() && !ifd.tile_byte_counts.is_empty())
+        || (!ifd.strip_offsets.is_empty() && !ifd.strip_byte_counts.is_empty());
     let is_subsampled = (new_subfile_type & 1) != 0;
     // PARSERS-005 / ERR-011: 0x884C (lossy DNG) is not decoded; exclude it from
     // the candidate check so walk() does not select an IFD that will fail later.
@@ -885,134 +952,139 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
         if depth >= MAX_IFD_DEPTH || !visited.insert(off) {
             return;
         }
-    let mut subs = Vec::new();
-    let mut ifd = RawIfd::default();
-    let mut new_subfile_type: u32 = 0;
-    let mut has_image_dims = false;
-    let mut has_tiles = false;
+        let mut subs = Vec::new();
+        let mut ifd = RawIfd::default();
+        let mut new_subfile_type: u32 = 0;
+        let mut has_image_dims = false;
+        let mut has_tiles = false;
 
-    let next_ifd = visit_ifd(data, off, le, |tag, dtype, cnt, val, inline_pos| match tag {
-            0x00FE => new_subfile_type = val,
-            0x0100 => {
-                ifd.width = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
-                has_image_dims = true;
-            }
-            0x0101 => {
-                ifd.height = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
-            }
-            0x0102 => {
-                ifd.bits_per_sample =
-                    first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0) as u16;
-            }
-            0x0103 => {
-                ifd.compression = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
-            }
-            0x0115 => {
-                ifd.samples_per_pixel =
-                    first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(1) as u16;
-            }
-            0x0111 => {
-                ifd.strip_offsets = read_array_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x0116 => {
-                ifd.rows_per_strip = first_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x0117 => {
-                ifd.strip_byte_counts = read_array_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x0142 => {
-                ifd.tile_width = first_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x0143 => {
-                ifd.tile_length = first_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x0144 => {
-                ifd.tile_offsets = read_array_u32(data, dtype, cnt, val, inline_pos, le);
-                has_tiles = true;
-            }
-            0x0145 => {
-                ifd.tile_byte_counts = read_array_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x010F => state.make = read_ascii(data, dtype, cnt, val, inline_pos),
-            0x0110 => state.model = read_ascii(data, dtype, cnt, val, inline_pos),
-            0x0112 => {
-                state.orientation =
-                    first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
-            }
-            0x014A => {
-                subs = read_array_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0x828D => {
-                // CFARepeatPatternDim — ignore (we assume 2x2)
-            }
-            0x828E => {
-                // CFAPattern: we only handle the standard 2x2 mosaic (exactly 4
-                // entries). Any other length (non-2x2 repeat, malformed, or absent
-                // tag) is an INTENTIONAL fallback to the RGGB default applied
-                // downstream — not a silent error.
-                let arr = read_array_u32(data, dtype, cnt, val, inline_pos, le);
-                if arr.len() == 4 {
-                    ifd.cfa_pattern =
-                        Some([arr[0] as u8, arr[1] as u8, arr[2] as u8, arr[3] as u8]);
+        let next_ifd = visit_ifd(
+            data,
+            off,
+            le,
+            |tag, dtype, cnt, val, inline_pos| match tag {
+                0x00FE => new_subfile_type = val,
+                0x0100 => {
+                    ifd.width = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                    has_image_dims = true;
                 }
-            }
-            0xC61A => {
-                ifd.black_level = first_f32(data, dtype, cnt, val, inline_pos, le)
-                    .map(|v| v.round().clamp(0.0, 65535.0) as u16);
-            }
-            0xC61D => {
-                ifd.white_level = first_f32(data, dtype, cnt, val, inline_pos, le)
-                    .map(|v| v.round().clamp(0.0, 65535.0) as u16);
-            }
-            0x8827 => {
-                // ISOSpeedRatings — SHORT array; take first value.
-                state.iso = first_u32(data, dtype, cnt, val, inline_pos, le);
-            }
-            0xC628 => {
-                state.as_shot_neutral = read_as_shot_neutral(data, dtype, cnt, val, le);
-            }
-            0xC629 => {
-                state.as_shot_white_xy = read_as_shot_white_xy(data, dtype, cnt, val, le);
-            }
-            TAG_COLOR_MATRIX_1 => {
-                state.color_matrix_1 = read_matrix3x3(data, dtype, cnt, val, le);
-            }
-            TAG_COLOR_MATRIX_2 => {
-                state.color_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
-            }
-            TAG_FORWARD_MATRIX_1 => {
-                state.forward_matrix_1 = read_matrix3x3(data, dtype, cnt, val, le);
-            }
-            TAG_FORWARD_MATRIX_2 => {
-                state.forward_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
-            }
-            _ => {}
-        });
+                0x0101 => {
+                    ifd.height = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                }
+                0x0102 => {
+                    ifd.bits_per_sample =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0) as u16;
+                }
+                0x0103 => {
+                    ifd.compression = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                }
+                0x0115 => {
+                    ifd.samples_per_pixel =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(1) as u16;
+                }
+                0x0111 => {
+                    ifd.strip_offsets = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x0116 => {
+                    ifd.rows_per_strip = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x0117 => {
+                    ifd.strip_byte_counts = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x0142 => {
+                    ifd.tile_width = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x0143 => {
+                    ifd.tile_length = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x0144 => {
+                    ifd.tile_offsets = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                    has_tiles = true;
+                }
+                0x0145 => {
+                    ifd.tile_byte_counts = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x010F => state.make = read_ascii(data, dtype, cnt, val, inline_pos),
+                0x0110 => state.model = read_ascii(data, dtype, cnt, val, inline_pos),
+                0x0112 => {
+                    state.orientation =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
+                }
+                0x014A => {
+                    subs = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x828D => {
+                    // CFARepeatPatternDim — ignore (we assume 2x2)
+                }
+                0x828E => {
+                    // CFAPattern: we only handle the standard 2x2 mosaic (exactly 4
+                    // entries). Any other length (non-2x2 repeat, malformed, or absent
+                    // tag) is an INTENTIONAL fallback to the RGGB default applied
+                    // downstream — not a silent error.
+                    let arr = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                    if arr.len() == 4 {
+                        ifd.cfa_pattern =
+                            Some([arr[0] as u8, arr[1] as u8, arr[2] as u8, arr[3] as u8]);
+                    }
+                }
+                0xC61A => {
+                    ifd.black_level = first_f32(data, dtype, cnt, val, inline_pos, le)
+                        .map(|v| v.round().clamp(0.0, 65535.0) as u16);
+                }
+                0xC61D => {
+                    ifd.white_level = first_f32(data, dtype, cnt, val, inline_pos, le)
+                        .map(|v| v.round().clamp(0.0, 65535.0) as u16);
+                }
+                0x8827 => {
+                    // ISOSpeedRatings — SHORT array; take first value.
+                    state.iso = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0xC628 => {
+                    state.as_shot_neutral = read_as_shot_neutral(data, dtype, cnt, val, le);
+                }
+                0xC629 => {
+                    state.as_shot_white_xy = read_as_shot_white_xy(data, dtype, cnt, val, le);
+                }
+                TAG_COLOR_MATRIX_1 => {
+                    state.color_matrix_1 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                TAG_COLOR_MATRIX_2 => {
+                    state.color_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                TAG_FORWARD_MATRIX_1 => {
+                    state.forward_matrix_1 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                TAG_FORWARD_MATRIX_2 => {
+                    state.forward_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                _ => {}
+            },
+        );
 
-    // Determine if this IFD is the full-res raw: needs ImageWidth/Length and
-    // tile offsets, and NewSubFileType bit 0 must be 0 (full-res).
-    let _ = has_tiles;
-    if has_image_dims && raw_ifd_supported_candidate(&ifd, new_subfile_type) {
-        let area = (ifd.width as u64) * (ifd.height as u64);
-        let replace = state
-            .raw_ifd
-            .as_ref()
-            .map(|prev| area > (prev.width as u64) * (prev.height as u64))
-            .unwrap_or(true);
-        if replace {
-            state.raw_ifd = Some(ifd);
+        // Determine if this IFD is the full-res raw: needs ImageWidth/Length and
+        // tile offsets, and NewSubFileType bit 0 must be 0 (full-res).
+        let _ = has_tiles;
+        if has_image_dims && raw_ifd_supported_candidate(&ifd, new_subfile_type) {
+            let area = (ifd.width as u64) * (ifd.height as u64);
+            let replace = state
+                .raw_ifd
+                .as_ref()
+                .map(|prev| area > (prev.width as u64) * (prev.height as u64))
+                .unwrap_or(true);
+            if replace {
+                state.raw_ifd = Some(ifd);
+            }
         }
-    }
 
-    for s in subs {
-        walk_inner(data, s as usize, le, state, visited, depth + 1);
-    }
-    // DNG-004: follow the next-IFD chain pointer so we also scan IFD1, IFD2, …
-    // (SubIFD chains for things like EXIF / maker-note sub-trees are handled
-    // separately via the `subs` vector above).
-    if next_ifd > 0 {
-        walk_inner(data, next_ifd as usize, le, state, visited, depth + 1);
-    }
+        for s in subs {
+            walk_inner(data, s as usize, le, state, visited, depth + 1);
+        }
+        // DNG-004: follow the next-IFD chain pointer so we also scan IFD1, IFD2, …
+        // (SubIFD chains for things like EXIF / maker-note sub-trees are handled
+        // separately via the `subs` vector above).
+        if next_ifd > 0 {
+            walk_inner(data, next_ifd as usize, le, state, visited, depth + 1);
+        }
     }
     let mut visited = HashSet::new();
     walk_inner(data, off, le, state, &mut visited, 0);
@@ -1118,7 +1190,10 @@ fn read_array_u32(
             break;
         }
         let v = match dtype {
-            1 | 6 => match data.get(off) { Some(&b) => b as u32, None => break },
+            1 | 6 => match data.get(off) {
+                Some(&b) => b as u32,
+                None => break,
+            },
             3 => read_u16(data, off, le) as u32,
             4 => read_u32(data, off, le),
             _ => break,
@@ -1185,7 +1260,13 @@ fn read_i32(data: &[u8], off: usize, le: bool) -> i32 {
     }
 }
 
-fn read_as_shot_white_xy(data: &[u8], dtype: u16, cnt: u32, val: u32, le: bool) -> Option<[f32; 2]> {
+fn read_as_shot_white_xy(
+    data: &[u8],
+    dtype: u16,
+    cnt: u32,
+    val: u32,
+    le: bool,
+) -> Option<[f32; 2]> {
     if cnt < 2 || dtype != 5 {
         return None;
     }
@@ -1504,7 +1585,10 @@ mod tests {
         assert_eq!(w, 4);
         assert_eq!(h, 2);
         assert_eq!(&*s, &raw[..]);
-        assert!(matches!(s, std::borrow::Cow::Borrowed(_)), "identity must be zero-copy");
+        assert!(
+            matches!(s, std::borrow::Cow::Borrowed(_)),
+            "identity must be zero-copy"
+        );
     }
 
     #[test]
@@ -1583,7 +1667,9 @@ mod tests {
         if !used_real {
             println!("No real asset found in cwd; falling back to synthetic black-sub kernel timing (isolates the new scalar loop cost).");
             let black = 64u16;
-            let mut base: Vec<u16> = (0..(1920*1440)).map(|i| (i % 1000 + 100) as u16).collect();
+            let mut base: Vec<u16> = (0..(1920 * 1440))
+                .map(|i| (i % 1000 + 100) as u16)
+                .collect();
             for i in 0..10 {
                 let subtract = i % 2 == 0;
                 let mut buf = base.clone();
@@ -1592,7 +1678,10 @@ mod tests {
                     demosaic::subtract_black_in_place(&mut buf, black);
                 }
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                println!("synthetic flip {}: {:.4} ms (subtract_black={})", i, ms, subtract);
+                println!(
+                    "synthetic flip {}: {:.4} ms (subtract_black={})",
+                    i, ms, subtract
+                );
             }
         }
         println!("=== End flip-flop ===\n");
@@ -1636,7 +1725,10 @@ pub fn decode_bytes_demosaiced(data: &[u8]) -> Result<DngDemosaiced> {
 
 /// Internal impl with switch for "newer code" (subtract_black=true, clean linear for Lens17/photogram/AR)
 /// vs "old code" (false, preserve bias like pre-clean-linear change). Used for targeted flip-flop tests.
-pub(crate) fn decode_bytes_demosaiced_impl(data: &[u8], subtract_black: bool) -> Result<DngDemosaiced> {
+pub(crate) fn decode_bytes_demosaiced_impl(
+    data: &[u8],
+    subtract_black: bool,
+) -> Result<DngDemosaiced> {
     let (state, raw, _le) = load_dng(data)?;
 
     let width = raw.width as usize;
@@ -1729,8 +1821,9 @@ pub(crate) fn decode_bytes_demosaiced_impl(data: &[u8], subtract_black: bool) ->
             }
             let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let t1 = Instant::now();
-            let rgb = demosaic::demosaic_bayer_mhc(&img.raw, img.width, img.height, cfa_phase(img.cfa))
-                .map_err(|e| anyhow!("demosaic: {}", e))?;
+            let rgb =
+                demosaic::demosaic_bayer_mhc(&img.raw, img.width, img.height, cfa_phase(img.cfa))
+                    .map_err(|e| anyhow!("demosaic: {}", e))?;
             let demosaic_ms = t1.elapsed().as_secs_f64() * 1000.0;
             return Ok(DngDemosaiced {
                 width: img.width,
@@ -1798,7 +1891,9 @@ pub(crate) fn decode_bytes_demosaiced_impl(data: &[u8], subtract_black: bool) ->
             let off = raw.tile_offsets[idx] as usize;
             let bc = raw.tile_byte_counts[idx] as usize;
             // checked_add (000-security-11): off+bc can wrap usize on wasm32.
-            let end = off.checked_add(bc).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+            let end = off
+                .checked_add(bc)
+                .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
             let src = data
                 .get(off..end)
                 .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
@@ -1859,14 +1954,14 @@ pub(crate) fn decode_bytes_demosaiced_impl(data: &[u8], subtract_black: bool) ->
             if c_halo > 0 {
                 let top = &halo_rows[0..width];
                 for hi in 0..c_halo {
-                    c_ctx[hi*width..(hi+1)*width].copy_from_slice(top);
+                    c_ctx[hi * width..(hi + 1) * width].copy_from_slice(top);
                 }
             }
             let mid_off = c_halo * width;
-            c_ctx[mid_off..mid_off + c_halo*width].copy_from_slice(&halo_rows);
-            let south_top = &ctx[band_off..band_off + c_halo*width];
+            c_ctx[mid_off..mid_off + c_halo * width].copy_from_slice(&halo_rows);
+            let south_top = &ctx[band_off..band_off + c_halo * width];
             let south_off = (c_halo + c_halo) * width;
-            c_ctx[south_off..south_off + c_halo*width].copy_from_slice(south_top);
+            c_ctx[south_off..south_off + c_halo * width].copy_from_slice(south_top);
             demosaic::demosaic_rggb_mhc_band(
                 &c_ctx,
                 width,
@@ -1881,7 +1976,11 @@ pub(crate) fn decode_bytes_demosaiced_impl(data: &[u8], subtract_black: bool) ->
             rgb_write_row += c_halo;
         }
 
-        let safe = if is_last { row_h } else { row_h.saturating_sub(halo) };
+        let safe = if is_last {
+            row_h
+        } else {
+            row_h.saturating_sub(halo)
+        };
         if safe > 0 {
             demosaic::demosaic_rggb_mhc_band(
                 &ctx,

@@ -32,14 +32,14 @@ fn main() {
     };
 
     // Single-threaded, deterministic, RGBA8 output.
-    let (pixels, width, height) =
-        match raw_pipeline::jxl_casadecoder::decode_jxl_rgba8(&jxl_bytes) {
-            Some(r) => r,
-            None => {
-                eprintln!("failed to decode {jxl_path}");
-                process::exit(1);
-            }
-        };
+    let (pixels, width, height) = match raw_pipeline::jxl_casadecoder::decode_jxl_rgba8(&jxl_bytes)
+    {
+        Some(r) => r,
+        None => {
+            eprintln!("failed to decode {jxl_path}");
+            process::exit(1);
+        }
+    };
 
     let img = match RgbaImage::from_raw(width, height, pixels) {
         Some(i) => i,

@@ -28,8 +28,15 @@ fn main() {
     }
     copy_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = copy_ms[copy_ms.len() / 2];
-    println!("CR2 reassembly copy-back @ {:.1} MP ({} MB):", n as f64 / 1e6, n * 2 / 1024 / 1024);
+    println!(
+        "CR2 reassembly copy-back @ {:.1} MP ({} MB):",
+        n as f64 / 1e6,
+        n * 2 / 1024 / 1024
+    );
     println!("  eliminated copy median_ms : {:.3}", median);
     println!("  (E1 replaces this with *raw_buf = raster, a pointer move ~= 0 ms,");
-    println!("   and also drops one ~{}MB transient that briefly coexisted with raster)", n * 2 / 1024 / 1024);
+    println!(
+        "   and also drops one ~{}MB transient that briefly coexisted with raster)",
+        n * 2 / 1024 / 1024
+    );
 }

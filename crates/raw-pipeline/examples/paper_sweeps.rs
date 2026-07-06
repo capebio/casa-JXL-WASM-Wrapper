@@ -66,7 +66,9 @@ fn main() {
         frames.push(img.into_raw());
     }
     let n = frames.len();
-    let nthreads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+    let nthreads = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1);
     eprintln!("# {mode} sweep: {n} frames @ {w}x{h} from {dir}");
     println!("mode,tier,param,size_mb,enc_ms_f,dec_batch_ms_f,dec_seq_ms_f");
 
@@ -79,7 +81,12 @@ fn main() {
         opts.effort = e;
         opts.rate = VideoRate::Lossy(d);
         opts.gop_len = gop;
-        let mut src = VecFrames { frames: frames.to_vec(), i: 0, w, h };
+        let mut src = VecFrames {
+            frames: frames.to_vec(),
+            i: 0,
+            w,
+            h,
+        };
         let mut sink: Vec<u8> = Vec::new();
         encode_casv_video_streaming_to(&mut src, &opts, &mut sink).unwrap();
         sink
@@ -93,7 +100,9 @@ fn main() {
                 .split(',')
                 .map(|s| s.parse().unwrap())
                 .collect();
-            let tiers = std::env::args().nth(4).unwrap_or("fable,archive,jolt".into());
+            let tiers = std::env::args()
+                .nth(4)
+                .unwrap_or("fable,archive,jolt".into());
             for &gop in &gops {
                 if tiers.contains("fable") {
                     let r = refs(&frames);
@@ -186,7 +195,10 @@ fn main() {
                 .split(',')
                 .map(|s| s.parse().unwrap())
                 .collect();
-            let e: u8 = std::env::args().nth(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+            let e: u8 = std::env::args()
+                .nth(4)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
             for &d in &ds {
                 let t0 = Instant::now();
                 let bytes = enc_jolt(&frames, d, e, 24);

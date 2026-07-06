@@ -101,8 +101,12 @@ fn dng_peak_mem_stream_vs_full() {
     {
         let img = dng::decode_bytes(&data).unwrap();
         let rgb = raw_pipeline::demosaic::demosaic_bayer_mhc(
-            &img.raw, img.width, img.height, dng::cfa_phase(img.cfa),
-        ).unwrap();
+            &img.raw,
+            img.width,
+            img.height,
+            dng::cfa_phase(img.cfa),
+        )
+        .unwrap();
         std::hint::black_box((&img.raw, &rgb));
     }
     let full_peak = PEAK.load(Ordering::Relaxed) - base_full;
@@ -114,14 +118,28 @@ fn dng_peak_mem_stream_vs_full() {
         let src = dng::DngRowSource::new(&data).unwrap();
         let (w, h, phase) = (src.meta().width, src.meta().height, src.phase());
         let prev = raw_pipeline::stream_preview::build_previews_streaming(
-            src, w, h, phase, &[(300, 300), (120, 120)],
-        ).unwrap();
+            src,
+            w,
+            h,
+            phase,
+            &[(300, 300), (120, 120)],
+        )
+        .unwrap();
         std::hint::black_box(&prev);
     }
     let stream_peak = PEAK.load(Ordering::Relaxed) - base_s;
 
-    println!("DNG working-set peak: full={} stream={} ratio={:.3}",
-        full_peak, stream_peak, stream_peak as f64 / full_peak as f64);
+    println!(
+        "DNG working-set peak: full={} stream={} ratio={:.3}",
+        full_peak,
+        stream_peak,
+        stream_peak as f64 / full_peak as f64
+    );
     // comp=7 target ~1/14; assert a robust < 1/2 (also covers a comp=1 ~1/3.5 fixture).
-    assert!(stream_peak * 2 < full_peak, "stream peak {} not < full/2 {}", stream_peak, full_peak);
+    assert!(
+        stream_peak * 2 < full_peak,
+        "stream peak {} not < full/2 {}",
+        stream_peak,
+        full_peak
+    );
 }

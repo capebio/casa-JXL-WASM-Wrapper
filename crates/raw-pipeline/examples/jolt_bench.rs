@@ -11,8 +11,8 @@
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn main() {
     use raw_pipeline::casa_video::{
-        decode_casv_footer_all_rgb8, encode_casv_video, jolt_encode_stream_to,
-        parse_casv_rate_box, CasaVideoOptions, JoltPreset, VideoFrameSource,
+        decode_casv_footer_all_rgb8, encode_casv_video, jolt_encode_stream_to, parse_casv_rate_box,
+        CasaVideoOptions, JoltPreset, VideoFrameSource,
     };
     use std::time::Instant;
 
@@ -73,7 +73,12 @@ fn main() {
         let t0 = Instant::now();
         let bytes = match preset {
             Some(p) => {
-                let mut src = VecFrames { frames: frames.clone(), i: 0, w, h };
+                let mut src = VecFrames {
+                    frames: frames.clone(),
+                    i: 0,
+                    w,
+                    h,
+                };
                 let mut sink: Vec<u8> = Vec::new();
                 jolt_encode_stream_to(&mut src, p, &mut sink).unwrap();
                 sink

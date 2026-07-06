@@ -28,7 +28,10 @@ fn main() {
     #[cfg(not(target_arch = "x86_64"))]
     let has_avx2 = false;
 
-    println!("\n=== TRAVERSAL FUSION: separate vs fused (min ms/call) === avx2={}\n", has_avx2);
+    println!(
+        "\n=== TRAVERSAL FUSION: separate vs fused (min ms/call) === avx2={}\n",
+        has_avx2
+    );
 
     for (w, h, label) in sizes {
         let px = w * h;
@@ -77,11 +80,19 @@ fn main() {
             };
             // Alternate which arm runs first to cancel start-of-round thermal advantage.
             if r % 2 == 0 {
-                sep_times.push(time_fn(&|b| { std::hint::black_box(separate_passes(b)); }));
-                fused_times.push(time_fn(&|b| { std::hint::black_box(fused_pass(b)); }));
+                sep_times.push(time_fn(&|b| {
+                    std::hint::black_box(separate_passes(b));
+                }));
+                fused_times.push(time_fn(&|b| {
+                    std::hint::black_box(fused_pass(b));
+                }));
             } else {
-                fused_times.push(time_fn(&|b| { std::hint::black_box(fused_pass(b)); }));
-                sep_times.push(time_fn(&|b| { std::hint::black_box(separate_passes(b)); }));
+                fused_times.push(time_fn(&|b| {
+                    std::hint::black_box(fused_pass(b));
+                }));
+                sep_times.push(time_fn(&|b| {
+                    std::hint::black_box(separate_passes(b));
+                }));
             }
         }
 
@@ -96,6 +107,9 @@ fn main() {
         println!("  fused    (1 pass):   {:.3} ms (median)", fused);
         let speedup = sep / fused;
         let bandwidth_saved = (1.0 - (fused / sep)) * 100.0;
-        println!("  {} speedup: {:.2}x   bandwidth saved: {:.1}%\n", label, speedup, bandwidth_saved);
+        println!(
+            "  {} speedup: {:.2}x   bandwidth saved: {:.1}%\n",
+            label, speedup, bandwidth_saved
+        );
     }
 }

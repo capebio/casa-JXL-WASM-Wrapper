@@ -64,16 +64,32 @@ fn main() -> io::Result<()> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--variant" => { variant = Box::leak(args[i + 1].clone().into_boxed_str()); i += 2; }
-            "--in"  => { in_path  = Some(args[i + 1].clone()); i += 2; }
-            "--out" => { out_path = Some(args[i + 1].clone()); i += 2; }
-            "--reps" => { reps_arg = args[i + 1].parse().ok(); i += 2; }
-            _ => { i += 1; }
+            "--variant" => {
+                variant = Box::leak(args[i + 1].clone().into_boxed_str());
+                i += 2;
+            }
+            "--in" => {
+                in_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--out" => {
+                out_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--reps" => {
+                reps_arg = args[i + 1].parse().ok();
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
-    let in_path  = in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
-    let out_path = out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
+    let in_path =
+        in_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--in required"))?;
+    let out_path =
+        out_path.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--out required"))?;
 
     let src = fs::read(&in_path)?;
     let n_u16 = src.len() / 2;
@@ -95,8 +111,13 @@ fn main() -> io::Result<()> {
 
     let decode = match variant {
         "branched" => decode_branched as fn(&[u8], &mut [u16], usize, usize, usize, bool),
-        "hoisted"  => decode_hoisted  as fn(&[u8], &mut [u16], usize, usize, usize, bool),
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "variant must be branched or hoisted")),
+        "hoisted" => decode_hoisted as fn(&[u8], &mut [u16], usize, usize, usize, bool),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "variant must be branched or hoisted",
+            ))
+        }
     };
 
     // Warm-up round excluded from output.

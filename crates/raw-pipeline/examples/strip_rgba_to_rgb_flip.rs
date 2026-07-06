@@ -65,8 +65,13 @@ fn main() {
     ];
 
     println!("strip_rgba_to_rgb flip — RGBA8→RGB8 (no-alpha RAW path), opaque input");
-    println!("  A=with_capacity+extend_from_slice  B1=vec![0]+zip-write  B2=with_capacity+flat_map\n");
-    println!("{:>16} | {:>9} {:>9} {:>9} | {:>8} {:>8} | winner", "case", "A_ms", "B1_ms", "B2_ms", "B1 %sav", "B2 %sav");
+    println!(
+        "  A=with_capacity+extend_from_slice  B1=vec![0]+zip-write  B2=with_capacity+flat_map\n"
+    );
+    println!(
+        "{:>16} | {:>9} {:>9} {:>9} | {:>8} {:>8} | winner",
+        "case", "A_ms", "B1_ms", "B2_ms", "B1 %sav", "B2 %sav"
+    );
 
     let rounds = 12usize;
     let mut all_pass_gate = true;
@@ -110,7 +115,13 @@ fn main() {
         let mb2 = median(&times[2]);
         let sav1 = (ma - mb1) / ma * 100.0;
         let sav2 = (ma - mb2) / ma * 100.0;
-        let best = if mb2 <= mb1 && mb2 <= ma { "B2" } else if mb1 < ma { "B1" } else { "A" };
+        let best = if mb2 <= mb1 && mb2 <= ma {
+            "B2"
+        } else if mb1 < ma {
+            "B1"
+        } else {
+            "A"
+        };
         if sav2 < 5.0 && sav1 < 5.0 {
             all_pass_gate = false;
         }
@@ -122,6 +133,10 @@ fn main() {
 
     println!(
         "\nGate ≥5% %saved on the dominant 24MP case decides item 1. {}",
-        if all_pass_gate { "(some case passed)" } else { "(check 24MP row)" }
+        if all_pass_gate {
+            "(some case passed)"
+        } else {
+            "(check 24MP row)"
+        }
     );
 }

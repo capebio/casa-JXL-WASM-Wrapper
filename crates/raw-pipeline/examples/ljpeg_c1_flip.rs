@@ -15,7 +15,8 @@ use std::time::Instant;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap_or_else(|| {
-        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng".into()
+        r"C:\Foo\raw-converter-wasm\.timing-source\PXL_20260527_180319603.RAW-02.ORIGINAL.dng"
+            .into()
     });
     let data = std::fs::read(&path).expect("read DNG");
     let ranges = dng::ljpeg_tile_ranges(&data).expect("ljpeg tile ranges");
@@ -27,7 +28,10 @@ fn main() {
         "file: {}  tiles: {}  tile0: {}x{} cps={} prec={}",
         path.rsplit(['\\', '/']).next().unwrap_or(&path),
         ranges.len(),
-        info0.width, info0.height, info0.components, info0.precision,
+        info0.width,
+        info0.height,
+        info0.components,
+        info0.precision,
     );
 
     // Per-tile (slice, buf_w, buf_h).
@@ -118,7 +122,10 @@ fn main() {
 
     let ma = med(&ta);
     let mb = med(&tb);
-    println!("LJPEG full-frame decode ({} tiles), interleaved {rounds} rounds, round0 dropped:", tiles.len());
+    println!(
+        "LJPEG full-frame decode ({} tiles), interleaved {rounds} rounds, round0 dropped:",
+        tiles.len()
+    );
     println!("  A generic   : {ma:.2} ms");
     println!("  B dispatched: {mb:.2} ms  (cps=1->c1, cps=2->c2, else generic)");
     println!(

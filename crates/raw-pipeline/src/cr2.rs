@@ -27,25 +27,25 @@ use anyhow::{anyhow, bail, Context, Result};
 
 #[derive(Debug)]
 pub struct Cr2Image {
-    pub width:        usize,
-    pub height:       usize,
-    pub raw:          Vec<u16>,
-    pub black:        u16,
-    pub white:        u16,
-    pub wb_r:         f32,
-    pub wb_g:         f32,
-    pub wb_b:         f32,
-    pub iso:          Option<u32>,
+    pub width: usize,
+    pub height: usize,
+    pub raw: Vec<u16>,
+    pub black: u16,
+    pub white: u16,
+    pub wb_r: f32,
+    pub wb_g: f32,
+    pub wb_b: f32,
+    pub iso: Option<u32>,
     pub color_matrix: Option<[[f32; 3]; 3]>,
-    pub make:         String,
-    pub model:        String,
-    pub orientation:  u16,
+    pub make: String,
+    pub model: String,
+    pub orientation: u16,
     /// Bayer CFA phase (row_parity, col_parity) of the top-left cropped pixel.
     /// (0,0) = RGGB origin (Red at top-left). Derived from the SensorInfo
     /// active-area origin parity when the tag is present and consistent; the
     /// center-crop fallback is even-snapped so it always reports (0,0). The
     /// demosaicer must be told this.
-    pub cfa_phase:    (u8, u8),
+    pub cfa_phase: (u8, u8),
 }
 
 impl Cr2Image {
@@ -110,7 +110,11 @@ fn read_u16(data: &[u8], off: usize, le: bool) -> u16 {
     };
     match data.get(off..end) {
         Some(b) => {
-            if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) }
+            if le {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            }
         }
         None => 0,
     }
@@ -126,7 +130,11 @@ fn read_u32(data: &[u8], off: usize, le: bool) -> u32 {
     };
     match data.get(off..end) {
         Some(b) => {
-            if le { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) }
+            if le {
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            }
         }
         None => 0,
     }
@@ -135,35 +143,54 @@ fn read_u32(data: &[u8], off: usize, le: bool) -> u32 {
 fn type_size(t: u16) -> usize {
     match t {
         1 | 2 | 6 | 7 => 1,
-        3 | 8          => 2,
-        4 | 9 | 11     => 4,
-        5 | 10 | 12    => 8,
-        _              => 0,
+        3 | 8 => 2,
+        4 | 9 | 11 => 4,
+        5 | 10 | 12 => 8,
+        _ => 0,
     }
 }
 
-fn entry_first_u32(data: &[u8], dtype: u16, cnt: u32, val: u32, inline_pos: usize, le: bool) -> Option<u32> {
-    if cnt == 0 { return None; }
+fn entry_first_u32(
+    data: &[u8],
+    dtype: u16,
+    cnt: u32,
+    val: u32,
+    inline_pos: usize,
+    le: bool,
+) -> Option<u32> {
+    if cnt == 0 {
+        return None;
+    }
     let ts = type_size(dtype);
-    if ts == 0 { return None; }
+    if ts == 0 {
+        return None;
+    }
     // u64 math: ts*cnt is file-controlled and can wrap usize on 32-bit/wasm,
     // spuriously selecting the inline branch. Same result for all valid files.
     let inline = (ts as u64) * (cnt as u64) <= 4;
     let p = if inline { inline_pos } else { val as usize };
     // Checked add: `p` and `ts` are file-controlled; `p + ts` can wrap on 32-bit/wasm and
     // defeat the bounds guard. OOB/overflow returns None (unchanged for valid files).
-    if p.checked_add(ts).map_or(true, |e| e > data.len()) { return None; }
+    if p.checked_add(ts).map_or(true, |e| e > data.len()) {
+        return None;
+    }
     match dtype {
         1 | 6 => data.get(p).map(|&b| b as u32),
         3 | 8 => Some(read_u16(data, p, le) as u32),
         4 | 9 => Some(read_u32(data, p, le)),
-        _     => None,
+        _ => None,
     }
 }
 
 fn read_ascii(data: &[u8], cnt: u32, val: u32, inline_pos: usize) -> String {
-    if cnt == 0 { return String::new(); }
-    let (p, len) = if cnt <= 4 { (inline_pos, cnt as usize) } else { (val as usize, cnt as usize) };
+    if cnt == 0 {
+        return String::new();
+    }
+    let (p, len) = if cnt <= 4 {
+        (inline_pos, cnt as usize)
+    } else {
+        (val as usize, cnt as usize)
+    };
     // Checked add: on 32-bit/wasm `p + len` (both from file-controlled u32) can wrap below
     // data.len() and pass an unchecked compare, then `&data[p..p + len]` panics. Same valid
     // output: in-bounds returns the string; OOB/overflow returns empty (unchanged behaviour).
@@ -187,20 +214,28 @@ fn extract_wb_from_raw(data: &[u8], off: usize, cnt: u32, le: bool) -> Option<(f
     // On 32-bit/wasm `off + 2` and `base + 8` (base = off + wb_index*2) can wrap below
     // data.len() and defeat the bounds guard, reading unrelated bytes as WB multipliers.
     // For valid files base is small and in-bounds, so WB is unchanged.
-    if cnt < 1 || off.checked_add(2).map_or(true, |e| e > data.len()) { return None; }
-    let version   = read_u16(data, off, le);
+    if cnt < 1 || off.checked_add(2).map_or(true, |e| e > data.len()) {
+        return None;
+    }
+    let version = read_u16(data, off, le);
     let wb_index: usize = if version >= 6 { 63 } else { 25 };
-    if (cnt as usize) < wb_index + 4 { return None; }
+    if (cnt as usize) < wb_index + 4 {
+        return None;
+    }
     let base = match off.checked_add(wb_index * 2) {
         Some(b) => b,
         None => return None,
     };
-    if base.checked_add(8).map_or(true, |e| e > data.len()) { return None; }
-    let r  = read_u16(data, base,     le) as f32;
+    if base.checked_add(8).map_or(true, |e| e > data.len()) {
+        return None;
+    }
+    let r = read_u16(data, base, le) as f32;
     let g1 = read_u16(data, base + 2, le) as f32;
     // g2 = read_u16(data, base + 4, le) — not used
-    let b  = read_u16(data, base + 6, le) as f32;
-    if g1 < 1.0 { return None; }
+    let b = read_u16(data, base + 6, le) as f32;
+    if g1 < 1.0 {
+        return None;
+    }
     Some((r / g1, b / g1))
 }
 
@@ -217,27 +252,41 @@ fn parse_ljpeg_sof(data: &[u8], strip_off: usize, strip_len: usize) -> Option<(u
     let buf = data.get(strip_off..end)?;
     let mut i = 0;
     while i + 3 < buf.len() {
-        if buf[i] != 0xFF { i += 1; continue; }
+        if buf[i] != 0xFF {
+            i += 1;
+            continue;
+        }
         let marker = buf[i + 1];
         if marker == 0xC3 {
-            if i + 10 > buf.len() { return None; }
+            if i + 10 > buf.len() {
+                return None;
+            }
             let precision = buf[i + 4];
-            let height    = u16::from_be_bytes([buf[i + 5], buf[i + 6]]);
-            let width     = u16::from_be_bytes([buf[i + 7], buf[i + 8]]);
-            let ncomp     = buf[i + 9];
+            let height = u16::from_be_bytes([buf[i + 5], buf[i + 6]]);
+            let width = u16::from_be_bytes([buf[i + 7], buf[i + 8]]);
+            let ncomp = buf[i + 9];
             return Some((precision, height, width, ncomp));
         }
         match marker {
-            0xD8 => { i += 2; continue; }  // SOI — no length field
-            0xDA | 0xD9 => return None,     // SOS (data starts) or EOI
+            0xD8 => {
+                i += 2;
+                continue;
+            } // SOI — no length field
+            0xDA | 0xD9 => return None, // SOS (data starts) or EOI
             _ => {}
         }
         // Variable-length segment: validate seg_len before advancing.
-        if i + 4 > buf.len() { return None; }
+        if i + 4 > buf.len() {
+            return None;
+        }
         let seg_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
-        if seg_len < 2 { return None; }           // malformed: length includes itself
+        if seg_len < 2 {
+            return None;
+        } // malformed: length includes itself
         let next = i + 2 + seg_len;
-        if next > buf.len() { return None; }       // OOB guard
+        if next > buf.len() {
+            return None;
+        } // OOB guard
         i = next;
     }
     None
@@ -266,15 +315,30 @@ fn canon_cam_xyz(_model: &str) -> Option<[i32; 9]> {
 /// keeps CR2 colour consistent with how DNG colour is rendered in this pipeline.
 fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
     // Alloc-free ASCII case-insensitive "canon" search (was a String alloc per decode).
-    let has_canon = make.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"canon"));
+    let has_canon = make
+        .as_bytes()
+        .windows(5)
+        .any(|w| w.eq_ignore_ascii_case(b"canon"));
     if !has_canon {
         return None;
     }
     let raw = canon_cam_xyz(model)?;
     let cam_xyz = [
-        [raw[0] as f32 / 10000.0, raw[1] as f32 / 10000.0, raw[2] as f32 / 10000.0],
-        [raw[3] as f32 / 10000.0, raw[4] as f32 / 10000.0, raw[5] as f32 / 10000.0],
-        [raw[6] as f32 / 10000.0, raw[7] as f32 / 10000.0, raw[8] as f32 / 10000.0],
+        [
+            raw[0] as f32 / 10000.0,
+            raw[1] as f32 / 10000.0,
+            raw[2] as f32 / 10000.0,
+        ],
+        [
+            raw[3] as f32 / 10000.0,
+            raw[4] as f32 / 10000.0,
+            raw[5] as f32 / 10000.0,
+        ],
+        [
+            raw[6] as f32 / 10000.0,
+            raw[7] as f32 / 10000.0,
+            raw[8] as f32 / 10000.0,
+        ],
     ];
     let cam_to_xyz = crate::dng::invert3x3(cam_xyz)?;
     Some(crate::dng::mul3x3(crate::dng::XYZ_D50_TO_SRGB, cam_to_xyz))
@@ -289,20 +353,27 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
 /// (full-raster rebuild, then in-place crop) for A/B flips and parity tests.
 #[doc(hidden)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ReassemblyVariant { Fused, SplitBulk, SplitScatter }
+pub enum ReassemblyVariant {
+    Fused,
+    SplitBulk,
+    SplitScatter,
+}
 
 /// Decode CR2 from raw bytes. Single call, no second Vec allocation.
 pub fn decode_bytes(data: &[u8]) -> Result<Cr2Image> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, None, false, ReassemblyVariant::Fused)
-        .map(|(img, _, _)| img)
+    decode_impl(data, &mut buf, true, None, false, ReassemblyVariant::Fused).map(|(img, _, _)| img)
 }
 
 /// Decode forcing a legacy split slice-reassembly variant (bench only).
 /// `use_scatter=true` selects the pre-#1 scalar scatter; `false` the split bulk copy.
 #[doc(hidden)]
 pub fn decode_bytes_variant(data: &[u8], use_scatter: bool) -> Result<Cr2Image> {
-    let v = if use_scatter { ReassemblyVariant::SplitScatter } else { ReassemblyVariant::SplitBulk };
+    let v = if use_scatter {
+        ReassemblyVariant::SplitScatter
+    } else {
+        ReassemblyVariant::SplitBulk
+    };
     decode_bytes_reassembly(data, v)
 }
 
@@ -318,8 +389,15 @@ pub fn decode_bytes_bench(data: &[u8]) -> Result<(Cr2Image, Cr2Timings)> {
     let mut buf = Vec::new();
     let base = std::time::Instant::now();
     let clock = move || base.elapsed().as_secs_f64() * 1000.0;
-    decode_impl(data, &mut buf, true, Some(&clock), false, ReassemblyVariant::Fused)
-        .map(|(img, t, _)| (img, t))
+    decode_impl(
+        data,
+        &mut buf,
+        true,
+        Some(&clock),
+        false,
+        ReassemblyVariant::Fused,
+    )
+    .map(|(img, t, _)| (img, t))
 }
 
 /// Decode with per-phase timings using a caller-supplied monotonic millisecond clock.
@@ -330,8 +408,15 @@ pub fn decode_bytes_with_clock(
     clock: &dyn Fn() -> f64,
 ) -> Result<(Cr2Image, Cr2Timings)> {
     let mut buf = Vec::new();
-    decode_impl(data, &mut buf, true, Some(clock), false, ReassemblyVariant::Fused)
-        .map(|(img, t, _)| (img, t))
+    decode_impl(
+        data,
+        &mut buf,
+        true,
+        Some(clock),
+        false,
+        ReassemblyVariant::Fused,
+    )
+    .map(|(img, t, _)| (img, t))
 }
 
 /// Decode with full LJPEG stage statistics (for profiling only — slightly slower due to counters).
@@ -344,8 +429,15 @@ pub fn decode_bytes_with_ljpeg_stats(data: &[u8]) -> Result<(Cr2Image, ljpeg::Lj
 /// Decode reusing scratch buffer to avoid per-call full-frame allocation (batch mode).
 /// The scratch.raw buffer grows to full-frame size on the first call and is reused thereafter.
 pub fn decode_with_scratch(data: &[u8], scratch: &mut ScratchBuffers) -> Result<Cr2Image> {
-    decode_impl(data, &mut scratch.raw, false, None, false, ReassemblyVariant::Fused)
-        .map(|(img, _, _)| img)
+    decode_impl(
+        data,
+        &mut scratch.raw,
+        false,
+        None,
+        false,
+        ReassemblyVariant::Fused,
+    )
+    .map(|(img, _, _)| img)
 }
 
 /// Batch decode with reusable scratch AND per-phase timings — the production
@@ -358,8 +450,15 @@ pub fn decode_with_scratch_clock(
     scratch: &mut ScratchBuffers,
     clock: &dyn Fn() -> f64,
 ) -> Result<(Cr2Image, Cr2Timings)> {
-    decode_impl(data, &mut scratch.raw, false, Some(clock), false, ReassemblyVariant::Fused)
-        .map(|(img, t, _)| (img, t))
+    decode_impl(
+        data,
+        &mut scratch.raw,
+        false,
+        Some(clock),
+        false,
+        ReassemblyVariant::Fused,
+    )
+    .map(|(img, t, _)| (img, t))
 }
 
 /// Reorder Canon multi-slice LJPEG output from stream-stacked vertical slices into
@@ -383,12 +482,16 @@ fn reassemble_slices(
     let block = nw.saturating_mul(high);
     for i in 0..n {
         let col0 = i * nw;
-        if nw == 0 || col0 >= stride { break; }
+        if nw == 0 || col0 >= stride {
+            break;
+        }
         let run = nw.min(stride - col0);
         let src_base = i * block;
         for row in 0..high {
             let s = src_base + row * nw;
-            if s + run > buf_len { break; }
+            if s + run > buf_len {
+                break;
+            }
             let d = row * stride + col0;
             raster[d..d + run].copy_from_slice(&src[s..s + run]);
         }
@@ -400,7 +503,9 @@ fn reassemble_slices(
             let src_base = n * block;
             for row in 0..high {
                 let s = src_base + row * lw;
-                if s + run > buf_len { break; }
+                if s + run > buf_len {
+                    break;
+                }
                 let d = row * stride + col0;
                 raster[d..d + run].copy_from_slice(&src[s..s + run]);
             }
@@ -414,17 +519,26 @@ fn reassemble_slices(
 /// byte-identical to this. Not used by the shipped decode path.
 #[doc(hidden)]
 pub fn reassemble_slices_scatter(
-    src: &[u16], stride: usize, high: usize, n: usize, nw: usize, lw: usize,
+    src: &[u16],
+    stride: usize,
+    high: usize,
+    n: usize,
+    nw: usize,
+    lw: usize,
 ) -> Vec<u16> {
     let block = nw * high;
     let mut raster = vec![0u16; stride * high];
     for jidx in 0..(stride * high) {
         let mut i = jidx / block;
         let last = i >= n;
-        if last { i = n; }
+        if last {
+            i = n;
+        }
         let local = jidx - i * block;
         let sw = if last { lw } else { nw };
-        if sw == 0 { break; }
+        if sw == 0 {
+            break;
+        }
         let row = local / sw;
         let col = local % sw + i * nw;
         if row < high && col < stride {
@@ -456,11 +570,18 @@ pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)>
     }
     let mut strip_offset: u32 = 0;
     let mut strip_byte_count: u32 = 0;
-    visit_ifd(data, raw_ifd_off, le, |tag, dtype, cnt, val, ip| match tag {
-        0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
-        0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
-        _ => {}
-    });
+    visit_ifd(
+        data,
+        raw_ifd_off,
+        le,
+        |tag, dtype, cnt, val, ip| match tag {
+            0x0111 => strip_offset = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+            0x0117 => {
+                strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0)
+            }
+            _ => {}
+        },
+    );
     if strip_offset == 0 || strip_byte_count == 0 {
         bail!("CR2: missing strip offset or byte count in raw IFD");
     }
@@ -472,7 +593,12 @@ pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)>
     }
     let (_prec, sof_h, sof_w, ncomp) = parse_ljpeg_sof(data, strip_off, strip_len)
         .ok_or_else(|| anyhow!("CR2: could not find SOF3 marker in LJPEG strip"))?;
-    Ok((strip_off, strip_len, sof_w as usize * ncomp as usize, sof_h as usize))
+    Ok((
+        strip_off,
+        strip_len,
+        sof_w as usize * ncomp as usize,
+        sof_h as usize,
+    ))
 }
 
 /// Canon MakerNote SensorInfo (tag 0x00E0): true sensor geometry + active-area
@@ -481,11 +607,11 @@ pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)>
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SensorInfo {
-    pub sensor_width:  u16,
+    pub sensor_width: u16,
     pub sensor_height: u16,
-    pub left:   u16,
-    pub top:    u16,
-    pub right:  u16,
+    pub left: u16,
+    pub top: u16,
+    pub right: u16,
     pub bottom: u16,
 }
 
@@ -504,20 +630,29 @@ impl SensorInfo {
 /// idx 0 reserved, 1..=8 geometry). Returns None unless the borders are ordered
 /// and inside the sensor grid.
 fn sensor_info_from_entry(
-    data: &[u8], dtype: u16, cnt: u32, val: u32, ip: usize, le: bool,
+    data: &[u8],
+    dtype: u16,
+    cnt: u32,
+    val: u32,
+    ip: usize,
+    le: bool,
 ) -> Option<SensorInfo> {
-    if dtype != 3 || cnt < 9 { return None; }
+    if dtype != 3 || cnt < 9 {
+        return None;
+    }
     // cnt ≥ 9 SHORTs never fits inline, but keep the general multiply-free test.
     let p = if cnt <= 2 { ip } else { val as usize };
     // 9 SHORTs = 18 bytes needed from p (checked add: p is file-controlled).
-    if p.checked_add(18).map_or(true, |e| e > data.len()) { return None; }
+    if p.checked_add(18).map_or(true, |e| e > data.len()) {
+        return None;
+    }
     let at = |i: usize| read_u16(data, p + i * 2, le);
     let cand = SensorInfo {
-        sensor_width:  at(1),
+        sensor_width: at(1),
         sensor_height: at(2),
-        left:   at(5),
-        top:    at(6),
-        right:  at(7),
+        left: at(5),
+        top: at(6),
+        right: at(7),
         bottom: at(8),
     };
     (cand.left < cand.right
@@ -532,29 +667,49 @@ fn sensor_info_from_entry(
 /// tag is missing/malformed (caller falls back to the center-crop heuristic).
 #[doc(hidden)]
 pub fn parse_sensor_info(data: &[u8]) -> Option<SensorInfo> {
-    if data.len() < 16 { return None; }
+    if data.len() < 16 {
+        return None;
+    }
     let le = match &data[0..4] {
         [0x49, 0x49, 0x2A, 0x00] => true,
         [0x4D, 0x4D, 0x00, 0x2A] => false,
         _ => return None,
     };
-    if &data[8..10] != b"CR" { return None; }
+    if &data[8..10] != b"CR" {
+        return None;
+    }
     let ifd0_off = read_u32(data, 4, le) as usize;
 
     let mut exif_ifd_off: u32 = 0;
     visit_ifd(data, ifd0_off, le, |tag, _dtype, _cnt, val, _ip| {
-        if tag == 0x8769 { exif_ifd_off = val; }
+        if tag == 0x8769 {
+            exif_ifd_off = val;
+        }
     });
-    if exif_ifd_off == 0 || (exif_ifd_off as usize) >= data.len() { return None; }
+    if exif_ifd_off == 0 || (exif_ifd_off as usize) >= data.len() {
+        return None;
+    }
 
     let mut makernote_off: u32 = 0;
     let mut makernote_len: u32 = 0;
-    visit_ifd(data, exif_ifd_off as usize, le, |tag, _dtype, cnt, val, _ip| {
-        if tag == 0x927C { makernote_off = val; makernote_len = cnt; }
-    });
-    if makernote_off == 0 || makernote_len < 2 { return None; }
+    visit_ifd(
+        data,
+        exif_ifd_off as usize,
+        le,
+        |tag, _dtype, cnt, val, _ip| {
+            if tag == 0x927C {
+                makernote_off = val;
+                makernote_len = cnt;
+            }
+        },
+    );
+    if makernote_off == 0 || makernote_len < 2 {
+        return None;
+    }
     let mn_off = makernote_off as usize;
-    if mn_off.checked_add(2).map_or(true, |e| e > data.len()) { return None; }
+    if mn_off.checked_add(2).map_or(true, |e| e > data.len()) {
+        return None;
+    }
 
     let mut si: Option<SensorInfo> = None;
     visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| {
@@ -593,8 +748,12 @@ fn choose_crop_origin(
     }
     let mut left = (decoded_width - crop_w) / 2;
     let mut top = (decoded_height - crop_h) / 2;
-    if left & 1 != 0 { left -= 1; }
-    if top & 1 != 0 { top -= 1; }
+    if left & 1 != 0 {
+        left -= 1;
+    }
+    if top & 1 != 0 {
+        top -= 1;
+    }
     (left, top, (0, 0))
 }
 
@@ -620,20 +779,36 @@ fn reassemble_slices_crop(
 ) -> Vec<u16> {
     // Per-slice crop intersection: source block base, slice width, first source
     // column, run length. ≤ n+1 entries — computed once, reused for every row.
-    struct Seg { src_base: usize, sw: usize, src_col: usize, run: usize }
+    struct Seg {
+        src_base: usize,
+        sw: usize,
+        src_col: usize,
+        run: usize,
+    }
     let block = nw * high;
     let crop_right = left + crop_w;
     let mut segs: Vec<Seg> = Vec::with_capacity(n + 1);
     for i in 0..=n {
         let sw = if i < n { nw } else { lw };
-        if sw == 0 { continue; } // lw==0 → no remainder slice
+        if sw == 0 {
+            continue;
+        } // lw==0 → no remainder slice
         let col0 = i * nw;
-        if col0 >= stride { break; }
+        if col0 >= stride {
+            break;
+        }
         let sw_eff = sw.min(stride - col0);
         let lo = col0.max(left);
         let hi = (col0 + sw_eff).min(crop_right);
-        if lo >= hi { continue; }
-        segs.push(Seg { src_base: i * block, sw, src_col: lo - col0, run: hi - lo });
+        if lo >= hi {
+            continue;
+        }
+        segs.push(Seg {
+            src_base: i * block,
+            sw,
+            src_col: lo - col0,
+            run: hi - lo,
+        });
     }
     let mut out = Vec::with_capacity(crop_w * crop_h);
     for row in 0..crop_h {
@@ -653,12 +828,12 @@ fn reassemble_slices_crop(
 /// `move_buf`: when true, moves `raw_buf` into the returned Cr2Image (no copy of crop data).
 ///             when false, clones crop data from raw_buf (scratch retains capacity).
 fn decode_impl(
-    data:           &[u8],
-    raw_buf:        &mut Vec<u16>,
-    move_buf:       bool,
-    clock:          Option<&dyn Fn() -> f64>,
-    capture_stats:  bool,
-    variant:        ReassemblyVariant, // Fused = shipped; Split* = bench/parity only
+    data: &[u8],
+    raw_buf: &mut Vec<u16>,
+    move_buf: bool,
+    clock: Option<&dyn Fn() -> f64>,
+    capture_stats: bool,
+    variant: ReassemblyVariant, // Fused = shipped; Split* = bench/parity only
 ) -> Result<(Cr2Image, Cr2Timings, Option<ljpeg::LjpegStats>)> {
     // Phase timing is driven by an injected monotonic millisecond clock rather than
     // std::time::Instant, which is unavailable on wasm32-unknown-unknown (panics).
@@ -686,7 +861,7 @@ fn decode_impl(
         bail!("CR2: missing Canon CR marker at offset 8");
     }
 
-    let ifd0_off    = read_u32(data, 4,  le) as usize;
+    let ifd0_off = read_u32(data, 4, le) as usize;
     let raw_ifd_off = read_u32(data, 12, le) as usize;
 
     // -----------------------------------------------------------------------
@@ -695,38 +870,50 @@ fn decode_impl(
     let t_parse = mark();
 
     // IFD0: image dimensions, orientation, strings, ExifIFD pointer
-    let mut img_width:    u32 = 0;
-    let mut img_height:   u32 = 0;
-    let mut orientation:  u16 = 1;
-    let mut make          = String::new();
-    let mut model         = String::new();
+    let mut img_width: u32 = 0;
+    let mut img_height: u32 = 0;
+    let mut orientation: u16 = 1;
+    let mut make = String::new();
+    let mut model = String::new();
     let mut exif_ifd_off: u32 = 0;
 
     visit_ifd(data, ifd0_off, le, |tag, dtype, cnt, val, ip| match tag {
-        0x0100 => img_width    = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
-        0x0101 => img_height   = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
-        0x0112 => orientation  = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(1) as u16,
-        0x010F => make         = read_ascii(data, cnt, val, ip),
-        0x0110 => model        = read_ascii(data, cnt, val, ip),
+        0x0100 => img_width = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        0x0101 => img_height = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        0x0112 => orientation = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(1) as u16,
+        0x010F => make = read_ascii(data, cnt, val, ip),
+        0x0110 => model = read_ascii(data, cnt, val, ip),
         0x8769 => exif_ifd_off = val,
-        _      => {}
+        _ => {}
     });
 
     if img_width == 0 || img_height == 0 {
-        bail!("CR2: zero image dimensions in IFD0 (w={}, h={})", img_width, img_height);
+        bail!(
+            "CR2: zero image dimensions in IFD0 (w={}, h={})",
+            img_width,
+            img_height
+        );
     }
 
     // ExifIFD: ISO, MakerNote pointer
-    let mut iso:           Option<u32> = None;
+    let mut iso: Option<u32> = None;
     let mut makernote_off: u32 = 0;
     let mut makernote_len: u32 = 0;
 
     if exif_ifd_off > 0 && (exif_ifd_off as usize) < data.len() {
-        visit_ifd(data, exif_ifd_off as usize, le, |tag, dtype, cnt, val, ip| match tag {
-            0x8827 => iso           = entry_first_u32(data, dtype, cnt, val, ip, le),
-            0x927C => { makernote_off = val; makernote_len = cnt; }
-            _      => {}
-        });
+        visit_ifd(
+            data,
+            exif_ifd_off as usize,
+            le,
+            |tag, dtype, cnt, val, ip| match tag {
+                0x8827 => iso = entry_first_u32(data, dtype, cnt, val, ip, le),
+                0x927C => {
+                    makernote_off = val;
+                    makernote_len = cnt;
+                }
+                _ => {}
+            },
+        );
     }
 
     // Canon MakerNote: zero-alloc WB extraction (item 5) + SensorInfo capture
@@ -764,37 +951,44 @@ fn decode_impl(
         bail!("CR2: invalid raw IFD offset {}", raw_ifd_off);
     }
 
-    let mut strip_offset:     u32 = 0;
+    let mut strip_offset: u32 = 0;
     let mut strip_byte_count: u32 = 0;
-    let mut cr2_slices:       [u16; 3] = [0; 3];
-    let mut have_slices:      bool = false;
-    let mut black_from_ifd:   u16 = 0;
+    let mut cr2_slices: [u16; 3] = [0; 3];
+    let mut have_slices: bool = false;
+    let mut black_from_ifd: u16 = 0;
 
-    visit_ifd(data, raw_ifd_off, le, |tag, dtype, cnt, val, ip| match tag {
-        0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
-        0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
-        0xC640 if dtype == 3 && cnt >= 3 => {
-            // cnt >= 3 SHORTs = 6 bytes — never inline; the old `2 * cnt` form
-            // could wrap usize on 32-bit/wasm and spuriously pick the inline arm.
-            let p = val as usize;
-            // Checked add: `p + 6` can wrap on 32-bit/wasm and spuriously pass the guard.
-            if p.checked_add(6).map_or(false, |e| e <= data.len()) {
-                cr2_slices[0] = read_u16(data, p,     le);
-                cr2_slices[1] = read_u16(data, p + 2, le);
-                cr2_slices[2] = read_u16(data, p + 4, le);
-                have_slices = cr2_slices[0] > 0;
+    visit_ifd(
+        data,
+        raw_ifd_off,
+        le,
+        |tag, dtype, cnt, val, ip| match tag {
+            0x0111 => strip_offset = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+            0x0117 => {
+                strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0)
             }
-        }
-        // BlackLevel tags: 0xC61A (first plausible value wins) (item 1 fix)
-        0xC61A | 0xC632 if black_from_ifd == 0 => {
-            if let Some(b) = entry_first_u32(data, dtype, cnt, val, ip, le) {
-                if b > 0 && b < 8192 {
-                    black_from_ifd = b as u16;
+            0xC640 if dtype == 3 && cnt >= 3 => {
+                // cnt >= 3 SHORTs = 6 bytes — never inline; the old `2 * cnt` form
+                // could wrap usize on 32-bit/wasm and spuriously pick the inline arm.
+                let p = val as usize;
+                // Checked add: `p + 6` can wrap on 32-bit/wasm and spuriously pass the guard.
+                if p.checked_add(6).map_or(false, |e| e <= data.len()) {
+                    cr2_slices[0] = read_u16(data, p, le);
+                    cr2_slices[1] = read_u16(data, p + 2, le);
+                    cr2_slices[2] = read_u16(data, p + 4, le);
+                    have_slices = cr2_slices[0] > 0;
                 }
             }
-        }
-        _ => {}
-    });
+            // BlackLevel tags: 0xC61A (first plausible value wins) (item 1 fix)
+            0xC61A | 0xC632 if black_from_ifd == 0 => {
+                if let Some(b) = entry_first_u32(data, dtype, cnt, val, ip, le) {
+                    if b > 0 && b < 8192 {
+                        black_from_ifd = b as u16;
+                    }
+                }
+            }
+            _ => {}
+        },
+    );
 
     let parse_ms = elapsed(t_parse);
 
@@ -802,15 +996,19 @@ fn decode_impl(
         bail!("CR2: missing strip offset or byte count in raw IFD");
     }
 
-    let strip_off = strip_offset     as usize;
+    let strip_off = strip_offset as usize;
     let strip_len = strip_byte_count as usize;
     // Checked add: strip_off/strip_len are file-controlled; `strip_off + strip_len` can wrap
     // on 32-bit/wasm and pass the guard, then `&data[strip_off..strip_off + strip_len]` (below)
     // would panic. Reject on overflow or OOB. Unchanged for valid files.
     let strip_end = match strip_off.checked_add(strip_len) {
         Some(e) if e <= data.len() => e,
-        _ => bail!("CR2: strip [off={}, len={}] out of bounds (file size {})",
-                   strip_off, strip_len, data.len()),
+        _ => bail!(
+            "CR2: strip [off={}, len={}] out of bounds (file size {})",
+            strip_off,
+            strip_len,
+            data.len()
+        ),
     };
 
     // -----------------------------------------------------------------------
@@ -824,7 +1022,12 @@ fn decode_impl(
     let ncomp = ncomp as usize;
 
     if sof_w == 0 || sof_h == 0 || ncomp == 0 {
-        bail!("CR2: invalid SOF3 dimensions {}×{} ncomp={}", sof_w, sof_h, ncomp);
+        bail!(
+            "CR2: invalid SOF3 dimensions {}×{} ncomp={}",
+            sof_w,
+            sof_h,
+            ncomp
+        );
     }
     // Overflow guard: corrupt files can claim huge dimensions → OOM (multi-lens review).
     // No known RAW sensor exceeds 200 MP.
@@ -832,12 +1035,18 @@ fn decode_impl(
         .saturating_mul(ncomp as u64)
         .saturating_mul(sof_h as u64);
     if total_check > 200_000_000 {
-        bail!("CR2: implausible decoded dimensions {}×{}×{} = {} px", sof_w, sof_h, ncomp, total_check);
+        bail!(
+            "CR2: implausible decoded dimensions {}×{}×{} = {} px",
+            sof_w,
+            sof_h,
+            ncomp,
+            total_check
+        );
     }
 
     // CR2Slices: validated before use (item 15)
     let decoded_width: usize = if have_slices {
-        let n  = cr2_slices[0] as usize;
+        let n = cr2_slices[0] as usize;
         let nw = cr2_slices[1] as usize;
         let lw = cr2_slices[2] as usize;
         if n > 32 || nw == 0 {
@@ -851,7 +1060,7 @@ fn decode_impl(
     // -----------------------------------------------------------------------
     // LJPEG decode — single allocation, in-place crop eliminates second Vec
     // -----------------------------------------------------------------------
-    let stride        = sof_w * ncomp;
+    let stride = sof_w * ncomp;
 
     // The decode buffer's true row length is `stride` (decode_tile is called with
     // stride_pixels = stride below); the crop steps source addresses by `stride` while
@@ -862,11 +1071,14 @@ fn decode_impl(
     if decoded_width != stride {
         bail!(
             "CR2: CR2Slices width {} disagrees with LJPEG stride {} (sof_w={} ncomp={})",
-            decoded_width, stride, sof_w, ncomp
+            decoded_width,
+            stride,
+            sof_w,
+            ncomp
         );
     }
 
-    let total_pixels  = stride * sof_h;
+    let total_pixels = stride * sof_h;
     let raw_buf_bytes = total_pixels * 2;
 
     raw_buf.resize(total_pixels, 0);
@@ -889,12 +1101,12 @@ fn decode_impl(
     // -----------------------------------------------------------------------
     let (mut black, white) = match precision {
         14 => (2048u16, 15300u16),
-        12 => (512u16,  4095u16),
+        12 => (512u16, 4095u16),
         // precision is an unchecked u8 from the LJPEG SOF3 marker. `1u16 << precision`
         // overflows (panic in debug, wrong value in release) for precision >= 16. Guard:
         // precision >= 16 saturates white to u16::MAX; valid 8/10-bit paths are unchanged.
         _ if precision >= 16 => (0u16, u16::MAX),
-        _  => (0u16, (1u16 << precision).saturating_sub(1)),
+        _ => (0u16, (1u16 << precision).saturating_sub(1)),
     };
     if black_from_ifd > 0 && black_from_ifd < white {
         black = black_from_ifd;
@@ -903,12 +1115,17 @@ fn decode_impl(
     // -----------------------------------------------------------------------
     // Crop geometry
     // -----------------------------------------------------------------------
-    let crop_w = img_width  as usize;
+    let crop_w = img_width as usize;
     let crop_h = img_height as usize;
 
     if decoded_width < crop_w || sof_h < crop_h {
-        bail!("CR2: decoded size {}×{} smaller than expected {}×{}",
-              decoded_width, sof_h, crop_w, crop_h);
+        bail!(
+            "CR2: decoded size {}×{} smaller than expected {}×{}",
+            decoded_width,
+            sof_h,
+            crop_w,
+            crop_h
+        );
     }
 
     // Crop origin: prefer the camera's own active-area borders (SensorInfo,
@@ -924,8 +1141,15 @@ fn decode_impl(
         choose_crop_origin(sensor_info, decoded_width, sof_h, crop_w, crop_h);
 
     if left + crop_w > decoded_width || top + crop_h > sof_h {
-        bail!("CR2: crop region [left={}, top={}, w={}, h={}] exceeds decoded {}×{}",
-              left, top, crop_w, crop_h, decoded_width, sof_h);
+        bail!(
+            "CR2: crop region [left={}, top={}, w={}, h={}] exceeds decoded {}×{}",
+            left,
+            top,
+            crop_w,
+            crop_h,
+            decoded_width,
+            sof_h
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -946,20 +1170,26 @@ fn decode_impl(
     let raw_out: Vec<u16>;
 
     if have_slices {
-        let n  = cr2_slices[0] as usize;
+        let n = cr2_slices[0] as usize;
         let nw = cr2_slices[1] as usize;
         let lw = cr2_slices[2] as usize;
         // Overflow guard for nw*high (both paths derive block = nw*high).
-        nw.checked_mul(sof_h).ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
+        nw.checked_mul(sof_h)
+            .ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
         if variant == ReassemblyVariant::Fused {
             // raw_buf keeps the full-length stacked decode → in scratch mode the
             // next resize(total_pixels) is a no-op (no tail re-zero-fill).
             let t = mark();
             let out = reassemble_slices_crop(
-                raw_buf, stride, sof_h, n, nw, lw, left, top, crop_w, crop_h);
+                raw_buf, stride, sof_h, n, nw, lw, left, top, crop_w, crop_h,
+            );
             reassemble_ms = elapsed(t);
             if out.len() != crop_len {
-                bail!("CR2: fused reassembly produced {} px, expected {}", out.len(), crop_len);
+                bail!(
+                    "CR2: fused reassembly produced {} px, expected {}",
+                    out.len(),
+                    crop_len
+                );
             }
             raw_out = out;
         } else {
@@ -984,9 +1214,9 @@ fn decode_impl(
             raw_buf.truncate(crop_len);
             crop_ms = elapsed(t_crop);
             raw_out = if move_buf {
-                std::mem::take(raw_buf)     // zero-copy — raw_buf left empty
+                std::mem::take(raw_buf) // zero-copy — raw_buf left empty
             } else {
-                raw_buf[..crop_len].to_vec()   // batch mode: clone crop, retain capacity
+                raw_buf[..crop_len].to_vec() // batch mode: clone crop, retain capacity
             };
         }
     } else if move_buf {
@@ -1002,7 +1232,7 @@ fn decode_impl(
         }
         raw_buf.truncate(crop_len);
         crop_ms = elapsed(t_crop);
-        raw_out = std::mem::take(raw_buf);  // zero-copy — raw_buf left empty
+        raw_out = std::mem::take(raw_buf); // zero-copy — raw_buf left empty
     } else {
         // Single-slice scratch path: copy crop rows straight into the output —
         // raw_buf is untouched and stays full-length, so the next decode's
@@ -1022,27 +1252,36 @@ fn decode_impl(
     let total_ms = elapsed(t_total);
 
     let timings = Cr2Timings {
-        total_ms, parse_ms, ljpeg_ms, reassemble_ms, crop_ms,
-        raw_buf_bytes, crop_buf_bytes,
+        total_ms,
+        parse_ms,
+        ljpeg_ms,
+        reassemble_ms,
+        crop_ms,
+        raw_buf_bytes,
+        crop_buf_bytes,
         slices: if have_slices { cr2_slices } else { [0; 3] },
     };
 
-    Ok((Cr2Image {
-        width:        crop_w,
-        height:       crop_h,
-        raw:          raw_out,
-        black,
-        white,
-        wb_r,
-        wb_g:         1.0,
-        wb_b,
-        iso,
-        color_matrix: canon_color_matrix(&make, &model),
-        make,
-        model,
-        orientation,
-        cfa_phase,
-    }, timings, ljpeg_stats))
+    Ok((
+        Cr2Image {
+            width: crop_w,
+            height: crop_h,
+            raw: raw_out,
+            black,
+            white,
+            wb_r,
+            wb_g: 1.0,
+            wb_b,
+            iso,
+            color_matrix: canon_color_matrix(&make, &model),
+            make,
+            model,
+            orientation,
+            cfa_phase,
+        },
+        timings,
+        ljpeg_stats,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,28 +1311,40 @@ mod tests {
     #[test]
     fn rejects_missing_cr_marker() {
         let mut data = vec![0u8; 16];
-        data[0] = 0x49; data[1] = 0x49; data[2] = 0x2A; data[3] = 0x00;
-        data[8] = 0x00; data[9] = 0x00;
+        data[0] = 0x49;
+        data[1] = 0x49;
+        data[2] = 0x2A;
+        data[3] = 0x00;
+        data[8] = 0x00;
+        data[9] = 0x00;
         let result = decode_bytes(&data);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("CR marker"), "error should mention CR marker: {msg}");
+        assert!(
+            msg.contains("CR marker"),
+            "error should mention CR marker: {msg}"
+        );
     }
 
     // Zero-alloc WB extraction from raw file bytes
     #[test]
     fn extract_wb_version6() {
         let mut data = vec![0u8; 140]; // 70 u16s × 2 bytes
-        // Write version=6 at offset 0
-        data[0] = 6; data[1] = 0; // version = 6 LE
-        // WB at index 63: offset 63*2 = 126
-        let r:  u16 = 2166;
+                                       // Write version=6 at offset 0
+        data[0] = 6;
+        data[1] = 0; // version = 6 LE
+                     // WB at index 63: offset 63*2 = 126
+        let r: u16 = 2166;
         let g1: u16 = 1024;
-        let b:  u16 = 1789;
-        data[126] = (r  & 0xFF) as u8; data[127] = (r  >> 8) as u8;
-        data[128] = (g1 & 0xFF) as u8; data[129] = (g1 >> 8) as u8;
-        data[130] = 0; data[131] = 0; // g2
-        data[132] = (b  & 0xFF) as u8; data[133] = (b  >> 8) as u8;
+        let b: u16 = 1789;
+        data[126] = (r & 0xFF) as u8;
+        data[127] = (r >> 8) as u8;
+        data[128] = (g1 & 0xFF) as u8;
+        data[129] = (g1 >> 8) as u8;
+        data[130] = 0;
+        data[131] = 0; // g2
+        data[132] = (b & 0xFF) as u8;
+        data[133] = (b >> 8) as u8;
         let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 70, true).unwrap();
         let er = 2166.0 / 1024.0;
         let eb = 1789.0 / 1024.0;
@@ -1104,15 +1355,20 @@ mod tests {
     #[test]
     fn extract_wb_version1() {
         let mut data = vec![0u8; 60]; // 30 u16s × 2 bytes
-        data[0] = 1; data[1] = 0; // version = 1 LE
-        // WB at index 25: offset 25*2 = 50
-        let r:  u16 = 1800;
+        data[0] = 1;
+        data[1] = 0; // version = 1 LE
+                     // WB at index 25: offset 25*2 = 50
+        let r: u16 = 1800;
         let g1: u16 = 1024;
-        let b:  u16 = 1600;
-        data[50] = (r  & 0xFF) as u8; data[51] = (r  >> 8) as u8;
-        data[52] = (g1 & 0xFF) as u8; data[53] = (g1 >> 8) as u8;
-        data[54] = 0; data[55] = 0; // g2
-        data[56] = (b  & 0xFF) as u8; data[57] = (b  >> 8) as u8;
+        let b: u16 = 1600;
+        data[50] = (r & 0xFF) as u8;
+        data[51] = (r >> 8) as u8;
+        data[52] = (g1 & 0xFF) as u8;
+        data[53] = (g1 >> 8) as u8;
+        data[54] = 0;
+        data[55] = 0; // g2
+        data[56] = (b & 0xFF) as u8;
+        data[57] = (b >> 8) as u8;
         let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 30, true).unwrap();
         assert!((wb_r - 1800.0 / 1024.0).abs() < 1e-4);
         assert!((wb_b - 1600.0 / 1024.0).abs() < 1e-4);
@@ -1122,9 +1378,10 @@ mod tests {
     fn extract_wb_returns_none_for_zero_g1() {
         let mut data = vec![0u8; 140];
         data[0] = 6; // version = 6
-        // R at 126..128, G1 at 128..130 = 0
-        data[126] = 0xD0; data[127] = 0x07; // R = 2000
-        // G1 stays 0
+                     // R at 126..128, G1 at 128..130 = 0
+        data[126] = 0xD0;
+        data[127] = 0x07; // R = 2000
+                          // G1 stays 0
         assert!(extract_wb_from_raw(&data, 0, 70, true).is_none());
     }
 
@@ -1132,11 +1389,17 @@ mod tests {
     fn visit_ifd_empty_returns_zero() {
         // Empty IFD (count=0) should not call visitor and return next offset
         let mut data = vec![0u8; 8];
-        data[0] = 0; data[1] = 0; // count = 0
-        // next offset at bytes 2..6
-        data[2] = 0; data[3] = 0; data[4] = 0; data[5] = 0;
+        data[0] = 0;
+        data[1] = 0; // count = 0
+                     // next offset at bytes 2..6
+        data[2] = 0;
+        data[3] = 0;
+        data[4] = 0;
+        data[5] = 0;
         let mut called = false;
-        let next = visit_ifd(&data, 0, true, |_, _, _, _, _| { called = true; });
+        let next = visit_ifd(&data, 0, true, |_, _, _, _, _| {
+            called = true;
+        });
         assert!(!called);
         assert_eq!(next, 0);
     }
@@ -1145,9 +1408,12 @@ mod tests {
     fn visit_ifd_corruption_guard() {
         // IFD claiming > 512 entries should return 0, no visitor calls
         let mut data = vec![0u8; 4];
-        data[0] = 0xFF; data[1] = 0x03; // count = 1023 LE
+        data[0] = 0xFF;
+        data[1] = 0x03; // count = 1023 LE
         let mut called = false;
-        let next = visit_ifd(&data, 0, true, |_, _, _, _, _| { called = true; });
+        let next = visit_ifd(&data, 0, true, |_, _, _, _, _| {
+            called = true;
+        });
         assert!(!called);
         assert_eq!(next, 0);
     }
@@ -1161,7 +1427,7 @@ mod tests {
             Err(_) => return, // file not present — skip
         };
         let img = decode_bytes(&data).expect("CR2 decode failed");
-        assert_eq!(img.width,  5184, "width");
+        assert_eq!(img.width, 5184, "width");
         assert_eq!(img.height, 3456, "height");
         assert!(img.wb_r > 1.0 && img.wb_r < 5.0, "wb_r={}", img.wb_r);
         assert!(img.wb_b > 1.0 && img.wb_b < 5.0, "wb_b={}", img.wb_b);
@@ -1181,11 +1447,28 @@ mod tests {
         };
         let (img, t) = decode_bytes_bench(&data).expect("bench decode failed");
         assert_eq!(img.raw.len(), img.width * img.height);
-        assert!(t.total_ms > 0.0, "total_ms should be positive: {}", t.total_ms);
-        assert!(t.ljpeg_ms > 0.0, "ljpeg_ms should be positive: {}", t.ljpeg_ms);
-        assert!(t.ljpeg_ms <= t.total_ms, "ljpeg_ms={} > total_ms={}", t.ljpeg_ms, t.total_ms);
-        assert!(t.raw_buf_bytes > t.crop_buf_bytes,
-            "raw_buf_bytes={} should exceed crop_buf_bytes={}", t.raw_buf_bytes, t.crop_buf_bytes);
+        assert!(
+            t.total_ms > 0.0,
+            "total_ms should be positive: {}",
+            t.total_ms
+        );
+        assert!(
+            t.ljpeg_ms > 0.0,
+            "ljpeg_ms should be positive: {}",
+            t.ljpeg_ms
+        );
+        assert!(
+            t.ljpeg_ms <= t.total_ms,
+            "ljpeg_ms={} > total_ms={}",
+            t.ljpeg_ms,
+            t.total_ms
+        );
+        assert!(
+            t.raw_buf_bytes > t.crop_buf_bytes,
+            "raw_buf_bytes={} should exceed crop_buf_bytes={}",
+            t.raw_buf_bytes,
+            t.crop_buf_bytes
+        );
     }
 
     #[test]
@@ -1207,8 +1490,10 @@ mod tests {
             let src: Vec<u16> = (0..total).map(|i| (i % 65535) as u16).collect();
             let bulk = reassemble_slices(&src, stride, high, n, nw, lw);
             let scalar = reassemble_slices_scatter(&src, stride, high, n, nw, lw);
-            assert_eq!(bulk, scalar,
-                "mismatch for n={n} nw={nw} lw={lw} high={high}");
+            assert_eq!(
+                bulk, scalar,
+                "mismatch for n={n} nw={nw} lw={lw} high={high}"
+            );
         }
     }
 
@@ -1223,21 +1508,61 @@ mod tests {
     #[test]
     fn choose_crop_origin_prefers_valid_sensor_info() {
         // Real ADH-body geometry: active 6000x4000 at (276,48) inside 6288x4056.
-        let si = SensorInfo { sensor_width: 6288, sensor_height: 4056, left: 276, top: 48, right: 6275, bottom: 4047 };
-        assert_eq!(choose_crop_origin(Some(si), 6288, 4056, 6000, 4000), (276, 48, (0, 0)));
+        let si = SensorInfo {
+            sensor_width: 6288,
+            sensor_height: 4056,
+            left: 276,
+            top: 48,
+            right: 6275,
+            bottom: 4047,
+        };
+        assert_eq!(
+            choose_crop_origin(Some(si), 6288, 4056, 6000, 4000),
+            (276, 48, (0, 0))
+        );
         // Odd origin → real parity carried through as CFA phase, no snapping.
-        let si_odd = SensorInfo { sensor_width: 100, sensor_height: 60, left: 5, top: 3, right: 84, bottom: 42 };
-        assert_eq!(choose_crop_origin(Some(si_odd), 100, 60, 80, 40), (5, 3, (1, 1)));
+        let si_odd = SensorInfo {
+            sensor_width: 100,
+            sensor_height: 60,
+            left: 5,
+            top: 3,
+            right: 84,
+            bottom: 42,
+        };
+        assert_eq!(
+            choose_crop_origin(Some(si_odd), 100, 60, 80, 40),
+            (5, 3, (1, 1))
+        );
     }
 
     #[test]
     fn choose_crop_origin_falls_back_when_inconsistent() {
         // Active dims disagree with the IFD0 crop → center fallback.
-        let si = SensorInfo { sensor_width: 100, sensor_height: 60, left: 4, top: 2, right: 93, bottom: 51 };
-        assert_eq!(choose_crop_origin(Some(si), 100, 60, 80, 40), (10, 10, (0, 0)));
+        let si = SensorInfo {
+            sensor_width: 100,
+            sensor_height: 60,
+            left: 4,
+            top: 2,
+            right: 93,
+            bottom: 51,
+        };
+        assert_eq!(
+            choose_crop_origin(Some(si), 100, 60, 80, 40),
+            (10, 10, (0, 0))
+        );
         // Sensor grid disagrees with the decoded grid → center fallback.
-        let si2 = SensorInfo { sensor_width: 200, sensor_height: 60, left: 4, top: 2, right: 83, bottom: 41 };
-        assert_eq!(choose_crop_origin(Some(si2), 100, 60, 80, 40), (10, 10, (0, 0)));
+        let si2 = SensorInfo {
+            sensor_width: 200,
+            sensor_height: 60,
+            left: 4,
+            top: 2,
+            right: 83,
+            bottom: 41,
+        };
+        assert_eq!(
+            choose_crop_origin(Some(si2), 100, 60, 80, 40),
+            (10, 10, (0, 0))
+        );
         // Tag absent → center fallback (even-snapped).
         assert_eq!(choose_crop_origin(None, 100, 60, 80, 40), (10, 10, (0, 0)));
         assert_eq!(choose_crop_origin(None, 101, 61, 80, 40), (10, 10, (0, 0)));
@@ -1247,19 +1572,25 @@ mod tests {
     fn sensor_crop_matches_grid_single_slice() {
         // Single-slice body: the decoded grid IS the raster, so the shipped crop
         // must equal grid rows at the SensorInfo origin, row for row.
-        let Some(data) = fixture("ADH 1234.CR2") else { return };
+        let Some(data) = fixture("ADH 1234.CR2") else {
+            return;
+        };
         let si = parse_sensor_info(&data).expect("SensorInfo present");
         let (off, len, stride, rows) = ljpeg_strip_geometry(&data).unwrap();
         let img = decode_bytes(&data).unwrap();
         assert_eq!(img.width, si.active_width());
         assert_eq!(img.height, si.active_height());
         let mut grid = vec![0u16; stride * rows];
-        crate::ljpeg::decode_tile(&data[off..off + len], &mut grid, 0, stride, stride, rows).unwrap();
+        crate::ljpeg::decode_tile(&data[off..off + len], &mut grid, 0, stride, stride, rows)
+            .unwrap();
         let (ls, ts) = (si.left as usize, si.top as usize);
         for &row in &[0usize, img.height / 2, img.height - 1] {
             let g = (ts + row) * stride + ls;
-            assert_eq!(&img.raw[row * img.width..(row + 1) * img.width],
-                       &grid[g..g + img.width], "row {row}");
+            assert_eq!(
+                &img.raw[row * img.width..(row + 1) * img.width],
+                &grid[g..g + img.width],
+                "row {row}"
+            );
         }
         assert_eq!(img.cfa_phase, (0, 0), "ADH origin is even/even");
     }
@@ -1273,11 +1604,15 @@ mod tests {
             let Some(data) = fixture(name) else { continue };
             let f = decode_bytes_reassembly(&data, ReassemblyVariant::Fused).expect("fused");
             let b = decode_bytes_reassembly(&data, ReassemblyVariant::SplitBulk).expect("bulk");
-            let s = decode_bytes_reassembly(&data, ReassemblyVariant::SplitScatter).expect("scatter");
+            let s =
+                decode_bytes_reassembly(&data, ReassemblyVariant::SplitScatter).expect("scatter");
             assert_eq!(f.raw, b.raw, "fused vs bulk: {name}");
             assert_eq!(f.raw, s.raw, "fused vs scatter: {name}");
-            assert_eq!((f.width, f.height, f.black, f.white, f.cfa_phase),
-                       (b.width, b.height, b.black, b.white, b.cfa_phase), "{name}");
+            assert_eq!(
+                (f.width, f.height, f.black, f.white, f.cfa_phase),
+                (b.width, b.height, b.black, b.white, b.cfa_phase),
+                "{name}"
+            );
             assert_eq!(f.wb_r.to_bits(), b.wb_r.to_bits(), "{name}");
             assert_eq!(f.wb_b.to_bits(), b.wb_b.to_bits(), "{name}");
         }
@@ -1288,13 +1623,18 @@ mod tests {
         // multi → single → multi with ONE scratch: byte-identical to fresh decodes.
         // Exercises the no-truncate warm path (stale tail must be fully overwritten
         // by the next LJPEG decode — full-write invariant).
-        let (Some(m), Some(s)) = (fixture("_MG_1744.CR2"), fixture("ADH 1234.CR2")) else { return };
+        let (Some(m), Some(s)) = (fixture("_MG_1744.CR2"), fixture("ADH 1234.CR2")) else {
+            return;
+        };
         let mut sc = ScratchBuffers::default();
         for (i, data) in [&m, &s, &m].into_iter().enumerate() {
             let a = decode_with_scratch(data, &mut sc).expect("scratch decode");
             let b = decode_bytes(data).expect("fresh decode");
             assert_eq!(a.raw, b.raw, "call {i}");
-            assert_eq!((a.width, a.height, a.black, a.white), (b.width, b.height, b.black, b.white));
+            assert_eq!(
+                (a.width, a.height, a.black, a.white),
+                (b.width, b.height, b.black, b.white)
+            );
         }
     }
 
@@ -1305,13 +1645,15 @@ mod tests {
         // geometry, lw==0 (no remainder), crop==full, crop inside one slice, crop
         // spanning all slices.
         let cases = [
-            (2usize, 4usize, 6usize, 5usize, 2usize, 0usize, 8usize, 4usize),
+            (
+                2usize, 4usize, 6usize, 5usize, 2usize, 0usize, 8usize, 4usize,
+            ),
             (3, 8, 8, 7, 0, 2, 32, 5),
             (1, 16, 4, 9, 4, 2, 10, 6),
-            (2, 1728, 1888, 12, 80, 2, 5184, 8),  // real Canon widths
-            (4, 5, 3, 6, 0, 0, 23, 6),             // crop == full frame
-            (2, 8, 0, 5, 2, 0, 12, 5),             // lw == 0
-            (3, 10, 5, 8, 12, 2, 6, 4),            // crop inside slice 1
+            (2, 1728, 1888, 12, 80, 2, 5184, 8), // real Canon widths
+            (4, 5, 3, 6, 0, 0, 23, 6),           // crop == full frame
+            (2, 8, 0, 5, 2, 0, 12, 5),           // lw == 0
+            (3, 10, 5, 8, 12, 2, 6, 4),          // crop inside slice 1
         ];
         for &(n, nw, lw, high, left, top, cw, ch) in &cases {
             let stride = n * nw + lw;
@@ -1325,7 +1667,10 @@ mod tests {
                 want.extend_from_slice(&raster[s..s + cw]);
             }
             let got = reassemble_slices_crop(&src, stride, high, n, nw, lw, left, top, cw, ch);
-            assert_eq!(got, want, "n={n} nw={nw} lw={lw} high={high} l={left} t={top} {cw}x{ch}");
+            assert_eq!(
+                got, want,
+                "n={n} nw={nw} lw={lw} high={high} l={left} t={top} {cw}x{ch}"
+            );
         }
     }
 
@@ -1351,7 +1696,10 @@ mod tests {
         // (val as usize = OOB) and return None — not read the inline area.
         let data = vec![0xABu8; 32];
         // dtype=3 (SHORT, ts=2), cnt = 0x8000_0003 → 2*cnt wraps to 6 on 32-bit.
-        assert_eq!(entry_first_u32(&data, 3, 0x8000_0003, 0xFFFF_FFFF, 4, true), None);
+        assert_eq!(
+            entry_first_u32(&data, 3, 0x8000_0003, 0xFFFF_FFFF, 4, true),
+            None
+        );
     }
 
     #[test]
@@ -1368,8 +1716,16 @@ mod tests {
         // Per-model matrices are temporarily disabled: direct adobe_coeff use in
         // CasaWASM's WB-first pipeline produces channel collapse (see canon_cam_xyz comment).
         // All bodies fall through to the generic CANON_CAM_TO_SRGB fallback.
-        for model in ["Canon EOS 550D", "Canon EOS Kiss X4", "Canon EOS M5", "Canon EOS 9999X"] {
-            assert!(canon_color_matrix("Canon", model).is_none(), "expected None for {model}");
+        for model in [
+            "Canon EOS 550D",
+            "Canon EOS Kiss X4",
+            "Canon EOS M5",
+            "Canon EOS 9999X",
+        ] {
+            assert!(
+                canon_color_matrix("Canon", model).is_none(),
+                "expected None for {model}"
+            );
         }
         assert!(canon_color_matrix("OM Digital Solutions", "OM-5").is_none());
     }

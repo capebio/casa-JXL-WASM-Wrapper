@@ -143,8 +143,15 @@ fn report(title: &str, stats: &[Stat]) {
         "variant", "median ms", "stdev", "cv", "peak MB", "%saved", "trust", "quality"
     );
     for s in stats {
-        let cv = if s.median_ms > 0.0 { s.stdev_ms / s.median_ms } else { 0.0 };
-        let q = s.quality.map(|q| format!("{q:.4}")).unwrap_or_else(|| "-".into());
+        let cv = if s.median_ms > 0.0 {
+            s.stdev_ms / s.median_ms
+        } else {
+            0.0
+        };
+        let q = s
+            .quality
+            .map(|q| format!("{q:.4}"))
+            .unwrap_or_else(|| "-".into());
         println!(
             "  {:<22} {:>9.2} {:>9.2} {:>8.3} {:>9.1} {:>+8.0} {:>7}  {}",
             s.name, s.median_ms, s.stdev_ms, cv, s.peak_mb, s.pct_saved, s.trust, q
@@ -154,7 +161,11 @@ fn report(title: &str, stats: &[Stat]) {
     use std::io::Write;
     let dir = std::path::PathBuf::from("docs/outputs/timing tests/flip-native");
     std::fs::create_dir_all(&dir).ok();
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("journal.toon")) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("journal.toon"))
+    {
         let _ = writeln!(f, "=== {title}");
         for s in stats {
             let _ = writeln!(
@@ -191,11 +202,17 @@ fn bench_size(w: usize, h: usize) {
         },
     ];
     let stats = flip(&mut variants, 9, 1);
-    report(&format!("demosaic preview, {w}x{h} ({:.1} MP)", (w * h) as f64 / 1e6), &stats);
+    report(
+        &format!("demosaic preview, {w}x{h} ({:.1} MP)", (w * h) as f64 / 1e6),
+        &stats,
+    );
 }
 
 fn main() {
-    println!("flip_native — interleaved in-process timing (parallel={})", cfg!(feature = "parallel"));
+    println!(
+        "flip_native — interleaved in-process timing (parallel={})",
+        cfg!(feature = "parallel")
+    );
     bench_size(5184, 3888); // ~20 MP
     bench_size(4032, 3024); // ~12 MP
     println!("\nquality column = Butteraugli vs full-res preview (from demosaic_preview_demo); <1.0 ≈ invisible.");

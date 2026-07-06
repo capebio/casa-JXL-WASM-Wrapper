@@ -34,16 +34,20 @@ where
     let mut ta = Vec::with_capacity(rounds);
     let mut tb = Vec::with_capacity(rounds);
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(f_a()); tb.push(f_b()); }
-        else           { tb.push(f_b()); ta.push(f_a()); }
+        if r % 2 == 0 {
+            ta.push(f_a());
+            tb.push(f_b());
+        } else {
+            tb.push(f_b());
+            ta.push(f_a());
+        }
     }
     (ta, tb)
 }
 
 /// Print per-round ns values and summary line.
 /// `unit` = ops per timing slot (for ns/op normalization).
-fn print_result(label: &str, ta: &mut Vec<u64>, tb: &mut Vec<u64>,
-                unit: u64, parity: bool) {
+fn print_result(label: &str, ta: &mut Vec<u64>, tb: &mut Vec<u64>, unit: u64, parity: bool) {
     let rounds = ta.len();
     // Per-round table: show ns/op
     for r in 0..rounds {
@@ -56,8 +60,10 @@ fn print_result(label: &str, ta: &mut Vec<u64>, tb: &mut Vec<u64>,
     let med_b = median(tb) / unit;
     let speedup = med_a as f64 / med_b.max(1) as f64;
     let parity_str = if parity { "PARITY OK" } else { "PARITY FAIL" };
-    println!("  {label} median  A={med_a}ns/op  B={med_b}ns/op  \
-              speedup={speedup:.1}x  [{parity_str}]");
+    println!(
+        "  {label} median  A={med_a}ns/op  B={med_b}ns/op  \
+              speedup={speedup:.1}x  [{parity_str}]"
+    );
 }
 
 // ── A1/B1  Queue drain: Vec erase-front vs VecDeque pop_front ────────────────
@@ -68,20 +74,20 @@ fn print_result(label: &str, ta: &mut Vec<u64>, tb: &mut Vec<u64>,
 // Each timing slot drains QUEUE_BATCH independent queues of QUEUE_N items.
 // Reported as ns per full-drain (N items out of one queue).
 const QUEUE_N: usize = 2_000;
-const QUEUE_BATCH: u64 = 8;   // drains per slot → enough ns above floor for B
+const QUEUE_BATCH: u64 = 8; // drains per slot → enough ns above floor for B
 const QUEUE_ROUNDS: usize = 15;
 
 fn bench_queue() {
-    println!(
-        "\n[A1/B1] Queue drain: Vec drain(0..1) [old O(N)] vs VecDeque pop_front [new O(1)]"
-    );
+    println!("\n[A1/B1] Queue drain: Vec drain(0..1) [old O(N)] vs VecDeque pop_front [new O(1)]");
     println!("  N={QUEUE_N} items/drain, {QUEUE_BATCH} drains/slot, {QUEUE_ROUNDS} rounds");
     println!("  Pattern: even rounds A→B first, odd rounds B→A first");
 
     // Seed values kept opaque via black_box so LLVM cannot compute the sums
     // statically and elide either loop.  Without this, VecDeque drain compiles
     // down to a closed-form arithmetic sum (O(1) at compile time) and reports 0ns.
-    let seeds: Vec<u64> = (0..QUEUE_BATCH).map(|i| black_box(i * 0xdeadbeef)).collect();
+    let seeds: Vec<u64> = (0..QUEUE_BATCH)
+        .map(|i| black_box(i * 0xdeadbeef))
+        .collect();
 
     // A: Vec drain via drain(0..1) — O(N) per item, O(N²) total (old erase-front)
     let run_a = || -> u64 {
@@ -153,15 +159,9 @@ fn bench_copy() {
     let buffer_size_b = stride_b * COPY_H;
     let saved_pct_b = (buffer_size_b - logical_b) * 100 / buffer_size_b;
 
-    println!(
-        "\n[A2/B2] Input copy: full buffer_size vs logical_size  ({COPY_W}×{COPY_H} RGB)"
-    );
-    println!(
-        "  (a) stride={stride_a} (64B align): saved={pad_pct_a}‰ of {buffer_size_a}B"
-    );
-    println!(
-        "  (b) stride={stride_b} (pow2):      saved={saved_pct_b}% of {buffer_size_b}B"
-    );
+    println!("\n[A2/B2] Input copy: full buffer_size vs logical_size  ({COPY_W}×{COPY_H} RGB)");
+    println!("  (a) stride={stride_a} (64B align): saved={pad_pct_a}‰ of {buffer_size_a}B");
+    println!("  (b) stride={stride_b} (pow2):      saved={saved_pct_b}% of {buffer_size_b}B");
 
     let buf_a: Vec<u8> = (0..buffer_size_a).map(|i| i as u8).collect();
     let buf_b: Vec<u8> = (0..buffer_size_b).map(|i| i as u8).collect();
@@ -170,11 +170,13 @@ fn bench_copy() {
 
     // Sub-case (a): 64B-aligned stride — last row saves only a few bytes
     let run_aa = || -> u64 {
-        let t = Instant::now(); let _c: Vec<u8> = buf_a[..buffer_size_a].to_vec();
+        let t = Instant::now();
+        let _c: Vec<u8> = buf_a[..buffer_size_a].to_vec();
         t.elapsed().as_nanos() as u64
     };
     let run_ab = || -> u64 {
-        let t = Instant::now(); let _c: Vec<u8> = buf_a[..logical_a].to_vec();
+        let t = Instant::now();
+        let _c: Vec<u8> = buf_a[..logical_a].to_vec();
         t.elapsed().as_nanos() as u64
     };
     let (mut ta_a, mut tb_a) = flipflop(COPY_ROUNDS, run_aa, run_ab);
@@ -182,36 +184,48 @@ fn bench_copy() {
     // report in µs (÷1000), unit=1 copy per slot
     for r in 0..COPY_ROUNDS {
         let order = if r % 2 == 0 { "A→B" } else { "B→A" };
-        println!("  (a) r{r:02} [{order}]  A={:>7}µs  B={:>7}µs",
-                 ta_a[r] / 1000, tb_a[r] / 1000);
+        println!(
+            "  (a) r{r:02} [{order}]  A={:>7}µs  B={:>7}µs",
+            ta_a[r] / 1000,
+            tb_a[r] / 1000
+        );
     }
     let med_a = median(&mut ta_a) / 1000;
     let med_b = median(&mut tb_a) / 1000;
     let speedup = med_a as f64 / med_b.max(1) as f64;
-    println!("  (a) median  A={med_a}µs  B={med_b}µs  speedup={speedup:.2}x  [{}]",
-             if parity_a { "PARITY OK" } else { "PARITY FAIL" });
+    println!(
+        "  (a) median  A={med_a}µs  B={med_b}µs  speedup={speedup:.2}x  [{}]",
+        if parity_a { "PARITY OK" } else { "PARITY FAIL" }
+    );
 
     // Sub-case (b): power-of-2 stride (pool/arena allocator)
     let run_ba = || -> u64 {
-        let t = Instant::now(); let _c: Vec<u8> = buf_b[..buffer_size_b].to_vec();
+        let t = Instant::now();
+        let _c: Vec<u8> = buf_b[..buffer_size_b].to_vec();
         t.elapsed().as_nanos() as u64
     };
     let run_bb = || -> u64 {
-        let t = Instant::now(); let _c: Vec<u8> = buf_b[..logical_b].to_vec();
+        let t = Instant::now();
+        let _c: Vec<u8> = buf_b[..logical_b].to_vec();
         t.elapsed().as_nanos() as u64
     };
     let (mut ta_b, mut tb_b) = flipflop(COPY_ROUNDS, run_ba, run_bb);
     let parity_b = buf_b[..logical_b] == buf_b[..logical_b];
     for r in 0..COPY_ROUNDS {
         let order = if r % 2 == 0 { "A→B" } else { "B→A" };
-        println!("  (b) r{r:02} [{order}]  A={:>7}µs  B={:>7}µs",
-                 ta_b[r] / 1000, tb_b[r] / 1000);
+        println!(
+            "  (b) r{r:02} [{order}]  A={:>7}µs  B={:>7}µs",
+            ta_b[r] / 1000,
+            tb_b[r] / 1000
+        );
     }
     let med_a = median(&mut ta_b) / 1000;
     let med_b = median(&mut tb_b) / 1000;
     let speedup = med_a as f64 / med_b.max(1) as f64;
-    println!("  (b) median  A={med_a}µs  B={med_b}µs  speedup={speedup:.2}x  [{}]",
-             if parity_b { "PARITY OK" } else { "PARITY FAIL" });
+    println!(
+        "  (b) median  A={med_a}µs  B={med_b}µs  speedup={speedup:.2}x  [{}]",
+        if parity_b { "PARITY OK" } else { "PARITY FAIL" }
+    );
 }
 
 // ── A3/B3  Box header alloc: heap Vec vs stack [u8; 20] ──────────────────────
@@ -224,16 +238,21 @@ const BOX_ITERS: u64 = 200_000;
 const BOX_ROUNDS: usize = 13;
 
 fn bench_box_header() {
-    println!(
-        "\n[A3/B3] Box header alloc: heap Vec(box_header_size) [old] vs stack [u8;20] [new]"
-    );
+    println!("\n[A3/B3] Box header alloc: heap Vec(box_header_size) [old] vs stack [u8;20] [new]");
     println!("  {BOX_ITERS} allocs/slot, {BOX_ROUNDS} rounds  (ns/alloc reported)");
     println!("  Pattern: even rounds A→B first, odd rounds B→A first");
 
     // Sizes kept opaque so LLVM cannot elide the Vec allocation (it would
     // otherwise see the tiny Vec never escapes and remove the heap call).
     let sizes: Vec<usize> = (0..BOX_ITERS)
-        .map(|i| black_box(match i % 4 { 0 => 8usize, 1 => 12, 2 => 16, _ => 20 }))
+        .map(|i| {
+            black_box(match i % 4 {
+                0 => 8usize,
+                1 => 12,
+                2 => 16,
+                _ => 20,
+            })
+        })
         .collect();
 
     // A: heap Vec allocation (old code: std::vector<uint8_t> box_header(box_header_size))
@@ -280,9 +299,7 @@ const AHDR_ITERS: u64 = 200_000;
 const AHDR_ROUNDS: usize = 13;
 
 fn bench_append_box_header() {
-    println!(
-        "\n[B1/B1x] AppendBoxHeader: double-resize [old] vs stack+single-resize [new]"
-    );
+    println!("\n[B1/B1x] AppendBoxHeader: double-resize [old] vs stack+single-resize [new]");
     println!("  {AHDR_ITERS} appends/slot, {AHDR_ROUNDS} rounds  (ns/append)");
     println!("  Pattern: even rounds A→B first, odd rounds B→A first");
 
@@ -298,9 +315,9 @@ fn bench_append_box_header() {
         for &hdr_sz in &hdr_sizes {
             let mut v: Vec<u8> = Vec::new();
             let n = v.len();
-            v.resize(n + 16, 0u8);               // grow to max
-            black_box(v[n]);                       // force the alloc to stay
-            v.resize(n + hdr_sz, 0u8);            // shrink to actual
+            v.resize(n + 16, 0u8); // grow to max
+            black_box(v[n]); // force the alloc to stay
+            v.resize(n + hdr_sz, 0u8); // shrink to actual
             sink = sink.wrapping_add(v[n]);
         }
         black_box(sink);
@@ -315,7 +332,7 @@ fn bench_append_box_header() {
             let buf = black_box([0u8; 16]);
             let mut v: Vec<u8> = Vec::new();
             let n = v.len();
-            v.resize(n + hdr_sz, 0u8);            // single grow to actual size
+            v.resize(n + hdr_sz, 0u8); // single grow to actual size
             v[n..n + hdr_sz].copy_from_slice(&buf[..hdr_sz]);
             sink = sink.wrapping_add(v[n]);
         }
@@ -324,13 +341,19 @@ fn bench_append_box_header() {
     };
 
     let (mut ta, mut tb) = flipflop(AHDR_ROUNDS, run_a, run_b);
-    print_result("append_box_header (per call)", &mut ta, &mut tb, AHDR_ITERS, true);
+    print_result(
+        "append_box_header (per call)",
+        &mut ta,
+        &mut tb,
+        AHDR_ITERS,
+        true,
+    );
 }
 
 // ── A4/B4  Real encoder: animation batch vs single-frame  ────────────────────
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 mod real_encoder {
-    use raw_pipeline::jxl_casaencoder::{Encoder, EncodeOptions, Frame};
+    use raw_pipeline::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
     use std::time::Instant;
 
     const ANIM_FRAMES: usize = 32;
@@ -343,7 +366,9 @@ mod real_encoder {
         let mut v = Vec::with_capacity(n);
         let mut s = seed;
         for _ in 0..n {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             v.push(((s >> 33) & 0xff) as u8);
         }
         v
@@ -367,7 +392,8 @@ mod real_encoder {
         let pixels: Vec<Vec<u8>> = (0..ANIM_FRAMES)
             .map(|i| mkpix(FRAME_W, FRAME_H, i as u64 * 0x9e3779b97f4a7c15))
             .collect();
-        let frames: Vec<Frame> = pixels.iter()
+        let frames: Vec<Frame> = pixels
+            .iter()
             .map(|p| Frame::rgb(p, FRAME_W, FRAME_H))
             .collect();
 
@@ -396,8 +422,13 @@ mod real_encoder {
         let mut ta = Vec::with_capacity(ROUNDS);
         let mut tb = Vec::with_capacity(ROUNDS);
         for r in 0..ROUNDS {
-            if r % 2 == 0 { ta.push(run_a()); tb.push(run_b()); }
-            else           { tb.push(run_b()); ta.push(run_a()); }
+            if r % 2 == 0 {
+                ta.push(run_a());
+                tb.push(run_b());
+            } else {
+                tb.push(run_b());
+                ta.push(run_a());
+            }
         }
         let ma = median(&mut ta);
         let mb = median(&mut tb);

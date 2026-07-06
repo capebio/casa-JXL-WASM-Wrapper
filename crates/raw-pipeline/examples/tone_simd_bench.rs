@@ -22,7 +22,13 @@ fn synth(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (r, g, b)
 }
 
-fn time_one(simd: bool, base: &(Vec<f32>, Vec<f32>, Vec<f32>), sat: f32, vib: f32, vib_zero: bool) -> f64 {
+fn time_one(
+    simd: bool,
+    base: &(Vec<f32>, Vec<f32>, Vec<f32>),
+    sat: f32,
+    vib: f32,
+    vib_zero: bool,
+) -> f64 {
     let (mut r, mut g, mut b) = (base.0.clone(), base.1.clone(), base.2.clone());
     let t = Instant::now();
     if simd {
@@ -47,13 +53,22 @@ fn run(label: &str, base: &(Vec<f32>, Vec<f32>, Vec<f32>), sat: f32, vib: f32, v
     sc.sort_by(|a, b| a.partial_cmp(b).unwrap());
     si.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let (cmed, imed) = (sc[rounds / 2], si[rounds / 2]);
-    println!("  {:<22} scalar {:7.2} ms  |  simd {:7.2} ms  |  {:.2}x", label, cmed, imed, cmed / imed);
+    println!(
+        "  {:<22} scalar {:7.2} ms  |  simd {:7.2} ms  |  {:.2}x",
+        label,
+        cmed,
+        imed,
+        cmed / imed
+    );
 }
 
 fn main() {
     let n = 20_000_000usize; // ~20 MP
     let base = synth(n);
-    println!("apply_tone_math flip-flop — {} M elems, median of 10 rounds", n / 1_000_000);
+    println!(
+        "apply_tone_math flip-flop — {} M elems, median of 10 rounds",
+        n / 1_000_000
+    );
     run("vib_zero (sat only)", &base, 1.30, 0.0, true);
     run("vibrance active (div)", &base, 1.30, 0.5, false);
 }

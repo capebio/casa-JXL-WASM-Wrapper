@@ -123,7 +123,9 @@ pub fn extract_largest_jpeg(data: &[u8]) -> Option<Vec<u8>> {
 /// pointer: tag 0x0201 = byte offset, 0x0202 = byte length).  Returns None if
 /// IFD1 is absent or the tags are missing.
 pub fn extract_thumbnail_jpeg(data: &[u8]) -> Option<Vec<u8>> {
-    if data.len() < 8 { return None; }
+    if data.len() < 8 {
+        return None;
+    }
     let (le, ifd0_offset) = parse_header(data).ok()?;
     let r = Reader { data, le };
     // Skip past IFD0 entries to reach the next-IFD pointer.
@@ -131,7 +133,9 @@ pub fn extract_thumbnail_jpeg(data: &[u8]) -> Option<Vec<u8>> {
     let count = (r.u16(off).ok()? as usize).min(512);
     let next_ptr_off = off + 2 + count * 12;
     let ifd1_offset = r.u32(next_ptr_off).ok()?;
-    if ifd1_offset == 0 { return None; }
+    if ifd1_offset == 0 {
+        return None;
+    }
     // IFD1 — find JPEGInterchangeFormat (0x0201) and JPEGInterchangeFormatLength (0x0202).
     let ifd1 = read_ifd(&r, ifd1_offset).ok()?;
     let mut jpeg_off: Option<u32> = None;
@@ -145,7 +149,9 @@ pub fn extract_thumbnail_jpeg(data: &[u8]) -> Option<Vec<u8>> {
     }
     let start = jpeg_off? as usize;
     let len = jpeg_len? as usize;
-    if len == 0 { return None; }
+    if len == 0 {
+        return None;
+    }
     // SEC-012: start + len can overflow usize on wasm32 for crafted values.
     let end = start.checked_add(len)?;
     data.get(start..end).map(|b| b.to_vec())
@@ -171,7 +177,11 @@ pub fn extract_smallest_jpeg(data: &[u8], min_bytes: usize) -> Option<Vec<u8>> {
     let mut best: Option<&[u8]> = None;
     for n in 0..sois.len() {
         let start = sois[n];
-        let end = if n + 1 < sois.len() { sois[n + 1] } else { scan_end };
+        let end = if n + 1 < sois.len() {
+            sois[n + 1]
+        } else {
+            scan_end
+        };
         let mut eoi = None;
         let mut j = end.saturating_sub(1);
         while j > start + 1 {
@@ -197,10 +207,14 @@ pub fn extract_smallest_jpeg(data: &[u8], min_bytes: usize) -> Option<Vec<u8>> {
 /// Used by the fast-thumb emit so the frontend can pre-size the grid canvas
 /// to the eventual RAW-thumb dims before the full pipeline runs.
 pub fn parse_orientation_and_dims(data: &[u8]) -> (u16, u32, u32) {
-    let Ok((le, ifd0_offset)) = parse_header(data) else { return (1, 0, 0); };
+    let Ok((le, ifd0_offset)) = parse_header(data) else {
+        return (1, 0, 0);
+    };
     let r = Reader { data, le };
     let off = ifd0_offset as usize;
-    let Ok(count) = r.u16(off) else { return (1, 0, 0); };
+    let Ok(count) = r.u16(off) else {
+        return (1, 0, 0);
+    };
     let count = (count as usize).min(512);
     let mut orientation: u16 = 1;
     let mut width: u32 = 0;
@@ -210,18 +224,38 @@ pub fn parse_orientation_and_dims(data: &[u8]) -> (u16, u32, u32) {
         let dtype = r.u16(e + 2).ok()?;
         let val_off = r.u32(e + 8).ok()?;
         let val = match dtype {
-            3 => if le { val_off & 0xFFFF } else { val_off >> 16 },
+            3 => {
+                if le {
+                    val_off & 0xFFFF
+                } else {
+                    val_off >> 16
+                }
+            }
             _ => val_off,
         };
         Some((dtype, val))
     };
     for i in 0..count {
         let e = off + 2 + i * 12;
-        let Ok(tag) = r.u16(e) else { break; };
+        let Ok(tag) = r.u16(e) else {
+            break;
+        };
         match tag {
-            0x0112 => if let Some((_, v)) = read_val(e) { orientation = v as u16; },
-            0x0100 => if let Some((_, v)) = read_val(e) { width = v; },
-            0x0101 => if let Some((_, v)) = read_val(e) { height = v; },
+            0x0112 => {
+                if let Some((_, v)) = read_val(e) {
+                    orientation = v as u16;
+                }
+            }
+            0x0100 => {
+                if let Some((_, v)) = read_val(e) {
+                    width = v;
+                }
+            }
+            0x0101 => {
+                if let Some((_, v)) = read_val(e) {
+                    height = v;
+                }
+            }
             _ => {}
         }
     }
@@ -231,17 +265,29 @@ pub fn parse_orientation_and_dims(data: &[u8]) -> (u16, u32, u32) {
 /// Reads only IFD0 orientation tag (0x0112). Does not require strip tags to be valid.
 /// Used pre-semaphore for the fast thumbnail path. Returns 1 on any parse error.
 pub fn parse_orientation(data: &[u8]) -> u16 {
-    let Ok((le, ifd0_offset)) = parse_header(data) else { return 1; };
+    let Ok((le, ifd0_offset)) = parse_header(data) else {
+        return 1;
+    };
     let r = Reader { data, le };
     let off = ifd0_offset as usize;
-    let Ok(count) = r.u16(off) else { return 1; };
+    let Ok(count) = r.u16(off) else {
+        return 1;
+    };
     let count = (count as usize).min(512);
     for i in 0..count {
         let e = off + 2 + i * 12;
-        let Ok(tag) = r.u16(e) else { break; };
+        let Ok(tag) = r.u16(e) else {
+            break;
+        };
         if tag == 0x0112 {
-            let Ok(val) = r.u32(e + 8) else { return 1; };
-            return if le { (val & 0xFFFF) as u16 } else { (val >> 16) as u16 };
+            let Ok(val) = r.u32(e + 8) else {
+                return 1;
+            };
+            return if le {
+                (val & 0xFFFF) as u16
+            } else {
+                (val >> 16) as u16
+            };
         }
     }
     1
@@ -253,7 +299,10 @@ pub fn parse(data: &[u8]) -> Result<OrfInfo> {
     }
 
     let (little_endian, ifd0_offset) = parse_header(data)?;
-    let r = Reader { data, le: little_endian };
+    let r = Reader {
+        data,
+        le: little_endian,
+    };
 
     let mut info = OrfInfo {
         width: 0,
@@ -299,7 +348,11 @@ pub fn parse(data: &[u8]) -> Result<OrfInfo> {
             0x0117 => info.strip_byte_count = entry.as_u32(&r)?,
             0x010F => info.make = entry.as_ascii(&r),
             0x0110 => info.model = entry.as_ascii(&r),
-            0x0132 => if info.datetime.is_empty() { info.datetime = entry.as_ascii(&r); },
+            0x0132 => {
+                if info.datetime.is_empty() {
+                    info.datetime = entry.as_ascii(&r);
+                }
+            }
             0x8769 => exif_offset = entry.as_u32(&r)?,
             0x8825 => gps_offset = entry.as_u32(&r)?,
             _ => {}
@@ -337,14 +390,20 @@ pub fn parse(data: &[u8]) -> Result<OrfInfo> {
             for entry in &exif {
                 match entry.tag {
                     0x829A => info.exposure = entry.as_rational(&r),
-                    0x829D => info.fnumber  = entry.as_rational(&r),
-                    0x8827 => info.iso      = entry.as_u32(&r).ok(),
-                    0x9003 => if info.datetime.is_empty() || info.datetime.starts_with("0000") {
-                        info.datetime = entry.as_ascii(&r);
-                    },
-                    0x920A => info.focal_length    = entry.as_rational(&r),
+                    0x829D => info.fnumber = entry.as_rational(&r),
+                    0x8827 => info.iso = entry.as_u32(&r).ok(),
+                    0x9003 => {
+                        if info.datetime.is_empty() || info.datetime.starts_with("0000") {
+                            info.datetime = entry.as_ascii(&r);
+                        }
+                    }
+                    0x920A => info.focal_length = entry.as_rational(&r),
                     0xA405 => info.focal_length_35 = entry.as_u32(&r).ok().map(|v| v as u16),
-                    0xA434 => if info.lens.is_empty() { info.lens = entry.as_ascii(&r); },
+                    0xA434 => {
+                        if info.lens.is_empty() {
+                            info.lens = entry.as_ascii(&r);
+                        }
+                    }
                     0x927C => parse_olympus_makernote(&r, entry, &mut info),
                     _ => {}
                 }
@@ -370,9 +429,19 @@ fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
     let mut alt: Option<(u32, u32)> = None;
     for e in entries {
         match e.tag {
-            0x0001 => { let s = e.as_ascii(r); if let Some(c) = s.bytes().next() { lat_ref = c; } }
+            0x0001 => {
+                let s = e.as_ascii(r);
+                if let Some(c) = s.bytes().next() {
+                    lat_ref = c;
+                }
+            }
             0x0002 => lat_dms = e.as_rational_triplet(r),
-            0x0003 => { let s = e.as_ascii(r); if let Some(c) = s.bytes().next() { lon_ref = c; } }
+            0x0003 => {
+                let s = e.as_ascii(r);
+                if let Some(c) = s.bytes().next() {
+                    lon_ref = c;
+                }
+            }
             0x0004 => lon_dms = e.as_rational_triplet(r),
             0x0005 => alt_ref = e.as_u32(r).unwrap_or(0) as u8,
             0x0006 => alt = e.as_rational(r),
@@ -384,10 +453,18 @@ fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
         let m = dms[1].0 as f64 / dms[1].1.max(1) as f64;
         let s = dms[2].0 as f64 / dms[2].1.max(1) as f64;
         let v = d + m / 60.0 + s / 3600.0;
-        if r == b'S' || r == b'W' { -v } else { v }
+        if r == b'S' || r == b'W' {
+            -v
+        } else {
+            v
+        }
     };
-    if let Some(d) = lat_dms { info.gps_lat = Some(to_deg(d, lat_ref)); }
-    if let Some(d) = lon_dms { info.gps_lon = Some(to_deg(d, lon_ref)); }
+    if let Some(d) = lat_dms {
+        info.gps_lat = Some(to_deg(d, lat_ref));
+    }
+    if let Some(d) = lon_dms {
+        info.gps_lon = Some(to_deg(d, lon_ref));
+    }
     if let Some((n, d)) = alt {
         let v = n as f64 / d.max(1) as f64;
         info.gps_alt = Some(if alt_ref == 1 { -v } else { v });
@@ -481,7 +558,11 @@ impl IfdEntry {
             // PARSERS-006: reject unrecognized dtypes rather than silently treating
             // value_off as a numeric value, which would return nonsense for pointer types
             // (e.g. RATIONAL=5, ASCII=2, UNDEFINED=7) that happen to share a tag.
-            _ => bail!("IFD tag {:#06x}: unsupported dtype {} for as_u32", self.tag, self.dtype),
+            _ => bail!(
+                "IFD tag {:#06x}: unsupported dtype {} for as_u32",
+                self.tag,
+                self.dtype
+            ),
         }
     }
 
@@ -517,7 +598,9 @@ impl IfdEntry {
     /// RATIONAL (dtype=5) or SRATIONAL (dtype=10): 8-byte numerator/denominator
     /// pair stored at the value offset (always a pointer — 8 bytes > 4 inline).
     fn as_rational(&self, r: &Reader) -> Option<(u32, u32)> {
-        if self.dtype != 5 && self.dtype != 10 { return None; }
+        if self.dtype != 5 && self.dtype != 10 {
+            return None;
+        }
         let p = self.value_off as usize;
         let n = r.u32(p).ok()?;
         let d = r.u32(p + 4).ok()?;
@@ -527,7 +610,9 @@ impl IfdEntry {
     /// Three RATIONAL values in a row (24 bytes via pointer). Used for GPS
     /// latitude/longitude (degrees, minutes, seconds).
     fn as_rational_triplet(&self, r: &Reader) -> Option<[(u32, u32); 3]> {
-        if self.dtype != 5 || self.count < 3 { return None; }
+        if self.dtype != 5 || self.count < 3 {
+            return None;
+        }
         let p = self.value_off as usize;
         let n0 = r.u32(p).ok()?;
         let d0 = r.u32(p + 4).ok()?;
@@ -559,7 +644,13 @@ fn read_ifd(r: &Reader, offset: u32) -> Result<Vec<IfdEntry>> {
 #[inline]
 fn ifd_u16(data: &[u8], off: usize, le: bool) -> u16 {
     match data.get(off..off.wrapping_add(2)) {
-        Some(b) => if le { u16::from_le_bytes([b[0], b[1]]) } else { u16::from_be_bytes([b[0], b[1]]) },
+        Some(b) => {
+            if le {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            }
+        }
         None => 0,
     }
 }
@@ -568,7 +659,13 @@ fn ifd_u16(data: &[u8], off: usize, le: bool) -> u16 {
 #[inline]
 fn ifd_u32(data: &[u8], off: usize, le: bool) -> u32 {
     match data.get(off..off.wrapping_add(4)) {
-        Some(b) => if le { u32::from_le_bytes([b[0], b[1], b[2], b[3]]) } else { u32::from_be_bytes([b[0], b[1], b[2], b[3]]) },
+        Some(b) => {
+            if le {
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            }
+        }
         None => 0,
     }
 }
@@ -580,15 +677,22 @@ fn ifd_u32(data: &[u8], off: usize, le: bool) -> u32 {
 /// byte offset of the 4-byte value field for callers that need in-place reads.
 /// Returns the next-IFD offset (0 on OOB or when there is none).
 pub(crate) fn visit_ifd<F: FnMut(u16, u16, u32, u32, usize)>(
-    data: &[u8], off: usize, le: bool, mut visitor: F,
+    data: &[u8],
+    off: usize,
+    le: bool,
+    mut visitor: F,
 ) -> u32 {
-    if off.checked_add(2).map_or(true, |e| e > data.len()) { return 0; }
+    if off.checked_add(2).map_or(true, |e| e > data.len()) {
+        return 0;
+    }
     let count = (ifd_u16(data, off, le) as usize).min(512);
     for i in 0..count {
         let e = off + 2 + i * 12;
-        if e.checked_add(12).map_or(true, |end| end > data.len()) { break; }
+        if e.checked_add(12).map_or(true, |end| end > data.len()) {
+            break;
+        }
         visitor(
-            ifd_u16(data, e,     le),
+            ifd_u16(data, e, le),
             ifd_u16(data, e + 2, le),
             ifd_u32(data, e + 4, le),
             ifd_u32(data, e + 8, le),
@@ -597,13 +701,9 @@ pub(crate) fn visit_ifd<F: FnMut(u16, u16, u32, u32, usize)>(
     }
     // SEC-006 / ERR-010: off + 2 + count * 12 can overflow usize on wasm32 when
     // off is a large file-supplied value.
-    let next_pos = off
-        .checked_add(2)
-        .and_then(|v| v.checked_add(count * 12));
+    let next_pos = off.checked_add(2).and_then(|v| v.checked_add(count * 12));
     match next_pos {
-        Some(p) if p.checked_add(4).map_or(false, |end| end <= data.len()) => {
-            ifd_u32(data, p, le)
-        }
+        Some(p) if p.checked_add(4).map_or(false, |end| end <= data.len()) => ifd_u32(data, p, le),
         _ => 0,
     }
 }
@@ -644,13 +744,19 @@ fn parse_olympus_makernote(r: &Reader, entry: &IfdEntry, info: &mut OrfInfo) {
     // TIFF stores SHORT[1] or SHORT[2] directly in the 4-byte value field when
     // count*2 ≤ 4.  Must NOT treat it as a file pointer.
     let inline_u16 = |v: u32| -> u16 {
-        if sub.le { (v & 0xFFFF) as u16 } else { (v >> 16) as u16 }
+        if sub.le {
+            (v & 0xFFFF) as u16
+        } else {
+            (v >> 16) as u16
+        }
     };
 
     for i in 0..count as usize {
         let e_off = sub_off + 2 + i * 12;
         let Ok(tag) = sub.u16(e_off) else { return };
-        let Ok(dtype) = sub.u16(e_off + 2) else { return };
+        let Ok(dtype) = sub.u16(e_off + 2) else {
+            return;
+        };
         let Ok(cnt) = sub.u32(e_off + 4) else { return };
         let Ok(val) = sub.u32(e_off + 8) else { return };
         match tag {
@@ -718,8 +824,12 @@ fn parse_olympus_makernote(r: &Reader, entry: &IfdEntry, info: &mut OrfInfo) {
                     };
                     // Guard against zero levels — mirrors 0x2040 path; a zero SHORT
                     // would zero the channel multiplier and produce a colour cast.
-                    if a > 0 { info.wb_r = Some(a as f32 / 256.0); }
-                    if b > 0 { info.wb_b = Some(b as f32 / 256.0); }
+                    if a > 0 {
+                        info.wb_r = Some(a as f32 / 256.0);
+                    }
+                    if b > 0 {
+                        info.wb_b = Some(b as f32 / 256.0);
+                    }
                 }
             }
             // ImageProcessing sub-IFD — contains WB_RBLevels (tag 0x0100) on
@@ -738,7 +848,10 @@ fn parse_olympus_makernote(r: &Reader, entry: &IfdEntry, info: &mut OrfInfo) {
                         for col in 0..3 {
                             match sub.u16(p + (row * 3 + col) * 2) {
                                 Ok(v) => m[row][col] = (v as i16) as f32 / 256.0,
-                                Err(_) => { ok = false; break 'outer; }
+                                Err(_) => {
+                                    ok = false;
+                                    break 'outer;
+                                }
                             }
                         }
                     }
@@ -754,11 +867,15 @@ fn parse_olympus_makernote(r: &Reader, entry: &IfdEntry, info: &mut OrfInfo) {
 
 fn parse_equipment_subifd(r: &Reader, off: u32, base_off: usize, info: &mut OrfInfo) -> Result<()> {
     let p = off as usize;
-    if p + 2 > r.data.len() { return Ok(()); }
+    if p + 2 > r.data.len() {
+        return Ok(());
+    }
     let count = r.u16(p)?;
     for i in 0..count as usize {
         let e = p + 2 + i * 12;
-        if e + 12 > r.data.len() { break; }
+        if e + 12 > r.data.len() {
+            break;
+        }
         let tag = r.u16(e)?;
         let dtype = r.u16(e + 2)?;
         let cnt = r.u32(e + 4)?;
@@ -780,27 +897,45 @@ fn parse_equipment_subifd(r: &Reader, off: u32, base_off: usize, info: &mut OrfI
     Ok(())
 }
 
-fn parse_camera_settings_subifd(r: &Reader, off: u32, _base_off: usize, info: &mut OrfInfo) -> Result<()> {
+fn parse_camera_settings_subifd(
+    r: &Reader,
+    off: u32,
+    _base_off: usize,
+    info: &mut OrfInfo,
+) -> Result<()> {
     let p = off as usize;
-    if p + 2 > r.data.len() { return Ok(()); }
+    if p + 2 > r.data.len() {
+        return Ok(());
+    }
     let count = r.u16(p)?;
     for i in 0..count as usize {
         let e = p + 2 + i * 12;
-        if e + 12 > r.data.len() { break; }
+        if e + 12 > r.data.len() {
+            break;
+        }
         let tag = r.u16(e)?;
         let dtype = r.u16(e + 2)?;
         let _cnt = r.u32(e + 4)?;
         let val = r.u32(e + 8)?;
         // 0x0500 WhiteBalance2 — SHORT[1], inline. Low 16 bits on LE.
         if tag == 0x0500 && dtype == 3 {
-            let v = if r.le { (val & 0xFFFF) as u16 } else { (val >> 16) as u16 };
+            let v = if r.le {
+                (val & 0xFFFF) as u16
+            } else {
+                (val >> 16) as u16
+            };
             info.wb_mode = Some(v);
         }
     }
     Ok(())
 }
 
-fn parse_image_processing_subifd(r: &Reader, off: u32, base_off: usize, info: &mut OrfInfo) -> Result<()> {
+fn parse_image_processing_subifd(
+    r: &Reader,
+    off: u32,
+    base_off: usize,
+    info: &mut OrfInfo,
+) -> Result<()> {
     let p = off as usize;
     if p + 2 > r.data.len() {
         return Ok(());
@@ -847,11 +982,16 @@ fn parse_image_processing_subifd(r: &Reader, off: u32, base_off: usize, info: &m
                 for col in 0..3 {
                     match r.u16(ptr + (row * 3 + col) * 2) {
                         Ok(v) => m[row][col] = (v as i16) as f32 / 256.0,
-                        Err(_) => { ok = false; break 'cm; }
+                        Err(_) => {
+                            ok = false;
+                            break 'cm;
+                        }
                     }
                 }
             }
-            if ok { info.color_matrix = Some(m); }
+            if ok {
+                info.color_matrix = Some(m);
+            }
         }
     }
     Ok(())
@@ -943,7 +1083,8 @@ pub fn bench_decode_orf(data: &[u8]) -> Result<DecodeBench> {
     let strip_end = strip_start
         .checked_add(info.strip_byte_count as usize)
         .ok_or_else(|| anyhow!("strip range overflow"))?;
-    let strip = data.get(strip_start..strip_end)
+    let strip = data
+        .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
 
     let t = std::time::Instant::now();
@@ -986,7 +1127,8 @@ pub fn bench_pipeline_orf(data: &[u8]) -> Result<PipelineBench> {
     let strip_end = strip_start
         .checked_add(info.strip_byte_count as usize)
         .ok_or_else(|| anyhow!("strip range overflow"))?;
-    let strip = data.get(strip_start..strip_end)
+    let strip = data
+        .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
 
     let t = std::time::Instant::now();
@@ -1025,7 +1167,8 @@ pub fn bench_tone_split_orf(data: &[u8]) -> Result<(f64, f64)> {
     let strip_end = strip_start
         .checked_add(info.strip_byte_count as usize)
         .ok_or_else(|| anyhow!("strip range overflow"))?;
-    let strip = data.get(strip_start..strip_end)
+    let strip = data
+        .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
     let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
@@ -1039,7 +1182,10 @@ pub fn bench_tone_split_orf(data: &[u8]) -> Result<(f64, f64)> {
 pub fn decode_orf_rgba8(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let info = parse(data)?;
     if info.compression != 1 {
-        bail!("unsupported compression {} (only ljpeg compression=1 supported)", info.compression);
+        bail!(
+            "unsupported compression {} (only ljpeg compression=1 supported)",
+            info.compression
+        );
     }
     let w = info.width as usize;
     let h = info.height as usize;
@@ -1071,7 +1217,8 @@ pub fn bench_tone_e2e_orf(data: &[u8]) -> Result<(f64, f64, u8, usize)> {
     let strip_end = strip_start
         .checked_add(info.strip_byte_count as usize)
         .ok_or_else(|| anyhow!("strip range overflow"))?;
-    let strip = data.get(strip_start..strip_end)
+    let strip = data
+        .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
     let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
@@ -1118,7 +1265,8 @@ pub fn bench_tone_stage_3way_orf(data: &[u8]) -> Result<(f64, f64, f64)> {
     let strip_end = strip_start
         .checked_add(info.strip_byte_count as usize)
         .ok_or_else(|| anyhow!("strip range overflow"))?;
-    let strip = data.get(strip_start..strip_end)
+    let strip = data
+        .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
     let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;

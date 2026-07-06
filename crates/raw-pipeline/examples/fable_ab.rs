@@ -16,8 +16,12 @@ fn main() {
         eprintln!("usage: fable_ab <rgb-file> <w> <h> <frame-index> [reps]");
         std::process::exit(1);
     }
-    let (path, w, h, idx) = (&args[1], args[2].parse::<u32>().unwrap(),
-                             args[3].parse::<u32>().unwrap(), args[4].parse::<usize>().unwrap());
+    let (path, w, h, idx) = (
+        &args[1],
+        args[2].parse::<u32>().unwrap(),
+        args[3].parse::<u32>().unwrap(),
+        args[4].parse::<usize>().unwrap(),
+    );
     let reps = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(30usize);
     let flen = (w * h * 3) as usize;
     let raw = std::fs::read(path).expect("read rgb");
@@ -37,20 +41,32 @@ fn main() {
     let jxl_arms: Vec<(&str, Vec<u8>)> = {
         use raw_pipeline::jxl_casaencoder::{encode_rgb8, EncodeOptions};
         vec![
-            ("jxl-e1", encode_rgb8(&src, w, h, EncodeOptions::lossless().with_effort(1)).unwrap()),
-            ("jxl-e3", encode_rgb8(&src, w, h, EncodeOptions::lossless().with_effort(3)).unwrap()),
+            (
+                "jxl-e1",
+                encode_rgb8(&src, w, h, EncodeOptions::lossless().with_effort(1)).unwrap(),
+            ),
+            (
+                "jxl-e3",
+                encode_rgb8(&src, w, h, EncodeOptions::lossless().with_effort(3)).unwrap(),
+            ),
         ]
     };
     #[cfg(not(feature = "jxl-codec"))]
     let jxl_arms: Vec<(&str, Vec<u8>)> = Vec::new();
 
     let bpp = |n: usize| n as f64 * 8.0 / (w as f64 * h as f64);
-    println!("frame {idx} {w}x{h}: FableBraid {} B ({:.3} bpp, enc {fb_enc_ms:.1} ms)",
-             fb.len(), bpp(fb.len()));
+    println!(
+        "frame {idx} {w}x{h}: FableBraid {} B ({:.3} bpp, enc {fb_enc_ms:.1} ms)",
+        fb.len(),
+        bpp(fb.len())
+    );
     for (name, bytes) in &jxl_arms {
-        println!("  {name}: {} B ({:.3} bpp)  FB bytes = {:+.1}%",
-                 bytes.len(), bpp(bytes.len()),
-                 100.0 * (fb.len() as f64 - bytes.len() as f64) / bytes.len() as f64);
+        println!(
+            "  {name}: {} B ({:.3} bpp)  FB bytes = {:+.1}%",
+            bytes.len(),
+            bpp(bytes.len()),
+            100.0 * (fb.len() as f64 - bytes.len() as f64) / bytes.len() as f64
+        );
     }
 
     // ── interleaved decode timing ──
@@ -78,6 +94,9 @@ fn main() {
     println!("decode x{reps} (interleaved): FableBraid min {fmin:.2} med {fmed:.2} ms");
     for (k, (name, _)) in jxl_arms.iter().enumerate() {
         let (mn, md) = stat(&mut jxl_t[k]);
-        println!("  {name}: min {mn:.2} med {md:.2} ms   → FB speedup {:.2}x (med)", md / fmed);
+        println!(
+            "  {name}: min {mn:.2} med {md:.2} ms   → FB speedup {:.2}x (med)",
+            md / fmed
+        );
     }
 }

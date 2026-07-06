@@ -60,7 +60,17 @@ fn measure(w: usize, h: usize, params: &pipeline::PipelineParams) -> (usize, usi
     PEAK.store(base, Ordering::Relaxed);
     {
         let mut out = Vec::new();
-        stream_export::export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 0.0, 1.0, 3, &mut out).unwrap();
+        stream_export::export_jxl_streaming_from_strip(
+            &strip,
+            w,
+            h,
+            params.clone(),
+            0.0,
+            1.0,
+            3,
+            &mut out,
+        )
+        .unwrap();
         std::hint::black_box(&out);
     }
     let stream = PEAK.load(Ordering::Relaxed) - base;
@@ -75,13 +85,32 @@ fn streaming_export_peak_is_constant_and_below_whole() {
     // the win (it's what makes gigapixel viable), not a fixed ratio.
     let (whole2, stream2) = measure(2048, 4096, &params); // ~2 bands
     let (whole4, stream4) = measure(2048, 8192, &params); // ~4 bands
-    println!("h=4096: whole={} stream={} ratio={:.3}", whole2, stream2, stream2 as f64 / whole2 as f64);
-    println!("h=8192: whole={} stream={} ratio={:.3}", whole4, stream4, stream4 as f64 / whole4 as f64);
+    println!(
+        "h=4096: whole={} stream={} ratio={:.3}",
+        whole2,
+        stream2,
+        stream2 as f64 / whole2 as f64
+    );
+    println!(
+        "h=8192: whole={} stream={} ratio={:.3}",
+        whole4,
+        stream4,
+        stream4 as f64 / whole4 as f64
+    );
 
     // Streaming is below whole at both, and the win widens with height.
     assert!(stream2 < whole2, "stream {stream2} !< whole {whole2} @4096");
-    assert!(stream4 * 2 < whole4, "stream {stream4} !< whole/2 {whole4} @8192 (win should widen)");
+    assert!(
+        stream4 * 2 < whole4,
+        "stream {stream4} !< whole/2 {whole4} @8192 (win should widen)"
+    );
     // Streaming peak is ~constant in height (O(band)), whole roughly doubles.
-    assert!(stream4 < stream2 * 3 / 2, "stream peak grew too much with height: {stream2} -> {stream4}");
-    assert!(whole4 > whole2 * 3 / 2, "whole peak should grow ~linearly with height: {whole2} -> {whole4}");
+    assert!(
+        stream4 < stream2 * 3 / 2,
+        "stream peak grew too much with height: {stream2} -> {stream4}"
+    );
+    assert!(
+        whole4 > whole2 * 3 / 2,
+        "whole peak should grow ~linearly with height: {whole2} -> {whole4}"
+    );
 }

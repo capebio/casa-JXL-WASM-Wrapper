@@ -16,7 +16,9 @@ use crate::stream_band::StreamingBandSource;
 /// ≤2048-row super-tiles top-to-bottom (validated monotonic; see
 /// `examples/jxl_chunked_pull_order.rs`), which is exactly `band()`'s contract.
 impl<S: RawRowSource> ChunkedColorSource for StreamingBandSource<S> {
-    fn num_channels(&self) -> u32 { 3 }
+    fn num_channels(&self) -> u32 {
+        3
+    }
     fn rect(&mut self, xpos: usize, ypos: usize, xsize: usize, ysize: usize) -> (*const u8, usize) {
         self.band(xpos, ypos, xsize, ysize)
     }
@@ -26,8 +28,14 @@ impl<S: RawRowSource> ChunkedColorSource for StreamingBandSource<S> {
 /// `nr_strength > 0` and/or `params.texture`/`params.clarity != 0` engage the look-adjusted
 /// (spatial band-halo) path; all-zero keeps the tone-only path.
 pub fn export_jxl_streaming_from_strip(
-    strip: &[u8], w: usize, h: usize, params: PipelineParams, nr_strength: f32,
-    distance: f32, effort: i64, out: &mut Vec<u8>,
+    strip: &[u8],
+    w: usize,
+    h: usize,
+    params: PipelineParams,
+    nr_strength: f32,
+    distance: f32,
+    effort: i64,
+    out: &mut Vec<u8>,
 ) -> Result<(), String> {
     let src = OrfRowDecoder::new(strip, w, h)?;
     let mut s = StreamingBandSource::new(src, w, h, params, nr_strength, (0, 0));
@@ -38,22 +46,30 @@ pub fn export_jxl_streaming_from_strip(
 /// Container entry stays tone-only (nr_strength = 0); spatial look is driven through the
 /// `_from_strip` core / `StreamingBandSource` directly (params carries texture/clarity).
 pub fn export_orf_jxl_streaming(
-    orf: &[u8], distance: f32, effort: i64, out: &mut Vec<u8>,
+    orf: &[u8],
+    distance: f32,
+    effort: i64,
+    out: &mut Vec<u8>,
 ) -> Result<(usize, usize), String> {
     let mut s = StreamingBandSource::from_orf_bytes(orf, 0.0)?;
     let (w, h) = (s.width(), s.height());
-    encode_chunked(w as u32, h as u32, distance, effort, &mut s, out).map_err(|e| format!("{e:?}"))?;
+    encode_chunked(w as u32, h as u32, distance, effort, &mut s, out)
+        .map_err(|e| format!("{e:?}"))?;
     Ok((w, h))
 }
 
 /// Export a full-res JXL from DNG container bytes (comp=7 tiled or comp=1 uncompressed).
 /// Byte-identical to `decode_bytes → demosaic_bayer_mhc(phase) → tone → encode`.
 pub fn export_dng_jxl_streaming(
-    dng: &[u8], distance: f32, effort: i64, out: &mut Vec<u8>,
+    dng: &[u8],
+    distance: f32,
+    effort: i64,
+    out: &mut Vec<u8>,
 ) -> Result<(usize, usize), String> {
     let mut s = StreamingBandSource::from_dng_bytes(dng, 0.0)?;
     let (w, h) = (s.width(), s.height());
-    encode_chunked(w as u32, h as u32, distance, effort, &mut s, out).map_err(|e| format!("{e:?}"))?;
+    encode_chunked(w as u32, h as u32, distance, effort, &mut s, out)
+        .map_err(|e| format!("{e:?}"))?;
     Ok((w, h))
 }
 
@@ -74,7 +90,17 @@ mod tests {
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
             let whole = encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();
             let mut streamed = Vec::new();
-            export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 0.0, 1.0, 3, &mut streamed).unwrap();
+            export_jxl_streaming_from_strip(
+                &strip,
+                w,
+                h,
+                params.clone(),
+                0.0,
+                1.0,
+                3,
+                &mut streamed,
+            )
+            .unwrap();
             assert_eq!(streamed, whole, "export bytes differ {}x{}", w, h);
         }
     }
@@ -89,11 +115,23 @@ mod tests {
             let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
             let mut rgb8 = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
-            let mut enc = Encoder::with_threads(EncodeOptions::lossless().with_effort(2), 1).unwrap();
+            let mut enc =
+                Encoder::with_threads(EncodeOptions::lossless().with_effort(2), 1).unwrap();
             let mut whole = Vec::new();
-            enc.encode_into(&Frame::rgb(&rgb8, w as u32, h as u32), &mut whole).unwrap();
+            enc.encode_into(&Frame::rgb(&rgb8, w as u32, h as u32), &mut whole)
+                .unwrap();
             let mut streamed = Vec::new();
-            export_jxl_streaming_from_strip(&strip, w, h, params.clone(), 0.0, 0.0, 2, &mut streamed).unwrap();
+            export_jxl_streaming_from_strip(
+                &strip,
+                w,
+                h,
+                params.clone(),
+                0.0,
+                0.0,
+                2,
+                &mut streamed,
+            )
+            .unwrap();
             assert_eq!(streamed, whole, "lossless export bytes differ {}x{}", w, h);
         }
     }
@@ -117,7 +155,17 @@ mod tests {
             let whole = encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();
 
             let mut streamed = Vec::new();
-            export_jxl_streaming_from_strip(&strip, w, h, params.clone(), nr, 1.0, 3, &mut streamed).unwrap();
+            export_jxl_streaming_from_strip(
+                &strip,
+                w,
+                h,
+                params.clone(),
+                nr,
+                1.0,
+                3,
+                &mut streamed,
+            )
+            .unwrap();
             assert_eq!(streamed, whole, "spatial export bytes differ {}x{}", w, h);
         }
     }

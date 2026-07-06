@@ -25,9 +25,16 @@ use std::time::{Duration, Instant};
 mod winmem {
     #[repr(C)]
     struct Pmc {
-        cb: u32, page_fault_count: u32, peak_working_set_size: usize, working_set_size: usize,
-        quota_peak_paged: usize, quota_paged: usize, quota_peak_nonpaged: usize, quota_nonpaged: usize,
-        pagefile: usize, peak_pagefile: usize,
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged: usize,
+        quota_paged: usize,
+        quota_peak_nonpaged: usize,
+        quota_nonpaged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
     }
     extern "system" {
         fn GetCurrentProcess() -> isize;
@@ -37,12 +44,20 @@ mod winmem {
         unsafe {
             let mut c: Pmc = core::mem::zeroed();
             c.cb = core::mem::size_of::<Pmc>() as u32;
-            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 { c.working_set_size as u64 } else { 0 }
+            if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) != 0 {
+                c.working_set_size as u64
+            } else {
+                0
+            }
         }
     }
 }
 #[cfg(not(windows))]
-mod winmem { pub fn working_set() -> u64 { 0 } }
+mod winmem {
+    pub fn working_set() -> u64 {
+        0
+    }
+}
 
 fn run(n_workers: usize, reps: usize, data: Arc<Vec<u8>>) -> f64 {
     let next = Arc::new(AtomicUsize::new(0));
@@ -52,28 +67,50 @@ fn run(n_workers: usize, reps: usize, data: Arc<Vec<u8>>) -> f64 {
         let (next, data) = (Arc::clone(&next), Arc::clone(&data));
         handles.push(std::thread::spawn(move || loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= reps { break; }
+            if i >= reps {
+                break;
+            }
             // decode_full allocates the full output buffer, decodes, discards. Panics
             // are surfaced by unwrap so a bad fixture fails loudly.
             let _ = std::hint::black_box(decode_full(&data).expect("jxl decode"));
         }));
     }
-    for h in handles { let _ = h.join(); }
+    for h in handles {
+        let _ = h.join();
+    }
     reps as f64 / wall.elapsed().as_secs_f64()
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let reps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(48).max(1);
+    let reps: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48)
+        .max(1);
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     let modes: [(&str, String); 3] = [
-        ("full   ", format!("{root}/docs/Benchmark results/P2200619-prog-p6-q85.jxl")),
-        ("L2_2048", format!("{root}/timings/fastest/pyramid-L2-2048.jxl")),
-        ("L0_256 ", format!("{root}/timings/fastest/pyramid-L0-256.jxl")),
+        (
+            "full   ",
+            format!("{root}/docs/Benchmark results/P2200619-prog-p6-q85.jxl"),
+        ),
+        (
+            "L2_2048",
+            format!("{root}/timings/fastest/pyramid-L2-2048.jxl"),
+        ),
+        (
+            "L0_256 ",
+            format!("{root}/timings/fastest/pyramid-L0-256.jxl"),
+        ),
     ];
-    let cores = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(8);
+    let cores = std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(8);
     let ns: Vec<usize> = [1usize, 2, 4, cores, cores * 2]
-        .into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
 
     // Background WS sampler.
     let ws_max = Arc::new(AtomicU64::new(0));
@@ -89,12 +126,20 @@ fn main() {
     };
 
     println!("=== JXL decode concurrency: {reps} decodes/run, {cores} cores ===");
-    println!("(cheap JXL preview = decode a small pyramid level; libjxl has no reduced-res output)\n");
-    println!("{:<8} {:>4}  {:>10}  {:>10}", "size", "N", "dec/s", "peakRSS_MB");
+    println!(
+        "(cheap JXL preview = decode a small pyramid level; libjxl has no reduced-res output)\n"
+    );
+    println!(
+        "{:<8} {:>4}  {:>10}  {:>10}",
+        "size", "N", "dec/s", "peakRSS_MB"
+    );
     for (label, path) in &modes {
         let data = match std::fs::read(path) {
             Ok(d) => Arc::new(d),
-            Err(e) => { println!("{label}  skip: {e}"); continue; }
+            Err(e) => {
+                println!("{label}  skip: {e}");
+                continue;
+            }
         };
         for &n in &ns {
             ws_max.store(winmem::working_set(), Ordering::Relaxed);

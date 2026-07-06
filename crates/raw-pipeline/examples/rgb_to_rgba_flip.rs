@@ -11,7 +11,11 @@
 use std::time::Instant;
 
 fn simd_blocks(src_len: usize, n: usize) -> usize {
-    if src_len < 16 { 0 } else { ((src_len - 16) / 12 + 1).min(n / 4) }
+    if src_len < 16 {
+        0
+    } else {
+        ((src_len - 16) / 12 + 1).min(n / 4)
+    }
 }
 
 fn scalar(rgb: &[u8]) -> Vec<u8> {
@@ -19,8 +23,11 @@ fn scalar(rgb: &[u8]) -> Vec<u8> {
     let mut out = vec![255u8; n * 4];
     let (mut si, mut di) = (0usize, 0usize);
     for _ in 0..n {
-        out[di] = rgb[si]; out[di + 1] = rgb[si + 1]; out[di + 2] = rgb[si + 2];
-        si += 3; di += 4;
+        out[di] = rgb[si];
+        out[di + 1] = rgb[si + 1];
+        out[di + 2] = rgb[si + 2];
+        si += 3;
+        di += 4;
     }
     out
 }
@@ -29,14 +36,21 @@ fn scalar(rgb: &[u8]) -> Vec<u8> {
 fn simd(rgb: &[u8]) -> Vec<u8> {
     let n = rgb.len() / 3;
     let mut out = vec![255u8; n * 4];
-    let blocks = if std::is_x86_feature_detected!("ssse3") { simd_blocks(rgb.len(), n) } else { 0 };
+    let blocks = if std::is_x86_feature_detected!("ssse3") {
+        simd_blocks(rgb.len(), n)
+    } else {
+        0
+    };
     if blocks > 0 {
         unsafe { ssse3(rgb, &mut out, blocks) };
     }
     let (mut si, mut di) = (blocks * 4 * 3, blocks * 4 * 4);
     for _ in (blocks * 4)..n {
-        out[di] = rgb[si]; out[di + 1] = rgb[si + 1]; out[di + 2] = rgb[si + 2];
-        si += 3; di += 4;
+        out[di] = rgb[si];
+        out[di + 1] = rgb[si + 1];
+        out[di + 2] = rgb[si + 2];
+        si += 3;
+        di += 4;
     }
     out
 }
@@ -55,7 +69,9 @@ unsafe fn ssse3(rgb: &[u8], out: &mut [u8], blocks: usize) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn simd(rgb: &[u8]) -> Vec<u8> { scalar(rgb) }
+fn simd(rgb: &[u8]) -> Vec<u8> {
+    scalar(rgb)
+}
 
 fn med(v: &[f64]) -> f64 {
     let mut w: Vec<f64> = v[1..].to_vec();
@@ -66,10 +82,12 @@ fn med(v: &[f64]) -> f64 {
 fn main() {
     let (w, h) = (6000usize, 4000usize); // 24 MP
     let mut s: u32 = 0x9e37_79b9;
-    let rgb: Vec<u8> = (0..w * h * 3).map(|_| {
-        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (s >> 24) as u8
-    }).collect();
+    let rgb: Vec<u8> = (0..w * h * 3)
+        .map(|_| {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (s >> 24) as u8
+        })
+        .collect();
 
     // parity across tricky lengths too
     for &px in &[0usize, 1, 3, 4, 5, 7, 16, 17, 1001] {
@@ -89,12 +107,20 @@ fn main() {
         t.elapsed().as_secs_f64() * 1e3
     };
     for r in 0..rounds {
-        if r % 2 == 0 { ta.push(time(&run_a, &mut sink)); tb.push(time(&run_b, &mut sink)); }
-        else { tb.push(time(&run_b, &mut sink)); ta.push(time(&run_a, &mut sink)); }
+        if r % 2 == 0 {
+            ta.push(time(&run_a, &mut sink));
+            tb.push(time(&run_b, &mut sink));
+        } else {
+            tb.push(time(&run_b, &mut sink));
+            ta.push(time(&run_a, &mut sink));
+        }
     }
     std::hint::black_box(sink);
     let (ma, mb) = (med(&ta), med(&tb));
     println!("rgb_to_rgba flip  {w}x{h} (24 MP)  parity: EXACT (incl tail)");
-    println!("  scalar={ma:.3}ms  pshufb={mb:.3}ms  saved={:.1}% ({:.1}ms)",
-        (ma - mb) / ma * 100.0, ma - mb);
+    println!(
+        "  scalar={ma:.3}ms  pshufb={mb:.3}ms  saved={:.1}% ({:.1}ms)",
+        (ma - mb) / ma * 100.0,
+        ma - mb
+    );
 }

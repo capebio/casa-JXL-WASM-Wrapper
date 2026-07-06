@@ -11,8 +11,17 @@ fn main() {
         Ok(img) => {
             let img: Image<u8> = img;
             let mut sum: u64 = 0;
-            for &b in img.data.iter().take(4096) { sum += b as u64; }
-            println!("NATIVE DECODE OK: {}x{} ch={} bytes={} checksum4k={}", img.width, img.height, img.channels, img.data.len(), sum);
+            for &b in img.data.iter().take(4096) {
+                sum += b as u64;
+            }
+            println!(
+                "NATIVE DECODE OK: {}x{} ch={} bytes={} checksum4k={}",
+                img.width,
+                img.height,
+                img.channels,
+                img.data.len(),
+                sum
+            );
         }
         Err(e) => println!("NATIVE DECODE FAILED: {:?}", e),
     }

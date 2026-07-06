@@ -24,6 +24,44 @@ export function defaultThreshForDistance(distance) {
   return Math.max(0, Math.min(16, t));
 }
 
+const _clamp01to100 = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 50;
+  return Math.max(0, Math.min(100, n));
+};
+
+/**
+ * Map a single 0..100 "encode speed" slider to the underlying quality/time
+ * knobs. 0 = best quality (slow); 100 = fastest (lowest quality). The slider
+ * spans the *existing* preset range — Quality (d0.5, effort 4) ↔ Realtime
+ * (d2.0, effort 1) — so its midpoint sits near Balanced and it never drops
+ * below the established Realtime floor. Effort 4→1 and distance 0.5→2.0 are
+ * both monotone in wall-clock over this band (the wider 0.5→3.0 / effort-7
+ * range was measured non-monotone: libjxl effort 7 can beat effort 6 at low
+ * distance). Resolution is a separate control (`dim` downscale) — libjxl
+ * RESAMPLING=2 is a size-not-speed lever (upsample-aware encode ~5x slower,
+ * measured) and true chroma subsampling is not a public libjxl knob.
+ */
+export function speedToSettings(speed) {
+  const s = _clamp01to100(speed);
+  const effort = Math.round(4 - (s / 100) * 3); // 4 (quality) → 1 (fast)
+  const distance = Number((0.5 + (s / 100) * 1.5).toFixed(2)); // 0.5 → 2.0
+  return { effort, distance, thresh: defaultThreshForDistance(distance) };
+}
+
+/**
+ * Fast **full-dimensioned** proxy for scrubbing / live editing in a video editor.
+ * `proxyFactor` 2 = each frame stores half-resolution but the codestream declares
+ * the full size, so it self-upsamples on decode — the proxy is dimension-identical
+ * to the final (overlays 1:1, no UI reflow when you swap proxy↔final) yet ~2×
+ * faster to encode (~4× at factor 4) and all-intra (instant random-access scrub).
+ * Maps to the native `encode_casv_proxy_rgb8` path via rate `proxy<N>`.
+ */
+export const PROXY_PRESET = {
+  label: 'Preview proxy', distance: 1.5, effort: 1, proxyFactor: 2,
+  hint: 'Fast full-size proxy (half-res inside, upsamples on decode) for scrubbing / live editing. Re-encode at full quality for the final file.',
+};
+
 /** Short badge for a frame's container entry (from casv-web CasvFrameEntry). */
 export function frameKindLabel(entry) {
   if (!entry || !entry.isPFrame) return 'I';
@@ -137,8 +175,16 @@ export function buildEncodeRequest(form) {
     e.code = 'BAD_INPUT';
     throw e;
   }
-  const rate = form.rate === 'lossless' ? 'lossless' : 'lossy';
-  const skip = ['none', 'bbox', 'tile'].includes(form.skip) ? form.skip : 'none';
+  // Full-dimensioned proxy mode (proxyFactor 2/4): all-intra, each frame stored at
+  // 1/N res but declaring full dims. rate becomes `proxy<N>` for the native path.
+  const proxyFactor = Math.round(CLAMP(form.proxyFactor, 0, 8, 0));
+  const isProxy = proxyFactor >= 2;
+  const rate = isProxy
+    ? `proxy${proxyFactor}`
+    : (form.rate === 'lossless' ? 'lossless' : 'lossy');
+  // Proxy is all-intra and downsamples internally, so it never uses skip and needs
+  // ffmpeg to deliver full-resolution frames (dim = exact).
+  const skip = isProxy ? 'none' : (['none', 'bbox', 'tile'].includes(form.skip) ? form.skip : 'none');
   const distance = rate === 'lossless' ? 0 : CLAMP(form.distance, 0.1, 15, 1.0);
   const effort = Math.round(CLAMP(form.effort, 1, 10, rate === 'lossless' ? 7 : 3));
   const gop = Math.round(CLAMP(form.gop, 1, 600, 24));
@@ -149,15 +195,17 @@ export function buildEncodeRequest(form) {
   const thresh = form.thresh == null || form.thresh === ''
     ? defaultThreshForDistance(distance)
     : Math.round(CLAMP(form.thresh, 0, 255, 0));
-  const dim = sourceKind === 'video'
-    ? (['exact', '2160', '1440', '1080', '720', '512'].includes(String(form.dim)) ? String(form.dim) : 'exact')
-    : null;
+  const dim = sourceKind !== 'video'
+    ? null
+    : isProxy
+      ? 'exact'
+      : (['exact', '2160', '1440', '1080', '720', '512'].includes(String(form.dim)) ? String(form.dim) : 'exact');
 
   return {
     sourceKind,
     inputPaths: paths,
     rate, distance, effort, gop, skip, tile, thresh,
-    fpsNum, fpsDen, dim,
+    fpsNum, fpsDen, dim, proxyFactor,
     outputPath: form.outputPath || null,
     // Default filename for the native save dialog: keep the source name and add
     // `.casv` (e.g. clip.mp4 → clip.mp4.casv). Native encode_casv_video should
