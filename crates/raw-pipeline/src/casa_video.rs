@@ -810,6 +810,12 @@ struct StreamCtx {
     crop: Vec<u8>,
     /// Confidence-scheduled tile admission (None = classic behavior).
     admission: Option<TileAdmission>,
+    /// K5: lossless tier. I-frames encode at distance 0 (modular lossless);
+    /// P-frames are additive 16-bit residuals vs the previous SOURCE frame (NOT
+    /// REPLACE) — drift-free because a lossless decode reproduces the source exactly.
+    lossless: bool,
+    /// Reused u16 residual scratch for the lossless P-frame path (whole-frame).
+    resid16: Vec<u16>,
 }
 
 /// Confidence-scheduled tile admission state for the streaming Tile tier:
@@ -830,14 +836,28 @@ struct TileAdmission {
 }
 
 fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<StreamCtx, VideoError> {
-    let distance = match opts.rate {
-        VideoRate::Lossy(d) => d,
-        VideoRate::Lossless => return Err(VideoError::Unsupported),
+    // K5: the lossless tier now streams (whole-frame additive residual P-frames).
+    // Lossy keeps rejecting SkipMode::None (lossy whole-frame residual through VarDCT
+    // is broken — see the LOSSY inter-frame findings). Lossless requires None in this
+    // streaming path (residual bbox/tile streaming is a follow-up); lossless I-frames
+    // encode at distance 0.
+    let (distance, lossless) = match opts.rate {
+        VideoRate::Lossy(d) => (d, false),
+        VideoRate::Lossless => (0.0, true),
     };
-    if matches!(opts.skip, SkipMode::None) {
+    if !lossless && matches!(opts.skip, SkipMode::None) {
+        return Err(VideoError::Unsupported);
+    }
+    if lossless && !matches!(opts.skip, SkipMode::None) {
+        // Only whole-frame residual is wired for streaming lossless so far.
         return Err(VideoError::Unsupported);
     }
     let enc_threads = resolve_enc_threads();
+    let enc = if lossless {
+        Encoder::new(EncodeOptions::lossless().with_effort(opts.effort))?
+    } else {
+        Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?
+    };
     Ok(StreamCtx {
         width,
         height,
@@ -850,7 +870,7 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
             .unwrap_or_else(|| default_thresh_for_distance(distance)),
         // P-frame atlas encoder stays single-threaded on purpose (see
         // `resolve_enc_threads`): tiny sub-group atlases lose to fork-join sync.
-        enc: Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?,
+        enc,
         enc_threads,
         changed: Vec::new(),
         bitmap: Vec::new(),
@@ -864,6 +884,8 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
                 est_tile_bytes: None,
                 allowed: f64::INFINITY,
             }),
+        lossless,
+        resid16: Vec::new(),
     })
 }
 
@@ -873,7 +895,9 @@ impl StreamCtx {
     /// malloc + struct init) and re-derives the auto change threshold so
     /// detection stays matched to the quantization error.
     fn set_distance(&mut self, d: f32, opts: &CasaVideoOptions) -> Result<(), VideoError> {
-        if d == self.distance {
+        // Lossless has no distance to steer — the rate controller never runs for it,
+        // but guard anyway so a future caller can't silently un-lossless the encoder.
+        if self.lossless || d == self.distance {
             return Ok(());
         }
         self.distance = d;
@@ -982,6 +1006,14 @@ fn encode_stream_frame(
 ) -> Result<u32, VideoError> {
     let (width, height) = (ctx.width, ctx.height);
     if is_iframe {
+        if ctx.lossless {
+            // Bit-exact lossless I-frame via the held Rate::Lossless encoder — matches
+            // the batch tier (encode_rgb8 with lossless opts). Lossless has no tile
+            // admission, so no ref-frame bookkeeping.
+            ctx.enc
+                .encode_into(&Frame::rgb(px, width, height), payload)?;
+            return Ok(0);
+        }
         let mut isrc = WholeImageSource {
             data: px,
             width: width as usize,
@@ -1001,6 +1033,24 @@ fn encode_stream_frame(
             adm.ref_frame.extend_from_slice(px);
         }
         return Ok(0);
+    }
+    if ctx.lossless {
+        // K5 lossless P-frame: whole-frame additive 16-bit residual vs the previous
+        // SOURCE frame (byte-identical to the batch `encode_residual16` payload —
+        // `encode_casv_delta_rgb8`). No REPLACE flag: the decoder ADDS the residual
+        // (`apply_pframe` whole-frame path). Drift-free because a lossless decode
+        // reproduces the source exactly, so encoder-side source == decoder-side prev.
+        let n = px.len();
+        ctx.resid16.clear();
+        ctx.resid16.reserve(n);
+        ctx.resid16.extend(
+            px.iter()
+                .zip(prev_src)
+                .map(|(&c, &p)| ((c as i32 - p as i32) + 32768) as u16),
+        );
+        ctx.enc
+            .encode_into(&Frame::rgb(ctx.resid16.as_slice(), width, height), payload)?;
+        return Ok(CASV_PFRAME_FLAG);
     }
     if matches!(ctx.skip, SkipMode::Tile) {
         let t = ctx.tile.max(1);
@@ -3045,6 +3095,81 @@ mod tests {
             }
         }
         v
+    }
+
+    fn lossless_none_opts(gop: u32) -> CasaVideoOptions {
+        CasaVideoOptions {
+            rate: VideoRate::Lossless,
+            gop_len: gop,
+            skip: SkipMode::None,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_none_decodes_to_source_byte_exact() {
+        // K5 decode-equality contract: streaming lossless (whole-frame residual)
+        // reconstructs every SOURCE frame byte-exact. Motion across frames (varying
+        // seed) exercises the residual P-frames, and gop=3 exercises I/P mix.
+        let (w, h) = (64u32, 48u32);
+        let frames: Vec<Vec<u8>> = (0..5).map(|k| gradient(w, h, (k * 37) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let bytes = encode_casv_video_streaming(&mut src, &lossless_none_opts(3))
+            .expect("streaming lossless encode");
+        let decoded = decode_casv_all_rgb8(&bytes).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, dw, dh)) in decoded.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} dims");
+            assert_eq!(px, &frames[i], "frame {i} not byte-exact (lossless decode-equality)");
+        }
+    }
+
+    #[test]
+    fn streaming_lossless_footer_decodes_to_source_byte_exact() {
+        // Same contract through the FOOTER format (the one that carries CSAU audio).
+        let (w, h) = (48u32, 32u32);
+        let frames: Vec<Vec<u8>> = (0..4).map(|k| gradient(w, h, (k * 53 + 1) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 30,
+            fps_den: 1,
+        };
+        let mut sink: Vec<u8> = Vec::new();
+        encode_casv_video_streaming_to(&mut src, &lossless_none_opts(2), &mut sink)
+            .expect("streaming lossless footer encode");
+        let decoded = decode_casv_footer_all_rgb8(&sink).expect("footer decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "footer frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn streaming_lossy_still_rejects_skip_none() {
+        // Lossy whole-frame residual through VarDCT is broken — must stay rejected.
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 2,
+            skip: SkipMode::None,
+            tile: 32,
+            effort: 3,
+            thresh: None,
+            rate_control: None,
+        };
+        assert!(matches!(stream_ctx(32, 32, &opts), Err(VideoError::Unsupported)));
     }
 
     #[test]

@@ -449,20 +449,22 @@ fn run_video_mode(args: &[String]) -> ! {
         rate_control,
     };
 
-    // The streaming encoder is lossy-REPLACE only (`stream_ctx` rejects Lossless
-    // and skip=None — additive residual through VarDCT is invalid). Route those
-    // modes through the batch dispatcher (all-intra / additive residual / bbox /
-    // tile), which needs all frames resident and writes header format (no CSAU
-    // footer → no audio yet).
-    let streaming_capable =
-        matches!(rate, VideoRate::Lossy(_)) && !matches!(skip, SkipMode::None);
+    // The streaming encoder handles lossy-REPLACE (bbox/tile) AND — since K5 —
+    // lossless whole-frame residual (skip=none). Both stream ~2 frames + the footer
+    // format, so both carry CSAU audio. Everything else (lossless bbox/tile, all-intra
+    // proxy) still routes through the batch dispatcher (all frames resident, header
+    // format, no audio yet). Lossy skip=none stays invalid (VarDCT residual is broken).
+    let streaming_capable = (matches!(rate, VideoRate::Lossy(_))
+        && !matches!(skip, SkipMode::None))
+        || (matches!(rate, VideoRate::Lossless) && matches!(skip, SkipMode::None));
     if !streaming_capable {
         let frames = drain_all(&mut src, probed);
         let n = frames.len();
         if ogg_bytes.is_some() {
             eprintln!(
-                "casv_encode: lossless / skip=none video does not carry audio yet \
-                 (CSAU lives in the streaming footer format) — encoding silent"
+                "casv_encode: this tier (lossless bbox/tile, or lossy skip=none) does not \
+                 carry audio yet (CSAU lives in the streaming footer format; lossless skip=none \
+                 now streams WITH audio) — encoding silent"
             );
         }
         progress("encode", 0, n);
