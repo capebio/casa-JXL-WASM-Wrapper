@@ -17,7 +17,8 @@
 //! Video mode:
 //!   casv_encode --video <in> <out> <fps_num> <fps_den> <rate> <distance> \
 //!               <effort> <gop> <skip> <tile> <thresh|auto> <dim> [bps]
-//!   rate  = lossy | lossless | auto (auto = lossy with given distance)
+//!   rate  = lossy | lossless | fable | auto (auto = lossy with given distance;
+//!           fable = braided-rANS lossless tier, footer format + audio, native-only)
 //!   dim   = <max_px> | exact  (scale longest edge to max_px; exact = no scale)
 //!   bps   = optional target bytes/sec (lossy only): JOLT rate control plus
 //!           confidence-scheduled tile admission. 0 or absent = quality-targeted
@@ -26,9 +27,9 @@
 //! Prints `OK <bytes> <out>` on success; exits non-zero with a message on error.
 
 use raw_pipeline::casa_video::{
-    default_thresh_for_distance, encode_casv_proxy_rgb8, encode_casv_video,
-    encode_casv_video_streaming_with_audio_progress, CasaVideoOptions, RateControl, SkipMode,
-    VideoFrameSource, VideoRate,
+    default_thresh_for_distance, encode_casv_fable_streaming_with_audio, encode_casv_proxy_rgb8,
+    encode_casv_video, encode_casv_video_streaming_with_audio_progress, CasaVideoOptions,
+    RateControl, SkipMode, VideoFrameSource, VideoRate,
 };
 use raw_pipeline::jxl_casaencoder::EncodeOptions;
 
@@ -426,6 +427,23 @@ fn run_video_mode(args: &[String]) -> ! {
         progress("encode", n, n);
         std::fs::write(out_casv, &bytes)
             .unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
+        println!("OK {} {}", bytes.len(), out_casv);
+        std::process::exit(0);
+    }
+
+    // FableBraid tier (braided-rANS lossless): footer format + CSAU audio, streams
+    // ~2 frames resident. Native playback works today; casv-web fable decode is
+    // pending a wasm pkg rebuild. Uses only the parsed gop (no distance/skip/tile).
+    if args[5] == "fable" {
+        progress("encode", 0, probed);
+        let bytes = encode_casv_fable_streaming_with_audio(
+            &mut src,
+            gop.max(1),
+            ogg_bytes.as_deref(),
+            &mut |done| progress("encode", done, probed),
+        )
+        .unwrap_or_else(|e| fail(format!("fable encode failed: {e:?}")));
+        std::fs::write(out_casv, &bytes).unwrap_or_else(|e| fail(format!("write {out_casv}: {e}")));
         println!("OK {} {}", bytes.len(), out_casv);
         std::process::exit(0);
     }

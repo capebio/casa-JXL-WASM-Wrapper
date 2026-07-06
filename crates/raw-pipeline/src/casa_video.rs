@@ -1433,6 +1433,97 @@ pub fn encode_casv_fable_streaming(
     }))
 }
 
+/// K5: streaming **FableBraid** encode in the **footer format**, straight to a sink
+/// (constant peak; the header-format [`encode_casv_fable_streaming`] buffers all
+/// payloads). The fable signal rides the optional CASR box (bit 1) since the 32-byte
+/// footer has no flags field — legacy readers skip the box, and the footer decoders
+/// ([`decode_casv_footer_all_rgb8`] / `_for_each`) read it to route frames through a
+/// `DeltaDecodeSession`. This is the tier that carries CSAU audio for fable (splice
+/// with [`encode_casv_fable_streaming_with_audio`]).
+pub fn encode_casv_fable_streaming_to_progress<W: std::io::Write>(
+    src: &mut dyn VideoFrameSource,
+    gop_len: u32,
+    sink: &mut W,
+    on_frame: &mut dyn FnMut(usize),
+) -> Result<(), VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let gop = gop_len.max(1) as usize;
+    let expected = (width as usize) * (height as usize) * 3;
+
+    let mut index: Vec<(u32, u32)> = Vec::new(); // (rel_offset, len | flags)
+    let mut cur: Vec<u8> = Vec::new();
+    let mut prev_src: Vec<u8> = Vec::new();
+    let mut idx = 0usize;
+    let mut offset: u64 = 0;
+
+    loop {
+        std::mem::swap(&mut cur, &mut prev_src);
+        if !src.next_frame_into(&mut cur) {
+            break;
+        }
+        if cur.len() != expected {
+            return Err(VideoError::FrameSize {
+                idx,
+                expected,
+                got: cur.len(),
+            });
+        }
+        let (flags, payload) = if idx % gop == 0 {
+            (0u32, crate::fable_braid::encode_rgb8(&cur, width, height))
+        } else {
+            (
+                CASV_PFRAME_FLAG,
+                crate::fable_braid::encode_rgb8_delta(&cur, &prev_src, width, height),
+            )
+        };
+        sink.write_all(&payload).map_err(|_| VideoError::Io)?;
+        index.push((offset as u32, (payload.len() as u32) | flags));
+        offset += payload.len() as u64;
+        idx += 1;
+        on_frame(idx);
+    }
+    if index.is_empty() {
+        return Err(VideoError::Empty);
+    }
+
+    let index_offset = offset;
+    for (off, lenf) in &index {
+        sink.write_all(&off.to_le_bytes()).map_err(|_| VideoError::Io)?;
+        sink.write_all(&lenf.to_le_bytes()).map_err(|_| VideoError::Io)?;
+    }
+    // CASR box carrying ONLY the fable flag (no lossy bit) so footer decoders route
+    // to the fable session. Same box slot the JOLT rate encoder uses.
+    sink.write_all(&CASV_RATE_BOX_MAGIC.to_le_bytes())
+        .map_err(|_| VideoError::Io)?;
+    sink.write_all(&CASV_HDR_FABLE_FLAG.to_le_bytes())
+        .map_err(|_| VideoError::Io)?;
+    let footer = build_casv_footer(&CasvFooter {
+        index_offset,
+        width,
+        height,
+        frame_count: index.len() as u32,
+        fps_num,
+        fps_den,
+    });
+    sink.write_all(&footer).map_err(|_| VideoError::Io)?;
+    Ok(())
+}
+
+/// Buffered footer-format fable encode with optional CSAU audio spliced in — the
+/// fable analogue of [`encode_casv_video_streaming_with_audio_progress`].
+pub fn encode_casv_fable_streaming_with_audio(
+    src: &mut dyn VideoFrameSource,
+    gop_len: u32,
+    ogg_opus: Option<&[u8]>,
+    on_frame: &mut dyn FnMut(usize),
+) -> Result<Vec<u8>, VideoError> {
+    let mut buf = Vec::new();
+    encode_casv_fable_streaming_to_progress(src, gop_len, &mut buf, on_frame)?;
+    splice_csau_before_footer(&mut buf, ogg_opus);
+    Ok(buf)
+}
+
 /// **Streaming to a sink** (footer-indexed): identical encode to
 /// [`encode_casv_video_streaming`] but writes each frame's codestream straight to
 /// `sink` as produced, buffering only the tiny index (8 bytes/frame), then appends
@@ -2608,6 +2699,9 @@ struct CasvView<'a> {
     min_offset: usize,
     /// Frame slices must end at or before this (footer layout: the index start).
     max_end: usize,
+    /// FableBraid tier (header flag for header layout; CASR-box flag for footer
+    /// layout). When true, frames decode through a `DeltaDecodeSession`, not libjxl.
+    fable: bool,
 }
 
 impl<'a> CasvView<'a> {
@@ -2621,6 +2715,7 @@ impl<'a> CasvView<'a> {
             index_pos: CASV_HEADER_BYTES,
             min_offset: CASV_HEADER_BYTES,
             max_end: data.len(),
+            fable: hdr.flags & CASV_HDR_FABLE_FLAG != 0,
         })
     }
 
@@ -2638,6 +2733,10 @@ impl<'a> CasvView<'a> {
             let off = u32::from_le_bytes(data[e..e + 4].try_into().ok()?);
             off.checked_add(delta)?;
         }
+        // Footer layout has no header flags word; the fable signal rides the
+        // optional CASR box (bit 1, disjoint from the lossy bit 0). Legacy readers
+        // skip the box, so this stays backward-compatible.
+        let fable = parse_casv_rate_box(data).is_some_and(|fl| fl & CASV_HDR_FABLE_FLAG != 0);
         Some(CasvView {
             data,
             width: f.width,
@@ -2646,6 +2745,7 @@ impl<'a> CasvView<'a> {
             index_pos: idx_start,
             min_offset: 0,
             max_end: idx_start,
+            fable,
         })
     }
 
@@ -3075,9 +3175,41 @@ pub fn decode_casv_all_rgb8(data: &[u8]) -> Option<Vec<(Vec<u8>, u32, u32)>> {
 
 /// GOP-parallel batch decode over either container layout (see
 /// [`decode_casv_all_rgb8`] for the parallelism contract).
+/// Decode every frame of a FABLE-tier view serially: one `DeltaDecodeSession`
+/// carries the P-chain (decode_intra resets it at each I-frame), lending
+/// `(index, pixels)` to `sink`. Shared by the all-frames and for-each footer
+/// decoders (header-layout fable is handled in decode_casv_all_rgb8 directly).
+fn decode_casv_view_fable(view: &CasvView, mut sink: impl FnMut(usize, &[u8])) -> Option<()> {
+    let (w, h) = (view.width, view.height);
+    let mut sess = crate::fable_braid::DeltaDecodeSession::new();
+    let mut prev: Option<Vec<u8>> = None;
+    for i in 0..view.frame_count {
+        let (flags, slice) = view.entry(i)?;
+        let px = if flags & CASV_PFRAME_FLAG != 0 {
+            let p = prev.take()?;
+            sess.decode_delta(slice, &p, w, h)?
+        } else {
+            let (px, dw, dh) = sess.decode_intra(slice)?;
+            if (dw, dh) != (w, h) {
+                return None;
+            }
+            px
+        };
+        sink(i, &px);
+        prev = Some(px);
+    }
+    Some(())
+}
+
 fn decode_casv_view_all_rgb8(view: &CasvView) -> Option<Vec<(Vec<u8>, u32, u32)>> {
     let (w, h) = (view.width, view.height);
     let n = view.frame_count;
+    if view.fable {
+        // Footer-layout fable: serial DeltaDecodeSession (no libjxl).
+        let mut out = Vec::with_capacity(n);
+        decode_casv_view_fable(view, |_, px| out.push((px.to_vec(), w, h)))?;
+        return Some(out);
+    }
     // GOP boundaries = I-frame positions. The scan also validates every index
     // entry up front (any malformed entry fails the whole decode, exactly as
     // the serial loop's lazy per-frame parse would).
@@ -3167,6 +3299,11 @@ fn decode_casv_view_for_each(
     mut f: impl FnMut(usize, &[u8], u32, u32),
 ) -> Option<usize> {
     let (w, h) = (view.width, view.height);
+    if view.fable {
+        // Footer-layout fable: serial DeltaDecodeSession (no libjxl threads).
+        decode_casv_view_fable(view, |i, px| f(i, px, w, h))?;
+        return Some(view.frame_count);
+    }
     let mut sess = CasvDecodeSession::with_threads(num_threads)?;
     let mut recon: Vec<u8> = Vec::new();
     decode_casv_range(
@@ -3425,6 +3562,67 @@ mod tests {
         assert_eq!(decoded.len(), frames.len());
         for (i, (px, _, _)) in decoded.iter().enumerate() {
             assert_eq!(px, &frames[i], "fable frame {i} not byte-exact");
+        }
+    }
+
+    #[test]
+    fn footer_fable_decodes_to_source_byte_exact() {
+        // K5 step 5: fable in the FOOTER format. The fable signal rides the CASR box;
+        // the footer decoders (all + for_each) route to DeltaDecodeSession and
+        // reconstruct every SOURCE frame byte-exact (fable is lossless).
+        let (w, h) = (48u32, 40u32);
+        let frames: Vec<Vec<u8>> = (0..5).map(|k| gradient(w, h, (k * 23 + 9) as u8)).collect();
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 24,
+            fps_den: 1,
+        };
+        let mut buf = Vec::new();
+        encode_casv_fable_streaming_to_progress(&mut src, 3, &mut buf, &mut |_| {})
+            .expect("footer fable encode");
+        // The CASR box carries the fable flag.
+        assert_eq!(
+            parse_casv_rate_box(&buf).map(|f| f & CASV_HDR_FABLE_FLAG != 0),
+            Some(true),
+            "footer fable must set the CASR fable bit"
+        );
+        let decoded = decode_casv_footer_all_rgb8(&buf).expect("footer fable decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "footer fable frame {i} not byte-exact");
+        }
+        // The for_each footer decoder routes fable too.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        decode_casv_footer_for_each_rgb8(&buf, |_, px, _, _| got.push(px.to_vec()))
+            .expect("footer fable for_each");
+        assert_eq!(got, frames);
+    }
+
+    #[test]
+    fn footer_fable_with_audio_roundtrips() {
+        // Fable footer + CSAU audio: the whole point of the footer format for fable
+        // (the header format can't carry audio). Audio recovers; frames stay exact.
+        let (w, h) = (32u32, 32u32);
+        let frames: Vec<Vec<u8>> = (0..3).map(|k| gradient(w, h, (k * 61 + 2) as u8)).collect();
+        let audio = vec![0xAAu8; 64]; // stand-in Ogg/Opus payload
+        let mut src = SliceFrameSource {
+            frames: &frames,
+            i: 0,
+            width: w,
+            height: h,
+            fps_num: 30,
+            fps_den: 1,
+        };
+        let buf = encode_casv_fable_streaming_with_audio(&mut src, 2, Some(&audio), &mut |_| {})
+            .expect("fable footer + audio");
+        assert_eq!(parse_casv_audio_box(&buf), Some(audio.as_slice()), "CSAU audio must survive");
+        let decoded = decode_casv_footer_all_rgb8(&buf).expect("decode");
+        assert_eq!(decoded.len(), frames.len());
+        for (i, (px, _, _)) in decoded.iter().enumerate() {
+            assert_eq!(px, &frames[i], "fable+audio frame {i} not byte-exact");
         }
     }
 
