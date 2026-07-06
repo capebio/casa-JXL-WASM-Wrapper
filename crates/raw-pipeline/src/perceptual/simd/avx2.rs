@@ -156,6 +156,41 @@ pub unsafe fn ssd_avx2(a: &[u8], b: &[u8]) -> u64 {
     // Use assert_eq! (not debug_assert_eq!) to match ssim_moments_avx2's assert! —
     // mismatched buffers would cause OOB SIMD reads in release builds (silent UB).
     assert_eq!(a.len(), b.len(), "ssd_avx2: buffers must have equal length");
+    // Byte-band parallelism: SSD is a u64 integer sum, so any band split sums to
+    // exactly the same total (same unconditional-exactness argument as
+    // ssim_moments_avx2_cal). Bands are 16-byte aligned so every band keeps the
+    // same vector/scalar boundary shape. Gated ≥8 MB (bench:
+    // examples/ssd_mt_flip.rs); small compares stay serial.
+    #[cfg(feature = "parallel")]
+    {
+        const BAND_BYTES: usize = 4 << 20; // 4 MB, multiple of 16
+        if a.len() >= SSD_PAR_MIN_BYTES {
+            use rayon::prelude::*;
+            let bands = a.len().div_ceil(BAND_BYTES);
+            return (0..bands)
+                .into_par_iter()
+                .map(|k| {
+                    let i0 = k * BAND_BYTES;
+                    let i1 = (i0 + BAND_BYTES).min(a.len());
+                    // SAFETY: avx2 verified by the dispatching caller; band
+                    // slices are in-bounds and equal-length by construction.
+                    unsafe { ssd_band_avx2(&a[i0..i1], &b[i0..i1]) }
+                })
+                .sum();
+        }
+    }
+    ssd_band_avx2(a, b)
+}
+
+/// Engage the parallel SSD pass only at ≥8 MB per buffer (2M RGBA px).
+#[cfg(feature = "parallel")]
+const SSD_PAR_MIN_BYTES: usize = 8 << 20;
+
+/// SSD over one equal-length byte band — exactly the original `ssd_avx2` loop.
+///
+/// SAFETY: caller guarantees avx2 and `a.len() == b.len()`.
+#[target_feature(enable = "avx2")]
+unsafe fn ssd_band_avx2(a: &[u8], b: &[u8]) -> u64 {
     let len = a.len();
     // Drain the i32 lane accumulator into u64 before any lane can wrap.
     // 130050 · 16000 = 2.0808e9 < 2³¹−1 (2.1475e9), with margin.
@@ -1021,6 +1056,30 @@ mod reduction_tests {
         let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
         let want = unsafe { ssim_moments_avx2(&a, &b, np) };
         let got = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
+        assert_eq!(want, got);
+    }
+
+    /// SSD at a byte count crossing SSD_PAR_MIN_BYTES (8 MB), so under the
+    /// default `parallel` feature this exercises the 4 MB band map-sum path
+    /// (3 bands incl. a partial last band + a non-multiple-of-16 tail) and
+    /// proves it exactly equal to the scalar oracle (u64 integer sum).
+    #[test]
+    fn ssd_parallel_bands_match_scalar_oracle() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let n = (8usize << 20) + (2 << 20) + 7; // 10 MB + 7, odd tail
+        let a: Vec<u8> = (0..n).map(|i| (i * 13 % 255) as u8).collect();
+        let b: Vec<u8> = (0..n).map(|i| (i * 29 % 255) as u8).collect();
+        let want: u64 = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| {
+                let d = x as i64 - y as i64;
+                (d * d) as u64
+            })
+            .sum();
+        let got = unsafe { ssd_avx2(&a, &b) };
         assert_eq!(want, got);
     }
 
