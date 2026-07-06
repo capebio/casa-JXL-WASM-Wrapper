@@ -33,6 +33,9 @@ packages/jxl-wasm/dist/*.plain.wasm
 # Rust build artifacts (Cargo target dir)
 target/
 .cargo-home/
+
+# ccache compiler cache — accidentally committed (3166 files); bloated every worktree checkout (S4 hygiene)
+**/.ccache/
 .codex-cargo-target-*/
 # Generated threaded-wasm pkg (build with tools/build-mt-wasm.sh)
 pkg-mt/
