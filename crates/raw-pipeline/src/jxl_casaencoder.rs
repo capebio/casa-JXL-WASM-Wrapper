@@ -1218,6 +1218,74 @@ pub fn encode_rgb8_downsampled(
     Encoder::new(opts)?.encode(&Frame::rgb(&down, dw, dh))
 }
 
+// ─── JPEG → JXL lossless transcode ───────────────────────────────────────────
+
+/// Losslessly transcode JPEG bytes into a JXL container.
+///
+/// Calls `JxlEncoderStoreJPEGMetadata` + `JxlEncoderAddJPEGFrame` so the JXL
+/// bitstream can be re-transcoded back to the original JPEG losslessly.
+/// Requires `JPEGXL_ENABLE_TRANSCODE_JPEG=ON` in jxl-ffi/build.rs (already set).
+pub fn transcode_jpeg_to_jxl(jpeg: &[u8]) -> Result<Vec<u8>, EncodeError> {
+    if jpeg.is_empty() {
+        return Err(EncodeError::Jxl("empty JPEG input".into()));
+    }
+    unsafe {
+        let enc = ffi::JxlEncoderCreate(std::ptr::null());
+        if enc.is_null() {
+            return Err(EncodeError::Create);
+        }
+        macro_rules! check {
+            ($call:expr, $msg:expr) => {
+                if $call != ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
+                    ffi::JxlEncoderDestroy(enc);
+                    return Err(EncodeError::Jxl($msg.into()));
+                }
+            };
+        }
+        check!(
+            ffi::JxlEncoderStoreJPEGMetadata(enc, 1),
+            "JxlEncoderStoreJPEGMetadata failed"
+        );
+        let frame = ffi::JxlEncoderFrameSettingsCreate(enc, ptr::null());
+        if frame.is_null() {
+            ffi::JxlEncoderDestroy(enc);
+            return Err(EncodeError::Jxl("JxlEncoderFrameSettingsCreate failed".into()));
+        }
+        check!(
+            ffi::JxlEncoderAddJPEGFrame(frame, jpeg.as_ptr(), jpeg.len()),
+            "JxlEncoderAddJPEGFrame failed"
+        );
+        ffi::JxlEncoderCloseInput(enc);
+
+        let mut cap = jpeg.len().max(65536);
+        let mut out: Vec<u8> = vec![0u8; cap];
+        let mut next_out = out.as_mut_ptr();
+        let mut avail_out = cap;
+        loop {
+            let status = ffi::JxlEncoderProcessOutput(enc, &mut next_out, &mut avail_out);
+            if status == ffi::JxlEncoderStatus::JXL_ENC_SUCCESS {
+                let final_len = next_out.offset_from(out.as_ptr()) as usize;
+                ffi::JxlEncoderDestroy(enc);
+                out.truncate(final_len);
+                return Ok(out);
+            }
+            if status == ffi::JxlEncoderStatus::JXL_ENC_NEED_MORE_OUTPUT {
+                let offset = next_out.offset_from(out.as_ptr()) as usize;
+                cap *= 2;
+                out.resize(cap, 0);
+                next_out = out.as_mut_ptr().add(offset);
+                avail_out = cap - offset;
+                continue;
+            }
+            ffi::JxlEncoderDestroy(enc);
+            return Err(EncodeError::Jxl(format!(
+                "JxlEncoderProcessOutput status {}",
+                status.0
+            )));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
