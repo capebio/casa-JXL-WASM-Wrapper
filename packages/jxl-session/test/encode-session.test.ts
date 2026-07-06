@@ -152,16 +152,11 @@ describe("encodeOptionsToStartMsg mapper exhaustiveness", () => {
   // they are session-level (signal, onMetric) or encode-handler-side controls
   // (modular, brotliEffort, decodingSpeed, photonNoiseIso, buffering,
   //  advancedControls, jpegReconstruction) that are not part of the wire protocol.
+  // Only session-level / caller-side fields are omitted from the wire (K6#2: the
+  // advanced codec fields are now forwarded).
   const INTENTIONALLY_OMITTED: ReadonlySet<keyof EncodeOptions> = new Set([
     "signal",
     "onMetric",
-    "modular",
-    "brotliEffort",
-    "decodingSpeed",
-    "photonNoiseIso",
-    "buffering",
-    "advancedControls",
-    "jpegReconstruction",
   ] as const satisfies (keyof EncodeOptions)[]);
 
   // All EncodeOptions keys that ARE forwarded (must appear as keys in the
@@ -194,9 +189,47 @@ describe("encodeOptionsToStartMsg mapper exhaustiveness", () => {
     "intrinsicSize",
     "disablePerceptualHeuristics",
     "codestreamLevel",
+    // Advanced codec fields (K6#2) — forwarded on the wire.
+    "modular",
+    "brotliEffort",
+    "decodingSpeed",
+    "photonNoiseIso",
+    "buffering",
+    "advancedControls",
+    "jpegReconstruction",
+    "alreadyDownsampled",
+    "upsamplingMode",
+    "ecResampling",
+    "frameIndexing",
+    "allowExpertOptions",
   ] as const satisfies (keyof EncodeOptions)[]);
 
+  // Compile-time exhaustive key set: TypeScript ERRORS here if a field is added to
+  // EncodeOptions and not listed, forcing MAPPED/OMITTED to be updated — the real
+  // drift guard (the `satisfies` on the sets above only checks listed keys valid,
+  // not that ALL keys are listed).
+  const ALL_ENCODE_OPTION_KEYS: Record<keyof EncodeOptions, true> = {
+    format: true, width: true, height: true, hasAlpha: true,
+    iccProfile: true, exif: true, xmp: true,
+    distance: true, quality: true, effort: true,
+    modular: true, brotliEffort: true, decodingSpeed: true, photonNoiseIso: true,
+    progressive: true, progressiveFlavor: true, previewFirst: true,
+    progressiveDc: true, progressiveAc: true, qProgressiveAc: true, groupOrder: true,
+    centerX: true, centerY: true, buffering: true, advancedControls: true,
+    chunked: true, sidecarSizes: true, priority: true, signal: true, onMetric: true,
+    orientation: true, intrinsicSize: true, disablePerceptualHeuristics: true,
+    codestreamLevel: true, jpegReconstruction: true, alreadyDownsampled: true,
+    upsamplingMode: true, ecResampling: true, frameIndexing: true, allowExpertOptions: true,
+  };
+
   it("MAPPED + OMITTED covers every EncodeOptions key (drift guard)", () => {
+    // Every EncodeOptions key must be classified as either mapped or omitted.
+    for (const k of Object.keys(ALL_ENCODE_OPTION_KEYS) as (keyof EncodeOptions)[]) {
+      assert.ok(
+        MAPPED_OPT_KEYS.has(k) || INTENTIONALLY_OMITTED.has(k),
+        `EncodeOptions key "${k}" is neither mapped nor intentionally omitted`
+      );
+    }
     // Build a full EncodeOptions object with every field set so TypeScript
     // exhaustiveness catches new keys at compile time via the satisfies below.
     const allKeys: (keyof EncodeOptions)[] = [
@@ -235,6 +268,20 @@ describe("encodeOptionsToStartMsg mapper exhaustiveness", () => {
       intrinsicSize: { width: 4, height: 4 },
       disablePerceptualHeuristics: true,
       codestreamLevel: 5,
+      // Advanced fields (K6#2) with distinct sentinels — incl. an explicit `false`
+      // to confirm boolean falses are forwarded (`!= null`), not dropped.
+      modular: 1,
+      brotliEffort: 7,
+      decodingSpeed: 2,
+      photonNoiseIso: 400,
+      buffering: { strategy: 3 },
+      advancedControls: { filters: { epf: 2 } },
+      jpegReconstruction: { cfl: true },
+      alreadyDownsampled: false,
+      upsamplingMode: 0,
+      ecResampling: 2,
+      frameIndexing: "1",
+      allowExpertOptions: true,
     };
     const msg = encodeOptionsToStartMsg("test-id", opts, opts.distance ?? null, null);
     assert.equal(msg.type, "encode_start");
@@ -246,6 +293,19 @@ describe("encodeOptionsToStartMsg mapper exhaustiveness", () => {
     assert.equal(msg.progressiveDc, 1);
     assert.equal(msg.sidecarSizes?.[0], 64);
     assert.equal(msg.codestreamLevel, 5);
+    // Advanced fields forwarded (the K6#2 gap).
+    assert.equal(msg.modular, 1);
+    assert.equal(msg.brotliEffort, 7);
+    assert.equal(msg.decodingSpeed, 2);
+    assert.equal(msg.photonNoiseIso, 400);
+    assert.deepEqual(msg.buffering, { strategy: 3 });
+    assert.deepEqual(msg.advancedControls, { filters: { epf: 2 } });
+    assert.deepEqual(msg.jpegReconstruction, { cfl: true });
+    assert.equal(msg.alreadyDownsampled, false); // explicit false survives
+    assert.equal(msg.upsamplingMode, 0);
+    assert.equal(msg.ecResampling, 2);
+    assert.equal(msg.frameIndexing, "1");
+    assert.equal(msg.allowExpertOptions, true);
     // Confirm the combined key list has no duplicates.
     const seen = new Set<string>();
     for (const k of allKeys) {

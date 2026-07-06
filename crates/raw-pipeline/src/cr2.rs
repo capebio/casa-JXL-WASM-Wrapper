@@ -17,6 +17,7 @@
 //! - Cr2Timings: per-phase timing for benchmarks.
 //! - Multi-lens review: overflow guard on decoded dimensions; vestigial Cfa re-export removed.
 
+use crate::decompress::RawRowSource;
 use crate::ljpeg;
 use crate::tiff::{visit_ifd, RawImageMeta};
 use anyhow::{anyhow, bail, Context, Result};
@@ -1282,6 +1283,374 @@ fn decode_impl(
         timings,
         ljpeg_stats,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Streaming row source
+// ---------------------------------------------------------------------------
+
+/// Pre-computed segment for one vertical slice in a multi-slice CR2 mosaic row.
+/// Mirrors the `Seg` inside `reassemble_slices_crop` but hoisted to module level
+/// so `Cr2RowSource::next_row_into` can iterate them without re-computing per row.
+struct SliceSeg {
+    src_base: usize, // index into raw[] of this slice's first sample
+    sw: usize,       // slice logical width (nw for full slices, lw for remainder)
+    src_col: usize,  // first source column within the slice for the crop window
+    run: usize,      // number of pixels to copy from this slice per row
+}
+
+/// Streaming CR2 raw-row source. Decodes the whole LJPEG mosaic upfront (2 B/px)
+/// then serves raster rows lazily. Peak = mosaic + band, vs the batch path which
+/// holds mosaic + rgb16 + rgb8 simultaneously. At 24 MP: ~48 MB vs ~264 MB.
+///
+/// Single-slice (CR2Slices all zero): mosaic is in raster order; row reads are
+/// a direct slice of the buffer.
+/// Multi-slice: mosaic is in stacked-slice order; rows are reconstructed on demand
+/// using the per-row form of `reassemble_slices_crop`.
+pub struct Cr2RowSource {
+    raw: Vec<u16>,
+    width: usize,
+    height: usize,
+    row: usize,
+    top: usize,
+    left: usize,
+    stride: usize,       // logical row stride = decoded_width = sof_w * ncomp
+    have_slices: bool,
+    segs: Vec<SliceSeg>, // empty when !have_slices
+    pub cfa_phase: (u8, u8),
+    pub black: u16,
+    pub white: u16,
+    pub wb_r: f32,
+    pub wb_g: f32,
+    pub wb_b: f32,
+    pub iso: Option<u32>,
+    pub color_matrix: Option<[[f32; 3]; 3]>,
+    pub make: String,
+    pub model: String,
+    pub orientation: u16,
+}
+
+impl RawRowSource for Cr2RowSource {
+    fn width(&self) -> usize {
+        self.width
+    }
+    fn height(&self) -> usize {
+        self.height
+    }
+
+    fn next_row_into(&mut self, dst: &mut [u16]) -> Result<bool, String> {
+        if self.row >= self.height {
+            return Ok(false);
+        }
+        let y = self.top + self.row;
+        let w = self.width;
+        if self.have_slices {
+            let mut out_col = 0usize;
+            for s in &self.segs {
+                let p = s.src_base + y * s.sw + s.src_col;
+                let end = p + s.run;
+                dst[out_col..out_col + s.run].copy_from_slice(
+                    self.raw.get(p..end).ok_or_else(|| {
+                        format!(
+                            "Cr2RowSource: slice OOB row {} p={p} end={end} len={}",
+                            self.row,
+                            self.raw.len()
+                        )
+                    })?,
+                );
+                out_col += s.run;
+            }
+            if out_col != w {
+                return Err(format!(
+                    "Cr2RowSource: reassembled {out_col} px, expected {w} at row {}",
+                    self.row
+                ));
+            }
+        } else {
+            let p = y * self.stride + self.left;
+            let end = p + w;
+            dst[..w].copy_from_slice(
+                self.raw.get(p..end).ok_or_else(|| {
+                    format!(
+                        "Cr2RowSource: OOB row {} p={p} end={end} len={}",
+                        self.row,
+                        self.raw.len()
+                    )
+                })?,
+            );
+        }
+        self.row += 1;
+        Ok(true)
+    }
+}
+
+/// Parse a CR2 and decode the LJPEG mosaic into a streaming row source.
+/// Peak allocation = mosaic buffer (2 B/px) + caller's band.
+/// Does not demosaic, process, or encode — callers feed the result into
+/// `StreamingBandSource` then the encoding pipeline.
+pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
+    if data.len() < 16 {
+        bail!("CR2: file too small ({} bytes)", data.len());
+    }
+    let le = match &data[0..4] {
+        [0x49, 0x49, 0x2A, 0x00] => true,
+        [0x4D, 0x4D, 0x00, 0x2A] => false,
+        m => bail!("CR2: not a TIFF file (magic {:02X?})", m),
+    };
+    if data.get(8..10) != Some(b"CR") {
+        bail!("CR2: missing Canon CR marker at offset 8");
+    }
+
+    let ifd0_off = read_u32(data, 4, le) as usize;
+    let raw_ifd_off = read_u32(data, 12, le) as usize;
+
+    // IFD0: dimensions, orientation, make/model, ExifIFD pointer
+    let mut img_width: u32 = 0;
+    let mut img_height: u32 = 0;
+    let mut orientation: u16 = 1;
+    let mut make = String::new();
+    let mut model = String::new();
+    let mut exif_ifd_off: u32 = 0;
+
+    visit_ifd(data, ifd0_off, le, |tag, dtype, cnt, val, ip| match tag {
+        0x0100 => img_width  = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        0x0101 => img_height = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+        0x0112 => orientation = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(1) as u16,
+        0x010F => make  = read_ascii(data, cnt, val, ip),
+        0x0110 => model = read_ascii(data, cnt, val, ip),
+        0x8769 => exif_ifd_off = val,
+        _ => {}
+    });
+
+    if img_width == 0 || img_height == 0 {
+        bail!("CR2: zero image dimensions in IFD0 (w={}, h={})", img_width, img_height);
+    }
+
+    // ExifIFD: ISO, MakerNote pointer
+    let mut iso: Option<u32> = None;
+    let mut makernote_off: u32 = 0;
+    let mut makernote_len: u32 = 0;
+
+    if exif_ifd_off > 0 && (exif_ifd_off as usize) < data.len() {
+        visit_ifd(
+            data,
+            exif_ifd_off as usize,
+            le,
+            |tag, dtype, cnt, val, ip| match tag {
+                0x8827 => iso = entry_first_u32(data, dtype, cnt, val, ip, le),
+                0x927C => {
+                    makernote_off = val;
+                    makernote_len = cnt;
+                }
+                _ => {}
+            },
+        );
+    }
+
+    // MakerNote: WB + SensorInfo
+    let mut wb_r: f32 = 2.0;
+    let mut wb_b: f32 = 1.7;
+    let mut sensor_info: Option<SensorInfo> = None;
+
+    if makernote_off > 0 && makernote_len >= 2 {
+        let mn_off = makernote_off as usize;
+        if mn_off.checked_add(2).map_or(false, |e| e <= data.len()) {
+            visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| match tag {
+                0x4001 if dtype == 3 && cnt > 0 => {
+                    let p = if cnt <= 2 { ip } else { val as usize };
+                    if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le) {
+                        wb_r = r;
+                        wb_b = b;
+                    }
+                }
+                0x00E0 => {
+                    if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
+                        sensor_info = Some(cand);
+                    }
+                }
+                _ => {}
+            });
+        }
+    }
+
+    // RAW IFD: strip location, CR2Slices, black level
+    if raw_ifd_off == 0 || raw_ifd_off >= data.len() {
+        bail!("CR2: invalid raw IFD offset {}", raw_ifd_off);
+    }
+    let mut strip_offset: u32 = 0;
+    let mut strip_byte_count: u32 = 0;
+    let mut cr2_slices: [u16; 3] = [0; 3];
+    let mut have_slices = false;
+    let mut black_from_ifd: u16 = 0;
+
+    visit_ifd(
+        data,
+        raw_ifd_off,
+        le,
+        |tag, dtype, cnt, val, ip| match tag {
+            0x0111 => strip_offset     = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+            0x0117 => strip_byte_count = entry_first_u32(data, dtype, cnt, val, ip, le).unwrap_or(0),
+            0xC640 if dtype == 3 && cnt >= 3 => {
+                let p = val as usize;
+                if p.checked_add(6).map_or(false, |e| e <= data.len()) {
+                    cr2_slices[0] = read_u16(data, p, le);
+                    cr2_slices[1] = read_u16(data, p + 2, le);
+                    cr2_slices[2] = read_u16(data, p + 4, le);
+                    have_slices = cr2_slices[0] > 0;
+                }
+            }
+            0xC61A | 0xC632 if black_from_ifd == 0 => {
+                if let Some(b) = entry_first_u32(data, dtype, cnt, val, ip, le) {
+                    if b > 0 && b < 8192 {
+                        black_from_ifd = b as u16;
+                    }
+                }
+            }
+            _ => {}
+        },
+    );
+
+    if strip_offset == 0 || strip_byte_count == 0 {
+        bail!("CR2: missing strip offset or byte count in raw IFD");
+    }
+    let strip_off = strip_offset as usize;
+    let strip_len = strip_byte_count as usize;
+    let strip_end = match strip_off.checked_add(strip_len) {
+        Some(e) if e <= data.len() => e,
+        _ => bail!(
+            "CR2: strip [off={strip_off}, len={strip_len}] out of bounds (file {}B)",
+            data.len()
+        ),
+    };
+
+    // SOF3 parse
+    let (precision, sof_h, sof_w, ncomp) =
+        parse_ljpeg_sof(data, strip_off, strip_len)
+            .ok_or_else(|| anyhow!("CR2: could not find SOF3 marker in LJPEG strip"))?;
+    let sof_h = sof_h as usize;
+    let sof_w = sof_w as usize;
+    let ncomp = ncomp as usize;
+
+    if sof_w == 0 || sof_h == 0 || ncomp == 0 {
+        bail!("CR2: invalid SOF3 dims {}×{} ncomp={}", sof_w, sof_h, ncomp);
+    }
+    let total_check = (sof_w as u64)
+        .saturating_mul(ncomp as u64)
+        .saturating_mul(sof_h as u64);
+    if total_check > 200_000_000 {
+        bail!(
+            "CR2: implausible decoded dims {}×{}×{}",
+            sof_w, sof_h, ncomp
+        );
+    }
+
+    let decoded_width = if have_slices {
+        let n  = cr2_slices[0] as usize;
+        let nw = cr2_slices[1] as usize;
+        let lw = cr2_slices[2] as usize;
+        if n > 32 || nw == 0 {
+            bail!("CR2: implausible CR2Slices [{} {} {}]", n, nw, lw);
+        }
+        n * nw + lw
+    } else {
+        sof_w * ncomp
+    };
+    let stride = sof_w * ncomp;
+    // Guard: if CR2Slices width disagrees with LJPEG stride the per-row math would shear.
+    if decoded_width != stride {
+        bail!(
+            "CR2: CR2Slices width {decoded_width} disagrees with LJPEG stride {stride} \
+             (sof_w={sof_w} ncomp={ncomp})"
+        );
+    }
+
+    // LJPEG decode → resident mosaic buffer
+    let total_pixels = stride * sof_h;
+    let mut raw = vec![0u16; total_pixels];
+    ljpeg::decode_tile(&data[strip_off..strip_end], &mut raw, 0, stride, stride, sof_h)
+        .with_context(|| "CR2: LJPEG decode failed")?;
+
+    // Black/white defaults from SOF precision, overridden by IFD tag
+    let (mut black, white) = match precision {
+        14 => (2048u16, 15300u16),
+        12 => (512u16, 4095u16),
+        _ if precision >= 16 => (0u16, u16::MAX),
+        _ => (0u16, (1u16 << precision).saturating_sub(1)),
+    };
+    if black_from_ifd > 0 && black_from_ifd < white {
+        black = black_from_ifd;
+    }
+
+    // Crop geometry
+    let crop_w = img_width as usize;
+    let crop_h = img_height as usize;
+    if decoded_width < crop_w || sof_h < crop_h {
+        bail!(
+            "CR2: decoded {decoded_width}×{sof_h} smaller than expected {crop_w}×{crop_h}"
+        );
+    }
+    let (left, top, cfa_phase) =
+        choose_crop_origin(sensor_info, decoded_width, sof_h, crop_w, crop_h);
+    if left + crop_w > decoded_width || top + crop_h > sof_h {
+        bail!(
+            "CR2: crop [{left},{top},{crop_w},{crop_h}] exceeds decoded {decoded_width}×{sof_h}"
+        );
+    }
+
+    // Segment descriptors for multi-slice rows (same math as reassemble_slices_crop,
+    // computed once here so next_row_into is O(n_slices) not O(n_slices + recompute).
+    let segs = if have_slices {
+        let n  = cr2_slices[0] as usize;
+        let nw = cr2_slices[1] as usize;
+        let lw = cr2_slices[2] as usize;
+        nw.checked_mul(sof_h)
+            .ok_or_else(|| anyhow!("CR2: slice block overflow"))?;
+        let block     = nw * sof_h;
+        let crop_right = left + crop_w;
+        let mut segs = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let sw = if i < n { nw } else { lw };
+            if sw == 0 { continue; }
+            let col0 = i * nw;
+            if col0 >= stride { break; }
+            let sw_eff = sw.min(stride - col0);
+            let lo = col0.max(left);
+            let hi = (col0 + sw_eff).min(crop_right);
+            if lo >= hi { continue; }
+            segs.push(SliceSeg {
+                src_base: i * block,
+                sw,
+                src_col: lo - col0,
+                run: hi - lo,
+            });
+        }
+        segs
+    } else {
+        Vec::new()
+    };
+
+    Ok(Cr2RowSource {
+        raw,
+        width: crop_w,
+        height: crop_h,
+        row: 0,
+        top,
+        left,
+        stride,
+        have_slices,
+        segs,
+        cfa_phase,
+        black,
+        white,
+        wb_r,
+        wb_g: 1.0,
+        wb_b,
+        iso,
+        color_matrix: canon_color_matrix(&make, &model),
+        make,
+        model,
+        orientation,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -19,9 +19,14 @@ import { deferred, newSessionId, toTransferableBuffer, type Deferred } from "./u
 /**
  * Forwards all user-provided EncodeOptions to worker. See encodeOptionsToStartMsg for field mapping.
  *
- * Intentionally omitted from MsgEncodeStart (session-level or caller-side only):
- *   signal, onMetric, modular, brotliEffort, decodingSpeed, photonNoiseIso,
- *   buffering, advancedControls, jpegReconstruction
+ * Intentionally omitted from MsgEncodeStart (session-level / caller-side only, not
+ * a codec setting): signal, onMetric.
+ *
+ * All codec-affecting fields — including the advanced set (modular, brotliEffort,
+ * decodingSpeed, photonNoiseIso, buffering, advancedControls, jpegReconstruction,
+ * alreadyDownsampled, upsamplingMode, ecResampling, frameIndexing,
+ * allowExpertOptions) — are forwarded; MsgEncodeStart carries matching optional
+ * fields and both workers consume them.
  *
  * distance/quality defaulting is resolved by the caller before invoking this
  * function (distance defaults to 1.0 when neither is supplied; distance wins
@@ -65,6 +70,20 @@ export function encodeOptionsToStartMsg(
   if (opts.intrinsicSize != null) msg.intrinsicSize = opts.intrinsicSize;
   if (opts.disablePerceptualHeuristics === true) msg.disablePerceptualHeuristics = true;
   if (opts.codestreamLevel != null) msg.codestreamLevel = opts.codestreamLevel;
+  // Advanced codec fields (wire-forward; the workers map any present field onto the
+  // facade EncoderOptions). Booleans use `!= null` so an explicit `false` is carried.
+  if (opts.modular != null) msg.modular = opts.modular;
+  if (opts.brotliEffort != null) msg.brotliEffort = opts.brotliEffort;
+  if (opts.decodingSpeed != null) msg.decodingSpeed = opts.decodingSpeed;
+  if (opts.photonNoiseIso != null) msg.photonNoiseIso = opts.photonNoiseIso;
+  if (opts.buffering !== undefined) msg.buffering = opts.buffering;
+  if (opts.advancedControls !== undefined) msg.advancedControls = opts.advancedControls;
+  if (opts.jpegReconstruction !== undefined) msg.jpegReconstruction = opts.jpegReconstruction;
+  if (opts.alreadyDownsampled != null) msg.alreadyDownsampled = opts.alreadyDownsampled;
+  if (opts.upsamplingMode != null) msg.upsamplingMode = opts.upsamplingMode;
+  if (opts.ecResampling != null) msg.ecResampling = opts.ecResampling;
+  if (opts.frameIndexing != null) msg.frameIndexing = opts.frameIndexing;
+  if (opts.allowExpertOptions != null) msg.allowExpertOptions = opts.allowExpertOptions;
   return msg;
 }
 

@@ -2282,3 +2282,35 @@ Deferred architectural ideas (real, but out of scope for a pipeline.rs-local har
   isn't cheaply isolable in flipflop (it needs Tauri `State`). Deferred: extend `lightbox_bench.rs`/
   `strategy_bench.rs` to exercise the real `local_pool` under `PrioritySem` and A/B `.max(1)` vs
   `.max(2)` vs live-sem at c∈{1,3,6,12}. Expected: parity-or-better at 12×, wins at lowered c.
+
+---
+
+## 2026-07-06 — Deferred from `src-tauri/src/lib.rs` review (branch chore/lib-safeconst-emit-cleanup-k2x9)
+
+Scope applied to lib.rs: 2 safe cleanups only (dropped 2 dead `unsafe new_unchecked` on cache-cap consts, cut 1 deep-link `String` alloc). lib.rs is app control-plane, not a hot path — no benchmark moves there. The following architecture-level items were identified during the "hologram/genetics" strategic pass but are **out of scope, large, speculative, and live in other modules** (`pipeline.rs`, `pyramid_store.rs`, `priority_sem.rs`, frontend), not lib.rs. No flipflop-revert path exists for a multi-module control-plane rewrite, so they need spec + brainstorm before any code.
+
+**P0 (systemic, highest risk/reward):**
+1. **Global MemoryLedger** — admission-control one byte budget spanning cache-resident + leased-Arc + active decode/encode scratch + in-flight IPC + pending pyramid-write buffers. Reserve estimated peak bytes before admitting a job; refuse cache insert that would starve active work. Fixes: correct LRU can still OOM under 12× concurrency because eviction of an `Arc<T>` ≠ memory returned to OS.
+2. **Split 12×1 batch throughput policy from interactive single-file latency policy.** `FILE_CONCURRENCY=12` currently doubles as CPU-thread input, memory admission, and batch scheduling. Keep 12×1 as measured ORF batch default; derive admission dynamically (min of configured CPU jobs, mem_budget/peak_per_job, lane capacity). Verify `set_concurrency` updates BOTH permit capacity AND libjxl threads_per_file (else silent oversubscription).
+3. **Weighted byte-budgeted caches** replacing uniform 25-entry count caps — one entry-count LRU treats a thumbnail == a ~100 MiB RGB16 frame. Cache value ≈ reuse_prob × recompute_cost × downstream_fanout ÷ retained_bytes.
+4. **Pyramid init single-shot**; remove the temp_dir `PyramidStore` created in `AppState::new()` then replaced in `ensure_pyramid_root` (Uninitialized→Initializing→Ready, or init in `.setup()` before commands are reachable). Current `ensure_pyramid_root` has a benign double-init race (two callers both see `None`).
+5. **Pyramid reads must not serialize behind unrelated writes** — one global `Mutex<PyramidStore>` serializes gallery traffic; split into immutable root + concurrent manifest/index cache + per-image write lock.
+6. **Bounded, uniquely-owned cancellation + render-generation state** — `in_flight_cancels: HashMap<String,...>` and `look_render_gens: HashMap<u64,u64>` are unbounded and String/path-keyed; move to `JobId`-owned entries with a completion guard that removes on finish/fail/panic.
+
+**P1:**
+7. Semantic asset-lineage keys: `SourceKey → DecodeKey → RenderKey → EncodeKey` (fingerprint + decoder/demosaic/colour policy + look/crop/dims + pipeline version). Numeric `u64` ids stay as short-lived runtime handles only. Kills stale reuse after in-place source replace / codec upgrade, enables dedup + single-flight.
+8. Single-flight `PreviewPlan` per (frame, rendition) — thumb+lightbox produced in one plan; concurrent thumb+lightbox requests join one task instead of double-decoding.
+9. Store cache payloads behind `Arc<Rgb16State>` / `Arc<RgbFrame>` so a cache hit clones an Arc under-lock then releases before encode/tonemap/downscale — avoids full-frame copy while holding the mutex. (Do this BEFORE any parking_lot swap.)
+10. Bound subject-crop variants per frame (not just global 100), discard stale generations aggressively.
+11. Interactive lane with fair priority aging so repeated clicks can't starve batch completion.
+
+**P2 (cleanup after measurement):**
+12. Feature-gate `bench::*` + benchmark commands out of production builds (currently always compiled + routed).
+13. Generation-ownership commit protocol: every async render/preview/crop/encode re-checks its generation immediately before cache-insert/emit; drop stale results (prevents late job overwriting newer output — "zombie results").
+14. Split CPU / I/O / memory / pyramid-write admission instead of one file-level permit.
+15. Buffer pool (RGB16 slabs, RGB8 lightbox/thumb slabs, JXL input planes) governed by the same MemoryLedger.
+16. Pyramid/JXL durable output versioned by DecodeKey → acts as compressed recovery tier under RAM pressure (Tier 0 display → 1 RGB16 → 2 nearby JXL/pyramid → 3 disk → 4 RAW).
+17. Deep-link routing idempotent + exact-route validation (not `starts_with`), coalesce duplicate route bursts.
+18. Relaxed atomic ordering for `next_id` allocation (uniqueness only, no sequencing).
+
+**JXL-as-video reframe (design, not a lib.rs edit):** `SequenceController` above FrameStore/WorkController/PyramidService — current frame, browse direction/velocity, viewport res target, graded temporal prefetch (current=display-quality, next=thumb/low-pyramid, near=manifest-only, reverse=cancel). Keep frames independently addressable (random-access anchors); do NOT introduce inter-frame dependency chains unless CASV defines them and they measurably help. Validate against existing ORF baseline ~2.23 files/s @ 12×1.

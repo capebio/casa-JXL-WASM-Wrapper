@@ -110,7 +110,7 @@ fn main() {
         // lossy bbox REPLACE, 6 GOPs.
         write(
             "lossybbox_g8.casv",
-            &encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, 1.0, 6).unwrap(),
+            &encode_casv_delta_lossy_bbox_rgb8(&refs, w, h, 24, 1, 8, EncodeOptions::distance(1.0), 6).unwrap(),
         );
         // JOLT batch (header format, tile REPLACE).
         write(
@@ -125,6 +125,7 @@ fn main() {
             tile: 32,
             effort: 3,
             thresh: None,
+            rate_control: None,
         };
         let mut src = VecFrames {
             frames: frames.clone(),

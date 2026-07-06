@@ -152,9 +152,20 @@ pub fn extract_thumbnail_jpeg(data: &[u8]) -> Option<Vec<u8>> {
     if len == 0 {
         return None;
     }
+    // Cap at 8 MiB — a TIFF thumbnail is never this large; crafted headers could
+    // point at multi-GB regions and trigger OOM-equivalent allocations.
+    const MAX_THUMBNAIL_JPEG_BYTES: usize = 8 * 1024 * 1024;
+    if len > MAX_THUMBNAIL_JPEG_BYTES {
+        return None;
+    }
     // SEC-012: start + len can overflow usize on wasm32 for crafted values.
     let end = start.checked_add(len)?;
-    data.get(start..end).map(|b| b.to_vec())
+    let slice = data.get(start..end)?;
+    // Basic SOI/EOI content validation — reject blobs that are clearly not JPEG.
+    if slice.len() < 4 || slice[0] != 0xFF || slice[1] != 0xD8 {
+        return None;
+    }
+    Some(slice.to_vec())
 }
 
 /// Scan the first 3 MB of `data` for JPEG SOI markers and return the smallest
@@ -472,6 +483,9 @@ fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
 }
 
 fn parse_header(data: &[u8]) -> Result<(bool, u32)> {
+    if data.len() < 8 {
+        bail!("truncated TIFF header: {} bytes", data.len());
+    }
     let magic = &data[0..4];
     let le = match magic {
         b"IIRO" | b"IIRS" | b"IIUS" => true,

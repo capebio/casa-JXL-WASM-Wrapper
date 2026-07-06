@@ -274,12 +274,31 @@ export interface CasvDecodedFrame {
   index: number;
 }
 
+/**
+ * Stateful FableBraid decode session (K6#4). The fable tier is a whole-frame
+ * temporal chain (intra keyframe, then RGB8 deltas against the previous frame),
+ * so — unlike the JXL tiers — a per-call decoder is insufficient. Wrap the wasm
+ * `FableDeltaSession` handle (from @casabio/jxl-wasm's crate) in this shape:
+ *   decodeIntra(bytes) -> RGB8;  decodeDelta(bytes, prevRgb8, w, h) -> RGB8.
+ * Both return tightly-packed interleaved RGB8 (width*height*3).
+ */
+export interface FableSession {
+  decodeIntra(bytes: Uint8Array): Uint8Array;
+  decodeDelta(bytes: Uint8Array, prev: Uint8Array, w: number, h: number): Uint8Array;
+}
+export type FableSessionFactory = () => FableSession;
+
 export interface PlayOptions {
   /**
    * Reuse one RGBA buffer across frames (zero-copy playback: paint each frame
    * before pulling the next). Default false: every frame is an independent copy.
    */
   reuseBuffer?: boolean;
+  /**
+   * Factory for a fable decode session — required to play fable-tier .casv in the
+   * browser (K6#4). Omit for the JXL tiers. When absent, a fable file throws.
+   */
+  fableSession?: FableSessionFactory;
 }
 
 /** Blit an RGBA rect into the running frame. */
@@ -314,7 +333,13 @@ export async function* playCasv(
 ): AsyncGenerator<CasvDecodedFrame> {
   const reader = CasvReader.parse(bytes);
   if (reader.rate.fable) {
-    throw new Error("Fable-tier .casv is native-only (braided-rANS codec has no wasm decode yet)");
+    if (!options.fableSession) {
+      throw new Error(
+        "Fable-tier .casv needs a fableSession factory (wrap the wasm FableDeltaSession); none provided"
+      );
+    }
+    yield* playFable(reader, bytes, options.fableSession(), options);
+    return;
   }
   const { width, height } = reader.header;
   const frameBytes = width * height * 4;
@@ -352,6 +377,56 @@ export async function* playCasv(
       }
     }
     yield { rgba: current, width, height, index: i };
+  }
+}
+
+/** Expand tightly-packed RGB8 into a preallocated RGBA8 buffer (alpha = 255). */
+function rgb8ToRgba(rgb: Uint8Array, pixels: number, out: Uint8Array): void {
+  for (let i = 0; i < pixels; i++) {
+    out[i * 4] = rgb[i * 3]!;
+    out[i * 4 + 1] = rgb[i * 3 + 1]!;
+    out[i * 4 + 2] = rgb[i * 3 + 2]!;
+    out[i * 4 + 3] = 255;
+  }
+}
+
+/**
+ * Fable-tier playback (K6#4). Each frame is a whole-frame fable blob: frame 0 is
+ * intra, the rest are RGB8 temporal deltas against the previous frame this session
+ * returned. Fable is lossless, so the session's previous RGB8 is exact — no drift.
+ */
+async function* playFable(
+  reader: CasvReader,
+  bytes: Uint8Array,
+  session: FableSession,
+  options: PlayOptions
+): AsyncGenerator<CasvDecodedFrame> {
+  const { width, height } = reader.header;
+  const pixels = width * height;
+  const rgbBytes = pixels * 3;
+  const frameBytes = pixels * 4;
+  let prevRgb: Uint8Array | null = null;
+  let rgba: Uint8Array | null = null;
+
+  for (let i = 0; i < reader.frameCount; i++) {
+    const e = reader.entry(i);
+    const payload = bytes.subarray(e.offset, e.offset + e.length);
+    let rgb: Uint8Array;
+    if (!e.isPFrame) {
+      rgb = session.decodeIntra(payload);
+    } else {
+      if (prevRgb === null) throw new Error(`frame ${i}: fable P-frame before any I-frame`);
+      rgb = session.decodeDelta(payload, prevRgb, width, height);
+    }
+    if (rgb.length !== rgbBytes) {
+      throw new Error(`frame ${i}: fable decode produced ${rgb.length} bytes, expected ${rgbBytes}`);
+    }
+    // The session returns a fresh buffer each call, so keeping the reference as
+    // `prev` is safe even under reuseBuffer (we only reuse the RGBA output).
+    prevRgb = rgb;
+    if (rgba === null || !options.reuseBuffer) rgba = new Uint8Array(frameBytes);
+    rgb8ToRgba(rgb, pixels, rgba);
+    yield { rgba, width, height, index: i };
   }
 }
 

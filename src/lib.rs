@@ -759,6 +759,83 @@ struct LookOverrides {
     clarity: f32,
 }
 
+impl LookOverrides {
+    /// Neutral look: all sliders 0; `wb_r`/`wb_b` = NaN meaning "use camera WB"
+    /// (matches web/worker.js `RAW_NEUTRAL`).
+    fn neutral() -> Self {
+        LookOverrides {
+            wb_r: f32::NAN,
+            wb_b: f32::NAN,
+            exposure_ev: 0.0,
+            contrast: 0.0,
+            highlights: 0.0,
+            shadows: 0.0,
+            whites: 0.0,
+            blacks: 0.0,
+            saturation: 0.0,
+            vibrance: 0.0,
+            temp: 0.0,
+            tint: 0.0,
+            texture: 0.0,
+            clarity: 0.0,
+        }
+    }
+
+    /// Parse a plain JS object of named look fields (camelCase, matching the
+    /// existing `RAW_NEUTRAL` shape in web/worker.js) into a `LookOverrides`.
+    ///
+    /// Contract (K6#1): **unknown key → `JsError`** (kills the silent-typo class
+    /// that the 14-positional-arg API allowed); **missing key → default** (neutral;
+    /// forward-compatible as the look grows). `null`/`undefined` → all-neutral.
+    /// Every recognized value must be a number (NaN is a valid number and is how
+    /// `wbR`/`wbB` request the camera WB).
+    fn from_js(obj: &JsValue) -> Result<LookOverrides, JsError> {
+        let mut look = LookOverrides::neutral();
+        if obj.is_undefined() || obj.is_null() {
+            return Ok(look);
+        }
+        let obj_ref = obj
+            .dyn_ref::<js_sys::Object>()
+            .ok_or_else(|| JsError::new("look params must be a plain object"))?;
+        for key in js_sys::Object::keys(obj_ref).iter() {
+            let k = key
+                .as_string()
+                .ok_or_else(|| JsError::new("look param key is not a string"))?;
+            let val = js_sys::Reflect::get(obj, &key)
+                .map_err(|_| JsError::new("failed to read look param value"))?;
+            let num = || -> Result<f32, JsError> {
+                val.as_f64()
+                    .map(|x| x as f32)
+                    .ok_or_else(|| JsError::new(&format!("look param '{k}' must be a number")))
+            };
+            match k.as_str() {
+                "exposureEv" => look.exposure_ev = num()?,
+                "contrast" => look.contrast = num()?,
+                "highlights" => look.highlights = num()?,
+                "shadows" => look.shadows = num()?,
+                "whites" => look.whites = num()?,
+                "blacks" => look.blacks = num()?,
+                "saturation" => look.saturation = num()?,
+                "vibrance" => look.vibrance = num()?,
+                "temp" => look.temp = num()?,
+                "tint" => look.tint = num()?,
+                "wbR" => look.wb_r = num()?,
+                "wbB" => look.wb_b = num()?,
+                "texture" => look.texture = num()?,
+                "clarity" => look.clarity = num()?,
+                other => {
+                    return Err(JsError::new(&format!(
+                        "unknown look param '{other}' (allowed: exposureEv, contrast, \
+                         highlights, shadows, whites, blacks, saturation, vibrance, temp, \
+                         tint, wbR, wbB, texture, clarity)"
+                    )))
+                }
+            }
+        }
+        Ok(look)
+    }
+}
+
 struct OrfDecoded {
     rgb16: Vec<u16>,
     w: usize,
@@ -1351,6 +1428,20 @@ pub fn process_orf_with_flags(
         texture,
         clarity,
     };
+    process_orf_impl(decode_orf_raw(data, output_flags)?, output_flags, &look)
+}
+
+/// K6#1: named-object look API. `look` is a plain JS object (camelCase fields —
+/// see `LookOverrides::from_js`); unknown key → error, missing key → neutral
+/// default. Preferred over the 14-positional-arg `process_orf_with_flags`, which
+/// remains for back-compat.
+#[wasm_bindgen]
+pub fn process_orf_with_look(
+    data: &[u8],
+    output_flags: u32,
+    look: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let look = LookOverrides::from_js(&look)?;
     process_orf_impl(decode_orf_raw(data, output_flags)?, output_flags, &look)
 }
 
@@ -2437,6 +2528,17 @@ impl LookRenderer {
             Ok(final_rgb)
         }
     }
+
+    /// K6#1: named-object look API. `look` is a plain JS object (camelCase fields —
+    /// see `LookOverrides::from_js`); unknown key → error, missing key → neutral.
+    /// Preferred over the 14-positional-arg `render`, which remains for back-compat.
+    pub fn render_look(&self, look: JsValue) -> Result<Vec<u8>, JsError> {
+        let l = LookOverrides::from_js(&look)?;
+        self.render(
+            l.wb_r, l.wb_b, l.exposure_ev, l.contrast, l.highlights, l.shadows, l.whites,
+            l.blacks, l.saturation, l.vibrance, l.temp, l.tint, l.texture, l.clarity,
+        )
+    }
 }
 
 /// EXIF metadata extracted without demosaic/tonemap.  Use for gallery thumbnails,
@@ -2998,6 +3100,17 @@ pub fn process_dng_with_flags(
     process_dng_impl(decode_dng_raw(data, output_flags)?, output_flags, &look)
 }
 
+/// K6#1: named-object look API for DNG (see [`process_orf_with_look`]).
+#[wasm_bindgen]
+pub fn process_dng_with_look(
+    data: &[u8],
+    output_flags: u32,
+    look: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let look = LookOverrides::from_js(&look)?;
+    process_dng_impl(decode_dng_raw(data, output_flags)?, output_flags, &look)
+}
+
 // ─── CR2 pipeline ─────────────────────────────────────────────────────────────
 
 struct Cr2Decoded {
@@ -3280,6 +3393,17 @@ pub fn process_cr2_with_flags(
         texture,
         clarity,
     };
+    process_cr2_impl(decode_cr2_raw(data)?, output_flags, &look)
+}
+
+/// K6#1: named-object look API for CR2 (see [`process_orf_with_look`]).
+#[wasm_bindgen]
+pub fn process_cr2_with_look(
+    data: &[u8],
+    output_flags: u32,
+    look: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let look = LookOverrides::from_js(&look)?;
     process_cr2_impl(decode_cr2_raw(data)?, output_flags, &look)
 }
 
@@ -4006,4 +4130,81 @@ pub fn fable_decode_rgb8_delta(
 ) -> Result<Vec<u8>, JsValue> {
     raw_pipeline::fable_braid::decode_rgb8_delta(bytes, prev, width, height)
         .ok_or_else(|| JsValue::from_str("fable: corrupt delta stream"))
+}
+
+/// K6#4: stateful FableBraid decode session for browser CASV playback. Mirrors the
+/// native `DeltaDecodeSession` (`fable_braid.rs`): decode an intra keyframe, then
+/// temporal-delta frames against the previous frame this session returned. The
+/// stateless `fable_decode_rgb8*` fns above are pure functions; the fable video
+/// tier is a whole-frame temporal chain, so browser playback needs this session.
+///
+/// `decode_intra` sets `width`/`height`; `decode_delta` takes the current dims and
+/// the previous frame's RGB8 (the value this session last returned).
+#[wasm_bindgen]
+pub struct FableDeltaSession {
+    inner: raw_pipeline::fable_braid::DeltaDecodeSession,
+    last_w: u32,
+    last_h: u32,
+}
+
+#[wasm_bindgen]
+impl FableDeltaSession {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> FableDeltaSession {
+        FableDeltaSession {
+            inner: raw_pipeline::fable_braid::DeltaDecodeSession::new(),
+            last_w: 0,
+            last_h: 0,
+        }
+    }
+
+    /// Decode an intra (keyframe) fable frame; caches its planes for subsequent
+    /// `decode_delta` calls. Updates `width`/`height`. Returns interleaved RGB8.
+    pub fn decode_intra(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+        match self.inner.decode_intra(bytes) {
+            Some((px, w, h)) => {
+                self.last_w = w;
+                self.last_h = h;
+                Ok(px)
+            }
+            None => Err(JsError::new(
+                "fable decode_intra failed (corrupt container or non-subtract-green RCT)",
+            )),
+        }
+    }
+
+    /// Decode a temporal-delta fable frame against `prev` (the RGB8 this session
+    /// returned for the previous frame). `w`/`h` are the current frame dims.
+    pub fn decode_delta(
+        &mut self,
+        bytes: &[u8],
+        prev: &[u8],
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<u8>, JsError> {
+        match self.inner.decode_delta(bytes, prev, w, h) {
+            Some(px) => {
+                self.last_w = w;
+                self.last_h = h;
+                Ok(px)
+            }
+            None => Err(JsError::new("fable decode_delta failed (corrupt stream or dim mismatch)")),
+        }
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.last_w
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.last_h
+    }
+}
+
+impl Default for FableDeltaSession {
+    fn default() -> Self {
+        Self::new()
+    }
 }

@@ -1,6 +1,9 @@
 // BSD-clean own-FFI JXL codec (replaces GPL jpegxl-rs/jpegxl-sys). Native only.
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 pub mod casa_video;
+// K4: RAW time-lapse → CASV (RawVideoSource). Native + jxl-codec (feeds casa_video).
+#[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+pub mod raw_video;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 pub mod jxl_casadecoder;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
@@ -18,6 +21,7 @@ pub mod demosaic;
 pub mod dng;
 pub mod exif;
 pub mod fable_braid;
+pub mod frame_pipeline;
 pub mod frame_stats;
 pub mod image_formats;
 pub mod ljpeg;
