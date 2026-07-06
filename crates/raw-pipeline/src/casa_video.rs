@@ -41,7 +41,8 @@
 
 use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
 use crate::jxl_casaencoder::{
-    encode_chunked, encode_rgb8, EncodeError, EncodeOptions, Encoder, Frame, WholeImageSource,
+    encode_chunked_threaded, encode_rgb8, encode_rgb8_downsampled, EncodeError, EncodeOptions,
+    Encoder, Frame, WholeImageSource,
 };
 use rayon::prelude::*;
 
@@ -318,6 +319,28 @@ pub fn encode_casv_video_with_audio_progress(
     let mut buf = Vec::new();
     // Use the footer-format sink encoder: writes [frames][index][CASR][footer].
     encode_casv_video_streaming_to_progress(&mut src, opts, &mut buf, on_frame)?;
+    if let Some(audio) = ogg_opus {
+        // Insert CSAU between the CASR box and the 32-byte footer.
+        let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
+        write_csau_box(&mut buf, audio);
+        buf.extend_from_slice(&footer);
+    }
+    Ok(buf)
+}
+
+/// Like [`encode_casv_video_with_audio_progress`] but pulls frames from a lazy
+/// `src` instead of a resident slice — so a caller that decodes frames on demand
+/// (e.g. from a video stream) keeps peak memory at ~2 frames rather than the
+/// whole clip. Byte-identical output for the same frame sequence (both feed the
+/// same streaming encoder). Same footer format + CSAU insertion.
+pub fn encode_casv_video_streaming_with_audio_progress(
+    src: &mut dyn VideoFrameSource,
+    opts: &CasaVideoOptions,
+    ogg_opus: Option<&[u8]>,
+    on_frame: &mut dyn FnMut(usize),
+) -> Result<Vec<u8>, VideoError> {
+    let mut buf = Vec::new();
+    encode_casv_video_streaming_to_progress(src, opts, &mut buf, on_frame)?;
     if let Some(audio) = ogg_opus {
         // Insert CSAU between the CASR box and the 32-byte footer.
         let footer = buf.split_off(buf.len() - CASV_FOOTER_BYTES);
@@ -711,6 +734,34 @@ pub trait VideoFrameSource {
 ///
 /// v1 buffers the compressed output in RAM (small vs raw frames); a true
 /// stream-to-sink footer format is a later step.
+/// Worker-thread count for the **streaming I-frame** libjxl encode. The
+/// streaming encoders process one frame at a time, so — unlike the rayon
+/// frame-parallel batch encoders — the cores sit idle during each I-frame's
+/// full-res VarDCT encode; a libjxl parallel runner fills them (flip-measured
+/// **1.62×** on all-intra content). The tiny P-frame REPLACE atlases are
+/// deliberately left single-threaded: a changed-tile atlas on typical (low-
+/// motion) content is one libjxl group or less, so the per-frame fork-join
+/// sync would cost more than the parallelism gains (this is the CV-E6 finding;
+/// the JE-8 square atlas fixed the sliver *shape* but not the sub-group *size*,
+/// and the flip sweep confirmed atlas MT is a wash-to-noise there). Threading
+/// only the reliably-large I-frame encode captures the win with no regression
+/// risk. Output is byte-identical across thread counts
+/// (`encode_chunked_threaded` is proven so), so this only moves wall-clock.
+/// `CASV_ENC_THREADS` overrides for A/B (`1` = single-threaded baseline,
+/// `0`/unset = auto = all cores).
+fn resolve_enc_threads() -> usize {
+    if let Ok(v) = std::env::var("CASV_ENC_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
 struct StreamCtx {
     width: u32,
     height: u32,
@@ -719,6 +770,8 @@ struct StreamCtx {
     skip: SkipMode,
     tile: u32,
     thresh: u8,
+    /// Worker threads for the I-frame chunked encode (see [`resolve_enc_threads`]).
+    enc_threads: usize,
     /// One `JxlEncoder` handle reused for every P-frame crop/atlas encode
     /// (`encode_into` Resets it between encodes) — kills the per-frame
     /// create/destroy + settings resend and appends compressed bytes straight
@@ -740,6 +793,7 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
     if matches!(opts.skip, SkipMode::None) {
         return Err(VideoError::Unsupported);
     }
+    let enc_threads = resolve_enc_threads();
     Ok(StreamCtx {
         width,
         height,
@@ -750,7 +804,10 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
         thresh: opts
             .thresh
             .unwrap_or_else(|| default_thresh_for_distance(distance)),
+        // P-frame atlas encoder stays single-threaded on purpose (see
+        // `resolve_enc_threads`): tiny sub-group atlases lose to fork-join sync.
         enc: Encoder::new(EncodeOptions::distance(distance).with_effort(opts.effort))?,
+        enc_threads,
         changed: Vec::new(),
         bitmap: Vec::new(),
         atlas: Vec::new(),
@@ -848,7 +905,15 @@ fn encode_stream_frame(
             data: px,
             width: width as usize,
         };
-        encode_chunked(width, height, ctx.distance, ctx.effort, &mut isrc, payload)?;
+        encode_chunked_threaded(
+            width,
+            height,
+            ctx.distance,
+            ctx.effort,
+            ctx.enc_threads,
+            &mut isrc,
+            payload,
+        )?;
         return Ok(0);
     }
     if matches!(ctx.skip, SkipMode::Tile) {
@@ -1192,6 +1257,72 @@ pub fn encode_casv_rgb8(
         offset += s.len();
     }
     // Data.
+    for s in &streams {
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
+/// Encode a **full-dimensioned low-resolution proxy** `.casv`: every frame is an
+/// independent JXL codestream that stores `1/factor` linear resolution but
+/// declares the full `width×height`, so the decoder upsamples each frame back to
+/// full size ([`encode_rgb8_downsampled`]). All-intra (Architecture A) — instant
+/// random access, ideal for editor scrubbing — and ~2–5× faster to encode than a
+/// full-resolution all-intra `.casv` because each frame codes only `1/factor²`
+/// the pixels. The output is dimension-identical to the full-res encode, so it
+/// drops in 1:1 as a scrubbing proxy and decodes with the **unchanged**
+/// [`decode_casv_all_rgb8`] (each frame self-upsamples to the declared dims).
+/// `factor == 1` is byte-identical to [`encode_casv_rgb8`].
+pub fn encode_casv_proxy_rgb8(
+    frames: &[&[u8]],
+    width: u32,
+    height: u32,
+    fps_num: u32,
+    fps_den: u32,
+    factor: u32,
+    opts: EncodeOptions,
+) -> Result<Vec<u8>, VideoError> {
+    if frames.is_empty() {
+        return Err(VideoError::Empty);
+    }
+    let expected = (width as usize) * (height as usize) * 3;
+
+    // Independent frames → encode in parallel (order preserved by collect).
+    let streams: Vec<Vec<u8>> = frames
+        .par_iter()
+        .enumerate()
+        .map(|(idx, px)| {
+            if px.len() != expected {
+                return Err(VideoError::FrameSize {
+                    idx,
+                    expected,
+                    got: px.len(),
+                });
+            }
+            Ok(encode_rgb8_downsampled(px, width, height, factor, opts.clone())?)
+        })
+        .collect::<Result<Vec<_>, VideoError>>()?;
+
+    // Container declares the FULL dims; each frame's codestream self-upsamples.
+    let header = CasvHeader {
+        width,
+        height,
+        frame_count: frames.len() as u32,
+        fps_num,
+        fps_den,
+        flags: 0,
+    };
+    let index_bytes = frames.len() * CASV_INDEX_ENTRY_BYTES;
+    let data_start = CASV_HEADER_BYTES + index_bytes;
+    let total: usize = data_start + streams.iter().map(|s| s.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&build_casv_header(&header));
+    let mut offset = data_start;
+    for s in &streams {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        offset += s.len();
+    }
     for s in &streams {
         out.extend_from_slice(s);
     }
@@ -2788,6 +2919,33 @@ mod tests {
     }
 
     #[test]
+    fn proxy_encode_decodes_to_full_size_and_is_all_intra() {
+        // Dims divisible by 4 so factor 2/4 downsample cleanly. The proxy declares
+        // full dims; every frame self-upsamples on decode.
+        let (w, h) = (32u32, 24u32);
+        let src: Vec<Vec<u8>> = (0..3).map(|s| gradient(w, h, (s * 40) as u8)).collect();
+        let refs: Vec<&[u8]> = src.iter().map(|v| v.as_slice()).collect();
+
+        // factor 1 == plain all-intra, byte-identical to encode_casv_rgb8.
+        let p1 = encode_casv_proxy_rgb8(&refs, w, h, 24, 1, 1, EncodeOptions::distance(1.0)).unwrap();
+        let a1 = encode_casv_rgb8(&refs, w, h, 24, 1, EncodeOptions::distance(1.0)).unwrap();
+        assert_eq!(p1, a1, "factor 1 proxy must equal encode_casv_rgb8");
+
+        // factor 2 proxy: smaller, all-intra, decodes to full dims via self-upsampling.
+        let p2 = encode_casv_proxy_rgb8(&refs, w, h, 24, 1, 2, EncodeOptions::distance(1.0)).unwrap();
+        assert!(p2.len() < a1.len(), "proxy must be smaller than full-res all-intra");
+        let all = decode_casv_all_rgb8(&p2).expect("decode proxy");
+        assert_eq!(all.len(), 3);
+        for (i, (px, dw, dh)) in all.iter().enumerate() {
+            assert_eq!((*dw, *dh), (w, h), "frame {i} decodes to full dims");
+            assert_eq!(px.len(), (w * h * 3) as usize);
+        }
+        for i in 0..3 {
+            assert!(!casv_frame_info(&p2, i).unwrap().0, "proxy frame {i} must be I (all-intra)");
+        }
+    }
+
+    #[test]
     fn fable_roundtrip_is_byte_exact_with_gop_and_random_access() {
         let (w, h) = (30u32, 22u32);
         // 9 frames, GOP 4 → I at 0/4/8; includes identical consecutive frames
@@ -3310,6 +3468,62 @@ mod tests {
             v2.len() as f64 / v1.len() as f64,
             m1 / m2
         );
+    }
+
+    #[test]
+    fn streaming_source_with_audio_matches_slice_batch() {
+        // A lazy pull source must produce byte-identical output to the resident
+        // slice path for the same frames (both feed encode_casv_video_streaming_
+        // to_progress + the same CSAU insertion). Guards the sidecar's lazy-decode
+        // memory optimization.
+        struct VF {
+            f: Vec<Vec<u8>>,
+            i: usize,
+            w: u32,
+            h: u32,
+        }
+        impl VideoFrameSource for VF {
+            fn dims(&self) -> (u32, u32) {
+                (self.w, self.h)
+            }
+            fn fps(&self) -> (u32, u32) {
+                (24, 1)
+            }
+            fn next_frame(&mut self) -> Option<Vec<u8>> {
+                if self.i < self.f.len() {
+                    let v = self.f[self.i].clone();
+                    self.i += 1;
+                    Some(v)
+                } else {
+                    None
+                }
+            }
+        }
+        let (w, h) = (32u32, 24u32);
+        let frames: Vec<Vec<u8>> = (0..7).map(|s| gradient(w, h, (s * 30) as u8)).collect();
+        let opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            skip: SkipMode::Tile,
+            gop_len: 3,
+            tile: 16,
+            effort: 3,
+            thresh: Some(8),
+            rate_control: None,
+        };
+        let audio = b"OggS fake opus payload".as_slice();
+        let batch = encode_casv_video_with_audio_progress(
+            &frames, w, h, 24, 1, &opts, Some(audio), &mut |_| {},
+        )
+        .unwrap();
+        let mut src = VF { f: frames.clone(), i: 0, w, h };
+        let streamed = encode_casv_video_streaming_with_audio_progress(
+            &mut src, &opts, Some(audio), &mut |_| {},
+        )
+        .unwrap();
+        // Byte-identical to the already-shipping slice path is the guarantee
+        // (both emit footer-format + CSAU); decode is covered by the footer
+        // roundtrip tests.
+        assert_eq!(batch, streamed, "lazy source must byte-match the slice batch");
     }
 
     #[test]

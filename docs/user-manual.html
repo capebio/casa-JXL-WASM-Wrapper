@@ -72,7 +72,7 @@ li{margin-bottom:4px}
 <body>
 <div id="wrap">
 <div id="header">
-  <h1>CasaWASM <small>Developer Manual · 2026-07-03</small></h1>
+  <h1>CasaWASM <small>Developer Manual · 2026-07-05</small></h1>
 </div>
 <div id="tabbar">
   <button class="tb on" onclick="sw(0)">Architecture</button>
@@ -528,6 +528,32 @@ u32 raw_len | raw_residual_bytes</pre>
   <p>A separate, runtime-only colour adjustment engine in <code class="path">crates/raw-pipeline/src/pipeline.rs</code> (<code>apply_tone_math</code> hot path). Not the same as the Butteraugli-replacement kernel above.</p>
   <p>When <code>PipelineParams.perceptual_constancy = true</code>: illumination-invariant exposure/saturation/white-balance using a log-space foundation grounded in Bujack et al. 2022/2025 (non-Riemannian colour geometry). Targets AR plant recognition and photogrammetry workflows — specimens read consistently under varying light. Also improves early progressive-frame usability for ML/AR pipelines (consistent features even on DC-only passes).</p>
   <p class="dim" style="font-size:12px">Status: stub + log-space foundation in place. Full B-matrix + Molchanov tensor integration planned as LUT/SIMD accelerated path. Runtime-only — never baked into ingest.</p>
+
+  <h3>16-bit Metric Variants (2026-07-05)</h3>
+  <p>The three metrics above run at 8-bit (255² PSNR peak, u8 XYB LUT) and drive the runtime progressive-convergence loop. The codec-comparison benchmark needs distortion resolved at <b>full bit depth</b> — an 8-bit metric quantises away the &gt;8-bit signal, which would make a 16-bit RD curve a mere mirror of the 8-bit one. Three 16-bit variants:</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Metric</th><th>Where</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>computeButteraugli16</b></td>
+        <td><code class="path">packages/jxl-wasm/src/bridge.cpp</code> · facade</td>
+        <td>libjxl Butteraugli over RGBA16. Faithful clone of the 8-bit bridge — the <em>only</em> change is the pixel read: <code>pow(v/65535, 2.2)</code> replaces the 256-entry <code>SrgbGamma22Lut</code> (same gamma-2.2 transfer at 16-bit resolution). Bit-promoted 8-bit input (<code>b·257</code>) linearises byte-identically to the 8-bit path → parity probe <code>self=0, rel=0.0000</code>.</td>
+      </tr>
+      <tr>
+        <td><b>psnr16</b></td>
+        <td><code class="path">benchmark/metrics16.mjs</code></td>
+        <td>Pure JS over interleaved RGBA16 (alpha skipped). <code>10·log₁₀(65535²/MSE)</code>.</td>
+      </tr>
+      <tr>
+        <td><b>ssim16</b></td>
+        <td><code class="path">benchmark/metrics16.mjs</code></td>
+        <td>16-bit luma, 8×8 non-overlapping windows. <code>C1=(0.01·65535)²</code>, <code>C2=(0.03·65535)²</code>.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="dim" style="font-size:12px">Benchmark-only — not wired into the runtime convergence loop (which stays 8-bit PerSee). See <b>Benchmarks → 16-bit / HDR Codec Comparison</b>.</p>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════ TAB 3: BENCHMARKS -->
@@ -663,6 +689,47 @@ u32 raw_len | raw_residual_bytes</pre>
     </tbody>
   </table>
   </div>
+
+  <h3>16-bit / HDR Codec Comparison (2026-07-05)</h3>
+  <p>A real 16-bit rate-distortion path in the codec-paper suite (<code class="path">CodecPaperFullTest.mjs</code>), replacing the former static "16-bit/HDR" capability-matrix row. Source is the project's own RAW-derived high-bit-depth content — the honest &gt;8-bit source.</p>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Stage</th><th>What</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>Source</b></td>
+        <td>RAW → display-referred RGBA16 render. New flag <code>OUT_FULL_DISP16</code> (=32) on <code>process_{orf,cr2,dng}_with_flags</code> → <code>take_rgb16_disp()</code>, then <code>downscale_rgb16_pub</code> + <code>rgb16_to_rgba16</code> to a 1920 long-edge. Reuses the existing <code>pipeline::process_16bit</code> render at full-range [0,65535]; <code>disp16&gt;&gt;8</code> matches the shipped 8-bit render to <b>0.0000%</b>.</td>
+      </tr>
+      <tr>
+        <td><b>Codecs</b></td>
+        <td>JXL (our facade, <code>format:'rgba16'</code>), AVIF 10/12-bit (sharp), PNG-16 (lossless anchor, bit-exact). JPEG/WebP are 8-bit-only and excluded; <code>@jsquash/jxl</code> is 8-bit-only, so there is no <code>jxl_orig</code> 16-bit reference.</td>
+      </tr>
+      <tr>
+        <td><b>Metrics</b></td>
+        <td>psnr16 + ssim16 (JS) always; butteraugli16 (WASM bridge) when present. See <b>Perceptual Metrics → 16-bit Metric Variants</b>.</td>
+      </tr>
+      <tr>
+        <td><b>Figures</b></td>
+        <td><code>rd-{psnr,ssim,butteraugli}-16bit.svg</code> + <code>lossless-16bit-size.svg</code> (PNG-16 floor) + a "16-bit / HDR Rate-Distortion" gallery section.</td>
+      </tr>
+    </tbody>
+  </table>
+  </div>
+  <div class="box box-green">
+    <div class="box-title">Additive-metric design</div>
+    <p style="margin:0">The 16-bit Butteraugli bridge needs an Emscripten rebuild — the one high-risk step. It is <b>additive</b>: <code>butteraugliDistance16</code> returns <code>null</code> when the symbol is absent → the driver omits <code>butteraugli16</code> from the row → the figure and its gallery entry are omitted, while PSNR-16/SSIM-16 still render. The deliverable is never blocked on the rebuild.</p>
+  </div>
+  <div class="tbl-wrap">
+  <table>
+    <thead><tr><th>Rebuild / probe</th><th>Command</th></tr></thead>
+    <tbody>
+      <tr><td>RAW pkg (RGBA16 export)</td><td><code>build-parallel-wasm.ps1</code> — drop the <code>c-perceptual</code> feature (AVX2 can't target wasm32; <code>PerceptualComparer</code> is pure-Rust and unaffected).</td></tr>
+      <tr><td>enc:simd WASM tier (butteraugli16)</td><td><code>JXL_WASM_ONLY_KIND=enc … build.mjs --host-toolchain</code> (needs <code>external/libjxl-012</code> or <code>LIBJXL_SRC_DIR</code>).</td></tr>
+      <tr><td>Probes</td><td><code class="path">tools/probe-16bit-disp.mjs</code> · <code class="path">tools/probe-butteraugli16.mjs</code></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="dim" style="font-size:12px">True HDR (PQ/HLG, Rec.2020) deferred — needs an HDR corpus + a PU/PQ-domain metric; the <code>rgbaf32</code> facade path is the substrate. Follow-up spec: <code class="path">docs/superpowers/specs/2026-07-05-hdr-followup-part3c.md</code>.</p>
 </div>
 
 </div><!-- #content -->
