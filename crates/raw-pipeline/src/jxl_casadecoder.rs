@@ -1330,6 +1330,94 @@ pub fn decode_progressive_first_total(jxl_bytes: &[u8]) -> Option<(f64, f64)> {
 pub use decode_full as bench_jxl_decode_lowlevel_full;
 pub use decode_progressive_first_total as bench_jxl_decode_lowlevel_progressive;
 
+/// Decode only the DC (lowest-frequency) pass of a progressive JXL.
+/// Returns `(rgb8_pixels, width, height, elapsed_ms)`.
+/// BSD-clean replacement for the GPL `jpegxl-sys` path in
+/// `bench.rs`, which used `jpegxl-sys::decode::JxlDecoderSetProgressiveDetail`.
+pub fn decode_dc(jxl_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, u64), String> {
+    unsafe {
+        let dec = ffi::JxlDecoderCreate(std::ptr::null());
+        if dec.is_null() {
+            return Err("JxlDecoderCreate returned null".into());
+        }
+
+        let events = S_BASIC.0 | S_PROG.0 | S_FULL.0;
+        if ffi::JxlDecoderSubscribeEvents(dec, events) != S_SUCCESS {
+            ffi::JxlDecoderDestroy(dec);
+            return Err("JxlDecoderSubscribeEvents failed".into());
+        }
+        if ffi::JxlDecoderSetProgressiveDetail(dec, ffi::JxlProgressiveDetail::kDC) != S_SUCCESS {
+            ffi::JxlDecoderDestroy(dec);
+            return Err("JxlDecoderSetProgressiveDetail(kDC) failed".into());
+        }
+        if ffi::JxlDecoderSetInput(dec, jxl_bytes.as_ptr(), jxl_bytes.len()) != S_SUCCESS {
+            ffi::JxlDecoderDestroy(dec);
+            return Err("JxlDecoderSetInput failed".into());
+        }
+        ffi::JxlDecoderCloseInput(dec);
+
+        let pf = pixel_format::<u8>(3); // RGB
+        let mut info = std::mem::MaybeUninit::<ffi::JxlBasicInfo>::uninit();
+        let mut w: u32 = 0;
+        let mut h: u32 = 0;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut buf_set = false;
+        let t = Instant::now();
+
+        loop {
+            let status = ffi::JxlDecoderProcessInput(dec);
+            if status == S_BASIC {
+                if ffi::JxlDecoderGetBasicInfo(dec, info.as_mut_ptr()) == S_SUCCESS {
+                    let bi = info.assume_init_ref();
+                    w = bi.xsize;
+                    h = bi.ysize;
+                }
+            } else if status == S_NEEDOUT {
+                let mut size: usize = 0;
+                if ffi::JxlDecoderImageOutBufferSize(dec, &pf, &mut size) != S_SUCCESS {
+                    ffi::JxlDecoderDestroy(dec);
+                    return Err("JxlDecoderImageOutBufferSize failed".into());
+                }
+                buf.resize(size, 0);
+                if ffi::JxlDecoderSetImageOutBuffer(dec, &pf, buf.as_mut_ptr() as *mut _, size)
+                    != S_SUCCESS
+                {
+                    ffi::JxlDecoderDestroy(dec);
+                    return Err("JxlDecoderSetImageOutBuffer failed".into());
+                }
+                buf_set = true;
+            } else if status == S_PROG {
+                // Deferred buffer: libjxl requested progression before output buffer was set.
+                if !buf_set {
+                    let mut size: usize = 0;
+                    if ffi::JxlDecoderImageOutBufferSize(dec, &pf, &mut size) == S_SUCCESS {
+                        buf.resize(size, 0);
+                        let _ = ffi::JxlDecoderSetImageOutBuffer(
+                            dec,
+                            &pf,
+                            buf.as_mut_ptr() as *mut _,
+                            size,
+                        );
+                    }
+                }
+                if ffi::JxlDecoderFlushImage(dec) == S_SUCCESS && w > 0 && h > 0 {
+                    let ms = t.elapsed().as_millis() as u64;
+                    ffi::JxlDecoderDestroy(dec);
+                    return Ok((buf, w, h, ms));
+                }
+            } else if status == S_FULL || status == S_SUCCESS {
+                // No separate DC pass; return full image.
+                let ms = t.elapsed().as_millis() as u64;
+                ffi::JxlDecoderDestroy(dec);
+                return Ok((buf, w, h, ms));
+            } else if status == ffi::JxlDecoderStatus::JXL_DEC_ERROR || status == S_NEEDIN {
+                ffi::JxlDecoderDestroy(dec);
+                return Err(format!("JxlDecoderProcessInput error: {}", status.0));
+            }
+        }
+    }
+}
+
 // ── per-tile JXTC ROI container (pure container math + Decoder-backed decode) ──
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
