@@ -456,7 +456,7 @@ interface LibjxlWasmModule {
   _jxl_wasm_dec_flush_duplicate_skips?(state: number): number;
   _jxl_wasm_dec_flush_image_ms?(state: number): number;
   // Sidecar thumbnail encode (present after WASM rebuild with sidecar bridge)
-  _jxl_wasm_encode_rgba8_with_sidecars?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, sidecarDimsPtr: number, numSidecars: number): number;
+  _jxl_wasm_encode_rgba8_with_sidecars?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, sidecarDimsPtr: number, numSidecars: number, resampling: number): number;
   _jxl_wasm_buffer_next?(handle: number): number;
   // #10: C++ region crop decode — avoids shipping full-image pixels to JS
   _jxl_wasm_decode_rgba8_region?(inputPtr: number, inputSize: number, cx: number, cy: number, cw: number, ch: number, downsample: number): number;
@@ -464,7 +464,7 @@ interface LibjxlWasmModule {
   _jxl_wasm_decode_rgbaf32_region?(inputPtr: number, inputSize: number, cx: number, cy: number, cw: number, ch: number, downsample: number): number;
   // #11: Streaming encoder — yields 64 KB chunks
   _jxl_wasm_enc_create?(): number;
-  _jxl_wasm_enc_push_pixels?(state: number, pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
+  _jxl_wasm_enc_push_pixels?(state: number, pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
   _jxl_wasm_enc_take_chunk?(state: number): number;
   _jxl_wasm_enc_error?(state: number): number;
   _jxl_wasm_enc_free?(state: number): void;
@@ -2423,7 +2423,7 @@ class LibjxlEncoder implements JxlEncoder {
             let handle = module._jxl_wasm_encode_rgba8_with_sidecars!(
               ptr, this.options.width, this.options.height,
               distance, this.options.effort, hasAlpha,
-              dimsPtr, sortedSizes.length,
+              dimsPtr, sortedSizes.length, resampling,
             );
             while (handle !== 0) {
               // Capture next pointer before takeBuffer frees handle.
@@ -2452,7 +2452,7 @@ class LibjxlEncoder implements JxlEncoder {
           const fmtIndex = this.options.format === "rgbaf32" ? 2 : this.options.format === "rgba16" ? 1 : this.options.format === "rgb8" ? 3 : 0;
             const encState = module._jxl_wasm_enc_create!();
             try {
-            const rc = module._jxl_wasm_enc_push_pixels!(encState, ptr, this.options.width, this.options.height, distance, this.options.effort, fmtIndex, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering);
+            const rc = module._jxl_wasm_enc_push_pixels!(encState, ptr, this.options.width, this.options.height, distance, this.options.effort, fmtIndex, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering, groupOrder, resampling);
             if (rc !== 0) throw new Error(`JXL streaming encode failed (${rc})`);
             let chunkHandle: number;
             while ((chunkHandle = module._jxl_wasm_enc_take_chunk!(encState)) !== 0) {
