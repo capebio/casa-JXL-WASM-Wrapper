@@ -553,6 +553,42 @@ fn resolve_backend(opts: &Opts) -> Backend {
 /// (`fill_test_xyb`) so both sides run the identical conversion — on AVX2 the
 /// scalar-LUT kernel, on AVX-512/wasm their SIMD kernels, else the scalar tail.
 fn convert_xyb(backend: Backend, px: &[u8], n: usize, x: &mut [f32], y: &mut [f32], b: &mut [f32]) {
+    // Pixel-band parallelism (native only; the wasm threaded tier stays serial
+    // until a flipflopdom browser bench exists — scheduling changes are
+    // bench-gated). The conversion is a pure per-pixel map (LUT + matrix, no
+    // cross-pixel state, no accumulators), so a band split is unconditionally
+    // bit-identical: each output element is the same function of its own input
+    // pixel regardless of banding. Bands call the SAME dispatched kernel on
+    // subslices. Gated ≥2M px (bench: examples/xyb_band_mt_flip.rs).
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    {
+        const XYB_BAND_PX: usize = 1 << 20;
+        if n >= 2 * XYB_BAND_PX {
+            use rayon::prelude::*;
+            x[..n].par_chunks_mut(XYB_BAND_PX)
+                .zip(y[..n].par_chunks_mut(XYB_BAND_PX))
+                .zip(b[..n].par_chunks_mut(XYB_BAND_PX))
+                .enumerate()
+                .for_each(|(k, ((xb, yb), bb))| {
+                    let p0 = k * XYB_BAND_PX;
+                    let m = xb.len();
+                    convert_xyb_one(backend, &px[p0 * 4..(p0 + m) * 4], m, xb, yb, bb);
+                });
+            return;
+        }
+    }
+    convert_xyb_one(backend, px, n, x, y, b);
+}
+
+/// Single-band dispatch — the original `convert_xyb` body.
+fn convert_xyb_one(
+    backend: Backend,
+    px: &[u8],
+    n: usize,
+    x: &mut [f32],
+    y: &mut [f32],
+    b: &mut [f32],
+) {
     match backend {
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2Strict | Backend::Avx2Rsqrt => unsafe {
@@ -671,6 +707,31 @@ fn downsample_inplace(src: &[f32], dst: &mut [f32], w: usize, h: usize, dw: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// convert_xyb at a pixel count crossing the 2M-px band gate must be
+    /// BIT-identical to the single-band dispatch (pure per-pixel map — banding
+    /// cannot change any element). Covers a partial last band + non-multiple-
+    /// of-8 tail on the Auto backend of the test machine.
+    #[test]
+    fn convert_xyb_parallel_bands_bit_identical() {
+        let n = (1usize << 21) + (1 << 19) + 3; // 2.62M px, odd tail
+        let mut px = vec![0u8; n * 4];
+        let mut s: u32 = 0x5555_1234;
+        for v in &mut px {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (s >> 16) as u8;
+        }
+        let backend = resolve_backend(&Opts::default());
+        let (mut x1, mut y1, mut b1) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+        let (mut x2, mut y2, mut b2) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+        convert_xyb(backend, &px, n, &mut x1, &mut y1, &mut b1);
+        convert_xyb_one(backend, &px, n, &mut x2, &mut y2, &mut b2);
+        for i in 0..n {
+            assert_eq!(x1[i].to_bits(), x2[i].to_bits(), "x[{i}]");
+            assert_eq!(y1[i].to_bits(), y2[i].to_bits(), "y[{i}]");
+            assert_eq!(b1[i].to_bits(), b2[i].to_bits(), "b[{i}]");
+        }
+    }
 
     fn checker(w: usize, h: usize) -> Vec<u8> {
         let mut v = vec![0u8; w * h * 4];
