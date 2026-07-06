@@ -185,6 +185,16 @@ export class EncodeHandler {
       intrinsicSize: (this.opts as MsgEncodeStart).intrinsicSize,
       disablePerceptualHeuristics: (this.opts as MsgEncodeStart).disablePerceptualHeuristics,
       codestreamLevel: (this.opts as MsgEncodeStart).codestreamLevel,
+      // Advanced density knobs the facade EncoderOptions honors directly (K6#2).
+      // Previously dropped at this boundary despite being on the wire. The other
+      // advanced wire fields (buffering, alreadyDownsampled, upsamplingMode,
+      // ecResampling, frameIndexing, allowExpertOptions, advancedControls,
+      // jpegReconstruction) need lower-level create_image_* plumbing not exposed by
+      // the high-level facade encoder — carried on the wire for future consumers.
+      modular: (this.opts as MsgEncodeStart).modular,
+      brotliEffort: (this.opts as MsgEncodeStart).brotliEffort,
+      decodingSpeed: (this.opts as MsgEncodeStart).decodingSpeed,
+      photonNoiseIso: (this.opts as MsgEncodeStart).photonNoiseIso,
       copyInput: false,
     } as Parameters<JxlModule["createEncoder"]>[0];
     const tCreate0 = performance.now();

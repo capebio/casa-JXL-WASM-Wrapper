@@ -48,6 +48,10 @@ interface NodeCodecModule {
     progressiveAc?: number;
     qProgressiveAc?: number;
     groupOrder?: number;
+    modular?: number;
+    brotliEffort?: number;
+    decodingSpeed?: number;
+    photonNoiseIso?: number;
   }): NodeEncoder;
 }
 
@@ -166,6 +170,12 @@ export class EncodeHandler {
       ...(this.opts.progressiveAc != null ? { progressiveAc: this.opts.progressiveAc } : {}),
       ...(this.opts.qProgressiveAc != null ? { qProgressiveAc: this.opts.qProgressiveAc } : {}),
       ...(this.opts.groupOrder != null ? { groupOrder: this.opts.groupOrder } : {}),
+      // Advanced density knobs the facade honors directly (K6#2) — previously
+      // dropped here despite being on the wire.
+      ...(this.opts.modular != null ? { modular: this.opts.modular } : {}),
+      ...(this.opts.brotliEffort != null ? { brotliEffort: this.opts.brotliEffort } : {}),
+      ...(this.opts.decodingSpeed != null ? { decodingSpeed: this.opts.decodingSpeed } : {}),
+      ...(this.opts.photonNoiseIso != null ? { photonNoiseIso: this.opts.photonNoiseIso } : {}),
     };
     const encoder = codec.createEncoder(encOpts);
     this.encoder = encoder;
