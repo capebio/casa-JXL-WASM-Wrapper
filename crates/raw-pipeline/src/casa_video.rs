@@ -538,6 +538,16 @@ impl CasaVideoOptions {
             ..Self::streaming(start_distance)
         }
     }
+    /// [`Self::streaming_bitrate`] plus confidence-scheduled tile admission:
+    /// over-budget frames ship only their highest-SAD tiles and defer the rest
+    /// against the last-sent state (see [`RateControl::tile_admission`]).
+    /// Tighter burst adherence at the same average rate.
+    pub fn streaming_bitrate_admitted(start_distance: f32, target_bytes_per_sec: u32) -> Self {
+        CasaVideoOptions {
+            rate_control: Some(RateControl::targeting(target_bytes_per_sec).with_tile_admission()),
+            ..Self::streaming(start_distance)
+        }
+    }
     /// JOLT preset → options. See [`JoltPreset`].
     pub fn jolt(preset: JoltPreset) -> Self {
         match preset {
@@ -3762,6 +3772,20 @@ mod tests {
         );
         assert_eq!(decode_casv_all_rgb8(&starved).unwrap().len(), 36);
         assert_eq!(decode_casv_all_rgb8(&flooded).unwrap().len(), 36);
+    }
+
+    /// The admitted-bitrate preset is the bitrate preset plus the admission
+    /// flag — nothing else may differ.
+    #[test]
+    fn streaming_bitrate_admitted_only_adds_admission() {
+        let plain = CasaVideoOptions::streaming_bitrate(1.5, 50_000);
+        let admitted = CasaVideoOptions::streaming_bitrate_admitted(1.5, 50_000);
+        let (p, a) = (plain.rate_control.unwrap(), admitted.rate_control.unwrap());
+        assert!(!p.tile_admission);
+        assert!(a.tile_admission);
+        assert_eq!(p.target_bytes_per_sec, a.target_bytes_per_sec);
+        assert_eq!(p.vbv_seconds, a.vbv_seconds);
+        assert!(matches!(admitted.skip, SkipMode::Tile), "admission needs the tile tier");
     }
 
     /// Tile-admission count: measurement frame admits all, debt admits none,
