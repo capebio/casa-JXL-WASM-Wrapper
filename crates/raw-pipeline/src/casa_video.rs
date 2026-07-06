@@ -314,6 +314,22 @@ impl<'a> VideoFrameSource for SliceFrameSource<'a> {
             None
         }
     }
+    /// Fill the caller's ping-pong buffer directly (the trait's documented
+    /// fast path): copies into the warm buffer instead of the default
+    /// next_frame() route, which cloned a fresh full-frame Vec per frame
+    /// (alloc + memcpy + free of w*h*3 — ~2.7 MB @720p, ~25 MB @4K, every
+    /// frame) only to overwrite the reused buffer. Byte-identical frames,
+    /// strictly less allocator work.
+    fn next_frame_into(&mut self, buf: &mut Vec<u8>) -> bool {
+        if self.i < self.frames.len() {
+            buf.clear();
+            buf.extend_from_slice(&self.frames[self.i]);
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Encode frames to footer-format `.casv` with an optional Ogg/Opus audio track
