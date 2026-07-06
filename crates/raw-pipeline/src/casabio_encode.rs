@@ -89,6 +89,9 @@ const EFFORT_THUMB: u8 = 1; // Lightning
 const EFFORT_PREVIEW: u8 = 3; // Falcon
 const EFFORT_FULL: u8 = 3; // Falcon
 
+/// Compat shim for S1 Tauri app migration: old name for encode_rgba8_pyramid_from_rgb16.
+pub use encode_rgba8_pyramid_from_rgb16 as encode_raw_pyramid_ladder;
+
 /// Compat shim for S1 Tauri app migration: encode RGBA16 pixels to JXL.
 /// Maps the old `jpegxl-rs`-backed signature to `jxl_casaencoder`.
 pub fn encode_rgba16(
