@@ -16,16 +16,19 @@
 //!
 //! Video mode:
 //!   casv_encode --video <in> <out> <fps_num> <fps_den> <rate> <distance> \
-//!               <effort> <gop> <skip> <tile> <thresh|auto> <dim>
+//!               <effort> <gop> <skip> <tile> <thresh|auto> <dim> [bps]
 //!   rate  = lossy | lossless | auto (auto = lossy with given distance)
 //!   dim   = <max_px> | exact  (scale longest edge to max_px; exact = no scale)
+//!   bps   = optional target bytes/sec (lossy only): JOLT rate control plus
+//!           confidence-scheduled tile admission. 0 or absent = quality-targeted
+//!           encode exactly as before.
 //!
 //! Prints `OK <bytes> <out>` on success; exits non-zero with a message on error.
 
 use raw_pipeline::casa_video::{
     default_thresh_for_distance, encode_casv_proxy_rgb8, encode_casv_video,
-    encode_casv_video_streaming_with_audio_progress, CasaVideoOptions, SkipMode, VideoFrameSource,
-    VideoRate,
+    encode_casv_video_streaming_with_audio_progress, CasaVideoOptions, RateControl, SkipMode,
+    VideoFrameSource, VideoRate,
 };
 use raw_pipeline::jxl_casaencoder::EncodeOptions;
 
@@ -330,8 +333,9 @@ fn run_video_mode(args: &[String]) -> ! {
     // args[5] = rate (lossy|lossless|auto), args[6] = distance
     // args[7] = effort, args[8] = gop
     // args[9] = skip, args[10] = tile, args[11] = thresh|auto, args[12] = dim
+    // args[13] = optional target bytes/sec (0/absent = no rate control)
     if args.len() < 13 {
-        fail("usage: casv_encode --video <in> <out> <fps_num> <fps_den> <rate> <d> <e> <gop> <skip> <tile> <thresh> <dim>");
+        fail("usage: casv_encode --video <in> <out> <fps_num> <fps_den> <rate> <d> <e> <gop> <skip> <tile> <thresh> <dim> [bps]");
     }
     let in_video = &args[1];
     let out_casv = &args[2];
@@ -430,6 +434,11 @@ fn run_video_mode(args: &[String]) -> ! {
         "lossless" => VideoRate::Lossless,
         _ => VideoRate::Lossy(distance),
     };
+    // Optional bitrate target: JOLT distance feedback + confidence-scheduled
+    // tile admission (lossy only — lossless has no distance to steer).
+    let bps: u32 = args.get(13).map_or(0, |s| s.parse().unwrap_or_else(|_| fail("bad bps")));
+    let rate_control = (bps > 0 && !matches!(rate, VideoRate::Lossless))
+        .then(|| RateControl::targeting(bps).with_tile_admission());
     let opts = CasaVideoOptions {
         rate,
         gop_len: gop.max(1),
@@ -437,7 +446,7 @@ fn run_video_mode(args: &[String]) -> ! {
         tile,
         effort: effort.clamp(1, 10),
         thresh: Some(thresh.unwrap_or_else(|| default_thresh_for_distance(distance))),
-        rate_control: None,
+        rate_control,
     };
 
     // The streaming encoder is lossy-REPLACE only (`stream_ctx` rejects Lossless
