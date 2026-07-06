@@ -1339,7 +1339,7 @@ pub use decode_progressive_first_total as bench_jxl_decode_lowlevel_progressive;
 ///
 /// Return value: `(rgb8_pixels, width, height, elapsed_ms)`.
 ///
-/// This is the BSD-clean replacement for the GPL `decode_libjxl_dc` in
+/// BSD-clean replacement for the GPL `decode_libjxl_dc` in
 /// `bench.rs`, which used `jpegxl-sys::decode::JxlDecoderSetProgressiveDetail`.
 pub fn decode_dc(jxl_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, u64), String> {
     unsafe {
