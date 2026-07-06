@@ -177,6 +177,93 @@ pub fn ssd_wasm(a: &[u8], b: &[u8]) -> u64 {
     sum
 }
 
+/// wasm v128 separable box blur (radius `r`, clamp-to-edge) → fresh Vec.
+/// BIT-IDENTICAL to `blur::box_blur` by construction: the horizontal pass is the
+/// shared scalar `box_blur_h`, and the vertical pass runs the exact same
+/// per-column float ops (`sums = tmp*(r+1)`, `+= tmp[row]`, store `sums*inv`,
+/// `sums += add - sub`) 4 columns at a time in one `v128` — per-column op order
+/// is unchanged (lane t == the scalar TILE slot for that column), only the
+/// column-group width differs, and columns are fully independent, so every
+/// f32 result is the same IEEE op sequence as the scalar oracle. The `x..w`
+/// scalar remainder is verbatim `box_blur`.
+///
+/// This is the reference-mask blur (`blur_mask`), the dominant Comparer::new
+/// cost — previously the only major perceptual kernel still scalar on
+/// WasmSimd (native got `box_blur_avx2`, +13.7/11.3/30.1% at 1/6/24 MP; the
+/// 4-wide v128 form targets the same win class over the SSE2-shaped scalar
+/// tile the wasm build otherwise emits).
+pub fn box_blur_wasm(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let n = w * h;
+    if n == 0 {
+        return Vec::new();
+    }
+    // assert! (not debug_assert!) matching scale_err_wasm — the v128 loads below
+    // trust this bound and WASM release is the primary production target.
+    assert!(src.len() >= n, "box_blur_wasm: src shorter than w*h");
+    // tmp and dst are FULLY overwritten before any read (box_blur_h writes every
+    // tmp element; the v128 pass + scalar remainder write every dst element), so
+    // vec![0f32; n] would be 2·n·4 B of dead memset — and on the wasm dlmalloc
+    // heap (which memsets on reuse, unlike fresh native pages) that cost is real.
+    // SAFETY: f32 has no invalid bit patterns; every slot exposed by set_len is
+    // written before it is read; f32 has no Drop. Same pattern as box_blur /
+    // box_blur_avx2.
+    let mut tmp: Vec<f32> = Vec::with_capacity(n);
+    let mut dst: Vec<f32> = Vec::with_capacity(n);
+    unsafe {
+        tmp.set_len(n);
+        dst.set_len(n);
+    }
+    let inv = 1.0 / (2 * r + 1) as f32;
+
+    // Horizontal pass: shared scalar recurrence (identical to box_blur).
+    crate::perceptual::blur::box_blur_h(src, &mut tmp, w, h, r, inv);
+
+    // Vertical pass: 4 columns per iteration in one v128 lane group.
+    let rp1 = f32x4_splat(r as f32 + 1.0);
+    let inv_v = f32x4_splat(inv);
+    let h_max = h - 1;
+    let tp = tmp.as_ptr();
+    let dp = dst.as_mut_ptr();
+    let mut x = 0usize;
+    // SAFETY: every load/store below is bounded by row.min(h_max)*w + x + 4 <=
+    // (h-1)*w + w = n while x + 4 <= w (v128_load/store carry no alignment
+    // requirement in wasm).
+    unsafe {
+        while x + 4 <= w {
+            // seed the window: tmp[x..x+4]*(r+1) + Σ_{k=1..=r} tmp[k.min(h_max)*w + x..]
+            let mut sums = f32x4_mul(v128_load(tp.add(x) as *const v128), rp1);
+            for k in 1..=r {
+                let row = k.min(h_max) * w;
+                sums = f32x4_add(sums, v128_load(tp.add(row + x) as *const v128));
+            }
+            for y in 0..h {
+                let drow = y * w;
+                v128_store(dp.add(drow + x) as *mut v128, f32x4_mul(sums, inv_v));
+                let add_row = (y + r + 1).min(h_max) * w;
+                let sub_row = y.saturating_sub(r) * w;
+                let add = v128_load(tp.add(add_row + x) as *const v128);
+                let sub = v128_load(tp.add(sub_row + x) as *const v128);
+                sums = f32x4_add(sums, f32x4_sub(add, sub));
+            }
+            x += 4;
+        }
+    }
+    // Scalar remainder for the < 4 trailing columns — identical to box_blur.
+    for col in x..w {
+        let mut sum = tmp[col] * (r as f32 + 1.0);
+        for k in 1..=r {
+            sum += tmp[k.min(h_max) * w + col];
+        }
+        for y in 0..h {
+            dst[y * w + col] = sum * inv;
+            let add = tmp[(y + r + 1).min(h_max) * w + col];
+            let sub = tmp[y.saturating_sub(r) * w + col];
+            sum += add - sub;
+        }
+    }
+    dst
+}
+
 /// Drain lanes 0/1/2 (R,G,B; lane 3 = alpha, discarded) of an i32x4 partial into a
 /// u64[3] accumulator. Unsigned `as u32 as u64` widen for the same reason as ssd.
 #[inline]

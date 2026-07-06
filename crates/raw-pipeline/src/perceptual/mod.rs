@@ -619,6 +619,12 @@ fn blur_mask(backend: Backend, src: &[f32], w: usize, h: usize, r: usize) -> Vec
         Backend::Avx2Strict | Backend::Avx2Rsqrt | Backend::Avx512Strict | Backend::Avx512Rsqrt => unsafe {
             simd::avx2::box_blur_avx2(src, w, h, r)
         },
+        // v128 vertical pass, bit-identical to the scalar oracle by construction
+        // (shared H pass, same per-column op order — see box_blur_wasm docs).
+        // Closes the last major scalar hole on the wasm perceptual path: the mask
+        // blur is the dominant Comparer::new cost (examples/ref_build_effect.rs).
+        #[cfg(target_arch = "wasm32")]
+        Backend::WasmSimd => simd::wasm::box_blur_wasm(src, w, h, r),
         _ => blur::box_blur(src, w, h, r),
     }
 }

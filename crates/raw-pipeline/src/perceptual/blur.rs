@@ -132,6 +132,78 @@ mod tests {
         }
     }
 
+    /// Native proxy for `simd::wasm::box_blur_wasm` (which only compiles on
+    /// wasm32): emulates its vertical pass exactly — 4-column groups with the
+    /// same per-column op order (`[f32;4]` lanes ≙ one v128), `x+4<=w` boundary,
+    /// verbatim scalar remainder — and asserts BIT-identical output vs
+    /// `box_blur` (TILE=8). Locks the kernel's core claim: per-column op order
+    /// is width-independent, so any column-group width is bit-exact.
+    #[test]
+    fn four_wide_column_groups_bit_identical_to_box_blur() {
+        for (w, h, r) in [(37usize, 23usize, 3usize), (16, 16, 1), (5, 9, 8), (129, 31, 2)] {
+            let n = w * h;
+            let mut src = vec![0f32; n];
+            let mut s: u32 = 0x1234_5678;
+            for v in &mut src {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = (s >> 8) as f32 / 65_536.0;
+            }
+            let oracle = box_blur(&src, w, h, r);
+
+            // 4-wide emulation of box_blur_wasm's V pass.
+            let inv = 1.0 / (2 * r + 1) as f32;
+            let mut tmp = vec![0f32; n];
+            box_blur_h(&src, &mut tmp, w, h, r, inv);
+            let mut dst = vec![0f32; n];
+            let h_max = h - 1;
+            let mut x = 0usize;
+            while x + 4 <= w {
+                let mut sums = [0f32; 4];
+                for t in 0..4 {
+                    sums[t] = tmp[x + t] * (r as f32 + 1.0);
+                }
+                for k in 1..=r {
+                    let row = k.min(h_max) * w;
+                    for t in 0..4 {
+                        sums[t] += tmp[row + x + t];
+                    }
+                }
+                for y in 0..h {
+                    let drow = y * w;
+                    for t in 0..4 {
+                        dst[drow + x + t] = sums[t] * inv;
+                    }
+                    let add_row = (y + r + 1).min(h_max) * w;
+                    let sub_row = y.saturating_sub(r) * w;
+                    for t in 0..4 {
+                        sums[t] += tmp[add_row + x + t] - tmp[sub_row + x + t];
+                    }
+                }
+                x += 4;
+            }
+            for col in x..w {
+                let mut sum = tmp[col] * (r as f32 + 1.0);
+                for k in 1..=r {
+                    sum += tmp[k.min(h_max) * w + col];
+                }
+                for y in 0..h {
+                    dst[y * w + col] = sum * inv;
+                    let add = tmp[(y + r + 1).min(h_max) * w + col];
+                    let sub = tmp[y.saturating_sub(r) * w + col];
+                    sum += add - sub;
+                }
+            }
+
+            for (i, (a, b)) in oracle.iter().zip(&dst).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "bit mismatch at {i} for {w}x{h} r={r}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn radius_one_averages_neighbors_interior() {
         // 1-row impulse, interior pixel should be (0+9+0)/3 = 3 after H pass only;
