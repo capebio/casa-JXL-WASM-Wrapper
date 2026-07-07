@@ -43,6 +43,37 @@ export interface AssetStoreStats {
   oversized: number;
   persistentReads: number;
   persistentWrites: number;
+  admissionWarnings: number;
+}
+
+export interface AdmitOptions {
+  /** Memory ceiling to check against (default: the store's remaining `maxBytes - bytes`). */
+  budgetBytes?: number;
+  /** Safety headroom applied to the estimate (default 1.5, per the S3 ADR). */
+  multiplier?: number;
+  /** Identifier included in the warning (e.g. filename). */
+  label?: string;
+  /** Injectable warning sink (default console.warn) — tests capture it. */
+  warn?: (msg: string) => void;
+}
+
+export interface AdmitResult {
+  /** Always true — this is a log-only preflight, never a hard reject. */
+  admitted: boolean;
+  estimatedPeakBytes: number;
+  budgetBytes: number;
+  projectedBytes: number;
+  wouldExceed: boolean;
+}
+
+/** RAW-decode peak/retained memory projection (JS mirror of the Rust model). */
+export interface DecodePeakEstimate {
+  width: number;
+  height: number;
+  outputFlags: number;
+  pixels: number;
+  retainedBytes: number;
+  peakBytes: number;
 }
 
 export interface NamespaceHandle {
@@ -83,6 +114,7 @@ export declare class AssetStore {
   store(key: string, value: ArrayBufferLike | ArrayBufferView, sizeBytes?: number): Promise<void>;
   remove(key: string): Promise<void>;
   stats(): AssetStoreStats;
+  admit(estimatedPeakBytes: number, opts?: AdmitOptions): AdmitResult;
   namespace(ns: string): NamespaceHandle;
 }
 
@@ -94,5 +126,36 @@ export declare function fitWithinBudget<T>(
   sizeOf: (item: T) => number,
 ): { admitted: T[]; skipped: T[]; usedBytes: number };
 export declare function isQuotaExceeded(err: unknown): boolean;
+
+/** A jxl-cache-shaped L2 cache (duck-typed; not imported from jxl-cache). */
+export interface CacheLike {
+  get(key: string): Promise<ArrayBufferLike | ArrayBufferView | undefined | null>;
+  set(key: string, buffer: ArrayBuffer): Promise<void>;
+  delete(key: string): Promise<void>;
+  has?(key: string): Promise<boolean>;
+  init?(): Promise<void>;
+}
+
+/** Adapt a jxl-cache-shaped cache into an injectable AssetStore PersistentBackend (S3-Q5). */
+export declare function persistentBackendFromCache(cache: CacheLike): PersistentBackend;
+
+// ---- RAW-decode memory preflight (mirror of Rust estimate_decode_peak) ----
+export declare const OUT_FULL_RGB8: number;
+export declare const OUT_LIGHTBOX: number;
+export declare const OUT_THUMB: number;
+export declare const OUT_FULL_16: number;
+export declare const OUT_NO_ORIENT: number;
+export declare const OUT_FULL_DISP16: number;
+export declare const OUT_BATCH_DEFAULT: number;
+export declare function estimateDecodePeak(
+  width: number,
+  height: number,
+  outputFlags: number,
+): DecodePeakEstimate;
+export declare function estimateDecodePeakBytes(
+  width: number,
+  height: number,
+  outputFlags: number,
+): number;
 
 export default AssetStore;

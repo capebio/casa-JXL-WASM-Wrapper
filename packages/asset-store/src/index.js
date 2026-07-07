@@ -128,6 +128,74 @@ function defaultEstimator(override) {
   };
 }
 
+/**
+ * Adapt a jxl-cache-shaped L2 cache into an AssetStore `PersistentBackend`
+ * (S3-Q5). Duck-typed on purpose — this does NOT import jxl-cache; pass any
+ * object exposing `get`/`set`/`delete` (and optionally `has`/`init`). The layer
+ * boundary holds: asset-store never hard-requires the cache; the app injects it.
+ *
+ * Two shape gaps are bridged: (1) jxl-cache's `set(key, buffer)` requires a
+ * tight, non-shared `ArrayBuffer`, so any TypedArray/DataView view or
+ * `SharedArrayBuffer` value is copied into one first; a plain `ArrayBuffer`
+ * passes through. (2) If the cache exposes `init()`, it is awaited once
+ * (idempotent — jxl-cache caches its own init promise) before the first op so
+ * OPFS is ready. Once wrapped, `AssetStore.store()`/`load()` provide the
+ * write-through / read-through the handoff describes (put also persists; a
+ * memory miss reads through and promotes).
+ *
+ * @param {{ get(key: string): Promise<ArrayBufferLike | ArrayBufferView | undefined | null>,
+ *           set(key: string, buffer: ArrayBuffer): Promise<void>,
+ *           delete(key: string): Promise<void>,
+ *           has?(key: string): Promise<boolean>,
+ *           init?(): Promise<void> }} cache
+ * @returns {PersistentBackend}
+ */
+export function persistentBackendFromCache(cache) {
+  if (!cache || typeof cache.get !== "function" || typeof cache.set !== "function") {
+    throw new TypeError("persistentBackendFromCache: cache must expose get() and set()");
+  }
+  /** @type {Promise<void> | null} */
+  let ready = null;
+  const ensure = () => {
+    if (typeof cache.init !== "function") return undefined;
+    return (ready ??= Promise.resolve(cache.init()).catch(() => {}));
+  };
+  /** Copy any byte-carrier into a fresh, tight, non-shared ArrayBuffer. */
+  const toArrayBuffer = (value) => {
+    if (value instanceof ArrayBuffer) return value; // already tight + non-shared
+    let view;
+    if (ArrayBuffer.isView(value)) {
+      view = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    } else if (typeof SharedArrayBuffer !== "undefined" && value instanceof SharedArrayBuffer) {
+      view = new Uint8Array(value);
+    } else {
+      throw new TypeError("persistentBackendFromCache: value must be an ArrayBuffer or a view");
+    }
+    const copy = new Uint8Array(view.byteLength);
+    copy.set(view);
+    return copy.buffer;
+  };
+  return {
+    async get(key) {
+      await ensure();
+      return cache.get(key);
+    },
+    async set(key, value) {
+      await ensure();
+      await cache.set(key, toArrayBuffer(value));
+    },
+    async delete(key) {
+      await ensure();
+      await cache.delete(key);
+    },
+    async has(key) {
+      await ensure();
+      if (typeof cache.has === "function") return cache.has(key);
+      return (await cache.get(key)) != null;
+    },
+  };
+}
+
 /** Is an error a storage-quota rejection, across browsers/engines? */
 export function isQuotaExceeded(err) {
   if (!err) return false;
@@ -194,6 +262,7 @@ export class AssetStore {
       oversized: 0,
       persistentReads: 0,
       persistentWrites: 0,
+      admissionWarnings: 0,
     };
   }
 
@@ -399,6 +468,56 @@ export class AssetStore {
   }
 
   /**
+   * Log-only decode-admission preflight (S3-Q3). Given the projected peak byte
+   * footprint of a pending decode (e.g. from `estimateDecodePeak`), warn — but do
+   * NOT reject — when it would blow the memory budget. Hard-gating is deferred
+   * until the model-vs-RSS multiplier is measured against real runs; the S3 ADR's
+   * recommended 1.5× safety headroom is the default. Always returns
+   * `admitted: true` — the caller proceeds regardless. On the hot path (peak
+   * fits) this only does arithmetic: no warn, no allocation.
+   *
+   * Content-agnostic on purpose: it takes a byte count, not image knowledge, so
+   * the governor never learns about the RAW pipeline. The domain estimate lives
+   * in `mem-budget.js` (`estimateDecodePeak`); callers compose the two.
+   *
+   * @param {number} estimatedPeakBytes projected decode peak (bytes)
+   * @param {{ budgetBytes?: number, multiplier?: number, label?: string,
+   *           warn?: (msg: string) => void }} [opts]
+   *   budgetBytes — memory ceiling to check against (default: this store's
+   *     remaining in-memory headroom `maxBytes - bytes`);
+   *   multiplier — safety headroom on the estimate (default 1.5, per the S3 ADR);
+   *   label — identifier included in the warning (e.g. filename);
+   *   warn — injectable sink (default `console.warn`) — tests capture it.
+   * @returns {{ admitted: boolean, estimatedPeakBytes: number, budgetBytes: number,
+   *             projectedBytes: number, wouldExceed: boolean }}
+   */
+  admit(estimatedPeakBytes, opts = {}) {
+    const multiplier =
+      Number.isFinite(opts.multiplier) && opts.multiplier > 0 ? opts.multiplier : 1.5;
+    const budgetBytes = Number.isFinite(opts.budgetBytes)
+      ? Math.max(0, opts.budgetBytes)
+      : Math.max(0, this._maxBytes - this._bytes);
+    const peak = Number.isFinite(estimatedPeakBytes) ? Math.max(0, estimatedPeakBytes) : 0;
+    const projectedBytes = peak * multiplier;
+    const wouldExceed = projectedBytes > budgetBytes;
+    if (wouldExceed) {
+      this._stats.admissionWarnings++;
+      const warn =
+        opts.warn ??
+        ((m) => {
+          if (typeof console !== "undefined" && console.warn) console.warn(m);
+        });
+      const mb = (b) => (b / (1024 * 1024)).toFixed(1);
+      warn(
+        `[${this.name}] decode preflight${opts.label ? ` (${opts.label})` : ""}: ` +
+          `projected ~${mb(projectedBytes)} MB (peak ${mb(peak)} MB ×${multiplier}) ` +
+          `exceeds budget ${mb(budgetBytes)} MB — proceeding (log-only, S3-Q3).`,
+      );
+    }
+    return { admitted: true, estimatedPeakBytes: peak, budgetBytes, projectedBytes, wouldExceed };
+  }
+
+  /**
    * A namespaced view: keys are transparently prefixed with `${ns}:` so multiple
    * clients (peep, file-picker, pyramid…) share ONE governed byte budget without
    * key collisions. Returns a thin handle over this same store.
@@ -477,5 +596,20 @@ export class AssetStore {
     }
   }
 }
+
+// Re-export the RAW-decode memory preflight (a pure JS mirror of the Rust
+// `estimate_decode_peak`) so admission callers get the estimate + the governor
+// from one entry point. See `mem-budget.js`.
+export {
+  estimateDecodePeak,
+  estimateDecodePeakBytes,
+  OUT_FULL_RGB8,
+  OUT_LIGHTBOX,
+  OUT_THUMB,
+  OUT_FULL_16,
+  OUT_NO_ORIENT,
+  OUT_FULL_DISP16,
+  OUT_BATCH_DEFAULT,
+} from "./mem-budget.js";
 
 export default AssetStore;

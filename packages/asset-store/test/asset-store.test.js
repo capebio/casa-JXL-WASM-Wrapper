@@ -6,6 +6,14 @@ import {
   contentHash,
   fitWithinBudget,
   isQuotaExceeded,
+  persistentBackendFromCache,
+  estimateDecodePeakBytes,
+  OUT_FULL_RGB8,
+  OUT_LIGHTBOX,
+  OUT_THUMB,
+  OUT_FULL_16,
+  OUT_FULL_DISP16,
+  OUT_BATCH_DEFAULT,
 } from "../src/index.js";
 
 const buf = (n, fill = 0) => new Uint8Array(n).fill(fill);
@@ -307,4 +315,133 @@ test("stats() reports the governed totals", () => {
   assert.equal(st.bytes, 100);
   assert.equal(st.hits, 1);
   assert.equal(st.misses, 1);
+  assert.equal(st.admissionWarnings, 0);
+});
+
+// ---- decode-admission preflight (S3-Q3, log-only) ----
+test("admit warns (log-only) when projected peak exceeds budget, never rejects", () => {
+  const s = new AssetStore({ maxBytes: 1000, name: "gate" });
+  const logs = [];
+  // Mock the estimate with a value that would blow the budget.
+  const r = s.admit(1_000_000, { budgetBytes: 100_000, warn: (m) => logs.push(m) });
+  assert.equal(r.admitted, true); // NOT a hard reject
+  assert.equal(r.wouldExceed, true);
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /log-only/);
+  assert.match(logs[0], /gate/);
+  assert.equal(s.stats().admissionWarnings, 1);
+});
+
+test("admit is silent on the hot path when the decode fits", () => {
+  const s = new AssetStore({ maxBytes: 1000 });
+  const logs = [];
+  const r = s.admit(1000, { budgetBytes: 100_000, warn: (m) => logs.push(m) });
+  assert.equal(r.admitted, true);
+  assert.equal(r.wouldExceed, false);
+  assert.equal(logs.length, 0);
+  assert.equal(s.stats().admissionWarnings, 0);
+});
+
+test("admit default budget is the store's remaining RAM headroom", () => {
+  const s = new AssetStore({ maxBytes: 1000 });
+  s.set("a", buf(900)); // 100 bytes headroom left
+  const logs = [];
+  const r = s.admit(200, { multiplier: 1, warn: (m) => logs.push(m) }); // 200 > 100
+  assert.equal(r.budgetBytes, 100);
+  assert.equal(r.wouldExceed, true);
+  assert.equal(logs.length, 1);
+});
+
+test("admit composes with estimateDecodePeak — the wired admission gate", () => {
+  const s = new AssetStore({ maxBytes: 1 });
+  const budgetBytes = 384 * 1024 * 1024; // documented ~384 MB WASM-heap budget
+  const logs = [];
+  // 24 MP all-flags decode (~517 MB peak × 1.5 ≈ 776 MB) blows the budget → warn.
+  const bigFlags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_FULL_16 | OUT_FULL_DISP16;
+  const bigPeak = estimateDecodePeakBytes(6000, 4000, bigFlags);
+  const r = s.admit(bigPeak, { budgetBytes, warn: (m) => logs.push(m) });
+  assert.equal(r.wouldExceed, true);
+  assert.equal(logs.length, 1);
+  // A 12 MP shipping-flags decode fits under the same budget → silent.
+  const smallPeak = estimateDecodePeakBytes(4000, 3000, OUT_BATCH_DEFAULT);
+  const r2 = s.admit(smallPeak, { budgetBytes, warn: (m) => logs.push(m) });
+  assert.equal(r2.wouldExceed, false);
+  assert.equal(logs.length, 1); // no new warning
+});
+
+// ---- jxl-cache OPFS adapter (S3-Q5) ----
+class FakeJxlCache {
+  constructor() {
+    this.map = new Map(); // key → ArrayBuffer (the OPFS L2)
+    this.initCalls = 0;
+  }
+  async init() {
+    this.initCalls++;
+  }
+  async get(k) {
+    return this.map.get(k);
+  }
+  async set(k, buffer) {
+    this.map.set(k, buffer);
+  }
+  async delete(k) {
+    this.map.delete(k);
+  }
+  async has(k) {
+    return this.map.has(k);
+  }
+}
+
+test("persistentBackendFromCache: store → RAM evict → load reads through OPFS L2", async () => {
+  const cache = new FakeJxlCache();
+  const backend = persistentBackendFromCache(cache);
+  const s = new AssetStore({ maxBytes: 250, persistent: backend });
+  await s.store("a", buf(100, 1));
+  await s.store("b", buf(100, 2));
+  await s.store("c", buf(100, 3)); // RAM full (250) → "a" evicted from memory
+  assert.ok(!s.has("a"), "a evicted from RAM tier");
+  assert.ok(cache.map.has("a"), "a persisted to OPFS L2 during write-through");
+  assert.ok(cache.initCalls >= 1, "cache.init() awaited before first op");
+  // Miss in RAM → read through the L2 backend → promote back into RAM.
+  const v = await s.load("a");
+  assert.ok(v, "loaded from L2");
+  assert.equal(new Uint8Array(v)[0], 1);
+  assert.ok(s.has("a"), "promoted back into RAM");
+  assert.equal(s.stats().persistentReads, 1);
+});
+
+test("persistentBackendFromCache normalizes a view to a tight non-shared ArrayBuffer", async () => {
+  const cache = new FakeJxlCache();
+  const backend = persistentBackendFromCache(cache);
+  const parent = new Uint8Array(10).fill(9);
+  const view = parent.subarray(2, 6); // offset 2, length 4
+  await backend.set("k", view);
+  const stored = cache.map.get("k");
+  assert.ok(stored instanceof ArrayBuffer, "stored as a plain ArrayBuffer");
+  assert.equal(stored.byteLength, 4, "tight copy, not the 10-byte parent");
+  assert.deepEqual([...new Uint8Array(stored)], [9, 9, 9, 9]);
+});
+
+test("persistentBackendFromCache requires get()+set()", () => {
+  assert.throws(() => persistentBackendFromCache({}));
+  assert.throws(() => persistentBackendFromCache(null));
+});
+
+test("persistentBackendFromCache.has falls back to get() when the cache lacks has()", async () => {
+  const store = new Map();
+  const cache = {
+    async get(k) {
+      return store.get(k);
+    },
+    async set(k, b) {
+      store.set(k, b);
+    },
+    async delete(k) {
+      store.delete(k);
+    },
+  };
+  const backend = persistentBackendFromCache(cache);
+  await backend.set("x", new Uint8Array([1, 2]).buffer);
+  assert.equal(await backend.has("x"), true);
+  assert.equal(await backend.has("y"), false);
 });

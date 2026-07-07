@@ -11,7 +11,13 @@ import { WorkerMsg } from './worker-message-types.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
-import { AssetStore } from '../packages/asset-store/src/index.js';
+// `estimateDecodePeak` + `OUT_BATCH_DEFAULT` back the log-only decode preflight
+// below (S3-Q3); it mirrors the Rust `estimate_decode_peak` memory model.
+import {
+    AssetStore,
+    estimateDecodePeak,
+    OUT_BATCH_DEFAULT,
+} from '../packages/asset-store/src/index.js';
 // Capability-detection namespace import over the RAW WASM pkg. Binding the
 // module does NOT instantiate WASM (init is lazy via default()/initSync), so
 // this is safe at page load. We only read which functions the build exported —
@@ -1115,6 +1121,16 @@ window.removeCard = removeCard;
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB hard limit before WASM
 const seenFiles = new Set(); // "name|size|lastModified" — prevents duplicate-drop cards
 
+// S3-Q3: log-only RAW-decode admission preflight. The browser decodes a RAW to
+// full RGB8 + previews in ~360 MB of WASM heap at 24 MP (all-flags climbs to
+// ~517 MB); there was no way to ask "will this fit?" before starting. The ADR's
+// model + 1.5× RSS safety headroom means ~384 MB of live-byte budget is the
+// point past which we warn. This is a SIGNAL only — it never rejects a decode
+// (the pipeline runs concurrently; a real pre-gate awaits the scheduler
+// retained-HWM governor, S3-Q4). `admit()` supplies the ×1.5 headroom + warn.
+const RAW_DECODE_BUDGET_BYTES = 384 * 1024 * 1024;
+const rawDecodeGovernor = new AssetStore({ name: 'raw-decode', maxBytes: RAW_DECODE_BUDGET_BYTES });
+
 function fileKey(f) { return `${f.name}|${f.size}|${f.lastModified}`; }
 
 function makeCard(name) {
@@ -1702,6 +1718,17 @@ function startConvert(file, existingCard) {
             bumpJpegSignature(valid.map(v => `${v.w}×${v.h} ori${v.orientation}`).join(' + '));
 
             const largest = valid[valid.length - 1];
+
+            // S3-Q3 decode preflight (log-only): the largest embedded JPEG is
+            // ~sensor resolution, so project the RAW decode's peak working set
+            // from it and warn if it would blow the WASM-heap budget. Flags = the
+            // shipping batch set (RGB8|lightbox|thumbnail). Observational only —
+            // the pipeline already runs in Phase B; this never gates it. Mirrors
+            // the Rust estimate_decode_peak model.
+            try {
+                const peak = estimateDecodePeak(largest.w, largest.h, OUT_BATCH_DEFAULT).peakBytes;
+                rawDecodeGovernor.admit(peak, { label: file.name || `${largest.w}×${largest.h}` });
+            } catch { /* preflight must never break ingest */ }
 
             if (card.classList.contains('busy') || card.classList.contains('embedded-thumb')) {
                 drawOrientedThumb(card.querySelector('canvas'), largest.bmp, largest.orientation, 360);
