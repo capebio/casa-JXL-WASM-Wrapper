@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <link rel="icon" href="data:," />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codec Compare — CasaWASM</title>
+  <script type="importmap">
+  {
+    "imports": {
+      "@casabio/jxl-wasm": "../../packages/jxl-wasm/dist/index.js"
+    }
+  }
+  </script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --surface2: #0f172a;
+      --border: #334155;
+      --text: #e2e8f0;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --accent: #818cf8;
+      --accent2: #38bdf8;
+      --success: #4ade80;
+      --warn: #fbbf24;
+      --error: #f87171;
+      --radius: 8px;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    .page-header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 1rem 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .page-header h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: var(--text);
+    }
+    .page-header .subtitle {
+      font-size: 0.8rem;
+      color: var(--text-dim);
+    }
+
+    main {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    /* ── Drop zone ── */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: var(--radius);
+      padding: 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+      background: var(--surface);
+      color: var(--text-muted);
+    }
+    #drop-zone:hover, #drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(129, 140, 248, 0.05);
+      color: var(--text);
+    }
+    #drop-zone .drop-icon { font-size: 2rem; margin-bottom: 0.5rem; }
+    #drop-zone .drop-hint { font-size: 0.8rem; color: var(--text-dim); margin-top: 0.3rem; }
+    #file-input { display: none; }
+
+    /* ── Controls row ── */
+    .controls-row {
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border-radius: var(--radius);
+      padding: 0.75rem 1rem;
+      border: 1px solid var(--border);
+    }
+    .control-group { display: flex; align-items: center; gap: 0.5rem; }
+    .control-group label { font-size: 0.85rem; color: var(--text-muted); white-space: nowrap; }
+    #quality-slider { width: 140px; accent-color: var(--accent); }
+    #quality-value { font-weight: 700; color: var(--accent); min-width: 2.5em; }
+
+    #export-btn {
+      margin-left: auto;
+      padding: 0.5rem 1.2rem;
+      background: var(--accent);
+      color: #0f172a;
+      border: none;
+      border-radius: var(--radius);
+      font-weight: 700;
+      cursor: pointer;
+      font-size: 0.85rem;
+      transition: opacity 0.15s;
+    }
+    #export-btn:disabled { opacity: 0.4; cursor: default; }
+
+    /* ── Status ── */
+    .status { font-size: 0.8rem; color: var(--text-dim); padding: 0.25rem 0; }
+    .status.error { color: var(--error); }
+
+    /* ── Two-column layout ── */
+    .compare-layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+    @media (max-width: 900px) {
+      .compare-layout { grid-template-columns: 1fr; }
+    }
+
+    /* ── Original panel ── */
+    .panel {
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      overflow: hidden;
+    }
+    .panel-header {
+      padding: 0.6rem 1rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .panel-body { padding: 0.75rem; }
+
+    #original-canvas {
+      display: block;
+      max-width: 100%;
+      max-height: 350px;
+      border-radius: 4px;
+      object-fit: contain;
+    }
+
+    /* ── Heatmap panel ── */
+    #heatmap-canvas {
+      display: block;
+      max-width: 100%;
+      max-height: 350px;
+      border-radius: 4px;
+    }
+    .heatmap-legend {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+    .heatmap-legend .grad {
+      width: 120px; height: 10px; border-radius: 3px;
+      background: linear-gradient(to right, #0000ff, #00ffff, #00ff00, #ffff00, #ff0000);
+    }
+
+    /* ── Codec grid ── */
+    #codec-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+    }
+    @media (max-width: 900px) {
+      #codec-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 560px) {
+      #codec-grid { grid-template-columns: 1fr; }
+    }
+
+    .codec-card {
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      padding: 0.75rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+    .codec-card .card-title {
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: var(--text);
+    }
+    .codec-card canvas.thumb {
+      display: block;
+      max-width: 100%;
+      border-radius: 4px;
+    }
+    .codec-card .card-meta {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+      display: flex;
+      flex-direction: column;
+      gap: 0.15rem;
+    }
+    .codec-card .size { font-weight: 600; color: var(--text); }
+    .codec-card .enc-time { color: var(--text-dim); }
+    .codec-card .score { color: var(--accent2); }
+
+    .heatmap-btn {
+      padding: 0.3rem 0.6rem;
+      background: transparent;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--text-muted);
+      font-size: 0.75rem;
+      cursor: pointer;
+      transition: all 0.12s;
+    }
+    .heatmap-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .heatmap-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(129,140,248,0.1); }
+
+    /* ── BD-rate bar ── */
+    #bd-rate-row {
+      background: var(--surface);
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      padding: 0.75rem 1rem;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+  <header class="page-header">
+    <div>
+      <h1>Codec Compare</h1>
+      <div class="subtitle">JXL vs JPEG vs AVIF vs WebP — drop any image to compare</div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Drop zone -->
+    <div id="drop-zone" role="button" tabindex="0" aria-label="Drop image here or click to select">
+      <div class="drop-icon">&#128444;</div>
+      <div>Drop an image here, or click to select</div>
+      <div class="drop-hint">Supports JPEG, PNG, WebP, ORF, CR2, DNG — decoded to RGBA, then re-encoded with all 4 codecs</div>
+      <input type="file" id="file-input" accept=".jpg,.jpeg,.png,.webp,.avif,.orf,.cr2,.dng,.raw" />
+    </div>
+
+    <!-- Controls -->
+    <div class="controls-row">
+      <div class="control-group">
+        <label for="quality-slider">Quality:</label>
+        <input type="range" id="quality-slider" min="40" max="99" value="80" step="1" />
+        <span id="quality-value">80</span>
+      </div>
+      <div id="status" class="status">Drop an image to start.</div>
+      <button id="export-btn" disabled>Export Report</button>
+    </div>
+
+    <!-- Codec grid (thumbnails + stats) -->
+    <div id="codec-grid"></div>
+
+    <!-- Two-column: original + heatmap -->
+    <div class="compare-layout">
+      <div class="panel">
+        <div class="panel-header">Original</div>
+        <div class="panel-body">
+          <canvas id="original-canvas"></canvas>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-header">Butteraugli Heatmap (blue = low error, red = high error)</div>
+        <div class="panel-body">
+          <canvas id="heatmap-canvas"></canvas>
+          <div class="heatmap-legend">
+            <span>Low</span>
+            <div class="grad"></div>
+            <span>High</span>
+            <span>&nbsp;— click "Show heatmap" on a codec card above to switch</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- BD-rate summary -->
+    <div id="bd-rate-row">BD-Rate vs JPEG: run comparison to compute…</div>
+  </main>
+
+  <script type="module" src="./compare.js"></script>
+</body>
+</html>
