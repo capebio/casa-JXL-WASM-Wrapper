@@ -351,14 +351,15 @@ export class LookRenderer {
      * @param {Float32Array} color_matrix_flat
      * @param {boolean} apply_rotation
      * @param {number} black
+     * @param {number} white
      * @returns {LookRenderer}
      */
-    static new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, apply_rotation, black) {
+    static new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, apply_rotation, black, white) {
         const ptr0 = passArray8ToWasm0(rgb16_bytes, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.lookrenderer_new_with_options(ptr0, len0, width, height, orientation, ptr1, len1, apply_rotation, black);
+        const ret = wasm.lookrenderer_new_with_options(ptr0, len0, width, height, orientation, ptr1, len1, apply_rotation, black, white);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -920,6 +921,17 @@ export class ProcessResult {
      */
     get wb_r_used() {
         const ret = wasm.__wbg_get_processresult_wb_r_used(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * White level the pipeline normalised by (per-format: Olympus 4095, CR2/DNG
+     * from the file tag ~15300). The live LookRenderer MUST use this same white or
+     * the preview blows out — CR2/DNG 14-bit data ÷ the Olympus 4095 default is a
+     * ~3.7× over-exposure. Twin of `black_used`.
+     * @returns {number}
+     */
+    get white_used() {
+        const ret = wasm.__wbg_get_processresult_white_used(this.__wbg_ptr);
         return ret;
     }
     /**

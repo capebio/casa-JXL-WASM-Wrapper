@@ -257,6 +257,12 @@ pub struct ProcessResult {
     /// black=0 magenta cast. Olympus = OLYMPUS_BLACK_LEVEL; CR2/DNG = file tag.
     #[wasm_bindgen(readonly)]
     pub black_used: u16,
+    /// White level the pipeline normalised by (per-format: Olympus 4095, CR2/DNG
+    /// from the file tag ~15300). The live LookRenderer MUST use this same white or
+    /// the preview blows out — CR2/DNG 14-bit data ÷ the Olympus 4095 default is a
+    /// ~3.7× over-exposure. Twin of `black_used`.
+    #[wasm_bindgen(readonly)]
+    pub white_used: u16,
     #[wasm_bindgen(readonly)]
     pub color_matrix_from_mn: bool,
     make: String,
@@ -432,6 +438,7 @@ impl ProcessResult {
             &self.color_matrix_flat,
             false,
             self.black_used,
+            self.white_used,
         )
     }
 
@@ -447,6 +454,7 @@ impl ProcessResult {
             &self.color_matrix_flat,
             false,
             self.black_used,
+            self.white_used,
         )
     }
 }
@@ -1305,6 +1313,7 @@ fn process_orf_impl(
         wb_r_used: params.wb_r,
         wb_b_used: params.wb_b,
         black_used: params.black,
+        white_used: params.white,
         color_matrix_from_mn,
         make: info.make,
         model: info.model,
@@ -2407,6 +2416,10 @@ pub struct LookRenderer {
     // every render() so live slider edits subtract the same black as the initial
     // decode — otherwise edits revert to the black=0 magenta cast.
     black: u16,
+    // Per-format white level (Olympus 4095, CR2/DNG from file ~15300). render()
+    // normalises by this; without it CR2/DNG 14-bit previews blow out under the
+    // Olympus 4095 default (~3.7× over-exposure).
+    white: u16,
 }
 
 impl LookRenderer {
@@ -2430,6 +2443,7 @@ impl LookRenderer {
         color_matrix_flat: &[f32; 9],
         apply_rotation: bool,
         black: u16,
+        white: u16,
     ) -> LookRenderer {
         let w = width as usize;
         let h = height as usize;
@@ -2452,6 +2466,7 @@ impl LookRenderer {
             apply_rotation,
             color_matrix,
             black,
+            white,
         }
     }
 }
@@ -2472,7 +2487,7 @@ impl LookRenderer {
     ) -> Result<LookRenderer, JsError> {
         // Legacy 5-arg constructor (used by the perf benchmark): black=0. The
         // colour-correct app path uses new_with_options with the per-format black.
-        Self::new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, true, 0)
+        Self::new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, true, 0, 0)
     }
 
     /// Variant of `new` that lets the caller opt out of CPU rotation in
@@ -2488,6 +2503,7 @@ impl LookRenderer {
         color_matrix_flat: &[f32],
         apply_rotation: bool,
         black: u16,
+        white: u16,
     ) -> Result<LookRenderer, JsError> {
         let w = width as usize;
         let h = height as usize;
@@ -2533,6 +2549,7 @@ impl LookRenderer {
             apply_rotation,
             color_matrix,
             black,
+            white,
         })
     }
 
@@ -2578,6 +2595,12 @@ impl LookRenderer {
         // Subtract the same per-format black the initial decode used, else live
         // edits revert to the black=0 magenta cast (Olympus) / wrong shadows.
         params.black = self.black;
+        // Normalise by the same per-format white the decode used. default_olympus
+        // sets white=4095 (12-bit); CR2/DNG are 14-bit (~15300) → without this the
+        // live preview divides by 4095 and blows out ~3.7×. (0 = keep the default.)
+        if self.white > self.black {
+            params.white = self.white;
+        }
         if wb_r.is_finite() && wb_r > 0.0 {
             params.wb_r = wb_r;
         }
@@ -3064,6 +3087,7 @@ fn process_dng_impl(
         wb_r_used: params.wb_r,
         wb_b_used: params.wb_b,
         black_used: params.black,
+        white_used: params.white,
         color_matrix_from_mn: params.color_matrix.to_option().is_some(),
         make,
         model,

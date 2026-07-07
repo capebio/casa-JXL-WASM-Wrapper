@@ -30,6 +30,30 @@ import {
     probe as probeColour,
 } from './perceptual-color.mjs';
 
+// On-page console: mirror console.* (and relayed worker logs) into a panel so
+// debugging doesn't require DevTools. Panel + toggle live in index.html.
+(function initPageConsole() {
+    const append = (kind, parts) => {
+        const p = document.getElementById('page-console');
+        if (!p) return;
+        const line = document.createElement('div');
+        if (kind === 'warn') line.style.color = '#fd0';
+        else if (kind === 'error') line.style.color = '#f66';
+        line.textContent = parts.map((a) => {
+            if (typeof a === 'object') { try { return JSON.stringify(a); } catch { return String(a); } }
+            return String(a);
+        }).join(' ');
+        p.appendChild(line);
+        while (p.childNodes.length > 600) p.removeChild(p.firstChild);
+        p.scrollTop = p.scrollHeight;
+    };
+    for (const k of ['log', 'warn', 'error', 'info']) {
+        const orig = console[k].bind(console);
+        console[k] = (...a) => { try { append(k === 'info' ? 'log' : k, a); } catch {} orig(...a); };
+    }
+    window.pushDbg = (...a) => console.log(...a);
+})();
+
 const IS_TAURI = typeof window !== 'undefined' && !!window.__TAURI__;
 window.IS_TAURI = IS_TAURI;
 const { invoke } = IS_TAURI ? window.__TAURI__.core : {};
@@ -759,6 +783,7 @@ class WorkerPool {
 
     _onMessage(worker, ev) {
         const { id, type } = ev.data;
+        if (type === 'wlog') { console.log('[worker]', ev.data.text); return; }
         if (type === WorkerMsg.LIGHTBOX_LIVE || type === WorkerMsg.ERROR_LIVE) {
             if (this._liveHandler) this._liveHandler(ev.data);
             return;

@@ -38,6 +38,18 @@
 import { detectFormat, detectRawKind } from './format-detect.js';
 import { WorkerMsg } from './worker-message-types.js';
 
+// Relay this worker's console to the main thread's on-page console (debug aid).
+for (const __k of ['log', 'warn', 'error']) {
+    const __orig = console[__k].bind(console);
+    console[__k] = (...a) => {
+        __orig(...a);
+        try {
+            const s = a.map((x) => (typeof x === 'object' ? JSON.stringify(x) : String(x))).join(' ');
+            self.postMessage({ type: 'wlog', text: '[' + __k + '] ' + s });
+        } catch { /* non-cloneable arg — skip relay */ }
+    };
+}
+
 let init, rawWasm;
 // A3: rgb_to_rgba removed — send RGB8 directly to JXL worker (saves ~250ms + 25% transfer)
 let process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, LookRenderer, rotate_rgb8;
@@ -188,14 +200,17 @@ async function ensureWasm() {
 // Phase 2: construct with apply_rotation=false. render() returns sensor-orient
 // pixels with sensor dims. Main thread applies EXIF rotation as a canvas
 // transform during draw — GPU-accelerated, decoupled from slider tick rate.
-function makeLiveState(rgb16Bytes, w, h, orientation, wbR, wbB, colorMatrix, black) {
+function makeLiveState(rgb16Bytes, w, h, orientation, wbR, wbB, colorMatrix, black, white) {
     // Only orientations 6 (90° CW) and 8 (90° CCW) actually swap axes in
     // apply_orientation (pipeline.rs).  Tags 5/7 are pass-through there, so
     // using orientation >= 5 overreports axisSwap and mis-sizes the canvas.
     const axisSwap = orientation === 6 || orientation === 8;
     // black: per-format pedestal (Olympus 256, CR2/DNG from file) so live slider
     // edits subtract the same black as the initial decode — no magenta on drag.
-    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, orientation, colorMatrix, false, black >>> 0);
+    // white: per-format white level (CR2/DNG ~15300, else 0 → keep the Olympus
+    // 4095 default) so the live preview normalises by the same white the decode
+    // used — without it CR2/DNG 14-bit data blows out ~3.7×.
+    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, orientation, colorMatrix, false, black >>> 0, (white >>> 0) || 0);
     return {
         renderer,
         // Native source dims (sensor orientation).
@@ -335,7 +350,7 @@ function downscaleRgb16LE(src, sw, sh, dw, dh) {
 // makeLiveState for an EXR/TIFF buffer: identity matrix, no EXIF orientation,
 // black=0. Otherwise identical shape to the RAW makeLiveState above.
 function makeImageLiveState(rgb16Bytes, w, h) {
-    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, 1, IDENTITY_CM, false, 0);
+    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, 1, IDENTITY_CM, false, 0, 0);
     return { renderer, nativeW: w, nativeH: h, outW: w, outH: h, orientation: 1, wbR: NaN, wbB: NaN };
 }
 
@@ -395,7 +410,7 @@ function processImageFormat(id, bytes, opts, look, route) {
         // EXR/TIFF have no EXIF rotation, but user 90° turns still compose.
         const userTurns = Math.round(((opts.userRotation || 0) % 360 + 360) % 360 / 90) % 4;
         const encodeOrientation = composeOrientation(1, userTurns);
-        const fullRenderer = LookRenderer.new_with_options(fullRgb16, w, h, 1, IDENTITY_CM, false, 0);
+        const fullRenderer = LookRenderer.new_with_options(fullRgb16, w, h, 1, IDENTITY_CM, false, 0, 0);
         let fullRgb;
         try {
             fullRgb = applyLookToState({ renderer: fullRenderer, wbR: NaN, wbB: NaN }, look);
@@ -643,8 +658,12 @@ self.addEventListener('message', async (ev) => {
         const wbR = result.wb_r_used;
         const wbB = result.wb_b_used;
         const black = result.black_used; // per-format pedestal for the live LookRenderer
+        const white = result.white_used; // per-format white the live LookRenderer normalises by
         const make  = result.make;
         const model = result.model;
+        // DEBUG: the exact black/white the lightbox + thumb LookRenderers use. If
+        // white != the file's white (~15300 for CR2/DNG), the live preview blows out.
+        console.log(`[DBG] "${model}" black_used=${black} white_used=${white} wbR=${wbR.toFixed(3)} wbB=${wbB.toFixed(3)} lb=${result.lb_w}x${result.lb_h}`);
         const colorMatrixFromMn = result.color_matrix_from_mn;
         const ori = result.orientation;
         const colorMatrix = new Float32Array(result.color_matrix_used());
