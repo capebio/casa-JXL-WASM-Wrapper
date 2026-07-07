@@ -113,6 +113,10 @@ jobs:
           - dng_decode
           - ljpeg_decode
           - decompress
+          - casv_header
+          - casv_footer
+          - casv_audio_box
+          - jxtc_header
     defaults:
       run:
         working-directory: crates/raw-pipeline
