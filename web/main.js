@@ -630,15 +630,24 @@ class WorkerPool {
                 if (typeof listener.options?.guard === 'function' && !listener.options.guard()) continue;
                 // See the policy note above: cache writes stay centralized here.
                 if (data.type === 'jxl_progress' || data.type === 'jxl_decoded') {
-                    applyJxlDecodeCachePolicy(
-                        listener.options?.cacheTarget,
-                        data.decodeId,
-                        data.rgba,
-                        data.w,
-                        data.h,
-                        isFinal,
-                        listener.options?.cachePolicy ?? 'never',
-                    );
+                    const ct = listener.options?.cacheTarget;
+                    // Skip caching into a card removed mid-decode (detached node):
+                    // its _jxlDecoded write would be orphaned onto a dead element.
+                    // Not every listener passes a removal `guard` above, so gate
+                    // centrally on isConnected. The in-flight decode still runs to
+                    // completion (best-effort; push() has no mid-decode cancel) —
+                    // we just don't stash pixels on a card that's gone.
+                    if (!(ct && ct.isConnected === false)) {
+                        applyJxlDecodeCachePolicy(
+                            ct,
+                            data.decodeId,
+                            data.rgba,
+                            data.w,
+                            data.h,
+                            isFinal,
+                            listener.options?.cachePolicy ?? 'never',
+                        );
+                    }
                 }
                 listener.cb(data);
             }
