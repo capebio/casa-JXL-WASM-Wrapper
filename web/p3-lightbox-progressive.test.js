@@ -33,7 +33,7 @@ test('P3.1 main-thread cache policy and the three production call sites are wire
     expect(mainJs).toContain('function applyJxlDecodeCachePolicy(');
     expect(mainJs).toContain("policy === 'onFirstProgress'");
     expect(mainJs).toContain("policy === 'onFinal' && isFinal");
-    expect(mainJs).toContain('card._jxlProgressCacheDecodeId = decodeId');
+    expect(mainJs).toContain('getCardState(card)._jxlProgressCacheDecodeId = decodeId');
     expect(mainJs).toContain("cachePolicy: 'onFirstProgress'");
     const onFinalCallSites = mainJs.match(/cachePolicy: 'onFinal'/g) ?? [];
     expect(onFinalCallSites.length).toBeGreaterThanOrEqual(2);

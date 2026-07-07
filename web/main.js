@@ -379,17 +379,17 @@ window.lightboxRefreshDraw = () => {
 };
 window.allCards = () => cards;
 
-// Decode the parent's full-resolution JXL into card._jxlDecoded if not already
+// Decode the parent's full-resolution JXL into getCardState(card)._jxlDecoded if not already
 // cached. Used by crop.js to render focal-subject thumbnails from the JXL
 // roundtrip. Returns a promise that resolves when the buffer is in place.
 window.decodeFullJxlFor = function decodeFullJxlFor(card) {
     return new Promise((resolve) => {
-        if (!card?._blobUrl) { resolve(null); return; }
-        if (card._jxlDecoded) { resolve(card._jxlDecoded); return; }
-        pool.decodeJxl(card._blobUrl, (msg) => {
+        if (!getCardState(card)?._blobUrl) { resolve(null); return; }
+        if (getCardState(card)._jxlDecoded) { resolve(getCardState(card)._jxlDecoded); return; }
+        pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
             if (msg.type === 'decode_error') { resolve(null); return; }
             if (msg.type !== 'jxl_decoded' && msg.isFinal !== true) return;
-            resolve(card._jxlDecoded ?? { rgba: msg.rgba, w: msg.w, h: msg.h });
+            resolve(getCardState(card)._jxlDecoded ?? { rgba: msg.rgba, w: msg.w, h: msg.h });
         }, 'low', {
             progressive: true,
             cachePolicy: 'onFinal',
@@ -406,14 +406,14 @@ window.decodeFullJxlFor = function decodeFullJxlFor(card) {
 window.openLightboxAtSubject = function openLightboxAtSubject(parentCard, subjectId) {
     if (!parentCard) return;
     openLightbox(parentCard);
-    parentCard._focusedSubjectId = subjectId;
+    getCardState(parentCard)._focusedSubjectId = subjectId;
     // After open, queue a frame to apply the subject zoom — the canvas needs
     // to have been painted first.
     requestAnimationFrame(() => focusOnSubject(parentCard, subjectId));
 };
 
 function focusOnSubject(card, subjectId) {
-    const subj = (card?._subjects || []).find(s => s.id === subjectId);
+    const subj = (getCardState(card)?._subjects || []).find(s => s.id === subjectId);
     if (!subj) return;
     focusOnRegion(subj.x, subj.y, subj.w, subj.h);
 }
@@ -489,13 +489,13 @@ document.addEventListener('pointerup', () => {
 reprocessBtn.addEventListener('click', () => reprocessSelected());
 
 applyLookBtn.addEventListener('click', () => {
-    const selected = cards.filter(c => c.classList.contains('selected') && c._file);
-    const targets = selected.length ? selected : cards.filter(c => c._file);
+    const selected = cards.filter(c => c.classList.contains('selected') && getCardState(c)._file);
+    const targets = selected.length ? selected : cards.filter(c => getCardState(c)._file);
     if (!targets.length) return;
     if (!selected.length) {
         // No explicit selection — select all, then reprocess all.
         for (const c of cards) {
-            if (c._file) {
+            if (getCardState(c)._file) {
                 c.classList.add('selected');
                 c.querySelector('.thumb-select').textContent = '✓';
             }
@@ -579,12 +579,12 @@ function applyJxlDecodeCachePolicy(card, decodeId, pixels, w, h, isFinal, policy
     if (policy === 'onFirstProgress') {
         if (jxlFirstProgressCacheSeen.has(decodeId)) return;
         jxlFirstProgressCacheSeen.add(decodeId);
-        card._jxlProgressCacheDecodeId = decodeId;
-        card._jxlDecoded = { rgba: pixels, w, h };
+        getCardState(card)._jxlProgressCacheDecodeId = decodeId;
+        getCardState(card)._jxlDecoded = { rgba: pixels, w, h };
         return;
     }
     if (policy === 'onFinal' && isFinal) {
-        card._jxlDecoded = { rgba: pixels, w, h };
+        getCardState(card)._jxlDecoded = { rgba: pixels, w, h };
     }
 }
 
@@ -1024,8 +1024,8 @@ window.scheduleLiveUpdate = scheduleLiveUpdate;
 function triggerLiveUpdate(look) {
     if (IS_TAURI) { triggerLiveUpdateTauri(look); return; }
     const card = cards[lightboxIndex];
-    if (!card || !card._taskId) return;
-    if (!pool.reprocessLive(card._taskId, look)) return;
+    if (!card || !getCardState(card)._taskId) return;
+    if (!pool.reprocessLive(getCardState(card)._taskId, look)) return;
     liveInFlight = true;
 }
 
@@ -1043,7 +1043,7 @@ pool.setLiveHandler((msg) => {
     liveInFlight = false;
     if (lightboxIndex >= 0) {
         const card = cards[lightboxIndex];
-        if (msg.type === WorkerMsg.LIGHTBOX_LIVE && card && msg.id === card._taskId) {
+        if (msg.type === WorkerMsg.LIGHTBOX_LIVE && card && msg.id === getCardState(card)._taskId) {
             // Phase 2: worker sends sensor-orientation pixels + orientation tag.
             // Apply rotation via GPU canvas transform — no CPU pixel-shuffle.
             const sW = msg.nativeW ?? msg.w;
@@ -1071,6 +1071,70 @@ contrastBoostEl.addEventListener('change', () => { scheduleLiveUpdate(); schedul
 const cardByTaskId = new Map();
 let galleryDebounceTimer = null;
 
+// ---------------------------------------------------------------------------
+// CardState WeakMap — canonical per-card state store
+// ---------------------------------------------------------------------------
+// State is keyed on the card <div> element. The WeakMap holds a plain
+// Object.create(null) so GC can collect both key and value once the card
+// element leaves the `cards` array and is removed from the DOM.
+//
+// Proxy getters/setters installed by initCardState keep card._field reads and
+// writes in sync with the WeakMap state. This lets external code (crop.js,
+// Playwright headless tests) continue to access card._field directly without
+// any change, while all internal main.js code uses getCardState(card)._field.
+/** @type {WeakMap<Element, CardState>} */
+const cardState = new WeakMap();
+
+// Property names that belong to CardState (matches the @typedef below).
+// Used by initCardState to install proxy getters/setters on new card elements.
+const _CARD_STATE_KEYS = [
+    '_file', '_taskId', '_tauriPath', '_pendingPriority', '_pendingLookBatch',
+    '_lightbox', '_embeddedPreview', '_blobUrl', '_jxlDecoded',
+    '_jxlThumbBmp', '_jxlThumbW', '_jxlThumbH', '_jxlProgressCacheDecodeId',
+    '_thumbRgb', '_thumbW', '_thumbH',
+    '_thumbNativeW', '_thumbNativeH', '_thumbOrientation',
+    '_sensorW', '_sensorH',
+    '_sourceMode', '_crop', '_subjects', '_focusedSubjectId',
+    '_jxlPrefetching', '_largePreviewFetching', '_largePreviewFetched',
+    '_wb', '_colorMatrixFromMn', '_camera', '_exif',
+    '_pipelineMs', '_phaseMs', '_meta', '_tauriResult',
+];
+
+/**
+ * Return the CardState object for a card element, or undefined if not initialised.
+ * @param {Element} card
+ * @returns {CardState|undefined}
+ */
+function getCardState(card) {
+    return cardState.get(card);
+}
+
+/**
+ * Create and register a CardState for `card`, pre-populated with `initialFields`.
+ * Also installs proxy getters/setters on the DOM element so card._field reads and
+ * writes continue to work for external code (crop.js, Playwright tests, etc.).
+ * @param {Element} card
+ * @param {Partial<CardState>} initialFields
+ * @returns {CardState}
+ */
+function initCardState(card, initialFields) {
+    const state = Object.assign(Object.create(null), initialFields);
+    cardState.set(card, state);
+    // Wire proxy getters/setters for each known key.  Closes over `state` so
+    // every access is a single property lookup — no WeakMap call overhead.
+    for (const key of _CARD_STATE_KEYS) {
+        if (!Object.getOwnPropertyDescriptor(card, key)) {
+            Object.defineProperty(card, key, {
+                get()  { return state[key]; },
+                set(v) { state[key] = v; },
+                configurable: true,
+                enumerable:   true,
+            });
+        }
+    }
+    return state;
+}
+
 function scheduleGalleryLiveUpdate() {
     clearTimeout(galleryDebounceTimer);
     galleryDebounceTimer = setTimeout(() => triggerGalleryLiveUpdate(currentLook()), 80);
@@ -1078,21 +1142,21 @@ function scheduleGalleryLiveUpdate() {
 
 function triggerGalleryLiveUpdate(look) {
     const taskIds = cards
-        .filter(c => c.classList.contains('selected') && c._taskId)
-        .map(c => c._taskId);
+        .filter(c => c.classList.contains('selected') && getCardState(c)._taskId)
+        .map(c => getCardState(c)._taskId);
     pool.reprocessAllLive(taskIds, look);
 }
 
 pool.setThumbLiveHandler((msg) => {
     const card = cardByTaskId.get(msg.id);
     if (card) {
-        card._thumbRgb = msg.rgb;
-        card._thumbW   = msg.w;
-        card._thumbH   = msg.h;
+        getCardState(card)._thumbRgb = msg.rgb;
+        getCardState(card)._thumbW   = msg.w;
+        getCardState(card)._thumbH   = msg.h;
         // Phase 2: sensor dims + orientation for GPU-rotate draw.
-        card._thumbNativeW = msg.nativeW ?? msg.w;
-        card._thumbNativeH = msg.nativeH ?? msg.h;
-        card._thumbOrientation = msg.orientation ?? 1;
+        getCardState(card)._thumbNativeW = msg.nativeW ?? msg.w;
+        getCardState(card)._thumbNativeH = msg.nativeH ?? msg.h;
+        getCardState(card)._thumbOrientation = msg.orientation ?? 1;
         redrawThumbRotated(card);
     }
 });
@@ -1113,18 +1177,18 @@ const cards = []; // ordered list of card elements for lightbox prev/next
 // route through here rather than dropping the element directly.
 function removeCard(card) {
     if (!card) return;
-    if (card._taskId != null) {
-        pool.cancelTask(card._taskId);
-        try { pool.releaseState(card._taskId); } catch {}
-        cardByTaskId.delete(card._taskId);
+    if (getCardState(card)._taskId != null) {
+        pool.cancelTask(getCardState(card)._taskId);
+        try { pool.releaseState(getCardState(card)._taskId); } catch {}
+        cardByTaskId.delete(getCardState(card)._taskId);
     }
-    if (card._tauriPath != null) cardByFilename.delete(card._tauriPath);
-    if (card._blobUrl) { try { URL.revokeObjectURL(card._blobUrl); } catch {} card._blobUrl = null; }
+    if (getCardState(card)._tauriPath != null) cardByFilename.delete(getCardState(card)._tauriPath);
+    if (getCardState(card)._blobUrl) { try { URL.revokeObjectURL(getCardState(card)._blobUrl); } catch {} getCardState(card)._blobUrl = null; }
     // Close per-card ImageBitmaps so their GPU-backed store is freed eagerly
     // rather than waiting on GC of the detached node — mirrors the explicit
     // .close() the thumb/lightbox paths already do when replacing a bitmap.
-    if (card._jxlThumbBmp) { try { card._jxlThumbBmp.close(); } catch {} card._jxlThumbBmp = null; }
-    if (card._embeddedPreview?.bmp) { try { card._embeddedPreview.bmp.close(); } catch {} card._embeddedPreview = null; }
+    if (getCardState(card)._jxlThumbBmp) { try { getCardState(card)._jxlThumbBmp.close(); } catch {} getCardState(card)._jxlThumbBmp = null; }
+    if (getCardState(card)._embeddedPreview?.bmp) { try { getCardState(card)._embeddedPreview.bmp.close(); } catch {} getCardState(card)._embeddedPreview = null; }
     const i = cards.indexOf(card);
     if (i !== -1) cards.splice(i, 1);
     try { card.remove(); } catch {}
@@ -1161,19 +1225,18 @@ function fileKey(f) { return `${f.name}|${f.size}|${f.lastModified}`; }
 /**
  * Per-card state contract.
  *
- * There is no WeakMap/Map for per-card state: each card's state lives as
- * underscore-prefixed expando properties on its own gallery `<div>` element.
- * This block is the single authoritative description of that shape. (An earlier
- * S2-Q4 plan proposed a `WeakMap<Element, CardState>` + a discriminated-union
- * `_lightbox`; both were dropped after a cleanup pass made the premise stale —
- * `_lightbox` is a decoded-pixel cache, not lightbox open-state, and the "per-card
- * Maps" it meant to consolidate never existed here. Open-lightbox state is the
- * module global `lightboxIndex`; live-update state is the module globals
- * `liveInFlight`/`livePendingLook`/`liveDebounceTimer`, one active lightbox at a
- * time. `peepCache` and `cardByTaskId`/`cardByFilename` are cross-card indices,
- * not per-card state.)
+ * State is stored in the module-level `cardState` WeakMap (Element → CardState)
+ * and accessed via `getCardState(card)`. Proxy getters/setters installed by
+ * `initCardState` keep `getCardState(card)._field` in sync with the WeakMap-backed object, so
+ * external code (crop.js, Playwright tests) that reads getCardState(card)._field directly
+ * continues to work without modification.
  *
- * @typedef {HTMLDivElement & {
+ * Open-lightbox state is the module global `lightboxIndex`; live-update state
+ * is `liveInFlight`/`livePendingLook`/`liveDebounceTimer` — one active lightbox
+ * at a time. `peepCache` and `cardByTaskId`/`cardByFilename` are cross-card
+ * indices, not per-card state — they are NOT migrated to the WeakMap.
+ *
+ * @typedef {{
  *   // --- identity / lifecycle ---
  *   _file?: File,                       // source RAW file (set in addCard)
  *   _taskId?: number|null,              // in-flight/last RAW worker task; key into cardByTaskId
@@ -1225,6 +1288,10 @@ function fileKey(f) { return `${f.name}|${f.size}|${f.lastModified}`; }
  */
 function makeCard(name) {
     const card = document.createElement('div');
+    // Register the WeakMap state entry immediately so all event-listener closures
+    // below and any external code (crop.js) that reads getCardState(card)._field see the same
+    // WeakMap-backed state from the moment the card is created.
+    initCardState(card, {});
     card.className = 'thumb busy';
     // Pre-size canvas to the RAW-thumb default (360×270 landscape 4:3, the
     // common Olympus aspect).  Without this, the canvas starts 0×0 and the
@@ -1255,7 +1322,7 @@ function makeCard(name) {
     });
     card.querySelector('.thumb-dl-btn').addEventListener('click', (e) => {
         e.stopPropagation();
-        const stem = (card._file?.name || 'image').replace(/\.(orf|cr2|dng)$/i, '');
+        const stem = (getCardState(card)._file?.name || 'image').replace(/\.(orf|cr2|dng)$/i, '');
         const cv = card.querySelector('canvas');
         cv.toBlob((blob) => {
             if (!blob) return;
@@ -1280,11 +1347,11 @@ function makeCard(name) {
         uploadBtn.textContent = '↑';
         uploadBtn.addEventListener('click', async (e) => {
             e.stopPropagation();
-            if (!card._tauriResult) return;
+            if (!getCardState(card)._tauriResult) return;
             uploadBtn.disabled = true; uploadBtn.textContent = '…';
             try {
                 const [settings, token] = await Promise.all([invoke('get_settings'), invoke('get_token')]);
-                const { jxl, exif } = card._tauriResult;
+                const { jxl, exif } = getCardState(card)._tauriResult;
                 const _jb = new Uint8Array(jxl); let _js = '';
                 // Chunked binary-string build: String.fromCharCode.apply over
                 // 0x8000-byte windows avoids the super-linear cost of per-byte
@@ -1311,15 +1378,15 @@ function makeCard(name) {
 function cycleSourceForCard(card, dir = 1) {
     const order = ['raw', 'jxl', 'jpeg'];
     const available = order.filter(m => {
-        if (m === 'raw')  return !!card._lightbox;
-        if (m === 'jxl')  return !!card._blobUrl;
-        if (m === 'jpeg') return !!card._embeddedPreview;
+        if (m === 'raw')  return !!getCardState(card)._lightbox;
+        if (m === 'jxl')  return !!getCardState(card)._blobUrl;
+        if (m === 'jpeg') return !!getCardState(card)._embeddedPreview;
         return false;
     });
     if (available.length < 2) return;
-    const cur = available.indexOf(card._sourceMode ?? 'raw');
+    const cur = available.indexOf(getCardState(card)._sourceMode ?? 'raw');
     const next = available[(cur + dir + available.length) % available.length];
-    card._sourceMode = next;
+    getCardState(card)._sourceMode = next;
     const labels = { raw: 'RAW', jxl: 'JXL', jpeg: 'JPEG' };
     refreshThumbToggleButton(card);
     if (lightboxIndex >= 0 && cards[lightboxIndex] === card) {
@@ -1337,13 +1404,13 @@ function refreshThumbToggleButton(card) {
     const btn = card.querySelector('.thumb-toggle-jpeg');
     if (!btn) return;
     const available = ['raw', 'jxl', 'jpeg'].filter(m => {
-        if (m === 'raw')  return !!card._lightbox;
-        if (m === 'jxl')  return !!card._blobUrl;
-        if (m === 'jpeg') return !!card._embeddedPreview;
+        if (m === 'raw')  return !!getCardState(card)._lightbox;
+        if (m === 'jxl')  return !!getCardState(card)._blobUrl;
+        if (m === 'jpeg') return !!getCardState(card)._embeddedPreview;
     });
     btn.hidden = available.length < 2;
     if (available.length < 2) return;
-    const mode   = card._sourceMode ?? 'raw';
+    const mode   = getCardState(card)._sourceMode ?? 'raw';
     const labels = { raw: 'RAW', jxl: 'JXL', jpeg: 'JPEG' };
     btn.textContent = labels[mode] ?? 'RAW';
     btn.setAttribute('data-mode', mode);
@@ -1464,40 +1531,40 @@ function drawRotatedCanvas(canvas, rgb, w, h, degrees) {
 }
 
 // Redraw a card's thumbnail applying the current userRotations entry.  Routes
-// through card._sourceMode: when 'jpeg' and we have an embedded preview cached,
+// through getCardState(card)._sourceMode: when 'jpeg' and we have an embedded preview cached,
 // the camera's JPEG is rendered at the same canvas pixel dims as the JXL/RGB
 // thumb so toggling doesn't change the viewport.
 function redrawThumbRotated(card) {
-    const deg = card._file?.name ? (userRotations[card._file.name] || 0) : 0;
+    const deg = getCardState(card)._file?.name ? (userRotations[getCardState(card)._file.name] || 0) : 0;
     const canvas = card.querySelector('canvas');
-    if (card._sourceMode === 'jpeg' && card._embeddedPreview && card._thumbW && card._thumbH) {
-        drawJpegToTargetDims(canvas, card._embeddedPreview.bmp,
-                             card._embeddedPreview.orientation || 1,
-                             card._thumbW, card._thumbH);
+    if (getCardState(card)._sourceMode === 'jpeg' && getCardState(card)._embeddedPreview && getCardState(card)._thumbW && getCardState(card)._thumbH) {
+        drawJpegToTargetDims(canvas, getCardState(card)._embeddedPreview.bmp,
+                             getCardState(card)._embeddedPreview.orientation || 1,
+                             getCardState(card)._thumbW, getCardState(card)._thumbH);
         canvas.style.transform = deg ? `rotate(${deg}deg)` : '';
         setThumbSource(card, classifyJpegThumbSource(
-            card._embeddedPreview.w, card._embeddedPreview.h));
+            getCardState(card)._embeddedPreview.w, getCardState(card)._embeddedPreview.h));
         return;
     }
     // Prefer the cached JXL-decoded thumb when it's available — the badge
     // says "JXL thumb" so the pixels should match.
-    if (card._jxlThumbBmp && card._jxlThumbW && card._jxlThumbH) {
-        canvas.width  = card._jxlThumbW;
-        canvas.height = card._jxlThumbH;
-        canvas.getContext('2d').drawImage(card._jxlThumbBmp, 0, 0);
+    if (getCardState(card)._jxlThumbBmp && getCardState(card)._jxlThumbW && getCardState(card)._jxlThumbH) {
+        canvas.width  = getCardState(card)._jxlThumbW;
+        canvas.height = getCardState(card)._jxlThumbH;
+        canvas.getContext('2d').drawImage(getCardState(card)._jxlThumbBmp, 0, 0);
         canvas.style.transform = deg ? `rotate(${deg}deg)` : '';
         setThumbSource(card, 'jxl');
         return;
     }
-    if (!card._thumbRgb) return;
+    if (!getCardState(card)._thumbRgb) return;
     // Phase 2: rgb is sensor-orientation if nativeW/H/orientation present;
     // GPU-rotated draw avoids the CPU transpose. Falls back to plain putImageData
     // for older messages or when orientation is identity.
-    if (card._thumbNativeW && card._thumbOrientation && card._thumbOrientation !== 1) {
-        drawSensorWithOrientation(canvas, card._thumbRgb,
-            card._thumbNativeW, card._thumbNativeH, card._thumbOrientation);
+    if (getCardState(card)._thumbNativeW && getCardState(card)._thumbOrientation && getCardState(card)._thumbOrientation !== 1) {
+        drawSensorWithOrientation(canvas, getCardState(card)._thumbRgb,
+            getCardState(card)._thumbNativeW, getCardState(card)._thumbNativeH, getCardState(card)._thumbOrientation);
     } else {
-        drawCanvas(canvas, card._thumbW, card._thumbH, card._thumbRgb);
+        drawCanvas(canvas, getCardState(card)._thumbW, getCardState(card)._thumbH, getCardState(card)._thumbRgb);
     }
     canvas.style.transform = deg ? `rotate(${deg}deg)` : '';
     // RAW-pipeline thumb — no badge.
@@ -1506,7 +1573,7 @@ function redrawThumbRotated(card) {
 
 // Rotate a card by delta degrees and persist + sync lightbox if open.
 function rotateCard(card, delta) {
-    const name = card._file?.name;
+    const name = getCardState(card)._file?.name;
     if (!name) return;
     userRotations[name] = (((userRotations[name] || 0) + delta) % 360 + 360) % 360;
     saveUserRotations();
@@ -1752,22 +1819,22 @@ function startConvert(file, existingCard) {
     } else {
         // Re-processing: release old rgb16 state from the worker before re-submitting,
         // otherwise liveStateMap accumulates ~15 MB per reprocess of the same card.
-        if (card._taskId) pool.releaseState(card._taskId);
+        if (getCardState(card)._taskId) pool.releaseState(getCardState(card)._taskId);
         card.classList.remove('encoding', 'error', 'embedded-thumb');
         card.classList.add('busy');
-        card._lightbox = null;
+        getCardState(card)._lightbox = null;
         // Keep _embeddedPreview alive across reprocess — JPEG-vs-JXL toggle needs it.
         // Force the JXL view back on so the user actually sees the result of
         // pressing Apply/Re-process; otherwise they'd be staring at the
         // (unchanged) camera JPEG and assume the action did nothing.
-        card._sourceMode = 'raw';
+        getCardState(card)._sourceMode = 'raw';
         refreshThumbToggleButton(card);
         if (lightboxIndex >= 0 && cards[lightboxIndex] === card) {
             drawLightboxForCard(card);
         }
     }
     totalSubmitted++;
-    card._file = file;
+    getCardState(card)._file = file;
     // Check for existing sidecar dot + hydrate crop/subjects so any focal
     // subjects show up as sibling cards before the user opens the lightbox.
     if (typeof loadSidecar === 'function' && file.name) {
@@ -1830,11 +1897,11 @@ function startConvert(file, existingCard) {
                 setThumbSource(card, classifyJpegThumbSource(largest.w, largest.h));
             }
 
-            card._embeddedPreview = { bmp: largest.bmp, w: largest.w, h: largest.h,
+            getCardState(card)._embeddedPreview = { bmp: largest.bmp, w: largest.w, h: largest.h,
                                       orientation: largest.orientation };
             refreshThumbToggleButton(card);
             if (lightboxIndex >= 0 && cards[lightboxIndex] === card) {
-                if (!card._lightbox) {
+                if (!getCardState(card)._lightbox) {
                     // drawLightboxForCard ends with syncZoomToDisplayLong()
                     // which preserves displayed size (or fits on first paint).
                     drawLightboxForCard(card);
@@ -1858,23 +1925,23 @@ function startConvert(file, existingCard) {
             // TIFF-magic RAW (orf/dng/cr2) from developed TIFF. Detection still
             // works on magic bytes alone if name is absent (e.g. EXR/CR2).
             opts.name = file.name || '';
-            const initialPriority = card._pendingPriority || 'normal';
-            card._pendingPriority = null;
+            const initialPriority = getCardState(card)._pendingPriority || 'normal';
+            getCardState(card)._pendingPriority = null;
             const taskId = pool.submit(bytes, opts, {
                 onThumb(msg) {
-                    card._thumbRgb = msg.rgb;
-                    card._thumbW   = msg.w;
-                    card._thumbH   = msg.h;
+                    getCardState(card)._thumbRgb = msg.rgb;
+                    getCardState(card)._thumbW   = msg.w;
+                    getCardState(card)._thumbH   = msg.h;
                     // Phase 2: sensor dims + orientation for GPU-rotate draw.
-                    card._thumbNativeW = msg.nativeW ?? msg.w;
-                    card._thumbNativeH = msg.nativeH ?? msg.h;
-                    card._thumbOrientation = msg.orientation ?? 1;
+                    getCardState(card)._thumbNativeW = msg.nativeW ?? msg.w;
+                    getCardState(card)._thumbNativeH = msg.nativeH ?? msg.h;
+                    getCardState(card)._thumbOrientation = msg.orientation ?? 1;
                     // Fresh RAW thumb — drop any stale JXL bitmap from a prior
                     // process so redrawThumbRotated paints the new RAW pixels
                     // rather than the old JXL cache.
-                    if (card._jxlThumbBmp) {
-                        try { card._jxlThumbBmp.close(); } catch {}
-                        card._jxlThumbBmp = null;
+                    if (getCardState(card)._jxlThumbBmp) {
+                        try { getCardState(card)._jxlThumbBmp.close(); } catch {}
+                        getCardState(card)._jxlThumbBmp = null;
                     }
                     try {
                         redrawThumbRotated(card);
@@ -1884,12 +1951,12 @@ function startConvert(file, existingCard) {
                         drawCanvas(card.querySelector('canvas'), msg.w, msg.h, msg.rgb);
                     }
                     refreshThumbToggleButton(card);
-                    card._pipelineMs = msg.pipelineMs;
-                    card._phaseMs = msg.phaseMs;
-                    card._wb = { r: msg.wbR, b: msg.wbB };
-                    card._colorMatrixFromMn = msg.colorMatrixFromMn;
-                    card._camera = [msg.make, msg.model].filter(Boolean).join(' ') || '?';
-                    card._exif = msg.exif || null;
+                    getCardState(card)._pipelineMs = msg.pipelineMs;
+                    getCardState(card)._phaseMs = msg.phaseMs;
+                    getCardState(card)._wb = { r: msg.wbR, b: msg.wbB };
+                    getCardState(card)._colorMatrixFromMn = msg.colorMatrixFromMn;
+                    getCardState(card)._camera = [msg.make, msg.model].filter(Boolean).join(' ') || '?';
+                    getCardState(card)._exif = msg.exif || null;
                     card.querySelector('.thumb-dl-btn').hidden = false;
                     card.classList.remove('busy', 'embedded-thumb');
                     card.classList.add('encoding');
@@ -1898,7 +1965,7 @@ function startConvert(file, existingCard) {
                 onLightbox(msg) {
                     // Phase 2: cache sensor pixels + orientation so the lightbox
                     // draw applies rotation via canvas transform (GPU) rather than CPU.
-                    card._lightbox = {
+                    getCardState(card)._lightbox = {
                         rgb: msg.rgb,
                         w: msg.w, h: msg.h,
                         nativeW: msg.nativeW ?? msg.w,
@@ -1917,40 +1984,40 @@ function startConvert(file, existingCard) {
                     // timings and exif with width/height 0 (lib.rs previews-only
                     // results have no sensor dims). Patch the real totals and
                     // dims now — before the stats push below reads them.
-                    if (msg.pipelineMs != null) card._pipelineMs = msg.pipelineMs;
-                    if (msg.phaseMs) card._phaseMs = msg.phaseMs;
-                    if (card._exif && !card._exif.width && msg.w) {
-                        card._exif.width  = msg.w;
-                        card._exif.height = msg.h;
+                    if (msg.pipelineMs != null) getCardState(card)._pipelineMs = msg.pipelineMs;
+                    if (msg.phaseMs) getCardState(card)._phaseMs = msg.phaseMs;
+                    if (getCardState(card)._exif && !getCardState(card)._exif.width && msg.w) {
+                        getCardState(card)._exif.width  = msg.w;
+                        getCardState(card)._exif.height = msg.h;
                     }
                     const blob = new Blob([msg.jxl], { type: 'image/jxl' });
                     // Revoke any previous blob URL for this card before creating a new one.
-                    if (card._blobUrl) URL.revokeObjectURL(card._blobUrl);
+                    if (getCardState(card)._blobUrl) URL.revokeObjectURL(getCardState(card)._blobUrl);
                     const url = URL.createObjectURL(blob);
-                    card._blobUrl = url;
-                    card._jxlDecoded = null;  // cache stale once bytes change
+                    getCardState(card)._blobUrl = url;
+                    getCardState(card)._jxlDecoded = null;  // cache stale once bytes change
                     card.querySelector('.size').textContent =
                         `${(msg.jxl.byteLength / 1024).toFixed(0)} KB`;
-                    const totalMs = card._pipelineMs + msg.jxlMs;
+                    const totalMs = getCardState(card)._pipelineMs + msg.jxlMs;
                     const effortNote = (msg.effortUsed && msg.effortRequested && msg.effortUsed < msg.effortRequested)
                         ? ` (effort ${msg.effortRequested}→${msg.effortUsed}: OOM)` : '';
                     card.querySelector('.time').textContent =
                         (totalMs >= 60000
                             ? `${Math.floor(totalMs / 60000)}m ${((totalMs % 60000) / 1000).toFixed(0)}s`
                             : `${(totalMs / 1000).toFixed(1)}s`) + effortNote;
-                    card._meta =
-                        `${msg.w}×${msg.h} • pipeline ${card._pipelineMs.toFixed(0)} ms • JXL ${msg.jxlMs.toFixed(0)} ms${effortNote}`;
+                    getCardState(card)._meta =
+                        `${msg.w}×${msg.h} • pipeline ${getCardState(card)._pipelineMs.toFixed(0)} ms • JXL ${msg.jxlMs.toFixed(0)} ms${effortNote}`;
 
                     // Stats line — keeps everything one image needs on one row.
                     statSeq++;
-                    const p = card._phaseMs || {};
-                    const wb = card._wb || {};
+                    const p = getCardState(card)._phaseMs || {};
+                    const wb = getCardState(card)._wb || {};
                     const name = file.name.padEnd(18, ' ').slice(0, 18);
                     const wbStr = wb.r != null
                         ? `wb R${wb.r.toFixed(3)} B${wb.b.toFixed(3)}`
                         : 'wb ?';
-                    const matrixStr = card._colorMatrixFromMn === true ? 'mn-matrix'
-                                    : card._colorMatrixFromMn === false ? 'fallback-matrix'
+                    const matrixStr = getCardState(card)._colorMatrixFromMn === true ? 'mn-matrix'
+                                    : getCardState(card)._colorMatrixFromMn === false ? 'fallback-matrix'
                                     : '';
                     bumpWbMatrix(wbStr, matrixStr);
                     pushStat(
@@ -1959,12 +2026,12 @@ function startConvert(file, existingCard) {
                         `dem ${fmtMs(p.demosaic)}  ` +
                         `tone ${fmtMs(p.tonemap)}  ` +
                         `ori ${fmtMs(p.orient)}  ` +
-                        `pipe ${fmtMs(card._pipelineMs)}  ` +
+                        `pipe ${fmtMs(getCardState(card)._pipelineMs)}  ` +
                         `jxl ${fmtMs(msg.jxlMs)}  ` +
                         `out ${fmtKb(msg.jxl.byteLength)}`,
                     );
 
-                    emaPipeline = emaPipeline == null ? card._pipelineMs : EMA_A * card._pipelineMs + (1 - EMA_A) * emaPipeline;
+                    emaPipeline = emaPipeline == null ? getCardState(card)._pipelineMs : EMA_A * getCardState(card)._pipelineMs + (1 - EMA_A) * emaPipeline;
                     emaEncode   = emaEncode   == null ? msg.jxlMs        : EMA_A * msg.jxlMs        + (1 - EMA_A) * emaEncode;
                     totalDone++;
                     refreshStatus();
@@ -1973,7 +2040,7 @@ function startConvert(file, existingCard) {
                     repaintThumbFromJxl(card);
                     // Subject sibling cards: now that JXL is ready, render
                     // their thumbnails from the parent's full-res JXL pixels.
-                    if (card._subjects?.length && typeof window.renderSubjectThumb === 'function') {
+                    if (getCardState(card)._subjects?.length && typeof window.renderSubjectThumb === 'function') {
                         window.renderSubjectThumb(card).catch(() => {});
                     }
                 },
@@ -1987,7 +2054,7 @@ function startConvert(file, existingCard) {
                     refreshStatus();
                 },
             }, initialPriority);
-            card._taskId = taskId;
+            getCardState(card)._taskId = taskId;
             cardByTaskId.set(taskId, card);
         })
         .catch((e) => {
@@ -2235,7 +2302,7 @@ function classifyJpegThumbSource(w, h) {
 // shows what the JXL roundtrip actually looks like (replacing whatever embedded
 // or RAW-pipeline thumb was there). Best-effort — failures stay silent.
 function repaintThumbFromJxl(card) {
-    if (!card?._blobUrl) return;
+    if (!getCardState(card)?._blobUrl) return;
     // TTFP-6 (bounded cache-join): this decode runs at FULL resolution and was
     // previously discarded after the 360px resize. If the card sits inside the
     // lightbox prefetch neighbourhood (current ±PREFETCH_NEIGHBORS, wrap-around
@@ -2257,7 +2324,7 @@ function repaintThumbFromJxl(card) {
             }
         }
     }
-    pool.decodeJxl(card._blobUrl, (msg) => {
+    pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
         if (msg.type === 'decode_error') {
             console.warn('JXL thumb decode error:', msg.error);
             return;
@@ -2279,12 +2346,12 @@ function repaintThumbFromJxl(card) {
             canvas.height = targetH;
             const ctx = canvas.getContext('2d');
             ctx.drawImage(bmp, 0, 0);
-            if (card._jxlThumbBmp && card._jxlThumbBmp !== bmp) {
-                try { card._jxlThumbBmp.close(); } catch {}
+            if (getCardState(card)._jxlThumbBmp && getCardState(card)._jxlThumbBmp !== bmp) {
+                try { getCardState(card)._jxlThumbBmp.close(); } catch {}
             }
-            card._jxlThumbBmp = bmp;
-            card._jxlThumbW   = targetW;
-            card._jxlThumbH   = targetH;
+            getCardState(card)._jxlThumbBmp = bmp;
+            getCardState(card)._jxlThumbW   = targetW;
+            getCardState(card)._jxlThumbH   = targetH;
             card.classList.remove('embedded-thumb');
             setThumbSource(card, 'jxl');
         }).catch(e => console.warn('JXL thumb bitmap failed:', e));
@@ -2466,8 +2533,8 @@ function resetLbZoom() {
 function rotateBy(delta) {
     lbRotation = ((lbRotation + delta) % 360 + 360) % 360;
     const card = cards[lightboxIndex];
-    if (card?._file?.name) {
-        userRotations[card._file.name] = lbRotation;
+    if (getCardState(card)?._file?.name) {
+        userRotations[getCardState(card)._file.name] = lbRotation;
         saveUserRotations();
         redrawThumbRotated(card);
     }
@@ -2491,12 +2558,12 @@ function zoomAtPoint(clientX, clientY, factor) {
 }
 
 function drawLightboxForCard(card) {
-    const mode = card._sourceMode ?? 'raw';
+    const mode = getCardState(card)._sourceMode ?? 'raw';
 
     if (mode === 'jpeg') {
-        if (card._embeddedPreview && card._lightbox) {
-            const { w, h } = card._lightbox;
-            const { bmp, orientation } = card._embeddedPreview;
+        if (getCardState(card)._embeddedPreview && getCardState(card)._lightbox) {
+            const { w, h } = getCardState(card)._lightbox;
+            const { bmp, orientation } = getCardState(card)._embeddedPreview;
             drawJpegToTargetDims(lightboxCanvas, bmp, orientation || 1, w, h);
             if (lightboxCanvas.width > 0) {
                 const _ctx = lightboxCanvas.getContext('2d');
@@ -2509,16 +2576,16 @@ function drawLightboxForCard(card) {
             return;
         }
         // Fallback: lightbox not ready yet, treat as raw.
-        card._sourceMode = 'raw';
+        getCardState(card)._sourceMode = 'raw';
     }
 
     if (mode === 'jxl') {
-        if (!card._blobUrl) {
+        if (!getCardState(card)._blobUrl) {
             // JXL not ready yet — fall back to raw.
-            card._sourceMode = 'raw';
-        } else if (card._jxlDecoded) {
+            getCardState(card)._sourceMode = 'raw';
+        } else if (getCardState(card)._jxlDecoded) {
             // Cached from prefetch — instant paint.
-            const { rgba, w, h } = card._jxlDecoded;
+            const { rgba, w, h } = getCardState(card)._jxlDecoded;
             lightboxCanvas.width  = w;
             lightboxCanvas.height = h;
             const ctx = lightboxCanvas.getContext('2d');
@@ -2545,7 +2612,7 @@ function drawLightboxForCard(card) {
             // Decode in flight — keep whatever pixels are on screen, show loader.
             lbLoadingBadge.hidden = false;
             updateToggleButtonState(card);
-            pool.decodeJxl(card._blobUrl, (msg) => {
+            pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
                 if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
                 if (msg.type === 'decode_error') {
                     console.warn('JXL decode error:', msg.error);
@@ -2595,7 +2662,7 @@ function drawLightboxForCard(card) {
     // fresh RGB frame which `triggerLiveUpdateTauri` paints directly.
     //
     // WASM-mode keeps the original flow: the WASM worker emits the lightbox
-    // RGB so card._lightbox.rgb is set without needing a fetch; if JXL is
+    // RGB so getCardState(card)._lightbox.rgb is set without needing a fetch; if JXL is
     // ready first, auto-promote to JXL mode so the user sees real output.
     //
     // Order of preference:
@@ -2605,21 +2672,21 @@ function drawLightboxForCard(card) {
     //      larger ~1620×1080 preview via fetchLargePreviewIfNeeded)
     //   3. JXL decode (WASM only — Tauri stays on embedded)
     //   4. 1×1 clear (nothing available yet)
-    const hasFullRgb     = !!(card._lightbox && card._lightbox.rgb);
-    const hasEmbedded    = !!card._embeddedPreview;
+    const hasFullRgb     = !!(getCardState(card)._lightbox && getCardState(card)._lightbox.rgb);
+    const hasEmbedded    = !!getCardState(card)._embeddedPreview;
 
     // WASM only: when JXL bytes arrive before RGB, jump to JXL mode so the
     // user sees real encoded output instead of the JPEG preview placeholder.
     // Tauri intentionally skips this — embedded JPEG stays primary until a
     // slider edit triggers `apply_look`.
-    if (!hasFullRgb && card._blobUrl && !IS_TAURI) {
-        card._sourceMode = 'jxl';
+    if (!hasFullRgb && getCardState(card)._blobUrl && !IS_TAURI) {
+        getCardState(card)._sourceMode = 'jxl';
         drawLightboxForCard(card);
         return;
     }
 
     if (hasFullRgb) {
-        const lb = card._lightbox;
+        const lb = getCardState(card)._lightbox;
         // Phase 2: if sensor-orient pixels with EXIF orientation, draw rotated via GPU.
         if (lb.nativeW && lb.orientation && lb.orientation !== 1) {
             drawSensorWithOrientation(lightboxCanvas, lb.rgb, lb.nativeW, lb.nativeH, lb.orientation);
@@ -2634,14 +2701,14 @@ function drawLightboxForCard(card) {
         lbLoadingBadge.hidden = true;
         applyStraightenToLightboxCanvas(card);
     } else if (hasEmbedded) {
-        const { bmp, orientation } = card._embeddedPreview;
+        const { bmp, orientation } = getCardState(card)._embeddedPreview;
         // In Tauri mode, the initial fast-emit JPEG is the tiny ~160×120 IFD1
         // thumbnail.  Drawing it would size the lightbox canvas to that, then
         // jump bigger when fetchLargePreviewIfNeeded swaps in the ~1620×1080
         // preview (different aspect ratio — 4:3 vs 3:2).  Defer until the
         // large preview lands so the lightbox starts at the correct size.
         const isSmallInTauri = IS_TAURI && Math.max(bmp.width, bmp.height) < 600
-                              && !card._largePreviewFetched;
+                              && !getCardState(card)._largePreviewFetched;
         if (isSmallInTauri) {
             lightboxCanvas.width = 1;
             lightboxCanvas.height = 1;
@@ -2658,8 +2725,8 @@ function drawLightboxForCard(card) {
             const swap = o >= 5;
             const srcDispW = swap ? bmp.height : bmp.width;
             const srcDispH = swap ? bmp.width  : bmp.height;
-            const knownW = card._lightbox?.w;
-            const knownH = card._lightbox?.h;
+            const knownW = getCardState(card)._lightbox?.w;
+            const knownH = getCardState(card)._lightbox?.h;
             let targetW, targetH;
             if (knownW > 0 && knownH > 0) {
                 targetW = knownW; targetH = knownH;
@@ -2695,15 +2762,15 @@ function drawLightboxForCard(card) {
     updateToggleButtonState(card);
     syncZoomToDisplayLong();
     // Final safety net for straighten in any remaining paths
-    if (card && card._crop && card._crop.angle) {
+    if (card && getCardState(card)._crop && getCardState(card)._crop.angle) {
         applyStraightenToLightboxCanvas(card);
     }
 }
 
 function updateToggleButtonState(card) {
-    const mode   = card?._sourceMode ?? 'raw';
+    const mode   = getCardState(card)?._sourceMode ?? 'raw';
     const labels = { raw: 'RAW', jxl: 'JXL', jpeg: 'JPEG' };
-    const havePair = !!(card && (card._lightbox || card._embeddedPreview || card._blobUrl));
+    const havePair = !!(card && (getCardState(card)._lightbox || getCardState(card)._embeddedPreview || getCardState(card)._blobUrl));
     if (lbToggleJpegBtn) {
         lbToggleJpegBtn.disabled = !havePair;
         lbToggleJpegBtn.textContent = labels[mode] ?? 'RAW';
@@ -2828,7 +2895,7 @@ function fmtWb(exif) {
 }
 
 function buildInfoRows(card) {
-    const ex = card._exif;
+    const ex = getCardState(card)._exif;
     if (!ex) return [];
     const camera = [ex.make, ex.model].filter(Boolean).join(' ').trim() || '—';
     const dim = (ex.width && ex.height) ? `${ex.width} × ${ex.height}` : null;
@@ -2846,7 +2913,7 @@ function buildInfoRows(card) {
         ['Dimensions', dim],
         ['Format',    'ORF (Olympus 12-bit)'],
         ['Quality',   fmtQuality(ex.quality)],
-        ['Pipeline',  card._pipelineMs != null ? `${card._pipelineMs.toFixed(0)} ms` : null],
+        ['Pipeline',  getCardState(card)._pipelineMs != null ? `${getCardState(card)._pipelineMs.toFixed(0)} ms` : null],
     ].filter(([_, v]) => v != null);
 }
 
@@ -2885,16 +2952,16 @@ function renderInfoPanel(card) {
 }
 
 // Background JXL prefetch — keeps RAW on display but stashes decoded JXL
-// pixels in card._jxlDecoded so manual toggle / zoom is instant.
+// pixels in getCardState(card)._jxlDecoded so manual toggle / zoom is instant.
 const PREFETCH_NEIGHBORS = 2;
 function prefetchJxl(card, priority = 'normal') {
-    if (!card || !card._blobUrl) return;
-    if (card._jxlDecoded) return;
-    if (card._jxlPrefetching) return;
-    card._jxlPrefetching = true;
-    pool.decodeJxl(card._blobUrl, (msg) => {
+    if (!card || !getCardState(card)._blobUrl) return;
+    if (getCardState(card)._jxlDecoded) return;
+    if (getCardState(card)._jxlPrefetching) return;
+    getCardState(card)._jxlPrefetching = true;
+    pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
         if (msg.type === 'decode_error' || msg.type === 'jxl_decoded' || msg.isFinal === true) {
-            card._jxlPrefetching = false;
+            getCardState(card)._jxlPrefetching = false;
         }
     }, priority, {
         progressive: true,
@@ -2923,13 +2990,13 @@ function promoteRawAroundCurrent() {
     if (lightboxIndex < 0) return;
     const setRawPriority = (card, prio) => {
         if (!card) return;
-        if (card._taskId != null) pool.setPriority(card._taskId, prio);
-        else card._pendingPriority = prio;
+        if (getCardState(card)._taskId != null) pool.setPriority(getCardState(card)._taskId, prio);
+        else getCardState(card)._pendingPriority = prio;
         // Tauri side: each promote_file call allocates a fresh ever-decreasing
         // priority on the backend, so the LAST call wins the front of the
         // queue.  Order matters here — neighbours first, current last.
-        if (IS_TAURI && card._tauriPath) {
-            invoke('promote_file', { path: card._tauriPath }).catch(() => {});
+        if (IS_TAURI && getCardState(card)._tauriPath) {
+            invoke('promote_file', { path: getCardState(card)._tauriPath }).catch(() => {});
         }
     };
     // Promote neighbours first (lowest urgency), then current LAST.  Backend
@@ -2947,7 +3014,7 @@ function promoteRawAroundCurrent() {
 }
 
 // Tauri-only: fetch the larger embedded preview JPEG on demand and swap
-// it into card._embeddedPreview so the lightbox shows a high-quality placeholder
+// it into getCardState(card)._embeddedPreview so the lightbox shows a high-quality placeholder
 // while the RAW pipeline finishes.  No-op if the full RAW lightbox is already
 // drawn or a fetch is already pending.
 //
@@ -2957,50 +3024,50 @@ function promoteRawAroundCurrent() {
 let _largePrevDebounceTimer = null;
 let _largePrevDebounceTarget = null;
 function fetchLargePreviewIfNeeded(card) {
-    if (!IS_TAURI || !card || !card._tauriPath) return;
-    if (card._largePreviewFetched || card._largePreviewFetching) return;
-    if (card._lightbox && card._lightbox.rgb) return; // RAW already there
+    if (!IS_TAURI || !card || !getCardState(card)._tauriPath) return;
+    if (getCardState(card)._largePreviewFetched || getCardState(card)._largePreviewFetching) return;
+    if (getCardState(card)._lightbox && getCardState(card)._lightbox.rgb) return; // RAW already there
     _largePrevDebounceTarget = card;
     clearTimeout(_largePrevDebounceTimer);
     _largePrevDebounceTimer = setTimeout(() => {
         if (_largePrevDebounceTarget !== card) return;
-        if (card._largePreviewFetched || card._largePreviewFetching) return;
-        if (card._lightbox && card._lightbox.rgb) return;
-        card._largePreviewFetching = true;
-        invoke('get_large_preview', { path: card._tauriPath })
+        if (getCardState(card)._largePreviewFetched || getCardState(card)._largePreviewFetching) return;
+        if (getCardState(card)._lightbox && getCardState(card)._lightbox.rgb) return;
+        getCardState(card)._largePreviewFetching = true;
+        invoke('get_large_preview', { path: getCardState(card)._tauriPath })
             .then((bytes) => {
                 const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-                const orientation = card._embeddedPreview?.orientation || 1;
+                const orientation = getCardState(card)._embeddedPreview?.orientation || 1;
                 return createImageBitmap(new Blob([u8], { type: 'image/jpeg' }))
                     .then(bmp => ({ bmp, orientation }));
             })
             .then(({ bmp, orientation }) => {
-                const prev = card._embeddedPreview;
+                const prev = getCardState(card)._embeddedPreview;
                 if (!prev || bmp.width * bmp.height > prev.bmp.width * prev.bmp.height) {
                     if (prev?.bmp && prev.bmp !== bmp) try { prev.bmp.close(); } catch {}
-                    card._embeddedPreview = { bmp, w: bmp.width, h: bmp.height, orientation };
+                    getCardState(card)._embeddedPreview = { bmp, w: bmp.width, h: bmp.height, orientation };
                 } else {
                     try { bmp.close(); } catch {}
                 }
-                card._largePreviewFetched = true;
+                getCardState(card)._largePreviewFetched = true;
                 if (lightboxIndex >= 0 && cards[lightboxIndex] === card &&
-                    !(card._lightbox && card._lightbox.rgb)) {
+                    !(getCardState(card)._lightbox && getCardState(card)._lightbox.rgb)) {
                     drawLightboxForCard(card);
                 }
             })
             .catch((e) => { console.warn('get_large_preview failed:', e); })
-            .finally(() => { card._largePreviewFetching = false; });
+            .finally(() => { getCardState(card)._largePreviewFetching = false; });
     }, 80);
 }
 
 function openLightbox(card) {
     lightboxIndex = cards.indexOf(card);
-    lbRotation = card._file?.name ? (userRotations[card._file.name] ?? 0) : 0;
-    card._sourceMode = 'raw';
+    lbRotation = getCardState(card)._file?.name ? (userRotations[getCardState(card)._file.name] ?? 0) : 0;
+    getCardState(card)._sourceMode = 'raw';
     resetLookSliders();
     // Auto-load sidecar if present
-    if (typeof loadSidecar === 'function' && (card._tauriPath || card._file?.name)) {
-        const sidecarPath = card._tauriPath || card._file?.name;
+    if (typeof loadSidecar === 'function' && (getCardState(card)._tauriPath || getCardState(card)._file?.name)) {
+        const sidecarPath = getCardState(card)._tauriPath || getCardState(card)._file?.name;
         loadSidecar(sidecarPath).then(sidecar => {
             if (sidecar && typeof applySidecar === 'function') applySidecar(sidecar);
             // After sidecar applied, sync sibling cards in the grid and queue
@@ -3018,13 +3085,13 @@ function openLightbox(card) {
 
     // Reset straighten slider to the card's current state (or 0)
     if (lbStraighten) {
-        const ang = card._crop?.angle || 0;
+        const ang = getCardState(card)._crop?.angle || 0;
         lbStraighten.value = String(ang);
         if (lbStraightenVal) lbStraightenVal.textContent = ang.toFixed(1) + '°';
     }
     // If a crop is saved on this card, fit-to-crop instead of fit-to-image.
-    if (card._crop) {
-        requestAnimationFrame(() => focusOnRegion(card._crop.x, card._crop.y, card._crop.w, card._crop.h));
+    if (getCardState(card)._crop) {
+        requestAnimationFrame(() => focusOnRegion(getCardState(card)._crop.x, getCardState(card)._crop.y, getCardState(card)._crop.w, getCardState(card)._crop.h));
     }
     promoteRawAroundCurrent();
     prefetchAroundCurrent();
@@ -3043,7 +3110,7 @@ function openLightbox(card) {
 function drawLightbox() {
     const card = cards[lightboxIndex];
     if (!card) return;
-    lbRotation = card._file?.name ? (userRotations[card._file.name] ?? 0) : 0;
+    lbRotation = getCardState(card)._file?.name ? (userRotations[getCardState(card)._file.name] ?? 0) : 0;
     drawLightboxForCard(card);
     renderInfoPanel(card);
     refreshFilmstripPrimary();
@@ -3076,13 +3143,13 @@ function nextInLightbox(dir) {
     // than jumping to the next/previous top-level photo. Falling off either
     // end returns to top-level navigation.
     const cur = cards[lightboxIndex];
-    if (cur && cur._focusedSubjectId !== undefined && cur._subjects?.length) {
-        const ids = [null, ...cur._subjects.map(s => s.id)];
-        const at  = ids.indexOf(cur._focusedSubjectId);
+    if (cur && getCardState(cur)._focusedSubjectId !== undefined && getCardState(cur)._subjects?.length) {
+        const ids = [null, ...getCardState(cur)._subjects.map(s => s.id)];
+        const at  = ids.indexOf(getCardState(cur)._focusedSubjectId);
         const nextAt = at + dir;
         if (nextAt >= 0 && nextAt < ids.length) {
             const nextId = ids[nextAt];
-            cur._focusedSubjectId = nextId;
+            getCardState(cur)._focusedSubjectId = nextId;
             if (nextId == null) {
                 // Back to full parent — refit zoom to viewport.
                 lbDisplayLongPx = null; lbPanX = 0; lbPanY = 0;
@@ -3094,11 +3161,11 @@ function nextInLightbox(dir) {
         }
         // Falling off the connected set → fall through to normal cycle and
         // clear focus.
-        cur._focusedSubjectId = undefined;
+        getCardState(cur)._focusedSubjectId = undefined;
     }
     lightboxIndex = (lightboxIndex + dir + cards.length) % cards.length;
     const card = cards[lightboxIndex];
-    if (card) card._sourceMode = 'raw';
+    if (card) getCardState(card)._sourceMode = 'raw';
     liveInFlight = false;
     livePendingLook = null;
     resetLookSliders();
@@ -3112,7 +3179,7 @@ function nextInLightbox(dir) {
     refreshFilmstripPrimary();
 
     if (lbStraighten && card) {
-        const ang = card._crop?.angle || 0;
+        const ang = getCardState(card)._crop?.angle || 0;
         lbStraighten.value = String(ang);
         if (lbStraightenVal) lbStraightenVal.textContent = ang.toFixed(1) + '°';
     }
@@ -3125,7 +3192,7 @@ function nextInLightbox(dir) {
  * but excellent for real-world straighten (-15°..+15°).
  */
 function applyStraightenToLightboxCanvas(card) {
-    const crop = card?._crop;
+    const crop = getCardState(card)?._crop;
     if (!crop || !crop.angle || !lightboxCanvas.width || !lightboxCanvas.height) return;
 
     const angleRad = (crop.angle || 0) * Math.PI / 180;
@@ -3274,7 +3341,7 @@ function populateFilmstrip() {
             thumb.style.background = idx % 2 ? '#1f2937' : '#111827';
             const label = document.createElement('div');
             label.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:9px;opacity:.6;color:#9ca3af;overflow:hidden;padding:2px;text-align:center';
-            label.textContent = (card._file?.name || 'img').replace(/\.[^.]+$/, '').slice(-8);
+            label.textContent = (getCardState(card)._file?.name || 'img').replace(/\.[^.]+$/, '').slice(-8);
             thumb.appendChild(label);
         }
 
@@ -3296,7 +3363,7 @@ function populateFilmstrip() {
                 if (targetIdx !== lightboxIndex && cards[targetIdx]) {
                     lightboxIndex = targetIdx;
                     const targetCard = cards[targetIdx];
-                    targetCard._sourceMode = targetCard._sourceMode || 'raw';
+                    getCardState(targetCard)._sourceMode = getCardState(targetCard)._sourceMode || 'raw';
                     lbDisplayLongPx = null; lbPanX = 0; lbPanY = 0;
                     drawLightbox();
                     promoteRawAroundCurrent();
@@ -3314,7 +3381,7 @@ function populateFilmstrip() {
             if (cards[targetIdx]) {
                 lightboxIndex = targetIdx;
                 const c = cards[targetIdx];
-                c._sourceMode = c._sourceMode || 'raw';
+                getCardState(c)._sourceMode = getCardState(c)._sourceMode || 'raw';
                 lbDisplayLongPx = null; lbPanX = 0; lbPanY = 0;
                 drawLightbox();
             }
@@ -3345,9 +3412,9 @@ function applyLookToFilmstripSelection() {
     const taskIds = [];
     indices.forEach(i => {
         const c = cards[i];
-        if (c && c._taskId) taskIds.push(c._taskId);
+        if (c && getCardState(c)._taskId) taskIds.push(getCardState(c)._taskId);
         // Also update any live state on the card objects themselves (for gallery)
-        if (c) c._pendingLookBatch = { ...look };
+        if (c) getCardState(c)._pendingLookBatch = { ...look };
     });
 
     // Reuse the existing live machinery (best effort)
@@ -3362,7 +3429,7 @@ function applyLookToFilmstripSelection() {
     if (window.IS_TAURI) {
         indices.forEach(i => {
             const c = cards[i];
-            const fname = c?._tauriPath || c?._file?.name;
+            const fname = getCardState(c)?._tauriPath || getCardState(c)?._file?.name;
             if (fname && typeof window.saveSidecar === 'function') {
                 // saveSidecar reads current global look + the card's crop/subjects
                 window.saveSidecar(fname).catch(() => {});
@@ -3412,7 +3479,7 @@ if (lbToggleJpegBtn) {
 lbDownloadBtn.addEventListener('click', () => {
     const card = cards[lightboxIndex];
     if (!card) return;
-    const stem = (card._file?.name || 'image').replace(/\.(orf|cr2|dng)$/i, '');
+    const stem = (getCardState(card)._file?.name || 'image').replace(/\.(orf|cr2|dng)$/i, '');
     lightboxCanvas.toBlob((blob) => {
         if (!blob) return;
         const url = URL.createObjectURL(blob);
@@ -3431,8 +3498,8 @@ if (lbStraighten) {
         if (lbStraightenVal) lbStraightenVal.textContent = angle.toFixed(1) + '°';
 
         // Create or update the crop descriptor with the angle
-        const existing = card._crop || { x: 0.05, y: 0.05, w: 0.9, h: 0.9, ratio: 'free' };
-        card._crop = {
+        const existing = getCardState(card)._crop || { x: 0.05, y: 0.05, w: 0.9, h: 0.9, ratio: 'free' };
+        getCardState(card)._crop = {
             ...existing,
             angle,
             inOriginalSpace: true
@@ -3446,11 +3513,11 @@ if (lbStraightenAuto) {
     lbStraightenAuto.addEventListener('click', () => {
         const card = cards[lightboxIndex];
         if (!card || !lightboxCanvas.width || !lightboxCanvas.height) return;
-        const currentAngle = card._crop?.angle || 0;
-        const ratio = card._crop?.ratio || 'free';
+        const currentAngle = getCardState(card)._crop?.angle || 0;
+        const ratio = getCardState(card)._crop?.ratio || 'free';
         const newCrop = computeStraightenCrop(lightboxCanvas.width, lightboxCanvas.height, currentAngle, ratio);
         if (newCrop) {
-            card._crop = newCrop;
+            getCardState(card)._crop = newCrop;
             if (lbStraighten) lbStraighten.value = String(newCrop.angle || 0);
             if (lbStraightenVal) lbStraightenVal.textContent = (newCrop.angle || 0).toFixed(1) + '°';
             drawLightboxForCard(card);
@@ -3572,7 +3639,7 @@ document.addEventListener('keydown', (e) => {
         e.preventDefault();
         if (!lightbox.hidden) {
             const card = cards[lightboxIndex];
-            const sidecarPath = card?._tauriPath || card?._file?.name;
+            const sidecarPath = getCardState(card)?._tauriPath || getCardState(card)?._file?.name;
             if (sidecarPath && typeof saveSidecar === 'function') saveSidecar(sidecarPath);
         }
         return;
@@ -3653,8 +3720,8 @@ document.addEventListener('keydown', (e) => {
         // If a subject is focused, clear focus and refit parent first; only
         // close the lightbox when there's no subject context to back out of.
         const cur = cards[lightboxIndex];
-        if (cur && cur._focusedSubjectId) {
-            cur._focusedSubjectId = undefined;
+        if (cur && getCardState(cur)._focusedSubjectId) {
+            getCardState(cur)._focusedSubjectId = undefined;
             lbDisplayLongPx = null; lbPanX = 0; lbPanY = 0;
             syncZoomToDisplayLong();
             e.preventDefault();
@@ -3798,15 +3865,15 @@ document.addEventListener('keydown', (e) => {
 // Re-process — applies current look-controls to either selected cards or all.
 // ---------------------------------------------------------------------------
 function reprocessSelected() {
-    const selected = cards.filter((c) => c.classList.contains('selected') && c._file);
-    const targets = selected.length ? selected : cards.filter((c) => c._file);
+    const selected = cards.filter((c) => c.classList.contains('selected') && getCardState(c)._file);
+    const targets = selected.length ? selected : cards.filter((c) => getCardState(c)._file);
     if (!targets.length) return;
     const ls = lookInputs
         .filter((el) => Number(el.value) !== 0)
         .map((el) => `${el.dataset.look}=${el.value}`)
         .join(' ');
     pushStat(`--- reprocess (${targets.length}) ${ls || '(all zero)'} ---`);
-    for (const card of targets) startConvert(card._file, card);
+    for (const card of targets) startConvert(getCardState(card)._file, card);
 }
 
 // ---------------------------------------------------------------------------
@@ -3897,9 +3964,9 @@ function onFileDoneTauri(path, result) {
 
     // Drop any stale JXL bitmap from a prior process so the new RAW thumb
     // doesn't get masked by a redrawThumbRotated call that prefers the cache.
-    if (card._jxlThumbBmp) {
-        try { card._jxlThumbBmp.close(); } catch {}
-        card._jxlThumbBmp = null;
+    if (getCardState(card)._jxlThumbBmp) {
+        try { getCardState(card)._jxlThumbBmp.close(); } catch {}
+        getCardState(card)._jxlThumbBmp = null;
     }
     // Defensive paint — surface failures instead of leaving a black canvas.
     try {
@@ -3925,14 +3992,14 @@ function onFileDoneTauri(path, result) {
         const tEl = card.querySelector('.time');
         if (tEl) tEl.textContent = 'paint: ' + (e.message || e);
     }
-    card._tauriResult = result;
+    getCardState(card)._tauriResult = result;
 
     // Tauri-only: ship dims now, fetch pixels lazily via get_lightbox(id) on
     // first lightbox open.  Cuts per-file IPC payload by ~30 MB JSON, which
-    // benchmark showed is the dominant batch-queue gap.  card._lightbox stays
+    // benchmark showed is the dominant batch-queue gap.  getCardState(card)._lightbox stays
     // truthy so existing _lightbox checks (havePair, raw-mode gating) work.
     if (typeof result?.lightbox_width === 'number' && result?.id != null) {
-        card._lightbox = {
+        getCardState(card)._lightbox = {
             rgb: null,
             w: result.lightbox_width,
             h: result.lightbox_height,
@@ -3947,9 +4014,9 @@ function onFileDoneTauri(path, result) {
             ? Uint8Array.from(atob(result.jxl), c => c.charCodeAt(0))
             : (result.jxl instanceof Uint8Array ? result.jxl : new Uint8Array(result.jxl));
         const blob = new Blob([jxlBytes], { type: 'image/jxl' });
-        if (card._blobUrl) URL.revokeObjectURL(card._blobUrl);
-        card._blobUrl = URL.createObjectURL(blob);
-        card._jxlDecoded = null;
+        if (getCardState(card)._blobUrl) URL.revokeObjectURL(getCardState(card)._blobUrl);
+        getCardState(card)._blobUrl = URL.createObjectURL(blob);
+        getCardState(card)._jxlDecoded = null;
         const dlBtn = card.querySelector('.thumb-dl-btn');
         if (dlBtn) dlBtn.hidden = false;
         refreshThumbToggleButton(card);
@@ -3957,7 +4024,7 @@ function onFileDoneTauri(path, result) {
         // Repaint thumb from the JXL roundtrip so the grid shows JXL output.
         repaintThumbFromJxl(card);
         // Subject sibling cards: render their thumbs now that JXL is ready.
-        if (card._subjects?.length && typeof window.renderSubjectThumb === 'function') {
+        if (getCardState(card)._subjects?.length && typeof window.renderSubjectThumb === 'function') {
             window.renderSubjectThumb(card).catch(() => {});
         }
     }
@@ -4012,8 +4079,8 @@ async function startBatchTauri(paths) {
     for (const path of paths) {
         const filename = path.split(/[\\/]/).pop();
         const card = makeCard(filename);
-        card._file = { name: filename };
-        card._tauriPath = path;
+        getCardState(card)._file = { name: filename };
+        getCardState(card)._tauriPath = path;
         // Key on the full path, not the basename — distinct folders can hold the
         // same filename, and a basename key would silently collide (one card
         // shadowing the other in every findTauriCard / onFileDoneTauri lookup).
@@ -4092,11 +4159,11 @@ async function startBatchTauri(paths) {
                 // Tauri's file_thumb_fast always emits the small IFD1 preview.
                 setThumbSource(card, classifyJpegThumbSource(bmp.width, bmp.height));
             }
-            card._embeddedPreview = { bmp, w: bmp.width, h: bmp.height, orientation };
-            card._sensorW = sensorW;
-            card._sensorH = sensorH;
+            getCardState(card)._embeddedPreview = { bmp, w: bmp.width, h: bmp.height, orientation };
+            getCardState(card)._sensorW = sensorW;
+            getCardState(card)._sensorH = sensorH;
             refreshThumbToggleButton(card);
-            if (lightboxIndex >= 0 && cards[lightboxIndex] === card && !card._lightbox) {
+            if (lightboxIndex >= 0 && cards[lightboxIndex] === card && !getCardState(card)._lightbox) {
                 drawLightboxForCard(card);
             }
         }).catch(() => {});
@@ -5369,12 +5436,12 @@ let tauriLivePending = null;
 
 async function triggerLiveUpdateTauri(look) {
     const card = cards[lightboxIndex];
-    if (!card || !card._tauriResult) return;
+    if (!card || !getCardState(card)._tauriResult) return;
     if (tauriLiveInFlight) { tauriLivePending = look; return; }
     tauriLiveInFlight = true;
     try {
         const buf = await invoke('apply_look', {
-            id: card._tauriResult.id,
+            id: getCardState(card)._tauriResult.id,
             look: lookToSnake(look),
         });
         const view = new DataView(buf);
@@ -5391,9 +5458,9 @@ async function triggerLiveUpdateTauri(look) {
             lightboxCanvas.height = h;
             // Also cache on card so subsequent draws know the RAW dims and
             // the embedded fallback branch matches.
-            if (!card._lightbox) card._lightbox = {};
-            card._lightbox.w = w;
-            card._lightbox.h = h;
+            if (!getCardState(card)._lightbox) getCardState(card)._lightbox = {};
+            getCardState(card)._lightbox.w = w;
+            getCardState(card)._lightbox.h = h;
         }
         const ctx = lightboxCanvas.getContext('2d');
         ctx.putImageData(new ImageData(rgbToRgbaArr(rgb), w, h), 0, 0);
@@ -5492,12 +5559,12 @@ function runH29DevelopChannel(adjustments) {
         return false;
     }
     const card = cards[lightboxIndex];
-    if (!card || !card._taskId) return false;
+    if (!card || !getCardState(card)._taskId) return false;
     try {
         // Stream the develop-slider deltas, then drive a progressive refinement
         // pass. Both are the real H29 exports detected above.
-        h29.applyLookStream(card._taskId, lookToSnake(adjustments));
-        h29.progressivePass(card._taskId);
+        h29.applyLookStream(getCardState(card)._taskId, lookToSnake(adjustments));
+        h29.progressivePass(getCardState(card)._taskId);
         return true;
     } catch (e) {
         console.warn('[H29] develop channel failed, falling back:', e);
