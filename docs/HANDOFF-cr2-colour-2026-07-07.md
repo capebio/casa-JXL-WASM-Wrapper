@@ -112,6 +112,39 @@ the strip-based — not tiled — JPEG, read exactly its bytes) works in testing
 when the 3 MB scan yields nothing would give DNGs a correct instant preview
 (and mask the too-bright decode until tone is fixed). CR2/ORF unaffected.
 
+## UPDATE 3 (2026-07-07, viewed actual output) — it's EXPOSURE + R/B, not a matrix cast
+
+Viewing the user's screenshots vs the reference (`_MG_1747 small 1080.jpg`, a
+bright landscape: blue sky, green lily pads) reframed everything:
+
+- **The dominant bug is GROSS OVEREXPOSURE.** `pipeline.rs:320`
+  **`BASELINE_EXP_EV = 1.40`** — an always-on **+1.40 EV (2.64×)** gain added to
+  *every* decode (`exp_gain = 2^(exposure_ev + BASELINE_EXP_EV)`, line 1853),
+  "tuned to embedded JPEG luminance" = tuned for **Olympus ORF** (which needs the
+  boost). Applied to already-well-exposed **Canon CR2 + Pixel DNG** → blown-out,
+  milky, yellow highlights. `BASELINE_SAT=1.40→1.30` and `BASELINE_CONTRAST=0.55`
+  are likewise Olympus-tuned always-on. **This is the "too bright" for BOTH CR2
+  and DNG.** Fix = make the baseline exposure/sat **format-specific or adaptive**
+  (measure the embedded-JPEG luminance per file and match it, which is the stated
+  intent) instead of a fixed Olympus constant. Needs validation across
+  bright/normal/dark references + a wasm rebuild.
+- **Orange sky (final) = R/B phase assignment.** `refine_cfa_phase_by_green`
+  (shipped) correctly resolves the GREEN diagonal (magenta→gone) but the R/B
+  choice between the two green-correct phases `(0,1)`/`(1,0)` is a coin-flip on
+  the near-neutral whole-frame mean — wrong for the 550D → blue sky renders
+  orange (green foliage stays correct). Fix = reliable R/B disambiguation: sample
+  a region of known hue, use the CFAPattern/SensorInfo metadata correctly, or
+  validate against the reference (sky must be blue).
+- The earlier "yellow = generic matrix" read was a red herring — the pre-tone
+  mean was mildly off, but the VISIBLE damage is the +1.40 EV blow-out.
+
+**Right approach (stop guessing): make the tone/exposure stage native-testable**
+(extract `apply_tone`/exposure into a native harness, or a `wasm-pack --target
+nodejs` A/B) so exposure + R/B + matrix can be tuned end-to-end against the
+reference images as the oracle, WITHOUT a full wasm rebuild per iteration. Only
+then ship. (Lesson this session: a per-model matrix eyeballed on pre-tone means
+was inconsistent and got reverted.)
+
 ## Recommended fix path (dedicated — do NOT hack under wrap-up)
 
 Ordered by value/risk:
