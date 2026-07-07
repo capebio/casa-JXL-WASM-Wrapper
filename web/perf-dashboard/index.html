@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CasaWASM — Perf Dashboard</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 12px;
+      line-height: 1.5;
+      padding: 12px;
+      min-width: 320px;
+    }
+
+    h1 {
+      font-size: 11px;
+      font-weight: 600;
+      color: #7d8590;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      margin-bottom: 10px;
+    }
+
+    .perf-hud {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      max-width: 520px;
+    }
+
+    .panel {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+
+    h3 {
+      font-size: 10px;
+      font-weight: 600;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 8px;
+    }
+
+    p {
+      color: #c9d1d9;
+      font-size: 11.5px;
+    }
+
+    /* ---- Worker pool bars ---- */
+    .bar-group {
+      display: flex;
+      height: 8px;
+      border-radius: 4px;
+      overflow: hidden;
+      background: #21262d;
+      margin-bottom: 6px;
+    }
+    .bar { height: 100%; transition: width 0.28s ease; min-width: 0; }
+    .bar.active { background: #1f6feb; }
+    .bar.idle   { background: #238636; }
+
+    /* ---- Memory meter ---- */
+    .meter-track {
+      height: 8px;
+      border-radius: 4px;
+      overflow: hidden;
+      background: #21262d;
+      margin: 4px 0 6px;
+    }
+    .meter-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: #238636;
+      transition: width 0.28s ease, background 0.28s ease;
+    }
+
+    /* ---- Stat rows ---- */
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 2px 0;
+    }
+    .stat-label { color: #8b949e; }
+    .stat-val {
+      color: #e6edf3;
+      font-family: 'Cascadia Code', 'Courier New', monospace;
+      font-size: 11px;
+    }
+
+    /* ---- FPS canvas ---- */
+    canvas#fps-chart {
+      display: block;
+      border-radius: 3px;
+      background: #0d1117;
+      margin: 4px 0 5px;
+      width: 100%;
+      height: 56px;
+    }
+
+    /* ---- Debug-missing notice ---- */
+    #debug-missing {
+      margin-top: 10px;
+      max-width: 520px;
+      padding: 8px 10px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #8b949e;
+      font-size: 11px;
+      line-height: 1.6;
+    }
+    #debug-missing code {
+      font-family: 'Cascadia Code', monospace;
+      background: #21262d;
+      padding: 1px 4px;
+      border-radius: 3px;
+      color: #c9d1d9;
+    }
+  </style>
+</head>
+<body>
+
+<h1>CasaWASM — Perf Dashboard</h1>
+
+<div class="perf-hud">
+
+  <section class="panel" id="pool-panel">
+    <h3>Worker Pool</h3>
+    <div class="bar-group">
+      <div class="bar active" id="bar-active" style="width:0%"></div>
+      <div class="bar idle"   id="bar-idle"   style="width:0%"></div>
+    </div>
+    <p><span id="pool-active">0</span> active / <span id="pool-total">0</span> total</p>
+  </section>
+
+  <section class="panel" id="throughput-panel">
+    <h3>UI Refresh Rate</h3>
+    <canvas id="fps-chart" width="220" height="56"></canvas>
+    <p id="fps-label">— fps</p>
+  </section>
+
+  <section class="panel" id="memory-panel">
+    <h3>Asset Store</h3>
+    <div class="stat-row">
+      <span class="stat-label">Allocated</span>
+      <span class="stat-val"><span id="mem-allocated">0</span> / <span id="mem-budget">0</span> MB</span>
+    </div>
+    <div class="meter-track">
+      <div class="meter-fill" id="mem-meter" style="width:0%"></div>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">OPFS hit rate</span>
+      <span class="stat-val" id="cache-hit-rate">—</span>
+    </div>
+  </section>
+
+  <section class="panel" id="queue-panel">
+    <h3>Scheduler</h3>
+    <div class="stat-row">
+      <span class="stat-label">Queue depth</span>
+      <span class="stat-val" id="queue-depth">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Dedup set</span>
+      <span class="stat-val" id="dedup-size">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Draining</span>
+      <span class="stat-val" id="draining-state">—</span>
+    </div>
+  </section>
+
+</div>
+
+<div id="debug-missing" hidden>
+  <strong>No stats source.</strong> Open the main app with
+  <code>?debug=1</code> appended to the URL, then embed this dashboard
+  in an iframe (<code>src="perf-dashboard/index.html"</code>) or open it
+  in an adjacent tab pointing at the same origin.
+</div>
+
+<script type="module" src="./perf-dashboard.js"></script>
+</body>
+</html>

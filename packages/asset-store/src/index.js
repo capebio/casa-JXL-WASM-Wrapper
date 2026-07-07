@@ -518,6 +518,20 @@ export class AssetStore {
   }
 
   /**
+   * Lightweight dashboard-facing stats snapshot.
+   * Read-only; no side effects; additive (no behavior change).
+   */
+  getStats() {
+    return {
+      allocatedBytes: this._bytes,
+      budgetBytes: this._maxBytes,
+      hits: this._stats.hits,
+      misses: this._stats.misses,
+      evictions: this._stats.evictions,
+    };
+  }
+
+  /**
    * A namespaced view: keys are transparently prefixed with `${ns}:` so multiple
    * clients (peep, file-picker, pyramid…) share ONE governed byte budget without
    * key collisions. Returns a thin handle over this same store.
