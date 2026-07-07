@@ -75,6 +75,43 @@ removed) refined the four issues to exact mechanisms:
   wrong fallback WB giving a green cast. Fixing the M5 WB is the real lever.
 - **Generic matrix** — unchanged (documented deferral, below).
 
+## UPDATE 2 (2026-07-07 pm) — reference obtained; matrix/tone need full-pipeline validation
+
+**Reference render captured** (user-supplied, correct): `_MG_1747 small 1080.jpg`
+(Canon 550D) → mean **R/G=0.935, B/G=0.910** (near-neutral, faintly green — right
+for foliage). User confirms the CR2 sequence: embedded preview **correct** → RAW
+decode goes **yellow** → final.
+
+- **CR2 residual yellow = generic colour matrix.** After the phase fix, our
+  pre-tone means are R/G≈1.02, B/G≈0.88 → **red ~8% high, blue ~8% low = yellow**
+  vs the reference. The lever is the per-model matrix (the deferral).
+- **Attempted + REVERTED: enable the 550D adobe_coeff matrix + row-normalise.**
+  Result was inconsistent (R/G swung 0.67–3.2 across near-identical shots, B/G
+  still low). Two reasons it can't be validated this way: (1) comparing our
+  *pre-tone* channel means to the reference's *post-tone* means is not
+  apples-to-apples — the tone curve reshapes ratios; (2) the matrix amplifies
+  scene variance. **The colour-accuracy fix needs the FULL pipeline (incl. the
+  wasm `src/lib.rs` tone stage) run against the reference** — make the tone stage
+  native-testable, or build a wasm node harness, so WB+matrix can be tuned
+  end-to-end with the reference as the oracle. Do NOT ship a matrix by pre-tone
+  eyeballing.
+
+**DNG "too bright" = the TONE/EXPOSURE stage, not the decode.** Native decode
+params are sane: `black=0` (Pixel HDR+ pre-subtracts — correct), `white≈15340`,
+WB≈2.0/1.0/1.8 (from AsShotNeutral), ColorMatrix present; raw linear-mean is only
+0.04–0.09 (dark), naïve sRGB(mean)≈56–84/255. So the brightness is added in the
+wasm tone/exposure stage (baseline-exposure / curve), a separate item from the
+decode. Same "make tone native-testable" unblocks tuning it.
+
+**DNG has no fast embedded preview (latent gap).** Pixel DNG's display JPEG (IFD0,
+`Compression=7`, 1280×964) sits at **4.73 MB — past the 3 MB `PREVIEW_SLICE`** →
+Phase A finds no JPEG → the card shows the (too-bright) RAW decode instead of a
+correct fast preview. A TIFF-aware `findTiffJpegPreview` (walk IFD0+SubIFDs, pick
+the strip-based — not tiled — JPEG, read exactly its bytes) works in testing
+(returns offset 4956026 / 1280×964) but is **not wired**. Wiring it as a fallback
+when the 3 MB scan yields nothing would give DNGs a correct instant preview
+(and mask the too-bright decode until tone is fixed). CR2/ORF unaffected.
+
 ## Recommended fix path (dedicated — do NOT hack under wrap-up)
 
 Ordered by value/risk:
