@@ -1,0 +1,108 @@
+# cargo-fuzz harness for the raw-pipeline byte parsers (S4).
+#
+# The parsers process untrusted bytes and have accumulated many hand-patched
+# overflow guards — exactly the bug class fuzzing converts from hand-found to
+# machine-found. One libFuzzer target per parser.
+#
+# Build (needs cargo-fuzz + a nightly toolchain with the sanitizer runtime):
+#   cargo install cargo-fuzz
+#   cd crates/raw-pipeline
+#   cargo +nightly fuzz build                 # the 5 pure-Rust parser targets
+#   cargo +nightly fuzz build --features codec # + the CASV/JXTC targets (needs libjxl)
+#   cargo +nightly fuzz run tiff_parse -- -max_total_time=20   # smoke
+#
+# The CASV/JXTC parsers live behind raw-pipeline's `jxl-codec` feature (jxl-ffi →
+# libjxl), so those four targets are gated behind this crate's `codec` feature and
+# compile to a no-op stub otherwise, keeping `cargo fuzz build` libjxl-free.
+[package]
+name = "raw-pipeline-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+# Enable the CASV/JXTC container-header targets. Requires an env with
+# LIBJXL_SOURCE_DIR + LIBCLANG_PATH (see docs/S1-timings-report.md).
+codec = ["raw-pipeline/jxl-codec"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.raw-pipeline]
+path = ".."
+default-features = false
+
+# Standalone: keep this crate out of any ambient workspace so the fuzz profile
+# (sanitizer flags) never leaks into normal `cargo` invocations at the repo root.
+[workspace]
+
+[profile.release]
+debug = 1
+
+# ── pure-Rust parser targets (no libjxl) ──────────────────────────────────────
+[[bin]]
+name = "tiff_parse"
+path = "fuzz_targets/tiff_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cr2_decode"
+path = "fuzz_targets/cr2_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dng_decode"
+path = "fuzz_targets/dng_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ljpeg_decode"
+path = "fuzz_targets/ljpeg_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+# ── CASV/JXTC container-header targets (gated behind `codec`) ──────────────────
+[[bin]]
+name = "casv_header"
+path = "fuzz_targets/casv_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "casv_footer"
+path = "fuzz_targets/casv_footer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "casv_audio_box"
+path = "fuzz_targets/casv_audio_box.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jxtc_header"
+path = "fuzz_targets/jxtc_header.rs"
+test = false
+doc = false
+bench = false

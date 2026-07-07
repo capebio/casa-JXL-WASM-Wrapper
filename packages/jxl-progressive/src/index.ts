@@ -6,6 +6,9 @@ export {
   lookupTier,
   checkHash,
   migrateManifest,
+  tierPixelDims,
+  buildTiersFromOffsets,
+  PROGRESSIVE_MANIFEST_VERSION,
   ManifestValidationError,
   ManifestStaleError,
 } from "./progressive-manifest.js";
@@ -13,7 +16,28 @@ export type {
   TierName,
   ManifestTier,
   ProgressiveManifest,
+  AssetCapabilities,
 } from "./progressive-manifest.js";
+
+// S6: unified LOD/ROI resolver (one request language across progressive | pyramid | jxtc)
+export {
+  resolveLod,
+  toHttpRange,
+  fromProgressiveManifest,
+  fromPyramidLevels,
+  fromJxtcContainer,
+  LodResolveError,
+} from "./lod-resolver.js";
+export type {
+  LodRequest,
+  LodAsset,
+  ByteRange,
+  ByteSource,
+  LodMechanism,
+  QualityTier,
+  ResolutionLevel,
+  JxtcGrid,
+} from "./lod-resolver.js";
 
 // Saliency policy
 export {

@@ -127,15 +127,11 @@ fn main() {
         .define("JPEGXL_ENABLE_OPENEXR", "OFF")
         .define("JPEGXL_ENABLE_JPEGLI", "OFF")
         .define("JPEGXL_BUNDLE_LIBPNG", "OFF")
-        // JPEG↔JXL lossless transcode (AddJPEGFrame / SetJPEGBuffer / jpeg_data).
-        // No jxl-ffi consumer uses it: the only JPEG-transcode path in this repo
-        // is web/bridge.cpp's WASM build, which does NOT link jxl-ffi. Turning it
-        // OFF drops decode_to_jpeg.cc + enc_jpeg_data.cc + the jpeg_data subtree
-        // from the static lib (a build-time-only reduction; the public decode/
-        // encode symbols we DO use are unaffected). libjxl's own CI builds with
-        // this OFF, so it is a supported configuration. If any consumer ever
-        // calls JxlEncoderAddJPEGFrame / JxlDecoderSetJPEGBuffer, flip this back.
-        .define("JPEGXL_ENABLE_TRANSCODE_JPEG", "OFF");
+        // JPEG↔JXL lossless transcode (JxlEncoderAddJPEGFrame / JxlDecoderSetJPEGBuffer).
+        // ON: compiles enc_jpeg_data.cc + jpeg_data subtree into the static lib so
+        // raw_pipeline::jxl_casaencoder::transcode_jpeg_to_jxl can call JxlEncoderAddJPEGFrame.
+        // libjxl's own CI also builds this path, so it is a supported configuration.
+        .define("JPEGXL_ENABLE_TRANSCODE_JPEG", "ON");
 
     // sccache compiler-cache launcher (optional, guarded). When `sccache` is on
     // PATH, route libjxl's C/C++ compiles through it so object files are cached

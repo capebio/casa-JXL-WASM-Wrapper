@@ -17,6 +17,28 @@ export type { CameraPose, Relation, FrameSetMember, FrameSet, AssetChannel, Chan
 
 export type ScoreMetric = "ssim" | "psnr" | "butteraugli";
 
+/**
+ * S6 schema v2: the current manifest schema version. `validateManifest` accepts
+ * versions 1..=PROGRESSIVE_MANIFEST_VERSION and rejects anything newer (following the
+ * pyramid reader's "tolerate older, reject newer" pattern). v1 manifests parse unchanged
+ * — every v2 field is optional and default-filled on read.
+ */
+export const PROGRESSIVE_MANIFEST_VERSION = 2 as const;
+
+/**
+ * S6 schema v2 (additive): which LOD/ROI request axes an asset can serve. Lets the
+ * unified `lod-resolver` decide, without probing bytes, whether a `{level|region|quality}`
+ * request is answerable. All fields optional; absent = unknown (resolver falls back).
+ *   quality    — byte-prefix quality tiers available (this is always true for progressive).
+ *   resolution — distinct intrinsic resolutions available (per-tier pixel dims / pyramid).
+ *   region     — spatial ROI addressable (tiled / JXTC).
+ */
+export interface AssetCapabilities {
+  quality?: boolean;
+  resolution?: boolean;
+  region?: boolean;
+}
+
 export interface TierScore {
   metric: ScoreMetric;
   /** Metric value of this tier's partial reconstruction vs the reference. */
@@ -33,6 +55,15 @@ export interface ManifestTier {
   intendedUse: string;
   /** Optional measured perceptual score for this tier (Phase A). */
   score?: TierScore;
+  /**
+   * S6 schema v2 (additive): the intrinsic resolution this tier reconstructs, in pixels.
+   * A DC prefix reconstructs at ~ceil(source/8); the `full` tier at source dims. Encoder
+   * emits these so the resolver can match a `level` (target long-edge) request to the
+   * smallest sufficient tier. Absent on v1 manifests → `tierPixelDims` default-fills with
+   * the source dimensions.
+   */
+  pixelWidth?: number;
+  pixelHeight?: number;
 }
 
 /**
@@ -95,7 +126,8 @@ export interface ScaleFrontierEntry {
 }
 
 export interface ProgressiveManifest {
-  version: 1;
+  /** 1 = original schema; 2 = S6 (per-tier pixel dims + asset capabilities). Readers accept both. */
+  version: 1 | 2;
   source: {
     width: number;
     height: number;
@@ -126,6 +158,11 @@ export interface ProgressiveManifest {
   tiers: ManifestTier[];
   /** Optional display-scale → earliest-sufficient-tier frontier (Phase B). */
   scaleFrontier?: ScaleFrontierEntry[];
+  /**
+   * S6 schema v2 (additive): the LOD/ROI axes this asset can serve, for the unified
+   * `lod-resolver`. Optional; absent on v1 manifests (resolver derives from the tiers).
+   */
+  capabilities?: AssetCapabilities;
 
   // Phase 8: reserved ingest CV fields + channel semantics (PG2/PG4/PG5/ST8).
   // Populated for photogrammetry/transect assets; FrameSet groups multiple such manifests.
@@ -178,7 +215,12 @@ export function validateManifest(json: unknown): ProgressiveManifest {
   );
   const obj = json as Record<string, unknown>;
 
-  assertField(obj["version"] === 1, "version", "Manifest version must be 1");
+  // S6 v2: accept versions 1..=PROGRESSIVE_MANIFEST_VERSION; reject newer (unknown schema).
+  assertField(
+    obj["version"] === 1 || obj["version"] === 2,
+    "version",
+    `Manifest version must be 1 or ${PROGRESSIVE_MANIFEST_VERSION}`,
+  );
 
   // source
   assertField(
@@ -313,6 +355,20 @@ export function validateManifest(json: unknown): ProgressiveManifest {
       assertField(typeof sc["value"] === "number" && Number.isFinite(sc["value"] as number), `${f}.score.value`, `${f}.score.value must be a finite number`);
       assertField(sc["reference"] === "final" || sc["reference"] === "source", `${f}.score.reference`, `${f}.score.reference must be "final" or "source"`);
     }
+
+    // S6 v2 (additive): per-tier intrinsic pixel dims. Validated only when present so v1
+    // tiers stay valid. Must be positive integers no larger than the source dims (a tier
+    // cannot reconstruct more detail than the source carries).
+    for (const dim of ["pixelWidth", "pixelHeight"] as const) {
+      if (t[dim] !== undefined) {
+        const cap = dim === "pixelWidth" ? (src["width"] as number) : (src["height"] as number);
+        assertField(
+          typeof t[dim] === "number" && Number.isInteger(t[dim] as number) && (t[dim] as number) > 0 && (t[dim] as number) <= cap,
+          `${f}.${dim}`,
+          `${f}.${dim} must be a positive integer <= source.${dim === "pixelWidth" ? "width" : "height"} (${cap})`,
+        );
+      }
+    }
   }
 
   // Cross-tier: each tier name must appear at most once.
@@ -358,7 +414,37 @@ export function validateManifest(json: unknown): ProgressiveManifest {
     }
   }
 
+  // S6 v2 (additive): asset capabilities. Object of optional booleans; validated only when present.
+  if (obj["capabilities"] !== undefined) {
+    assertField(
+      typeof obj["capabilities"] === "object" && obj["capabilities"] !== null && !Array.isArray(obj["capabilities"]),
+      "capabilities",
+      "capabilities must be an object if present",
+    );
+    const caps = obj["capabilities"] as Record<string, unknown>;
+    for (const k of ["quality", "resolution", "region"] as const) {
+      if (caps[k] !== undefined) {
+        assertField(typeof caps[k] === "boolean", `capabilities.${k}`, `capabilities.${k} must be a boolean`);
+      }
+    }
+  }
+
   return json as ProgressiveManifest;
+}
+
+/**
+ * S6: the intrinsic pixel dims a tier reconstructs. Returns the tier's own v2
+ * `pixelWidth`/`pixelHeight` when present, else default-fills with the source dims (a v1
+ * manifest carries no per-tier resolution — the safe assumption is source resolution).
+ */
+export function tierPixelDims(
+  manifest: ProgressiveManifest,
+  tier: ManifestTier,
+): { width: number; height: number } {
+  return {
+    width: tier.pixelWidth ?? manifest.source.width,
+    height: tier.pixelHeight ?? manifest.source.height,
+  };
 }
 
 export function lookupTier(
@@ -399,9 +485,10 @@ export async function checkHash(
 export function migrateManifest(json: unknown): ProgressiveManifest {
   if (typeof json === "object" && json !== null) {
     const v = (json as Record<string, unknown>)["version"];
-    if (typeof v === "number" && v > 1) {
+    // S6 v2: accept 1..=PROGRESSIVE_MANIFEST_VERSION; a newer schema is unmigratable.
+    if (typeof v === "number" && v > PROGRESSIVE_MANIFEST_VERSION) {
       throw new ManifestValidationError(
-        `Cannot migrate manifest version ${v} (only version 1 supported)`,
+        `Cannot migrate manifest version ${v} (only versions 1..=${PROGRESSIVE_MANIFEST_VERSION} supported)`,
         "version",
       );
     }

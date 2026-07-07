@@ -736,6 +736,56 @@ const OUT_NO_ORIENT: u32 = 16;
 /// Full-resolution display-referred RGB16 (post WB/matrix/tone, oriented, full-range [0,65535]).
 const OUT_FULL_DISP16: u32 = 32;
 
+// S3: keep these private flag bits in lock-step with the estimator's mirror in
+// `raw_pipeline::mem_budget`. Any drift is a compile error, so the preflight
+// projection can never silently model the wrong flag layout.
+const _: () = {
+    assert!(OUT_FULL_RGB8 == raw_pipeline::mem_budget::OUT_FULL_RGB8);
+    assert!(OUT_LIGHTBOX == raw_pipeline::mem_budget::OUT_LIGHTBOX);
+    assert!(OUT_THUMB == raw_pipeline::mem_budget::OUT_THUMB);
+    assert!(OUT_FULL_16 == raw_pipeline::mem_budget::OUT_FULL_16);
+    assert!(OUT_NO_ORIENT == raw_pipeline::mem_budget::OUT_NO_ORIENT);
+    assert!(OUT_FULL_DISP16 == raw_pipeline::mem_budget::OUT_FULL_DISP16);
+};
+
+/// S3 preflight: project the peak / retained working-set of a RAW decode from
+/// dimensions + output flags, WITHOUT decoding. Behavior-neutral (changes no
+/// decode output). Fields are byte counts as `f64` (exact for all realistic
+/// sizes — well under 2^53). Browser callers use `peak_bytes` for pre-decode
+/// admission control against the WASM heap / memory budget, and `retained_bytes`
+/// for `AssetStore` accounting of the buffers a held `ProcessResult` keeps.
+/// See the model derivation in `raw_pipeline::mem_budget` / the memory-budget ADR.
+#[wasm_bindgen]
+pub struct DecodePeakEstimate {
+    #[wasm_bindgen(readonly)]
+    pub pixels: f64,
+    #[wasm_bindgen(readonly)]
+    pub retained_bytes: f64,
+    #[wasm_bindgen(readonly)]
+    pub peak_bytes: f64,
+}
+
+/// Project the decode peak/retained working set for `width`×`height` (active-area,
+/// pre-orientation) pixels and the given `output_flags` bitset (same bits as
+/// `process_orf_with_flags` / `process_dng_with_flags`). Pure — allocates nothing
+/// beyond the tiny result and touches no image data.
+#[wasm_bindgen]
+pub fn estimate_decode_peak(width: u32, height: u32, output_flags: u32) -> DecodePeakEstimate {
+    let e = raw_pipeline::mem_budget::estimate_decode_peak(width, height, output_flags);
+    DecodePeakEstimate {
+        pixels: e.pixels as f64,
+        retained_bytes: e.retained_bytes as f64,
+        peak_bytes: e.peak_bytes as f64,
+    }
+}
+
+/// Convenience scalar form: the transient peak-bytes projection only. Matches the
+/// `estimate_decode_peak_bytes()` name from the Wave-2 strategic map.
+#[wasm_bindgen]
+pub fn estimate_decode_peak_bytes(width: u32, height: u32, output_flags: u32) -> f64 {
+    raw_pipeline::mem_budget::estimate_decode_peak_bytes(width, height, output_flags) as f64
+}
+
 /// Olympus 12-bit sensor black pedestal (counts). Subtracted before WB so the
 /// per-channel multipliers don't inflate the pedestal into a magenta cast. See
 /// the rationale block in `decode_orf_raw`. Canonical Olympus value; the raw
@@ -926,10 +976,10 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
             params.black = OLYMPUS_BLACK_LEVEL;
             if let Some(r) = info.wb_r { params.wb_r = r; }
             if let Some(b) = info.wb_b { params.wb_b = b; }
-            if let Some(m) = info.color_matrix { params.color_matrix = Some(m); }
+            if let Some(m) = info.color_matrix { params.color_matrix = Some(m).into(); }
             let color_matrix_from_mn = info.color_matrix.is_some();
             let color_matrix_flat: [f32; 9] = {
-                let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+                let m = params.color_matrix.matrix();
                 [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
             };
 
@@ -1033,11 +1083,11 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
     }
     let color_matrix_from_mn = info.color_matrix.is_some();
     if let Some(m) = info.color_matrix {
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
 
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+        let m = params.color_matrix.matrix();
         [
             m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         ]
@@ -1943,7 +1993,7 @@ pub fn apply_look(
                 m[r][c] = color_matrix_flat[r * 3 + c];
             }
         }
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
     raw_pipeline::pipeline::apply_look_params(
         &mut params,
@@ -2488,7 +2538,7 @@ impl LookRenderer {
         if wb_b.is_finite() && wb_b > 0.0 {
             params.wb_b = wb_b;
         }
-        params.color_matrix = Some(self.color_matrix);
+        params.color_matrix = Some(self.color_matrix).into();
         raw_pipeline::pipeline::apply_look_params(
             &mut params,
             exposure_ev,
@@ -2697,9 +2747,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 params.white = white;
                 params.wb_r = wb_r;
                 params.wb_b = wb_b;
-                params.color_matrix = color_matrix;
+                params.color_matrix = color_matrix.into();
                 let color_matrix_flat: [f32; 9] = {
-                    let mm = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+                    let mm = params.color_matrix.matrix();
                     [mm[0][0], mm[0][1], mm[0][2], mm[1][0], mm[1][1], mm[1][2], mm[2][0], mm[2][1], mm[2][2]]
                 };
                 let t = now_ms();
@@ -2761,9 +2811,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
-    params.color_matrix = img.color_matrix;
+    params.color_matrix = img.color_matrix.into();
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.unwrap_or(pipeline::CAM_TO_SRGB);
+        let m = params.color_matrix.matrix();
         [
             m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         ]
@@ -2968,7 +3018,7 @@ fn process_dng_impl(
         wb_r_used: params.wb_r,
         wb_b_used: params.wb_b,
         black_used: params.black,
-        color_matrix_from_mn: params.color_matrix.is_some(),
+        color_matrix_from_mn: params.color_matrix.to_option().is_some(),
         make,
         model,
         rgb16_lb,
@@ -3248,9 +3298,9 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     params.white = cr2.white;
     params.wb_r = cr2.wb_r;
     params.wb_b = cr2.wb_b;
-    params.color_matrix = cr2.color_matrix;
+    params.color_matrix = cr2.color_matrix.into();
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.unwrap_or(CANON_CAM_TO_SRGB);
+        let m = params.color_matrix.to_option().unwrap_or(CANON_CAM_TO_SRGB);
         [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
     };
 

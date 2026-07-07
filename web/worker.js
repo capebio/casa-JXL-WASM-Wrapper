@@ -35,7 +35,7 @@
 // On a non-isolated host pkg/ will fail to instantiate with a clear WASM/SAB error; we
 // warn up front. If a ./pkg-st/ build is ever produced, restore the COI-gated branch.
 // Bound lazily in ensureWasm(), before any message handler touches these bindings.
-import { detectFormat } from './format-detect.js';
+import { detectFormat, detectRawKind } from './format-detect.js';
 import { WorkerMsg } from './worker-message-types.js';
 
 let init, rawWasm;
@@ -56,19 +56,31 @@ async function loadWasm() {
        decode_exr, decode_tiff } = rawWasm);
 }
 
-// Route a RAW buffer to the right decoder by magic bytes (robust vs. filename):
-//   Olympus ORF: 'IIR' (IIRO/IIRS/IIUS).  Canon CR2: TIFF 'II*\0' with 'CR' at offset 8.
-//   Everything else TIFF-like (II*\0 / MM\0*) → DNG. Falls back to ORF if unrecognized.
-function pickRawDecoderWithFlags(bytes) {
-  const b = bytes;
-  if (b.length >= 10) {
-    if (b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x52) return process_orf_with_flags; // IIR*
-    if (b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a && b[3] === 0x00 &&
-        b[8] === 0x43 && b[9] === 0x52) return process_cr2_with_flags;                  // II*\0 + 'CR'
-    if ((b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2a) ||
-        (b[0] === 0x4d && b[1] === 0x4d && b[3] === 0x2a)) return process_dng_with_flags; // TIFF → DNG
+// Route a RAW buffer to its WASM decoder via the SINGLE-SOURCE sniffer in
+// format-detect.js (detectRawKind) — the worker no longer re-implements its own
+// magic table. Olympus ORF / Canon CR2 / Adobe-DNG-family TIFF map to their
+// decoders; Sony ARW / Nikon NEF / Panasonic RW2 (no WASM decoder) and any
+// unrecognized magic raise a LOUD error instead of being silently misrouted to
+// the ORF/DNG decoder (K1 decode_raw contract: never guess a decoder). The throw
+// is caught by the decode handler's try/catch and surfaced as a WorkerMsg.ERROR.
+function pickRawDecoderWithFlags(bytes, name = '') {
+  const kind = detectRawKind(bytes, name);
+  switch (kind) {
+    case 'orf': return process_orf_with_flags;
+    case 'cr2': return process_cr2_with_flags;
+    case 'dng': return process_dng_with_flags;
+    case 'unsupported':
+      throw new Error(
+        `Unsupported RAW format: ${basename(name)} — Sony ARW / Nikon NEF / ` +
+        `Panasonic RW2 are not yet supported by the WASM RAW decoder.`);
+    default: // 'unknown'
+      throw new Error(
+        `Unrecognized RAW file: ${basename(name)} — no matching decoder for its magic bytes.`);
   }
-  return process_orf_with_flags;
+}
+
+function basename(name) {
+  return (name && name.split(/[\\/]/).pop()) || name || 'file';
 }
 
 // Named-options wrapper over the positional *_with_flags WASM signature.
@@ -530,7 +542,7 @@ self.addEventListener('message', async (ev) => {
         }
         // route === 'raw' — fall through to the unchanged RAW pipeline below.
 
-        const decoderFn = pickRawDecoderWithFlags(bytes);
+        const decoderFn = pickRawDecoderWithFlags(bytes, opts.name || '');
         const lookArgs = {
             exposureEv: look.exposureEv ?? 0,
             contrast:   look.contrast   ?? 0,

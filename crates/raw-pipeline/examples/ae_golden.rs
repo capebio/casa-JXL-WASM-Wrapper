@@ -209,7 +209,7 @@ fn main() {
         p.white = img.white;
         p.wb_r = img.wb_r;
         p.wb_b = img.wb_b;
-        p.color_matrix = img.color_matrix;
+        p.color_matrix = img.color_matrix.into();
         let (w, h) = (img.width as u32, img.height as u32);
         vs_line(
             "from_rgb16_realdng",

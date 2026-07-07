@@ -9,6 +9,9 @@
 import { getContext } from './jxl-browser-context.js';
 import { WorkerMsg } from './worker-message-types.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
+// S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
+// of it (one governed budget + one eviction policy), replacing the bespoke Map.
+import { AssetStore } from '../packages/asset-store/src/index.js';
 // Capability-detection namespace import over the RAW WASM pkg. Binding the
 // module does NOT instantiate WASM (init is lazy via default()/initSync), so
 // this is safe at page load. We only read which functions the build exported —
@@ -2929,6 +2932,15 @@ function drawLightbox() {
 function closeLightbox() {
     lightbox.hidden = true;
     lightboxIndex = -1;
+    // Stop the debounced live-update loop and clear its in-flight/pending flags.
+    // Without this, a live reprocess that resolves after close leaves
+    // liveInFlight=true and can stash a stale livePendingLook, which defeats the
+    // debounce on the next lightbox open. The retained worker liveStateMap is
+    // intentionally NOT freed here — re-opening the SAME card must still support
+    // live slider edits; genuine teardown (card removal) frees it via removeCard.
+    clearTimeout(liveDebounceTimer);
+    liveInFlight = false;
+    livePendingLook = null;
     if (lbPreviewBadge) lbPreviewBadge.hidden = true;
     lbLoadingBadge.hidden = true;
     lbDisplayLongPx = null;
@@ -4588,40 +4600,38 @@ const peepCache = new Map();
 // ladders so the current photo plus a neighbour stay hot; evicted variants are
 // transparently re-decoded from the retained jxlBytes on demand.
 const PEEP_DECODED_LRU_MAX = 24;
-// Insertion-ordered Map keyed "idx:q" → true. Map iteration order is insertion
-// order, so the first key is the LRU victim; touching = delete+re-set.
-const peepDecodedLru = new Map();
 const peepLruKey = (idx, q) => `${idx}:${q}`;
-
-// Record a freshly-decoded variant as most-recently-used and evict the oldest
-// decoded RGBA(s) if we are over the cap. Frees the evicted buffer from its
-// owning peepCache entry so it can be GC'd.
-function peepLruRecord(idx, q) {
-    const key = peepLruKey(idx, q);
-    peepDecodedLru.delete(key);
-    peepDecodedLru.set(key, true);
-    while (peepDecodedLru.size > PEEP_DECODED_LRU_MAX) {
-        const oldest = peepDecodedLru.keys().next().value;
-        peepDecodedLru.delete(oldest);
-        const sep = oldest.lastIndexOf(':');
-        const oIdx = Number(oldest.slice(0, sep));
-        const oQ = oldest.slice(sep + 1);
-        const oEntry = peepCache.get(oIdx);
+// S3: govern the decoded-RGBA LRU through AssetStore instead of a bespoke Map.
+// One "unit" per decoded variant (size = 1) + a 24-unit budget reproduces the
+// exact count-capped, insertion-ordered LRU (oldest = victim; touch = promote);
+// the onEvict hook frees the evicted RGBA from its owning peepCache entry so it
+// can be GC'd (transparently re-decoded from the retained jxlBytes on demand).
+// Switching `maxBytes` to a real byte budget later is a one-line change.
+const peepDecodedStore = new AssetStore({
+    name: 'peep-decoded',
+    maxBytes: PEEP_DECODED_LRU_MAX,
+    onEvict: (key) => {
+        const sep = key.lastIndexOf(':');
+        const oIdx = Number(key.slice(0, sep));
+        const oQ = key.slice(sep + 1);
         // PEEP_QUALITIES are numbers except 'lossless'; restore the number type
         // so the delete hits the same key the decoded variant was stored under.
         const qKey = oQ === 'lossless' ? oQ : Number(oQ);
+        const oEntry = peepCache.get(oIdx);
         if (oEntry?.decoded) delete oEntry.decoded[qKey];
-    }
+    },
+});
+
+// Record a freshly-decoded variant as most-recently-used; the store evicts the
+// LRU victim past the cap (freeing it via onEvict above).
+function peepLruRecord(idx, q) {
+    peepDecodedStore.set(peepLruKey(idx, q), true, 1);
 }
 
 // Mark an already-decoded variant as recently used (e.g. on paint/nav) without
-// inserting one that was never decoded.
+// inserting one that was never decoded (get() promotes if present, else no-op).
 function peepLruTouch(idx, q) {
-    const key = peepLruKey(idx, q);
-    if (peepDecodedLru.has(key)) {
-        peepDecodedLru.delete(key);
-        peepDecodedLru.set(key, true);
-    }
+    peepDecodedStore.get(peepLruKey(idx, q));
 }
 
 async function runPixelPeep() {
@@ -4636,7 +4646,7 @@ async function runPixelPeep() {
     peepIdx = 0;
     peepQuality = PEEP_INITIAL_Q;
     peepCache.clear();
-    peepDecodedLru.clear();
+    peepDecodedStore.clear();
     // Seed cache entries so .then() callbacks can locate their photo idx.
     for (let i = 0; i < paths.length; i++) {
         peepCache.set(i, { jxlBytes: {}, decoded: {}, encodeMs: {}, sizeBytes: {}, doneCount: 0 });
@@ -4857,7 +4867,7 @@ function peepCycleQuality(delta) {
 function exitPixelPeep() {
     pixelPeepActive = false;
     peepCache.clear();
-    peepDecodedLru.clear();
+    peepDecodedStore.clear();
     peepPaths = [];
     lightbox.hidden = true;
     lightbox.classList.remove('peep-mode');

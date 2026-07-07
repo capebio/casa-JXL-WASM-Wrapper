@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     p.wb_r = info.wb_r.unwrap_or(1.797);
     p.wb_g = 1.0;
     p.wb_b = info.wb_b.unwrap_or(1.797);
-    p.color_matrix = info.color_matrix;
+    p.color_matrix = info.color_matrix.into();
     p.exposure_ev = exp;
     p.contrast = contrast;
     p.saturation = sat;

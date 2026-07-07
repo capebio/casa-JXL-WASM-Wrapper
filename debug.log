@@ -1,2 +1,0 @@
-[0520/220908.694:ERROR:headless\lib\browser\command_line_handler.cc:154] Could not create directory C:\Tmp\chrome-test: Access is denied. (0x5)
-[0520/224650.336:ERROR:headless\lib\headless_content_main_delegate.cc:246] Remote debugging pipe file descriptors are not open.

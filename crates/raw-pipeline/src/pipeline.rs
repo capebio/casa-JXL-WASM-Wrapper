@@ -57,6 +57,193 @@ pub const CAM_TO_SRGB: [[f32; 3]; 3] = [
     [0.018, -0.298, 1.281],
 ];
 
+/// 3×3 identity — "no colour transform". Kept as a named constant so
+/// [`ColorMatrix::Identity`] resolves bit-for-bit to what the old code produced
+/// when a caller explicitly stored `Some([[1,0,0],[0,1,0],[0,0,1]])`.
+pub const IDENTITY_3X3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Camera→sRGB colour matrix, replacing the ambiguous `Option<[[f32; 3]; 3]>`
+/// that conflated three distinct states:
+///   * *absent* (`None`) → generic-Olympus fallback,
+///   * an *explicit camera/embedded* matrix (`Some(m)`), and
+///   * *identity / no-transform*, which the old `Option` could only smuggle in
+///     as `Some(identity)` and never distinguish from a real camera matrix.
+///
+/// Resolution is **byte-identical** to the previous `opt.unwrap_or(CAM_TO_SRGB)`:
+/// `None` ≡ [`ColorMatrix::GenericOlympus`] (→ [`CAM_TO_SRGB`]),
+/// `Some(m)` ≡ [`ColorMatrix::Camera`]`(m)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColorMatrix {
+    /// 3×3 identity — no colour transform ([`IDENTITY_3X3`]). Not produced by any
+    /// default decode path today; reserved for the scene-referred / linear-16
+    /// modes (S5 stage 2+), which need to express "leave camera RGB untouched".
+    Identity,
+    /// Explicit per-camera / embedded-derived matrix (was `Some(m)`).
+    Camera([[f32; 3]; 3]),
+    /// Generic Olympus fallback = [`CAM_TO_SRGB`] (was `None`).
+    GenericOlympus,
+}
+
+impl ColorMatrix {
+    /// Borrow the concrete 3×3 matrix applied in the tone/matrix stage.
+    /// Byte-identical to the old `color_matrix.as_ref().unwrap_or(&CAM_TO_SRGB)`.
+    #[inline]
+    pub fn as_matrix(&self) -> &[[f32; 3]; 3] {
+        match self {
+            ColorMatrix::Identity => &IDENTITY_3X3,
+            ColorMatrix::Camera(m) => m,
+            ColorMatrix::GenericOlympus => &CAM_TO_SRGB,
+        }
+    }
+
+    /// Owned copy of the concrete matrix.
+    /// Byte-identical to the old `color_matrix.unwrap_or(CAM_TO_SRGB)`.
+    #[inline]
+    pub fn matrix(&self) -> [[f32; 3]; 3] {
+        *self.as_matrix()
+    }
+
+    /// Legacy bridge OUT: `GenericOlympus → None`, `Camera(m) → Some(m)`,
+    /// `Identity → Some(IDENTITY_3X3)`. Call sites that had a *different* fallback
+    /// (e.g. `CANON_CAM_TO_SRGB`) stay byte-identical via
+    /// `.to_option().unwrap_or(their_fallback)`.
+    #[inline]
+    pub fn to_option(&self) -> Option<[[f32; 3]; 3]> {
+        match self {
+            ColorMatrix::GenericOlympus => None,
+            ColorMatrix::Camera(m) => Some(*m),
+            ColorMatrix::Identity => Some(IDENTITY_3X3),
+        }
+    }
+
+    /// Legacy bridge IN: `None → GenericOlympus`, `Some(m) → Camera(m)`.
+    #[inline]
+    pub fn from_option(opt: Option<[[f32; 3]; 3]>) -> Self {
+        match opt {
+            Some(m) => ColorMatrix::Camera(m),
+            None => ColorMatrix::GenericOlympus,
+        }
+    }
+}
+
+impl Default for ColorMatrix {
+    #[inline]
+    fn default() -> Self {
+        ColorMatrix::GenericOlympus
+    }
+}
+
+impl From<Option<[[f32; 3]; 3]>> for ColorMatrix {
+    #[inline]
+    fn from(opt: Option<[[f32; 3]; 3]>) -> Self {
+        ColorMatrix::from_option(opt)
+    }
+}
+
+impl From<[[f32; 3]; 3]> for ColorMatrix {
+    #[inline]
+    fn from(m: [[f32; 3]; 3]) -> Self {
+        ColorMatrix::Camera(m)
+    }
+}
+
+/// The single owner of camera→sRGB matrix precedence for the RAW pipeline.
+///
+/// Precedence (explicit, top wins):
+///   1. `embedded` — DNG ForwardMatrix/ColorMatrix-derived, or an app override,
+///   2. `per_make` — per-model table (e.g. the Canon table in `cr2.rs`),
+///   3. generic Olympus fallback ([`CAM_TO_SRGB`]).
+///
+/// This is **byte-neutral today**: every current per-format extraction already
+/// folds "embedded-or-per-make" into a single `Option` before it reaches the
+/// pipeline, so callers pass that as `embedded` with `per_make = None`, and
+/// `resolve(opt, None)` == the old `opt.unwrap_or(CAM_TO_SRGB)`. Stage 2 of the
+/// S5 plan threads the two inputs separately (re-enabling the CR2 per-make table)
+/// — a golden-approval-gated change, NOT done here.
+pub struct ColourPolicy;
+
+impl ColourPolicy {
+    #[inline]
+    pub fn resolve(
+        embedded: Option<[[f32; 3]; 3]>,
+        per_make: Option<[[f32; 3]; 3]>,
+    ) -> ColorMatrix {
+        match embedded.or(per_make) {
+            Some(m) => ColorMatrix::Camera(m),
+            None => ColorMatrix::GenericOlympus,
+        }
+    }
+}
+
+#[cfg(test)]
+mod colour_policy_tests {
+    use super::*;
+
+    const M: [[f32; 3]; 3] = [[0.9, 0.05, 0.05], [0.1, 0.8, 0.1], [0.0, -0.2, 1.2]];
+
+    /// The resolver must be byte-identical to the old `Option::unwrap_or(CAM_TO_SRGB)`.
+    #[test]
+    fn matrix_matches_legacy_unwrap_or() {
+        for opt in [None, Some(M), Some(CAM_TO_SRGB), Some(IDENTITY_3X3)] {
+            let legacy = opt.unwrap_or(CAM_TO_SRGB);
+            let modern = ColorMatrix::from_option(opt).matrix();
+            assert_eq!(legacy, modern, "mismatch for {opt:?}");
+            // and the borrowing accessor matches the old `.as_ref().unwrap_or(&fallback)`
+            let fallback = CAM_TO_SRGB;
+            let legacy_ref = opt.as_ref().unwrap_or(&fallback);
+            assert_eq!(legacy_ref, ColorMatrix::from_option(opt).as_matrix());
+        }
+    }
+
+    /// `to_option` is the exact inverse used at the `CANON_CAM_TO_SRGB` / `is_some` sites.
+    #[test]
+    fn to_option_round_trips() {
+        assert_eq!(ColorMatrix::GenericOlympus.to_option(), None);
+        assert_eq!(ColorMatrix::Camera(M).to_option(), Some(M));
+        assert_eq!(ColorMatrix::Identity.to_option(), Some(IDENTITY_3X3));
+        // is_some() bridge parity: None -> false, Some -> true.
+        assert!(!ColorMatrix::from_option(None).to_option().is_some());
+        assert!(ColorMatrix::from_option(Some(M)).to_option().is_some());
+    }
+
+    /// Identity resolves to the exact literal the old code smuggled through `Some(identity)`.
+    #[test]
+    fn identity_is_the_literal() {
+        assert_eq!(
+            ColorMatrix::Identity.matrix(),
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        );
+    }
+
+    /// Explicit precedence: embedded wins over per-make, per-make over generic fallback.
+    #[test]
+    fn precedence_embedded_then_per_make_then_generic() {
+        let e = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        assert_eq!(ColourPolicy::resolve(Some(e), Some(M)), ColorMatrix::Camera(e));
+        assert_eq!(ColourPolicy::resolve(None, Some(M)), ColorMatrix::Camera(M));
+        assert_eq!(ColourPolicy::resolve(None, None), ColorMatrix::GenericOlympus);
+        // Byte-neutral bridge: current callers pass (embedded, None).
+        assert_eq!(
+            ColourPolicy::resolve(Some(M), None).matrix(),
+            Some(M).unwrap_or(CAM_TO_SRGB)
+        );
+        assert_eq!(
+            ColourPolicy::resolve(None, None).matrix(),
+            None.unwrap_or(CAM_TO_SRGB)
+        );
+    }
+
+    /// The default policy is the generic Olympus fallback (was `None`).
+    #[test]
+    fn default_is_generic_olympus() {
+        assert_eq!(ColorMatrix::default(), ColorMatrix::GenericOlympus);
+        assert_eq!(
+            PipelineParams::default_olympus().color_matrix,
+            ColorMatrix::GenericOlympus
+        );
+    }
+}
+
 /// Max pixel payload (<1 GiB) — blocks corrupt dimension exploits before buffer writes.
 pub const MAX_PIXEL_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -107,6 +294,14 @@ pub fn validate_pixel_buffer_u16(
 ) -> Result<(), String> {
     validate_pixel_dims(width, height, channels)?;
     let expected = width * height * channels;
+    // u16 elements are 2 bytes each — validate_pixel_dims only checked element
+    // count against the byte budget, which is off by 2× for u16 buffers.
+    let byte_count = expected.saturating_mul(2);
+    if byte_count > MAX_PIXEL_BUFFER_BYTES {
+        return Err(format!(
+            "u16 pixel buffer {byte_count} bytes exceeds {MAX_PIXEL_BUFFER_BYTES} byte limit ({width}×{height}×{channels})"
+        ));
+    }
     if buffer.len() != expected {
         return Err(format!(
             "pixel buffer length mismatch: got {} expected {} ({width}×{height}×{channels})",
@@ -178,7 +373,9 @@ pub struct PipelineParams {
     pub vibrance: f32,    // -1..+1
     pub temp: f32,        // -1..+1 (warm <-> cool)
     pub tint: f32,        // -1..+1 (magenta <-> green)
-    pub color_matrix: Option<[[f32; 3]; 3]>,
+    /// Camera→sRGB matrix policy. `ColorMatrix::GenericOlympus` (the default)
+    /// resolves to [`CAM_TO_SRGB`], exactly as the old `None` did.
+    pub color_matrix: ColorMatrix,
     pub texture: f32, // -1..+1, unsharp σ=1
     pub clarity: f32, // -1..+1, unsharp σ=3
     // Runtime-only flag for Perceptual Constancy Mode (illumination-invariant
@@ -212,7 +409,7 @@ impl PipelineParams {
             vibrance: 0.0,
             temp: 0.0,
             tint: 0.0,
-            color_matrix: None,
+            color_matrix: ColorMatrix::GenericOlympus,
             texture: 0.0,
             clarity: 0.0,
             perceptual_constancy: false,
@@ -1174,140 +1371,172 @@ pub fn apply_unsharp_masks(
     height: usize,
     params: &PipelineParams,
 ) {
-    if params.texture == 0.0 && params.clarity == 0.0 {
+    let texture = if params.texture.is_finite() { params.texture } else { 0.0 };
+    let clarity  = if params.clarity.is_finite()  { params.clarity  } else { 0.0 };
+    if texture == 0.0 && clarity == 0.0 {
         return;
     }
-    // PIPE-003: When both texture and clarity are active, each must operate on the original
-    // (pre-unsharp) image.  Previously this called rgb16.to_vec() here (full-frame allocation,
-    // ~144 MB at 24 MP on every slider tick).  Instead we reuse the third BLUR_SCRATCH slot
-    // so the allocation is amortised after the first call.
-    BLUR_SCRATCH.with(|scratch| {
-        let (ref mut temp, ref mut blurred, ref mut snap_buf) = *scratch.borrow_mut();
-        let need_snap = params.texture != 0.0 && params.clarity != 0.0;
-        if need_snap {
+
+    let both = texture != 0.0 && clarity != 0.0;
+
+    if both {
+        // PIPE-003: both passes must each see the original (pre-unsharp) pixels.
+        // Texture pass: fused (no separate blurred frame). Clarity pass still
+        // needs the original snapshot to compute the luminance-weighted delta.
+        BLUR_SCRATCH.with(|scratch| {
+            let (ref mut temp, ref mut blurred, ref mut snap_buf) = *scratch.borrow_mut();
             snap_buf.resize(rgb16.len(), 0u16);
             snap_buf.copy_from_slice(rgb16);
-        }
-        // `pre_snap` is Some only when both sliders are active.
-        let has_snap = need_snap;
-        if params.texture != 0.0 {
-            separable_blur_with_bufs(rgb16, width, height, &gaussian_kernel_5(), temp, blurred);
+
+            // Texture: fused — one temp frame, no blurred frame.
+            separable_blur_apply(rgb16, width, height, &gaussian_kernel_5(), temp, |orig, blur| {
+                (orig + (texture * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16
+            });
+
+            // Clarity: blur snap_buf (original), add delta to texture-sharpened rgb16.
+            separable_blur_with_bufs(snap_buf, width, height, &gaussian_kernel_13(), temp, blurred);
             #[cfg(feature = "parallel")]
             rgb16
                 .par_chunks_mut(width * 3)
+                .zip(snap_buf.par_chunks(width * 3))
                 .zip(blurred.par_chunks(width * 3))
-                .for_each(|(r_row, b_row)| {
+                .for_each(|((r_row, o_row), b_row)| {
                     for i in 0..r_row.len() {
-                        let orig = r_row[i] as i32;
+                        let orig = o_row[i] as i32;
                         let blur = b_row[i] as i32;
-                        r_row[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32)
+                        let v = orig as f32 / 65535.0;
+                        let w = 4.0 * v * (1.0 - v);
+                        r_row[i] = (r_row[i] as i32
+                            + (clarity * w * (orig - blur) as f32).round() as i32)
                             .clamp(0, 65535) as u16;
                     }
                 });
             #[cfg(not(feature = "parallel"))]
-            {
-                let n = rgb16.len();
-                let mut i = 0;
-                while i < n {
-                    let orig = rgb16[i] as i32;
-                    let blur = blurred[i] as i32;
-                    rgb16[i] = (orig + (params.texture * (orig - blur) as f32).round() as i32)
-                        .clamp(0, 65535) as u16;
-                    i += 1;
-                }
+            for i in 0..rgb16.len() {
+                let orig = snap_buf[i] as i32;
+                let blur = blurred[i] as i32;
+                let v = orig as f32 / 65535.0;
+                let w = 4.0 * v * (1.0 - v);
+                rgb16[i] = (rgb16[i] as i32
+                    + (clarity * w * (orig - blur) as f32).round() as i32)
+                    .clamp(0, 65535) as u16;
+            }
+        });
+    } else if texture != 0.0 {
+        // Texture-only: fully fused, one frame scratch.
+        BLUR_SCRATCH.with(|scratch| {
+            let (ref mut temp, _, _) = *scratch.borrow_mut();
+            separable_blur_apply(rgb16, width, height, &gaussian_kernel_5(), temp, |orig, blur| {
+                (orig + (texture * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16
+            });
+        });
+    } else {
+        // Clarity-only: fully fused, one frame scratch.
+        // Midtone mask w = 4·v·(1−v), peaks at v=0.5.
+        BLUR_SCRATCH.with(|scratch| {
+            let (ref mut temp, _, _) = *scratch.borrow_mut();
+            separable_blur_apply(rgb16, width, height, &gaussian_kernel_13(), temp, |orig, blur| {
+                let v = orig as f32 / 65535.0;
+                let w = 4.0 * v * (1.0 - v);
+                (orig + (clarity * w * (orig - blur) as f32).round() as i32).clamp(0, 65535) as u16
+            });
+        });
+    }
+}
+
+/// Separable blur **fused** with a per-element apply closure.
+///
+/// Horizontal pass fills `temp` (one full-frame scratch). Vertical pass
+/// immediately folds each blurred sample into `rgb16` via `apply(orig, blur)`.
+/// The vertical pass reads from `temp` exclusively — never `rgb16` — so reading
+/// `rgb16[i]` for `orig` and writing the result back in place is race-free.
+///
+/// Peak scratch: ONE frame (`temp` only). Eliminating the old separate `blurred`
+/// output frame saves ~120 MB at 20 MP on every unsharp/NR call.
+fn separable_blur_apply(
+    rgb16: &mut [u16],
+    width: usize,
+    height: usize,
+    kernel: &[f32],
+    temp: &mut Vec<u16>,
+    apply: impl Fn(i32, i32) -> u16 + Sync,
+) {
+    let n = width * height * 3;
+    temp.resize(n, 0);
+    separable_blur_into(rgb16, width, height, kernel, temp);
+    let half = kernel.len() / 2;
+    let temp_slice = temp.as_slice();
+
+    #[cfg(feature = "parallel")]
+    rgb16
+        .par_chunks_mut(width * 3)
+        .enumerate()
+        .for_each(|(y, row)| {
+            blur_apply_row(row, y, width, height, half, kernel, temp_slice, &apply);
+        });
+
+    #[cfg(not(feature = "parallel"))]
+    for (y, row) in rgb16.chunks_mut(width * 3).enumerate() {
+        blur_apply_row(row, y, width, height, half, kernel, temp_slice, &apply);
+    }
+}
+
+/// Vertical-pass tile worker for [`separable_blur_apply`].
+/// De-interleaved VTILE=128 structure mirrors `separable_blur_with_bufs` so
+/// the accumulation loops auto-vectorise identically. Writes `apply(orig, blur)`
+/// in place: `row[o]` holds the untouched original until overwritten.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn blur_apply_row(
+    row: &mut [u16],
+    y: usize,
+    width: usize,
+    height: usize,
+    half: usize,
+    kernel: &[f32],
+    temp: &[u16],
+    apply: &(impl Fn(i32, i32) -> u16 + Sync),
+) {
+    const VTILE: usize = 128;
+    let klen = kernel.len();
+    let mut acc_r = [0f32; VTILE];
+    let mut acc_g = [0f32; VTILE];
+    let mut acc_b = [0f32; VTILE];
+    let mut r_tap = [0f32; VTILE];
+    let mut g_tap = [0f32; VTILE];
+    let mut b_tap = [0f32; VTILE];
+    for x0 in (0..width).step_by(VTILE) {
+        let x1 = (x0 + VTILE).min(width);
+        let tile = x1 - x0;
+        for xi in 0..tile {
+            acc_r[xi] = 0.0;
+            acc_g[xi] = 0.0;
+            acc_b[xi] = 0.0;
+        }
+        for ki in 0..klen {
+            let kv = kernel[ki];
+            let yi = (y as isize + ki as isize - half as isize)
+                .clamp(0, height as isize - 1) as usize;
+            let row_base = yi * width * 3;
+            for xi in 0..tile {
+                let b = row_base + (x0 + xi) * 3;
+                r_tap[xi] = temp[b] as f32;
+                g_tap[xi] = temp[b + 1] as f32;
+                b_tap[xi] = temp[b + 2] as f32;
+            }
+            for xi in 0..tile {
+                acc_r[xi] = bfma(r_tap[xi], kv, acc_r[xi]);
+                acc_g[xi] = bfma(g_tap[xi], kv, acc_g[xi]);
+                acc_b[xi] = bfma(b_tap[xi], kv, acc_b[xi]);
             }
         }
-        if params.clarity != 0.0 {
-            // Clarity blurs the original image (not the texture-sharpened output).
-            // When has_snap (both passes active), blur the snapshot in snap_buf; else blur rgb16 as usual.
-            if has_snap {
-                separable_blur_with_bufs(
-                    snap_buf,
-                    width,
-                    height,
-                    &gaussian_kernel_13(),
-                    temp,
-                    blurred,
-                );
-                // Apply clarity: orig from snap_buf, delta from snap blur, added to texture-sharpened rgb16.
-                #[cfg(feature = "parallel")]
-                rgb16
-                    .par_chunks_mut(width * 3)
-                    .zip(snap_buf.par_chunks(width * 3))
-                    .zip(blurred.par_chunks(width * 3))
-                    .for_each(|((r_row, o_row), b_row)| {
-                        for i in 0..r_row.len() {
-                            let orig = o_row[i] as i32;
-                            let blur = b_row[i] as i32;
-                            let v = orig as f32 / 65535.0;
-                            let w = 4.0 * v * (1.0 - v);
-                            r_row[i] = (r_row[i] as i32
-                                + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                                .clamp(0, 65535) as u16;
-                        }
-                    });
-                #[cfg(not(feature = "parallel"))]
-                {
-                    let n = rgb16.len();
-                    let mut i = 0;
-                    while i < n {
-                        let orig = snap_buf[i] as i32;
-                        let blur = blurred[i] as i32;
-                        let v = orig as f32 / 65535.0;
-                        let w = 4.0 * v * (1.0 - v);
-                        rgb16[i] = (rgb16[i] as i32
-                            + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                            .clamp(0, 65535) as u16;
-                        i += 1;
-                    }
-                }
-            } else {
-                // Only clarity is active (no texture pass ran): blur rgb16 directly as before.
-                separable_blur_with_bufs(
-                    rgb16,
-                    width,
-                    height,
-                    &gaussian_kernel_13(),
-                    temp,
-                    blurred,
-                );
-                #[cfg(feature = "parallel")]
-                rgb16
-                    .par_chunks_mut(width * 3)
-                    .zip(blurred.par_chunks(width * 3))
-                    .for_each(|(r_row, b_row)| {
-                        for i in 0..r_row.len() {
-                            let orig = r_row[i] as i32;
-                            let blur = b_row[i] as i32;
-                            let v = orig as f32 / 65535.0;
-                            let w = 4.0 * v * (1.0 - v);
-                            r_row[i] = (orig
-                                + (params.clarity * w * (orig - blur) as f32).round() as i32)
-                                .clamp(0, 65535) as u16;
-                        }
-                    });
-                #[cfg(not(feature = "parallel"))]
-                {
-                    let n = rgb16.len();
-                    let mut i = 0;
-                    let clarity_factor = params.clarity;
-                    while i < n {
-                        let orig = rgb16[i] as i32;
-                        let blur = blurred[i] as i32;
-                        // Midtone mask w = 4·v·(1−v), v = orig/65535 — peaks at v=0.5.
-                        // (The previous hoisted form folded the 4 into v as 4·orig/65535,
-                        // which computes 4v(1−4v): wrong sign and 2× magnitude at midtones.
-                        // Matches the parallel closure and the has_snap serial branch above.)
-                        let v = orig as f32 / 65535.0;
-                        let w = 4.0 * v * (1.0 - v);
-                        let delta = clarity_factor * w * (orig - blur) as f32;
-                        rgb16[i] = (orig as f32 + delta).round().clamp(0.0, 65535.0) as i32 as u16;
-                        i += 1;
-                    }
-                }
-            }
+        for xi in 0..tile {
+            let o = (x0 + xi) * 3;
+            row[o]     = apply(row[o]     as i32, acc_r[xi].round() as i32);
+            row[o + 1] = apply(row[o + 1] as i32, acc_g[xi].round() as i32);
+            row[o + 2] = apply(row[o + 2] as i32, acc_b[xi].round() as i32);
         }
-    });
+    }
 }
 
 /// Core per-pixel tone-mapping math (matrix + sat/vibrance around luma).
@@ -1680,7 +1909,7 @@ fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
     // Pre-fuse S·M for the default no-vibrance, non-perceptual path. Uses the SAME helper the
     // SIMD bulk path uses (tone_simd::vib_zero_matrix) so scalar and SIMD stay bit-identical.
     let matrix_fused = if vib_zero && !perceptual_constancy {
-        let m = params.color_matrix.unwrap_or(CAM_TO_SRGB);
+        let m = params.color_matrix.matrix();
         Some(crate::tone_simd::vib_zero_matrix(&m, sat))
     } else {
         None
@@ -1805,6 +2034,100 @@ pub fn process(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     out
 }
 
+/// S6: a rectangular sub-region in full-resolution pixels (top-left origin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionRect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// S6: the result of [`process_region`] — the (subsampled) rect as interleaved RGB8.
+#[derive(Clone, Debug)]
+pub struct RegionResult {
+    pub width: usize,
+    pub height: usize,
+    pub rgb8: Vec<u8>,
+}
+
+/// S6 — region/LOD entry over the per-pixel tone/colour pipeline (additive; editor ROI +
+/// tiled/AR/ML consumers that want just the pixels they need).
+///
+/// `process` / `process_into` is **per-pixel**: each output pixel is a pure function of its
+/// own RGB16 triple through the pre/post LUTs + colour matrix, with no spatial neighbourhood.
+/// Consequently the RGB8 for any rect is **byte-for-byte the crop** of the full-frame
+/// `process` output — which the tests pin exactly.
+///
+/// - `rgb16`: interleaved RGB16 of the full frame (`full_w * full_h * 3` elements).
+/// - `rect`: sub-region in full-res pixels; must lie within the frame.
+/// - `lod`: integer subsampling stride `>= 1` (1 = native detail; 2 = every other pixel, …).
+///   Output dims are `ceil(rect.w / lod) × ceil(rect.h / lod)`.
+///
+/// The spatial `texture`/`clarity` unsharp stage is a *separate* pre-pass (see
+/// [`apply_unsharp_masks`]) and — exactly as when calling `process` directly — is **not**
+/// applied here. Haloed spatial ROI (unsharp across a tile boundary) is future work and
+/// reuses the `stream_band` halo machinery.
+///
+/// # Panics
+/// If `rgb16.len() != full_w * full_h * 3`, `rect` exceeds the frame, or `lod == 0`.
+pub fn process_region(
+    rgb16: &[u16],
+    full_w: usize,
+    full_h: usize,
+    rect: RegionRect,
+    lod: usize,
+    params: &PipelineParams,
+) -> RegionResult {
+    assert!(lod >= 1, "process_region: lod must be >= 1");
+    assert_eq!(
+        rgb16.len(),
+        full_w * full_h * 3,
+        "process_region: rgb16 length must be full_w*full_h*3"
+    );
+    assert!(
+        rect.x + rect.w <= full_w && rect.y + rect.h <= full_h,
+        "process_region: rect out of bounds"
+    );
+
+    // An empty region (zero width OR height) normalizes to a 0×0 result.
+    if rect.w == 0 || rect.h == 0 {
+        return RegionResult {
+            width: 0,
+            height: 0,
+            rgb8: Vec::new(),
+        };
+    }
+    let out_w = rect.w.div_ceil(lod);
+    let out_h = rect.h.div_ceil(lod);
+
+    // Gather the (subsampled) rect's RGB16 into a contiguous buffer, then run the per-pixel
+    // pipeline. Because that pipeline is per-pixel, this is byte-identical to cropping
+    // process(full) at `rect` (verified in region_tests).
+    let mut sub = Vec::with_capacity(out_w * out_h * 3);
+    let mut oy = 0;
+    while oy < rect.h {
+        let row = (rect.y + oy) * full_w;
+        let mut ox = 0;
+        while ox < rect.w {
+            let idx = (row + rect.x + ox) * 3;
+            sub.push(rgb16[idx]);
+            sub.push(rgb16[idx + 1]);
+            sub.push(rgb16[idx + 2]);
+            ox += lod;
+        }
+        oy += lod;
+    }
+    debug_assert_eq!(sub.len(), out_w * out_h * 3);
+
+    let rgb8 = process(&sub, params);
+    RegionResult {
+        width: out_w,
+        height: out_h,
+        rgb8,
+    }
+}
+
 /// T2: like `process` but writes into a caller-owned buffer.
 /// `out` must have exactly `rgb16.len()` elements (one u8 per u16 input; i.e. `width * height * 3` bytes).
 /// Lets the interactive LookRenderer reuse one output buffer across re-renders instead of
@@ -1821,8 +2144,7 @@ pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
         "process_into: out must have rgb16.len() elements"
     );
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
 
     #[cfg(not(feature = "parallel"))]
     {
@@ -2092,8 +2414,7 @@ pub fn process_into_simd(rgb16: &[u16], params: &PipelineParams, out: &mut [u8])
     // Guard before derive_tone_inputs so the assertion fires before any work is done.
     assert!(!params.perceptual_constancy, "process_into_simd is the plain ingest path only; use process_into for perceptual_constancy");
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     // Pre-fused S·M (built once in derive_tone_inputs) for the default no-vibrance path;
     // `Some ⟺ vib_zero` here (perceptual_constancy is asserted off). Feeding it to the
     // kernel skips the per-block `vib_zero_matrix` rebuild. Copy: Option<&[[f32;3];3]>.
@@ -2215,8 +2536,7 @@ pub fn process_auto(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 /// Returns `(pre_lut_ms, tone_math_ms, post_lut_ms)`.
 pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f64, f64) {
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let lut_len = (params.white as usize + 1).next_power_of_two().min(65536);
     let lut_mask = lut_len - 1;
     let pre_r = build_pre_lut_compact(params.black, params.white, ti.wb_r, ti.exp_gain, lut_len);
@@ -2307,8 +2627,7 @@ pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f6
 /// tone-math cost. Used by examples/pipeline_profile to decide what to vectorize.
 pub fn bench_tone_split(rgb16: &[u16], params: &PipelineParams) -> (f64, f64) {
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let pre_r = build_pre_lut(params.black, params.white, ti.wb_r, ti.exp_gain);
     let pre_g = build_pre_lut(params.black, params.white, ti.wb_g, ti.exp_gain);
     let pre_b = build_pre_lut(params.black, params.white, ti.wb_b, ti.exp_gain);
@@ -2368,8 +2687,7 @@ pub fn bench_tone_split(rgb16: &[u16], params: &PipelineParams) -> (f64, f64) {
 pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let n = rgb16.len() / 3;
     let mut out = vec![0u8; n * 4];
 
@@ -2483,8 +2801,7 @@ pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 pub fn process_rgb(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let n = rgb16.len() / 3;
     let mut out = vec![0u8; n * 3];
 
@@ -2631,28 +2948,14 @@ pub fn apply_luminance_nr(rgb16: &mut [u16], width: usize, height: usize, streng
     }
     let s = strength.clamp(0.0, 1.0);
     let kernel = gaussian_kernel_5();
+    // Fused: single temp frame, no separate blurred frame (~120 MB saved at 20 MP).
+    // Flipflop bench (2026-06-18): serial 130ms, parallel 20ms → 6.6× speedup on 12MP.
     BLUR_SCRATCH.with(|scratch| {
-        let (ref mut temp, ref mut blurred, _) = *scratch.borrow_mut();
-        separable_blur_with_bufs(rgb16, width, height, &kernel, temp, blurred);
-        // Flipflop bench (2026-06-18): serial 130ms, parallel 20ms → 6.6× speedup on 12MP.
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            rgb16
-                .par_iter_mut()
-                .zip(blurred.par_iter())
-                .for_each(|(o, &b)| {
-                    let ov = *o as f32;
-                    *o = (ov + (b as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16;
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for (o, &b) in rgb16.iter_mut().zip(blurred.iter()) {
-                let ov = *o as f32;
-                *o = (ov + (b as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16;
-            }
-        }
+        let (ref mut temp, _, _) = *scratch.borrow_mut();
+        separable_blur_apply(rgb16, width, height, &kernel, temp, |orig, blur| {
+            let ov = orig as f32;
+            (ov + (blur as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16
+        });
     });
 }
 
@@ -2676,8 +2979,7 @@ pub fn process_16bit(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
 pub fn process_16bit_scalar(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let n = rgb16.len() / 3;
     let mut out = vec![0u16; n * 3];
 
@@ -2787,8 +3089,7 @@ pub fn process_16bit_simd(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
     assert!(!ti.perceptual_constancy, "process_16bit_simd is the plain ingest path only; use process_16bit_scalar for perceptual_constancy");
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     // See process_into_simd: pre-fused matrix skips the per-block vib_zero_matrix rebuild.
     let fused = ti.matrix_fused.as_ref();
     let n = rgb16.len() / 3;
@@ -3949,7 +4250,7 @@ mod tonemap_flip_flops {
             highlights: 0.0,
             whites: 0.0,
             blacks: 0.0,
-            color_matrix: None,
+            color_matrix: ColorMatrix::GenericOlympus,
             texture: 0.0,
             clarity: 0.0,
             perceptual_constancy: false,
@@ -4673,5 +4974,95 @@ mod orientation_u16_tests {
         let (out, w, h) = apply_orientation_u16(rgb, 2, 1, 2);
         assert_eq!((w, h), (2, 1));
         assert_eq!(out, vec![4, 5, 6, 1, 2, 3]);
+    }
+}
+
+/// S6: `process_region` (region/LOD entry over the per-pixel pipeline) — the byte-exact
+/// contract is that a full-frame region equals `process(full)` and any sub-rect equals the
+/// crop of `process(full)`, because the tone/colour stage is per-pixel.
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    fn synth_rgb16(w: usize, h: usize) -> Vec<u16> {
+        // Spread values across the 12-bit range so the tone LUTs + colour matrix are exercised.
+        let mut v = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                v.push(((x * 37 + y * 11) % 4096) as u16);
+                v.push(((x * 13 + y * 53) % 4096) as u16);
+                v.push(((x * 7 + y * 101) % 4096) as u16);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn process_region_full_frame_equals_process() {
+        let (w, h) = (16usize, 12usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let full = process(&rgb16, &params);
+        let region = process_region(&rgb16, w, h, RegionRect { x: 0, y: 0, w, h }, 1, &params);
+        assert_eq!((region.width, region.height), (w, h));
+        assert_eq!(
+            region.rgb8, full,
+            "full-frame region (lod=1) must be byte-identical to process(full)"
+        );
+    }
+
+    #[test]
+    fn process_region_subrect_equals_crop_of_full() {
+        let (w, h) = (16usize, 12usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let full = process(&rgb16, &params);
+        let rect = RegionRect { x: 3, y: 2, w: 5, h: 4 };
+        let region = process_region(&rgb16, w, h, rect, 1, &params);
+        assert_eq!((region.width, region.height), (rect.w, rect.h));
+        for oy in 0..rect.h {
+            for ox in 0..rect.w {
+                let (sx, sy) = (rect.x + ox, rect.y + oy);
+                let fi = (sy * w + sx) * 3;
+                let ri = (oy * rect.w + ox) * 3;
+                assert_eq!(
+                    &region.rgb8[ri..ri + 3],
+                    &full[fi..fi + 3],
+                    "region pixel ({ox},{oy}) must match crop of full at ({sx},{sy})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_region_lod2_subsamples_and_matches_full() {
+        let (w, h) = (16usize, 12usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let full = process(&rgb16, &params);
+        let region = process_region(&rgb16, w, h, RegionRect { x: 0, y: 0, w, h }, 2, &params);
+        assert_eq!((region.width, region.height), (w.div_ceil(2), h.div_ceil(2)));
+        for oy in 0..region.height {
+            for ox in 0..region.width {
+                let (sx, sy) = (ox * 2, oy * 2);
+                let fi = (sy * w + sx) * 3;
+                let ri = (oy * region.width + ox) * 3;
+                assert_eq!(
+                    &region.rgb8[ri..ri + 3],
+                    &full[fi..fi + 3],
+                    "lod=2 region pixel ({ox},{oy}) must match full at ({sx},{sy})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_region_zero_area_is_empty() {
+        let (w, h) = (8usize, 8usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let region = process_region(&rgb16, w, h, RegionRect { x: 2, y: 2, w: 0, h: 3 }, 1, &params);
+        assert_eq!((region.width, region.height), (0, 0));
+        assert!(region.rgb8.is_empty());
     }
 }

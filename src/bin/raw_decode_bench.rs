@@ -417,7 +417,7 @@ fn bench_dng(path: &str, rows: &mut Vec<BenchRow>) {
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
-    params.color_matrix = img.color_matrix;
+    params.color_matrix = img.color_matrix.into();
 
     let clarity = measure_clarity(&rgb16, w, h, &params);
     let tone = bench_tone_outputs(&rgb16, &params);
@@ -493,7 +493,7 @@ fn bench_cr2(path: &str, rows: &mut Vec<BenchRow>) {
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
-    params.color_matrix = img.color_matrix;
+    params.color_matrix = img.color_matrix.into();
     let tone = bench_tone_outputs(&rgb16, &params);
 
     // Use direct RGBA + 4ch encode for the measured JXL path (Tauri direct-feed parity).
@@ -575,7 +575,7 @@ fn bench_orf(path: &str, rows: &mut Vec<BenchRow>) {
         params.wb_b = b;
     }
     if let Some(m) = info.color_matrix {
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
 
     let clarity = measure_clarity(&rgb16, w, h, &params);
@@ -1255,7 +1255,7 @@ fn process_orf_to_rgba8(path: &str) -> Option<(Vec<u8>, usize, usize)> {
         params.wb_b = b;
     }
     if let Some(m) = info.color_matrix {
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
     let rgba = pipeline::process_rgba(&rgb16, &params);
     Some((rgba, w, h))

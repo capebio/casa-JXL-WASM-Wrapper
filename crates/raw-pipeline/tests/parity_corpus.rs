@@ -1,14 +1,49 @@
-//! S1 parity corpus: end-to-end pipeline on real RAW files.
+//! S1 parity corpus + S4 golden SHA ledger: end-to-end pipeline on real RAW
+//! files, plus a machine-independent ledger over the checked-in fixtures.
 //!
 //! Confirms the canonical crate decodes real ORF + DNG files without panicking,
-//! produces correctly-sized non-trivial pixel output, and prints FNV hashes for
-//! archival comparison against the old vendored pipeline.
+//! produces correctly-sized non-trivial pixel output, and — new in S4 — asserts
+//! the decoded-pixel digests against pinned values so any silent pixel drift
+//! (a colour-math or parser change) fails CI instead of shipping.
 //!
-//! Fixture-gated: each test skips gracefully when the asset file is absent.
+//! ## Ledger design (S4)
+//! Two tiers:
+//!   1. **Machine-gated RAW tier** — real ORF/DNG on this dev box. Skips
+//!      gracefully when absent (other machines / CI). Pinned digests reuse the
+//!      values recorded in `docs/S1-timings-report.md`.
+//!   2. **Always-present fixture tier** (`golden_fixture_ledger`) — the checked-in
+//!      `tests/fixtures/mandelbrot_*` TIFF/EXR. Runs everywhere including CI, so
+//!      the ledger is never all-skipped.
+//!
+//! ## Determinism contract
+//! Digests are `std::hash::DefaultHasher` (SipHash-1-3 with fixed keys —
+//! stable within a Rust release, deterministic across processes/threads). The
+//! pins were verified reproducible on rustc 1.95.0 across TWO independent
+//! release builds — one `-C target-cpu=native` (AVX2 demosaic/decompress) and
+//! one scalar — proving the SIMD paths are byte-exact vs scalar at the whole
+//! pipeline level. Run single-threaded (`--test-threads=1`) for the ledger; the
+//! pipeline's internal rayon is per-pixel deterministic so the digest is
+//! thread-count-invariant, but pinning ST removes any doubt.
+//!
+//! If a pin ever legitimately changes (intentional colour-pipeline evolution),
+//! update the constant AND record the reason in `docs/S1-timings-report.md`.
+//! Never "silently adopt" a new digest.
 
-use raw_pipeline::{dng, pipeline, tiff};
+use raw_pipeline::{dng, image_formats, pipeline, tiff};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+// ── pinned digests (S4 golden ledger) ─────────────────────────────────────────
+// RAW tier — reused verbatim from docs/S1-timings-report.md (rustc 1.95.0).
+const ORF_RGBA8_HASH: u64 = 0x8806_8222_77ea_c608; // P1110226.ORF → decode_orf_rgba8
+const DNG_RGB8_HASH: u64 = 0x3c3f_b141_39ef_ec5c; //  PXL…dng → process() rgb8
+// Fixture tier — captured on rustc 1.95.0 from the checked-in mandelbrot assets.
+// tiff8 == exr-display: the EXR is the HDR-linear twin of the same pattern the
+// 8-bit TIFF stores as sRGB, so linear→sRGB8 display reproduces the TIFF exactly
+// (an intentional cross-check, not a collision — 256 KiB SipHash collision ≈ 2^-64).
+const FIX_TIFF8_HASH: u64 = 0x59c4_4f57_580a_1f5a;
+const FIX_TIFF16_HASH: u64 = 0x09c1_95e2_e8ad_c961;
+const FIX_EXR_DISP8_HASH: u64 = 0x59c4_4f57_580a_1f5a;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -60,7 +95,15 @@ fn orf_rgba8_sanity() {
     assert_eq!(rgba8.len(), w as usize * h as usize * 4);
     assert_nontrivial(&rgba8, "orf_rgba8");
 
-    println!("ORF rgba8  {w}×{h}  hash={:#018x}", buf_hash(&rgba8));
+    let hash = buf_hash(&rgba8);
+    println!("ORF rgba8  {w}×{h}  hash={hash:#018x}");
+    // S4 golden ledger: pixel digest is pinned. A mismatch = the ORF→rgba8 path
+    // changed output (parser, demosaic, or tone math). If intentional, update
+    // ORF_RGBA8_HASH + docs/S1-timings-report.md; never adopt silently.
+    assert_eq!(
+        hash, ORF_RGBA8_HASH,
+        "ORF rgba8 digest drift: got {hash:#018x}, pinned {ORF_RGBA8_HASH:#018x}"
+    );
 }
 
 /// process() (rgb8 path, no width arg) via bench_pipeline_orf — 3 runs, reports avg.
@@ -146,7 +189,13 @@ fn dng_rgb8_sanity() {
     assert_eq!(rgb8.len(), w * h * 3, "process() output wrong size");
     assert_nontrivial(&rgb8, "dng_rgb8");
 
-    println!("DNG rgb8  {w}×{h}  hash={:#018x}", buf_hash(&rgb8));
+    let hash = buf_hash(&rgb8);
+    println!("DNG rgb8  {w}×{h}  hash={hash:#018x}");
+    // S4 golden ledger: pinned decoded-pixel digest (see ORF note above).
+    assert_eq!(
+        hash, DNG_RGB8_HASH,
+        "DNG rgb8 digest drift: got {hash:#018x}, pinned {DNG_RGB8_HASH:#018x}"
+    );
 }
 
 /// DNG rgb8 is deterministic.
@@ -181,4 +230,50 @@ fn dng_align_to_rggb_infallible() {
     let (_slice, w, h) = dng::align_to_rggb(&img.raw, img.width, img.height, img.cfa);
     assert!(w > 0 && h > 0);
     println!("align_to_rggb infallible OK  {w}×{h}");
+}
+
+// ── Always-present fixture ledger (S4) ─────────────────────────────────────────
+
+const FIX_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// Golden SHA ledger over the checked-in mandelbrot fixtures. Unlike the RAW
+/// tier this needs no machine-local asset, so it runs everywhere (incl. CI) and
+/// guards the TIFF/EXR ingest + display-conversion paths against silent drift.
+///
+/// Digests below are pinned; a mismatch means `image_formats` decode changed
+/// output. Update the constant + note the reason if the change is intentional.
+#[test]
+fn golden_fixture_ledger() {
+    // 8-bit TIFF → RGBA8 planar decode.
+    let t8 = image_formats::decode_tiff_bytes(
+        &std::fs::read(format!("{FIX_DIR}/mandelbrot_u8.tiff")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((t8.width, t8.height, t8.bit_depth), (256, 256, 8));
+    let h8 = buf_hash(&t8.u8);
+    println!("FIX tiff8   256×256  hash={h8:#018x}");
+
+    // 16-bit TIFF → RGBA16; hash the little-endian byte view for a stable digest.
+    let t16 = image_formats::decode_tiff_bytes(
+        &std::fs::read(format!("{FIX_DIR}/mandelbrot_u16.tiff")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((t16.width, t16.height, t16.bit_depth), (256, 256, 16));
+    let t16_bytes: Vec<u8> = t16.u16.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let h16 = buf_hash(&t16_bytes);
+    println!("FIX tiff16  256×256  hash={h16:#018x}");
+
+    // EXR f32 HDR → linear→sRGB8 display conversion (the shipped display path).
+    let exr = image_formats::decode_exr_bytes(
+        &std::fs::read(format!("{FIX_DIR}/mandelbrot_f32.exr")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!((exr.width, exr.height, exr.bit_depth), (256, 256, 32));
+    let disp = image_formats::f32_linear_to_srgb8(&exr.f32);
+    let hd = buf_hash(&disp);
+    println!("FIX exr8    256×256  hash={hd:#018x}");
+
+    assert_eq!(h8, FIX_TIFF8_HASH, "tiff8 digest drift: got {h8:#018x}");
+    assert_eq!(h16, FIX_TIFF16_HASH, "tiff16 digest drift: got {h16:#018x}");
+    assert_eq!(hd, FIX_EXR_DISP8_HASH, "exr disp8 digest drift: got {hd:#018x}");
 }

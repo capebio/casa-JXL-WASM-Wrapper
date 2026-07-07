@@ -10,6 +10,7 @@ import type {
   LevelZeroSeed,
   MasterMetadata,
   ProducedBy,
+  LodCapabilities,
 } from "./manifest.js";
 
 export const MANIFEST_SCHEMA_VERSION = 2;
@@ -91,6 +92,16 @@ function validateMasterMetadata(v: unknown, path: string): MasterMetadata {
   const mtimeMs = requireNumber(o["mtimeMs"], `${path}.mtimeMs`);
   const result: MasterMetadata = { name, format: format as MasterMetadata["format"], mtimeMs };
   if (o["sizeBytes"] !== undefined) result.sizeBytes = requireNumber(o["sizeBytes"], `${path}.sizeBytes`);
+  return result;
+}
+
+/** S6 (additive): validate an optional LodCapabilities bag — object of optional booleans. */
+function validateCapabilities(v: unknown, path: string): LodCapabilities {
+  const o = requireObject(v, path);
+  const result: LodCapabilities = {};
+  for (const k of ["quality", "resolution", "region"] as const) {
+    if (o[k] !== undefined) result[k] = requireBoolean(o[k], `${path}.${k}`);
+  }
   return result;
 }
 
@@ -176,6 +187,10 @@ function validateLevel(v: unknown, path: string): PyramidLevel {
     });
   }
 
+  if (o["capabilities"] !== undefined) {
+    level.capabilities = validateCapabilities(o["capabilities"], `${path}.capabilities`);
+  }
+
   return level;
 }
 
@@ -243,6 +258,7 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
   if (o["producedBy"] !== undefined) result.producedBy = validateProducedBy(o["producedBy"], "manifest.producedBy");
   if (o["metadata"] !== undefined) { result.metadata = sanitizeOpaqueObject(requireObject(o["metadata"], "manifest.metadata"), "manifest.metadata"); }
   if (o["convergedByteEnd"] !== undefined) result.convergedByteEnd = requireNumber(o["convergedByteEnd"], "manifest.convergedByteEnd");
+  if (o["capabilities"] !== undefined) result.capabilities = validateCapabilities(o["capabilities"], "manifest.capabilities");
 
   return result;
 }

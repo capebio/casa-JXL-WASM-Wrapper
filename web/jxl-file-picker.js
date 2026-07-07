@@ -21,6 +21,11 @@
  *   picker.setDisabled(true, "Load required first");
  */
 
+// S3: route the per-key byte-budget decision through AssetStore's single greedy
+// admission helper instead of a bespoke loop (one policy for "which entries fit
+// under a byte cap", shared with the other governed caches). Behavior-identical.
+import { fitWithinBudget } from '../packages/asset-store/src/index.js';
+
 const DB_NAME = 'jxl-file-picker-memory';
 const DB_STORE = 'lastFiles';
 
@@ -57,7 +62,11 @@ async function saveLastFiles(key, files) {
     // Store metadata + actual bytes for the most recent selection, but bound
     // total persisted bytes so large RAW blobs don't grow IDB without limit.
     // Once the budget is exhausted, remaining files keep metadata only.
-    let budget = MAX_PERSIST_BYTES;
+    // AssetStore.fitWithinBudget makes the admission decision (greedy, in
+    // selection order) — identical to the old `f.size <= remaining` loop.
+    const admitted = new Set(
+      fitWithinBudget(files, MAX_PERSIST_BYTES, (f) => f.size).admitted,
+    );
     const records = await Promise.all(files.map(async (f) => {
       const rec = {
         name: f.name,
@@ -65,9 +74,8 @@ async function saveLastFiles(key, files) {
         type: f.type,
         lastUsed: Date.now(),
       };
-      if (f.size <= budget) {
+      if (admitted.has(f)) {
         rec.bytes = await f.arrayBuffer();
-        budget -= f.size;
       }
       return rec;
     }));
