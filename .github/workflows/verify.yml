@@ -1,0 +1,86 @@
+# S4 verification gate — the machine-checkable half of the hardening architecture.
+#
+# Wires the four S4 legs into CI: (1) parser + golden-ledger + fuzz-smoke + parity
+# oracles, (2) `cargo fuzz build` of the libFuzzer targets, (3) the K6.5 FFI-ABI
+# contract test. Every command here is verified locally on Windows/MSVC; the
+# workflow itself was authored by the S4 overnight run and has NOT been executed
+# on GitHub Actions — treat the runner image / action versions as unconfirmed
+# until a first green run (see docs/WAVE2-QUESTIONS-DEFERRED.md §S4 D4).
+#
+# Deliberately libjxl-free: the Rust legs build raw-pipeline with
+# `--no-default-features` so no jxl-ffi/libjxl/emscripten toolchain is required.
+# The machine-local ORF/DNG ledger entries skip gracefully (fixtures absent on
+# CI); the checked-in mandelbrot fixture ledger runs everywhere.
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-parsers:
+    name: rust parsers + golden ledger + fuzz-smoke + oracles
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/raw-pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/raw-pipeline
+      # Pinned single-thread: the golden SHA ledger is thread-invariant but pins ST
+      # by discipline (see tests/parity_corpus.rs). --no-default-features keeps the
+      # jxl-codec (libjxl) test files out of the build; we name the libjxl-free tests.
+      - name: cargo test (libjxl-free surface)
+        run: >
+          cargo test --no-default-features --features parallel,image-formats
+          --lib
+          --test parity_corpus
+          --test fuzz_smoke
+          --test parity_oracles
+          --test image_formats_roundtrip
+          -- --test-threads=1
+
+  fuzz-build:
+    name: cargo fuzz build (parser targets)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/raw-pipeline
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/raw-pipeline/fuzz
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # Pure-Rust targets only; the CASV/JXTC targets are behind `--features codec`
+      # (libjxl) and are excluded from this libjxl-free gate.
+      - name: build fuzz targets
+        run: cargo +nightly fuzz build
+      # Short smoke: prove each target starts and runs its seed corpus. Not a real
+      # fuzzing campaign — see D3 for where long runs should live.
+      - name: 20s smoke per target
+        run: |
+          for t in tiff_parse cr2_decode dng_decode ljpeg_decode decompress; do
+            cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=200000
+          done
+
+  ffi-abi:
+    name: FFI ABI contract (K6.5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      # The interface-parse assertions always run; the compiled-arity check
+      # self-skips when packages/jxl-wasm/dist is unbuilt (no emscripten here).
+      - name: bun ffi-abi contract test
+        working-directory: packages/jxl-wasm
+        run: bun test test/ffi-abi-contract.test.ts

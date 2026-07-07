@@ -1,0 +1,7 @@
+# cargo-fuzz build + run artifacts (regenerable). The seed corpus under
+# corpus/<target>/ IS tracked (checked-in starting inputs); fuzzer-grown corpora,
+# crash artifacts, and coverage data are not.
+target/
+artifacts/
+coverage/
+Cargo.lock
