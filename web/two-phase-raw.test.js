@@ -22,7 +22,13 @@ import { join } from 'node:path';
 import initRaw, * as rawWasm from './pkg/raw_converter_wasm.js';
 
 const DEFAULT_ORF_FOLDER = String.raw`C:\995\2026-02-20 Gobabeb To Windhoek`;
-const ORF_FOLDER = process.env.TEST_ORF_FOLDER ?? DEFAULT_ORF_FOLDER;
+// Corpus fallback: the committed default ORF folder is machine-specific. When it
+// is absent, fall back to the checked-in RAW test fixtures (which contain
+// P1110226.ORF) so the byte-identity + batch tests are runnable here too.
+const TESTS = String.raw`C:\Foo\raw-converter\tests`;
+const ORF_FOLDER = process.env.TEST_ORF_FOLDER
+    ?? (existsSync(DEFAULT_ORF_FOLDER) ? DEFAULT_ORF_FOLDER : TESTS);
+const ORF_FIXTURE = join(TESTS, 'P1110226.ORF');
 const DNG_FIXTURE = String.raw`C:\Foo\raw-converter\tests\PXL_20260501_095020990.RAW-02.ORIGINAL.dng`;
 
 const OUT_FULL_RGB8 = 1;
@@ -32,8 +38,19 @@ const OUT_NO_ORIENT = 16;
 
 const orfTest = existsSync(ORF_FOLDER) ? test : test.skip;
 const dngTest = existsSync(DNG_FIXTURE) ? test : test.skip;
+const batchTest = existsSync(ORF_FIXTURE) ? test : test.skip;
 
 const sha = (buf) => createHash('sha256').update(buf).digest('hex');
+
+// The web-target pkg's default init resolves the .wasm via `fetch(new URL(...))`,
+// which hangs for file:// URLs under bun/node. Pass the wasm bytes explicitly;
+// initRaw is idempotent, so sharing one init across tests is free.
+let rawInit;
+function ensureRaw() {
+    return (rawInit ??= initRaw({
+        module_or_path: readFileSync(new URL('./pkg/raw_converter_wasm_bg.wasm', import.meta.url)),
+    }));
+}
 
 // Neutral look, camera WB (NaN overrides) — the worker's default submit shape.
 function processNeutral(fn, bytes, flags) {
@@ -99,7 +116,7 @@ function expectArmsEqual({ aPrev, aFull, bPrev, bFull }) {
 }
 
 orfTest('two-phase ORF split is byte-identical to the monolithic call', async () => {
-    await initRaw();
+    await ensureRaw();
     const orfs = readdirSync(ORF_FOLDER)
         .filter((n) => n.toLowerCase().endsWith('.orf'))
         .sort()
@@ -120,7 +137,7 @@ orfTest('two-phase ORF split is byte-identical to the monolithic call', async ()
 // The full-res encode output IS identical either way. If this test ever flips
 // (lib.rs unifies the DNG preview sources), extend the split to DNG.
 dngTest('DNG previews-only twin differs from monolithic previews (split stays ORF-only)', async () => {
-    await initRaw();
+    await ensureRaw();
     const bytes = new Uint8Array(readFileSync(DNG_FIXTURE));
     const r = runBothArms(rawWasm.process_dng_with_flags, bytes);
     expect(r.bPrev.th).not.toBe(r.aPrev.th);
@@ -130,4 +147,25 @@ dngTest('DNG previews-only twin differs from monolithic previews (split stays OR
     expect(r.bFull.w).toBe(r.aFull.w);
     expect(r.bFull.h).toBe(r.aFull.h);
     console.log('  DNG previews diverge (expected) — worker.js keeps DNG monolithic');
+}, 300_000);
+
+// Documents the waste the batch gate removes. The interactive two-phase split
+// (previews-only phase 1 + full-res phase 2) re-runs the dominant serial
+// `decompress` stage TWICE, so its summed decompress cost is ~2x the single
+// monolithic call that batch/headless exports take. The full RGB8 bytes are
+// byte-identical either way (proven by the ORF A/B test above); the gate only
+// changes WHEN the split is taken, never the pixels.
+batchTest('batch flag decodes ORF once (no double decompress)', async () => {
+    await ensureRaw();
+    const bytes = new Uint8Array(readFileSync(ORF_FIXTURE));
+    const single = processNeutral(rawWasm.process_orf_with_flags, bytes,
+        OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
+    const singleDecompress = single.decompress_ms; single.free();
+    const p1 = processNeutral(rawWasm.process_orf_with_flags, bytes, OUT_LIGHTBOX | OUT_THUMB);
+    const p2 = processNeutral(rawWasm.process_orf_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+    const twoPhaseDecompress = p1.decompress_ms + p2.decompress_ms;
+    console.log(`  decompress_ms: single=${singleDecompress} two-phase=${twoPhaseDecompress}` +
+        ` (p1=${p1.decompress_ms}, p2=${p2.decompress_ms})`);
+    p1.free(); p2.free();
+    expect(twoPhaseDecompress).toBeGreaterThan(singleDecompress * 1.5);
 }, 300_000);

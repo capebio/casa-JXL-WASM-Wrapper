@@ -594,7 +594,16 @@ self.addEventListener('message', async (ev) => {
         // checkpoint after the first WASM call, none between phases (a
         // between-phase skip would strand the pool slot, since the worker is
         // released on ENCODE_REQUEST).
-        const canSplit = decoderFn === process_orf_with_flags;
+        //
+        // batch:true opts out of the split. The two-phase path trades total CPU
+        // (a second full decompress — the 74%-dominant serial stage) for
+        // first-paint preview latency; that trade only pays for the INTERACTIVE
+        // viewer. Batch/headless exports need no on-screen preview, so they take
+        // the single monolithic call (same shape DNG/CR2 already use) and decode
+        // each ORF once. Previews are still posted below (the monolithic branch
+        // builds THUMB/LIGHTBOX too) — just after the full decode, not before.
+        const interactive = opts.batch !== true;   // default: interactive
+        const canSplit = interactive && decoderFn === process_orf_with_flags;
 
         const pT0 = performance.now();
         // OUT_NO_ORIENT: skip apply_orientation on the full RGB8 — JXL records
