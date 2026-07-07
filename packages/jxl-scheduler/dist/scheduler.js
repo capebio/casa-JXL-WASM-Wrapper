@@ -546,7 +546,7 @@ export class Scheduler {
             return;
         bp.queueDepth = Math.max(0, bp.queueDepth - 1);
         // Dev-only invariant: queueDepth must never go negative (A3).
-        if (process.env.NODE_ENV !== "production" && bp.queueDepth < 0) {
+        if (typeof process !== "undefined" && process.env.NODE_ENV !== "production" && bp.queueDepth < 0) {
             throw new Error(`Scheduler invariant violated: queueDepth went negative (${bp.queueDepth}) for session ${sessionId}`);
         }
         const hwm = this.adaptiveHwm();
