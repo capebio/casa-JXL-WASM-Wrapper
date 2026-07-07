@@ -356,13 +356,18 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
 /// The demosaicer's phase must place green on the correct diagonal. The phase
 /// derived from SensorInfo / the center-crop fallback is wrong for some bodies
 /// (observed: the 550D reports RGGB `(0,0)` but its greens sit on the main
-/// diagonal → green↔R/B swap → a magenta cast). We detect the green diagonal from
-/// the actual pixels and flip the phase's column parity when it disagrees.
+/// diagonal → green↔R/B swap → a magenta cast; render-verified against a reference
+/// its true phase is `(1,0)`, i.e. the derived crop *row* parity is off by one).
 ///
-/// Scene-independent: it does NOT assume green is the brightest channel — only
-/// that the two green sites (identical colour, adjacent) are far more equal than
-/// the R/B singletons. No-op when the derived phase already agrees, or when the
-/// frame is too flat/neutral to tell (R≈B) — the safe direction.
+/// Green detection is scene-independent (the two green sites — identical colour,
+/// adjacent — are far more equal than the R/B singletons; no "green is brightest"
+/// assumption). Note R/B *cannot* be told apart from raw brightness (a red scene
+/// brightens the R site — M5; a blue-sky scene brightens the B site — 550D — so a
+/// WB/gray-world hint fails both ways). We therefore only correct the diagonal:
+/// when green disagrees we flip the crop **row** parity (the observed error mode —
+/// a top-margin off-by-one; RGGB→GBRG). No-op when the derived phase already agrees
+/// or the frame is too flat to judge. Bodies whose error is instead a *column*
+/// off-by-one would need a column flip — verify per body against a reference sky.
 fn refine_cfa_phase_by_green(raw: &[u16], w: usize, h: usize, derived: (u8, u8)) -> (u8, u8) {
     if w < 4 || h < 4 || raw.len() < w * h {
         return derived;
@@ -409,12 +414,11 @@ fn refine_cfa_phase_by_green(raw: &[u16], w: usize, h: usize, derived: (u8, u8))
     // Phases with green on the MAIN diagonal: (0,1) GRBG, (1,0) GBRG.
     let derived_on_main = matches!(derived, (0, 1) | (1, 0));
     if derived_on_main == green_on_main {
-        return derived; // already the correct diagonal
+        return derived; // already the correct diagonal (e.g. M5 RGGB)
     }
-    // Flip one parity to move green across the diagonal, preserving the derived
-    // R/B tendency as far as possible. (R/B *within* the corrected diagonal is a
-    // second-order distinction the WB + matrix largely absorb.)
-    (derived.0, derived.1 ^ 1)
+    // Green is on the wrong diagonal → flip the crop ROW parity (top-margin
+    // off-by-one). Render-verified: 550D (0,0)→(1,0) gives a blue sky, not orange.
+    (derived.0 ^ 1, derived.1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1836,24 +1840,22 @@ mod tests {
     }
 
     #[test]
-    fn refine_cfa_phase_flips_when_green_on_wrong_diagonal() {
-        // 8×8 synthetic mosaic. Greens (identical colour) on the MAIN diagonal:
-        // (0,0)&(1,1) = 2000 (equal); singletons (0,1)=3000 R, (1,0)=1000 B.
+    fn refine_cfa_phase_row_flips_when_green_on_wrong_diagonal() {
+        // 8×8 synthetic. Greens (identical colour) on the MAIN diagonal:
+        // (0,0)&(1,1)=2000 (equal); singletons (0,1)/(1,0) differ.
         let (w, h) = (8usize, 8usize);
         let mut raw = vec![0u16; w * h];
         for y in 0..h {
             for x in 0..w {
                 raw[y * w + x] = match (y & 1, x & 1) {
-                    (0, 0) | (1, 1) => 2000, // green
-                    (0, 1) => 3000,          // red
-                    _ => 1000,               // blue
+                    (0, 0) | (1, 1) => 2000,
+                    (0, 1) => 3000,
+                    _ => 1000,
                 };
             }
         }
-        // Derived RGGB (0,0) expects green on the ANTI diagonal → must flip col parity.
-        assert_eq!(refine_cfa_phase_by_green(&raw, w, h, (0, 0)), (0, 1));
-        // Already green-on-main → no change.
-        assert_eq!(refine_cfa_phase_by_green(&raw, w, h, (0, 1)), (0, 1));
+        // Derived RGGB (0,0) has green on the ANTI diagonal → mismatch → flip row parity.
+        assert_eq!(refine_cfa_phase_by_green(&raw, w, h, (0, 0)), (1, 0));
     }
 
     #[test]
@@ -1864,14 +1866,14 @@ mod tests {
         for y in 0..h {
             for x in 0..w {
                 rggb[y * w + x] = match (y & 1, x & 1) {
-                    (0, 1) | (1, 0) => 2000, // green
-                    (0, 0) => 3000,          // red
-                    _ => 1000,               // blue
+                    (0, 1) | (1, 0) => 2000,
+                    (0, 0) => 3000,
+                    _ => 1000,
                 };
             }
         }
         assert_eq!(refine_cfa_phase_by_green(&rggb, w, h, (0, 0)), (0, 0));
-        // Flat/neutral frame (R≈B) → too ambiguous to judge → keep derived, whatever it is.
+        // Flat/neutral frame → too ambiguous → keep derived, whatever it is.
         let flat = vec![1500u16; w * h];
         assert_eq!(refine_cfa_phase_by_green(&flat, w, h, (0, 0)), (0, 0));
         assert_eq!(refine_cfa_phase_by_green(&flat, w, h, (1, 0)), (1, 0));
