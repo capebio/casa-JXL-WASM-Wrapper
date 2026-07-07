@@ -99,9 +99,16 @@ git add web/worker.js web/main.js web/two-phase-raw.test.js .flipflop/dom-tests/
 git commit -m "perf(worker): decode ORF once for batch exports (skip two-phase double-decompress)"
 ```
 
-### Task 1.2: Borrow (not copy) the encode input buffer
+### Task 1.2: Borrow (not copy) the encode input buffer — ❌ DROPPED (inert, already done upstream)
+
+**Rejected 2026-07-07 after code trace.** The premise was wrong: the encode input is TRANSFERRED as an ArrayBuffer (`encode-session.ts:214`), and the facade's `copyOrBorrowInput` (`facade.ts:2921`, the ENCODER path — the original plan mislabeled the DECODER slice at `facade.ts:1486`) always returns a zero-copy `new Uint8Array(value)` VIEW for an ArrayBuffer regardless of `copyInput`. The `.slice()` only fires for a `Uint8Array` input with `copy===true`, which never happens here. The worker already passes `copyInput:false` (`encode-handler.ts:198`, upstream `36400b87`), and the session `EncodeOptions` (`types.ts:152`) has no `copyInput` field to forward — so adding it to `main.js` is a dead property. There is no ~60MB slice to remove; the only encode-input copy is the intrinsic `HEAPU8.set` into the WASM heap. **No code change.** (Lesson: the earlier browser-orchestration trace conflated the decoder `copyInput` slice with the encode path.)
+
+<details><summary>Original (rejected) task text</summary>
 
 `encodeJxlSession` doesn't set `copyInput`, so the facade does a defensive `.slice()` of the full RGB8 (`facade.ts:1485`) before the mandatory `HEAPU8.set`. That buffer is a single-owner ArrayBuffer transferred into the encode worker and discarded after `finish()` — never mutated — so borrowing is safe. Saves one ~60 MB memcpy/file.
+</details>
+
+*(Steps below are VOID — task dropped. Original for reference only.)*
 
 **Files:**
 - Modify: `web/main.js:970-991` (`encodeJxlSession` — pass `copyInput:false` into `encOpts`)
