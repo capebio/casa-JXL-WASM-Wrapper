@@ -613,7 +613,9 @@ fn run_raw_frames_mode(args: &[String]) -> ! {
         // encoding, so decode the independent RAW frames concurrently (rayon,
         // order-preserving, byte-identical to the serial drain) instead of one at a
         // time — the RAW-timelapse path is decode-bound and each frame is a separate
-        // file. Peak memory is unchanged (batch already holds all N frames resident).
+        // file. The N result frames are the same resident set batch already held; the
+        // only added peak is a BOUNDED pool of in-flight full-res decode transients
+        // (≤ rayon thread count, ~72MB each at 24MP) — see decode_all_parallel's doc.
         let frames = src
             .decode_all_parallel(&|done| progress("decode", done, total))
             .unwrap_or_else(|e| fail(format!("raw frame decode: {e:?}")));
