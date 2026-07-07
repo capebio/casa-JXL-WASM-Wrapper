@@ -1994,6 +1994,100 @@ pub fn process(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     out
 }
 
+/// S6: a rectangular sub-region in full-resolution pixels (top-left origin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionRect {
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+}
+
+/// S6: the result of [`process_region`] — the (subsampled) rect as interleaved RGB8.
+#[derive(Clone, Debug)]
+pub struct RegionResult {
+    pub width: usize,
+    pub height: usize,
+    pub rgb8: Vec<u8>,
+}
+
+/// S6 — region/LOD entry over the per-pixel tone/colour pipeline (additive; editor ROI +
+/// tiled/AR/ML consumers that want just the pixels they need).
+///
+/// `process` / `process_into` is **per-pixel**: each output pixel is a pure function of its
+/// own RGB16 triple through the pre/post LUTs + colour matrix, with no spatial neighbourhood.
+/// Consequently the RGB8 for any rect is **byte-for-byte the crop** of the full-frame
+/// `process` output — which the tests pin exactly.
+///
+/// - `rgb16`: interleaved RGB16 of the full frame (`full_w * full_h * 3` elements).
+/// - `rect`: sub-region in full-res pixels; must lie within the frame.
+/// - `lod`: integer subsampling stride `>= 1` (1 = native detail; 2 = every other pixel, …).
+///   Output dims are `ceil(rect.w / lod) × ceil(rect.h / lod)`.
+///
+/// The spatial `texture`/`clarity` unsharp stage is a *separate* pre-pass (see
+/// [`apply_unsharp_masks`]) and — exactly as when calling `process` directly — is **not**
+/// applied here. Haloed spatial ROI (unsharp across a tile boundary) is future work and
+/// reuses the `stream_band` halo machinery.
+///
+/// # Panics
+/// If `rgb16.len() != full_w * full_h * 3`, `rect` exceeds the frame, or `lod == 0`.
+pub fn process_region(
+    rgb16: &[u16],
+    full_w: usize,
+    full_h: usize,
+    rect: RegionRect,
+    lod: usize,
+    params: &PipelineParams,
+) -> RegionResult {
+    assert!(lod >= 1, "process_region: lod must be >= 1");
+    assert_eq!(
+        rgb16.len(),
+        full_w * full_h * 3,
+        "process_region: rgb16 length must be full_w*full_h*3"
+    );
+    assert!(
+        rect.x + rect.w <= full_w && rect.y + rect.h <= full_h,
+        "process_region: rect out of bounds"
+    );
+
+    // An empty region (zero width OR height) normalizes to a 0×0 result.
+    if rect.w == 0 || rect.h == 0 {
+        return RegionResult {
+            width: 0,
+            height: 0,
+            rgb8: Vec::new(),
+        };
+    }
+    let out_w = rect.w.div_ceil(lod);
+    let out_h = rect.h.div_ceil(lod);
+
+    // Gather the (subsampled) rect's RGB16 into a contiguous buffer, then run the per-pixel
+    // pipeline. Because that pipeline is per-pixel, this is byte-identical to cropping
+    // process(full) at `rect` (verified in region_tests).
+    let mut sub = Vec::with_capacity(out_w * out_h * 3);
+    let mut oy = 0;
+    while oy < rect.h {
+        let row = (rect.y + oy) * full_w;
+        let mut ox = 0;
+        while ox < rect.w {
+            let idx = (row + rect.x + ox) * 3;
+            sub.push(rgb16[idx]);
+            sub.push(rgb16[idx + 1]);
+            sub.push(rgb16[idx + 2]);
+            ox += lod;
+        }
+        oy += lod;
+    }
+    debug_assert_eq!(sub.len(), out_w * out_h * 3);
+
+    let rgb8 = process(&sub, params);
+    RegionResult {
+        width: out_w,
+        height: out_h,
+        rgb8,
+    }
+}
+
 /// T2: like `process` but writes into a caller-owned buffer.
 /// `out` must have exactly `rgb16.len()` elements (one u8 per u16 input; i.e. `width * height * 3` bytes).
 /// Lets the interactive LookRenderer reuse one output buffer across re-renders instead of
@@ -4854,5 +4948,95 @@ mod orientation_u16_tests {
         let (out, w, h) = apply_orientation_u16(rgb, 2, 1, 2);
         assert_eq!((w, h), (2, 1));
         assert_eq!(out, vec![4, 5, 6, 1, 2, 3]);
+    }
+}
+
+/// S6: `process_region` (region/LOD entry over the per-pixel pipeline) — the byte-exact
+/// contract is that a full-frame region equals `process(full)` and any sub-rect equals the
+/// crop of `process(full)`, because the tone/colour stage is per-pixel.
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+
+    fn synth_rgb16(w: usize, h: usize) -> Vec<u16> {
+        // Spread values across the 12-bit range so the tone LUTs + colour matrix are exercised.
+        let mut v = Vec::with_capacity(w * h * 3);
+        for y in 0..h {
+            for x in 0..w {
+                v.push(((x * 37 + y * 11) % 4096) as u16);
+                v.push(((x * 13 + y * 53) % 4096) as u16);
+                v.push(((x * 7 + y * 101) % 4096) as u16);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn process_region_full_frame_equals_process() {
+        let (w, h) = (16usize, 12usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let full = process(&rgb16, &params);
+        let region = process_region(&rgb16, w, h, RegionRect { x: 0, y: 0, w, h }, 1, &params);
+        assert_eq!((region.width, region.height), (w, h));
+        assert_eq!(
+            region.rgb8, full,
+            "full-frame region (lod=1) must be byte-identical to process(full)"
+        );
+    }
+
+    #[test]
+    fn process_region_subrect_equals_crop_of_full() {
+        let (w, h) = (16usize, 12usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let full = process(&rgb16, &params);
+        let rect = RegionRect { x: 3, y: 2, w: 5, h: 4 };
+        let region = process_region(&rgb16, w, h, rect, 1, &params);
+        assert_eq!((region.width, region.height), (rect.w, rect.h));
+        for oy in 0..rect.h {
+            for ox in 0..rect.w {
+                let (sx, sy) = (rect.x + ox, rect.y + oy);
+                let fi = (sy * w + sx) * 3;
+                let ri = (oy * rect.w + ox) * 3;
+                assert_eq!(
+                    &region.rgb8[ri..ri + 3],
+                    &full[fi..fi + 3],
+                    "region pixel ({ox},{oy}) must match crop of full at ({sx},{sy})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_region_lod2_subsamples_and_matches_full() {
+        let (w, h) = (16usize, 12usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let full = process(&rgb16, &params);
+        let region = process_region(&rgb16, w, h, RegionRect { x: 0, y: 0, w, h }, 2, &params);
+        assert_eq!((region.width, region.height), (w.div_ceil(2), h.div_ceil(2)));
+        for oy in 0..region.height {
+            for ox in 0..region.width {
+                let (sx, sy) = (ox * 2, oy * 2);
+                let fi = (sy * w + sx) * 3;
+                let ri = (oy * region.width + ox) * 3;
+                assert_eq!(
+                    &region.rgb8[ri..ri + 3],
+                    &full[fi..fi + 3],
+                    "lod=2 region pixel ({ox},{oy}) must match full at ({sx},{sy})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_region_zero_area_is_empty() {
+        let (w, h) = (8usize, 8usize);
+        let rgb16 = synth_rgb16(w, h);
+        let params = PipelineParams::default_olympus();
+        let region = process_region(&rgb16, w, h, RegionRect { x: 2, y: 2, w: 0, h: 3 }, 1, &params);
+        assert_eq!((region.width, region.height), (0, 0));
+        assert!(region.rgb8.is_empty());
     }
 }

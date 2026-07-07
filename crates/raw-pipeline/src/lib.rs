@@ -14,6 +14,10 @@ pub mod jxl_casaencoder;
 pub use jxl_casadecoder as jxl_decode;
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 pub mod casabio_encode;
+// S6 rider P3: pure CASAVA container v1/v2 reader + v2 writer (no libjxl — byte-only).
+// The frame-payload encoder/decoder lives in casa_video.rs (jxl-codec gated); this module
+// is the container format layer and compiles in every build.
+pub mod casv_container;
 pub mod cr2;
 pub mod decompress;
 pub mod demosaic;
