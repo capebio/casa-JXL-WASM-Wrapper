@@ -1495,6 +1495,52 @@ pub fn process_orf_with_look(
     process_orf_impl(decode_orf_raw(data, output_flags)?, output_flags, &look)
 }
 
+/// S6 — decode only a rectangular region of an Olympus ORF file.
+///
+/// Parses + decompresses + MHC-demosaics the ORF to full-resolution, pre-tonemapped RGB16
+/// in **sensor orientation**, then runs the per-pixel tone/colour pipeline over the rect
+/// `[x, x+w) × [y, y+h)` via the native [`raw_pipeline::pipeline::process_region`] at
+/// `lod = 1` (native detail). Returns the region as interleaved **RGB8** (`w*h*3` bytes) —
+/// matching the native `RegionResult.rgb8` shape (3 channels, not RGBA).
+///
+/// The tone/colour stage is per-pixel, so the region is byte-for-byte the crop of the
+/// full-frame decode at the same absolute coordinates. Compare against
+/// `process_orf_with_flags(bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT, ..neutral)`, which is
+/// likewise in sensor orientation and applies a neutral look (no spatial texture/clarity
+/// unsharp pre-pass — same as the region path here).
+///
+/// Errors (unsupported/corrupt ORF, or a rect outside the frame) are surfaced as a `JsValue`
+/// so the caller gets a clean exception instead of a wasm panic/abort.
+#[wasm_bindgen]
+pub fn process_region(
+    bytes: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<Vec<u8>, JsValue> {
+    // Decode to full-res, pre-tonemapped RGB16 (sensor orientation). OUT_FULL_16 fills
+    // `rgb16` (MHC demosaic + ISO NR) without building the lb/thumb preview buffers.
+    let decoded = decode_orf_raw(bytes, OUT_FULL_16).map_err(JsValue::from)?;
+    // Bounds-check in u64 (wasm32 `usize` is 32-bit) so the native assert — which would
+    // panic and abort the module — never fires on an out-of-frame rect.
+    if x as u64 + w as u64 > decoded.w as u64 || y as u64 + h as u64 > decoded.h as u64 {
+        return Err(JsValue::from_str(&format!(
+            "process_region: rect {w}×{h} @ ({x},{y}) exceeds image {}×{}",
+            decoded.w, decoded.h
+        )));
+    }
+    let rect = pipeline::RegionRect {
+        x: x as usize,
+        y: y as usize,
+        w: w as usize,
+        h: h as usize,
+    };
+    let region =
+        pipeline::process_region(&decoded.rgb16, decoded.w, decoded.h, rect, 1, &decoded.params);
+    Ok(region.rgb8)
+}
+
 /// Rotated RGB8 buffer with updated dimensions.
 #[wasm_bindgen]
 pub struct RotateResult {
