@@ -11,15 +11,45 @@
 // this package has zero hard dependencies; pair it with @casabio/jxl-wasm's
 // createDecoder in the browser.
 
-/** Little-endian magics, byte-identical to casa_video.rs. */
-export const CASV_MAGIC = 0x5641_5343; // "CSAV" as LE u32 read of b"CASV"... (matches Rust constant)
-export const CASV_VERSION = 1;
-export const CASV_HEADER_BYTES = 32;
-export const CASV_INDEX_ENTRY_BYTES = 8;
-export const CASV_FOOTER_MAGIC = 0x4653_4143;
-export const CASV_FOOTER_BYTES = 32;
-export const CASV_RATE_BOX_MAGIC = 0x5253_4143;
-export const CASV_AUDIO_BOX_MAGIC = 0x5541_5343;
+// K6#3: CASV format constants imported from the generated single source of
+// truth (casv-format.ts, produced by scripts/gen-casv-format.mjs from
+// crates/raw-pipeline/src/casa_video.rs). Do not hardcode CASV_* values here.
+// Import binds names locally (so module-internal functions can reference them);
+// the explicit re-export makes them part of the public casv-web API.
+import {
+  CASV_MAGIC,
+  CASV_VERSION,
+  CASV_HEADER_BYTES,
+  CASV_INDEX_ENTRY_BYTES,
+  CASV_PFRAME_FLAG,
+  CASV_BBOX_FLAG,
+  CASV_TILE_FLAG,
+  CASV_REPLACE_FLAG,
+  CASV_HDR_FABLE_FLAG,
+  CASV_TILE_V2_BIT,
+  CASV_HDRFLAG_LOSSY,
+  CASV_FOOTER_MAGIC,
+  CASV_FOOTER_BYTES,
+  CASV_AUDIO_BOX_MAGIC,
+  CASV_RATE_BOX_MAGIC,
+} from "./casv-format.js";
+export {
+  CASV_MAGIC,
+  CASV_VERSION,
+  CASV_HEADER_BYTES,
+  CASV_INDEX_ENTRY_BYTES,
+  CASV_PFRAME_FLAG,
+  CASV_BBOX_FLAG,
+  CASV_TILE_FLAG,
+  CASV_REPLACE_FLAG,
+  CASV_HDR_FABLE_FLAG,
+  CASV_TILE_V2_BIT,
+  CASV_HDRFLAG_LOSSY,
+  CASV_FOOTER_MAGIC,
+  CASV_FOOTER_BYTES,
+  CASV_AUDIO_BOX_MAGIC,
+  CASV_RATE_BOX_MAGIC,
+};
 
 /** An Ogg/Opus audio stream embedded in a footer-format .casv via the CSAU box. */
 export interface CasvAudio {
@@ -27,19 +57,8 @@ export interface CasvAudio {
   bytes: Uint8Array;
 }
 
-/** Index-entry flag bits (top nibble of the len field). */
-export const CASV_PFRAME_FLAG = 0x8000_0000;
-export const CASV_BBOX_FLAG = 0x4000_0000;
-export const CASV_TILE_FLAG = 0x2000_0000;
-export const CASV_REPLACE_FLAG = 0x1000_0000;
+/** Flag-bit mask (all four P-frame flag bits combined; internal use only). */
 const CASV_FLAG_BITS = CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG;
-
-/** Header flags word. */
-export const CASV_HDRFLAG_LOSSY = 1;
-export const CASV_HDR_FABLE_FLAG = 2;
-
-/** Tile payload: high bit of the leading tile-size u16 selects the v2 square atlas. */
-export const CASV_TILE_V2_BIT = 0x8000;
 
 export interface CasvHeader {
   width: number;
