@@ -211,6 +211,51 @@ export function isQuotaExceeded(err) {
 }
 
 /**
+ * Safety multiplier applied to the projected decode peak before admission
+ * (S3-Q3). 1.7 is the browser-MEASURED model-vs-WASM-heap ratio (2026-07-07
+ * sweep, DNG/CR2/ORF 9.9–24 MP: big-file cluster 1.62–1.66, worst clean 1.75).
+ * Replaces the ADR's 1.5 estimate. Do NOT lower below 1.7 without re-measuring.
+ */
+export const PEAK_MULTIPLIER = 1.7;
+
+/**
+ * Global RAW-decode memory ceiling (bytes). The shipped WASM build's shared
+ * linear heap caps at 2 GiB (32768 pages × 64 KiB); ~1.8 GiB is the usable
+ * working budget after glue/stack/decoder overhead. Admission never lets a
+ * projected decode past this minus what the governor already holds.
+ */
+export const BUDGET_BYTES = Math.round(1.8 * 1024 ** 3); // ~1.8 GiB
+
+/**
+ * Thrown by {@link AssetStore#admit} when a pending decode's projected peak
+ * working set would exceed the available memory budget. Carries the numbers so a
+ * caller can surface a precise user-visible message (and never a raw throw).
+ */
+export class AdmissionRejected extends Error {
+  /**
+   * @param {number} estimatedPeakBytes  projected decode peak (bytes)
+   * @param {number} budgetBytes         effective memory budget checked against
+   * @param {number} projectedBytes      peak × multiplier
+   * @param {number} multiplier          safety multiplier applied
+   * @param {string} [label]             caller identifier (e.g. filename)
+   */
+  constructor(estimatedPeakBytes, budgetBytes, projectedBytes, multiplier, label) {
+    const mb = (b) => (b / (1024 * 1024)).toFixed(1);
+    super(
+      `AdmissionRejected${label ? ` (${label})` : ""}: projected ~${mb(projectedBytes)} MB ` +
+        `(peak ${mb(estimatedPeakBytes)} MB ×${multiplier}) exceeds available memory ` +
+        `budget ${mb(budgetBytes)} MB`,
+    );
+    this.name = "AdmissionRejected";
+    this.estimatedPeakBytes = estimatedPeakBytes;
+    this.budgetBytes = budgetBytes;
+    this.projectedBytes = projectedBytes;
+    this.multiplier = multiplier;
+    this.label = label;
+  }
+}
+
+/**
  * Memory-governed, content-addressed asset store.
  *
  * The in-memory tier is synchronous (matches the ad-hoc `Map` caches it
@@ -262,7 +307,7 @@ export class AssetStore {
       oversized: 0,
       persistentReads: 0,
       persistentWrites: 0,
-      admissionWarnings: 0,
+      admissionRejections: 0,
     };
   }
 
@@ -468,53 +513,50 @@ export class AssetStore {
   }
 
   /**
-   * Log-only decode-admission preflight (S3-Q3). Given the projected peak byte
-   * footprint of a pending decode (e.g. from `estimateDecodePeak`), warn — but do
-   * NOT reject — when it would blow the memory budget. Hard-gating is deferred
-   * until the model-vs-RSS multiplier is measured against real runs; the S3 ADR's
-   * recommended 1.5× safety headroom is the default. Always returns
-   * `admitted: true` — the caller proceeds regardless. On the hot path (peak
-   * fits) this only does arithmetic: no warn, no allocation.
+   * Hard decode-admission gate (S3-Q3). Given the projected peak byte footprint
+   * of a pending decode (e.g. from `estimateDecodePeak`), apply the safety
+   * multiplier and **reject** — by throwing {@link AdmissionRejected} — when the
+   * projection would blow the memory budget. The multiplier (1.7) and global
+   * budget cap (1.8 GiB) are browser-measured (`PEAK_MULTIPLIER` / `BUDGET_BYTES`).
+   * On the hot path (peak fits) this only does arithmetic — no throw, no
+   * allocation — and returns `{ admitted: true, ... }` so callers can also read
+   * the projection. There is no retry here: the caller decides what to do with a
+   * rejection (surface a message, drop the card, etc.).
+   *
+   * The effective budget is `min(headroom, BUDGET_BYTES − allocated)`, so it is
+   * clamped by BOTH the caller-supplied (or store-derived) headroom AND the hard
+   * WASM-heap ceiling.
    *
    * Content-agnostic on purpose: it takes a byte count, not image knowledge, so
    * the governor never learns about the RAW pipeline. The domain estimate lives
    * in `mem-budget.js` (`estimateDecodePeak`); callers compose the two.
    *
    * @param {number} estimatedPeakBytes projected decode peak (bytes)
-   * @param {{ budgetBytes?: number, multiplier?: number, label?: string,
-   *           warn?: (msg: string) => void }} [opts]
-   *   budgetBytes — memory ceiling to check against (default: this store's
-   *     remaining in-memory headroom `maxBytes - bytes`);
-   *   multiplier — safety headroom on the estimate (default 1.5, per the S3 ADR);
-   *   label — identifier included in the warning (e.g. filename);
-   *   warn — injectable sink (default `console.warn`) — tests capture it.
-   * @returns {{ admitted: boolean, estimatedPeakBytes: number, budgetBytes: number,
-   *             projectedBytes: number, wouldExceed: boolean }}
+   * @param {{ budgetBytes?: number, multiplier?: number, label?: string }} [opts]
+   *   budgetBytes — memory headroom to check against (default: this store's
+   *     remaining in-memory headroom `maxBytes - bytes`); still clamped by the
+   *     global `BUDGET_BYTES` ceiling;
+   *   multiplier — safety headroom on the estimate (default `PEAK_MULTIPLIER`);
+   *   label — identifier included in the rejection message (e.g. filename).
+   * @returns {{ admitted: true, estimatedPeakBytes: number, budgetBytes: number,
+   *             projectedBytes: number, wouldExceed: false }}
+   * @throws {AdmissionRejected} when `peak × multiplier` exceeds the budget.
    */
   admit(estimatedPeakBytes, opts = {}) {
     const multiplier =
-      Number.isFinite(opts.multiplier) && opts.multiplier > 0 ? opts.multiplier : 1.5;
-    const budgetBytes = Number.isFinite(opts.budgetBytes)
+      Number.isFinite(opts.multiplier) && opts.multiplier > 0 ? opts.multiplier : PEAK_MULTIPLIER;
+    const headroom = Number.isFinite(opts.budgetBytes)
       ? Math.max(0, opts.budgetBytes)
       : Math.max(0, this._maxBytes - this._bytes);
+    // Clamp to the hard WASM-heap ceiling minus what the governor already holds.
+    const budgetBytes = Math.max(0, Math.min(headroom, BUDGET_BYTES - this._bytes));
     const peak = Number.isFinite(estimatedPeakBytes) ? Math.max(0, estimatedPeakBytes) : 0;
     const projectedBytes = peak * multiplier;
-    const wouldExceed = projectedBytes > budgetBytes;
-    if (wouldExceed) {
-      this._stats.admissionWarnings++;
-      const warn =
-        opts.warn ??
-        ((m) => {
-          if (typeof console !== "undefined" && console.warn) console.warn(m);
-        });
-      const mb = (b) => (b / (1024 * 1024)).toFixed(1);
-      warn(
-        `[${this.name}] decode preflight${opts.label ? ` (${opts.label})` : ""}: ` +
-          `projected ~${mb(projectedBytes)} MB (peak ${mb(peak)} MB ×${multiplier}) ` +
-          `exceeds budget ${mb(budgetBytes)} MB — proceeding (log-only, S3-Q3).`,
-      );
+    if (projectedBytes > budgetBytes) {
+      this._stats.admissionRejections++;
+      throw new AdmissionRejected(peak, budgetBytes, projectedBytes, multiplier, opts.label);
     }
-    return { admitted: true, estimatedPeakBytes: peak, budgetBytes, projectedBytes, wouldExceed };
+    return { admitted: true, estimatedPeakBytes: peak, budgetBytes, projectedBytes, wouldExceed: false };
   }
 
   /**

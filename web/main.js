@@ -11,10 +11,12 @@ import { WorkerMsg } from './worker-message-types.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
-// `estimateDecodePeak` + `OUT_BATCH_DEFAULT` back the log-only decode preflight
+// `estimateDecodePeak` + `OUT_BATCH_DEFAULT` back the hard decode-admission gate
 // below (S3-Q3); it mirrors the Rust `estimate_decode_peak` memory model.
+// `AdmissionRejected` is thrown when the projected peak blows the WASM-heap budget.
 import {
     AssetStore,
+    AdmissionRejected,
     estimateDecodePeak,
     OUT_BATCH_DEFAULT,
 } from '../packages/asset-store/src/index.js';
@@ -1121,9 +1123,10 @@ window.removeCard = removeCard;
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB hard limit before WASM
 const seenFiles = new Set(); // "name|size|lastModified" — prevents duplicate-drop cards
 
-// S3-Q3: log-only RAW-decode admission preflight. This is a SIGNAL only — it
-// never rejects a decode (the pipeline runs concurrently; a real pre-submit gate
-// is a separate change). `admit()` applies the safety multiplier + warns.
+// S3-Q3: hard RAW-decode admission gate. `admit()` applies the safety multiplier
+// and THROWS `AdmissionRejected` when the projected peak would blow the WASM-heap
+// budget; the caller catches it and surfaces a user-visible "too large for the
+// memory budget" message on the card (see the preflight block below).
 //
 // Budget = the WASM linear-heap ceiling. The shipped build's shared memory caps
 // at `maximum: 32768` pages × 64 KiB = 2 GiB (pkg glue: `new WebAssembly.Memory
@@ -1730,19 +1733,35 @@ function startConvert(file, existingCard) {
 
             const largest = valid[valid.length - 1];
 
-            // S3-Q3 decode preflight (log-only): the largest embedded JPEG is
+            // S3-Q3 decode preflight (hard gate): the largest embedded JPEG is
             // ~sensor resolution, so project the RAW decode's peak working set
-            // from it and warn if it would blow the WASM-heap budget. Flags = the
-            // shipping batch set (RGB8|lightbox|thumbnail). Observational only —
-            // the pipeline already runs in Phase B; this never gates it. Mirrors
-            // the Rust estimate_decode_peak model.
+            // from it and REJECT if it would blow the WASM-heap budget. Flags =
+            // the shipping batch set (RGB8|lightbox|thumbnail). Mirrors the Rust
+            // estimate_decode_peak model. On rejection we surface a user-visible
+            // error on the card instead of letting the worker OOM. Non-admission
+            // errors (e.g. estimator quirks) must never break ingest.
             try {
                 const peak = estimateDecodePeak(largest.w, largest.h, OUT_BATCH_DEFAULT).peakBytes;
                 rawDecodeGovernor.admit(peak, {
                     multiplier: RAW_DECODE_SAFETY_MULT,
                     label: file.name || `${largest.w}×${largest.h}`,
                 });
-            } catch { /* preflight must never break ingest */ }
+            } catch (err) {
+                if (err instanceof AdmissionRejected || err?.name === 'AdmissionRejected') {
+                    // Too large for the current memory budget: mark the card so the
+                    // user sees why, and skip drawing the (about-to-OOM) preview.
+                    card.classList.remove('busy', 'embedded-thumb');
+                    card.classList.add('error');
+                    card.dataset.error =
+                        `Image too large for current memory budget ` +
+                        `(needs ~${(err.projectedBytes / (1024 * 1024)).toFixed(0)} MB, ` +
+                        `budget ${(err.budgetBytes / (1024 * 1024)).toFixed(0)} MB)`;
+                    if (typeof pushStat === 'function') pushStat(`[admit] ${err.message}`);
+                    for (const v of valid) { try { v.bmp.close(); } catch {} }
+                    return;
+                }
+                /* non-admission error: preflight must never break ingest */
+            }
 
             if (card.classList.contains('busy') || card.classList.contains('embedded-thumb')) {
                 drawOrientedThumb(card.querySelector('canvas'), largest.bmp, largest.orientation, 360);

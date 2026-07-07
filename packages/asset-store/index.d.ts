@@ -43,27 +43,51 @@ export interface AssetStoreStats {
   oversized: number;
   persistentReads: number;
   persistentWrites: number;
-  admissionWarnings: number;
+  admissionRejections: number;
 }
 
 export interface AdmitOptions {
-  /** Memory ceiling to check against (default: the store's remaining `maxBytes - bytes`). */
+  /**
+   * Memory headroom to check against (default: the store's remaining
+   * `maxBytes - bytes`). Still clamped by the global `BUDGET_BYTES` ceiling.
+   */
   budgetBytes?: number;
-  /** Safety headroom applied to the estimate (default 1.5, per the S3 ADR). */
+  /** Safety headroom applied to the estimate (default `PEAK_MULTIPLIER`, 1.7). */
   multiplier?: number;
-  /** Identifier included in the warning (e.g. filename). */
+  /** Identifier included in the rejection message (e.g. filename). */
   label?: string;
-  /** Injectable warning sink (default console.warn) — tests capture it. */
-  warn?: (msg: string) => void;
 }
 
+/** Returned by `admit()` when the decode fits — it throws otherwise. */
 export interface AdmitResult {
-  /** Always true — this is a log-only preflight, never a hard reject. */
-  admitted: boolean;
+  /** Always `true` on return; a rejected decode throws `AdmissionRejected`. */
+  admitted: true;
   estimatedPeakBytes: number;
   budgetBytes: number;
   projectedBytes: number;
-  wouldExceed: boolean;
+  wouldExceed: false;
+}
+
+/** Safety multiplier applied to the projected decode peak (browser-measured). */
+export declare const PEAK_MULTIPLIER: number;
+/** Global RAW-decode memory ceiling in bytes (~1.8 GiB of the 2 GiB WASM heap). */
+export declare const BUDGET_BYTES: number;
+
+/** Thrown by `AssetStore#admit` when a decode's projected peak exceeds the budget. */
+export declare class AdmissionRejected extends Error {
+  readonly name: "AdmissionRejected";
+  readonly estimatedPeakBytes: number;
+  readonly budgetBytes: number;
+  readonly projectedBytes: number;
+  readonly multiplier: number;
+  readonly label?: string;
+  constructor(
+    estimatedPeakBytes: number,
+    budgetBytes: number,
+    projectedBytes: number,
+    multiplier: number,
+    label?: string,
+  );
 }
 
 /** RAW-decode peak/retained memory projection (JS mirror of the Rust model). */
@@ -114,6 +138,7 @@ export declare class AssetStore {
   store(key: string, value: ArrayBufferLike | ArrayBufferView, sizeBytes?: number): Promise<void>;
   remove(key: string): Promise<void>;
   stats(): AssetStoreStats;
+  /** @throws {AdmissionRejected} when `peak × multiplier` exceeds the budget. */
   admit(estimatedPeakBytes: number, opts?: AdmitOptions): AdmitResult;
   namespace(ns: string): NamespaceHandle;
 }

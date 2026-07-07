@@ -2,6 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   AssetStore,
+  AdmissionRejected,
+  PEAK_MULTIPLIER,
+  BUDGET_BYTES,
   measureBytes,
   contentHash,
   fitWithinBudget,
@@ -315,58 +318,74 @@ test("stats() reports the governed totals", () => {
   assert.equal(st.bytes, 100);
   assert.equal(st.hits, 1);
   assert.equal(st.misses, 1);
-  assert.equal(st.admissionWarnings, 0);
+  assert.equal(st.admissionRejections, 0);
 });
 
-// ---- decode-admission preflight (S3-Q3, log-only) ----
-test("admit warns (log-only) when projected peak exceeds budget, never rejects", () => {
+// ---- decode-admission gate (S3-Q3, hard reject) ----
+test("admit throws AdmissionRejected when projected peak exceeds budget", () => {
   const s = new AssetStore({ maxBytes: 1000, name: "gate" });
-  const logs = [];
-  // Mock the estimate with a value that would blow the budget.
-  const r = s.admit(1_000_000, { budgetBytes: 100_000, warn: (m) => logs.push(m) });
-  assert.equal(r.admitted, true); // NOT a hard reject
-  assert.equal(r.wouldExceed, true);
-  assert.equal(logs.length, 1);
-  assert.match(logs[0], /log-only/);
-  assert.match(logs[0], /gate/);
-  assert.equal(s.stats().admissionWarnings, 1);
+  // A value that (× the default 1.7 multiplier) blows the supplied budget.
+  assert.throws(
+    () => s.admit(1_000_000, { budgetBytes: 100_000, label: "big.dng" }),
+    (err) => {
+      assert.ok(err instanceof AdmissionRejected);
+      assert.equal(err.name, "AdmissionRejected");
+      assert.equal(err.estimatedPeakBytes, 1_000_000);
+      assert.equal(err.budgetBytes, 100_000);
+      assert.equal(err.projectedBytes, 1_000_000 * PEAK_MULTIPLIER);
+      assert.match(err.message, /big\.dng/); // label surfaced in the message
+      return true;
+    },
+  );
+  assert.equal(s.stats().admissionRejections, 1);
 });
 
-test("admit is silent on the hot path when the decode fits", () => {
+test("admit succeeds (no throw) on the hot path when the decode fits", () => {
   const s = new AssetStore({ maxBytes: 1000 });
-  const logs = [];
-  const r = s.admit(1000, { budgetBytes: 100_000, warn: (m) => logs.push(m) });
+  const r = s.admit(1000, { budgetBytes: 100_000 });
   assert.equal(r.admitted, true);
   assert.equal(r.wouldExceed, false);
-  assert.equal(logs.length, 0);
-  assert.equal(s.stats().admissionWarnings, 0);
+  assert.equal(r.projectedBytes, 1000 * PEAK_MULTIPLIER);
+  assert.equal(s.stats().admissionRejections, 0);
 });
 
 test("admit default budget is the store's remaining RAM headroom", () => {
   const s = new AssetStore({ maxBytes: 1000 });
   s.set("a", buf(900)); // 100 bytes headroom left
-  const logs = [];
-  const r = s.admit(200, { multiplier: 1, warn: (m) => logs.push(m) }); // 200 > 100
+  // 50 × 1.7 = 85 <= 100 → admitted; budgetBytes reflects the 100-byte headroom.
+  const r = s.admit(50);
   assert.equal(r.budgetBytes, 100);
-  assert.equal(r.wouldExceed, true);
-  assert.equal(logs.length, 1);
+  assert.equal(r.admitted, true);
+  // 200 × 1.7 = 340 > 100 → rejected.
+  assert.throws(() => s.admit(200), AdmissionRejected);
 });
 
-test("admit composes with estimateDecodePeak — the wired admission gate", () => {
+test("admit is clamped by the global BUDGET_BYTES ceiling", () => {
+  // Even with an absurd caller-supplied headroom, the 1.8 GiB cap governs.
   const s = new AssetStore({ maxBytes: 1 });
-  const budgetBytes = 384 * 1024 * 1024; // documented ~384 MB WASM-heap budget
-  const logs = [];
-  // 24 MP all-flags decode (~517 MB peak × 1.5 ≈ 776 MB) blows the budget → warn.
+  const overCeiling = BUDGET_BYTES + 1;
+  // peak × 1 just over the ceiling → rejected despite the huge budgetBytes arg.
+  assert.throws(
+    () => s.admit(overCeiling, { budgetBytes: Number.MAX_SAFE_INTEGER, multiplier: 1 }),
+    AdmissionRejected,
+  );
+  // A peak that fits under the ceiling is admitted.
+  const r = s.admit(BUDGET_BYTES - 1, { budgetBytes: Number.MAX_SAFE_INTEGER, multiplier: 1 });
+  assert.equal(r.admitted, true);
+});
+
+test("admit composes with estimateDecodePeak — oversized image is rejected", () => {
+  // Full production budget (empty governor at the 1.8 GiB cap).
+  const s = new AssetStore({ name: "raw-decode", maxBytes: BUDGET_BYTES });
   const bigFlags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_FULL_16 | OUT_FULL_DISP16;
-  const bigPeak = estimateDecodePeakBytes(6000, 4000, bigFlags);
-  const r = s.admit(bigPeak, { budgetBytes, warn: (m) => logs.push(m) });
-  assert.equal(r.wouldExceed, true);
-  assert.equal(logs.length, 1);
-  // A 12 MP shipping-flags decode fits under the same budget → silent.
+  // A 20000×20000 all-flags decode dwarfs 1.8 GiB → hard reject.
+  const bigPeak = estimateDecodePeakBytes(20000, 20000, bigFlags);
+  assert.throws(() => s.admit(bigPeak, { label: "huge.dng" }), AdmissionRejected);
+  // A 12 MP shipping-flags decode fits comfortably under 1.8 GiB → admitted.
   const smallPeak = estimateDecodePeakBytes(4000, 3000, OUT_BATCH_DEFAULT);
-  const r2 = s.admit(smallPeak, { budgetBytes, warn: (m) => logs.push(m) });
-  assert.equal(r2.wouldExceed, false);
-  assert.equal(logs.length, 1); // no new warning
+  const r = s.admit(smallPeak);
+  assert.equal(r.admitted, true);
+  assert.equal(r.wouldExceed, false);
 });
 
 // ---- jxl-cache OPFS adapter (S3-Q5) ----
