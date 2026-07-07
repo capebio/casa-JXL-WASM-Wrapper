@@ -36,6 +36,9 @@ target/
 
 # ccache compiler cache — accidentally committed (3166 files); bloated every worktree checkout (S4 hygiene)
 **/.ccache/
+
+# Prebuilt libjxl reference tooling (cjxl/djxl exes + source) — unreferenced by any build; untracked, kept on disk (S4-D5)
+external/libjxlJun26/
 .codex-cargo-target-*/
 # Generated threaded-wasm pkg (build with tools/build-mt-wasm.sh)
 pkg-mt/
