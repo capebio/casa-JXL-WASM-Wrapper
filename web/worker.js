@@ -175,14 +175,17 @@ async function ensureWasm() {
 // Phase 2: construct with apply_rotation=false. render() returns sensor-orient
 // pixels with sensor dims. Main thread applies EXIF rotation as a canvas
 // transform during draw — GPU-accelerated, decoupled from slider tick rate.
-function makeLiveState(rgb16Bytes, w, h, orientation, wbR, wbB, colorMatrix, black) {
+function makeLiveState(rgb16Bytes, w, h, orientation, wbR, wbB, colorMatrix, black, white) {
     // Only orientations 6 (90° CW) and 8 (90° CCW) actually swap axes in
     // apply_orientation (pipeline.rs).  Tags 5/7 are pass-through there, so
     // using orientation >= 5 overreports axisSwap and mis-sizes the canvas.
     const axisSwap = orientation === 6 || orientation === 8;
     // black: per-format pedestal (Olympus 256, CR2/DNG from file) so live slider
     // edits subtract the same black as the initial decode — no magenta on drag.
-    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, orientation, colorMatrix, false, black >>> 0);
+    // white: per-format white level (CR2/DNG ~15300, else 0 → keep the Olympus
+    // 4095 default) so the live preview normalises by the same white the decode
+    // used — without it CR2/DNG 14-bit data blows out ~3.7×.
+    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, orientation, colorMatrix, false, black >>> 0, (white >>> 0) || 0);
     return {
         renderer,
         // Native source dims (sensor orientation).
@@ -322,7 +325,7 @@ function downscaleRgb16LE(src, sw, sh, dw, dh) {
 // makeLiveState for an EXR/TIFF buffer: identity matrix, no EXIF orientation,
 // black=0. Otherwise identical shape to the RAW makeLiveState above.
 function makeImageLiveState(rgb16Bytes, w, h) {
-    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, 1, IDENTITY_CM, false, 0);
+    const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, 1, IDENTITY_CM, false, 0, 0);
     return { renderer, nativeW: w, nativeH: h, outW: w, outH: h, orientation: 1, wbR: NaN, wbB: NaN };
 }
 
@@ -382,7 +385,7 @@ function processImageFormat(id, bytes, opts, look, route) {
         // EXR/TIFF have no EXIF rotation, but user 90° turns still compose.
         const userTurns = Math.round(((opts.userRotation || 0) % 360 + 360) % 360 / 90) % 4;
         const encodeOrientation = composeOrientation(1, userTurns);
-        const fullRenderer = LookRenderer.new_with_options(fullRgb16, w, h, 1, IDENTITY_CM, false, 0);
+        const fullRenderer = LookRenderer.new_with_options(fullRgb16, w, h, 1, IDENTITY_CM, false, 0, 0);
         let fullRgb;
         try {
             fullRgb = applyLookToState({ renderer: fullRenderer, wbR: NaN, wbB: NaN }, look);
