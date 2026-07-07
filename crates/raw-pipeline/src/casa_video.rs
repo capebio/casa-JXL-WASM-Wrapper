@@ -1382,13 +1382,19 @@ fn stream_encode_one(
 /// state, so the codestream is byte-identical to the serial loop — only the SCHEDULING
 /// of decode changes. Depth 1 keeps the read-ahead shallow (the producer is at most one
 /// frame ahead), which avoids oversubscribing cores during the MT I-frame encode and
-/// preserves the streaming tier's low-memory contract. Set `CASV_STREAM_SERIAL=1` to
-/// force the legacy serial loop (byte-identical; used by the A/B).
+/// preserves the streaming tier's low-memory contract.
+///
+/// `overlap` selects the scheduler: `true` = the decode∥encode overlap (production
+/// default), `false` = the legacy serial loop. The two are byte-identical; the public
+/// wrappers derive it from `CASV_STREAM_SERIAL` (via [`stream_serial_forced`]) so the
+/// example A/B can toggle it, while the byte-identity `#[test]` passes both values
+/// directly — no racy process-global env mutation.
 fn stream_encode_frames(
     src: &mut (dyn VideoFrameSource + Send),
     opts: &CasaVideoOptions,
     on_frame: &mut dyn FnMut(usize),
     emit: &mut dyn FnMut(u32, &[u8]) -> Result<(), VideoError>,
+    overlap: bool,
 ) -> Result<usize, VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
@@ -1401,7 +1407,7 @@ fn stream_encode_frames(
     let mut payload = Vec::new();
 
     // ── Legacy SERIAL scheduler (A/B baseline; byte-identical). ──────────────────
-    if stream_serial_forced() {
+    if !overlap {
         // Ping-pong frame buffers: after each frame `cur` becomes `prev_src` and the
         // old `prev_src` buffer is refilled by the source (no per-frame allocation
         // for sources implementing `next_frame_into`).
@@ -1492,6 +1498,19 @@ pub fn encode_casv_video_streaming(
     src: &mut (dyn VideoFrameSource + Send),
     opts: &CasaVideoOptions,
 ) -> Result<Vec<u8>, VideoError> {
+    encode_casv_video_streaming_with(src, opts, !stream_serial_forced())
+}
+
+/// Injectable core of [`encode_casv_video_streaming`] (header-buffered container):
+/// `overlap` selects the decode∥encode overlap (`true`, production default) or the
+/// legacy serial loop (`false`). The public wrapper reads it from `CASV_STREAM_SERIAL`
+/// via [`stream_serial_forced`]; the byte-identity `#[test]` calls this directly with
+/// both values (no racy process-global env toggle). Both paths are byte-identical.
+fn encode_casv_video_streaming_with(
+    src: &mut (dyn VideoFrameSource + Send),
+    opts: &CasaVideoOptions,
+    overlap: bool,
+) -> Result<Vec<u8>, VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
 
@@ -1506,7 +1525,7 @@ pub fn encode_casv_video_streaming(
             data.extend_from_slice(payload);
             Ok(())
         };
-        stream_encode_frames(src, opts, &mut |_| {}, &mut emit)?;
+        stream_encode_frames(src, opts, &mut |_| {}, &mut emit, overlap)?;
     }
     if index.is_empty() {
         return Err(VideoError::Empty);
@@ -1705,6 +1724,21 @@ pub fn encode_casv_video_streaming_to_progress<W: std::io::Write>(
     sink: &mut W,
     on_frame: &mut dyn FnMut(usize),
 ) -> Result<(), VideoError> {
+    encode_casv_video_streaming_to_progress_with(src, opts, sink, on_frame, !stream_serial_forced())
+}
+
+/// Injectable core of [`encode_casv_video_streaming_to_progress`] (footer-to-sink
+/// container): `overlap` selects the decode∥encode overlap (`true`, production default)
+/// or the legacy serial loop (`false`). The public wrapper reads it from
+/// `CASV_STREAM_SERIAL` via [`stream_serial_forced`]; the byte-identity `#[test]` calls
+/// this directly with both values (no racy process-global env toggle). Byte-identical.
+fn encode_casv_video_streaming_to_progress_with<W: std::io::Write>(
+    src: &mut (dyn VideoFrameSource + Send),
+    opts: &CasaVideoOptions,
+    sink: &mut W,
+    on_frame: &mut dyn FnMut(usize),
+    overlap: bool,
+) -> Result<(), VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
 
@@ -1721,7 +1755,7 @@ pub fn encode_casv_video_streaming_to_progress<W: std::io::Write>(
             offset += payload.len() as u64;
             Ok(())
         };
-        stream_encode_frames(src, opts, on_frame, &mut emit)?;
+        stream_encode_frames(src, opts, on_frame, &mut emit, overlap)?;
     }
     if index.is_empty() {
         return Err(VideoError::Empty);
@@ -5706,6 +5740,130 @@ mod tests {
         })
         .unwrap();
         assert_eq!(k, 8);
+    }
+
+    /// Test source that emits `frames` and flags a source-forced scene-cut I-frame
+    /// at `cut_at`. `force_iframe()` reports for the frame just filled by
+    /// `next_frame_into` (i.e. `i - 1` after the post-increment) — this is exactly the
+    /// value the overlap PRODUCER reads right after decoding each frame and ships to
+    /// the consumer, so a mis-ordered read would show up as a byte-identity failure.
+    struct ForceCutFrames {
+        frames: Vec<Vec<u8>>,
+        i: usize,
+        w: u32,
+        h: u32,
+        cut_at: usize,
+    }
+    impl VideoFrameSource for ForceCutFrames {
+        fn dims(&self) -> (u32, u32) {
+            (self.w, self.h)
+        }
+        fn fps(&self) -> (u32, u32) {
+            (24, 1)
+        }
+        fn next_frame(&mut self) -> Option<Vec<u8>> {
+            if self.i < self.frames.len() {
+                let f = self.frames[self.i].clone();
+                self.i += 1;
+                Some(f)
+            } else {
+                None
+            }
+        }
+        fn force_iframe(&self) -> bool {
+            self.i > 0 && self.i - 1 == self.cut_at
+        }
+    }
+
+    /// CI byte-identity gate for the Phase 3.2 streaming decode∥encode overlap
+    /// (commit 21917b55). Overlap is the production default; the legacy serial loop is
+    /// the A/B baseline. Toggling that choice via `CASV_STREAM_SERIAL` from a `#[test]`
+    /// is RACY (tests run in parallel; env is process-global), so the choice is passed
+    /// as an explicit `overlap: bool` to the injectable encoder cores
+    /// (`encode_casv_video_streaming_with` / `..._to_progress_with`). This encodes a
+    /// tiny multi-frame clip BOTH ways and asserts the `.casv` bytes are identical, on
+    /// both containers — a future scheduler change that perturbs the codestream fails
+    /// HERE in CI, not only in the manual `examples/casv_overlap_ab.rs`.
+    #[test]
+    fn streaming_overlap_byte_identical_to_serial() {
+        let (w, h) = (48u32, 48u32);
+
+        // gop 3 over 6 frames => I at 0/3 + P elsewhere, plus a source-forced scene-cut
+        // I-frame at index 4: mixes every frame kind and exercises the force_iframe read.
+        let low = low_motion(w, h, 6);
+        let base_opts = CasaVideoOptions {
+            rate: VideoRate::Lossy(1.0),
+            gop_len: 3,
+            skip: SkipMode::Bbox,
+            tile: 16,
+            effort: 3,
+            thresh: Some(0),
+            rate_control: None,
+        };
+        // Rate-controlled + tile-admitted on textured motion: threads the RateState
+        // GOP-distance stepping and the admission bucket through the consumer — the
+        // state most sensitive to frame ordering if the overlap ever diverged.
+        let tex = textured_motion(w, h, 6);
+        let rc_opts = CasaVideoOptions {
+            gop_len: 3,
+            ..CasaVideoOptions::streaming_bitrate_admitted(1.0, 40_000)
+        };
+
+        let mk = |frames: &[Vec<u8>]| ForceCutFrames {
+            frames: frames.to_vec(),
+            i: 0,
+            w,
+            h,
+            cut_at: 4,
+        };
+
+        for (label, frames, opts) in [
+            ("bbox/no-rate-control", &low, &base_opts),
+            ("tile/rate-control+admission", &tex, &rc_opts),
+        ] {
+            // Footer-to-sink container, both schedulers.
+            let mut sink_ov = Vec::new();
+            encode_casv_video_streaming_to_progress_with(
+                &mut mk(frames),
+                opts,
+                &mut sink_ov,
+                &mut |_| {},
+                true,
+            )
+            .unwrap();
+            let mut sink_se = Vec::new();
+            encode_casv_video_streaming_to_progress_with(
+                &mut mk(frames),
+                opts,
+                &mut sink_se,
+                &mut |_| {},
+                false,
+            )
+            .unwrap();
+            assert!(!sink_ov.is_empty(), "{label}: footer output empty");
+            assert_eq!(
+                sink_ov, sink_se,
+                "{label}: footer overlap vs serial .casv bytes differ"
+            );
+
+            // Header-buffered container, both schedulers.
+            let buf_ov = encode_casv_video_streaming_with(&mut mk(frames), opts, true).unwrap();
+            let buf_se = encode_casv_video_streaming_with(&mut mk(frames), opts, false).unwrap();
+            assert_eq!(
+                buf_ov, buf_se,
+                "{label}: buffered overlap vs serial .casv bytes differ"
+            );
+
+            // The public default wrapper (env unset in CI) must pick the overlap path.
+            if !stream_serial_forced() {
+                let mut pub_sink = Vec::new();
+                encode_casv_video_streaming_to(&mut mk(frames), opts, &mut pub_sink).unwrap();
+                assert_eq!(
+                    pub_sink, sink_ov,
+                    "{label}: public default is not the overlap path"
+                );
+            }
+        }
     }
 
     #[test]
