@@ -1228,6 +1228,57 @@ function ensureU16Heap(module: LibjxlWasmModule, arr: Uint16Array): number {
   return ptr;
 }
 
+/**
+ * Encode a packed interleaved RGBA16 image to a standard JXL bitstream.
+ * Pixels must be 4 channels × 2 bytes per channel (little-endian uint16) = 8 bytes/pixel.
+ *
+ * Falls back to CapabilityMissing when the shipped WASM lacks the rgba16 encode
+ * entry point. Use JxlEncoder({ format: "rgba16" }) for the streaming-capable path
+ * which can fall through to the buffered encode path using the same WASM symbol.
+ *
+ * @param pixels  Packed RGBA16 data — Uint16Array, Uint8Array, or ArrayBuffer.
+ * @param width   Image width in pixels.
+ * @param height  Image height in pixels.
+ * @param quality JXL quality 0–100 (default 90). Maps to Butteraugli distance.
+ */
+export async function encodeRgba16(
+  pixels: Uint16Array | ArrayBuffer | Uint8Array,
+  width: number,
+  height: number,
+  quality = 90,
+): Promise<Uint8Array> {
+  const module = await loadLibjxlModule();
+  if (typeof module._jxl_wasm_encode_rgba16 !== "function") {
+    throw new CapabilityMissing(
+      "encodeRgba16 requires a WASM build with multi-format bridge (_jxl_wasm_encode_rgba16)"
+    );
+  }
+  const distance = distanceFromQuality(quality);
+  const byteLen = width * height * 4 * 2; // 4 channels × 2 bytes/channel
+  const view =
+    pixels instanceof Uint16Array
+      ? new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength)
+      : copyOrBorrowInput(pixels, false);
+  if (view.byteLength < byteLen) {
+    throw new Error(
+      `encodeRgba16: buffer too small — expected ${byteLen} bytes for ${width}×${height} RGBA16, got ${view.byteLength}`
+    );
+  }
+  const ptr = mallocOrThrow(module, byteLen, "encodeRgba16 pixels");
+  try {
+    module.HEAPU8.set(view.subarray(0, byteLen), ptr);
+    const handle = module._jxl_wasm_encode_rgba16(
+      ptr, width, height,
+      distance, /*effort=*/7, /*has_alpha=*/1,
+      /*progressive_dc=*/0, /*progressive_ac=*/0, /*qprogressive_ac=*/0,
+      /*buffering=*/0, /*group_order=*/0, /*resampling=*/1,
+    );
+    return takeBuffer(module, handle, "encodeRgba16").data;
+  } finally {
+    module._free(ptr);
+  }
+}
+
 async function encodeTileContainer(
   pixels: ArrayBuffer | Uint8Array,
   width: number,

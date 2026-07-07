@@ -87,6 +87,9 @@ export function createPyramidLightbox(deps) {
   let lastMouse = {x:0, y:0};
   let crossfade = 0;
   let is16bitMode = false;
+  let selectMode = false;    // crop-region selection mode
+  let cropRect = null;       // selected region in image-space coords { x, y, w, h }
+  let cropStart = null;      // drag start point in image-space { x, y } (cleared on mouseup)
 
   // Current adjustments mirror (for buildColorMatrix on the 16-bit / export path).
   const adjustments = Object.fromEntries(ADJUSTMENT_PARAMS.map((k) => [k, 0]));
@@ -149,7 +152,8 @@ export function createPyramidLightbox(deps) {
           <label style="margin-left:12px;font-size:10px;opacity:0.7;" title="16-bit (M3): decode 16-bit level / ROI -> WebGL float texture + shader colour-matrix (buildColorMatrix) + tone -> Floyd-Steinberg dither -> 8-bit display. Source 16-bit data untouched.">
             <input id="plb-16bit" type="checkbox"> 16-bit (M3)
           </label>
-          <button id="plb-export-roi" title="Export current viewport ROI as 16-bit JXL">Export ROI</button>
+          <button id="plb-select-region" title="Toggle crop-region selection mode (drag to draw)">Select Region</button>
+          <button id="plb-export-roi" title="Export selected region (or current viewport) as 16-bit JXL">Export ROI</button>
         </div>
         <canvas id="plb-canvas" width="${VIEW_W}" height="${VIEW_H}" style="border:1px solid #333;image-rendering:pixelated;cursor:grab;"></canvas>
         <canvas id="plb-hist" width="256" height="70" style="border:1px solid #333;display:block;margin-top:4px;"></canvas>
@@ -190,21 +194,68 @@ export function createPyramidLightbox(deps) {
       };
     }
 
-    // export current viewport ROI as a 16-bit JXL
+    // export selected region (or current viewport) as a 16-bit JXL
     const exp = modal.querySelector('#plb-export-roi');
     if (exp) exp.onclick = () => { void exportRoi(); };
 
-    // pan
+    // select-region toggle: switches between pan and crop-selection modes
+    const selBtn = modal.querySelector('#plb-select-region');
+    if (selBtn) selBtn.onclick = () => {
+      selectMode = !selectMode;
+      selBtn.textContent = selectMode ? 'Cancel Select' : 'Select Region';
+      if (canvas) canvas.style.cursor = selectMode ? 'crosshair' : 'grab';
+      if (!selectMode) { cropRect = null; cropStart = null; redraw(); }
+    };
+
+    // pan / crop-select mouse handlers
     const cvs = canvas;
-    cvs.addEventListener('mousedown', (e) => { isPanning=true; lastMouse={x:e.clientX,y:e.clientY}; cvs.style.cursor='grabbing'; });
-    window.addEventListener('mouseup', () => { isPanning=false; if (cvs) cvs.style.cursor='grab'; });
+    cvs.addEventListener('mousedown', (e) => {
+      if (selectMode) {
+        // start crop-rect drag in image-space
+        const {cx, cy} = canvasXY(e);
+        cropStart = canvasToImage(cx, cy);
+        cropRect = null;
+        cvs.style.cursor = 'crosshair';
+      } else {
+        isPanning = true;
+        lastMouse = {x: e.clientX, y: e.clientY};
+        cvs.style.cursor = 'grabbing';
+      }
+    });
+    window.addEventListener('mouseup', () => {
+      if (selectMode) {
+        cropStart = null; // drag complete; cropRect is the finalized selection
+        redraw();
+      } else {
+        isPanning = false;
+        if (cvs) cvs.style.cursor = selectMode ? 'crosshair' : 'grab';
+      }
+    });
     window.addEventListener('mousemove', (e) => {
-      if (!isPanning || !modal || modal.style.display==='none') return;
+      if (!modal || modal.style.display === 'none') return;
+      if (selectMode && cropStart) {
+        // update live crop rect as user drags
+        const {cx, cy} = canvasXY(e);
+        const p = canvasToImage(cx, cy);
+        if (p && levelInfo) {
+          const lw = levelInfo.w || VIEW_W, lh = levelInfo.h || VIEW_H;
+          const x = Math.min(cropStart.x, p.x), y = Math.min(cropStart.y, p.y);
+          cropRect = {
+            x: Math.round(Math.max(0, x)),
+            y: Math.round(Math.max(0, y)),
+            w: Math.round(Math.min(lw, Math.abs(p.x - cropStart.x))),
+            h: Math.round(Math.min(lh, Math.abs(p.y - cropStart.y))),
+          };
+        }
+        redraw();
+        return;
+      }
+      if (!isPanning) return;
       const dx = e.clientX - lastMouse.x;
       const dy = e.clientY - lastMouse.y;
       panX += dx / zoom;
       panY += dy / zoom;
-      lastMouse = {x:e.clientX, y:e.clientY};
+      lastMouse = {x: e.clientX, y: e.clientY};
       clampPan();
       redraw();
     });
@@ -444,6 +495,25 @@ export function createPyramidLightbox(deps) {
     };
   }
 
+  // Convert a canvas-relative mouse event position to image-space coordinates.
+  // Matches the viewportRegion() convention: canvas center (VIEW_W/2, VIEW_H/2) maps to
+  // image center (lw/2, lh/2) when panX=panY=0.
+  function canvasXY(e) {
+    if (!canvas) return {cx: 0, cy: 0};
+    const r = canvas.getBoundingClientRect();
+    return {cx: e.clientX - r.left, cy: e.clientY - r.top};
+  }
+  function canvasToImage(cx, cy) {
+    if (!levelInfo) return null;
+    const lw = levelInfo.w || VIEW_W, lh = levelInfo.h || VIEW_H;
+    const ix = lw / 2 + (cx - VIEW_W / 2 - panX) / zoom;
+    const iy = lh / 2 + (cy - VIEW_H / 2 - panY) / zoom;
+    return {
+      x: Math.max(0, Math.min(lw - 1, ix)),
+      y: Math.max(0, Math.min(lh - 1, iy)),
+    };
+  }
+
   function startCrossfade() {
     crossfade = 1.0;
     const st = performance.now();
@@ -513,6 +583,22 @@ export function createPyramidLightbox(deps) {
       c2.restore();
     }
 
+    // Crop-region overlay: draw dashed rect in canvas space.
+    // Uses the same coordinate system as viewportRegion() / canvasToImage():
+    //   canvasX = (imgX - lw/2) * zoom + VIEW_W/2 + panX
+    if (cropRect && levelInfo) {
+      const lw = levelInfo.w || VIEW_W, lh = levelInfo.h || VIEW_H;
+      const ccx = (cropRect.x - lw / 2) * zoom + VIEW_W / 2 + panX;
+      const ccy = (cropRect.y - lh / 2) * zoom + VIEW_H / 2 + panY;
+      c2.save();
+      c2.setLineDash([5, 3]);
+      c2.strokeStyle = 'rgba(255,220,0,0.9)';
+      c2.lineWidth = 1.5;
+      c2.strokeRect(ccx, ccy, cropRect.w * zoom, cropRect.h * zoom);
+      c2.setLineDash([]);
+      c2.restore();
+    }
+
     // visible-screen histogram (readback)
     const h2 = histC.getContext('2d');
     h2.fillStyle = '#111'; h2.fillRect(0,0,256,70);
@@ -558,6 +644,7 @@ export function createPyramidLightbox(deps) {
     const ni = (currentIdx + d + itemsList.length) % itemsList.length;
     if (ni === currentIdx) return;
     levelPixels = null; offscreen = null; levelInfo = null; levelRaw16 = null;
+    cropRect = null; cropStart = null;
     open(itemsList, ni);
   }
 
@@ -624,6 +711,7 @@ export function createPyramidLightbox(deps) {
     for (const k of ADJUSTMENT_PARAMS) adjustments[k] = 0;
     zoom = 1; panX = 0; panY = 0; crossfade = 0;
     levelPixels = null; offscreen = null; levelInfo = null; levelRaw16 = null;
+    cropRect = null; cropStart = null;
 
     modal.style.display = 'flex';
     // The modal is appended INTO rootEl (the host, e.g. #pyramid-lightbox), which
@@ -759,7 +847,9 @@ export function createPyramidLightbox(deps) {
    */
   async function exportRoi() {
     if (!item || !levelInfo || !levelInfo.contenthash || levelInfo.contenthash === 'fallback') return null;
-    const region = clampRegionToLevel(viewportRegion(), levelInfo);
+    // Use the drawn crop rect when set; fall back to the current viewport.
+    const rawRegion = (cropRect && cropRect.w > 0 && cropRect.h > 0) ? cropRect : viewportRegion();
+    const region = clampRegionToLevel(rawRegion, levelInfo);
     const srcBytes = await getLevelBytes(levelInfo.contenthash);
 
     // rgba16 ROI decode (region-only; never the whole frame).
@@ -777,6 +867,17 @@ export function createPyramidLightbox(deps) {
 
     const bytes = await encodeRgba16(adjusted, width, height, { quality: 95 });
     log?.(`plb exportRoi ${width}x${height} -> ${bytes.byteLength} bytes`);
+
+    // Download the encoded JXL.
+    const blob = new Blob([bytes], {type: 'image/jxl'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const name = item?.id ? String(item.id).replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40) : 'image';
+    a.download = `${name}-roi-${region.x}x${region.y}+${region.w}x${region.h}.jxl`;
+    a.click();
+    URL.revokeObjectURL(url);
+
     return { bytes, width, height };
   }
 
