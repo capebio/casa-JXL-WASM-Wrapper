@@ -497,7 +497,14 @@ fn tone_curve(x: f32, p: &TonePost) -> f32 {
 /// highlights — notably skies, where the red/blue WB multipliers exceed 1.0 and
 /// drive those channels past the clip point before green — retain gradient
 /// detail instead of flattening to a featureless white.
-const HIGHLIGHT_KNEE: f32 = 0.80;
+///
+/// Tuned 0.80 → 0.68 (2026-07-07) to stop bright Pixel-DNG scenes blowing out:
+/// the always-on `+1.40 EV` Olympus baseline pushes bright regions well past 1.0,
+/// and the higher knee let them cluster at white. Harness-validated across the
+/// corpus (`tests/highlight_tune.rs`): near-white %clip on the worst DNGs
+/// 30%→0.3% and 3.5%→0.1%, while ORF is unchanged (luma 142, 0% clip — its
+/// highlights sit below the knee) and overall luma stays put (midtones intact).
+const HIGHLIGHT_KNEE: f32 = 0.68;
 
 // Tone curve magic numbers hoisted (used in every LUT entry during build_post).
 const BLK_OFFSET_SCALE: f32 = 0.10;
