@@ -76,6 +76,7 @@ export interface JxlModule {
         progressionTarget: "header" | "dc" | "pass" | "final";
         emitEveryPass: boolean;
         progressiveDetail?: "dc" | "lastPasses" | "passes" | "dcProgressive";
+        suppressDuplicateProgress?: boolean;
         preserveIcc: boolean;
         preserveMetadata: boolean;
         targetWidth?: number | null;

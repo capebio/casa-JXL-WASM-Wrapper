@@ -946,6 +946,46 @@ describe("browser codec handlers", () => {
 
   // ── CLAUDE.md decode-handler test gaps ────────────────────────────────────
 
+  test("budgetMs: null — completes normally without crash or budget-exceeded", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    installWorkerPostMessage(messages);
+
+    const info = {
+      width: 1, height: 1, bitsPerSample: 8,
+      hasAlpha: true, hasAnimation: false, jpegReconstructionAvailable: false,
+    };
+    const codec = {
+      createDecoder() {
+        return {
+          push() {},
+          close() {},
+          cancel() {},
+          dispose() {},
+          async *events() {
+            yield { type: "header", info };
+            yield { type: "final", info, pixels: new Uint8Array([1, 2, 3, 4]).buffer, format: "rgba8", pixelStride: 4 };
+          },
+        };
+      },
+    };
+
+    // budgetMs: null means no time limit — handler must reach decode_final normally.
+    const handler = new DecodeHandler(
+      { ...baseDecodeStart, sessionId: "budget-null-no-crash", budgetMs: null },
+      codec as never,
+      { onSessionEnd: (sessionId) => ended.push(sessionId) },
+    );
+    handler.onChunk(new Uint8Array([0xff]).buffer);
+    handler.onClose();
+
+    await waitFor(() => ended.length === 1);
+
+    expect(messages.some((msg) => msg.type === "decode_final")).toBe(true);
+    expect(messages.some((msg) => msg.type === "decode_budget_exceeded")).toBe(false);
+    expect(ended).toEqual(["budget-null-no-crash"]);
+  });
+
   /** Controllable fake decoder: push resolution and event stream are gated by
    * the test; dispose is tracked. events() emits a header then parks forever
    * (the handler's terminal paths must not depend on the stream ending). */

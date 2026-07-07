@@ -11,6 +11,7 @@ interface PoolableDecoderOpts {
     progressionTarget?: string;
     emitEveryPass?: boolean;
     progressiveDetail?: string | null | undefined;
+    suppressDuplicateProgress?: boolean;
     preserveIcc?: boolean;
     preserveMetadata?: boolean;
     targetWidth?: number | null;

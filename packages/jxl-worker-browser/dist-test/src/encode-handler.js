@@ -144,6 +144,16 @@ export class EncodeHandler {
             intrinsicSize: this.opts.intrinsicSize,
             disablePerceptualHeuristics: this.opts.disablePerceptualHeuristics,
             codestreamLevel: this.opts.codestreamLevel,
+            // Advanced density knobs the facade EncoderOptions honors directly (K6#2).
+            // Previously dropped at this boundary despite being on the wire. The other
+            // advanced wire fields (buffering, alreadyDownsampled, upsamplingMode,
+            // ecResampling, frameIndexing, allowExpertOptions, advancedControls,
+            // jpegReconstruction) need lower-level create_image_* plumbing not exposed by
+            // the high-level facade encoder — carried on the wire for future consumers.
+            modular: this.opts.modular,
+            brotliEffort: this.opts.brotliEffort,
+            decodingSpeed: this.opts.decodingSpeed,
+            photonNoiseIso: this.opts.photonNoiseIso,
             copyInput: false,
         };
         const tCreate0 = performance.now();
