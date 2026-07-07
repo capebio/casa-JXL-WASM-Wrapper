@@ -23,6 +23,120 @@ pub use telemetry::{analyze_fused, RgbHistogram, TelemetryMetrics};
 
 pub use butteraugli::Kweights;
 
+/// wasm32-only parity surface for the Node SIMD-vs-scalar oracle harness
+/// (`test-wasm-simd-parity.mjs`, task S4-D2). For each perceptual kernel that has
+/// a v128 path it exposes BOTH the v128 kernel (`*_simd`) and the independent
+/// scalar reference (`*_scalar`) in FFI-friendly shapes, so `src/lib.rs` can add
+/// thin `#[wasm_bindgen]` forwarders and the harness can assert the two agree.
+///
+/// This adds NO native API surface (arch-gated) and does NOT alter any SIMD
+/// implementation — it only calls the existing kernels + oracles. The `*_simd`
+/// arms call `simd::wasm::*` directly (not the runtime `detect_wasm` dispatch),
+/// so a single `+simd128` build can A/B v128 against scalar in-process; the
+/// harness also cross-checks a `-simd128` build's `*_scalar` against a `+simd128`
+/// build's `*_simd` for full two-build fidelity.
+#[cfg(target_arch = "wasm32")]
+pub mod parity {
+    use super::*;
+
+    #[inline]
+    fn flat3(x: Vec<f32>, y: Vec<f32>, b: Vec<f32>) -> Vec<f32> {
+        let mut out = Vec::with_capacity(x.len() + y.len() + b.len());
+        out.extend_from_slice(&x);
+        out.extend_from_slice(&y);
+        out.extend_from_slice(&b);
+        out
+    }
+
+    // u64 sums here fit exactly in f64 (< 2^53 for every corpus this harness
+    // uses), so the FFI can hand JS a plain Float64Array instead of BigInt.
+    #[inline]
+    fn flat9(sa: [u64; 3], saa: [u64; 3], sab: [u64; 3]) -> Vec<f64> {
+        let mut v = Vec::with_capacity(9);
+        for a in [sa, saa, sab] {
+            for x in a {
+                v.push(x as f64);
+            }
+        }
+        v
+    }
+
+    // ---- box_blur (mask blur) ----
+    pub fn box_blur_simd(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        simd::wasm::box_blur_wasm(src, w, h, r)
+    }
+    pub fn box_blur_scalar(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        blur::box_blur(src, w, h, r)
+    }
+
+    // ---- scale_err (butteraugli per-scale p-norm) ----
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_err_simd(
+        mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32], tx: &[f32], ty: &[f32], tb: &[f32],
+        n: usize, kx: f32, ky: f32, kb: f32,
+    ) -> f32 {
+        simd::wasm::scale_err_wasm(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn scale_err_scalar(
+        mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32], tx: &[f32], ty: &[f32], tb: &[f32],
+        n: usize, kx: f32, ky: f32, kb: f32,
+    ) -> f32 {
+        butteraugli::scale_err(mask, rx, ry, rb, tx, ty, tb, n, &Kweights { kx, ky, kb })
+    }
+
+    // ---- ssd (PSNR sum-of-squared-diffs over packed u8) ----
+    pub fn ssd_simd(a: &[u8], b: &[u8]) -> f64 {
+        simd::wasm::ssd_wasm(a, b) as f64
+    }
+    /// Independent scalar SSD oracle (mirrors `psnr::psnr`'s inner accumulation and
+    /// the `ssd_wasm` scalar tail: `d = a - b; sum += d*d`, exact integer math).
+    pub fn ssd_scalar(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len(), "ssd_scalar: buffers must have equal length");
+        let mut sum: u64 = 0;
+        for i in 0..a.len() {
+            let d = a[i] as i64 - b[i] as i64;
+            sum += (d * d) as u64;
+        }
+        sum as f64
+    }
+
+    // ---- ssim_moments (per-channel Σx, Σx², Σxy over RGBA → 9 sums) ----
+    pub fn ssim_moments_simd(a: &[u8], b: &[u8], np: usize) -> Vec<f64> {
+        let (sa, saa, sab) = simd::wasm::ssim_moments_wasm(a, b, np);
+        flat9(sa, saa, sab)
+    }
+    pub fn ssim_moments_scalar(a: &[u8], b: &[u8], np: usize) -> Vec<f64> {
+        let (sa, saa, sab) = ssim::ssim_sums(a, b, np, 4);
+        flat9(sa, saa, sab)
+    }
+
+    // ---- pixels_to_xyb (RGBA → planar X/Y/B, returned flattened as [x.., y.., b..]) ----
+    pub fn xyb_simd(px: &[u8], n: usize) -> Vec<f32> {
+        let lut = xyb::sqrt_lin_lut();
+        let (mut x, mut y, mut b) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+        simd::wasm::pixels_to_xyb_wasm(px, n, lut, &mut x, &mut y, &mut b);
+        flat3(x, y, b)
+    }
+    pub fn xyb_scalar(px: &[u8], n: usize) -> Vec<f32> {
+        let (mut x, mut y, mut b) = (vec![0f32; n], vec![0f32; n], vec![0f32; n]);
+        xyb::pixels_to_xyb(px, n, &mut x, &mut y, &mut b);
+        flat3(x, y, b)
+    }
+
+    // ---- downsample (2× box, one plane) ----
+    pub fn downsample_simd(src: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let mut dst = vec![0f32; dw * dh];
+        simd::wasm::downsample_wasm(src, &mut dst, w, h, dw, dh);
+        dst
+    }
+    pub fn downsample_scalar(src: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
+        let mut dst = vec![0f32; dw * dh];
+        downsample_inplace(src, &mut dst, w, h, dw, dh);
+        dst
+    }
+}
+
 /// Which compute backend to use. `Auto` picks the fastest available at runtime.
 /// `ForceScalar` and `Force(id)` exist for the flip-flop bench.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

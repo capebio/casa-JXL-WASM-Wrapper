@@ -3538,6 +3538,84 @@ fn metrics_to_js(m: &Metrics) -> JsValue {
     o.into()
 }
 
+// ---------------------------------------------------------------------------
+// Perceptual SIMD-vs-scalar parity oracle (task S4-D2) — wasm32-only.
+//
+// Thin `#[wasm_bindgen]` forwarders over `raw_pipeline::perceptual::parity`.
+// For each perceptual kernel with a wasm v128 path, both the v128 (`*_simd`) and
+// scalar (`*_scalar`) implementations are exposed so `test-wasm-simd-parity.mjs`
+// can feed deterministic inputs and assert the two agree. Gated to wasm32 because
+// `perceptual::parity` (and the v128 kernels it wraps) only exist on that target.
+// No SIMD implementation is changed — these only *call* the existing kernels.
+// ---------------------------------------------------------------------------
+#[cfg(target_arch = "wasm32")]
+mod perceptual_parity_ffi {
+    use raw_pipeline::perceptual::parity as p;
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    pub fn perc_box_blur_simd(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        p::box_blur_simd(src, w, h, r)
+    }
+    #[wasm_bindgen]
+    pub fn perc_box_blur_scalar(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+        p::box_blur_scalar(src, w, h, r)
+    }
+
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn perc_scale_err_simd(
+        mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32], tx: &[f32], ty: &[f32], tb: &[f32],
+        n: usize, kx: f32, ky: f32, kb: f32,
+    ) -> f32 {
+        p::scale_err_simd(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb)
+    }
+    #[wasm_bindgen]
+    #[allow(clippy::too_many_arguments)]
+    pub fn perc_scale_err_scalar(
+        mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32], tx: &[f32], ty: &[f32], tb: &[f32],
+        n: usize, kx: f32, ky: f32, kb: f32,
+    ) -> f32 {
+        p::scale_err_scalar(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb)
+    }
+
+    #[wasm_bindgen]
+    pub fn perc_ssd_simd(a: &[u8], b: &[u8]) -> f64 {
+        p::ssd_simd(a, b)
+    }
+    #[wasm_bindgen]
+    pub fn perc_ssd_scalar(a: &[u8], b: &[u8]) -> f64 {
+        p::ssd_scalar(a, b)
+    }
+
+    #[wasm_bindgen]
+    pub fn perc_ssim_moments_simd(a: &[u8], b: &[u8], np: usize) -> Vec<f64> {
+        p::ssim_moments_simd(a, b, np)
+    }
+    #[wasm_bindgen]
+    pub fn perc_ssim_moments_scalar(a: &[u8], b: &[u8], np: usize) -> Vec<f64> {
+        p::ssim_moments_scalar(a, b, np)
+    }
+
+    #[wasm_bindgen]
+    pub fn perc_xyb_simd(px: &[u8], n: usize) -> Vec<f32> {
+        p::xyb_simd(px, n)
+    }
+    #[wasm_bindgen]
+    pub fn perc_xyb_scalar(px: &[u8], n: usize) -> Vec<f32> {
+        p::xyb_scalar(px, n)
+    }
+
+    #[wasm_bindgen]
+    pub fn perc_downsample_simd(src: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
+        p::downsample_simd(src, w, h, dw, dh)
+    }
+    #[wasm_bindgen]
+    pub fn perc_downsample_scalar(src: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
+        p::downsample_scalar(src, w, h, dw, dh)
+    }
+}
+
 // =====================================================================================
 // frame-stats telemetry flip-flop (bench-only; driven by tools/frame-stats-flipflop.mjs)
 //
