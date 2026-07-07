@@ -324,36 +324,6 @@ const LUMA_R: f32 = 0.2126;
 const LUMA_G: f32 = 0.7152;
 const LUMA_B: f32 = 0.0722;
 
-/// Precomputed ln/exp LUTs for perceptual constancy (Lens17 non-Riemannian grid).
-/// Reduces transcendental calls during grid initialization (4913 evaluations).
-/// Built lazily on first use.
-static LN_LINEAR_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-static EXP_LINEAR_LUT: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
-
-fn build_ln_linear_lut() -> Vec<f32> {
-    let mut lut = vec![0.0f32; 256];
-    let eps = 1e-6f32;
-    for i in 0..256 {
-        let norm = i as f32 / 255.0;
-        let linear = if norm <= 0.04045 {
-            norm / 12.92
-        } else {
-            ((norm + 0.055) / 1.055).powf(2.4)
-        };
-        lut[i] = (linear.max(eps)).ln();
-    }
-    lut
-}
-
-fn build_exp_linear_lut() -> Vec<f32> {
-    let mut lut = vec![0.0f32; 256];
-    for i in 0..256 {
-        let log_val = -6.0 + (i as f32 / 255.0) * 12.0;
-        lut[i] = log_val.exp().min(1.5);
-    }
-    lut
-}
-
 #[derive(Clone)]
 pub struct PipelineParams {
     pub black: u16,
@@ -654,8 +624,8 @@ fn hybrid_spring_and_dimishing_fc(lr: f32, lg: f32, lb: f32, luma_l: f32) -> (f3
 /// `sample()` performs trilinear interpolation into that grid, replacing per-pixel
 /// `ln`/`exp`/`sqrt` calls with a handful of multiplies and adds.
 ///
-/// Called per pixel in `apply_tone_math` via the `PERCEPTUAL_GRID` thread-local
-/// (lazy-initialised on first use, then borrowed read-only in the hot loop).
+/// Called per pixel in `apply_tone_math` via the process-wide `PERCEPTUAL_GRID` OnceLock
+/// (lazy-initialised on first use, then a read-only `&'static` deref in the hot loop).
 /// Do not treat this as inert: removing or skipping it disables perceptual constancy
 /// for all non-c-perceptual targets.
 ///
@@ -939,9 +909,12 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
     static BLUR_ROW_F32: std::cell::RefCell<Vec<f32>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    static PERCEPTUAL_GRID: std::cell::RefCell<Option<PerceptualGrid>> =
-        const { std::cell::RefCell::new(None) };
 }
+
+// PIPE-013: one shared, lazily-built perceptual-constancy grid (process-wide OnceLock).
+// The hot loop is a single `&'static` deref + read-only `sample()` — no per-pixel
+// thread-local lookup, no RefCell borrow, and no per-thread rebuild of the 17³ lattice.
+static PERCEPTUAL_GRID: std::sync::OnceLock<PerceptualGrid> = std::sync::OnceLock::new();
 
 fn build_post_lut(t: &TonePost) -> Vec<u8> {
     // MEASURED (2026-06-19): this rebuild is only ~2% of a slider-drag frame (item-0). The handoff's
@@ -1698,19 +1671,11 @@ pub fn apply_tone_math(
             // Inputs (r2/g2/b2) are post-matrix values in [0, 65535]; normalize to [0, 1.5] before sampling.
             // norm = 1.5/65535 maps [0, 65535] → [0, 1.5] to match the grid's build domain.
             let norm = 1.5 / 65535.0;
-            // Ensure the grid is initialised (borrow_mut only on first call per thread).
-            PERCEPTUAL_GRID.with(|g| {
-                if g.borrow().is_none() {
-                    *g.borrow_mut() = Some(PerceptualGrid::new());
-                }
-            });
-            // Read-only borrow for the hot pixel loop — avoids borrow_mut on every pixel.
-            let (rr, gg, bb) = PERCEPTUAL_GRID.with(|g| {
-                g.borrow()
-                    .as_ref()
-                    .unwrap()
-                    .sample(r2 * norm, g2 * norm, b2 * norm)
-            });
+            // PIPE-013: process-wide OnceLock — single &'static deref + read-only sample(),
+            // no per-pixel thread-local lookup or RefCell borrow.
+            let (rr, gg, bb) = PERCEPTUAL_GRID
+                .get_or_init(PerceptualGrid::new)
+                .sample(r2 * norm, g2 * norm, b2 * norm);
             // Grid output is in [0, 1.5]; scale back to [0, 65535] for the post-LUT.
             r2 = rr * 65535.0;
             g2 = gg * 65535.0;
