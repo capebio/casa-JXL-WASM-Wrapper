@@ -35,8 +35,11 @@ use std::hash::{Hash, Hasher};
 
 // ── pinned digests (S4 golden ledger) ─────────────────────────────────────────
 // RAW tier — reused verbatim from docs/S1-timings-report.md (rustc 1.95.0).
-const ORF_RGBA8_HASH: u64 = 0x8806_8222_77ea_c608; // P1110226.ORF → decode_orf_rgba8
-const DNG_RGB8_HASH: u64 = 0x3c3f_b141_39ef_ec5c; //  PXL…dng → process() rgb8
+// Re-pinned 2026-07-08 to the corrected output after intentional, author-validated tone/colour
+// fixes flowed into main via the jul07 aggregation. NOT silent — drift traced to the exact fixes
+// below; verify visually via the S5 golden-approval workflow if in doubt.
+const ORF_RGBA8_HASH: u64 = 0xfb91_a7f3_5549_eaeb; // P1110226.ORF → decode_orf_rgba8 (was 0x8806_8222_77ea_c608; global HIGHLIGHT_KNEE 0.80→0.68 tone fix b1ce12ed)
+const DNG_RGB8_HASH: u64 = 0x7a27_17d8_cdbb_e4c2; //  PXL…dng → process() rgb8 (was 0x3c3f_b141_39ef_ec5c; tone fix b1ce12ed + per-format white-level fix d0a22cc9)
 // Fixture tier — captured on rustc 1.95.0 from the checked-in mandelbrot assets.
 // tiff8 == exr-display: the EXR is the HDR-linear twin of the same pattern the
 // 8-bit TIFF stores as sRGB, so linear→sRGB8 display reproduces the TIFF exactly
