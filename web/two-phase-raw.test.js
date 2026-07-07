@@ -155,9 +155,13 @@ dngTest('DNG previews-only twin differs from monolithic previews (split stays OR
 // monolithic call that batch/headless exports take. The full RGB8 bytes are
 // byte-identical either way (proven by the ORF A/B test above); the gate only
 // changes WHEN the split is taken, never the pixels.
-batchTest('batch flag decodes ORF once (no double decompress)', async () => {
+batchTest('two-phase ORF pays ~2x decompress vs monolithic (motivates the batch gate)', async () => {
     await ensureRaw();
     const bytes = new Uint8Array(readFileSync(ORF_FIXTURE));
+    // Warmup: cold caches/predictors on the first decode inflate the single
+    // (measured-first) run and depress the ratio; a throwaway decode de-noises.
+    processNeutral(rawWasm.process_orf_with_flags, bytes,
+        OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT).free();
     const single = processNeutral(rawWasm.process_orf_with_flags, bytes,
         OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
     const singleDecompress = single.decompress_ms; single.free();
@@ -167,5 +171,9 @@ batchTest('batch flag decodes ORF once (no double decompress)', async () => {
     console.log(`  decompress_ms: single=${singleDecompress} two-phase=${twoPhaseDecompress}` +
         ` (p1=${p1.decompress_ms}, p2=${p2.decompress_ms})`);
     p1.free(); p2.free();
-    expect(twoPhaseDecompress).toBeGreaterThan(singleDecompress * 1.5);
+    // Threshold proves a SECOND decompress occurs (ratio clearly >1). Observed
+    // 1.5x-2.8x across machines (the streaming preview-only phase-1 decompress
+    // overhead is the machine-dependent swing); 1.3x keeps headroom below the
+    // ~1.5 floor while staying clearly separated from the ~1.0 "decoded once" case.
+    expect(twoPhaseDecompress).toBeGreaterThan(singleDecompress * 1.3);
 }, 300_000);
