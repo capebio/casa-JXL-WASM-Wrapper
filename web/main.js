@@ -5440,3 +5440,33 @@ function feedTauriParityBaseline(snapshot) {
     } catch { /* cross-tainted canvas or 0-size: skip baseline feed */ }
 }
 window.feedTauriParityBaseline = feedTauriParityBaseline;
+
+// ---------------------------------------------------------------------------
+// Live perf debug hook — opt-in ONLY via ?debug=1.
+// Exposes runtime stats to web/perf-dashboard/index.html (open in an iframe
+// or adjacent tab). Never set in production — the query-param guard ensures
+// zero overhead and zero globals on normal page loads.
+// ---------------------------------------------------------------------------
+if (new URLSearchParams(location.search).has('debug')) {
+  // main.js uses its own internal WorkerPool (not the jxl-scheduler package).
+  // Wrap it with a getStats() shim so the dashboard's Worker Pool + Scheduler
+  // panels show live data from this page's actual worker pool.
+  const _schedulerAdapter = {
+    getStats() {
+      return {
+        activeWorkers: pool.workers.length - pool.free.length,
+        idleWorkers: pool.free.length,
+        queueDepth: pool.queue.length + pool._jxlDecodeQueue.length,
+        dedupeSize: pool._jxlPendingByUrl.size,
+        draining: pool._jxlDecodeBusy,
+      };
+    },
+  };
+  window.__perfDebug = {
+    scheduler: _schedulerAdapter,
+    assetStore: peepDecodedStore,
+    // jxl-cache (JxlCacheBrowser) is not instantiated in main.js; null tells
+    // the dashboard to show "—" for OPFS hit rate.
+    jxlCache: null,
+  };
+}

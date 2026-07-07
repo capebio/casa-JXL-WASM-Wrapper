@@ -267,6 +267,20 @@ export class JxlCacheBrowser implements JxlCache {
     };
   }
 
+  /**
+   * Lightweight dashboard-facing stats snapshot.
+   * Read-only; no side effects; additive (no behavior change).
+   */
+  getStats(): { hits: number; misses: number; totalRequests: number; hitRate: number | null } {
+    const total = this.hitCount + this.missCount;
+    return {
+      hits: this.hitCount,
+      misses: this.missCount,
+      totalRequests: total,
+      hitRate: total > 0 ? this.hitCount / total : null,
+    };
+  }
+
   private async getPersistent(key: string): Promise<SharedArrayBuffer | undefined> {
     if (!this.opfsRoot) return undefined;
 

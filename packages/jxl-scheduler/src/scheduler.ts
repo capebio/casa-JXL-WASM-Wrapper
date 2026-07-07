@@ -790,6 +790,28 @@ export class Scheduler {
   }
 
   /**
+   * Lightweight dashboard-facing stats snapshot.
+   * Read-only; no side effects; additive (no behavior change).
+   * Shape is stable across refactors — callers must not depend on internal field names.
+   */
+  getStats(): {
+    activeWorkers: number;
+    idleWorkers: number;
+    queueDepth: number;
+    dedupeSize: number;
+    draining: boolean;
+  } {
+    return {
+      activeWorkers: this._runningCount,
+      idleWorkers: this.pool.idleCount,
+      queueDepth: this._queuedCount,
+      // _subscriberCount = fan-out dedupe subscriber sessions (non-worker-holding).
+      dedupeSize: this._subscriberCount,
+      draining: this.drainingQueue,
+    };
+  }
+
+  /**
    * Ensures a metric message's payload is decoupled before dispatch to any
    * onMessage handler (which ultimately feeds onMetric in jxl-session).
    * - Always returns a fresh top-level object for the dispatch (existing spread
