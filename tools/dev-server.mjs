@@ -36,6 +36,10 @@ const SECURITY_HEADERS = {
   'Cross-Origin-Opener-Policy': 'same-origin',
   'Cross-Origin-Embedder-Policy': 'require-corp',
   'Cross-Origin-Resource-Policy': 'cross-origin',
+  // Dev: never cache. Without this the browser aggressively caches the 1.7 MB
+  // raw_converter_wasm_bg.wasm and even Ctrl+Shift+R can serve a stale build, so
+  // a rebuilt pkg silently never reaches the page.
+  'Cache-Control': 'no-store, no-cache, must-revalidate',
 };
 
 // P5-3: Brotli serving micro-win for first-load .wasm (and .js). Serve .br sibling with
