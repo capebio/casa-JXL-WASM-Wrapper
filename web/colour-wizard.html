@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="data:," />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Colour Calibration Wizard — S5</title>
+    <link rel="stylesheet" href="./test-nav.css" />
+    <style>
+        /* ── Design tokens ────────────────────────────────────────────────── */
+        :root {
+            --bg:        #080b0f;
+            --surface:   #0f172a;
+            --surface2:  #1e293b;
+            --border:    #1e293b;
+            --border2:   #334155;
+            --text:      #e2e8f0;
+            --text2:     #94a3b8;
+            --faint:     #475569;
+            --accent:    #3b82f6;
+            --accent2:   #60a5fa;
+            --green:     #86efac;
+            --yellow:    #fde68a;
+            --red:       #f87171;
+            --radius:    8px;
+        }
+
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Inter', system-ui, sans-serif;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        /* ── Page layout ──────────────────────────────────────────────────── */
+        .wiz-page {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px 20px 60px;
+        }
+
+        .wiz-header {
+            display: flex;
+            align-items: baseline;
+            gap: 14px;
+            margin-bottom: 20px;
+            padding-bottom: 14px;
+            border-bottom: 1px solid var(--border);
+        }
+        .wiz-title { font-size: 22px; font-weight: 700; }
+        .wiz-subtitle { color: var(--text2); font-size: 12px; }
+
+        /* ── Drop zone ────────────────────────────────────────────────────── */
+        #wiz-drop {
+            border: 2px dashed var(--border2);
+            border-radius: var(--radius);
+            padding: 28px;
+            text-align: center;
+            color: var(--text2);
+            cursor: pointer;
+            transition: border-color .15s, background .15s;
+            margin-bottom: 12px;
+        }
+        #wiz-drop.drag-over {
+            border-color: var(--accent);
+            background: rgba(59, 130, 246, 0.07);
+        }
+        #wiz-pick-btn {
+            padding: 7px 16px;
+            border-radius: 5px;
+            border: 1px solid var(--border2);
+            background: var(--surface2);
+            color: var(--text);
+            cursor: pointer;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+        #wiz-pick-btn:hover { border-color: var(--accent); color: var(--accent2); }
+
+        #wiz-load-status {
+            font-size: 11.5px;
+            color: var(--green);
+            min-height: 18px;
+            margin-bottom: 18px;
+        }
+
+        /* ── Sections ─────────────────────────────────────────────────────── */
+        .wiz-section {
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            margin-bottom: 24px;
+            overflow: hidden;
+        }
+        .wiz-section-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 16px;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            cursor: pointer;
+            user-select: none;
+        }
+        .wiz-section-header h2 {
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .wiz-section-num {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 24px; height: 24px;
+            border-radius: 50%;
+            background: var(--accent);
+            color: #fff;
+            font-size: 11px;
+            font-weight: 700;
+            flex: 0 0 auto;
+        }
+        .wiz-section-body { padding: 16px; }
+
+        .wiz-row {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            align-items: flex-start;
+        }
+        .wiz-col { flex: 1 1 300px; min-width: 0; }
+
+        /* ── Canvas wrappers ──────────────────────────────────────────────── */
+        .canvas-wrap {
+            position: relative;
+            overflow: hidden;
+            border: 1px solid var(--border2);
+            border-radius: 4px;
+            background: #000;
+            line-height: 0;
+        }
+        canvas {
+            max-width: 100%;
+            display: block;
+        }
+        .canvas-label {
+            position: absolute;
+            top: 6px; left: 8px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: .08em;
+            color: rgba(255,255,255,.75);
+            background: rgba(0,0,0,.5);
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+
+        /* ── Pixel info ───────────────────────────────────────────────────── */
+        .info-box {
+            background: var(--surface);
+            border: 1px solid var(--border2);
+            border-radius: 5px;
+            padding: 10px 12px;
+            font-size: 12px;
+            min-height: 48px;
+            line-height: 1.6;
+            margin-top: 8px;
+        }
+        code {
+            background: rgba(99,102,241,.2);
+            border-radius: 3px;
+            padding: 1px 4px;
+            font-family: monospace;
+        }
+
+        /* ── Sampled points ───────────────────────────────────────────────── */
+        .sample-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 11.5px;
+            font-family: monospace;
+        }
+        .sample-swatch {
+            display: inline-block;
+            width: 16px; height: 16px;
+            border-radius: 3px;
+            border: 1px solid var(--border2);
+            flex: 0 0 auto;
+        }
+        .sample-wb { color: var(--accent2); margin-left: auto; }
+
+        /* ── Sliders ──────────────────────────────────────────────────────── */
+        .slider-grid {
+            display: grid;
+            grid-template-columns: 100px 1fr 48px;
+            gap: 6px 10px;
+            align-items: center;
+        }
+        .slider-grid label { font-size: 12px; color: var(--text2); }
+        .slider-grid input[type=range] { width: 100%; }
+        .slider-val { font-size: 12px; font-family: monospace; text-align: right; color: var(--text); }
+
+        /* ── Butteraugli score ────────────────────────────────────────────── */
+        #butter-score {
+            font-size: 13px;
+            padding: 8px 0;
+        }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 700;
+            margin-left: 6px;
+        }
+        .badge-pass   { background: var(--green);  color: #052e16; }
+        .badge-review { background: var(--yellow); color: #422006; }
+        .badge-fail   { background: var(--red);    color: #450a0a; }
+        .badge-pending{ background: var(--faint);  color: #fff; }
+
+        /* ── Buttons ──────────────────────────────────────────────────────── */
+        .wiz-btn {
+            padding: 6px 14px;
+            border-radius: 5px;
+            border: 1px solid var(--border2);
+            background: var(--surface2);
+            color: var(--text);
+            cursor: pointer;
+            font-size: 12px;
+            transition: border-color .1s;
+        }
+        .wiz-btn:hover { border-color: var(--accent); color: var(--accent2); }
+        .wiz-btn-primary {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: #fff;
+            font-weight: 600;
+        }
+        .wiz-btn-primary:hover { background: #2563eb; border-color: #2563eb; color: #fff; }
+
+        /* ── Sign-off ─────────────────────────────────────────────────────── */
+        .signoff-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+            font-size: 12px;
+        }
+        .signoff-name { flex: 1; font-family: monospace; }
+        .signoff-score { color: var(--text2); font-family: monospace; font-size: 11px; }
+
+        #signoff-status {
+            margin-top: 12px;
+            padding: 12px;
+            background: var(--surface);
+            border: 1px solid var(--border2);
+            border-radius: 5px;
+            font-size: 12px;
+            line-height: 1.7;
+        }
+
+        /* ── Misc ─────────────────────────────────────────────────────────── */
+        .faint { color: var(--faint); }
+        .mt8 { margin-top: 8px; }
+        .mt12 { margin-top: 12px; }
+        .mt16 { margin-top: 16px; }
+        .gap8 { gap: 8px; }
+        .flex { display: flex; }
+        small { font-size: 11px; color: var(--text2); }
+
+        /* ── Diff strip ───────────────────────────────────────────────────── */
+        .diff-strip {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid var(--border);
+        }
+        .heatmap-legend {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11px;
+            color: var(--text2);
+            margin-top: 6px;
+        }
+        .legend-grad {
+            display: inline-block;
+            width: 80px; height: 10px;
+            border-radius: 3px;
+            background: linear-gradient(to right, #3b82f6, #22c55e, #ef4444);
+        }
+    </style>
+</head>
+<body class="has-home-bar">
+    <nav class="home-bar" aria-label="Test pages">
+        <div class="home-bar-label">S5</div>
+        <div class="home-bar-links">
+            <a class="home-bar-link" href="./index.html">Home</a>
+            <a class="home-bar-link" href="./jxl-compare.html">Format race</a>
+            <a class="home-bar-link" href="./jxl-benchmark.html">Settings explorer</a>
+            <a class="home-bar-link is-active" href="./colour-wizard.html" aria-current="page">Colour Wizard</a>
+        </div>
+    </nav>
+
+    <main class="wiz-page">
+        <header class="wiz-header">
+            <h1 class="wiz-title">Colour Calibration Wizard</h1>
+            <span class="wiz-subtitle">S5 sign-off tool — advisory WB only — no pipeline changes</span>
+        </header>
+
+        <!-- File picker -->
+        <div id="wiz-drop">
+            <div>Drop a RAW file here (ORF, DNG, CR2)</div>
+            <button class="wiz-btn mt8" id="wiz-pick-btn">Choose file…</button>
+        </div>
+        <input type="file" id="wiz-file-input" accept=".orf,.dng,.cr2,.raw" style="display:none" />
+        <div id="wiz-load-status">No file loaded.</div>
+
+        <!-- ── Section 1: Neutral Patch Picker ──────────────────────────── -->
+        <section class="wiz-section" id="sec-patch">
+            <div class="wiz-section-header">
+                <span class="wiz-section-num">1</span>
+                <h2>Neutral Patch Picker</h2>
+                <small class="faint" style="margin-left:auto">Click the image to sample a pixel</small>
+            </div>
+            <div class="wiz-section-body">
+                <div class="wiz-row">
+                    <div class="wiz-col">
+                        <div class="canvas-wrap">
+                            <canvas id="preview-canvas" width="640" height="480"></canvas>
+                            <span class="canvas-label">Preview</span>
+                        </div>
+                        <div class="flex gap8 mt8">
+                            <button class="wiz-btn wiz-btn-primary" id="apply-wb-btn">Apply WB preview</button>
+                            <button class="wiz-btn" id="reset-wb-btn">Reset WB</button>
+                            <button class="wiz-btn" id="clear-samples-btn">Clear samples</button>
+                        </div>
+                    </div>
+                    <div class="wiz-col">
+                        <div class="info-box" id="pixel-info">
+                            <span class="faint">Click the image to sample a pixel.</span>
+                        </div>
+                        <div class="info-box mt8" id="wb-suggestion">
+                            <span class="faint">Suggested WB will appear here after sampling.</span>
+                        </div>
+                        <div class="mt12">
+                            <strong style="font-size:12px">Sampled points</strong>
+                            <div class="mt8" id="sampled-list"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Section 2: Two-up Comparison ─────────────────────────────── -->
+        <section class="wiz-section" id="sec-compare">
+            <div class="wiz-section-header">
+                <span class="wiz-section-num">2</span>
+                <h2>Two-up Comparison</h2>
+                <small class="faint" style="margin-left:auto">Before / After · Butteraugli diff heatmap</small>
+            </div>
+            <div class="wiz-section-body">
+                <!-- Sliders -->
+                <div class="slider-grid">
+                    <label>Exposure EV</label>
+                    <input type="range" id="sl-exposure" min="-3" max="3" step="0.1" value="0" />
+                    <span class="slider-val" id="sl-exposure-val">0.0</span>
+
+                    <label>Contrast</label>
+                    <input type="range" id="sl-contrast" min="-100" max="100" step="1" value="0" />
+                    <span class="slider-val" id="sl-contrast-val">0</span>
+
+                    <label>Saturation</label>
+                    <input type="range" id="sl-saturation" min="-100" max="100" step="1" value="0" />
+                    <span class="slider-val" id="sl-saturation-val">0</span>
+
+                    <label>WB R mult</label>
+                    <input type="range" id="sl-wb-r" min="0.5" max="4.0" step="0.01" value="1.0" />
+                    <span class="slider-val" id="sl-wb-r-val">1.0</span>
+
+                    <label>WB B mult</label>
+                    <input type="range" id="sl-wb-b" min="0.5" max="4.0" step="0.01" value="1.0" />
+                    <span class="slider-val" id="sl-wb-b-val">1.0</span>
+                </div>
+
+                <div class="mt8 flex gap8">
+                    <button class="wiz-btn wiz-btn-primary" id="render-btn">Render →</button>
+                    <span id="butter-score" class="faint">Butteraugli: —</span>
+                </div>
+
+                <div class="wiz-row mt12">
+                    <div class="wiz-col">
+                        <div class="canvas-wrap">
+                            <canvas id="before-canvas" width="640" height="480"></canvas>
+                            <span class="canvas-label">Before</span>
+                        </div>
+                    </div>
+                    <div class="wiz-col">
+                        <div class="canvas-wrap">
+                            <canvas id="after-canvas" width="640" height="480"></canvas>
+                            <span class="canvas-label">After</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="diff-strip">
+                    <strong style="font-size:12px">Butteraugli diff heatmap</strong>
+                    <div class="canvas-wrap mt8">
+                        <canvas id="diff-canvas" width="640" height="480"></canvas>
+                        <span class="canvas-label">XYB Error</span>
+                    </div>
+                    <div class="heatmap-legend">
+                        <span class="legend-grad"></span>
+                        low error → high error
+                        <span class="faint">· blue=identical, red=perceptually different</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Section 3: WB Scatter Visualizer ─────────────────────────── -->
+        <section class="wiz-section" id="sec-wb-vis">
+            <div class="wiz-section-header">
+                <span class="wiz-section-num">3</span>
+                <h2>White Balance Visualizer</h2>
+                <small class="faint" style="margin-left:auto">Camera RGB scatter · grey locus · white point</small>
+            </div>
+            <div class="wiz-section-body">
+                <div class="wiz-row">
+                    <div style="flex:0 0 auto">
+                        <canvas id="wb-scatter" width="380" height="380"
+                            style="border:1px solid var(--border2);border-radius:4px;"></canvas>
+                    </div>
+                    <div class="wiz-col">
+                        <div class="info-box" id="wb-scatter-info">
+                            <span class="faint">Load a RAW file to see the WB scatter diagram.</span>
+                        </div>
+                        <div class="mt12" style="font-size:12px;color:var(--text2);line-height:1.7">
+                            <strong style="color:var(--text)">How to read this chart:</strong><br>
+                            Each dot is a pixel's (R/G, B/G) ratio — the
+                            standard camera WB space. A perfectly grey pixel sits at
+                            <code>R/G = B/G = 1</code> (orange circle).<br><br>
+                            Auto-sampled grid points (transparent) show the overall
+                            scene distribution. User-sampled points (solid, coloured) are
+                            the patches you clicked in Section 1.<br><br>
+                            The dashed diagonal is the grey locus. Coloured scenes (sky,
+                            foliage) cluster away from this line.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- ── Section 4: Sign-off Checklist ─────────────────────────────── -->
+        <section class="wiz-section" id="sec-signoff">
+            <div class="wiz-section-header">
+                <span class="wiz-section-num">4</span>
+                <h2>Sign-off Checklist</h2>
+                <small class="faint" style="margin-left:auto">Golden corpus · PASS/REVIEW badges</small>
+            </div>
+            <div class="wiz-section-body">
+                <p class="faint" style="margin-bottom:12px;font-size:12px">
+                    Load a golden corpus via <code>?corpus=./docs/golden-corpus.json</code>.
+                    Each entry is compared against the current render.
+                    PASS = butteraugli &lt; 0.05 · REVIEW = ≥ 0.05.
+                </p>
+
+                <div id="corpus-list"></div>
+
+                <div class="flex gap8 mt12">
+                    <button class="wiz-btn wiz-btn-primary" id="approve-all-btn">Approve all PASS</button>
+                </div>
+
+                <div id="signoff-status" style="display:none"></div>
+
+                <div class="mt12 info-box" style="font-size:11.5px;line-height:1.7">
+                    <strong>Manual approval step</strong><br>
+                    After visually approving all PASS items, run:<br>
+                    <code>node scripts/golden-check.mjs --update</code><br>
+                    Or via Tauri: <code>invoke('golden_check', {'{'}update: true{'}'}</code>)<br>
+                    This updates <code>docs/golden-corpus.json</code> checksums.
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <script type="module" src="./colour-wizard.js"></script>
+</body>
+</html>
