@@ -59,13 +59,19 @@ Note: most of the S2 safe-subset was **already on `main`** (QUESTIONS §002/§00
 - **S3-Q1 peepCache: count-cap vs byte budget.** Migrated behavior-preservingly (count 24). Rec:
   keep now → `maxBytes ≈ 384 MB` after a scripted peep session under `performance.memory`.
 - **S3-Q2 asset-store import `src/` vs `dist/`.** Plain ESM, no build; `src/` works. Rec: keep.
-- **S3-Q3 Wire `estimate_decode_peak` into admission gate.** ✅ SOFT SIGNAL LANDED
-  (`feat/s3-asset-store-jul07`, 2026-07-07). The WASM export was absent from shipped `web/pkg`, so a
-  pure-JS mirror (`asset-store/src/mem-budget.js`, parity-tested) + `AssetStore.admit()` (log-only,
-  ×1.5) + a Phase-A preflight in `web/main.js` (`rawDecodeGovernor`, 384 MB) ship the soft signal.
-  REMAINS: the hard gate ≥1.5× once the model-vs-RSS multiplier is measured on a real browser run, and
-  retiring the 1 GiB `MAX_OUTPUT_BYTES_GUARD` in `jxl-worker-browser/src/decode-handler.ts` (a
-  different worker; needs the estimate available worker-side + the measurement).
+- **S3-Q3 Wire `estimate_decode_peak` into admission gate.** ✅ SOFT SIGNAL LANDED + CALIBRATED
+  (`feat/s3-asset-store-jul07`, 2026-07-07). Pure-JS mirror (`asset-store/src/mem-budget.js`,
+  parity-tested) + `AssetStore.admit()` (log-only) + Phase-A preflight in `web/main.js`.
+  ★ MEASURED (browser sweep, worker.js MEMPROBE, DNG/CR2/ORF 9.9–24 MP): WASM-heap/model ratio =
+  **1.62–1.66 on big files, 1.75 worst (small portrait)**; ratio does NOT grow with pixels. Two
+  corrections landed from the data: **multiplier 1.5→1.7** (`RAW_DECODE_SAFETY_MULT`) and
+  **budget 384 MB→~1.8 GiB** (`RAW_DECODE_BUDGET_BYTES`) — the shipped build's WASM shared memory caps
+  at `maximum:32768`×64 KiB = **2 GiB**, and a real 24 MP decode uses ~362 MB and completes, so 384 MB
+  would have false-rejected normal files. Net: the signal now only trips at ~110 MP+.
+  REMAINS: (a) turn the Phase-A *observation* into a true **pre-`pool.submit` hard reject** (a
+  code-path change — currently decode already runs in Phase B); (b) retire the 1 GiB
+  `MAX_OUTPUT_BYTES_GUARD` in `jxl-worker-browser/src/decode-handler.ts` (different worker; needs the
+  estimate worker-side). Both low-risk now that the numbers are known.
 - **S3-Q4 Per-session retained-frame governor — which layer.** Designed, NOT implemented (CLAUDE.md
   forbids backpressure in facade/session). Rec: extend the scheduler's byte-HWM to also count retained
   pixels; AssetStore-on-main-thread is the cheap interim.

@@ -85,10 +85,54 @@ is ready to drop in when that migration lands.
 | `packages/asset-store/test/asset-store.test.js` | admit tests + adapter round-trip |
 | `web/main.js` | `rawDecodeGovernor` + Phase-A log-only preflight |
 
+## Post-implementation — browser measurement + calibration (2026-07-07)
+
+A temporary `worker.js` MEMPROBE (uncommitted, reverted) logged WASM-linear-heap
+high-water vs the model peak per decode, over a real browser sweep (dev-server
+`tools/dev-server.mjs`, cross-origin-isolated). 15 clean points, DNG/CR2/ORF,
+9.9–24 MP:
+
+| MP | fmt | heap/model |
+|----|-----|-----------|
+| 9.9 landscape | DNG | 1.47–1.49 |
+| 9.9 portrait | DNG | 1.75 |
+| 12.5 | DNG | 1.72–1.73 |
+| 17.9 | CR2 | 1.63–1.65 |
+| 24.0 | CR2 | 1.62–1.66 |
+
+Findings:
+- **Ratio does not grow with pixels** (small portrait 1.75 > big 24 MP 1.66) —
+  fixed allocator/preview overhead as a shrinking fraction of `n`. Safe to
+  extrapolate to 45/60 MP (trends lower).
+- **Portrait > landscape at equal MP** — the worker decodes with `NO_ORIENT`, so
+  the model assumes no rotate, but portrait shots still pay an orientation-rotate
+  transient the model omits. The multiplier absorbs it.
+- **The 384 MB budget guess was wrong** — the build's WASM shared memory caps at
+  `maximum:32768`×64 KiB = **2 GiB**, and a 24 MP decode legitimately uses
+  ~362 MB and completes. A 384 MB hard gate would have false-rejected normal files.
+
+Calibration landed in `web/main.js`: `RAW_DECODE_SAFETY_MULT` **1.5 → 1.7**
+(measured), `RAW_DECODE_BUDGET_BYTES` **384 MB → ~1.8 GiB** (2 GiB ceiling −
+headroom). Kept **soft/log-only**; the signal now only trips at ~110 MP+.
+
+## Surfaced bugs
+
+- **FIXED — `scheduler.ts` `process.env` in `signalDrain`** (commit `05684e7e`):
+  read `process.env.NODE_ENV` unguarded before the `queueDepth<0` check → threw
+  `ReferenceError: process is not defined` on **every** browser worker message,
+  silently breaking backpressure drain. Guarded with `typeof process !==
+  "undefined"` (the idiom already used in `budget.ts`/`pool.ts`); fixed in src +
+  the compiled `dist/scheduler.js` the browser loads.
+- **OPEN — DNG embedded-preview too bright.** The Phase-A embedded-JPEG thumbnail
+  paints too bright, then corrects when the colour-managed RAW thumb lands. Real
+  colour-pipeline bug (embedded preview drawn uncorrected); not a quick guard-fix.
+  Not investigated — logged for a dedicated pass.
+
 ## Follow-ups (out of scope, unchanged)
 
-- Hard-gate on the peak estimate once the model-vs-RSS multiplier is measured on
-  real runs (S3-Q3 second half); then retire `MAX_OUTPUT_BYTES_GUARD` in
+- Turn the soft preflight into a true pre-`pool.submit` hard reject (now that the
+  multiplier/budget are calibrated); then retire `MAX_OUTPUT_BYTES_GUARD` in
   `decode-handler.ts`.
 - Wire `persistentBackendFromCache` into the pyramid level-byte cache (S3-Q5).
 - Per-session retained-frame governor (S3-Q4) — scheduler layer.
+- DNG embedded-preview colour correction (surfaced above).

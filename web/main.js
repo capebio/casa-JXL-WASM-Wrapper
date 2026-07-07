@@ -1121,14 +1121,25 @@ window.removeCard = removeCard;
 const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB hard limit before WASM
 const seenFiles = new Set(); // "name|size|lastModified" — prevents duplicate-drop cards
 
-// S3-Q3: log-only RAW-decode admission preflight. The browser decodes a RAW to
-// full RGB8 + previews in ~360 MB of WASM heap at 24 MP (all-flags climbs to
-// ~517 MB); there was no way to ask "will this fit?" before starting. The ADR's
-// model + 1.5× RSS safety headroom means ~384 MB of live-byte budget is the
-// point past which we warn. This is a SIGNAL only — it never rejects a decode
-// (the pipeline runs concurrently; a real pre-gate awaits the scheduler
-// retained-HWM governor, S3-Q4). `admit()` supplies the ×1.5 headroom + warn.
-const RAW_DECODE_BUDGET_BYTES = 384 * 1024 * 1024;
+// S3-Q3: log-only RAW-decode admission preflight. This is a SIGNAL only — it
+// never rejects a decode (the pipeline runs concurrently; a real pre-submit gate
+// is a separate change). `admit()` applies the safety multiplier + warns.
+//
+// Budget = the WASM linear-heap ceiling. The shipped build's shared memory caps
+// at `maximum: 32768` pages × 64 KiB = 2 GiB (pkg glue: `new WebAssembly.Memory
+// ({initial:22, maximum:32768, shared:true})`), so ~1.8 GiB (2 GiB minus
+// fragmentation/non-heap headroom) is the point past which a decode risks the
+// hard OOM. NOT the old 384 MB guess — measured 24 MP decodes legitimately use
+// ~362 MB and complete fine.
+//
+// Multiplier 1.7 = measured model-vs-WASM-heap ratio (2026-07-07 browser sweep,
+// DNG/CR2/ORF 9.9–24 MP: big-file cluster 1.62–1.66, worst clean 1.75; the ratio
+// does NOT grow with pixels, so it holds for larger frames). Replaces the ADR's
+// 1.5 estimate. The admission model here also assumes an orientation rotate
+// (OUT_BATCH_DEFAULT, no NO_ORIENT), which over-reserves vs the worker's
+// NO_ORIENT decode path — extra safety on top.
+const RAW_DECODE_BUDGET_BYTES = Math.round(1.8 * 1024 * 1024 * 1024); // ~1.8 GiB of the 2 GiB WASM ceiling
+const RAW_DECODE_SAFETY_MULT = 1.7;
 const rawDecodeGovernor = new AssetStore({ name: 'raw-decode', maxBytes: RAW_DECODE_BUDGET_BYTES });
 
 function fileKey(f) { return `${f.name}|${f.size}|${f.lastModified}`; }
@@ -1727,7 +1738,10 @@ function startConvert(file, existingCard) {
             // the Rust estimate_decode_peak model.
             try {
                 const peak = estimateDecodePeak(largest.w, largest.h, OUT_BATCH_DEFAULT).peakBytes;
-                rawDecodeGovernor.admit(peak, { label: file.name || `${largest.w}×${largest.h}` });
+                rawDecodeGovernor.admit(peak, {
+                    multiplier: RAW_DECODE_SAFETY_MULT,
+                    label: file.name || `${largest.w}×${largest.h}`,
+                });
             } catch { /* preflight must never break ingest */ }
 
             if (card.classList.contains('busy') || card.classList.contains('embedded-thumb')) {
