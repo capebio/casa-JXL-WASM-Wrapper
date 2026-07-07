@@ -50,8 +50,17 @@ Note: most of the S2 safe-subset was **already on `main`** (QUESTIONS §002/§00
   needs same-slider browser parity. Rec: single-source the tone op in a browser-verified change.
 - **S2-Q3 Route lightbox `loadLevel` through pooled tiled path.** Worker now speaks pool v1 protocol
   (landed), but lightbox still full-decodes. Rec: region-route later, browser-verified.
-- **S2-Q4 main.js CardState refactor** (WeakMap + discriminated union). Large ADR-level; staged plan
-  in handoff. Cheap wins (cancel-on-delete, peepCache LRU, closeLightbox reset) done.
+- **S2-Q4 main.js CardState refactor** — ASSESSED & DROPPED 2026-07-07 (commit c1d8fcf8). The
+  WeakMap+discriminated-union plan rested on a stale (pre-cleanup) premise: main.js has NO per-card
+  Maps (`liveStateMap` is worker-internal; `peepCache`/`cardBy*` are cross-card indices), per-card
+  state already lives as expando props on each card element, and `_lightbox` is a decoded RAW-pixel
+  cache — not lightbox open-state (that is the module global `lightboxIndex`). Migrating ~300 expando
+  sites on this 5/5, unit-test-free browser entry is high-risk/low-gain, and the `_lightbox` union
+  would break `havePair`/raw-mode gating. Delivered instead: a JSDoc `@typedef CardState` contract +
+  lifecycle invariants above `makeCard`, `removeCard` now closes per-card ImageBitmaps, and a central
+  detached-card guard in `_onJxlDecodeResponse`. Cheap wins (cancel-on-delete, peepCache LRU,
+  closeLightbox reset) were already done. Do not re-attempt the WeakMap migration without new
+  evidence it pays off.
 - **S2-Q5 Stale `dist/worker-protocol.js`.** Harmless (nothing imports the runtime validator). Rec:
   `tsc` rebuild dist, or wire the validator in dev.
 

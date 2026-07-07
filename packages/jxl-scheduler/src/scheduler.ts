@@ -701,9 +701,10 @@ export class Scheduler {
 
     bp.queueDepth = Math.max(0, bp.queueDepth - 1);
     // Dev-only invariant: queueDepth must never go negative (A3).
-    // Guard `process` — it is undefined in the browser, where reading
-    // process.env directly throws on every signalDrain (matches the
-    // established `typeof process !== "undefined"` idiom in budget.ts/pool.ts).
+    // Guard `typeof process` — this runs in the browser too, where `process` is
+    // undefined and a bare `process.env` read throws ReferenceError on every drain
+    // (caught by the worker onmessage wrapper, losing the drain signal). Matches
+    // the guarded idiom already used in pool.ts / budget.ts / decode-session.ts.
     if (typeof process !== "undefined" && process.env.NODE_ENV !== "production" && bp.queueDepth < 0) {
       throw new Error(`Scheduler invariant violated: queueDepth went negative (${bp.queueDepth}) for session ${sessionId}`);
     }

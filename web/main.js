@@ -636,15 +636,24 @@ class WorkerPool {
                 if (typeof listener.options?.guard === 'function' && !listener.options.guard()) continue;
                 // See the policy note above: cache writes stay centralized here.
                 if (data.type === 'jxl_progress' || data.type === 'jxl_decoded') {
-                    applyJxlDecodeCachePolicy(
-                        listener.options?.cacheTarget,
-                        data.decodeId,
-                        data.rgba,
-                        data.w,
-                        data.h,
-                        isFinal,
-                        listener.options?.cachePolicy ?? 'never',
-                    );
+                    const ct = listener.options?.cacheTarget;
+                    // Skip caching into a card removed mid-decode (detached node):
+                    // its _jxlDecoded write would be orphaned onto a dead element.
+                    // Not every listener passes a removal `guard` above, so gate
+                    // centrally on isConnected. The in-flight decode still runs to
+                    // completion (best-effort; push() has no mid-decode cancel) —
+                    // we just don't stash pixels on a card that's gone.
+                    if (!(ct && ct.isConnected === false)) {
+                        applyJxlDecodeCachePolicy(
+                            ct,
+                            data.decodeId,
+                            data.rgba,
+                            data.w,
+                            data.h,
+                            isFinal,
+                            listener.options?.cachePolicy ?? 'never',
+                        );
+                    }
                 }
                 listener.cb(data);
             }
@@ -1111,6 +1120,11 @@ function removeCard(card) {
     }
     if (card._tauriPath != null) cardByFilename.delete(card._tauriPath);
     if (card._blobUrl) { try { URL.revokeObjectURL(card._blobUrl); } catch {} card._blobUrl = null; }
+    // Close per-card ImageBitmaps so their GPU-backed store is freed eagerly
+    // rather than waiting on GC of the detached node — mirrors the explicit
+    // .close() the thumb/lightbox paths already do when replacing a bitmap.
+    if (card._jxlThumbBmp) { try { card._jxlThumbBmp.close(); } catch {} card._jxlThumbBmp = null; }
+    if (card._embeddedPreview?.bmp) { try { card._embeddedPreview.bmp.close(); } catch {} card._embeddedPreview = null; }
     const i = cards.indexOf(card);
     if (i !== -1) cards.splice(i, 1);
     try { card.remove(); } catch {}
@@ -1144,6 +1158,71 @@ const rawDecodeGovernor = new AssetStore({ name: 'raw-decode', maxBytes: RAW_DEC
 
 function fileKey(f) { return `${f.name}|${f.size}|${f.lastModified}`; }
 
+/**
+ * Per-card state contract.
+ *
+ * There is no WeakMap/Map for per-card state: each card's state lives as
+ * underscore-prefixed expando properties on its own gallery `<div>` element.
+ * This block is the single authoritative description of that shape. (An earlier
+ * S2-Q4 plan proposed a `WeakMap<Element, CardState>` + a discriminated-union
+ * `_lightbox`; both were dropped after a cleanup pass made the premise stale —
+ * `_lightbox` is a decoded-pixel cache, not lightbox open-state, and the "per-card
+ * Maps" it meant to consolidate never existed here. Open-lightbox state is the
+ * module global `lightboxIndex`; live-update state is the module globals
+ * `liveInFlight`/`livePendingLook`/`liveDebounceTimer`, one active lightbox at a
+ * time. `peepCache` and `cardByTaskId`/`cardByFilename` are cross-card indices,
+ * not per-card state.)
+ *
+ * @typedef {HTMLDivElement & {
+ *   // --- identity / lifecycle ---
+ *   _file?: File,                       // source RAW file (set in addCard)
+ *   _taskId?: number|null,              // in-flight/last RAW worker task; key into cardByTaskId
+ *   _tauriPath?: string,                // full fs path (Tauri only); key into cardByFilename
+ *   _pendingPriority?: 'normal'|'high'|null, // priority hint consumed at pool.submit
+ *   _pendingLookBatch?: object|null,    // batched Look for a queued gallery reprocess
+ *   // --- pixel / data caches ---
+ *   _lightbox?: {rgb:Uint8Array,w:number,h:number,nativeW:number,nativeH:number,orientation:number}|null,
+ *                                        // full-res RAW sensor pixels; set in onLightbox, nulled on reprocess.
+ *                                        // Truthiness == "RAW available" (drives havePair, raw-mode gating).
+ *   _embeddedPreview?: {bmp:ImageBitmap,w:number,h:number,orientation:number}|null, // largest camera JPEG; survives reprocess
+ *   _blobUrl?: string|null,             // object URL of encoded JXL blob; revoked before re-set + in removeCard
+ *   _jxlDecoded?: {rgba:Uint8ClampedArray,w:number,h:number}|null, // full-res JXL decode cache; nulled when bytes change
+ *   _jxlThumbBmp?: ImageBitmap|null, _jxlThumbW?: number, _jxlThumbH?: number, // cached JXL thumbnail bitmap + dims
+ *   _jxlProgressCacheDecodeId?: number, // decodeId of the progressive-decode cache entry
+ *   _thumbRgb?: Uint8Array, _thumbW?: number, _thumbH?: number, // RAW thumbnail pixels + display dims
+ *   _thumbNativeW?: number, _thumbNativeH?: number, _thumbOrientation?: number, // sensor dims + orientation for GPU-rotate draw
+ *   _sensorW?: number, _sensorH?: number, // sensor dims (Tauri lazy path)
+ *   // --- display / source selection ---
+ *   _sourceMode?: 'raw'|'jxl'|'jpeg',   // active display source (thumb + lightbox)
+ *   _crop?: object|null,                // crop rect (from sidecar)
+ *   _subjects?: Array<object>,          // focal subjects
+ *   _focusedSubjectId?: (string|number)|undefined, // currently focused subject in the cycle
+ *   // --- in-flight guards ---
+ *   _jxlPrefetching?: boolean,          // full-res JXL prefetch in flight
+ *   _largePreviewFetching?: boolean, _largePreviewFetched?: boolean, // Tauri lazy full-preview guards
+ *   // --- metadata (from worker onThumb/onDone) ---
+ *   _wb?: {r:number,b:number},          // white-balance multipliers
+ *   _colorMatrixFromMn?: boolean,       // color matrix source (true=maker-note, false=fallback)
+ *   _camera?: string,                   // "Make Model"
+ *   _exif?: object|null,                // EXIF (width/height patched on done)
+ *   _pipelineMs?: number, _phaseMs?: object, // timings
+ *   _meta?: string,                     // one-line display summary "WxH • pipeline X ms • JXL Y ms"
+ *   _tauriResult?: {jxl:ArrayBuffer,exif:object}|null, // Tauri encode result for planner upload
+ * }} CardState
+ *
+ * Lifecycle invariants:
+ *  - makeCard builds only the DOM + listeners; all data fields start undefined.
+ *    addCard sets `_file` and submits to the pool, producing `_taskId`.
+ *  - Reprocess (existingCard branch): `_lightbox = null`, `_sourceMode = 'raw'`,
+ *    releaseState(`_taskId`); `_embeddedPreview` is deliberately kept (JXL/JPEG toggle).
+ *  - onThumb: sets `_thumb*`, `_wb`, `_camera`, `_exif`, `_colorMatrixFromMn`,
+ *    `_pipelineMs`, `_phaseMs`; closes any stale `_jxlThumbBmp`.
+ *  - onLightbox: sets `_lightbox`.  onDone: sets `_blobUrl` + `_meta`, nulls
+ *    `_jxlDecoded`, patches `_exif` dims.
+ *  - Teardown is removeCard() ONLY: cancel + releaseState `_taskId`, drop from
+ *    cardByTaskId/cardByFilename, revoke `_blobUrl`, close per-card ImageBitmaps,
+ *    splice from `cards`, remove the node. Any delete UI must route through it.
+ */
 function makeCard(name) {
     const card = document.createElement('div');
     card.className = 'thumb busy';
