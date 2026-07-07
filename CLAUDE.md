@@ -97,7 +97,6 @@ Add under `packages/jxl-worker-browser/test/`:
 - Cancel while paused → decoder disposed, `decode_cancelled` posted
 - Cancel during active `push()` → `disposeActiveDecoder()` called safely
 - Budget exceeded before first progress → `postBudgetExceeded()` with live (non-detached) pixels
-- `budgetMs == null` → no crash
 - Many small chunks → `worker_drain` coalesced, queued bytes stay below `BYTE_DRAIN_HWM`
 - `DRAIN_MIN_INTERVAL_MS` prevents drain spam during bursts
 
