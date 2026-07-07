@@ -386,7 +386,7 @@ pub fn encode_casv_video_with_audio_progress(
 /// whole clip. Byte-identical output for the same frame sequence (both feed the
 /// same streaming encoder). Same footer format + CSAU insertion.
 pub fn encode_casv_video_streaming_with_audio_progress(
-    src: &mut dyn VideoFrameSource,
+    src: &mut (dyn VideoFrameSource + Send),
     opts: &CasaVideoOptions,
     ogg_opus: Option<&[u8]>,
     on_frame: &mut dyn FnMut(usize),
@@ -676,7 +676,7 @@ pub fn jolt_encode(
 /// rate box): holds only prev+current frame. Decode with
 /// [`decode_casv_footer_all_rgb8`]; read the rate with [`parse_casv_rate_box`].
 pub fn jolt_encode_stream_to<W: std::io::Write>(
-    src: &mut dyn VideoFrameSource,
+    src: &mut (dyn VideoFrameSource + Send),
     preset: JoltPreset,
     sink: &mut W,
 ) -> Result<(), VideoError> {
@@ -1311,6 +1311,175 @@ fn encode_stream_frame(
     Ok(CASV_PFRAME_FLAG | CASV_BBOX_FLAG | CASV_REPLACE_FLAG)
 }
 
+/// Whether the streaming encoders should run the legacy SERIAL decode→encode loop
+/// instead of the default decode∥encode overlap. `CASV_STREAM_SERIAL=1` selects it
+/// for the serial-vs-overlap A/B (`examples/casv_overlap_ab.rs`) — both paths are
+/// byte-identical. Any value other than empty or "0" selects serial.
+fn stream_serial_forced() -> bool {
+    std::env::var("CASV_STREAM_SERIAL")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
+/// Consumer-side encode of ONE streaming frame: the GOP/scene-cut decision, the
+/// per-GOP rate-control step, the tile-admission allowance, and the actual
+/// [`encode_stream_frame`] call — everything that touches `StreamCtx`/`RateState`
+/// and therefore the codestream. Shared verbatim by the serial and overlapped
+/// schedulers, so the output is byte-identical regardless of WHERE the frame was
+/// decoded. `force_i` is the source's `force_iframe()` for THIS frame (read right
+/// after it was filled), so moving decode to a producer thread cannot change the
+/// I-frame schedule. Returns the index flag bits; the encoded bytes land in `payload`.
+#[allow(clippy::too_many_arguments)]
+fn stream_encode_one(
+    cur: &[u8],
+    prev_src: &[u8],
+    force_i: bool,
+    idx: usize,
+    gop: usize,
+    opts: &CasaVideoOptions,
+    ctx: &mut StreamCtx,
+    rc: &mut Option<RateState>,
+    payload: &mut Vec<u8>,
+) -> Result<u32, VideoError> {
+    // GOP schedule vs source-forced I-frame (scene cut). Rate control steps only on
+    // the natural GOP boundary so a forced I-frame does not perturb the lossy
+    // distance feedback — for sources that never force, `is_iframe == at_gop`.
+    let at_gop = idx % gop == 0;
+    let is_iframe = at_gop || (idx > 0 && force_i);
+    if at_gop && idx > 0 {
+        if let Some(rc) = rc.as_mut() {
+            let d = rc.next_gop_distance(ctx.distance);
+            ctx.set_distance(d, opts)?;
+        }
+    }
+    payload.clear();
+    if let (Some(rc), Some(adm)) = (rc.as_ref(), ctx.admission.as_mut()) {
+        // This frame's allowance: per-frame refill plus bucket fullness
+        // (negative in debt → pure-skip frame).
+        adm.allowed = rc.frame_budget + rc.bucket;
+    }
+    let flags = encode_stream_frame(cur, prev_src, is_iframe, ctx, payload)?;
+    if let Some(rc) = rc.as_mut() {
+        rc.on_frame(payload.len());
+    }
+    Ok(flags)
+}
+
+/// Drive a streaming lossy/lossless encode: pull frames from `src`, encode each via
+/// [`stream_encode_one`], and hand the finished `(flags, payload)` to `emit` (which
+/// the caller uses to build the header-buffered or footer-to-sink container).
+/// `on_frame(count)` fires after each frame (counting from 1). Returns the frame count.
+/// Shared by [`encode_casv_video_streaming`] (buffered) and
+/// [`encode_casv_video_streaming_to_progress`] (footer sink).
+///
+/// **Phase 3.2 — decode∥encode overlap (default).** The serial loop ran, per frame,
+/// `src.next_frame_into()` (SOURCE DECODE) then `encode_stream_frame()` (ENCODE) on
+/// one thread; the P-frame encode (95 %+ of frames) is single-threaded, so the source
+/// decode ran with the other cores idle. This splits the two legs across a bounded,
+/// depth-1 [`std::sync::mpsc::sync_channel`]: a PRODUCER thread decodes frame N+1 (and
+/// reads its `force_iframe()`) while the CONSUMER (this thread) encodes frame N in
+/// order. The channel is FIFO and the consumer keeps ALL `StreamCtx`/`RateState`/emit
+/// state, so the codestream is byte-identical to the serial loop — only the SCHEDULING
+/// of decode changes. Depth 1 keeps the read-ahead shallow (the producer is at most one
+/// frame ahead), which avoids oversubscribing cores during the MT I-frame encode and
+/// preserves the streaming tier's low-memory contract. Set `CASV_STREAM_SERIAL=1` to
+/// force the legacy serial loop (byte-identical; used by the A/B).
+fn stream_encode_frames(
+    src: &mut (dyn VideoFrameSource + Send),
+    opts: &CasaVideoOptions,
+    on_frame: &mut dyn FnMut(usize),
+    emit: &mut dyn FnMut(u32, &[u8]) -> Result<(), VideoError>,
+) -> Result<usize, VideoError> {
+    let (width, height) = src.dims();
+    let (fps_num, fps_den) = src.fps();
+    let mut ctx = stream_ctx(width, height, opts)?;
+    let gop = opts.gop_len.max(1) as usize;
+    let expected = (width as usize) * (height as usize) * 3;
+    let mut rc = opts
+        .rate_control
+        .map(|c| RateState::new(c, fps_num, fps_den));
+    let mut payload = Vec::new();
+
+    // ── Legacy SERIAL scheduler (A/B baseline; byte-identical). ──────────────────
+    if stream_serial_forced() {
+        // Ping-pong frame buffers: after each frame `cur` becomes `prev_src` and the
+        // old `prev_src` buffer is refilled by the source (no per-frame allocation
+        // for sources implementing `next_frame_into`).
+        let mut cur: Vec<u8> = Vec::new();
+        let mut prev_src: Vec<u8> = Vec::new();
+        let mut idx = 0usize;
+        loop {
+            std::mem::swap(&mut cur, &mut prev_src);
+            if !src.next_frame_into(&mut cur) {
+                break;
+            }
+            if cur.len() != expected {
+                return Err(VideoError::FrameSize {
+                    idx,
+                    expected,
+                    got: cur.len(),
+                });
+            }
+            let force_i = src.force_iframe();
+            let flags = stream_encode_one(
+                &cur, &prev_src, force_i, idx, gop, opts, &mut ctx, &mut rc, &mut payload,
+            )?;
+            emit(flags, &payload)?;
+            idx += 1;
+            on_frame(idx);
+        }
+        return Ok(idx);
+    }
+
+    // ── OVERLAPPED scheduler (default): decode(N+1) ∥ encode(N). ─────────────────
+    std::thread::scope(|scope| -> Result<usize, VideoError> {
+        // Depth-1 bounded channel: the producer may be at most one frame ahead, so the
+        // source's internal buffer stays shallow. Each frame crosses as an owned Vec
+        // (the source buffer can't be borrowed across the thread boundary).
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, bool)>(1);
+        // PRODUCER: pull + decode frames in order, shipping each with its
+        // `force_iframe()` (read right after the frame is filled, exactly as the serial
+        // loop did). Owns `src` for the duration of the scope.
+        scope.spawn(move || {
+            loop {
+                let mut buf = Vec::new();
+                if !src.next_frame_into(&mut buf) {
+                    break; // end of stream → drop tx → consumer sees RecvError
+                }
+                let force_i = src.force_iframe();
+                if tx.send((buf, force_i)).is_err() {
+                    break; // consumer stopped early (error/unwind) → stop pulling
+                }
+            }
+        });
+        // CONSUMER: encode received frames in FIFO order — identical state transitions
+        // and emit order to the serial loop.
+        let mut prev_src: Vec<u8> = Vec::new();
+        let mut idx = 0usize;
+        loop {
+            let (cur, force_i) = match rx.recv() {
+                Ok(v) => v,
+                Err(_) => break, // producer finished (or errored/panicked)
+            };
+            if cur.len() != expected {
+                return Err(VideoError::FrameSize {
+                    idx,
+                    expected,
+                    got: cur.len(),
+                });
+            }
+            let flags = stream_encode_one(
+                &cur, &prev_src, force_i, idx, gop, opts, &mut ctx, &mut rc, &mut payload,
+            )?;
+            emit(flags, &payload)?;
+            idx += 1;
+            on_frame(idx);
+            prev_src = cur; // this frame is the P-frame reference for the next one
+        }
+        Ok(idx)
+    })
+}
+
 /// **Streaming** lossy-tier encode (header-indexed, buffered output): pulls frames
 /// one at a time, I-frames via `encode_chunked` (constant peak), P-frames via
 /// bbox/tile replace-skip — holding only prev+cur frame. Returns the standard
@@ -1320,65 +1489,24 @@ fn encode_stream_frame(
 ///
 /// Requires `opts.rate = Lossy` and `opts.skip = Bbox`/`Tile` (else [`VideoError::Unsupported`]).
 pub fn encode_casv_video_streaming(
-    src: &mut dyn VideoFrameSource,
+    src: &mut (dyn VideoFrameSource + Send),
     opts: &CasaVideoOptions,
 ) -> Result<Vec<u8>, VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
-    let mut ctx = stream_ctx(width, height, opts)?;
-    let gop = opts.gop_len.max(1) as usize;
-    let expected = (width as usize) * (height as usize) * 3;
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
     let mut data: Vec<u8> = Vec::new();
-    // Ping-pong frame buffers: after each frame `cur` becomes `prev_src` and the
-    // old `prev_src` buffer is refilled by the source (no per-frame allocation
-    // for sources implementing `next_frame_into`).
-    let mut cur: Vec<u8> = Vec::new();
-    let mut prev_src: Vec<u8> = Vec::new();
-    let mut idx = 0usize;
-    let mut payload = Vec::new();
-    let mut rc = opts
-        .rate_control
-        .map(|c| RateState::new(c, fps_num, fps_den));
-
-    loop {
-        std::mem::swap(&mut cur, &mut prev_src);
-        if !src.next_frame_into(&mut cur) {
-            break;
-        }
-        if cur.len() != expected {
-            return Err(VideoError::FrameSize {
-                idx,
-                expected,
-                got: cur.len(),
-            });
-        }
-        // GOP schedule vs source-forced I-frame (scene cut). Rate control steps
-        // only on the natural GOP boundary so a forced I-frame does not perturb the
-        // lossy distance feedback — for sources that never force (all existing
-        // sources), `is_iframe == at_gop` and the encode is byte-identical.
-        let at_gop = idx % gop == 0;
-        let is_iframe = at_gop || (idx > 0 && src.force_iframe());
-        if at_gop && idx > 0 {
-            if let Some(rc) = rc.as_mut() {
-                let d = rc.next_gop_distance(ctx.distance);
-                ctx.set_distance(d, opts)?;
-            }
-        }
-        payload.clear();
-        if let (Some(rc), Some(adm)) = (rc.as_ref(), ctx.admission.as_mut()) {
-            // This frame's allowance: per-frame refill plus bucket fullness
-            // (negative in debt → pure-skip frame).
-            adm.allowed = rc.frame_budget + rc.bucket;
-        }
-        let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
-        if let Some(rc) = rc.as_mut() {
-            rc.on_frame(payload.len());
-        }
-        index.push((flags, payload.len() as u32));
-        data.extend_from_slice(&payload);
-        idx += 1;
+    {
+        // Header-buffered container: accumulate (flags, len) + the concatenated
+        // payloads. The shared driver runs the decode∥encode overlap; the codestream
+        // is byte-identical to the old serial loop (see `stream_encode_frames`).
+        let mut emit = |flags: u32, payload: &[u8]| -> Result<(), VideoError> {
+            index.push((flags, payload.len() as u32));
+            data.extend_from_slice(payload);
+            Ok(())
+        };
+        stream_encode_frames(src, opts, &mut |_| {}, &mut emit)?;
     }
     if index.is_empty() {
         return Err(VideoError::Empty);
@@ -1561,7 +1689,7 @@ pub fn encode_casv_fable_streaming_with_audio(
 /// the index + a 32-byte footer. Constant peak for *both* raw frames and compressed
 /// output — for long / live streams. Read back with [`decode_casv_footer_all_rgb8`].
 pub fn encode_casv_video_streaming_to<W: std::io::Write>(
-    src: &mut dyn VideoFrameSource,
+    src: &mut (dyn VideoFrameSource + Send),
     opts: &CasaVideoOptions,
     sink: &mut W,
 ) -> Result<(), VideoError> {
@@ -1572,65 +1700,28 @@ pub fn encode_casv_video_streaming_to<W: std::io::Write>(
 /// (counting from 1) after each frame is encoded, for progress reporting. The
 /// bitstream is byte-identical — the callback only observes the running count.
 pub fn encode_casv_video_streaming_to_progress<W: std::io::Write>(
-    src: &mut dyn VideoFrameSource,
+    src: &mut (dyn VideoFrameSource + Send),
     opts: &CasaVideoOptions,
     sink: &mut W,
     on_frame: &mut dyn FnMut(usize),
 ) -> Result<(), VideoError> {
     let (width, height) = src.dims();
     let (fps_num, fps_den) = src.fps();
-    let mut ctx = stream_ctx(width, height, opts)?;
-    let gop = opts.gop_len.max(1) as usize;
-    let expected = (width as usize) * (height as usize) * 3;
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (offset, len_field)
-                                                 // Ping-pong frame buffers (see encode_casv_video_streaming).
-    let mut cur: Vec<u8> = Vec::new();
-    let mut prev_src: Vec<u8> = Vec::new();
-    let mut idx = 0usize;
     let mut offset: u64 = 0;
-    let mut payload = Vec::new();
-    let mut rc = opts
-        .rate_control
-        .map(|c| RateState::new(c, fps_num, fps_den));
-
-    loop {
-        std::mem::swap(&mut cur, &mut prev_src);
-        if !src.next_frame_into(&mut cur) {
-            break;
-        }
-        if cur.len() != expected {
-            return Err(VideoError::FrameSize {
-                idx,
-                expected,
-                got: cur.len(),
-            });
-        }
-        // GOP schedule vs source-forced I-frame (scene cut) — see the buffered
-        // encoder for the byte-identity rationale (rate control steps on `at_gop`).
-        let at_gop = idx % gop == 0;
-        let is_iframe = at_gop || (idx > 0 && src.force_iframe());
-        if at_gop && idx > 0 {
-            if let Some(rc) = rc.as_mut() {
-                let d = rc.next_gop_distance(ctx.distance);
-                ctx.set_distance(d, opts)?;
-            }
-        }
-        payload.clear();
-        if let (Some(rc), Some(adm)) = (rc.as_ref(), ctx.admission.as_mut()) {
-            // This frame's allowance: per-frame refill plus bucket fullness
-            // (negative in debt → pure-skip frame).
-            adm.allowed = rc.frame_budget + rc.bucket;
-        }
-        let flags = encode_stream_frame(&cur, &prev_src, is_iframe, &mut ctx, &mut payload)?;
-        if let Some(rc) = rc.as_mut() {
-            rc.on_frame(payload.len());
-        }
-        sink.write_all(&payload).map_err(|_| VideoError::Io)?;
-        index.push((offset as u32, (payload.len() as u32) | flags));
-        offset += payload.len() as u64;
-        idx += 1;
-        on_frame(idx);
+    {
+        // Footer-to-sink container: write each frame's payload straight to the sink as
+        // produced, buffering only the tiny index. The shared driver runs the
+        // decode∥encode overlap; the codestream is byte-identical to the old serial
+        // loop (see `stream_encode_frames`).
+        let mut emit = |flags: u32, payload: &[u8]| -> Result<(), VideoError> {
+            sink.write_all(payload).map_err(|_| VideoError::Io)?;
+            index.push((offset as u32, (payload.len() as u32) | flags));
+            offset += payload.len() as u64;
+            Ok(())
+        };
+        stream_encode_frames(src, opts, on_frame, &mut emit)?;
     }
     if index.is_empty() {
         return Err(VideoError::Empty);
