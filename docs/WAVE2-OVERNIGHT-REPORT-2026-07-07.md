@@ -3,6 +3,29 @@
 **Ask:** "See S1–S6 totally done. Defer any questions till afterwards. Do your best; I can
 revert/challenge afterwards."
 
+---
+## ✅ UPDATE 2026-07-07 — consolidation COMPLETE (supersedes the "merge plan" section below)
+
+The 6 branches were merged **and** reconciled with `origin/main`, all on one head:
+`perf/casv-video-simd-v2-jul05` @`407fea16`. Sequence: s4→s1→s5→s6→s3→s2 (zero textual
+conflicts) → merged `origin/main` (11 commits: decode_dc, transcode_jpeg, tiff hardening,
+fused blur+apply; one trivial `tiff.rs` conflict — duplicate 8-byte guard, resolved).
+**Verified on the final head:** native `raw-pipeline` **249 passed / 0 failed**;
+**byte-exact ORF `0x8806822277eac608` + DNG `0x3c3fb14139efec5c` unchanged**; libjxl **codec
+build Finished** (decode_dc/transcode link, TRANSCODE_JPEG on); **wasm32 compiles**; JS syntax
+clean. The S5 examples/libjxl caveat below is now **resolved** (codec build passed).
+
+Also cleaned: disk 553 MB → **79.6 GB** (removed all wave2 + 16 holo worktrees, cleared
+raw-converter-tauri build output, dead dirs); libjxl consolidated to **one submodule**
+(`libjxl-012`; removed vestigial 0.11); `libjxlJun26` untracked; **22 redundant local branches
+pruned**. Final: 3 local branches (this head, `main`, the other session's), 2 worktrees.
+
+Still your call (outward-facing): push this head / merge → `main`; prune the 42 remote-only
+branches; the kept dirs with unpushed work (`casabio-port2` 45, `rc-integrate-scratch` 18,
+`raw-converter` 7, 2 dirty tauri worktrees); the 30 items in `docs/WAVE2-QUESTIONS-DEFERRED.md`.
+
+---
+
 **How it was interpreted (and why):** several S-items are gated by *your* sign-off in the specs
 themselves — S5 requires per-stage colour approval, S1 requires per-item behavior-reconciliation
 decisions, S2's WebGL/tone calls need in-browser parity. "Totally done" therefore could not mean
