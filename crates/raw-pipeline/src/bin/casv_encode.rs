@@ -609,10 +609,14 @@ fn run_raw_frames_mode(args: &[String]) -> ! {
         }
         r.unwrap_or_else(|e| fail(format!("encode failed: {e:?}")))
     } else {
-        let frames = drain_all(&mut src, total);
-        if let Some(err) = src.take_error() {
-            fail(format!("raw frame decode: {err}"));
-        }
+        // Batch tiers (lossless / lossy skip=none) materialise every frame before
+        // encoding, so decode the independent RAW frames concurrently (rayon,
+        // order-preserving, byte-identical to the serial drain) instead of one at a
+        // time — the RAW-timelapse path is decode-bound and each frame is a separate
+        // file. Peak memory is unchanged (batch already holds all N frames resident).
+        let frames = src
+            .decode_all_parallel(&|done| progress("decode", done, total))
+            .unwrap_or_else(|e| fail(format!("raw frame decode: {e:?}")));
         let n = frames.len();
         progress("encode", 0, n);
         let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();

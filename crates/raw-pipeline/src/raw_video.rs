@@ -23,7 +23,10 @@
 
 #![cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
 
 use crate::casa_video::{VideoError, VideoFrameSource};
 use crate::casabio_encode::box_downscale_rgb8;
@@ -192,6 +195,39 @@ fn decode_raw_full(
     }
 }
 
+/// Decode one RAW file straight to its downscaled (or exact) target RGB8 frame —
+/// the exact per-frame work `next_frame_into` performs for the batch tiers, minus
+/// the scene-cut / `force_iframe` bookkeeping (the batch encoder never consults it).
+/// Self-contained and independent of any other frame, so a whole sequence can be
+/// decoded across frames in parallel and stay byte-identical to a serial drain.
+fn decode_frame_downscaled(
+    path: &Path,
+    look: &RawVideoLook,
+    nr: f32,
+    dw: u32,
+    dh: u32,
+) -> Result<Vec<u8>, VideoError> {
+    let bytes =
+        std::fs::read(path).map_err(|e| VideoError::Raw(format!("read {}: {e}", path.display())))?;
+    let mut full = Vec::new();
+    let (w, h) = decode_raw_full(&bytes, look, nr, &mut full)?;
+    let (dwu, dhu) = (dw as usize, dh as usize);
+    if dwu == w && dhu == h {
+        // Exact target: the native frame is the output — mirror of the
+        // `buf.extend_from_slice(src)` fast path in `next_frame_into`.
+        full.truncate(w * h * 3);
+        Ok(full)
+    } else {
+        let src = &full[..w * h * 3];
+        let mut out = vec![0u8; dwu * dhu * 3];
+        if box_downscale_rgb8(src, w as u32, h as u32, &mut out, dw, dh) {
+            Ok(out)
+        } else {
+            Err(VideoError::Raw(format!("downscale {w}x{h} -> {dw}x{dh} failed")))
+        }
+    }
+}
+
 /// Integer BT.601 luma mean of a packed RGB8 frame (scene-cut magnitude).
 fn luma_mean_rgb8(px: &[u8]) -> f32 {
     let n = px.len() / 3;
@@ -297,6 +333,51 @@ impl RawVideoSource {
     /// Take a decode error that aborted the stream, if any. Call after the encode.
     pub fn take_error(&mut self) -> Option<String> {
         self.last_err.take()
+    }
+
+    /// Number of frames (RAW files) in the sequence.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Always false — a `RawVideoSource` is built from a non-empty file list.
+    pub fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    /// Decode frame `idx` (in file order) to its downscaled RGB8 target buffer,
+    /// independently of stream position. Byte-identical to the frame `next_frame_into`
+    /// would produce at that index. Exposed for the serial-vs-parallel decode A/B.
+    pub fn decode_one(&self, idx: usize) -> Result<Vec<u8>, VideoError> {
+        decode_frame_downscaled(&self.files[idx], &self.look, self.nr_strength, self.dw, self.dh)
+    }
+
+    /// Decode **all** frames concurrently (rayon) into an order-preserving vector of
+    /// downscaled RGB8 frames — the parallel counterpart of draining `next_frame` for
+    /// the batch tiers (lossless / lossy skip=none), which materialise every frame
+    /// before encoding anyway. Each RAW file is an independent decode, so the result is
+    /// byte-identical to a serial drain: `par_iter().collect()` preserves file order,
+    /// and the first decode error short-circuits the collect. `on_frame(done)` fires
+    /// once per completed frame (unordered) for progress reporting.
+    ///
+    /// Peak memory ≈ all N result frames resident (same as the serial batch drain) plus
+    /// up to `rayon::current_num_threads()` full-res decode transients in flight.
+    pub fn decode_all_parallel(
+        &self,
+        on_frame: &(dyn Fn(usize) + Sync),
+    ) -> Result<Vec<Vec<u8>>, VideoError> {
+        let look = self.look;
+        let nr = self.nr_strength;
+        let (dw, dh) = (self.dw, self.dh);
+        let done = AtomicUsize::new(0);
+        self.files
+            .par_iter()
+            .map(|path| {
+                let frame = decode_frame_downscaled(path, &look, nr, dw, dh)?;
+                on_frame(done.fetch_add(1, Ordering::Relaxed) + 1);
+                Ok(frame)
+            })
+            .collect()
     }
 }
 
