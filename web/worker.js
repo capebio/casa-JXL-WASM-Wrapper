@@ -108,10 +108,16 @@ function processRawWithFlagsNamed(decoderFn, bytes, flags, opts = RAW_NEUTRAL) {
 }
 
 // EXIF orientation flag bits (mirror src/lib.rs).
+// NOTE: bit 8 is OUT_FULL_16 (full-res RGB16). OUT_NO_ORIENT is bit 16 — it was
+// split off the 8 collision in b08c0d31 and the shipped web/pkg checks bit 16.
+// This worker was the lone caller left at the stale 8 (all tests + asset-store
+// already use 16), so every full-res export was silently retaining the ~120 MB
+// RGB16 master (bit 8 = FULL_16) AND running apply_orientation instead of skipping
+// it — double-rotating portrait (EXIF 3/6/8) files. Keep in lock-step with lib.rs.
 const OUT_FULL_RGB8 = 1;
 const OUT_LIGHTBOX  = 2;
 const OUT_THUMB     = 4;
-const OUT_NO_ORIENT = 8;
+const OUT_NO_ORIENT = 16;
 
 // Compose EXIF orientation tag (1..8) with N additional CW quarter-turns.
 // Only handles the cycle {1, 6, 3, 8} that maps to pure rotations — Olympus
