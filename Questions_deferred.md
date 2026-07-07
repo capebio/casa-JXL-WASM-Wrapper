@@ -2173,13 +2173,13 @@ a wider blast radius, not squeezed into a single-file edit.
   size would stop an optimisation/fix applying to only one fork. Cross-project infra.
 
 <!-- casabio.rs upload-path holographic review — 2026-07-06 -->
-- **JPEG full variant: lossless transcode instead of decode→re-encode.** `casabio_upload_file`
-  decodes JPEG masters to RGBA then re-encodes the full level lossy (Q85) via `encode_one`.
-  `jxl_native::transcode_jpeg_to_jxl` exists and the main pipeline already uses it (pipeline.rs:1845).
-  Route JPEG full through transcode (lossless, skips the largest encode); decode only for thumb/preview.
-  BLOCKED on an orientation contract: transcode preserves the original JPEG + its EXIF-orientation
-  metadata, while casabio bakes orientation into pixels — consumers must honour one convention, not both.
-  Needs a sidecars-only encoder (encode_variants always emits `full`). Spans casabio + casabio_encode + server contract.
+- **✅ DONE (branch `perf/casabio-upload-govern-20260705-vx7`, commit 2c8310f) — JPEG full variant: lossless transcode.**
+  `casabio_upload_file` decoded JPEG masters to RGBA then re-encoded the full level lossy (Q85). Now the JPEG
+  full comes from `jxl_native::transcode_jpeg_to_jxl` (lossless, repacks DCT coeffs, ~20% smaller, carries EXIF
+  orientation via StoreJPEGMetadata). Added `encode_variants_sidecars` to raw-pipeline for thumb/preview-only
+  (byte-identical to encode_variants' 300/1080). Orientation resolved as metadata-honoured per user; CMYK/exotic
+  JPEGs fall back to the pixel re-encode. Follow-up micro (not done): JPEG path now opens the file 3× (image::open
+  + read_exif_orientation + std::fs::read for transcode bytes) — could decode from a single in-memory read.
 - **DNG/CR2/NEF decode routing.** `classify_source` tags 20 RAW extensions as `Raw`, but
   `decode_raw_to_rgba` is ORF-only (tiff::parse + Olympus decompress + `default_olympus`, rejects
   `compression != 1`) so compressed DNG/CR2/NEF fail with "compression X not supported" and never reach
