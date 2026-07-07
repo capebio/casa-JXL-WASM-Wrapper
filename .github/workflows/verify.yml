@@ -17,6 +17,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly fuzz campaigns — the `fuzz` job below only runs on these two triggers,
+  # not on push/PR (which would block reviews for 24 h on a standard runner).
+  schedule:
+    - cron: '0 2 * * *'    # 02:00 UTC daily
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -84,3 +89,50 @@ jobs:
       - name: bun ffi-abi contract test
         working-directory: packages/jxl-wasm
         run: bun test test/ffi-abi-contract.test.ts
+
+  # ── Long-running fuzz campaigns ──────────────────────────────────────────────
+  # Runs ONLY on nightly schedule or manual workflow_dispatch — NOT on push/PR.
+  # Each matrix job runs one libFuzzer target for up to 24 h on a standard runner
+  # (GitHub Actions caps free-tier hosted runners at 6 h; the -max_total_time value
+  # is intentionally larger so self-hosted / larger runners can exploit it fully).
+  #
+  # Coverage: the five pure-Rust parser targets that build without libjxl.
+  # The four codec-gated targets (casv_header, casv_footer, casv_audio_box,
+  # jxtc_header) require libjxl/emscripten and are excluded from this job;
+  # they are covered by the fuzz-build 20 s smoke above.
+  fuzz:
+    name: Fuzz ${{ matrix.target }} (nightly campaign)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - tiff_parse
+          - cr2_decode
+          - dng_decode
+          - ljpeg_decode
+          - decompress
+    defaults:
+      run:
+        working-directory: crates/raw-pipeline
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/raw-pipeline/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run fuzz campaign
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=86400 -jobs=4
+        env:
+          RUST_BACKTRACE: 1
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: crates/raw-pipeline/fuzz/artifacts/${{ matrix.target }}/
