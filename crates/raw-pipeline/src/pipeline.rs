@@ -3195,6 +3195,15 @@ pub fn downscale_rgb16_into(
     validate_pixel_buffer_u16(src, sw, sh, 3).expect("downscale_rgb16_into: source buffer bounds");
     validate_pixel_buffer_u16(out, dw, dh, 3).expect("downscale_rgb16_into: output buffer bounds");
 
+    // PIPE-015: identity (no resize) → exact copy. Also a correctness guard for the exact-factor
+    // path below: when sw==dw && sh==dh, n_px == 1 and `((1u128<<64)/1) as u64` wraps to 0, so
+    // `(sum * 0) >> 64` would blacken the whole frame. copy_from_slice is also faster than the
+    // per-pixel sum/reciprocal loop. (Lengths are validated equal above.)
+    if sw == dw && sh == dh {
+        out.copy_from_slice(src);
+        return;
+    }
+
     // Integer fast path for exact factors (very common: 1800px lb → 360px thumb = 5x).
     // Flipflop bench (2026-06-18): serial 8ms, parallel 3.4ms → 2.37× speedup on 12MP.
     // Optimization (C7, 2026-06-19): replace 3 divides/pixel with reciprocal multiply (8–13% faster).
@@ -3288,6 +3297,13 @@ pub fn downscale_rgb8_into(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usiz
     use rayon::prelude::*;
     validate_pixel_buffer(src, sw, sh, 3).expect("downscale_rgb8_into: source buffer bounds");
     validate_pixel_buffer(out, dw, dh, 3).expect("downscale_rgb8_into: output buffer bounds");
+
+    // PIPE-015: identity (no resize) → exact copy. Also guards the exact-factor reciprocal below
+    // (n == 1 → `((1u128<<64)/1) as u64` wraps to 0 → black frame). See downscale_rgb16_into.
+    if sw == dw && sh == dh {
+        out.copy_from_slice(src);
+        return;
+    }
 
     // Integer fast path for exact factors (symmetric to the rgb16 version).
     // Optimization (C7, 2026-06-19): replace 3 divides/pixel with reciprocal multiply (8–13% faster).
@@ -4822,6 +4838,27 @@ mod black_neutrality_tests {
 #[cfg(test)]
 mod downscale_recip_parity_tests {
     use super::*;
+
+    #[test]
+    fn identity_resize_is_exact_copy_rgb16() {
+        // PIPE-015 regression: sw==dw && sh==dh hits the exact-factor path with n_px == 1.
+        // `((1u128<<64)/1) as u64` wraps to 0, so the reciprocal multiply blackened the frame.
+        // The identity guard must instead reproduce the source byte-for-byte.
+        let (w, h) = (37usize, 21usize);
+        let src = synth_rgb16(w, h);
+        let mut out = vec![0u16; w * h * 3];
+        downscale_rgb16_into(&src, w, h, w, h, &mut out);
+        assert_eq!(out, src, "identity downscale must equal the source (not a black frame)");
+    }
+
+    #[test]
+    fn identity_resize_is_exact_copy_rgb8() {
+        let (w, h) = (37usize, 21usize);
+        let src: Vec<u8> = synth_rgb16(w, h).iter().map(|&v| (v >> 6) as u8).collect();
+        let mut out = vec![0u8; w * h * 3];
+        downscale_rgb8_into(&src, w, h, w, h, &mut out);
+        assert_eq!(out, src, "identity downscale (rgb8) must equal the source");
+    }
 
     /// Generate a synthetic RGB16 image with deterministic per-pixel values.
     fn synth_rgb16(w: usize, h: usize) -> Vec<u16> {
