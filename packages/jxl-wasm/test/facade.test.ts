@@ -19,7 +19,7 @@ import {
 
 // Types under test for extra-channel Phase 2 live in the facade (not yet re-exported via index).
 import type { ExtraChannel, EncoderOptions } from "../src/facade";
-import { computeButteraugli, extractJpegReconstructionFromJxl, serializeExtraChannelsForWasm, EC_BYTES } from "../src/facade";
+import { computeButteraugli, encodeRgba16, extractJpegReconstructionFromJxl, serializeExtraChannelsForWasm, EC_BYTES } from "../src/facade";
 
 const decodeOptions = {
   format: "rgba8" as const,
@@ -1064,6 +1064,109 @@ describe("bilinear resize via targetWidth/targetHeight", () => {
     expect(typeof decoder.push).toBe("function");
     expect(typeof decoder.events).toBe("function");
     decoder.cancel();
+  });
+});
+
+describe("encodeRgba16", () => {
+  afterEach(() => {
+    setJxlModuleFactoryForTesting(null);
+  });
+
+  test("calls _jxl_wasm_encode_rgba16 and returns encoded bytes", async () => {
+    const module = createFakeLibjxlModule() as any;
+    module._jxl_wasm_encode_rgba16 = (pixelsPtr: number, width: number, height: number) => {
+      const byteLength = width * height * 8; // 4 channels × 2 bytes
+      return module.__makeHandle(module.HEAPU8.slice(pixelsPtr, pixelsPtr + byteLength), width, height, 16);
+    };
+    setJxlModuleFactoryForTesting(async () => module);
+
+    const pixels = new Uint16Array(2 * 2 * 4);
+    pixels.set([65535, 0, 0, 65535,  0, 65535, 0, 65535,  0, 0, 65535, 65535,  32768, 32768, 32768, 65535]);
+    const result = await encodeRgba16(pixels, 2, 2, 90);
+    expect(result).toBeInstanceOf(Uint8Array);
+    // fake encode echoes the pixel bytes
+    expect(result.byteLength).toBe(2 * 2 * 8);
+  });
+
+  test("accepts Uint8Array and ArrayBuffer inputs", async () => {
+    const module = createFakeLibjxlModule() as any;
+    module._jxl_wasm_encode_rgba16 = (pixelsPtr: number, width: number, height: number) => {
+      return module.__makeHandle(module.HEAPU8.slice(pixelsPtr, pixelsPtr + width * height * 8), width, height, 16);
+    };
+    setJxlModuleFactoryForTesting(async () => module);
+
+    const buf = new Uint8Array(1 * 1 * 8).buffer; // 1×1 RGBA16 as ArrayBuffer
+    const r1 = await encodeRgba16(buf, 1, 1, 90);
+    expect(r1).toBeInstanceOf(Uint8Array);
+
+    const u8 = new Uint8Array(1 * 1 * 8);
+    const r2 = await encodeRgba16(u8, 1, 1, 90);
+    expect(r2).toBeInstanceOf(Uint8Array);
+  });
+
+  test("throws CapabilityMissing when _jxl_wasm_encode_rgba16 is absent", async () => {
+    const module = createFakeLibjxlModule(); // does NOT include _jxl_wasm_encode_rgba16
+    setJxlModuleFactoryForTesting(async () => module);
+
+    await expect(encodeRgba16(new Uint16Array(4), 1, 1)).rejects.toBeInstanceOf(CapabilityMissing);
+  });
+
+  test("throws when buffer is smaller than expected pixel stride", async () => {
+    const module = createFakeLibjxlModule() as any;
+    module._jxl_wasm_encode_rgba16 = () => 0;
+    setJxlModuleFactoryForTesting(async () => module);
+
+    // 1×1 RGBA16 needs 8 bytes; supply only 4
+    await expect(encodeRgba16(new Uint16Array(2), 1, 1)).rejects.toThrow(/buffer too small/);
+  });
+
+  test("frees the pixel buffer after encoding (no allocation leak)", async () => {
+    const module = createFakeLibjxlModule() as any;
+    module._jxl_wasm_encode_rgba16 = (pixelsPtr: number, width: number, height: number) => {
+      return module.__makeHandle(module.HEAPU8.slice(pixelsPtr, pixelsPtr + width * height * 8), width, height, 16);
+    };
+    setJxlModuleFactoryForTesting(async () => module);
+
+    const pixels = new Uint16Array(1 * 1 * 4);
+    await encodeRgba16(pixels, 1, 1, 90);
+    // Both the pixel ptr and the output handle data ptr should be freed
+    expect(module.__allocations.size).toBe(0);
+  });
+
+  test("round-trip: encode then decode via createDecoder returns pixels within rounding error", async () => {
+    const module = createFakeLibjxlModule() as any;
+    // fake encode: echo pixel bytes as "JXL bitstream"
+    module._jxl_wasm_encode_rgba16 = (pixelsPtr: number, width: number, height: number) => {
+      const byteLength = width * height * 8;
+      return module.__makeHandle(module.HEAPU8.slice(pixelsPtr, pixelsPtr + byteLength), width, height, 16);
+    };
+    // fake decode: echo "JXL bitstream" back as pixels (simulates lossless round-trip)
+    module._jxl_wasm_decode_rgba16 = (inputPtr: number, inputSize: number) => {
+      return module.__makeHandle(module.HEAPU8.slice(inputPtr, inputPtr + inputSize), 1, 1, 16);
+    };
+    setJxlModuleFactoryForTesting(async () => module);
+
+    const srcPixels = new Uint16Array([12000, 30000, 60000, 65535]); // 1×1 RGBA16
+    const encoded = await encodeRgba16(srcPixels, 1, 1, 100);
+    expect(encoded.byteLength).toBe(8); // 1×1 × 8 bytes/pixel
+
+    // Decode via createDecoder to verify the round-trip contract
+    const decoder = createDecoder({ ...decodeOptions, format: "rgba16" });
+    decoder.push(encoded.buffer);
+    decoder.close();
+    const events: any[] = [];
+    for await (const ev of decoder.events()) events.push(ev);
+    await decoder.dispose();
+
+    const final = events.find((e) => e.type === "final");
+    expect(final).toBeDefined();
+    if (final?.type === "final") {
+      const decoded = new Uint16Array(final.pixels.buffer, final.pixels.byteOffset, final.pixels.byteLength / 2);
+      // Within rounding error (fake = exact match; real WASM lossy may differ slightly)
+      for (let i = 0; i < srcPixels.length; i++) {
+        expect(Math.abs(decoded[i]! - srcPixels[i]!)).toBeLessThan(1);
+      }
+    }
   });
 });
 
