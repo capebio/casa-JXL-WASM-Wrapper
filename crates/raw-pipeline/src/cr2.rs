@@ -349,6 +349,74 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
     Some(crate::dng::mul3x3(crate::dng::XYZ_D50_TO_SRGB, cam_to_xyz))
 }
 
+/// Data-driven CFA (Bayer) phase correction from green-site equality.
+///
+/// In a 2×2 Bayer cell the two GREEN sites sample the same colour, so they are the
+/// near-EQUAL diagonal pair; Red and Blue (the singletons) are the UNEQUAL pair.
+/// The demosaicer's phase must place green on the correct diagonal. The phase
+/// derived from SensorInfo / the center-crop fallback is wrong for some bodies
+/// (observed: the 550D reports RGGB `(0,0)` but its greens sit on the main
+/// diagonal → green↔R/B swap → a magenta cast). We detect the green diagonal from
+/// the actual pixels and flip the phase's column parity when it disagrees.
+///
+/// Scene-independent: it does NOT assume green is the brightest channel — only
+/// that the two green sites (identical colour, adjacent) are far more equal than
+/// the R/B singletons. No-op when the derived phase already agrees, or when the
+/// frame is too flat/neutral to tell (R≈B) — the safe direction.
+fn refine_cfa_phase_by_green(raw: &[u16], w: usize, h: usize, derived: (u8, u8)) -> (u8, u8) {
+    if w < 4 || h < 4 || raw.len() < w * h {
+        return derived;
+    }
+    // Mean of each of the 4 site classes over an ODD stride (an even stride would
+    // alias the 2×2 grid and only sample one class).
+    let mut sum = [0u64; 4];
+    let mut cnt = [0u64; 4];
+    let ys = ((h / 512).max(1)) | 1;
+    let xs = ((w / 512).max(1)) | 1;
+    let mut y = 0;
+    while y < h {
+        let base = y * w;
+        let mut x = 0;
+        while x < w {
+            sum[(y & 1) * 2 + (x & 1)] += raw[base + x] as u64;
+            cnt[(y & 1) * 2 + (x & 1)] += 1;
+            x += xs;
+        }
+        y += ys;
+    }
+    let m = |i: usize| -> i64 {
+        if cnt[i] > 0 { (sum[i] / cnt[i]) as i64 } else { 0 }
+    };
+    let (m00, m01, m10, m11) = (m(0), m(1), m(2), m(3));
+    let diff_main = (m00 - m11).abs(); // (0,0)&(1,1) equal ⇒ green on main diagonal
+    let diff_anti = (m01 - m10).abs(); // (0,1)&(1,0) equal ⇒ green on anti-diagonal
+    let level = ((m00 + m01 + m10 + m11) / 4).max(1);
+
+    // The green pair is the clearly-more-equal diagonal: its internal difference
+    // must be well below the singleton pair's AND the singleton pair must differ
+    // by a meaningful amount (else the frame is too neutral to judge — keep derived).
+    let (green_diff, singleton_diff, green_on_main) = if diff_main <= diff_anti {
+        (diff_main, diff_anti, true)
+    } else {
+        (diff_anti, diff_main, false)
+    };
+    let clear = singleton_diff > green_diff * 4 && singleton_diff * 100 > level;
+    if !clear {
+        return derived;
+    }
+
+    // Phases with green on the ANTI diagonal: (0,0) RGGB, (1,1) BGGR.
+    // Phases with green on the MAIN diagonal: (0,1) GRBG, (1,0) GBRG.
+    let derived_on_main = matches!(derived, (0, 1) | (1, 0));
+    if derived_on_main == green_on_main {
+        return derived; // already the correct diagonal
+    }
+    // Flip one parity to move green across the diagonal, preserving the derived
+    // R/B tendency as far as possible. (R/B *within* the corrected diagonal is a
+    // second-order distinction the WB + matrix largely absorb.)
+    (derived.0, derived.1 ^ 1)
+}
+
 // ---------------------------------------------------------------------------
 // Decode entry points
 // ---------------------------------------------------------------------------
@@ -1269,6 +1337,12 @@ fn decode_impl(
         slices: if have_slices { cr2_slices } else { [0; 3] },
     };
 
+    // Data-driven CFA-phase correction: `choose_crop_origin` derives the phase
+    // from SensorInfo/center parity, which is wrong for some bodies (e.g. the
+    // 550D → green swapped onto the R/B diagonal → magenta). Verify against the
+    // actual pixels and flip if the green sites are on the other diagonal.
+    let cfa_phase = refine_cfa_phase_by_green(&raw_out, crop_w, crop_h, cfa_phase);
+
     Ok((
         Cr2Image {
             width: crop_w,
@@ -1759,6 +1833,48 @@ mod tests {
         data[127] = 0x07; // R = 2000
                           // G1 stays 0
         assert!(extract_wb_from_raw(&data, 0, 70, true).is_none());
+    }
+
+    #[test]
+    fn refine_cfa_phase_flips_when_green_on_wrong_diagonal() {
+        // 8×8 synthetic mosaic. Greens (identical colour) on the MAIN diagonal:
+        // (0,0)&(1,1) = 2000 (equal); singletons (0,1)=3000 R, (1,0)=1000 B.
+        let (w, h) = (8usize, 8usize);
+        let mut raw = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                raw[y * w + x] = match (y & 1, x & 1) {
+                    (0, 0) | (1, 1) => 2000, // green
+                    (0, 1) => 3000,          // red
+                    _ => 1000,               // blue
+                };
+            }
+        }
+        // Derived RGGB (0,0) expects green on the ANTI diagonal → must flip col parity.
+        assert_eq!(refine_cfa_phase_by_green(&raw, w, h, (0, 0)), (0, 1));
+        // Already green-on-main → no change.
+        assert_eq!(refine_cfa_phase_by_green(&raw, w, h, (0, 1)), (0, 1));
+    }
+
+    #[test]
+    fn refine_cfa_phase_noop_when_correct_or_neutral() {
+        let (w, h) = (8usize, 8usize);
+        // Greens on ANTI diagonal (real RGGB); singletons differ → derived (0,0) kept.
+        let mut rggb = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                rggb[y * w + x] = match (y & 1, x & 1) {
+                    (0, 1) | (1, 0) => 2000, // green
+                    (0, 0) => 3000,          // red
+                    _ => 1000,               // blue
+                };
+            }
+        }
+        assert_eq!(refine_cfa_phase_by_green(&rggb, w, h, (0, 0)), (0, 0));
+        // Flat/neutral frame (R≈B) → too ambiguous to judge → keep derived, whatever it is.
+        let flat = vec![1500u16; w * h];
+        assert_eq!(refine_cfa_phase_by_green(&flat, w, h, (0, 0)), (0, 0));
+        assert_eq!(refine_cfa_phase_by_green(&flat, w, h, (1, 0)), (1, 0));
     }
 
     #[test]

@@ -46,6 +46,35 @@ WB-first → matrix pipeline order.
   (channel collapse), so per-model matrices were disabled pending "scene-relative
   WB correction derived from the matrix's implied D65 neutral."
 
+## UPDATE 2026-07-07 — deeper diagnosis + first fix LANDED
+
+Native probes (temp `tests/cr2_color_diag.rs` + env-gated dumps in `cr2.rs`, both
+removed) refined the four issues to exact mechanisms:
+
+- **550D magenta = WRONG CFA PHASE. ✅ FIXED.** 4-phase demosaic proved the 550D's
+  greens sit on the MAIN diagonal (the two corner sites read *exactly equal* —
+  they are the greens), but `choose_crop_origin` derived RGGB `(0,0)` (greens on
+  the anti-diagonal) → green↔R/B swap → magenta. Fix: `refine_cfa_phase_by_green`
+  in `cr2.rs` — data-driven, scene-independent (greens are the more-equal
+  diagonal), flips the phase when the derived one disagrees; no-op otherwise.
+  Verified: 550D `(0,0)→(0,1)`, green now highest, cast R/G≈1.0 B/G≈0.8 (was
+  R/G≈1.6 B/G≈2.0); **M5 stays `(0,0)`**; all 22 `cr2` tests + 2 new unit tests
+  pass. Applied to the **batch** path (`Cr2Image`, what the browser CR2 decode
+  uses). *Streaming `Cr2RowSource` not yet corrected* (uncropped/stacked raw makes
+  green-detect crop-aware; CR2 card decode is batch so browser is covered).
+- **M5 WB = `0x4001` is `dtype=7` (UNDEFINED byte blob, 5120 B), code only accepts
+  `dtype==3` (SHORT).** So the M5 ColorData is skipped → `wb_from_camera=false` →
+  2.0/1.7 fallback. Within the M5 blob, **short-offset 71 holds the AsShot WB**
+  (only per-file-*varying* candidate: r≈1331–1576 / g=1024 / b≈1306–1540 → ~1.3–1.5×;
+  offsets 95/103 are constant = presets). The `version` word reads garbage at the
+  naïve base, so **the exact offset needs an exiftool/dcraw Canon-ColorData
+  cross-check before shipping** — not guessed. NOT yet fixed.
+- **M5 "black" frames = exposure, not (only) a bug.** Bright M5 frames have RAW
+  `min≈2010≈2048` (black level right); the dark ADH frames have low means
+  (mostly-shadow forest floor) so black-subtract crushes them — compounded by the
+  wrong fallback WB giving a green cast. Fixing the M5 WB is the real lever.
+- **Generic matrix** — unchanged (documented deferral, below).
+
 ## Recommended fix path (dedicated — do NOT hack under wrap-up)
 
 Ordered by value/risk:
