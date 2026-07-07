@@ -155,6 +155,18 @@ async function main() {
   }
 
   if (!insideDocker && !hostToolchain) {
+    // GUARD: the docker path builds STOCK UPSTREAM libjxl — the Dockerfile clones
+    // ${LIBJXL_TAG} (v0.11.2) from github.com/libjxl/libjxl and does NOT mount the in-repo
+    // fork or forward LIBJXL_SRC_DIR into the container. So if LIBJXL_SRC_DIR is set the caller
+    // wants the fork (external/libjxl-012), but this path would silently build + ship an
+    // UPSTREAM bridge (the trap that shipped a wrongly-tagged 0.11.2 dist). Fail closed.
+    if (useLocalSource && !process.argv.includes("--allow-upstream-docker")) {
+      throw new Error(
+        `LIBJXL_SRC_DIR is set (fork: ${sourceDir}) but the default docker path builds STOCK ` +
+          `UPSTREAM libjxl ${config.libjxlTag} and ignores LIBJXL_SRC_DIR. To build the fork use ` +
+          `--host-toolchain; to intentionally build upstream in docker pass --allow-upstream-docker.`
+      );
+    }
     await runDockerBuild();
     return;
   }
