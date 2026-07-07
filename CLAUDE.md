@@ -30,7 +30,9 @@ src/lib.rs             (RAW pipeline: ORF/DNG → RGB8/16 pixel buffer)
 | `packages/jxl-stream/src/browser.ts` | fromReadableStream / fromResponse; one-ahead I/O prefetch |
 | `packages/jxl-cache/src/browser.ts` | OPFS + LRU; content-agnostic |
 
-Optimization scores: scheduler/decode-handler/facade/cache/stream/lib.rs/protocol = **5/5**; decode-session = **4/5**; web/main.js + web/jxl-progressive-\*.js = **5/5**.
+Optimization scores: scheduler/decode-handler/facade/cache/stream/lib.rs/protocol = **5/5**; decode-session = **5/5**; web/main.js + web/jxl-progressive-\*.js = **5/5**.
+
+> decode-session 4/5→5/5 (2026-07-07, `perf/decode-session-5of5-jul07`): profiled the receive→emit→consume path. Default frame path is already optimal — `makeFrame` uses guard-assign (no per-field spread intermediates), `AsyncEventStream` is ratified (head-cursor, single-waiter slot, module-level `DONE`/`DONE_PROMISE`, packed-elements), emit is synchronous (no per-frame promise/microtask), and abort/budget checks are not per-push. The one remaining reducible per-frame allocation was the inline `emit` closure in `emitFoldedMetrics`, allocated on every progress/final frame when `onMetric` is set — hoisted to module scope. Measured (isolated A/B, 5×5M interleaved): 41.7→30.7 ns/call (−26%) + one closure alloc removed per frame. Emit-path microbench (200k frames) is otherwise dominated by the protocol-inherent async-iterator microtask hop (~180 ns/frame), not session code; heap churn is short-lived (fully GC'd, no retention).
 
 ## Layer Invariants — What Belongs Where
 
