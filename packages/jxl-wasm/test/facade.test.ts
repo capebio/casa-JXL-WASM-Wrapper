@@ -832,7 +832,7 @@ describe("@casabio/jxl-wasm facade", () => {
     let iccProfile: Uint8Array | null = null;
     try {
       iccProfile = new Uint8Array(
-        readFileSync(new URL("../../../external/libjxl/third_party/skcms/profiles/color.org/sRGB2014.icc", import.meta.url))
+        readFileSync(new URL("../../../external/libjxl-012/third_party/skcms/profiles/color.org/sRGB2014.icc", import.meta.url))
       );
     } catch {
       iccProfile = null; // fixture unavailable — still exercises EXIF/XMP path
