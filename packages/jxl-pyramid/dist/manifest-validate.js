@@ -7,6 +7,10 @@ export const INDEX_SCHEMA_VERSION = 1;
 const MAX_DIMENSION = 1 << 24; // 16777216 — matches libjxl JXTC header caps
 const MAX_BYTES = 1 << 30; // 1073741824 — 1 GiB safety cap
 const MAX_TILE_SIZE = 1 << 16; // 65536 — reasonable tile limit
+// Opaque-dict sanitization caps
+const MAX_OPAQUE_KEYS = 64;
+const MAX_OPAQUE_DEPTH = 4;
+const MAX_OPAQUE_KEY_LENGTH = 128;
 export class ManifestValidationError extends Error {
     path;
     constructor(message, path) {
@@ -43,6 +47,26 @@ function requireArray(v, path) {
         fail(path, `expected array, got ${typeof v}`);
     return v;
 }
+function sanitizeOpaqueObject(v, path, depth = 0) {
+    if (depth > MAX_OPAQUE_DEPTH)
+        fail(path, `opaque object exceeds maximum nesting depth ${MAX_OPAQUE_DEPTH}`);
+    const keys = Object.keys(v);
+    if (keys.length > MAX_OPAQUE_KEYS)
+        fail(path, `opaque object exceeds maximum key count ${MAX_OPAQUE_KEYS}, got ${keys.length}`);
+    const out = Object.create(null);
+    for (const k of keys) {
+        if (k.length > MAX_OPAQUE_KEY_LENGTH)
+            fail(path, `key "${k.slice(0, 32)}…" exceeds maximum length ${MAX_OPAQUE_KEY_LENGTH}`);
+        const child = v[k];
+        if (child !== null && typeof child === "object" && !Array.isArray(child)) {
+            out[k] = sanitizeOpaqueObject(child, `${path}.${k}`, depth + 1);
+        }
+        else {
+            out[k] = child;
+        }
+    }
+    return out;
+}
 function validateMasterMetadata(v, path) {
     const o = requireObject(v, path);
     const name = requireString(o["name"], `${path}.name`);
@@ -62,14 +86,23 @@ function validateMasterMetadata(v, path) {
         result.sizeBytes = requireNumber(o["sizeBytes"], `${path}.sizeBytes`);
     return result;
 }
+/** S6 (additive): validate an optional LodCapabilities bag — object of optional booleans. */
+function validateCapabilities(v, path) {
+    const o = requireObject(v, path);
+    const result = {};
+    for (const k of ["quality", "resolution", "region"]) {
+        if (o[k] !== undefined)
+            result[k] = requireBoolean(o[k], `${path}.${k}`);
+    }
+    return result;
+}
 function validateProducedBy(v, path) {
     const o = requireObject(v, path);
     const tool = requireString(o["tool"], `${path}.tool`);
     const version = requireString(o["version"], `${path}.version`);
     const result = { tool, version };
     if (o["params"] !== undefined) {
-        requireObject(o["params"], `${path}.params`);
-        result.params = o["params"];
+        result.params = sanitizeOpaqueObject(requireObject(o["params"], `${path}.params`), `${path}.params`);
     }
     return result;
 }
@@ -159,6 +192,9 @@ function validateLevel(v, path) {
             return point;
         });
     }
+    if (o["capabilities"] !== undefined) {
+        level.capabilities = validateCapabilities(o["capabilities"], `${path}.capabilities`);
+    }
     return level;
 }
 /**
@@ -220,11 +256,12 @@ export function parsePyramidManifest(json) {
     if (o["producedBy"] !== undefined)
         result.producedBy = validateProducedBy(o["producedBy"], "manifest.producedBy");
     if (o["metadata"] !== undefined) {
-        requireObject(o["metadata"], "manifest.metadata");
-        result.metadata = o["metadata"];
+        result.metadata = sanitizeOpaqueObject(requireObject(o["metadata"], "manifest.metadata"), "manifest.metadata");
     }
     if (o["convergedByteEnd"] !== undefined)
         result.convergedByteEnd = requireNumber(o["convergedByteEnd"], "manifest.convergedByteEnd");
+    if (o["capabilities"] !== undefined)
+        result.capabilities = validateCapabilities(o["capabilities"], "manifest.capabilities");
     return result;
 }
 function validateLevelZeroSeed(v, path) {

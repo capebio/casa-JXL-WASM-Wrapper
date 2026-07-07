@@ -142,13 +142,8 @@ export interface DecodeOptions {
     cacheDcTiles?: boolean;
 }
 export type ProgressiveMode = 'dc-then-final' | 'dc-only' | undefined;
-/** Agent6-4: once-per-LevelSource lazy capture of ICC (and future metadata) using minimal header decoder + facade.getIccProfile.
- *  Caches on the source object (like bytesId). Shared reference stamped to results (no per-tile copies).
- *  Only runs if options.preserveMetadata. For JXTC the profile lives in the codestream(s); header target is cheap.
- */
 export declare function ensureIccProfile(source: {
     bytes: Uint8Array;
-    [k: string]: any;
 }, opts?: {
     preserveMetadata?: boolean;
 }): Promise<Uint8Array | null>;

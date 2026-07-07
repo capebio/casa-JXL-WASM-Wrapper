@@ -20,6 +20,20 @@ export interface ProducedBy {
     version: string;
     params?: Record<string, unknown>;
 }
+/**
+ * S6 (additive): which LOD/ROI request axes a level or the whole asset can serve, for the
+ * unified `lod-resolver`. All fields optional; absent = derive from shape (a `tiled` level
+ * implies `region`, multiple levels imply `resolution`, a `qualityCurve` implies `quality`).
+ * Additive on schema 2 — manifests without it parse unchanged.
+ *   quality    — byte-prefix quality tiers available (qualityCurve / convergedByteEnd).
+ *   resolution — multiple resolution levels available (pyramid).
+ *   region     — spatial ROI addressable (tiled / JXTC).
+ */
+export interface LodCapabilities {
+    quality?: boolean;
+    resolution?: boolean;
+    region?: boolean;
+}
 /** Content-addressed color sidecars for Perceptual Constancy Mode (LUT blobs cacheable in PyramidCache as opaque bytes). */
 export interface ColorInfo {
     space?: "srgb" | "display-p3" | (string & {});
@@ -77,6 +91,11 @@ export interface PyramidLevel {
      * Sampled at ingest so clients pick their own bytes↔quality cutoff without re-running butteraugli.
      */
     qualityCurve?: QualityCurvePoint[];
+    /**
+     * S6 (additive): the LOD/ROI axes this level can serve (see LodCapabilities). Optional;
+     * absent → derive from shape (`tiled` ⇒ region, `qualityCurve` ⇒ quality).
+     */
+    capabilities?: LodCapabilities;
 }
 /** The schema definition of `manifest.json` per image. */
 export interface PyramidManifest {
@@ -101,6 +120,11 @@ export interface PyramidManifest {
     color?: ColorInfo;
     /** ML sidecars: embeddings and taxon labels for species recognition. */
     recognition?: RecognitionInfo;
+    /**
+     * S6 (additive): the LOD/ROI axes this asset can serve at the manifest level (see
+     * LodCapabilities). Optional; a pyramid with >1 level implies `resolution`.
+     */
+    capabilities?: LodCapabilities;
 }
 /** Quality target for pickByteEndForQuality. Provide at least one threshold. */
 export interface QualityTarget {

@@ -22,16 +22,16 @@ export var HandleState;
 })(HandleState || (HandleState = {}));
 const DEV = typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production';
 // Grok3 #16 single transition fn with table. Invalid throws in dev.
+const ALLOWED_TRANSITIONS = {
+    [HandleState.WarmFloor]: { [HandleState.Active]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },
+    [HandleState.WarmReapable]: { [HandleState.Active]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },
+    [HandleState.Active]: { [HandleState.WarmReapable]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },
+    [HandleState.Bad]: { [HandleState.Terminated]: true },
+    [HandleState.Terminated]: {},
+};
 function setHandleState(h, next, failureInfo) {
     const cur = h.state;
-    const allowed = {
-        [HandleState.WarmFloor]: [HandleState.Active, HandleState.Bad, HandleState.Terminated],
-        [HandleState.WarmReapable]: [HandleState.Active, HandleState.Bad, HandleState.Terminated],
-        [HandleState.Active]: [HandleState.WarmReapable, HandleState.Bad, HandleState.Terminated],
-        [HandleState.Bad]: [HandleState.Terminated],
-        [HandleState.Terminated]: [],
-    };
-    if (DEV && !allowed[cur]?.includes(next) && cur !== next) {
+    if (DEV && !ALLOWED_TRANSITIONS[cur]?.[next] && cur !== next) {
         throw new Error(`invalid handle state transition ${cur} -> ${next}`);
     }
     h.state = next;
@@ -253,6 +253,7 @@ export class PyramidWorkerPool {
         const spawned = [];
         for (let i = 0; i < n; i++) {
             const h = this.spawnOne();
+            h.inIdle = true;
             this.idle.push(h);
             this.armIdleTimer(h);
             spawned.push(h);
@@ -287,7 +288,7 @@ export class PyramidWorkerPool {
             waiter.resolve([]);
         // reject all inflight with POOL_DESTROYED
         for (const h of this.all) {
-            for (const job of Array.from(h.pending.values())) {
+            for (const job of h.pending.values()) {
                 try {
                     job.reject(new PyramidError('POOL_DESTROYED', 'pool destroyed'));
                 }
@@ -349,9 +350,12 @@ export class PyramidWorkerPool {
         setHandleState(h, HandleState.Terminated);
         this.clearIdleTimer(h);
         this.active.delete(h);
-        const ii = this.idle.indexOf(h);
-        if (ii >= 0)
-            this.idle.splice(ii, 1);
+        if (h.inIdle) {
+            const ii = this.idle.indexOf(h);
+            if (ii >= 0)
+                this.idle.splice(ii, 1);
+            h.inIdle = false;
+        }
         this.all.delete(h);
         this.bytesIdByWorker.delete(h.worker);
         try {
@@ -361,8 +365,10 @@ export class PyramidWorkerPool {
     }
     /** reap all idle (for visibility hidden etc) */
     reapAllIdle() {
-        for (const h of [...this.idle])
+        for (const h of [...this.idle]) {
+            h.inIdle = false;
             this.destroyHandle(h, 'reap all');
+        }
         this.idle.length = 0;
     }
     /**
@@ -397,6 +403,7 @@ export class PyramidWorkerPool {
         // LIFO drain (pop hottest) (Grok3 #18)
         while (got.length < activeLimit && this.idle.length > 0) {
             const h = this.idle.pop();
+            h.inIdle = false;
             this.clearIdleTimer(h);
             if (h.state !== HandleState.WarmReapable && h.state !== HandleState.WarmFloor) {
                 this.destroyHandle(h, 'stale on acquire');
@@ -444,6 +451,9 @@ export class PyramidWorkerPool {
                         if (idx >= 0) {
                             this.waiters.splice(idx, 1);
                             waiter.timer = undefined;
+                            if (DEV && got.length < count) {
+                                console.warn(`[pyramid] acquire timeout: requested ${count}, got ${got.length}, pool at max ${this.maxSize}`);
+                            }
                             resolve(got);
                         }
                     }, maxWait);
@@ -467,6 +477,7 @@ export class PyramidWorkerPool {
             }
             this.releaseBudget(h);
             setHandleState(h, HandleState.WarmReapable);
+            h.inIdle = true;
             this.idle.push(h); // LIFO push
         }
         // drain waiters before re-arm (Grok3)
@@ -477,6 +488,7 @@ export class PyramidWorkerPool {
             const give = [];
             while (give.length < w.want && this.idle.length > 0) {
                 const h = this.idle.pop();
+                h.inIdle = false;
                 this.clearIdleTimer(h);
                 if (this.coreBudget) {
                     if (this.coreBudget.tryAcquire(this.workerCost)) {
@@ -484,6 +496,7 @@ export class PyramidWorkerPool {
                     }
                     else {
                         this.idle.push(h);
+                        h.inIdle = true;
                         break;
                     }
                 }
@@ -500,13 +513,15 @@ export class PyramidWorkerPool {
         if (this.idleTimeoutMs <= 0) {
             while (this.idle.length > this.minIdle) {
                 const h = this.idle.pop();
+                h.inIdle = false;
                 this.destroyHandle(h, 'excess idle');
             }
             return;
         }
         if (this.idle.length <= this.minIdle)
             return;
-        for (let i = this.idle.length - 1; i >= this.minIdle; i--) {
+        const excessEnd = this.idle.length - this.minIdle;
+        for (let i = 0; i < excessEnd; i++) {
             const h = this.idle[i];
             if (h)
                 this.armIdleTimerFor(h);
@@ -587,7 +602,8 @@ export class PyramidWorkerPool {
                 return;
             }
             this.cleanupPendingJob(h, job);
-            job.resolve({ pixels, width: reply.w, height: reply.h });
+            const format = job.bytesPerPixel === 8 ? 'rgba16' : 'rgba8';
+            job.resolve({ pixels, width: reply.w, height: reply.h, format });
         };
         try {
             worker.addEventListener("message", onMessage);
@@ -610,7 +626,7 @@ export class PyramidWorkerPool {
     }
     // Pre-bound for setTimeout( fn, ms, arg ) passthrough (Grok4).
     _reapBound = (h) => {
-        if (this.idle.includes(h) && this.idle.length > this.minIdle) {
+        if (h.inIdle && this.idle.length > this.minIdle) {
             this.destroyHandle(h, 'idle reaped');
         }
     };
@@ -1162,15 +1178,11 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
                     dcOpts.cacheDcTiles = options.cacheDcTiles;
                 }
                 await decodeTilesParallel(bytesId, plan.format, orderedMisses, usable, outBuffer, vp, bpp, dcOpts, deadlineMs, p.requestTimeout, source.tileSize, source.level ?? 0);
-                let finalCompleted = orderedMisses.length + prewarmCompleted;
-                for (const item of hits) {
-                    finalCompleted += 1;
-                    onTile?.(item.region, finalCompleted, { id: item.id, key: tileKey(item.id), stage: 'final', completed: finalCompleted, total });
-                }
+                const finBase = orderedMisses.length + prewarmCompleted;
                 const finOpts = {
                     ...baseTileOpts,
                     progressiveStage: 'final',
-                    progressBase: finalCompleted,
+                    progressBase: finBase,
                     progressTotal: total,
                     sourceW: source.width,
                     sourceH: source.height,
@@ -1180,6 +1192,11 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
                     finOpts.sourceLevelId = levelId;
                 }
                 await decodeTilesParallel(bytesId, plan.format, orderedMisses, usable, outBuffer, vp, bpp, finOpts, deadlineMs, p.requestTimeout, source.tileSize, source.level ?? 0);
+                let finalCompleted = finBase + orderedMisses.length;
+                for (const item of hits) {
+                    finalCompleted += 1;
+                    onTile?.(item.region, finalCompleted, { id: item.id, key: tileKey(item.id), stage: 'final', completed: finalCompleted, total });
+                }
             }
             else {
                 const tileOpts = {
