@@ -214,7 +214,14 @@ fn read_ascii(data: &[u8], cnt: u32, val: u32, inline_pos: usize) -> String {
 
 /// Extract WB multipliers directly from file bytes — no Vec<u16> allocation.
 /// Reads version word then navigates to the AsShot WB index.
-fn extract_wb_from_raw(data: &[u8], off: usize, cnt: u32, le: bool) -> Option<(f32, f32)> {
+///
+/// `dtype` is the TIFF type of the 0x4001 ColorData entry: `3` = SHORT (`cnt` in
+/// shorts, version-word-selected WB index) — most bodies; `7` = UNDEFINED byte
+/// blob (`cnt` in bytes → cnt/2 shorts) — newer DIGIC bodies (e.g. EOS M5) whose
+/// ColorData is stored as raw bytes. The blob's leading word is not a usable
+/// version for those, so the AsShot WB_RGGBLevels sits at the fixed short-offset
+/// 71 (validated against the M5 embedded-preview reference).
+fn extract_wb_from_raw(data: &[u8], off: usize, cnt: u32, le: bool, dtype: u16) -> Option<(f32, f32)> {
     // Checked offset derivation: `off` is file-controlled (val as usize from MakerNote tag).
     // On 32-bit/wasm `off + 2` and `base + 8` (base = off + wb_index*2) can wrap below
     // data.len() and defeat the bounds guard, reading unrelated bytes as WB multipliers.
@@ -222,9 +229,15 @@ fn extract_wb_from_raw(data: &[u8], off: usize, cnt: u32, le: bool) -> Option<(f
     if cnt < 1 || off.checked_add(2).map_or(true, |e| e > data.len()) {
         return None;
     }
-    let version = read_u16(data, off, le);
-    let wb_index: usize = if version >= 6 { 63 } else { 25 };
-    if (cnt as usize) < wb_index + 4 {
+    // dtype 7 (UNDEFINED): cnt counts BYTES, so the array holds cnt/2 u16 shorts.
+    let shorts = if dtype == 7 { (cnt / 2) as usize } else { cnt as usize };
+    let wb_index: usize = if dtype == 7 {
+        71 // M5-style byte-blob ColorData: AsShot WB at short 71 (no usable version word).
+    } else {
+        let version = read_u16(data, off, le);
+        if version >= 6 { 63 } else { 25 }
+    };
+    if shorts < wb_index + 4 {
         return None;
     }
     let base = match off.checked_add(wb_index * 2) {
@@ -1005,11 +1018,13 @@ fn decode_impl(
         // Checked add: makernote_off is file-controlled; `mn_off + 2` can wrap on 32-bit.
         if mn_off.checked_add(2).map_or(false, |e| e <= data.len()) {
             visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| match tag {
-                0x4001 if dtype == 3 && cnt > 0 => {
-                    // cnt<=2 ⟺ 2*cnt<=4 without the file-controlled multiply
-                    // (2*cnt wraps usize on 32-bit/wasm for huge cnt).
-                    let p = if cnt <= 2 { ip } else { val as usize };
-                    if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le) {
+                0x4001 if (dtype == 3 || dtype == 7) && cnt > 0 => {
+                    // Value is inline when it fits in the 4-byte entry slot: dtype 3
+                    // (SHORT) ⟺ cnt<=2; dtype 7 (bytes) ⟺ cnt<=4. Avoids the
+                    // file-controlled multiply that wraps usize on 32-bit/wasm.
+                    let inline = if dtype == 7 { cnt <= 4 } else { cnt <= 2 };
+                    let p = if inline { ip } else { val as usize };
+                    if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le, dtype) {
                         wb_r = r;
                         wb_b = b;
                         wb_from_camera = true;
@@ -1541,9 +1556,10 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
         let mn_off = makernote_off as usize;
         if mn_off.checked_add(2).map_or(false, |e| e <= data.len()) {
             visit_ifd(data, mn_off, le, |tag, dtype, cnt, val, ip| match tag {
-                0x4001 if dtype == 3 && cnt > 0 => {
-                    let p = if cnt <= 2 { ip } else { val as usize };
-                    if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le) {
+                0x4001 if (dtype == 3 || dtype == 7) && cnt > 0 => {
+                    let inline = if dtype == 7 { cnt <= 4 } else { cnt <= 2 };
+                    let p = if inline { ip } else { val as usize };
+                    if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le, dtype) {
                         wb_r = r;
                         wb_b = b;
                     }
@@ -1799,7 +1815,7 @@ mod tests {
         data[131] = 0; // g2
         data[132] = (b & 0xFF) as u8;
         data[133] = (b >> 8) as u8;
-        let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 70, true).unwrap();
+        let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 70, true, 3).unwrap();
         let er = 2166.0 / 1024.0;
         let eb = 1789.0 / 1024.0;
         assert!((wb_r - er).abs() < 1e-4, "wb_r={wb_r} expected={er}");
@@ -1823,7 +1839,7 @@ mod tests {
         data[55] = 0; // g2
         data[56] = (b & 0xFF) as u8;
         data[57] = (b >> 8) as u8;
-        let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 30, true).unwrap();
+        let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 30, true, 3).unwrap();
         assert!((wb_r - 1800.0 / 1024.0).abs() < 1e-4);
         assert!((wb_b - 1600.0 / 1024.0).abs() < 1e-4);
     }
@@ -1836,7 +1852,7 @@ mod tests {
         data[126] = 0xD0;
         data[127] = 0x07; // R = 2000
                           // G1 stays 0
-        assert!(extract_wb_from_raw(&data, 0, 70, true).is_none());
+        assert!(extract_wb_from_raw(&data, 0, 70, true, 3).is_none());
     }
 
     #[test]
