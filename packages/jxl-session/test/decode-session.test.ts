@@ -398,6 +398,57 @@ describe("DecodeSessionImpl telemetry", () => {
     await session.cancel();
     await scheduler.shutdown();
   });
+
+  it("re-emits folded per-frame metrics through onMetric (mapped names, absent fields skipped)", async () => {
+    const seen: Array<{ name: string; value: number }> = [];
+    const { scheduler, workers } = makeScheduler();
+    const session = new DecodeSessionImpl(scheduler, {
+      format: "rgba8",
+      onMetric: (m) => seen.push(m),
+    });
+    const worker = await waitForWorker(workers);
+    const info = imageInfo();
+    // decode_final carrying folded metrics; timeToFinalMs omitted → must NOT emit.
+    worker.emit({
+      type: "decode_final", sessionId: session.id, info,
+      pixels: new ArrayBuffer(8), format: "rgba8", pixelStride: 256,
+      copyMs: 0.5, copiedBytes: 1024, timeToFirstPixelMs: 12, outputBytes: 2048,
+    });
+    await session.done();
+    // Order + name mapping is the folding contract (emitFoldedMetrics).
+    assert.deepEqual(seen, [
+      { name: "copy_to_transfer_ms", value: 0.5 },
+      { name: "copied_bytes", value: 1024 },
+      { name: "time_to_first_pixel_ms", value: 12 },
+      { name: "output_bytes", value: 2048 },
+    ]);
+    await scheduler.shutdown();
+  });
+
+  it("a throwing onMetric on one folded field does not suppress the remaining fields", async () => {
+    const seen: string[] = [];
+    const { scheduler, workers } = makeScheduler();
+    const session = new DecodeSessionImpl(scheduler, {
+      format: "rgba8",
+      onMetric: (m) => {
+        seen.push(m.name);
+        if (m.name === "copied_bytes") throw new Error("consumer boom");
+      },
+    });
+    const worker = await waitForWorker(workers);
+    const info = imageInfo();
+    worker.emit({
+      type: "decode_final", sessionId: session.id, info,
+      pixels: new ArrayBuffer(8), format: "rgba8", pixelStride: 256,
+      copyMs: 1, copiedBytes: 2, timeToFirstPixelMs: 3, outputBytes: 4, timeToFinalMs: 5,
+    });
+    await session.done();
+    // The throw on copied_bytes is caught per-metric; the other 4 still emit.
+    assert.deepEqual(seen, [
+      "copy_to_transfer_ms", "copied_bytes", "time_to_first_pixel_ms", "output_bytes", "time_to_final_ms",
+    ]);
+    await scheduler.shutdown();
+  });
 });
 
 describe("DecodeSessionImpl missing coverage", () => {
