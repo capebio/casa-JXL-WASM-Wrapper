@@ -43,6 +43,10 @@ required-features = ["jxl-codec"]
 name = "orf_metric_bench"
 required-features = ["parallel"]
 
+[[example]]
+name = "raw_video_exact_sha"
+required-features = ["jxl-codec"]
+
 [dev-dependencies]
 jxl-oxide = "0.11"
 # golden-corpus hashing for the casa_video decode harnesses (examples only)
