@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>S5 Golden Review — two-up viewer</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #111;
+    --surface:  #1c1c1e;
+    --border:   #333;
+    --text:     #e5e5e7;
+    --muted:    #8e8e93;
+    --pass:     #30d158;
+    --warn:     #ffd60a;
+    --fail:     #ff453a;
+    --accent:   #0a84ff;
+    --panel-w:  min(48vw, 760px);
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, sans-serif; font-size: 14px; }
+
+  /* ── layout ─────────────────────────────────────────────────────────── */
+  #root { display: flex; flex-direction: column; height: 100%; }
+
+  header {
+    padding: 12px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: .02em; }
+  header .subtitle { font-size: 12px; color: var(--muted); }
+
+  #status-badge {
+    margin-left: auto;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    background: #333;
+    color: var(--muted);
+  }
+  #status-badge.pass { background: rgba(48,209,88,.15); color: var(--pass); }
+  #status-badge.warn { background: rgba(255,214,10,.15); color: var(--warn); }
+  #status-badge.fail { background: rgba(255,69,58,.15);  color: var(--fail); }
+
+  /* ── controls ────────────────────────────────────────────────────────── */
+  #controls {
+    display: flex;
+    gap: 16px;
+    padding: 10px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .file-group { display: flex; flex-direction: column; gap: 4px; }
+  .file-group label { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+
+  input[type=file] {
+    font-size: 12px;
+    color: var(--text);
+    background: #2c2c2e;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    cursor: pointer;
+    max-width: 280px;
+  }
+
+  .separator { width: 1px; height: 40px; background: var(--border); align-self: center; }
+
+  .score-box {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 14px;
+    background: #2c2c2e;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    min-width: 160px;
+  }
+  .score-box .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .score-box .value { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .score-box .threshold { font-size: 11px; color: var(--muted); }
+
+  /* ── main content ────────────────────────────────────────────────────── */
+  #panels {
+    flex: 1;
+    display: grid;
+    grid-template-rows: 1fr auto;
+    overflow: hidden;
+  }
+
+  #images {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 2px;
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  .panel {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+    background: #000;
+  }
+
+  .panel-label {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    z-index: 10;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .04em;
+    backdrop-filter: blur(4px);
+    background: rgba(0,0,0,.6);
+    color: var(--text);
+  }
+
+  canvas.img-canvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+
+  .placeholder {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    height: 100%;
+    color: var(--muted);
+    font-size: 13px;
+    text-align: center;
+    padding: 20px;
+  }
+  .placeholder .icon { font-size: 36px; opacity: .5; }
+
+  /* ── heatmap row ─────────────────────────────────────────────────────── */
+  #heatmap-row {
+    border-top: 2px solid var(--border);
+    height: 200px;
+    background: #000;
+    display: flex;
+    align-items: stretch;
+    overflow: hidden;
+  }
+
+  #heatmap-wrap {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+  }
+  #heatmap-wrap canvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+
+  #heatmap-legend {
+    width: 200px;
+    border-left: 1px solid var(--border);
+    padding: 12px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  #heatmap-legend .leg-title { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .leg-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+  .leg-swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+
+  /* ── info footer ─────────────────────────────────────────────────────── */
+  #info-bar {
+    padding: 6px 20px;
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--muted);
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+  #info-bar span { white-space: nowrap; }
+
+  #progress-msg {
+    position: fixed;
+    bottom: 40px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(10,132,255,.9);
+    color: #fff;
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    display: none;
+    backdrop-filter: blur(6px);
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="root">
+
+  <header>
+    <div>
+      <h1>S5 Golden Review</h1>
+      <div class="subtitle">Two-up viewer · fixed neutral sliders · butteraugli heatmap</div>
+    </div>
+    <div id="status-badge">No comparison</div>
+  </header>
+
+  <div id="controls">
+    <div class="file-group">
+      <label>RAW file (live decode)</label>
+      <input type="file" id="raw-file" accept=".orf,.ORF,.dng,.DNG,.cr2,.CR2">
+    </div>
+
+    <div class="separator"></div>
+
+    <div class="file-group">
+      <label>Golden buffer (.rgba)</label>
+      <input type="file" id="golden-file" accept=".rgba">
+      <span style="font-size:10px;color:var(--muted)">Generated by: bun --smol scripts/golden-check.mjs --update</span>
+    </div>
+
+    <div class="separator"></div>
+
+    <div class="score-box">
+      <div class="label">Butteraugli</div>
+      <div class="value" id="score-val">—</div>
+      <div class="threshold" id="threshold-note">threshold 0.05</div>
+    </div>
+  </div>
+
+  <div id="panels">
+    <div id="images">
+      <div class="panel" id="panel-live">
+        <div class="panel-label">LIVE</div>
+        <canvas class="img-canvas" id="canvas-live" style="display:none"></canvas>
+        <div class="placeholder" id="ph-live">
+          <div class="icon">📷</div>
+          <div>Load a RAW file (.orf / .dng / .cr2)</div>
+          <div style="font-size:11px;opacity:.6">Decoded at neutral sliders — no adjustments</div>
+        </div>
+      </div>
+      <div class="panel" id="panel-golden">
+        <div class="panel-label">GOLDEN</div>
+        <canvas class="img-canvas" id="canvas-golden" style="display:none"></canvas>
+        <div class="placeholder" id="ph-golden">
+          <div class="icon">🗄️</div>
+          <div>Load a golden buffer (.rgba)</div>
+          <div style="font-size:11px;opacity:.6">From docs/golden-buffers/&lt;id&gt;.rgba</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="heatmap-row">
+      <div id="heatmap-wrap">
+        <div class="placeholder" id="ph-heatmap" style="height:100%;display:flex">
+          <div class="icon">🔍</div>
+          <div>Load both images to see the butteraugli difference heatmap</div>
+        </div>
+        <canvas id="canvas-heatmap" style="display:none;width:100%;height:100%;object-fit:contain"></canvas>
+      </div>
+      <div id="heatmap-legend">
+        <div class="leg-title">Perceptual error</div>
+        <div class="leg-row"><div class="leg-swatch" style="background:#000"></div><span>0 — identical</span></div>
+        <div class="leg-row"><div class="leg-swatch" style="background:#1a3a6b"></div><span>low error</span></div>
+        <div class="leg-row"><div class="leg-swatch" style="background:#0a84ff"></div><span>moderate</span></div>
+        <div class="leg-row"><div class="leg-swatch" style="background:#ffd60a"></div><span>approaching threshold</span></div>
+        <div class="leg-row"><div class="leg-swatch" style="background:#ff453a"></div><span>exceeds threshold</span></div>
+        <div style="margin-top:6px;font-size:10px;color:var(--muted)">Scale: 0 → max error<br>Red = perceptually visible change</div>
+      </div>
+    </div>
+  </div>
+
+  <div id="info-bar">
+    <span id="info-dims">—</span>
+    <span id="info-format">—</span>
+    <span id="info-sha">—</span>
+    <span id="info-time">—</span>
+  </div>
+
+</div>
+
+<div id="progress-msg"></div>
+
+<script type="module">
+// ── imports ───────────────────────────────────────────────────────────────────
+import initRaw, {
+    process_orf,
+    process_dng,
+    process_cr2,
+} from './pkg/raw_converter_wasm.js';
+
+import {
+    createButteraugliComparer,
+    computeSaliencyField,
+    pixelsToXyb,
+} from './jxl-butteraugli.js';
+
+// ── WASM init ─────────────────────────────────────────────────────────────────
+const progress = document.getElementById('progress-msg');
+function showProgress(msg) {
+    progress.textContent = msg;
+    progress.style.display = 'block';
+}
+function hideProgress() { progress.style.display = 'none'; }
+
+showProgress('Loading WASM pipeline…');
+await initRaw();
+hideProgress();
+
+// ── state ─────────────────────────────────────────────────────────────────────
+const THRESHOLD = 0.05;
+
+let liveRgba   = null;  // Uint8Array RGBA8
+let liveW      = 0;
+let liveH      = 0;
+let goldenRgba = null;  // Uint8Array RGBA8
+let goldenW    = 0;
+let goldenH    = 0;
+
+// ── canvas helpers ────────────────────────────────────────────────────────────
+function drawRgbaToCanvas(canvas, rgba, w, h) {
+    canvas.width  = w;
+    canvas.height = h;
+    const ctx  = canvas.getContext('2d');
+    const img  = new ImageData(new Uint8ClampedArray(rgba), w, h);
+    ctx.putImageData(img, 0, 0);
+    canvas.style.display = 'block';
+}
+
+function hideCanvas(canvas, placeholder) {
+    canvas.style.display = 'none';
+    placeholder.style.display = 'flex';
+}
+
+function showCanvas(canvas, placeholder) {
+    placeholder.style.display = 'none';
+    canvas.style.display = 'block';
+}
+
+// ── butteraugli heatmap ───────────────────────────────────────────────────────
+function renderHeatmap(saliency, w, h) {
+    const hc  = document.getElementById('canvas-heatmap');
+    const ph  = document.getElementById('ph-heatmap');
+    hc.width  = w;
+    hc.height = h;
+    const ctx = hc.getContext('2d');
+    const img = ctx.createImageData(w, h);
+    const d   = img.data;
+    const n   = w * h;
+
+    // Colour map: black → dark-blue → blue → yellow → red
+    // Mapped via saliency[i] in [0..1]
+    for (let i = 0; i < n; i++) {
+        const t = saliency[i]; // 0..1 (normalised by computeSaliencyField)
+        let r, g, b;
+        if (t < 0.25) {
+            const s = t / 0.25;
+            r = Math.round(0  + s * 26);
+            g = Math.round(0  + s * 58);
+            b = Math.round(0  + s * 107);
+        } else if (t < 0.5) {
+            const s = (t - 0.25) / 0.25;
+            r = Math.round(26  + s * (10  - 26));
+            g = Math.round(58  + s * (132 - 58));
+            b = Math.round(107 + s * (255 - 107));
+        } else if (t < 0.75) {
+            const s = (t - 0.5) / 0.25;
+            r = Math.round(10  + s * (255 - 10));
+            g = Math.round(132 + s * (214 - 132));
+            b = Math.round(255 + s * (10  - 255));
+        } else {
+            const s = (t - 0.75) / 0.25;
+            r = 255;
+            g = Math.round(214 + s * (69  - 214));
+            b = Math.round(10  + s * (58  - 10));
+        }
+        const pi = i * 4;
+        d[pi]   = r;
+        d[pi+1] = g;
+        d[pi+2] = b;
+        d[pi+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    ph.style.display = 'none';
+    hc.style.display = 'block';
+}
+
+// ── comparison ────────────────────────────────────────────────────────────────
+function runComparison() {
+    if (!liveRgba || !goldenRgba) return;
+    if (liveW !== goldenW || liveH !== goldenH) {
+        updateStatus('fail', `Dimension mismatch: live ${liveW}×${liveH} vs golden ${goldenW}×${goldenH}`);
+        return;
+    }
+
+    const t0      = performance.now();
+    const compare = createButteraugliComparer(goldenRgba, goldenW, goldenH);
+    const score   = compare(liveRgba);
+    const ms      = (performance.now() - t0).toFixed(0);
+
+    document.getElementById('score-val').textContent = score.toFixed(4);
+    document.getElementById('info-time').textContent = `butteraugli: ${ms} ms`;
+
+    if (score <= THRESHOLD) {
+        updateStatus('pass', `PASS — butteraugli ${score.toFixed(4)} ≤ ${THRESHOLD}`);
+    } else {
+        updateStatus('fail', `FAIL — butteraugli ${score.toFixed(4)} > ${THRESHOLD} (requires sign-off)`);
+    }
+
+    // Compute saliency field for heatmap
+    const refXyb   = pixelsToXyb(goldenRgba, goldenW * goldenH);
+    const saliency = computeSaliencyField(refXyb, liveRgba, liveW, liveH);
+    renderHeatmap(saliency, liveW, liveH);
+}
+
+function updateStatus(type, msg) {
+    const badge = document.getElementById('status-badge');
+    badge.className = type;
+    badge.textContent = msg;
+}
+
+// ── file handlers ─────────────────────────────────────────────────────────────
+
+// RAW file → live decode
+document.getElementById('raw-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const ext = file.name.split('.').pop().toUpperCase();
+    const fn  = ext === 'ORF' ? process_orf
+              : ext === 'DNG' ? process_dng
+              : ext === 'CR2' ? process_cr2
+              : null;
+    if (!fn) { alert(`Unsupported format: .${ext}`); return; }
+
+    showProgress(`Decoding ${file.name}…`);
+    const t0    = performance.now();
+    const bytes = new Uint8Array(await file.arrayBuffer());
+
+    let result;
+    try {
+        // Neutral sliders: all 0, camera WB (NaN overrides)
+        result = fn(bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+        liveRgba = result.rgba();
+        liveW    = result.width;
+        liveH    = result.height;
+    } catch (err) {
+        hideProgress();
+        alert(`Decode failed: ${err.message}`);
+        return;
+    } finally {
+        result?.free();
+    }
+
+    const decMs = (performance.now() - t0).toFixed(0);
+    hideProgress();
+
+    drawRgbaToCanvas(document.getElementById('canvas-live'), liveRgba, liveW, liveH);
+    showCanvas(document.getElementById('canvas-live'), document.getElementById('ph-live'));
+
+    document.getElementById('info-dims').textContent   = `${liveW}×${liveH}`;
+    document.getElementById('info-format').textContent = `.${ext}`;
+    document.getElementById('info-time').textContent   = `decode: ${decMs} ms`;
+
+    // SHA256 (via SubtleCrypto) for display
+    const hashBuf = await crypto.subtle.digest('SHA-256', liveRgba);
+    const hex     = Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2,'0')).join('');
+    document.getElementById('info-sha').textContent = `sha256: ${hex.slice(0, 16)}…`;
+
+    runComparison();
+});
+
+// Golden buffer (.rgba) → right panel
+document.getElementById('golden-file').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    showProgress('Loading golden buffer…');
+    goldenRgba = new Uint8Array(await file.arrayBuffer());
+    hideProgress();
+
+    // The .rgba filename encodes the id; dimensions must match live decode.
+    // We accept any w×h that is consistent with the buffer byte length.
+    if (liveW && liveH && goldenRgba.length === liveW * liveH * 4) {
+        goldenW = liveW;
+        goldenH = liveH;
+    } else {
+        // Try to infer dimensions: assume same aspect ratio as live decode.
+        // If no live decode yet, we can't display yet — just store the bytes.
+        goldenW = liveW || 0;
+        goldenH = liveH || 0;
+    }
+
+    if (goldenW && goldenH) {
+        drawRgbaToCanvas(document.getElementById('canvas-golden'), goldenRgba, goldenW, goldenH);
+        showCanvas(document.getElementById('canvas-golden'), document.getElementById('ph-golden'));
+        runComparison();
+    } else {
+        updateStatus('warn', `Golden loaded (${goldenRgba.length} bytes) — load RAW file first to set dimensions`);
+    }
+});
+
+// If live decode is loaded but dimensions weren't set for the golden, retry after live decode.
+// (Handled implicitly: runComparison() is called from both event handlers.)
+</script>
+</body>
+</html>

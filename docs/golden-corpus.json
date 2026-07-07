@@ -1,0 +1,38 @@
+{
+  "schema": "v1",
+  "threshold": 0.05,
+  "note": "Decoded RGBA8 pixel SHA256 at neutral sliders (exposure=0, contrast=0, all tone adjustments=0, camera WB). Run 'bun scripts/golden-check.mjs --update' to regenerate after a sign-off. Colour authority: David (capebio@gmail.com).",
+  "date": "2026-07-07",
+  "entries": [
+    {
+      "id": "P1110226-ORF",
+      "path": "C:\\Foo\\raw-converter\\tests\\P1110226.ORF",
+      "format": "ORF",
+      "description": "Olympus E-M5 II, 5240x3912 — S4 parity anchor, Rust-side ORF_RGBA8_HASH=0x8806822277eac608",
+      "sha256_rgba8": "5ad743c210c703153ca433ef476452e565e0dadf74af9d14c15c6e9f0391bed8",
+      "width": 5240,
+      "height": 3912,
+      "updated": "2026-07-07"
+    },
+    {
+      "id": "PXL-20260527-DNG",
+      "path": ".timing-source/PXL_20260527_180319603.RAW-02.ORIGINAL.dng",
+      "format": "DNG",
+      "description": "Pixel 2020 DNG, 3628x2732 — S4 parity anchor, Rust-side DNG_RGB8_HASH=0x3c3fb14139efec5c",
+      "sha256_rgba8": "db0761ac9f98bcb0e09bcc91a9e272bfe35fef0cec290d199eec38241deb697d",
+      "width": 3628,
+      "height": 2732,
+      "updated": "2026-07-07"
+    },
+    {
+      "id": "P2200407-ORF",
+      "path": "C:\\995\\2026-02-20 Gobabeb To Windhoek\\Gobabeb Herbarium\\P2200407.ORF",
+      "format": "ORF",
+      "description": "Olympus ORF from Gobabeb herbarium expedition — outdoor multi-tonal scene",
+      "sha256_rgba8": "6e3f17acc43b5859be4a82456832f44259d12b75879b5786a8e5128acaf0d712",
+      "width": 5240,
+      "height": 3912,
+      "updated": "2026-07-07"
+    }
+  ]
+}
