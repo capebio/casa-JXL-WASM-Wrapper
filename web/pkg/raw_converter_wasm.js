@@ -55,6 +55,56 @@ export class DecodeBench {
 if (Symbol.dispose) DecodeBench.prototype[Symbol.dispose] = DecodeBench.prototype.free;
 
 /**
+ * S3 preflight: project the peak / retained working-set of a RAW decode from
+ * dimensions + output flags, WITHOUT decoding. Behavior-neutral (changes no
+ * decode output). Fields are byte counts as `f64` (exact for all realistic
+ * sizes — well under 2^53). Browser callers use `peak_bytes` for pre-decode
+ * admission control against the WASM heap / memory budget, and `retained_bytes`
+ * for `AssetStore` accounting of the buffers a held `ProcessResult` keeps.
+ * See the model derivation in `raw_pipeline::mem_budget` / the memory-budget ADR.
+ */
+export class DecodePeakEstimate {
+    static __wrap(ptr) {
+        const obj = Object.create(DecodePeakEstimate.prototype);
+        obj.__wbg_ptr = ptr;
+        DecodePeakEstimateFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        DecodePeakEstimateFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_decodepeakestimate_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    get peak_bytes() {
+        const ret = wasm.__wbg_get_decodepeakestimate_peak_bytes(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {number}
+     */
+    get pixels() {
+        const ret = wasm.__wbg_get_decodepeakestimate_pixels(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {number}
+     */
+    get retained_bytes() {
+        const ret = wasm.__wbg_get_decodepeakestimate_retained_bytes(this.__wbg_ptr);
+        return ret;
+    }
+}
+if (Symbol.dispose) DecodePeakEstimate.prototype[Symbol.dispose] = DecodePeakEstimate.prototype.free;
+
+/**
  * Decoded non-RAW image handed to JS. One of the take_* buffers is non-empty,
  * selected by `bit_depth` (8 -> take_rgba8, 16 -> take_rgba16_le, 32 -> take_rgba_f32).
  */
@@ -140,6 +190,89 @@ export class DecodedImage {
 if (Symbol.dispose) DecodedImage.prototype[Symbol.dispose] = DecodedImage.prototype.free;
 
 /**
+ * K6#4: stateful FableBraid decode session for browser CASV playback. Mirrors the
+ * native `DeltaDecodeSession` (`fable_braid.rs`): decode an intra keyframe, then
+ * temporal-delta frames against the previous frame this session returned. The
+ * stateless `fable_decode_rgb8*` fns above are pure functions; the fable video
+ * tier is a whole-frame temporal chain, so browser playback needs this session.
+ *
+ * `decode_intra` sets `width`/`height`; `decode_delta` takes the current dims and
+ * the previous frame's RGB8 (the value this session last returned).
+ */
+export class FableDeltaSession {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        FableDeltaSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_fabledeltasession_free(ptr, 0);
+    }
+    /**
+     * Decode a temporal-delta fable frame against `prev` (the RGB8 this session
+     * returned for the previous frame). `w`/`h` are the current frame dims.
+     * @param {Uint8Array} bytes
+     * @param {Uint8Array} prev
+     * @param {number} w
+     * @param {number} h
+     * @returns {Uint8Array}
+     */
+    decode_delta(bytes, prev, w, h) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passArray8ToWasm0(prev, wasm.__wbindgen_malloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.fabledeltasession_decode_delta(this.__wbg_ptr, ptr0, len0, ptr1, len1, w, h);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v3;
+    }
+    /**
+     * Decode an intra (keyframe) fable frame; caches its planes for subsequent
+     * `decode_delta` calls. Updates `width`/`height`. Returns interleaved RGB8.
+     * @param {Uint8Array} bytes
+     * @returns {Uint8Array}
+     */
+    decode_intra(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.fabledeltasession_decode_intra(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v2;
+    }
+    /**
+     * @returns {number}
+     */
+    get height() {
+        const ret = wasm.fabledeltasession_height(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    constructor() {
+        const ret = wasm.fabledeltasession_new();
+        this.__wbg_ptr = ret;
+        FableDeltaSessionFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @returns {number}
+     */
+    get width() {
+        const ret = wasm.fabledeltasession_width(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) FableDeltaSession.prototype[Symbol.dispose] = FableDeltaSession.prototype.free;
+
+/**
  * WASM-resident rendering state for a single image (lightbox or thumbnail).
  *
  * Owns the pre-tonemapped RGB16 buffer.  Slider changes call `render()` without
@@ -220,14 +353,15 @@ export class LookRenderer {
      * @param {Float32Array} color_matrix_flat
      * @param {boolean} apply_rotation
      * @param {number} black
+     * @param {number} white
      * @returns {LookRenderer}
      */
-    static new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, apply_rotation, black) {
+    static new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, apply_rotation, black, white) {
         const ptr0 = passArray8ToWasm0(rgb16_bytes, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.lookrenderer_new_with_options(ptr0, len0, width, height, orientation, ptr1, len1, apply_rotation, black);
+        const ret = wasm.lookrenderer_new_with_options(ptr0, len0, width, height, orientation, ptr1, len1, apply_rotation, black, white);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -263,6 +397,22 @@ export class LookRenderer {
      */
     render(wb_r, wb_b, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity) {
         const ret = wasm.lookrenderer_render(this.__wbg_ptr, wb_r, wb_b, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * K6#1: named-object look API. `look` is a plain JS object (camelCase fields —
+     * see `LookOverrides::from_js`); unknown key → error, missing key → neutral.
+     * Preferred over the 14-positional-arg `render`, which remains for back-compat.
+     * @param {any} look
+     * @returns {Uint8Array}
+     */
+    render_look(look) {
+        const ret = wasm.lookrenderer_render_look(this.__wbg_ptr, look);
         if (ret[3]) {
             throw takeFromExternrefTable0(ret[2]);
         }
@@ -773,6 +923,17 @@ export class ProcessResult {
      */
     get wb_r_used() {
         const ret = wasm.__wbg_get_processresult_wb_r_used(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * White level the pipeline normalised by (per-format: Olympus 4095, CR2/DNG
+     * from the file tag ~15300). The live LookRenderer MUST use this same white or
+     * the preview blows out — CR2/DNG 14-bit data ÷ the Olympus 4095 default is a
+     * ~3.7× over-exposure. Twin of `black_used`.
+     * @returns {number}
+     */
+    get white_used() {
+        const ret = wasm.__wbg_get_processresult_white_used(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -1354,6 +1515,34 @@ export function downscale_rgba(src, src_w, src_h, dst_w, dst_h) {
 }
 
 /**
+ * Project the decode peak/retained working set for `width`×`height` (active-area,
+ * pre-orientation) pixels and the given `output_flags` bitset (same bits as
+ * `process_orf_with_flags` / `process_dng_with_flags`). Pure — allocates nothing
+ * beyond the tiny result and touches no image data.
+ * @param {number} width
+ * @param {number} height
+ * @param {number} output_flags
+ * @returns {DecodePeakEstimate}
+ */
+export function estimate_decode_peak(width, height, output_flags) {
+    const ret = wasm.estimate_decode_peak(width, height, output_flags);
+    return DecodePeakEstimate.__wrap(ret);
+}
+
+/**
+ * Convenience scalar form: the transient peak-bytes projection only. Matches the
+ * `estimate_decode_peak_bytes()` name from the Wave-2 strategic map.
+ * @param {number} width
+ * @param {number} height
+ * @param {number} output_flags
+ * @returns {number}
+ */
+export function estimate_decode_peak_bytes(width, height, output_flags) {
+    const ret = wasm.estimate_decode_peak_bytes(width, height, output_flags);
+    return ret;
+}
+
+/**
  * @param {Uint8Array} bytes
  * @returns {Uint8Array}
  */
@@ -1599,6 +1788,23 @@ export function process_cr2_with_flags(data, output_flags, exposure_ev, contrast
 }
 
 /**
+ * K6#1: named-object look API for CR2 (see [`process_orf_with_look`]).
+ * @param {Uint8Array} data
+ * @param {number} output_flags
+ * @param {any} look
+ * @returns {ProcessResult}
+ */
+export function process_cr2_with_look(data, output_flags, look) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.process_cr2_with_look(ptr0, len0, output_flags, look);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
  * Parse + decode a DNG file blob. Returns an error string on failure.
  * (Rayon when parallel-wasm feature active.) Look params: LR-style (-1..+1), except
  * exposure_ev in stops.  Pass NaN/≤0 for wb_r_override/wb_b_override to use defaults.
@@ -1665,6 +1871,23 @@ export function process_dng_with_flags(data, output_flags, exposure_ev, contrast
     const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.process_dng_with_flags(ptr0, len0, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, wb_r_override, wb_b_override, texture, clarity);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
+ * K6#1: named-object look API for DNG (see [`process_orf_with_look`]).
+ * @param {Uint8Array} data
+ * @param {number} output_flags
+ * @param {any} look
+ * @returns {ProcessResult}
+ */
+export function process_dng_with_look(data, output_flags, look) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.process_dng_with_look(ptr0, len0, output_flags, look);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -1747,6 +1970,26 @@ export function process_orf_with_flags(data, output_flags, exposure_ev, contrast
     const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.process_orf_with_flags(ptr0, len0, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, wb_r_override, wb_b_override, texture, clarity);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
+ * K6#1: named-object look API. `look` is a plain JS object (camelCase fields —
+ * see `LookOverrides::from_js`); unknown key → error, missing key → neutral
+ * default. Preferred over the 14-positional-arg `process_orf_with_flags`, which
+ * remains for back-compat.
+ * @param {Uint8Array} data
+ * @param {number} output_flags
+ * @param {any} look
+ * @returns {ProcessResult}
+ */
+export function process_orf_with_look(data, output_flags, look) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.process_orf_with_look(ptr0, len0, output_flags, look);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -1852,6 +2095,10 @@ function __wbg_get_imports(memory) {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return ret;
         },
+        __wbg___wbindgen_is_null_2042690d351e14f0: function(arg0) {
+            const ret = arg0 === null;
+            return ret;
+        },
         __wbg___wbindgen_is_undefined_35bb9f4c7fd651d5: function(arg0) {
             const ret = arg0 === undefined;
             return ret;
@@ -1864,8 +2111,40 @@ function __wbg_get_imports(memory) {
             const ret = wasmModule;
             return ret;
         },
+        __wbg___wbindgen_number_get_f73a1244370fcc2c: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'number' ? obj : undefined;
+            getDataViewMemory0().setFloat64(arg0 + 8 * 1, isLikeNone(ret) ? 0 : ret, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, !isLikeNone(ret), true);
+        },
+        __wbg___wbindgen_string_get_d109740c0d18f4d7: function(arg0, arg1) {
+            const obj = arg1;
+            const ret = typeof(obj) === 'string' ? obj : undefined;
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
         __wbg___wbindgen_throw_9c31b086c2b26051: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
+        },
+        __wbg_get_dcf82ab8aad1a593: function() { return handleError(function (arg0, arg1) {
+            const ret = Reflect.get(arg0, arg1);
+            return ret;
+        }, arguments); },
+        __wbg_get_unchecked_1dfe6d05ad91d9b7: function(arg0, arg1) {
+            const ret = arg0[arg1 >>> 0];
+            return ret;
+        },
+        __wbg_instanceof_Object_03924e0dbda74bd8: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Object;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
         },
         __wbg_instanceof_Window_faa5cf994f49cca7: function(arg0) {
             let result;
@@ -1885,6 +2164,14 @@ function __wbg_get_imports(memory) {
                 result = false;
             }
             const ret = result;
+            return ret;
+        },
+        __wbg_keys_682010b680c9b1f8: function(arg0) {
+            const ret = Object.keys(arg0);
+            return ret;
+        },
+        __wbg_length_2591a0f4f659a55c: function(arg0) {
+            const ret = arg0.length;
             return ret;
         },
         __wbg_new_02d162bc6cf02f60: function() {
@@ -1961,9 +2248,15 @@ function __wbg_get_imports(memory) {
 const DecodeBenchFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_decodebench_free(ptr, 1));
+const DecodePeakEstimateFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_decodepeakestimate_free(ptr, 1));
 const DecodedImageFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_decodedimage_free(ptr, 1));
+const FableDeltaSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_fabledeltasession_free(ptr, 1));
 const LookRendererFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_lookrenderer_free(ptr, 1));
@@ -2005,6 +2298,14 @@ function getArrayU16FromWasm0(ptr, len) {
 function getArrayU8FromWasm0(ptr, len) {
     ptr = ptr >>> 0;
     return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
+}
+
+let cachedDataViewMemory0 = null;
+function getDataViewMemory0() {
+    if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer !== wasm.memory.buffer) {
+        cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
+    }
+    return cachedDataViewMemory0;
 }
 
 let cachedFloat32ArrayMemory0 = null;
@@ -2069,6 +2370,43 @@ function passArrayF32ToWasm0(arg, malloc) {
     return ptr;
 }
 
+function passStringToWasm0(arg, malloc, realloc) {
+    if (realloc === undefined) {
+        const buf = cachedTextEncoder.encode(arg);
+        const ptr = malloc(buf.length, 1) >>> 0;
+        getUint8ArrayMemory0().subarray(ptr, ptr + buf.length).set(buf);
+        WASM_VECTOR_LEN = buf.length;
+        return ptr;
+    }
+
+    let len = arg.length;
+    let ptr = malloc(len, 1) >>> 0;
+
+    const mem = getUint8ArrayMemory0();
+
+    let offset = 0;
+
+    for (; offset < len; offset++) {
+        const code = arg.charCodeAt(offset);
+        if (code > 0x7F) break;
+        mem[ptr + offset] = code;
+    }
+    if (offset !== len) {
+        if (offset !== 0) {
+            arg = arg.slice(offset);
+        }
+        ptr = realloc(ptr, len, len = offset + arg.length * 3, 1) >>> 0;
+        const view = getUint8ArrayMemory0().subarray(ptr + offset, ptr + len);
+        const ret = cachedTextEncoder.encodeInto(arg, view);
+
+        offset += ret.written;
+        ptr = realloc(ptr, len, offset, 1) >>> 0;
+    }
+
+    WASM_VECTOR_LEN = offset;
+    return ptr;
+}
+
 function takeFromExternrefTable0(idx) {
     const value = wasm.__wbindgen_externrefs.get(idx);
     wasm.__externref_table_dealloc(idx);
@@ -2090,6 +2428,19 @@ function decodeText(ptr, len) {
     return cachedTextDecoder.decode(getUint8ArrayMemory0().slice(ptr, ptr + len));
 }
 
+const cachedTextEncoder = (typeof TextEncoder !== 'undefined' ? new TextEncoder() : undefined);
+
+if (cachedTextEncoder) {
+    cachedTextEncoder.encodeInto = function (arg, view) {
+        const buf = cachedTextEncoder.encode(arg);
+        view.set(buf);
+        return {
+            read: arg.length,
+            written: buf.length
+        };
+    };
+}
+
 let WASM_VECTOR_LEN = 0;
 
 let wasmModule, wasmInstance, wasm;
@@ -2097,6 +2448,7 @@ function __wbg_finalize_init(instance, module, thread_stack_size) {
     wasmInstance = instance;
     wasm = instance.exports;
     wasmModule = module;
+    cachedDataViewMemory0 = null;
     cachedFloat32ArrayMemory0 = null;
     cachedUint16ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
