@@ -324,6 +324,14 @@ pub struct ProcessResult {
     pub wb_mode: u16,
     #[wasm_bindgen(readonly)]
     pub wb_from_camera: bool,
+    // Mode 3 (single-decompress preview-first): when a phase-1 decode sets
+    // OUT_RETAIN_RAW, the full-resolution sensor raw u16 mosaic + camera-derived
+    // params + sensor dims are held here so `finish_full_rgb8` can produce the
+    // full RGB8 later without a second decompress. `None` on every other path.
+    retained_raw: Option<Vec<u16>>,
+    retained_params: Option<pipeline::PipelineParams>,
+    retained_w: usize,
+    retained_h: usize,
 }
 
 #[wasm_bindgen]
@@ -355,6 +363,86 @@ impl ProcessResult {
     // Returns empty on subsequent calls (ownership transferred).
     pub fn take_rgb(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.rgb)
+    }
+
+    /// Mode 3 (single-decompress preview-first): finish the full-resolution RGB8
+    /// output FROM the raw mosaic retained by a phase-1 `OUT_RETAIN_RAW` decode —
+    /// demosaic + tone (+ optional disp16 / orientation) only, NO second
+    /// decompress. Byte-identical to a fresh `OUT_FULL_RGB8` decode because both
+    /// go through `finish_from_raw`. After this returns, `take_rgb()` yields the
+    /// full RGB8 and `width`/`height`/`orient_ms`/`demosaic_ms`/`tonemap_ms`
+    /// reflect the full-res render. Errors (JsError) if the result was not
+    /// produced with `OUT_RETAIN_RAW`. The 14 look args match the trailing
+    /// arguments of `process_orf_with_flags`, in the same order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_full_rgb8(
+        &mut self,
+        output_flags: u32,
+        exposure_ev: f32,
+        contrast: f32,
+        highlights: f32,
+        shadows: f32,
+        whites: f32,
+        blacks: f32,
+        saturation: f32,
+        vibrance: f32,
+        temp: f32,
+        tint: f32,
+        wb_r: f32,
+        wb_b: f32,
+        texture: f32,
+        clarity: f32,
+    ) -> Result<(), JsError> {
+        let raw = self.retained_raw.take().ok_or_else(|| {
+            JsError::new("finish_full_rgb8: no retained raw (decode with OUT_RETAIN_RAW first)")
+        })?;
+        let params = self
+            .retained_params
+            .take()
+            .ok_or_else(|| JsError::new("finish_full_rgb8: no retained params"))?;
+        let look = LookOverrides {
+            wb_r,
+            wb_b,
+            exposure_ev,
+            contrast,
+            highlights,
+            shadows,
+            whites,
+            blacks,
+            saturation,
+            vibrance,
+            temp,
+            tint,
+            texture,
+            clarity,
+        };
+        let out = finish_from_raw(
+            raw,
+            self.retained_w,
+            self.retained_h,
+            params,
+            &look,
+            self.orientation,
+            self.iso,
+            output_flags,
+        )?;
+        self.rgb = out.rgb8;
+        self.width = out.final_w as u32;
+        self.height = out.final_h as u32;
+        self.demosaic_ms = out.demosaic_ms;
+        self.tonemap_ms = out.tonemap_ms;
+        self.orient_ms = out.orient_ms;
+        self.rgb16_full = out.rgb16_full;
+        self.full16_w = out.full16_w;
+        self.full16_h = out.full16_h;
+        self.rgb16_disp = out.rgb16_disp;
+        self.disp16_w = out.disp16_w;
+        self.disp16_h = out.disp16_h;
+        self.wb_r_used = out.wb_r_used;
+        self.wb_b_used = out.wb_b_used;
+        self.retained_w = 0;
+        self.retained_h = 0;
+        Ok(())
     }
 
     /// Borrow the RGB buffer; copies into a fresh JS `Uint8Array`.
@@ -735,6 +823,12 @@ const OUT_FULL_16: u32 = 8; // full-resolution RGB16 (M3: RAW {2048,full} pyrami
 const OUT_NO_ORIENT: u32 = 16;
 /// Full-resolution display-referred RGB16 (post WB/matrix/tone, oriented, full-range [0,65535]).
 const OUT_FULL_DISP16: u32 = 32;
+/// Mode 3 (single-decompress preview-first): retain the full-resolution raw u16
+/// mosaic (plus dims + camera-derived params) in the returned `ProcessResult`, so
+/// a later `ProcessResult::finish_full_rgb8` can produce the full RGB8 WITHOUT a
+/// second decompress. Setting this forces a full decompress (bypasses the
+/// streaming preview-only fast path, which never materializes the full mosaic).
+const OUT_RETAIN_RAW: u32 = 64;
 
 // S3: keep these private flag bits in lock-step with the estimator's mirror in
 // `raw_pipeline::mem_budget`. Any drift is a compile error, so the preflight
@@ -746,6 +840,7 @@ const _: () = {
     assert!(OUT_FULL_16 == raw_pipeline::mem_budget::OUT_FULL_16);
     assert!(OUT_NO_ORIENT == raw_pipeline::mem_budget::OUT_NO_ORIENT);
     assert!(OUT_FULL_DISP16 == raw_pipeline::mem_budget::OUT_FULL_DISP16);
+    assert!(OUT_RETAIN_RAW == raw_pipeline::mem_budget::OUT_RETAIN_RAW);
 };
 
 /// S3 preflight: project the peak / retained working-set of a RAW decode from
@@ -887,12 +982,15 @@ impl LookOverrides {
 }
 
 struct OrfDecoded {
-    rgb16: Vec<u16>,
+    // Full sensor raw u16 mosaic (empty on the streaming preview-only fast path,
+    // which never materializes it). The MHC demosaic + luminance NR that used to
+    // run here now live in `finish_from_raw`, shared by the normal full-decode
+    // path and the mode-3 deferred finish — so the raw travels intact.
+    raw: Vec<u16>,
     w: usize,
     h: usize,
     info: tiff::OrfInfo,
     decompress_ms: f64,
-    demosaic_ms: f64,
     wb_from_camera: bool,
     params: pipeline::PipelineParams,
     color_matrix_from_mn: bool,
@@ -959,8 +1057,12 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
         let (thumb_w, thumb_h) = target_dims(w, h, 360);
         let need_previews = output_flags & (OUT_LIGHTBOX | OUT_THUMB) != 0;
         let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
+        // Mode 3: OUT_RETAIN_RAW needs the full raw mosaic materialized, which the
+        // streaming path never produces — treat it like "raw is needed downstream"
+        // so this call takes the full decompress path below.
+        let retain_raw = output_flags & OUT_RETAIN_RAW != 0;
         let wb_from_camera = info.wb_r.is_some() && info.wb_b.is_some();
-        if should_stream_previews(need_previews, need_full_rgb, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
+        if should_stream_previews(need_previews, need_full_rgb || retain_raw, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
             let t = now_ms();
             let previews = raw_pipeline::stream_preview::build_previews_streaming(
                 raw_pipeline::decompress::OrfRowDecoder::new(strip, w, h)
@@ -984,10 +1086,9 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
             };
 
             return Ok(OrfDecoded {
-                rgb16: Vec::new(),
+                raw: Vec::new(),
                 w, h, info,
                 decompress_ms: stream_ms,
-                demosaic_ms: 0.0,
                 wb_from_camera,
                 params,
                 color_matrix_from_mn,
@@ -1093,38 +1194,17 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
         ]
     };
 
-    // Gate MHC demosaic: only needed when full-resolution output is requested.
-    // Preview paths (OUT_LIGHTBOX/THUMB) use the planar bilinear demosaic above.
-    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
-    let t = now_ms();
-    let mut rgb16 = if need_full_rgb {
-        demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| JsError::new(&e))?
-    } else {
-        Vec::new()
-    };
-    let demosaic_ms = if need_full_rgb { now_ms() - t } else { 0.0 };
-    drop(raw);
-
-    // ISO-gated luminance NR on the MHC output — only relevant for full-rgb paths.
-    if need_full_rgb {
-        let nr_strength = match info.iso.unwrap_or(0) {
-            iso if iso >= 6400 => 0.50f32,
-            iso if iso >= 3200 => 0.35,
-            iso if iso >= 1600 => 0.20,
-            _ => 0.0,
-        };
-        if nr_strength > 0.0 {
-            pipeline::apply_luminance_nr(&mut rgb16, w, h, nr_strength);
-        }
-    }
-
+    // The full raw mosaic travels intact to `process_orf_impl`. The MHC demosaic
+    // + ISO-gated luminance NR that used to run here now live in `finish_from_raw`
+    // (shared by the normal full-decode path and the mode-3 deferred finish), so
+    // the full-res output is byte-identical whichever path finishes it, and a
+    // phase-1 `OUT_RETAIN_RAW` decode can hold this mosaic for a later finish.
     Ok(OrfDecoded {
-        rgb16,
+        raw,
         w,
         h,
         info,
         decompress_ms,
-        demosaic_ms,
         wb_from_camera,
         params,
         color_matrix_from_mn,
@@ -1141,61 +1221,12 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
     })
 }
 
-/// Shared output stage: conditionally compute lb, thumb, and full RGB8 from
-/// pre-decoded ORF data according to `output_flags`.  Absent outputs have empty
-/// buffers and zero dims in the returned `ProcessResult`.
-fn process_orf_impl(
-    decoded: OrfDecoded,
-    output_flags: u32,
-    look: &LookOverrides,
-) -> Result<ProcessResult, JsError> {
-    let OrfDecoded {
-        mut rgb16,
-        w,
-        h,
-        info,
-        decompress_ms,
-        demosaic_ms,
-        wb_from_camera,
-        mut params,
-        color_matrix_from_mn,
-        color_matrix_flat,
-        lb_packed,
-        lb_w,
-        lb_h,
-        thumb_packed,
-        thumb_w,
-        thumb_h,
-        preview_demosaic_ms,
-        preview_downscale_ms,
-        fast_preview,
-    } = decoded;
-
-    // Hypercar: use precomputed fast planar bilinear + planar down for lb/thumb (cheap SIMD, no mhc for preview paths).
-    // The old down from (mhc) rgb16 is bypassed for previews; full rgb16 only for OUT_FULL_RGB8 tone.
-    // M3 full-res 16-bit (for pyramid RAW 2048/full levels). Only when OUT_FULL_16 flag set.
-    // A-5: capture the 16-bit master *after* the tone path's last read of rgb16 (moving it
-    // out, no copy) instead of packing a second full-res buffer here while rgb16 is still
-    // live. Packed to LE bytes lazily in take_rgb16_full; output bytes are unchanged.
-    let want_full16 = output_flags & OUT_FULL_16 != 0;
-    let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
-    let (out_full16_w, out_full16_h) = if want_full16 {
-        (w as u32, h as u32)
-    } else {
-        (0, 0)
-    };
-    let (rgb16_lb, out_lb_w, out_lb_h) = if output_flags & OUT_LIGHTBOX != 0 {
-        (lb_packed, lb_w, lb_h)
-    } else {
-        (vec![], 0, 0)
-    };
-
-    let (rgb16_thumb, out_thumb_w, out_thumb_h) = if output_flags & OUT_THUMB != 0 {
-        (thumb_packed, thumb_w, thumb_h)
-    } else {
-        (vec![], 0, 0)
-    };
-
+/// Apply the look overrides (explicit WB override + LR-style sliders) to
+/// camera-derived `params`. Shared by the normal full-decode path and the
+/// mode-3 deferred `finish_full_rgb8` so both derive identical tone params from
+/// identical look args. Only a finite, positive override replaces the camera WB;
+/// the sliders themselves never touch `params.wb_r/wb_b` or `params.black`.
+fn apply_look_to_params(params: &mut pipeline::PipelineParams, look: &LookOverrides) {
     if look.wb_r.is_finite() && look.wb_r > 0.0 {
         params.wb_r = look.wb_r.min(8.0);
     }
@@ -1203,7 +1234,7 @@ fn process_orf_impl(
         params.wb_b = look.wb_b.min(8.0);
     }
     raw_pipeline::pipeline::apply_look_params(
-        &mut params,
+        params,
         look.exposure_ev,
         look.contrast,
         look.highlights,
@@ -1217,9 +1248,75 @@ fn process_orf_impl(
         look.texture,
         look.clarity,
     );
+}
+
+/// Full-resolution outputs finished from a raw mosaic.
+struct FinishOutputs {
+    rgb8: Vec<u8>,
+    final_w: usize,
+    final_h: usize,
+    demosaic_ms: f64,
+    tonemap_ms: f64,
+    orient_ms: f64,
+    rgb16_full: Vec<u16>,
+    full16_w: u32,
+    full16_h: u32,
+    rgb16_disp: Vec<u16>,
+    disp16_w: u32,
+    disp16_h: u32,
+    wb_r_used: f32,
+    wb_b_used: f32,
+}
+
+/// Sole implementation of the full-res finish stage: MHC demosaic → ISO-gated
+/// luminance NR → look → tone → optional disp16 → optional orientation. Called
+/// by BOTH the normal `OUT_FULL_RGB8` decode path (`process_orf_impl`) and the
+/// mode-3 deferred `ProcessResult::finish_full_rgb8`, so the two are
+/// byte-identical by construction. `params` is camera-derived (pre-look); the
+/// look is applied here. `iso` gates the NR; `orientation` drives the CPU rotate
+/// unless `OUT_NO_ORIENT` is set. Consumes `raw` (freed right after demosaic).
+fn finish_from_raw(
+    raw: Vec<u16>,
+    w: usize,
+    h: usize,
+    mut params: pipeline::PipelineParams,
+    look: &LookOverrides,
+    orientation: u16,
+    iso: u32,
+    output_flags: u32,
+) -> Result<FinishOutputs, JsError> {
+    // MHC (quality) demosaic — full-res interleaved RGB16.
+    let t = now_ms();
+    let mut rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| JsError::new(&e))?;
+    let demosaic_ms = now_ms() - t;
+    drop(raw);
+
+    // ISO-gated luminance NR on the MHC output.
+    let nr_strength = match iso {
+        iso if iso >= 6400 => 0.50f32,
+        iso if iso >= 3200 => 0.35,
+        iso if iso >= 1600 => 0.20,
+        _ => 0.0,
+    };
+    if nr_strength > 0.0 {
+        pipeline::apply_luminance_nr(&mut rgb16, w, h, nr_strength);
+    }
+
+    // Apply the look to the camera-derived params (WB override + LR sliders).
+    apply_look_to_params(&mut params, look);
+    let wb_r_used = params.wb_r;
+    let wb_b_used = params.wb_b;
+
+    let want_full16 = output_flags & OUT_FULL_16 != 0;
+    let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
+    let (full16_w, full16_h) = if want_full16 {
+        (w as u32, h as u32)
+    } else {
+        (0, 0)
+    };
 
     let t = now_ms();
-    let (final_rgb, final_w, final_h, tonemap_ms, orient_ms, rgb16_full, rgb16_disp, disp16_w, disp16_h) =
+    let (rgb8, final_w, final_h, tonemap_ms, orient_ms, rgb16_full, rgb16_disp, disp16_w, disp16_h) =
         if output_flags & OUT_FULL_RGB8 != 0 {
             // Unsharp mutates rgb16 in place; the 16-bit master export is the *pre-unsharp*
             // image (as the former eager pack was), so snapshot before mutating in that
@@ -1244,10 +1341,10 @@ fn process_orf_impl(
             let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
             let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
                 let disp = pipeline::process_16bit(&rgb16, &params);
-                if skip_orient || info.orientation == 1 {
+                if skip_orient || orientation == 1 {
                     (disp, w as u32, h as u32)
                 } else {
-                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, info.orientation);
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, orientation);
                     (d, dw as u32, dh as u32)
                 }
             } else {
@@ -1264,10 +1361,10 @@ fn process_orf_impl(
             let t2 = now_ms();
             // OUT_NO_ORIENT lets the encoder use JXL's basic-info orientation field
             // — no CPU rotate, no 60–200 MB intermediate buffer.
-            let (fr, fw, fh) = if skip_orient || info.orientation == 1 {
+            let (fr, fw, fh) = if skip_orient || orientation == 1 {
                 (rgb8, w, h)
             } else {
-                pipeline::apply_orientation(rgb8, w, h, info.orientation)
+                pipeline::apply_orientation(rgb8, w, h, orientation)
             };
             (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         } else {
@@ -1277,10 +1374,10 @@ fn process_orf_impl(
             // default look params (texture/clarity = 0), so this matches the 8-bit render exactly.
             let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
                 let disp = pipeline::process_16bit(&rgb16, &params);
-                if skip_orient || info.orientation == 1 {
+                if skip_orient || orientation == 1 {
                     (disp, w as u32, h as u32)
                 } else {
-                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, info.orientation);
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, orientation);
                     (d, dw as u32, dh as u32)
                 }
             } else {
@@ -1289,6 +1386,177 @@ fn process_orf_impl(
             let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
             (vec![], 0, 0, 0.0, 0.0, rgb16_full, rgb16_disp, disp16_w, disp16_h)
         };
+
+    Ok(FinishOutputs {
+        rgb8,
+        final_w,
+        final_h,
+        demosaic_ms,
+        tonemap_ms,
+        orient_ms,
+        rgb16_full,
+        full16_w,
+        full16_h,
+        rgb16_disp,
+        disp16_w,
+        disp16_h,
+        wb_r_used,
+        wb_b_used,
+    })
+}
+
+/// Shared output stage: conditionally compute lb, thumb, and full RGB8 from
+/// pre-decoded ORF data according to `output_flags`.  Absent outputs have empty
+/// buffers and zero dims in the returned `ProcessResult`.
+fn process_orf_impl(
+    decoded: OrfDecoded,
+    output_flags: u32,
+    look: &LookOverrides,
+) -> Result<ProcessResult, JsError> {
+    let OrfDecoded {
+        raw,
+        w,
+        h,
+        info,
+        decompress_ms,
+        wb_from_camera,
+        params,
+        color_matrix_from_mn,
+        color_matrix_flat,
+        lb_packed,
+        lb_w,
+        lb_h,
+        thumb_packed,
+        thumb_w,
+        thumb_h,
+        preview_demosaic_ms,
+        preview_downscale_ms,
+        fast_preview,
+    } = decoded;
+
+    // Camera black pedestal is format-fixed and untouched by the look; capture it
+    // before `params` is moved into the finish / retain path.
+    let black_used = params.black;
+
+    // Previews (already built in decode_orf_raw) are surfaced per requested flags.
+    let (rgb16_lb, out_lb_w, out_lb_h) = if output_flags & OUT_LIGHTBOX != 0 {
+        (lb_packed, lb_w, lb_h)
+    } else {
+        (vec![], 0, 0)
+    };
+    let (rgb16_thumb, out_thumb_w, out_thumb_h) = if output_flags & OUT_THUMB != 0 {
+        (thumb_packed, thumb_w, thumb_h)
+    } else {
+        (vec![], 0, 0)
+    };
+
+    let retain = output_flags & OUT_RETAIN_RAW != 0;
+    let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
+
+    // Full-resolution outputs: (a) mode-3 retain — keep the raw mosaic + camera
+    // params for a later `finish_full_rgb8`; (b) normal full decode — finish now
+    // via `finish_from_raw`; (c) preview-only — drop the raw. Reported WB is the
+    // look-adjusted WB in every case (matching the classic path that fed the live
+    // LookRenderer); the *retained* params stay pre-look so the deferred finish
+    // applies its own look args.
+    let (
+        final_rgb,
+        final_w,
+        final_h,
+        demosaic_ms,
+        tonemap_ms,
+        orient_ms,
+        rgb16_full,
+        out_full16_w,
+        out_full16_h,
+        rgb16_disp,
+        disp16_w,
+        disp16_h,
+        wb_r_used,
+        wb_b_used,
+        retained_raw,
+        retained_params,
+        retained_w,
+        retained_h,
+    ) = if retain {
+        let mut look_params = params.clone();
+        apply_look_to_params(&mut look_params, look);
+        (
+            Vec::new(),
+            0usize,
+            0usize,
+            0.0,
+            0.0,
+            0.0,
+            Vec::new(),
+            0u32,
+            0u32,
+            Vec::new(),
+            0u32,
+            0u32,
+            look_params.wb_r,
+            look_params.wb_b,
+            Some(raw),
+            Some(params),
+            w,
+            h,
+        )
+    } else if need_full_rgb {
+        let out = finish_from_raw(
+            raw,
+            w,
+            h,
+            params,
+            look,
+            info.orientation,
+            info.iso.unwrap_or(0),
+            output_flags,
+        )?;
+        (
+            out.rgb8,
+            out.final_w,
+            out.final_h,
+            out.demosaic_ms,
+            out.tonemap_ms,
+            out.orient_ms,
+            out.rgb16_full,
+            out.full16_w,
+            out.full16_h,
+            out.rgb16_disp,
+            out.disp16_w,
+            out.disp16_h,
+            out.wb_r_used,
+            out.wb_b_used,
+            None,
+            None,
+            0usize,
+            0usize,
+        )
+    } else {
+        drop(raw);
+        let mut look_params = params;
+        apply_look_to_params(&mut look_params, look);
+        (
+            Vec::new(),
+            0usize,
+            0usize,
+            0.0,
+            0.0,
+            0.0,
+            Vec::new(),
+            0u32,
+            0u32,
+            Vec::new(),
+            0u32,
+            0u32,
+            look_params.wb_r,
+            look_params.wb_b,
+            None,
+            None,
+            0usize,
+            0usize,
+        )
+    };
 
     Ok(ProcessResult {
         rgb: final_rgb,
@@ -1302,9 +1570,9 @@ fn process_orf_impl(
         preview_demosaic_ms,
         preview_downscale_ms,
         fast_preview,
-        wb_r_used: params.wb_r,
-        wb_b_used: params.wb_b,
-        black_used: params.black,
+        wb_r_used,
+        wb_b_used,
+        black_used,
         color_matrix_from_mn,
         make: info.make,
         model: info.model,
@@ -1339,6 +1607,10 @@ fn process_orf_impl(
         quality: info.quality.unwrap_or(0),
         wb_mode: info.wb_mode.unwrap_or(0xFFFF),
         wb_from_camera,
+        retained_raw,
+        retained_params,
+        retained_w,
+        retained_h,
     })
 }
 
@@ -3052,6 +3324,12 @@ fn process_dng_impl(
         quality: 0,
         wb_mode: 0xFFFF,
         wb_from_camera: true,
+        // DNG/CR2 stay monolithic (worker.js never sets OUT_RETAIN_RAW for them),
+        // so there is never a retained raw mosaic to finish later.
+        retained_raw: None,
+        retained_params: None,
+        retained_w: 0,
+        retained_h: 0,
     })
 }
 

@@ -66,6 +66,11 @@ pub const OUT_FULL_16: u32 = 8;
 pub const OUT_NO_ORIENT: u32 = 16;
 /// Full-resolution display-referred RGB16 (u16 × 3ch, oriented).
 pub const OUT_FULL_DISP16: u32 = 32;
+/// Mode 3: retain the full RAW u16 mosaic in the result for a deferred full-res
+/// finish (`ProcessResult::finish_full_rgb8`) — no second decompress. Not a
+/// full-res *output* flag, so the peak/retained model is unaffected; mirrored
+/// here only to keep the wasm crate's compile-time flag-parity assert happy.
+pub const OUT_RETAIN_RAW: u32 = 64;
 
 /// Long-edge target of the lightbox preview (px). Matches `target_dims(_, 1800)`.
 const LIGHTBOX_LONG_EDGE: u64 = 1800;

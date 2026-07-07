@@ -118,6 +118,9 @@ const OUT_FULL_RGB8 = 1;
 const OUT_LIGHTBOX  = 2;
 const OUT_THUMB     = 4;
 const OUT_NO_ORIENT = 16;
+// Mode 3: retain the phase-1 raw mosaic so a later result.finish_full_rgb8()
+// produces the full RGB8 WITHOUT a second decompress (mirror src/lib.rs bit 64).
+const OUT_RETAIN_RAW = 64;
 
 // Compose EXIF orientation tag (1..8) with N additional CW quarter-turns.
 // Only handles the cycle {1, 6, 3, 8} that maps to pure rotations — Olympus
@@ -566,18 +569,19 @@ self.addEventListener('message', async (ev) => {
             clarity: look.clarity ?? 0,
         };
 
-        // TTFP-4 two-phase split (ORF only): previews first, full-res second.
+        // Mode 3 — single-decompress preview-first split (ORF only): previews
+        // first, full-res second, but decompress runs ONCE.
         //
         // The monolithic call held the 360px thumb and 1800px lightbox hostage
         // to the full-res decompress+demosaic+tonemap, because requesting
         // OUT_FULL_RGB8 disables lib.rs's streaming preview-only fast path
-        // (should_stream_previews). Phase 1 asks for previews only, so ORF
-        // takes the strip-streamed superpixel path (byte-identical previews —
-        // stream_preview tests + web/two-phase-raw.test.js A/B) and
-        // THUMB/LIGHTBOX post before any full-res work; phase 2 re-runs the
-        // decoder for OUT_FULL_RGB8 only (no preview build). Cost: the encode
-        // leg pays a second decompress — a deliberate first-paint-latency vs
-        // total-CPU trade.
+        // (should_stream_previews). Phase 1 asks for previews + OUT_RETAIN_RAW,
+        // which forces a full decompress (bypassing the streaming path) and
+        // RETAINS that full raw mosaic in the ProcessResult; THUMB/LIGHTBOX post
+        // before any full-res work. Phase 2 calls result.finish_full_rgb8() to
+        // demosaic+tone the RETAINED mosaic into the full RGB8 — NO second
+        // decompress, NO second decoder call. Byte-identical to a fresh full
+        // decode (web/_mode3_ab.mjs A/B + two-phase-raw.test.js).
         //
         // DNG stays monolithic: its monolithic previews are downscaled from
         // the FULL-RES MHC demosaic (process_dng_impl has no superpixel
@@ -588,20 +592,20 @@ self.addEventListener('message', async (ev) => {
         // split would repeat the full decode+demosaic for zero preview
         // speedup.
         //
-        // Phase-1 results have width/height == 0 (lib.rs previews-only path);
-        // sensor dims travel on ENCODE_REQUEST (phase 2) and main.js patches
-        // exif.width/height at DONE. Cancel semantics unchanged: one
-        // checkpoint after the first WASM call, none between phases (a
-        // between-phase skip would strand the pool slot, since the worker is
-        // released on ENCODE_REQUEST).
+        // Phase-1 results have width/height == 0 (lib.rs previews-only path)
+        // until finish_full_rgb8 sets the full sensor dims; sensor dims travel on
+        // ENCODE_REQUEST (phase 2) and main.js patches exif.width/height at DONE.
+        // Cancel semantics unchanged: one checkpoint after the first WASM call,
+        // none between phases (a between-phase skip would strand the pool slot,
+        // since the worker is released on ENCODE_REQUEST).
         //
-        // batch:true opts out of the split. The two-phase path trades total CPU
-        // (a second full decompress — the 74%-dominant serial stage) for
-        // first-paint preview latency; that trade only pays for the INTERACTIVE
-        // viewer. Batch/headless exports need no on-screen preview, so they take
-        // the single monolithic call (same shape DNG/CR2 already use) and decode
-        // each ORF once. Previews are still posted below (the monolithic branch
-        // builds THUMB/LIGHTBOX too) — just after the full decode, not before.
+        // batch:true opts out of the split. Mode 3's split now decodes each ORF
+        // exactly ONCE either way (the retained mosaic is reused), so the split is
+        // purely a first-paint-latency win with no extra decompress; batch still
+        // takes the single monolithic call (same shape DNG/CR2 use) so no raw is
+        // retained for headless exports. Previews are still posted below (the
+        // monolithic branch builds THUMB/LIGHTBOX too) — just after the full
+        // decode, not before.
         const interactive = opts.batch !== true;   // default: interactive
         const canSplit = interactive && decoderFn === process_orf_with_flags;
 
@@ -609,8 +613,10 @@ self.addEventListener('message', async (ev) => {
         // OUT_NO_ORIENT: skip apply_orientation on the full RGB8 — JXL records
         // rotation as metadata, so pixels stay sensor-native and we avoid the
         // 60–200 MB intermediate buffer + cache-hostile transpose at encode prep.
+        // Mode 3: OUT_RETAIN_RAW keeps phase-1's full raw mosaic so phase 2 finishes
+        // the full RGB8 from it (finish_full_rgb8) instead of decompressing again.
         const phase1Flags = canSplit
-            ? (OUT_LIGHTBOX | OUT_THUMB)
+            ? (OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW)
             : (OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
         const result = processRawWithFlagsNamed(decoderFn, bytes, phase1Flags, lookArgs);
         // Best-effort cancel checkpoint: the synchronous decode could not be
@@ -700,34 +706,42 @@ self.addEventListener('message', async (ev) => {
         const userTurns = Math.round(((opts.userRotation || 0) % 360 + 360) % 360 / 90) % 4;
         const encodeOrientation = composeOrientation(ori, userTurns);
 
-        // Phase 2 (split only): full-res decode for the encode leg. Previews
-        // are already on screen; this runs after their postMessages so the
-        // main thread paints while the worker crunches. The phase-1 result is
-        // freed first (renderers were moved out by take_*_renderer) so the
-        // preview and full-res WASM buffers are never co-resident.
+        // Phase 2 (split only): finish the full-res RGB8 FROM the raw mosaic
+        // retained in phase 1 — demosaic+tone only, NO second decompress and NO
+        // second decoder call. Previews are already on screen; this runs after
+        // their postMessages so the main thread paints while the worker crunches.
+        // The phase-1 renderers were already moved out (take_*_renderer); the
+        // retained mosaic is consumed here, then `result` is freed at the end.
         let fullRgb, encW, encH, encTimings;
         if (canSplit) {
-            result.free();
             const p2T0 = performance.now();
-            const result2 = processRawWithFlagsNamed(
-                decoderFn, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT, lookArgs);
+            // Same 14 look args, same order, as process_orf_with_flags / phase 1.
+            result.finish_full_rgb8(
+                OUT_FULL_RGB8 | OUT_NO_ORIENT,
+                lookArgs.exposureEv, lookArgs.contrast, lookArgs.highlights, lookArgs.shadows,
+                lookArgs.whites, lookArgs.blacks, lookArgs.saturation, lookArgs.vibrance,
+                lookArgs.temp, lookArgs.tint, lookArgs.wbR, lookArgs.wbB,
+                lookArgs.texture, lookArgs.clarity,
+            );
             const p2Ms = performance.now() - p2T0;
-            encW = result2.width;
-            encH = result2.height;
-            // Real totals for the stats line — decompress ran in BOTH phases,
-            // so the summed figure is the honest per-file CPU cost. Travels on
-            // ENCODE_REQUEST because THUMB (with the phase-1 partials) has
-            // already been posted; main.js patches card state at DONE.
+            encW = result.width;   // full sensor dims, set by finish_full_rgb8
+            encH = result.height;
+            // Honest single-decompress cost: decompress ran ONCE (phase 1); the
+            // finish contributes demosaic+tonemap only (its orient is skipped by
+            // OUT_NO_ORIENT). Travels on ENCODE_REQUEST because THUMB (with the
+            // phase-1 partials) has already been posted; main.js patches card
+            // state at DONE.
             encTimings = {
                 pipelineMs: pipelineMs + p2Ms,
                 phaseMs: {
-                    decompress: phaseMs.decompress + result2.decompress_ms,
-                    demosaic:   phaseMs.demosaic   + result2.demosaic_ms,
-                    tonemap:    result2.tonemap_ms,
-                    orient:     result2.orient_ms,
+                    decompress: phaseMs.decompress,   // the single decompress
+                    demosaic:   result.demosaic_ms,   // from the finish
+                    tonemap:    result.tonemap_ms,    // from the finish
+                    orient:     result.orient_ms,
                 },
             };
-            fullRgb = result2.take_rgb();
+            fullRgb = result.take_rgb();
+            result.free();
         } else {
             encW = w;
             encH = h;
