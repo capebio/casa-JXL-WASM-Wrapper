@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>Tone-math parity harness — 8-bit canonical vs WebGL 16-bit (S2-Q2)</title>
+<!--
+  Manual QA harness for S2-Q2 tone-math unification.
+
+  LEFT  = canonical 8-bit path  : filter-engine.buildColorMatrix + applyColorMatrixInPlace
+                                  + applyToneMapInPlace  (engine of record).
+  RIGHT = WebGL 16-bit path     : webgl-pipeline.renderRgba16AdjustedToCanvas (the GLSL
+                                  shaders I unified; CPU fallback if no WebGL).
+
+  Serve over the dev server so COOP/COEP + same-origin module imports work:
+      node tools/dev-server.mjs 8080
+  then open  http://localhost:8080/web/lightbox/tone-parity-harness.html
+
+  CONTENT MODES:
+   - "Seahorse (8-bit → ×257)"  : an 8-bit fractal lifted to 16-bit losslessly. The 8-bit and
+     16-bit paths see IDENTICAL values, so they MUST match — residual diff is only
+     Floyd-Steinberg dither + GL half-float storage (expect max ≲ 3/255). This is the parity
+     proof: revert the shader tone fix and the shadows/highlights sliders blow the diff up.
+   - "Synthetic 16-bit gradient": true sub-8-bit ramps. Here the 8-bit path BANDS and the
+     16-bit path stays smooth — diff in the gradients is EXPECTED (that is the 16-bit win).
+     Use this mode to eyeball the tone knees: shadows lift below luma 128, highlights compress
+     above luma 192.
+-->
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0f17; color: #cbd5e1; font: 13px/1.5 system-ui, sans-serif; }
+  header { padding: 10px 16px; background: #111827; border-bottom: 1px solid #1f2937; }
+  header b { color: #e5e7eb; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; margin-left: 8px; }
+  .ok { background: #064e3b; color: #6ee7b7; }
+  .warn { background: #7c2d12; color: #fdba74; }
+  main { display: flex; gap: 16px; padding: 16px; flex-wrap: wrap; }
+  .controls { width: 260px; flex: 0 0 auto; }
+  .row { display: flex; align-items: center; justify-content: space-between; margin: 6px 0; }
+  .row label { color: #94a3b8; }
+  .row output { color: #e5e7eb; width: 42px; text-align: right; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 130px; }
+  select, button { background: #1f2937; color: #e5e7eb; border: 1px solid #374151; border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; margin-top: 8px; }
+  .views { display: flex; gap: 16px; flex-wrap: wrap; flex: 1 1 480px; }
+  figure { margin: 0; }
+  figcaption { font-size: 12px; color: #94a3b8; margin-bottom: 4px; }
+  canvas { max-width: 100%; height: auto; background: #000; border: 1px solid #1f2937; image-rendering: pixelated; }
+  #diffReadout { margin-top: 6px; font-variant-numeric: tabular-nums; }
+  code { color: #93c5fd; }
+</style>
+
+<header>
+  <b>Tone-math parity</b> — canonical 8-bit vs WebGL 16-bit shader (S2-Q2)
+  <span id="glBadge" class="badge warn">WebGL: probing…</span>
+  <span id="modeBadge" class="badge"></span>
+</header>
+
+<main>
+  <div class="controls">
+    <div class="row">
+      <label for="content">Content</label>
+      <select id="content">
+        <option value="seahorse">Seahorse (8-bit → ×257)</option>
+        <option value="gradient">Synthetic 16-bit gradient</option>
+      </select>
+    </div>
+    <div class="row">
+      <label for="preset">Preset</label>
+      <select id="preset"></select>
+    </div>
+    <div id="sliders"></div>
+    <button id="reset">Reset sliders</button>
+    <div id="diffReadout"></div>
+  </div>
+
+  <div class="views">
+    <figure>
+      <figcaption>Canonical 8-bit (filter-engine)</figcaption>
+      <canvas id="cLeft"></canvas>
+    </figure>
+    <figure>
+      <figcaption>WebGL 16-bit (webgl-pipeline shader)</figcaption>
+      <canvas id="cRight"></canvas>
+    </figure>
+    <figure>
+      <figcaption>|diff| ×20 (dark = match)</figcaption>
+      <canvas id="cDiff"></canvas>
+    </figure>
+  </div>
+</main>
+
+<script type="module">
+  import {
+    buildColorMatrix, clampAdjustments, applyColorMatrixInPlace, applyToneMapInPlace,
+    APPROVED_LIGHTBOX_PRESETS,
+  } from './filter-engine.js';
+  import { renderRgba16AdjustedToCanvas, canUseWebGL16 } from './webgl-pipeline.js';
+
+  const SLIDERS = [
+    ['brightness', -100, 100], ['contrast', -100, 100], ['saturation', -100, 100],
+    ['shadows', 0, 100], ['highlights', -100, 0], ['clarity', 0, 100], ['dehaze', 0, 100],
+  ];
+  const params = Object.fromEntries(SLIDERS.map(([k]) => [k, 0]));
+
+  // ---- UI wiring ---------------------------------------------------------
+  const presetSel = document.getElementById('preset');
+  for (const p of APPROVED_LIGHTBOX_PRESETS) presetSel.add(new Option(p, p));
+  const slidersEl = document.getElementById('sliders');
+  for (const [k, lo, hi] of SLIDERS) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<label>${k}</label><input type="range" min="${lo}" max="${hi}" value="0" data-k="${k}"><output>0</output>`;
+    slidersEl.appendChild(row);
+  }
+  slidersEl.addEventListener('input', (e) => {
+    const k = e.target.dataset.k; if (!k) return;
+    params[k] = Number(e.target.value);
+    e.target.nextElementSibling.value = e.target.value;
+    render();
+  });
+  presetSel.addEventListener('change', render);
+  document.getElementById('content').addEventListener('change', loadContent);
+  document.getElementById('reset').addEventListener('click', () => {
+    for (const [k] of SLIDERS) params[k] = 0;
+    slidersEl.querySelectorAll('input').forEach((i) => { i.value = 0; i.nextElementSibling.value = 0; });
+    render();
+  });
+
+  const glOk = canUseWebGL16();
+  const glBadge = document.getElementById('glBadge');
+  glBadge.textContent = glOk ? 'WebGL: yes (real GLSL)' : 'WebGL: no (CPU fallback)';
+  glBadge.className = 'badge ' + (glOk ? 'ok' : 'warn');
+
+  // ---- content -----------------------------------------------------------
+  let content = null; // { w, h, u16: Uint16Array RGBA, eightBitLossless: bool }
+
+  function synthGradient(w = 512, h = 288) {
+    const u16 = new Uint16Array(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const o = (y * w + x) * 4;
+        const t = x / (w - 1);              // horizontal luma ramp 0..1 (true 16-bit)
+        const band = Math.floor(y / (h / 3)); // 0 R, 1 G, 2 B emphasis
+        const base = Math.round(t * 65535);
+        u16[o] = band === 0 ? base : Math.round(base * 0.6);
+        u16[o + 1] = band === 1 ? base : Math.round(base * 0.6);
+        u16[o + 2] = band === 2 ? base : Math.round(base * 0.6);
+        u16[o + 3] = 65535;
+      }
+    }
+    return { w, h, u16, eightBitLossless: false };
+  }
+
+  async function loadSeahorse() {
+    const img = new Image();
+    img.src = './testdata/seahorse.png';
+    await img.decode();
+    const w = img.naturalWidth, h = img.naturalHeight;
+    const cv = new OffscreenCanvas(w, h);
+    const ctx = cv.getContext('2d');
+    ctx.drawImage(img, 0, 0);
+    const rgba8 = ctx.getImageData(0, 0, w, h).data;
+    const u16 = new Uint16Array(w * h * 4);
+    for (let i = 0; i < u16.length; i++) u16[i] = rgba8[i] * 257; // lossless 8→16
+    for (let p = 0; p < w * h; p++) u16[p * 4 + 3] = 65535;
+    return { w, h, u16, eightBitLossless: true };
+  }
+
+  async function loadContent() {
+    content = document.getElementById('content').value === 'gradient'
+      ? synthGradient() : await loadSeahorse();
+    const mb = document.getElementById('modeBadge');
+    mb.textContent = content.eightBitLossless ? 'parity mode (diff = dither only)' : 'smoothness mode (banding expected)';
+    mb.className = 'badge ' + (content.eightBitLossless ? 'ok' : 'warn');
+    render();
+  }
+
+  // ---- render ------------------------------------------------------------
+  function renderCanonical8bit(u16, w, h, canvas, preset, adj) {
+    const rgba8 = new Uint8ClampedArray(w * h * 4);
+    for (let p = 0; p < w * h; p++) {
+      const o = p * 4;
+      rgba8[o] = Math.round((u16[o] / 65535) * 255);
+      rgba8[o + 1] = Math.round((u16[o + 1] / 65535) * 255);
+      rgba8[o + 2] = Math.round((u16[o + 2] / 65535) * 255);
+      rgba8[o + 3] = 255;
+    }
+    const matrix = buildColorMatrix(preset, adj);
+    applyColorMatrixInPlace(rgba8, w, h, matrix);
+    applyToneMapInPlace(rgba8, w, h, adj.shadows, adj.highlights);
+    for (let p = 0; p < w * h; p++) rgba8[p * 4 + 3] = 255;
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').putImageData(new ImageData(rgba8, w, h), 0, 0);
+  }
+
+  function renderDiff(left, right, canvas, w, h) {
+    const a = left.getContext('2d').getImageData(0, 0, w, h).data;
+    const b = right.getContext('2d').getImageData(0, 0, w, h).data;
+    const out = new Uint8ClampedArray(w * h * 4);
+    let maxD = 0, sumD = 0, n = 0;
+    for (let p = 0; p < w * h; p++) {
+      const o = p * 4;
+      for (let c = 0; c < 3; c++) {
+        const d = Math.abs(a[o + c] - b[o + c]);
+        maxD = Math.max(maxD, d); sumD += d; n++;
+        out[o + c] = Math.min(255, d * 20);
+      }
+      out[o + 3] = 255;
+    }
+    canvas.width = w; canvas.height = h;
+    canvas.getContext('2d').putImageData(new ImageData(out, w, h), 0, 0);
+    return { maxD, meanD: sumD / n };
+  }
+
+  function render() {
+    if (!content) return;
+    const { w, h, u16, eightBitLossless } = content;
+    const adj = clampAdjustments({ ...params });
+    const preset = presetSel.value;
+
+    renderCanonical8bit(u16, w, h, document.getElementById('cLeft'), preset, adj);
+    const right = document.getElementById('cRight');
+    // floydSteinbergDitherToCanvas putImageData's at (0,0) but does NOT resize the canvas —
+    // size it here or the ImageData is clipped to the default 300×150.
+    right.width = w; right.height = h;
+    renderRgba16AdjustedToCanvas(new Uint8Array(u16.buffer), w, h, right, preset, adj);
+
+    const { maxD, meanD } = renderDiff(
+      document.getElementById('cLeft'), right, document.getElementById('cDiff'), w, h);
+
+    const ro = document.getElementById('diffReadout');
+    if (eightBitLossless) {
+      const pass = maxD <= 4; // dither ±2 + GL half-float + rounding
+      ro.innerHTML = `max Δ <b>${maxD}</b>/255 · mean <b>${meanD.toFixed(3)}</b> `
+        + `<span class="badge ${pass ? 'ok' : 'warn'}">${pass ? 'PARITY OK' : 'MISMATCH'}</span>`;
+    } else {
+      ro.innerHTML = `max Δ <b>${maxD}</b>/255 · mean <b>${meanD.toFixed(3)}</b> `
+        + `<span class="badge warn">gradient banding — informational</span>`;
+    }
+    return { maxD, meanD, eightBitLossless, webgl: glOk };
+  }
+
+  // Test hook so a headless driver (Playwright) can run the REAL GLSL and read parity.
+  window.__harness = {
+    webgl: glOk,
+    async setContent(v) { document.getElementById('content').value = v; await loadContent(); },
+    measure(preset, p = {}) {
+      presetSel.value = preset;
+      for (const [k] of SLIDERS) params[k] = p[k] ?? 0;
+      slidersEl.querySelectorAll('input').forEach((i) => {
+        i.value = params[i.dataset.k]; i.nextElementSibling.value = i.value;
+      });
+      return render();
+    },
+  };
+
+  await loadContent();
+  window.__harness.ready = true;
+</script>
