@@ -25,7 +25,10 @@
 
 use std::path::PathBuf;
 
-use crate::casa_video::{VideoError, VideoFrameSource};
+use crate::casa_video::{
+    encode_casv_video, encode_casv_video_streaming, CasaVideoOptions, SkipMode, VideoError,
+    VideoFrameSource, VideoRate,
+};
 use crate::casabio_encode::box_downscale_rgb8;
 use crate::decompress::RawRowSource;
 use crate::pipeline::PipelineParams;
@@ -300,6 +303,68 @@ impl RawVideoSource {
     }
 }
 
+/// Encode a sorted list of RAW stills (ORF / DNG / CR2) directly into a `.casv`,
+/// written to `sink`; returns the number of bytes written. This is the
+/// programmatic sibling of the `casv_encode --raw-frames` CLI mode (which layers
+/// on per-frame progress + audio-free file output).
+///
+/// Builds a [`RawVideoSource`] with a fixed per-sequence look and routes exactly
+/// like that CLI mode:
+/// - **streaming, constant-peak** encoder ([`encode_casv_video_streaming`]) for the
+///   lossy bbox/tile tiers — holds ~2 downscaled frames + one full-res transient;
+/// - **buffered batch** encoder ([`encode_casv_video`]) for the all-frames-resident
+///   tiers (lossless, or lossy `skip=none`), where every decoded frame is resident.
+///
+/// A mid-stream RAW decode failure ends the pull early (the [`VideoFrameSource`]
+/// trait cannot surface an error); this surfaces it as [`VideoError::Raw`] instead
+/// of silently truncating the video. `look` / `nr_strength` / `fps_*` / `max_px` /
+/// `scene_cut` configure the source exactly as [`RawVideoSource::new`]; `opts` is the
+/// encoder knob-set.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_casv_from_raws<W: std::io::Write>(
+    files: Vec<PathBuf>,
+    look: RawVideoLook,
+    nr_strength: f32,
+    fps_num: u32,
+    fps_den: u32,
+    max_px: Option<u32>,
+    scene_cut: Option<f32>,
+    opts: &CasaVideoOptions,
+    sink: &mut W,
+) -> Result<usize, VideoError> {
+    let mut src =
+        RawVideoSource::new(files, look, nr_strength, fps_num, fps_den, max_px, scene_cut)?;
+    let (w, h) = src.dims();
+    let streaming_capable =
+        matches!(opts.rate, VideoRate::Lossy(_)) && !matches!(opts.skip, SkipMode::None);
+    let bytes = if streaming_capable {
+        let r = encode_casv_video_streaming(&mut src, opts);
+        if let Some(err) = src.take_error() {
+            return Err(VideoError::Raw(err));
+        }
+        r?
+    } else {
+        // Batch tiers need every frame resident. Pull with the buffer-filling
+        // override (no per-frame heap frame inside the source), taking ownership
+        // of each filled buffer.
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        let mut buf = Vec::new();
+        while src.next_frame_into(&mut buf) {
+            frames.push(std::mem::take(&mut buf));
+        }
+        if let Some(err) = src.take_error() {
+            return Err(VideoError::Raw(err));
+        }
+        if frames.is_empty() {
+            return Err(VideoError::Empty);
+        }
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        encode_casv_video(&refs, w, h, fps_num, fps_den, opts)?
+    };
+    sink.write_all(&bytes).map_err(|_| VideoError::Io)?;
+    Ok(bytes.len())
+}
+
 impl VideoFrameSource for RawVideoSource {
     fn dims(&self) -> (u32, u32) {
         (self.dw, self.dh)
@@ -478,5 +543,74 @@ mod tests {
         assert_eq!(sniff(&dng).unwrap(), RawFmt::Dng);
 
         assert!(sniff(&[0u8; 4]).is_err());
+    }
+
+    /// Two real Olympus ORF stills from the local capture corpus. Path-gated:
+    /// the assertions run only when the files are present (this dev machine),
+    /// and the test passes as a no-op elsewhere (CI has no corpus).
+    const CORPUS_ORF: [&str; 2] = [
+        "C:/995/2026-02-20 Gobabeb To Windhoek/P2200474.ORF",
+        "C:/995/2026-02-20 Gobabeb To Windhoek/P2200475 Kissenia capensis.ORF",
+    ];
+
+    fn corpus_files() -> Option<Vec<std::path::PathBuf>> {
+        let files: Vec<std::path::PathBuf> =
+            CORPUS_ORF.iter().map(std::path::PathBuf::from).collect();
+        files.iter().all(|p| p.exists()).then_some(files)
+    }
+
+    /// K4: a two-file `RawVideoSource` yields exactly two full RGB8 frames, then
+    /// end-of-stream, with no decode error.
+    #[test]
+    fn raw_video_source_two_frames() {
+        let Some(files) = corpus_files() else {
+            eprintln!("skip raw_video_source_two_frames: corpus ORF files absent");
+            return;
+        };
+        let mut src = RawVideoSource::new(
+            files,
+            RawVideoLook::default(),
+            0.0,
+            24,
+            1,
+            Some(1024), // cap the longest edge so the test stays fast + low-mem
+            None,
+        )
+        .expect("build RawVideoSource");
+        let (w, h) = src.dims();
+        assert!(w > 0 && h > 0, "non-zero target dims");
+        let expected = w as usize * h as usize * 3;
+        let f0 = src.next_frame().expect("frame 0");
+        assert_eq!(f0.len(), expected, "frame 0 is packed RGB8 at target dims");
+        let f1 = src.next_frame().expect("frame 1");
+        assert_eq!(f1.len(), expected, "frame 1 is packed RGB8 at target dims");
+        assert!(src.next_frame().is_none(), "exactly two frames");
+        assert!(src.take_error().is_none(), "no decode error");
+    }
+
+    /// K4: the two ORF stills encode end-to-end to a non-empty `.casv` via the
+    /// `encode_casv_from_raws` convenience entry (lossy tile streaming tier).
+    #[test]
+    fn encode_casv_from_raws_two_frames() {
+        let Some(files) = corpus_files() else {
+            eprintln!("skip encode_casv_from_raws_two_frames: corpus ORF files absent");
+            return;
+        };
+        let opts = CasaVideoOptions::streaming(2.0); // lossy · tile skip · gop 24
+        let mut out = Vec::new();
+        let n = encode_casv_from_raws(
+            files,
+            RawVideoLook::default(),
+            0.0,
+            24,
+            1,
+            Some(640),
+            None,
+            &opts,
+            &mut out,
+        )
+        .expect("encode_casv_from_raws");
+        assert!(n > 0, "non-empty .casv written");
+        assert_eq!(out.len(), n, "byte count matches written buffer");
     }
 }
