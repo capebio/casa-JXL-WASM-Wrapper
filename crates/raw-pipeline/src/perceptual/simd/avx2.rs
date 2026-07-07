@@ -56,6 +56,99 @@ pub unsafe fn scale_err_avx2(
             && tb.len() >= n,
         "scale_err_avx2: all input slices must have len >= n"
     );
+    // Drain the f32 lane accumulator to f64 every FLUSH iterations to prevent
+    // precision loss when summing > ~4096 values (f32 exact range ≈ 2^24).
+    // Keeps SIMD throughput while achieving f64 accumulation precision end-to-end.
+    const FLUSH: usize = 4096;
+    const FLUSH_PX: usize = FLUSH * 8; // lanes per drained f64 block (32768 px)
+    let lanes = n / 8 * 8;
+    let mut sum = 0f64;
+
+    // Flush-block band parallelism — BIT-EXACT, not merely equivalent: the serial
+    // kernel already resets its f32 accumulator at every FLUSH boundary and folds
+    // one f64 value per block, left-to-right. Bands aligned to those boundaries
+    // compute the exact same per-block f64 values (fresh acc, same lane ops), and
+    // the final left-fold below replays the identical f64 addition sequence. The
+    // only difference vs serial is skipping a trailing `+= hsum(zero-acc)` when
+    // lanes is an exact block multiple — adding +0.0 to a non-negative sum is a
+    // bit-level identity, so the result is unchanged. Compute-bound (div/sqrt per
+    // lane), so this survives the DS-ROWPAR bandwidth rule; gated ≥2M px (bench:
+    // examples/scale_err_mt_flip.rs).
+    #[cfg(feature = "parallel")]
+    {
+        const BLOCKS_PER_BAND: usize = 8; // 262144 px per band
+        if n >= SCALE_ERR_PAR_MIN_PIXELS && lanes >= 2 * BLOCKS_PER_BAND * FLUSH_PX {
+            use rayon::prelude::*;
+            let band_px = BLOCKS_PER_BAND * FLUSH_PX;
+            let bands = lanes.div_ceil(band_px);
+            let partials: Vec<Vec<f64>> = (0..bands)
+                .into_par_iter()
+                .map(|k| {
+                    let i0 = k * band_px;
+                    let i1 = (i0 + band_px).min(lanes);
+                    let mut out = Vec::with_capacity(BLOCKS_PER_BAND);
+                    // SAFETY: avx2+fma verified by the dispatching caller; i0 is a
+                    // FLUSH_PX multiple so drains land on the serial boundaries.
+                    unsafe {
+                        scale_err_lanes_avx2(
+                            mask, rx, ry, rb, tx, ty, tb, i0, i1, kx, ky, kb, rsqrt_path,
+                            &mut out,
+                        )
+                    };
+                    out
+                })
+                .collect();
+            for band in &partials {
+                for &v in band {
+                    sum += v; // identical left-to-right f64 fold as serial
+                }
+            }
+            sum = scale_err_tail(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb, lanes, sum);
+            return ((sum / n as f64).cbrt()) as f32;
+        }
+    }
+
+    let mut blocks: Vec<f64> = Vec::new();
+    scale_err_lanes_avx2(
+        mask, rx, ry, rb, tx, ty, tb, 0, lanes, kx, ky, kb, rsqrt_path, &mut blocks,
+    );
+    for &v in &blocks {
+        sum += v;
+    }
+    sum = scale_err_tail(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb, lanes, sum);
+    // cbrt() is faster and more accurate than powf(1.0/3.0) (two transcendentals).
+    ((sum / n as f64).cbrt()) as f32
+}
+
+/// Engage the parallel scale_err pass only at ≥2M pixels.
+#[cfg(feature = "parallel")]
+const SCALE_ERR_PAR_MIN_PIXELS: usize = 1 << 21;
+
+/// The scale_err vector loop over lane range `[i0, i1)` (both multiples of 8;
+/// `i0` additionally a multiple of `FLUSH*8` so drains land on the same global
+/// boundaries as the serial walk). Pushes one drained f64 per completed FLUSH
+/// block plus one for a trailing partial block (if any) — exactly the values the
+/// original loop folded into `sum`, in the same order.
+///
+/// SAFETY: caller guarantees avx2+fma and all seven slices have `len() >= i1`.
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn scale_err_lanes_avx2(
+    mask: &[f32],
+    rx: &[f32],
+    ry: &[f32],
+    rb: &[f32],
+    tx: &[f32],
+    ty: &[f32],
+    tb: &[f32],
+    i0: usize,
+    i1: usize,
+    kx: f32,
+    ky: f32,
+    kb: f32,
+    rsqrt_path: bool,
+    out: &mut Vec<f64>,
+) {
     let vkx = _mm256_set1_ps(kx);
     let vky = _mm256_set1_ps(ky);
     let vkb = _mm256_set1_ps(kb);
@@ -65,16 +158,10 @@ pub unsafe fn scale_err_avx2(
     let half = _mm256_set1_ps(0.5); // loop-invariant rsqrt Newton constants
     let threehalf = _mm256_set1_ps(1.5);
     let mut acc = _mm256_setzero_ps();
-    // Drain the f32 lane accumulator to f64 every FLUSH iterations to prevent
-    // precision loss when summing > ~4096 values (f32 exact range ≈ 2^24).
-    // Keeps SIMD throughput while achieving f64 accumulation precision end-to-end.
     const FLUSH: usize = 4096;
     let mut flush_count = 0usize;
-    let mut sum = 0f64;
-
-    let lanes = n / 8 * 8;
-    let mut i = 0;
-    while i < lanes {
+    let mut i = i0;
+    while i < i1 {
         let m = _mm256_loadu_ps(mask.as_ptr().add(i));
         // m = max(mask*2 + 0.15, 0.15)
         let mm = _mm256_max_ps(_mm256_fmadd_ps(m, v2, v015), v015);
@@ -131,15 +218,14 @@ pub unsafe fn scale_err_avx2(
         i += 8;
         flush_count += 1;
         if flush_count == FLUSH {
-            sum += hsum256(acc) as f64;
+            out.push(hsum256(acc) as f64);
             acc = _mm256_setzero_ps();
             flush_count = 0;
         }
     }
-    sum += hsum256(acc) as f64;
-    sum = scale_err_tail(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb, i, sum);
-    // cbrt() is faster and more accurate than powf(1.0/3.0) (two transcendentals).
-    ((sum / n as f64).cbrt()) as f32
+    if flush_count > 0 {
+        out.push(hsum256(acc) as f64);
+    }
 }
 
 /// AVX2 PSNR sum-of-squared-diffs over packed u8. Returns the integer sum (exact
@@ -1057,6 +1143,56 @@ mod reduction_tests {
         let want = unsafe { ssim_moments_avx2(&a, &b, np) };
         let got = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
         assert_eq!(want, got);
+    }
+
+    /// scale_err at a pixel count crossing SCALE_ERR_PAR_MIN_PIXELS (2M), so the
+    /// default `parallel` feature takes the flush-block band path. Compared
+    /// BIT-exactly against the serial walk reconstructed from the same band
+    /// helper (one full-range call + identical left fold + tail + cbrt) — the
+    /// parallel fold must replay the exact serial f64 addition sequence. Both
+    /// strict and rsqrt variants; n chosen with a partial trailing flush block
+    /// AND a scalar tail (n % 8 != 0).
+    #[test]
+    fn scale_err_parallel_flush_bands_bit_identical_to_serial() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")) {
+            return;
+        }
+        let n = (1usize << 21) + (1 << 15) + 13; // 2.13M px: partial block + tail
+        let mk = |seed: u32| -> Vec<f32> {
+            let mut s = seed;
+            (0..n)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (s >> 8) as f32 / 16_777_216.0
+                })
+                .collect()
+        };
+        let (mask, rx, ry, rb) = (mk(1), mk(2), mk(3), mk(4));
+        let (tx, ty, tb) = (mk(5), mk(6), mk(7));
+        let (kx, ky, kb) = (0.7f32, 1.1, 0.9);
+        for rsqrt in [false, true] {
+            let got = unsafe {
+                scale_err_avx2(&mask, &rx, &ry, &rb, &tx, &ty, &tb, n, kx, ky, kb, rsqrt)
+            };
+            // Serial reconstruction through the same band helper.
+            let lanes = n / 8 * 8;
+            let mut blocks: Vec<f64> = Vec::new();
+            unsafe {
+                scale_err_lanes_avx2(
+                    &mask, &rx, &ry, &rb, &tx, &ty, &tb, 0, lanes, kx, ky, kb, rsqrt,
+                    &mut blocks,
+                )
+            };
+            let mut sum = 0f64;
+            for &v in &blocks {
+                sum += v;
+            }
+            sum = super::super::scalar::scale_err_tail(
+                &mask, &rx, &ry, &rb, &tx, &ty, &tb, n, kx, ky, kb, lanes, sum,
+            );
+            let want = ((sum / n as f64).cbrt()) as f32;
+            assert_eq!(want.to_bits(), got.to_bits(), "rsqrt={rsqrt}");
+        }
     }
 
     /// SSD at a byte count crossing SSD_PAR_MIN_BYTES (8 MB), so under the
