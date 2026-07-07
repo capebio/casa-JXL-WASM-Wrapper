@@ -2932,6 +2932,15 @@ function drawLightbox() {
 function closeLightbox() {
     lightbox.hidden = true;
     lightboxIndex = -1;
+    // Stop the debounced live-update loop and clear its in-flight/pending flags.
+    // Without this, a live reprocess that resolves after close leaves
+    // liveInFlight=true and can stash a stale livePendingLook, which defeats the
+    // debounce on the next lightbox open. The retained worker liveStateMap is
+    // intentionally NOT freed here — re-opening the SAME card must still support
+    // live slider edits; genuine teardown (card removal) frees it via removeCard.
+    clearTimeout(liveDebounceTimer);
+    liveInFlight = false;
+    livePendingLook = null;
     if (lbPreviewBadge) lbPreviewBadge.hidden = true;
     lbLoadingBadge.hidden = true;
     lbDisplayLongPx = null;
