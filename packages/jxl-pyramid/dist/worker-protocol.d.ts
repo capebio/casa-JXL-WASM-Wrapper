@@ -7,6 +7,12 @@
  * Reply pixels: transfer [pixels.buffer] for zero-copy (Lens7/20).
  * progressiveStage + deadlineMs: use 'dc' + tight deadline for low-latency machine-rec/AR first pass (Lens12/16).
  * priority (higher = more urgent): gaming/priority queue, astro tracking, photogram select, attended AR viewport (Lens11/13/14/16).
+ *
+ * dist/worker-protocol.js is BUILD-ONLY for bundler consumers: no in-repo runtime code
+ * imports it directly (tests import this .ts via bun), but `validateWorkerRequest` is
+ * re-exported through the package barrel (src/index.ts → dist/index.js), so the compiled
+ * dist must be rebuilt (`bun run build`) and committed whenever this file changes — a stale
+ * `export {}` would strip the guard from the published @casabio/jxl-pyramid surface.
  */
 import type { ImageRegion } from "./tiling.js";
 export type { ImageRegion } from "./tiling.js";
@@ -15,6 +21,12 @@ export type WorkerRequest = {
     type: 'load';
     bytesId: number;
     bytes: Uint8Array;
+} | {
+    v: 1;
+    type: 'load';
+    bytesId: number;
+    sab: SharedArrayBuffer;
+    byteLength: number;
 } | {
     v: 1;
     type: 'decode';
@@ -53,4 +65,6 @@ export type WorkerReply = {
     };
 };
 export type WorkerErrorCode = 'JXTC_PARSE' | 'BAD_REGION' | 'OOM' | 'INTERNAL' | 'TIMEOUT' | 'UNKNOWN_BYTES_ID';
+/** Dev-mode assertion mirroring parseWorkerReply. Throws on malformed outbound requests in dev. No-op in production. */
+export declare function validateWorkerRequest(req: unknown): void;
 //# sourceMappingURL=worker-protocol.d.ts.map

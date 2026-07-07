@@ -118,7 +118,6 @@ export async function decodeTiledViewport(source, region, options) {
         const skipTiles = options?.skipTiles;
         const startMs = budgetMs != null ? performance.now() : 0;
         const deadline = budgetMs != null ? startMs + budgetMs : null;
-        let failedTiles = [];
         let target;
         // Progressive DC-then-final (F1 + L3-1): Phase 1 all DC, Phase 2 all final.
         // Delivers onTile twice per tile (DC first for full coarse paint, then final). Stream-stitch friendly.
@@ -164,6 +163,7 @@ export async function decodeTiledViewport(source, region, options) {
             const ordered = tilesWithBytes.slice().sort((a, b) => a.dist - b.dist);
             let deadlineHit = false;
             const stitchedFinal = new Set();
+            const failedTileKeys = new Set();
             // Phase 1: all DC (coarse first paint for entire viewport) with bounded fallback concurrency DL-7(b)
             await runWithBoundedConcurrency(ordered, 3, async (item) => {
                 if (signal?.aborted)
@@ -229,13 +229,15 @@ export async function decodeTiledViewport(source, region, options) {
                 catch (e) {
                     if (errorPolicy === 'skip-tile') {
                         zeroFillRect(target, vp, t, plan.bpp);
-                        failedTiles.push(id);
+                        failedTileKeys.add(key);
                         completed += 1;
                         const prog = { id, key, stage: 'dc', completed, total };
                         onTile?.(t, completed, prog);
                         return;
                     }
-                    throw e;
+                    if (e instanceof PyramidError)
+                        throw e;
+                    throw new PyramidError('JXTC_PARSE', `tile progressive dc: ${e instanceof Error ? e.message : String(e)}`, e);
                 }
             });
             if (progressive !== 'dc-only') {
@@ -253,7 +255,7 @@ export async function decodeTiledViewport(source, region, options) {
                         throw new PyramidError('TIMEOUT', 'budgetMs deadline exceeded during progressive decode');
                     }
                     const t = item.tile;
-                    const id = tileIdOf(t, source.tileSize, source.level ?? 0);
+                    const { id, finalKey } = item;
                     const key = tileKey(id);
                     if (skipTiles?.has(key)) {
                         completed += 1;
@@ -272,7 +274,6 @@ export async function decodeTiledViewport(source, region, options) {
                     const decodedH = Math.min(tileSize, source.height - srcOriginY);
                     const expectedLen = decodedW * decodedH * plan.bpp;
                     // Check for final cache hit
-                    const finalKey = `${makeTileCacheKey(levelId, id)}:${plan.format}:final`;
                     const finalHit = cache?.get(finalKey);
                     if (finalHit && finalHit.byteLength === expectedLen) {
                         stitchTileIntoViewport(target, vp, t, finalHit, source, plan.bpp);
@@ -301,13 +302,15 @@ export async function decodeTiledViewport(source, region, options) {
                     catch (e) {
                         if (errorPolicy === 'skip-tile') {
                             zeroFillRect(target, vp, t, plan.bpp);
-                            failedTiles.push(id);
+                            failedTileKeys.add(key);
                             completed += 1;
                             const prog = { id, key, stage: 'final', completed, total };
                             onTile?.(t, completed, prog);
                             return;
                         }
-                        throw e;
+                        if (e instanceof PyramidError)
+                            throw e;
+                        throw new PyramidError('JXTC_PARSE', `tile progressive final: ${e instanceof Error ? e.message : String(e)}`, e);
                     }
                 });
             }
@@ -315,29 +318,25 @@ export async function decodeTiledViewport(source, region, options) {
             if (deadlineHit) {
                 for (let i = 0; i < n; i++) {
                     const t = plan.tiles[i];
-                    const id = tileIdOf(t, source.tileSize, 0);
+                    const id = tileIdOf(t, source.tileSize, source.level ?? 0);
                     const k = tileKey(id);
                     if (!stitchedFinal.has(k)) {
-                        failedTiles.push(id);
+                        failedTileKeys.add(k);
                     }
                 }
             }
             const pixels = target.byteLength === need ? target : target.subarray(0, need);
             const result = { pixels, width: vp.w, height: vp.h, format: plan.format };
-            if (failedTiles.length > 0) {
-                // dedup by key (a tile may error in both phases)
-                const seen = new Set();
-                const uniq = [];
-                for (const id of failedTiles) {
-                    const k = tileKey(id);
-                    if (!seen.has(k)) {
-                        seen.add(k);
-                        uniq.push(id);
+            if (failedTileKeys.size > 0) {
+                const failedIds = [];
+                for (const item of tilesWithBytes) {
+                    if (failedTileKeys.has(tileKey(item.id))) {
+                        failedIds.push(item.id);
                     }
                 }
-                result.failedTiles = uniq;
+                result.failedTiles = failedIds;
             }
-            const complete = !deadlineHit && failedTiles.length === 0 && !(skipTiles && skipTiles.size > 0);
+            const complete = !deadlineHit && failedTileKeys.size === 0 && !(skipTiles && skipTiles.size > 0);
             if (complete) {
                 cacheStore(cache, cacheKey, target, need);
             }
@@ -423,6 +422,7 @@ async function decodeTileBytesProgressive(tileBytes, format, stage) {
         return out.px;
     }
     finally {
+        await drainOutcome.catch(() => { });
         await Promise.resolve(decoder.dispose()).catch(() => { });
     }
 }

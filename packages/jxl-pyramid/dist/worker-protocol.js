@@ -7,6 +7,53 @@
  * Reply pixels: transfer [pixels.buffer] for zero-copy (Lens7/20).
  * progressiveStage + deadlineMs: use 'dc' + tight deadline for low-latency machine-rec/AR first pass (Lens12/16).
  * priority (higher = more urgent): gaming/priority queue, astro tracking, photogram select, attended AR viewport (Lens11/13/14/16).
+ *
+ * dist/worker-protocol.js is BUILD-ONLY for bundler consumers: no in-repo runtime code
+ * imports it directly (tests import this .ts via bun), but `validateWorkerRequest` is
+ * re-exported through the package barrel (src/index.ts → dist/index.js), so the compiled
+ * dist must be rebuilt (`bun run build`) and committed whenever this file changes — a stale
+ * `export {}` would strip the guard from the published @casabio/jxl-pyramid surface.
  */
-export {};
+const _DEV = typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production';
+/** Dev-mode assertion mirroring parseWorkerReply. Throws on malformed outbound requests in dev. No-op in production. */
+export function validateWorkerRequest(req) {
+    if (!_DEV)
+        return;
+    if (!req || typeof req !== 'object')
+        throw new Error('[pyramid] WorkerRequest: not an object');
+    const r = req;
+    if (r.v !== 1)
+        throw new Error(`[pyramid] WorkerRequest: expected v=1, got v=${r.v}`);
+    if (r.type === 'load') {
+        if (typeof r.bytesId !== 'number')
+            throw new Error('[pyramid] WorkerRequest load: bytesId not a number');
+        if (r.sab !== undefined) {
+            if (typeof SharedArrayBuffer === 'undefined' || !(r.sab instanceof SharedArrayBuffer))
+                throw new Error('[pyramid] WorkerRequest load: sab is not a SharedArrayBuffer');
+            if (typeof r.byteLength !== 'number' || r.byteLength <= 0)
+                throw new Error('[pyramid] WorkerRequest load: byteLength must be positive number');
+        }
+        else if (!(r.bytes instanceof Uint8Array)) {
+            throw new Error('[pyramid] WorkerRequest load: bytes must be a Uint8Array');
+        }
+    }
+    else if (r.type === 'decode') {
+        if (typeof r.id !== 'number')
+            throw new Error('[pyramid] WorkerRequest decode: id not a number');
+        if (typeof r.bytesId !== 'number')
+            throw new Error('[pyramid] WorkerRequest decode: bytesId not a number');
+        if (!r.region || typeof r.region.x !== 'number' || typeof r.region.y !== 'number' ||
+            typeof r.region.w !== 'number' || typeof r.region.h !== 'number')
+            throw new Error('[pyramid] WorkerRequest decode: region must have numeric x,y,w,h');
+        if (r.format !== 'rgba8' && r.format !== 'rgba16')
+            throw new Error(`[pyramid] WorkerRequest decode: unknown format ${r.format}`);
+    }
+    else if (r.type === 'cancel') {
+        if (typeof r.id !== 'number')
+            throw new Error('[pyramid] WorkerRequest cancel: id not a number');
+    }
+    else {
+        throw new Error(`[pyramid] WorkerRequest: unknown type '${r.type}'`);
+    }
+}
 //# sourceMappingURL=worker-protocol.js.map

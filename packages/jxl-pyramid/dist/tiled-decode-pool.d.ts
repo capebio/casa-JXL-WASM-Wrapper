@@ -60,6 +60,7 @@ type WorkerHandle = {
         count: number;
     };
     budgetCharged?: boolean;
+    inIdle?: boolean;
 };
 export declare class PyramidWorkerPool {
     private readonly factory;
@@ -184,6 +185,7 @@ export declare function decodeTiledViewportPooled(containerBytes: Uint8Array, re
     signal?: AbortSignal;
     /** Opt-in SAB zero-copy for the load message when crossOriginIsolated. */
     useSAB?: boolean;
+    pool?: PyramidWorkerPool;
 }): Promise<DecodedLevel>;
 export declare function decodeTiledViewportPooled(source: Extract<LevelSource, {
     kind: "tiled";
@@ -193,6 +195,7 @@ export declare function decodeTiledViewportPooled(source: Extract<LevelSource, {
     workerFactory?: () => WorkerLike;
     signal?: AbortSignal;
     useSAB?: boolean;
+    pool?: PyramidWorkerPool;
 }): Promise<DecodedLevel>;
 export {};
 //# sourceMappingURL=tiled-decode-pool.d.ts.map

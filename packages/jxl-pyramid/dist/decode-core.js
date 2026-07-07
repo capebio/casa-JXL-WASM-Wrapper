@@ -223,12 +223,13 @@ export function viewportCacheKey(levelId, vp, format, quality) {
  *  Caches on the source object (like bytesId). Shared reference stamped to results (no per-tile copies).
  *  Only runs if options.preserveMetadata. For JXTC the profile lives in the codestream(s); header target is cheap.
  */
+const _iccCache = new WeakMap();
 export function ensureIccProfile(source, opts) {
     if (!opts?.preserveMetadata)
         return Promise.resolve(null);
-    const key = '_iccProfile';
-    if (key in source)
-        return source[key];
+    const cached = _iccCache.get(source);
+    if (cached !== undefined)
+        return cached;
     const p = (async () => {
         try {
             // Dynamic import avoids any potential cycle; facade has the getIccProfile (added for decode states).
@@ -255,7 +256,7 @@ export function ensureIccProfile(source, opts) {
             return null;
         }
     })();
-    source[key] = p;
+    _iccCache.set(source, p);
     return p;
 }
 export function cacheStore(cache, key, pixels, need) {
