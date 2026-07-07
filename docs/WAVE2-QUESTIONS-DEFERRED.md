@@ -59,14 +59,23 @@ Note: most of the S2 safe-subset was **already on `main`** (QUESTIONS §002/§00
 - **S3-Q1 peepCache: count-cap vs byte budget.** Migrated behavior-preservingly (count 24). Rec:
   keep now → `maxBytes ≈ 384 MB` after a scripted peep session under `performance.memory`.
 - **S3-Q2 asset-store import `src/` vs `dist/`.** Plain ESM, no build; `src/` works. Rec: keep.
-- **S3-Q3 Wire `estimate_decode_peak` into admission gate.** Export exists, unused. Rec: wire as a
-  soft log-only signal first, then a hard gate ≥1.5× once model-vs-RSS multiplier is measured; retire
-  the arbitrary 1 GiB `MAX_OUTPUT_BYTES_GUARD`.
+- **S3-Q3 Wire `estimate_decode_peak` into admission gate.** ✅ SOFT SIGNAL LANDED
+  (`feat/s3-asset-store-jul07`, 2026-07-07). The WASM export was absent from shipped `web/pkg`, so a
+  pure-JS mirror (`asset-store/src/mem-budget.js`, parity-tested) + `AssetStore.admit()` (log-only,
+  ×1.5) + a Phase-A preflight in `web/main.js` (`rawDecodeGovernor`, 384 MB) ship the soft signal.
+  REMAINS: the hard gate ≥1.5× once the model-vs-RSS multiplier is measured on a real browser run, and
+  retiring the 1 GiB `MAX_OUTPUT_BYTES_GUARD` in `jxl-worker-browser/src/decode-handler.ts` (a
+  different worker; needs the estimate available worker-side + the measurement).
 - **S3-Q4 Per-session retained-frame governor — which layer.** Designed, NOT implemented (CLAUDE.md
   forbids backpressure in facade/session). Rec: extend the scheduler's byte-HWM to also count retained
   pixels; AssetStore-on-main-thread is the cheap interim.
-- **S3-Q5 AssetStore drives jxl-cache OPFS?** ~10-line adapter, not wired. Rec: wire when pyramid
-  level-byte cache migrates.
+- **S3-Q5 AssetStore drives jxl-cache OPFS?** ✅ ADAPTER LANDED
+  (`persistentBackendFromCache()` in `asset-store/src/index.js`, round-trip tested;
+  `feat/s3-asset-store-jul07`). REMAINS: the pyramid call-site wiring. Note found while implementing —
+  `jxl-pyramid`'s `createInMemoryPyramidCache` has **no production call site yet** (tests only), and its
+  `PyramidCache` is a *synchronous by-reference* cache, so OPFS read-through can't live in `get()` — it
+  belongs at the async decode call site via the existing `onEvict` L2 hook. Wire both when the pyramid
+  decode path goes live in `web/`.
 
 ## S4 — verification & hardening
 - **S4-D1 Loose bench-script relocation — NOT done.** ~33 root scripts are not all scratch

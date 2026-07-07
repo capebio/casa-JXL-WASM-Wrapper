@@ -14,6 +14,13 @@
 //! `docs/adr/S3-memory-budget.md` for the derivation and the observed-vs-model
 //! relationship.
 //!
+//! MIRROR: the shipped `web/pkg` is not always rebuilt to surface the
+//! wasm-bindgen export, so a pure-JS copy of this exact model lives in
+//! `packages/asset-store/src/mem-budget.js` (`estimateDecodePeak`). If you change
+//! the buffer model or the OUT_* semantics here, update that mirror too — its
+//! parity test (`packages/asset-store/test/mem-budget.test.js`) pins to the same
+//! worked numbers this module's `#[test]` block asserts.
+//!
 //! ## Model (see ADR for the full derivation)
 //!
 //! Buffers, in bytes, for an `n = width*height`-pixel frame:
