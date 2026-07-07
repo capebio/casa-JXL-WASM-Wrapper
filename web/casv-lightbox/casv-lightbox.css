@@ -179,3 +179,23 @@
   display: block; margin-top: 5px; font-size: .8rem; color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+
+/* Fullscreen button: push it to the right side of the transport row. */
+.casv-lb__t--fs { margin-left: auto; }
+
+/* Fullscreen state — fill the viewport when the stage is promoted. */
+.casv-lb__stage:fullscreen,
+.casv-lb__stage:-webkit-full-screen {
+  background: #000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: unset;
+}
+.casv-lb__stage:fullscreen .casv-lb__canvas,
+.casv-lb__stage:-webkit-full-screen .casv-lb__canvas {
+  max-width: 100vw;
+  max-height: 100vh;
+  width: auto;
+  height: auto;
+}

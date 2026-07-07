@@ -59,6 +59,7 @@ export class CasvLightbox {
       open: $('open'), export: $('export'), encodeToggle: $('encodeToggle'),
       canvas: $('canvas'), stage: $('stage'), status: $('status'),
       play: $('play'), prev: $('prev'), next: $('next'), first: $('first'), last: $('last'),
+      fullscreen: $('fullscreen'),
       scrub: $('scrub'), counter: $('counter'), tc: $('tc'),
       speed: $('speed'), loop: $('loop'), vol: $('vol'), volRange: $('volRange'),
       meta: $('meta'), kind: $('kind'),
@@ -121,6 +122,7 @@ export class CasvLightbox {
     this.el.next.addEventListener('click', () => this._step(1));
     this.el.first.addEventListener('click', () => this._seek(0));
     this.el.last.addEventListener('click', () => this._seek(this.frames.length - 1));
+    if (this.el.fullscreen) this.el.fullscreen.addEventListener('click', () => this._toggleFullscreen());
     this.el.scrub.addEventListener('input', () => this._seek(Number(this.el.scrub.value)));
     this.el.speed.addEventListener('change', () => { this.speed = Number(this.el.speed.value); });
     this.el.loop.addEventListener('change', () => { this.loop = this.el.loop.checked; });
@@ -179,9 +181,19 @@ export class CasvLightbox {
       if (!hasFiles && !shouldHandleEncodeDrop(names)) return;
       event.preventDefault();
       event.stopPropagation();
-      if (event.type === 'drop' && !isTauri()) {
-        openDesktopCasvEncoder();
-        this._setStatus('Browser blocked local video paths. Opening the desktop app for MP4/MOV/WEBM encode...', 'warn');
+      if (event.type === 'drop') {
+        // .casv drop → open for playback (works in browser; no encoder redirect)
+        const files = Array.from(event.dataTransfer?.files || []);
+        const casvFile = files.find((f) => f.name.toLowerCase().endsWith('.casv'));
+        if (casvFile) {
+          casvFile.arrayBuffer().then((buf) => this.loadBytes(new Uint8Array(buf), casvFile.name))
+            .catch((e) => this._setStatus(`Drop failed: ${e.message}`, 'error'));
+          return;
+        }
+        if (!isTauri()) {
+          openDesktopCasvEncoder();
+          this._setStatus('Browser blocked local video paths. Opening the desktop app for MP4/MOV/WEBM encode...', 'warn');
+        }
       }
     };
     for (const type of ['dragenter', 'dragover', 'drop']) {
@@ -399,7 +411,20 @@ export class CasvLightbox {
     }
   }
 
+  _toggleFullscreen() {
+    const el = this.el.stage;
+    if (!el) return;
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      el.requestFullscreen().catch((e) => {
+        this._setStatus(`Fullscreen unavailable: ${e.message}`, 'warn');
+      });
+    }
+  }
+
   _onKey(e) {
+    if (e.key === 'f' || e.key === 'F') { this._toggleFullscreen(); return; }
     if (!this.frames.length) return;
     if (e.key === ' ') { e.preventDefault(); this._togglePlay(); }
     else if (e.key === 'ArrowLeft') { e.preventDefault(); this._step(-1); }
@@ -780,6 +805,7 @@ const TEMPLATE = `
   <button data-el="play" class="casv-lb__t casv-lb__t--play" title="Play/Pause (Space)" disabled>▶</button>
   <button data-el="next" class="casv-lb__t" title="Next (→)" disabled>▶▶</button>
   <button data-el="last" class="casv-lb__t" title="Last (End)" disabled>⏭</button>
+  <button data-el="fullscreen" class="casv-lb__t casv-lb__t--fs" title="Fullscreen (F)">⛶</button>
   <input data-el="scrub" class="casv-lb__scrub" type="range" min="0" max="0" value="0" step="1" disabled>
   <span class="casv-lb__counter" data-el="counter">0 / 0</span>
   <span class="casv-lb__tc" data-el="tc">—</span>
