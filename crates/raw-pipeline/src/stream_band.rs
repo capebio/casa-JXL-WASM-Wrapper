@@ -379,7 +379,7 @@ impl<'a> StreamingBandSource<OrfRowDecoder<'a>> {
             params.wb_b = b;
         }
         if let Some(m) = info.color_matrix {
-            params.color_matrix = Some(m);
+            params.color_matrix = Some(m).into();
         }
         let src = OrfRowDecoder::new(strip, w, h)?;
         Ok(Self::new(src, w, h, params, nr_strength, (0, 0)))
@@ -409,7 +409,7 @@ impl<'a> StreamingBandSource<DngRowSource<'a>> {
         params.white = white;
         params.wb_r = wb_r;
         params.wb_b = wb_b;
-        params.color_matrix = cm;
+        params.color_matrix = cm.into();
         Ok(Self::new(src, w, h, params, nr_strength, phase))
     }
 }
@@ -427,7 +427,7 @@ impl StreamingBandSource<Cr2RowSource> {
         params.white = src.white;
         params.wb_r = src.wb_r;
         params.wb_b = src.wb_b;
-        params.color_matrix = src.color_matrix;
+        params.color_matrix = src.color_matrix.into();
         Ok(Self::new(src, w, h, params, nr_strength, phase))
     }
 }

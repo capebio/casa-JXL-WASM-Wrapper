@@ -51,7 +51,7 @@ fn develop(path: &std::path::Path) -> Option<(Developed, &'static str)> {
             p.wb_r = info.wb_r.unwrap_or(1.797);
             p.wb_g = 1.0;
             p.wb_b = info.wb_b.unwrap_or(1.797);
-            p.color_matrix = info.color_matrix;
+            p.color_matrix = info.color_matrix.into();
             let mut rgb8 = vec![0u8; w * h * 3];
             let t = Instant::now();
             pipeline::process_into_auto(&rgb16, &p, &mut rgb8);
@@ -81,7 +81,7 @@ fn develop(path: &std::path::Path) -> Option<(Developed, &'static str)> {
             p.wb_r = img.wb_r;
             p.wb_g = img.wb_g;
             p.wb_b = img.wb_b;
-            p.color_matrix = img.color_matrix;
+            p.color_matrix = img.color_matrix.into();
             let mut rgb8 = vec![0u8; w * h * 3];
             let t = Instant::now();
             pipeline::process_into_auto(&rgb16, &p, &mut rgb8);
@@ -117,7 +117,7 @@ fn develop(path: &std::path::Path) -> Option<(Developed, &'static str)> {
             p.wb_r = img.wb_r;
             p.wb_g = img.wb_g;
             p.wb_b = img.wb_b;
-            p.color_matrix = img.color_matrix;
+            p.color_matrix = img.color_matrix.into();
             let mut rgb8 = vec![0u8; w * h * 3];
             let t = Instant::now();
             pipeline::process_into_auto(&rgb16, &p, &mut rgb8);

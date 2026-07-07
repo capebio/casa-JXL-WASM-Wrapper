@@ -30,6 +30,9 @@ pub struct DngImage {
     pub wb_r: f32,
     pub wb_g: f32,
     pub wb_b: f32,
+    /// `true` when WB was derived from AsShotNeutral; `false` = the 1.0/1.0
+    /// grey fallback fired. Informational only; does not affect WB math.
+    pub wb_from_camera: bool,
     pub iso: Option<u32>,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub make: String,
@@ -45,6 +48,7 @@ impl DngImage {
             wb_r: self.wb_r,
             wb_g: self.wb_g,
             wb_b: self.wb_b,
+            wb_from_camera: self.wb_from_camera,
             color_matrix: self.color_matrix,
             orientation: self.orientation,
             make: self.make.clone(),
@@ -181,6 +185,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         wb_r,
         wb_g,
         wb_b,
+        wb_from_camera: state.as_shot_neutral.is_some(),
         iso: state.iso,
         color_matrix,
         make: state.make,

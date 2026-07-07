@@ -116,7 +116,7 @@ fn load_orf(path: &Path) -> Result<(Vec<u16>, usize, usize, PipelineParams), Str
         params.wb_b = ab;
     }
     if let Some(m) = info.color_matrix {
-        params.color_matrix = Some(m);
+        params.color_matrix = Some(m).into();
     }
     println!(
         "loaded REAL ORF {}  {}x{} ({:.1} MP)  wb=({:.3},{:.3})",

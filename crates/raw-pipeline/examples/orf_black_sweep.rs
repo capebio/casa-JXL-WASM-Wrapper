@@ -72,7 +72,7 @@ fn main() -> anyhow::Result<()> {
         p.wb_r = wb_r;
         p.wb_g = 1.0;
         p.wb_b = wb_b;
-        p.color_matrix = info.color_matrix;
+        p.color_matrix = info.color_matrix.into();
         pipeline::process_into(&rgb16, &p, &mut out);
         let (r, g, b) = mean(&out);
         println!(

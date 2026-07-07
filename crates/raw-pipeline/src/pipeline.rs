@@ -57,6 +57,193 @@ pub const CAM_TO_SRGB: [[f32; 3]; 3] = [
     [0.018, -0.298, 1.281],
 ];
 
+/// 3×3 identity — "no colour transform". Kept as a named constant so
+/// [`ColorMatrix::Identity`] resolves bit-for-bit to what the old code produced
+/// when a caller explicitly stored `Some([[1,0,0],[0,1,0],[0,0,1]])`.
+pub const IDENTITY_3X3: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Camera→sRGB colour matrix, replacing the ambiguous `Option<[[f32; 3]; 3]>`
+/// that conflated three distinct states:
+///   * *absent* (`None`) → generic-Olympus fallback,
+///   * an *explicit camera/embedded* matrix (`Some(m)`), and
+///   * *identity / no-transform*, which the old `Option` could only smuggle in
+///     as `Some(identity)` and never distinguish from a real camera matrix.
+///
+/// Resolution is **byte-identical** to the previous `opt.unwrap_or(CAM_TO_SRGB)`:
+/// `None` ≡ [`ColorMatrix::GenericOlympus`] (→ [`CAM_TO_SRGB`]),
+/// `Some(m)` ≡ [`ColorMatrix::Camera`]`(m)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ColorMatrix {
+    /// 3×3 identity — no colour transform ([`IDENTITY_3X3`]). Not produced by any
+    /// default decode path today; reserved for the scene-referred / linear-16
+    /// modes (S5 stage 2+), which need to express "leave camera RGB untouched".
+    Identity,
+    /// Explicit per-camera / embedded-derived matrix (was `Some(m)`).
+    Camera([[f32; 3]; 3]),
+    /// Generic Olympus fallback = [`CAM_TO_SRGB`] (was `None`).
+    GenericOlympus,
+}
+
+impl ColorMatrix {
+    /// Borrow the concrete 3×3 matrix applied in the tone/matrix stage.
+    /// Byte-identical to the old `color_matrix.as_ref().unwrap_or(&CAM_TO_SRGB)`.
+    #[inline]
+    pub fn as_matrix(&self) -> &[[f32; 3]; 3] {
+        match self {
+            ColorMatrix::Identity => &IDENTITY_3X3,
+            ColorMatrix::Camera(m) => m,
+            ColorMatrix::GenericOlympus => &CAM_TO_SRGB,
+        }
+    }
+
+    /// Owned copy of the concrete matrix.
+    /// Byte-identical to the old `color_matrix.unwrap_or(CAM_TO_SRGB)`.
+    #[inline]
+    pub fn matrix(&self) -> [[f32; 3]; 3] {
+        *self.as_matrix()
+    }
+
+    /// Legacy bridge OUT: `GenericOlympus → None`, `Camera(m) → Some(m)`,
+    /// `Identity → Some(IDENTITY_3X3)`. Call sites that had a *different* fallback
+    /// (e.g. `CANON_CAM_TO_SRGB`) stay byte-identical via
+    /// `.to_option().unwrap_or(their_fallback)`.
+    #[inline]
+    pub fn to_option(&self) -> Option<[[f32; 3]; 3]> {
+        match self {
+            ColorMatrix::GenericOlympus => None,
+            ColorMatrix::Camera(m) => Some(*m),
+            ColorMatrix::Identity => Some(IDENTITY_3X3),
+        }
+    }
+
+    /// Legacy bridge IN: `None → GenericOlympus`, `Some(m) → Camera(m)`.
+    #[inline]
+    pub fn from_option(opt: Option<[[f32; 3]; 3]>) -> Self {
+        match opt {
+            Some(m) => ColorMatrix::Camera(m),
+            None => ColorMatrix::GenericOlympus,
+        }
+    }
+}
+
+impl Default for ColorMatrix {
+    #[inline]
+    fn default() -> Self {
+        ColorMatrix::GenericOlympus
+    }
+}
+
+impl From<Option<[[f32; 3]; 3]>> for ColorMatrix {
+    #[inline]
+    fn from(opt: Option<[[f32; 3]; 3]>) -> Self {
+        ColorMatrix::from_option(opt)
+    }
+}
+
+impl From<[[f32; 3]; 3]> for ColorMatrix {
+    #[inline]
+    fn from(m: [[f32; 3]; 3]) -> Self {
+        ColorMatrix::Camera(m)
+    }
+}
+
+/// The single owner of camera→sRGB matrix precedence for the RAW pipeline.
+///
+/// Precedence (explicit, top wins):
+///   1. `embedded` — DNG ForwardMatrix/ColorMatrix-derived, or an app override,
+///   2. `per_make` — per-model table (e.g. the Canon table in `cr2.rs`),
+///   3. generic Olympus fallback ([`CAM_TO_SRGB`]).
+///
+/// This is **byte-neutral today**: every current per-format extraction already
+/// folds "embedded-or-per-make" into a single `Option` before it reaches the
+/// pipeline, so callers pass that as `embedded` with `per_make = None`, and
+/// `resolve(opt, None)` == the old `opt.unwrap_or(CAM_TO_SRGB)`. Stage 2 of the
+/// S5 plan threads the two inputs separately (re-enabling the CR2 per-make table)
+/// — a golden-approval-gated change, NOT done here.
+pub struct ColourPolicy;
+
+impl ColourPolicy {
+    #[inline]
+    pub fn resolve(
+        embedded: Option<[[f32; 3]; 3]>,
+        per_make: Option<[[f32; 3]; 3]>,
+    ) -> ColorMatrix {
+        match embedded.or(per_make) {
+            Some(m) => ColorMatrix::Camera(m),
+            None => ColorMatrix::GenericOlympus,
+        }
+    }
+}
+
+#[cfg(test)]
+mod colour_policy_tests {
+    use super::*;
+
+    const M: [[f32; 3]; 3] = [[0.9, 0.05, 0.05], [0.1, 0.8, 0.1], [0.0, -0.2, 1.2]];
+
+    /// The resolver must be byte-identical to the old `Option::unwrap_or(CAM_TO_SRGB)`.
+    #[test]
+    fn matrix_matches_legacy_unwrap_or() {
+        for opt in [None, Some(M), Some(CAM_TO_SRGB), Some(IDENTITY_3X3)] {
+            let legacy = opt.unwrap_or(CAM_TO_SRGB);
+            let modern = ColorMatrix::from_option(opt).matrix();
+            assert_eq!(legacy, modern, "mismatch for {opt:?}");
+            // and the borrowing accessor matches the old `.as_ref().unwrap_or(&fallback)`
+            let fallback = CAM_TO_SRGB;
+            let legacy_ref = opt.as_ref().unwrap_or(&fallback);
+            assert_eq!(legacy_ref, ColorMatrix::from_option(opt).as_matrix());
+        }
+    }
+
+    /// `to_option` is the exact inverse used at the `CANON_CAM_TO_SRGB` / `is_some` sites.
+    #[test]
+    fn to_option_round_trips() {
+        assert_eq!(ColorMatrix::GenericOlympus.to_option(), None);
+        assert_eq!(ColorMatrix::Camera(M).to_option(), Some(M));
+        assert_eq!(ColorMatrix::Identity.to_option(), Some(IDENTITY_3X3));
+        // is_some() bridge parity: None -> false, Some -> true.
+        assert!(!ColorMatrix::from_option(None).to_option().is_some());
+        assert!(ColorMatrix::from_option(Some(M)).to_option().is_some());
+    }
+
+    /// Identity resolves to the exact literal the old code smuggled through `Some(identity)`.
+    #[test]
+    fn identity_is_the_literal() {
+        assert_eq!(
+            ColorMatrix::Identity.matrix(),
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        );
+    }
+
+    /// Explicit precedence: embedded wins over per-make, per-make over generic fallback.
+    #[test]
+    fn precedence_embedded_then_per_make_then_generic() {
+        let e = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        assert_eq!(ColourPolicy::resolve(Some(e), Some(M)), ColorMatrix::Camera(e));
+        assert_eq!(ColourPolicy::resolve(None, Some(M)), ColorMatrix::Camera(M));
+        assert_eq!(ColourPolicy::resolve(None, None), ColorMatrix::GenericOlympus);
+        // Byte-neutral bridge: current callers pass (embedded, None).
+        assert_eq!(
+            ColourPolicy::resolve(Some(M), None).matrix(),
+            Some(M).unwrap_or(CAM_TO_SRGB)
+        );
+        assert_eq!(
+            ColourPolicy::resolve(None, None).matrix(),
+            None.unwrap_or(CAM_TO_SRGB)
+        );
+    }
+
+    /// The default policy is the generic Olympus fallback (was `None`).
+    #[test]
+    fn default_is_generic_olympus() {
+        assert_eq!(ColorMatrix::default(), ColorMatrix::GenericOlympus);
+        assert_eq!(
+            PipelineParams::default_olympus().color_matrix,
+            ColorMatrix::GenericOlympus
+        );
+    }
+}
+
 /// Max pixel payload (<1 GiB) — blocks corrupt dimension exploits before buffer writes.
 pub const MAX_PIXEL_BUFFER_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -178,7 +365,9 @@ pub struct PipelineParams {
     pub vibrance: f32,    // -1..+1
     pub temp: f32,        // -1..+1 (warm <-> cool)
     pub tint: f32,        // -1..+1 (magenta <-> green)
-    pub color_matrix: Option<[[f32; 3]; 3]>,
+    /// Camera→sRGB matrix policy. `ColorMatrix::GenericOlympus` (the default)
+    /// resolves to [`CAM_TO_SRGB`], exactly as the old `None` did.
+    pub color_matrix: ColorMatrix,
     pub texture: f32, // -1..+1, unsharp σ=1
     pub clarity: f32, // -1..+1, unsharp σ=3
     // Runtime-only flag for Perceptual Constancy Mode (illumination-invariant
@@ -212,7 +401,7 @@ impl PipelineParams {
             vibrance: 0.0,
             temp: 0.0,
             tint: 0.0,
-            color_matrix: None,
+            color_matrix: ColorMatrix::GenericOlympus,
             texture: 0.0,
             clarity: 0.0,
             perceptual_constancy: false,
@@ -1680,7 +1869,7 @@ fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
     // Pre-fuse S·M for the default no-vibrance, non-perceptual path. Uses the SAME helper the
     // SIMD bulk path uses (tone_simd::vib_zero_matrix) so scalar and SIMD stay bit-identical.
     let matrix_fused = if vib_zero && !perceptual_constancy {
-        let m = params.color_matrix.unwrap_or(CAM_TO_SRGB);
+        let m = params.color_matrix.matrix();
         Some(crate::tone_simd::vib_zero_matrix(&m, sat))
     } else {
         None
@@ -1821,8 +2010,7 @@ pub fn process_into(rgb16: &[u16], params: &PipelineParams, out: &mut [u8]) {
         "process_into: out must have rgb16.len() elements"
     );
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
 
     #[cfg(not(feature = "parallel"))]
     {
@@ -2092,8 +2280,7 @@ pub fn process_into_simd(rgb16: &[u16], params: &PipelineParams, out: &mut [u8])
     // Guard before derive_tone_inputs so the assertion fires before any work is done.
     assert!(!params.perceptual_constancy, "process_into_simd is the plain ingest path only; use process_into for perceptual_constancy");
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     // Pre-fused S·M (built once in derive_tone_inputs) for the default no-vibrance path;
     // `Some ⟺ vib_zero` here (perceptual_constancy is asserted off). Feeding it to the
     // kernel skips the per-block `vib_zero_matrix` rebuild. Copy: Option<&[[f32;3];3]>.
@@ -2215,8 +2402,7 @@ pub fn process_auto(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 /// Returns `(pre_lut_ms, tone_math_ms, post_lut_ms)`.
 pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f64, f64) {
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let lut_len = (params.white as usize + 1).next_power_of_two().min(65536);
     let lut_mask = lut_len - 1;
     let pre_r = build_pre_lut_compact(params.black, params.white, ti.wb_r, ti.exp_gain, lut_len);
@@ -2307,8 +2493,7 @@ pub fn bench_tone_stage_3way(rgb16: &[u16], params: &PipelineParams) -> (f64, f6
 /// tone-math cost. Used by examples/pipeline_profile to decide what to vectorize.
 pub fn bench_tone_split(rgb16: &[u16], params: &PipelineParams) -> (f64, f64) {
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let pre_r = build_pre_lut(params.black, params.white, ti.wb_r, ti.exp_gain);
     let pre_g = build_pre_lut(params.black, params.white, ti.wb_g, ti.exp_gain);
     let pre_b = build_pre_lut(params.black, params.white, ti.wb_b, ti.exp_gain);
@@ -2368,8 +2553,7 @@ pub fn bench_tone_split(rgb16: &[u16], params: &PipelineParams) -> (f64, f64) {
 pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let n = rgb16.len() / 3;
     let mut out = vec![0u8; n * 4];
 
@@ -2483,8 +2667,7 @@ pub fn process_rgba(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
 pub fn process_rgb(rgb16: &[u16], params: &PipelineParams) -> Vec<u8> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let n = rgb16.len() / 3;
     let mut out = vec![0u8; n * 3];
 
@@ -2676,8 +2859,7 @@ pub fn process_16bit(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
 pub fn process_16bit_scalar(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     let n = rgb16.len() / 3;
     let mut out = vec![0u16; n * 3];
 
@@ -2787,8 +2969,7 @@ pub fn process_16bit_simd(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
     debug_assert_eq!(rgb16.len() % 3, 0);
     let ti = derive_tone_inputs(params);
     assert!(!ti.perceptual_constancy, "process_16bit_simd is the plain ingest path only; use process_16bit_scalar for perceptual_constancy");
-    let fallback = CAM_TO_SRGB;
-    let m = params.color_matrix.as_ref().unwrap_or(&fallback);
+    let m = params.color_matrix.as_matrix();
     // See process_into_simd: pre-fused matrix skips the per-block vib_zero_matrix rebuild.
     let fused = ti.matrix_fused.as_ref();
     let n = rgb16.len() / 3;
@@ -3949,7 +4130,7 @@ mod tonemap_flip_flops {
             highlights: 0.0,
             whites: 0.0,
             blacks: 0.0,
-            color_matrix: None,
+            color_matrix: ColorMatrix::GenericOlympus,
             texture: 0.0,
             clarity: 0.0,
             perceptual_constancy: false,

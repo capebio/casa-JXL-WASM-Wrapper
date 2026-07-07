@@ -57,7 +57,7 @@ fn dng_export_bytes_equal_whole() {
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
-    params.color_matrix = img.color_matrix;
+    params.color_matrix = img.color_matrix.into();
     let mut rgb8 = vec![0u8; w * h * 3];
     pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
     let whole = jxl_casaencoder::encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();
