@@ -7,11 +7,11 @@
 // Usage: bun analyze.ts [orf] [ref_jpg]
 //   Defaults to the test files in c:\Foo\raw-converter\tests\
 
-import init, { process_orf, downscale_rgb } from "./pkg/raw_converter_wasm.js";
+import init, { process_orf, downscale_rgb } from "../pkg/raw_converter_wasm.js";
 import { readFileSync } from "node:fs";
 import sharp from "sharp";
 import { parseArgs } from "node:util";
-import { CMP_W as DEFAULT_CMP_W, LUM_R, LUM_G, LUM_B } from "./tools/orf-utils.ts";
+import { CMP_W as DEFAULT_CMP_W, LUM_R, LUM_G, LUM_B } from "./orf-utils.ts";
 
 // ---------------------------------------------------------------------------
 // CLI Parsing & Configuration
@@ -48,7 +48,7 @@ const HIGHLIGHT_MIN = values.highlight !== undefined ? parseFloat(values.highlig
 // Init WASM
 // ---------------------------------------------------------------------------
 const wasmBytes = readFileSync(
-    new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url),
+    new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url),
 );
 await init({ module_or_path: wasmBytes });
 

@@ -3,13 +3,13 @@
 //
 // Usage:  bun colour-cmp.ts <orf> [orf2 ...]
 
-import init, { process_orf, downscale_rgb } from "./pkg/raw_converter_wasm.js";
+import init, { process_orf, downscale_rgb } from "../pkg/raw_converter_wasm.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import sharp from "sharp";
-import { CMP_W, extractLargestJpeg, stats, Stats } from "./tools/orf-utils.ts";
+import { CMP_W, extractLargestJpeg, stats, Stats } from "./orf-utils.ts";
 
 const wasmBytes = readFileSync(
-    new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url),
+    new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url),
 );
 await init({ module_or_path: wasmBytes });
 

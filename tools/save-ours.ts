@@ -1,9 +1,9 @@
 // Render ORF → PNG via our pipeline, for visual inspection.
-import init, { process_orf, downscale_rgb } from "./pkg/raw_converter_wasm.js";
+import init, { process_orf, downscale_rgb } from "../pkg/raw_converter_wasm.js";
 import { readFileSync } from "node:fs";
 import sharp from "sharp";
 
-const wasmBytes = readFileSync(new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url));
+const wasmBytes = readFileSync(new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url));
 await init({ module_or_path: wasmBytes });
 
 for (const f of process.argv.slice(2)) {

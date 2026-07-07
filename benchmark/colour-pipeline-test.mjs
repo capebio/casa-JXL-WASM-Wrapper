@@ -24,10 +24,10 @@ import initRaw, {
   process_dng_with_flags,
   rgb_to_rgba,
   downscale_rgb,
-} from './pkg/raw_converter_wasm.js';
-await initRaw({ module_or_path: readFileSync(new URL('./pkg/raw_converter_wasm_bg.wasm', import.meta.url)) });
+} from '../pkg/raw_converter_wasm.js';
+await initRaw({ module_or_path: readFileSync(new URL('../pkg/raw_converter_wasm_bg.wasm', import.meta.url)) });
 
-const { createDecoder, createEncoder } = await import('./packages/jxl-wasm/dist/index.js');
+const { createDecoder, createEncoder } = await import('../packages/jxl-wasm/dist/index.js');
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function exactBuffer(view) {

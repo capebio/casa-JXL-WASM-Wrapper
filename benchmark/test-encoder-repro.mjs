@@ -8,14 +8,14 @@ import initRaw, {
   downscale_rgb,
   process_orf_with_flags,
   rgb_to_rgba,
-} from "./pkg/raw_converter_wasm.js";
+} from "../pkg/raw_converter_wasm.js";
 
 const {
   createEncoder,
   setForcedTier,
-} = await import("./packages/jxl-wasm/dist/index.js");
+} = await import("../packages/jxl-wasm/dist/index.js");
 
-await initRaw({ module_or_path: readFileSync(new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url)) });
+await initRaw({ module_or_path: readFileSync(new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url)) });
 
 const TARGET = 1920;
 const OUTPUT_FULL_RGB = 1 | 2 | 4;

@@ -6,7 +6,7 @@ import type { Page } from "playwright";
 import { readdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { existsSync } from "node:fs";
-import { launch } from "./tools/launch-browser.mjs";
+import { launch } from "./launch-browser.mjs";
 
 const APP_URL = process.env.APP_URL ?? process.env.URL ?? "http://localhost:9000/web/index.html";
 

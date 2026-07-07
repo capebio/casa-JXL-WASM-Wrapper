@@ -1,17 +1,17 @@
 // End-to-end: ORF → wasm RGB8 → JXL encode → JXL decode → compare to
 // embedded JPEG.  Confirms JXL preserves colour.
 
-import init, { process_orf, downscale_rgb, rgb_to_rgba } from "./pkg/raw_converter_wasm.js";
+import init, { process_orf, downscale_rgb, rgb_to_rgba } from "../pkg/raw_converter_wasm.js";
 import { readFileSync } from "node:fs";
 import { Buffer } from "node:buffer";
 import sharp from "sharp";
 import encodeJxl from "@jsquash/jxl/encode.js";
 import decodeJxl from "@jsquash/jxl/decode.js";
-import { createDecoder, createEncoder } from "./packages/jxl-wasm/dist/facade.js";
-import { CMP_W, extractLargestJpeg, stats, Stats } from "./tools/orf-utils.ts";
+import { createDecoder, createEncoder } from "../packages/jxl-wasm/dist/facade.js";
+import { CMP_W, extractLargestJpeg, stats, Stats } from "./orf-utils.ts";
 
 const wasmBytes = readFileSync(
-    new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url),
+    new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url),
 );
 await init({ module_or_path: wasmBytes });
 

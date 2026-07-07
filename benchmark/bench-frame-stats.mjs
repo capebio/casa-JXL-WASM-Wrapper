@@ -51,7 +51,7 @@ function analyzeOld(pixels, width, height) {
 }
 
 async function runTrial(impl, which) {
-    const fn = impl === 'old' ? analyzeOld : (await import('./web/jxl-progressive-frame-stats.js')).analyzeProgressiveFrame;
+    const fn = impl === 'old' ? analyzeOld : (await import('../web/jxl-progressive-frame-stats.js')).analyzeProgressiveFrame;
     const full = makeBuf();
     const data = which === 'full' ? full : full.subarray(0, N * 4 - 4007);
     const ITERS = 12, TRIALS = 6, WARMUP = 8;

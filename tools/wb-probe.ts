@@ -2,12 +2,12 @@
 // Note: Only the active multipliers (used for final raw decode) are printed. If camera WB is present, 
 // it is trusted unconditionally per the pipeline calibration rule. (Honest comment per WB-2).
 
-import init, { process_orf } from "./pkg/raw_converter_wasm.js";
+import init, { process_orf } from "../pkg/raw_converter_wasm.js";
 import { readFileSync, statSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const wasmBytes = readFileSync(
-    new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url),
+    new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url),
 );
 await init({ module_or_path: wasmBytes });
 

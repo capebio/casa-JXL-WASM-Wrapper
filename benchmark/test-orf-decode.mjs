@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
-import initRaw, { process_orf_with_flags } from "./pkg/raw_converter_wasm.js";
+import initRaw, { process_orf_with_flags } from "../pkg/raw_converter_wasm.js";
 
-await initRaw({ module_or_path: readFileSync(new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url)) });
+await initRaw({ module_or_path: readFileSync(new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url)) });
 
 const OUTPUT_FULL_RGB = 1 | 2 | 4;
 const PROCESS_ARGS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Number.NaN, Number.NaN, 0, 0];

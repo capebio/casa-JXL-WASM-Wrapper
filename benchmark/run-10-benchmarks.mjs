@@ -48,11 +48,11 @@ class BrowserLikeWorker {
 }
 globalThis.Worker = BrowserLikeWorker;
 
-import initRaw, { process_orf, rgb_to_rgba, downscale_rgba } from './pkg/raw_converter_wasm.js';
+import initRaw, { process_orf, rgb_to_rgba, downscale_rgba } from '../pkg/raw_converter_wasm.js';
 import { createEncoder, createDecoder } from '@casabio/jxl-wasm';
-import { computePsnrVsFinal, computeSsimVsFinal } from './web/jxl-progressive-quality.js';
-import { pixelsToXyb, computeButteraugliVsFinal } from './web/jxl-butteraugli.js';
-import { createSneyersPreset } from './web/jxl-progressive-best-preset.js';
+import { computePsnrVsFinal, computeSsimVsFinal } from '../web/jxl-progressive-quality.js';
+import { pixelsToXyb, computeButteraugliVsFinal } from '../web/jxl-butteraugli.js';
+import { createSneyersPreset } from '../web/jxl-progressive-best-preset.js';
 
 const results = [];
 const runCount = 10;
@@ -60,7 +60,7 @@ const runCount = 10;
 async function runOnce(iteration) {
   console.log(`\n=== Run ${iteration}/${runCount} ===`);
 
-  const wasmBytes = readFileSync('./pkg/raw_converter_wasm_bg.wasm');
+  const wasmBytes = readFileSync('../pkg/raw_converter_wasm_bg.wasm');
   await initRaw(wasmBytes);
 
   const filePath = "C:\\995\\2026-02-20 Gobabeb To Windhoek\\P2200476 Pogonospermum cleomoides.ORF";

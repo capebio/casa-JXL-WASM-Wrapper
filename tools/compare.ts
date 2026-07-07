@@ -1,7 +1,7 @@
 // Process the test ORF through wasm at all-zero look controls and write a
 // PNG so we can eyeball the baseline against the camera's embedded JPEG.
 
-import init, { process_orf, downscale_rgb } from "./pkg/raw_converter_wasm.js";
+import init, { process_orf, downscale_rgb } from "../pkg/raw_converter_wasm.js";
 import { readFileSync } from "node:fs";
 import sharp from "sharp";
 
@@ -9,7 +9,7 @@ const ORF = process.argv[2] ?? String.raw`c:\Foo\raw-converter\tests\P1110226.OR
 const OUT = process.argv[3] ?? String.raw`c:\foo\raw-converter-wasm\baseline-out.png`;
 
 const wasmBytes = readFileSync(
-    new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url),
+    new URL("../pkg/raw_converter_wasm_bg.wasm", import.meta.url),
 );
 await init({ module_or_path: wasmBytes });
 

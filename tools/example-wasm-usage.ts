@@ -18,7 +18,7 @@ import init, {
   apply_look,
   rotate_rgb8,
   InitInput
-} from './pkg/raw_converter_wasm.js';
+} from '../pkg/raw_converter_wasm.js';
 
 /**
  * Initialize the WASM module.
@@ -36,7 +36,7 @@ import init, {
  * @example
  * // Node/Bun usage:
  * import { readFileSync } from 'node:fs';
- * const wasmBytes = readFileSync(new URL('./pkg/raw_converter_wasm_bg.wasm', import.meta.url));
+ * const wasmBytes = readFileSync(new URL('../pkg/raw_converter_wasm_bg.wasm', import.meta.url));
  * await initWasm({ module_or_path: wasmBytes });
  * 
  * @param initInput Optional WebAssembly Module, bytes (ArrayBuffer/Uint8Array), or initialization options.
