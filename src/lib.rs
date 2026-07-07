@@ -1061,6 +1061,14 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
         // streaming path never produces — treat it like "raw is needed downstream"
         // so this call takes the full decompress path below.
         let retain_raw = output_flags & OUT_RETAIN_RAW != 0;
+        // Mode 3 contract: OUT_RETAIN_RAW is a deferred-finish request and is mutually
+        // exclusive with a same-call full-output flag — the retain branch below stores the
+        // raw and produces NO full buffer, so combining them would silently drop the
+        // requested full output. Callers request retain in phase 1, then finish_full_rgb8.
+        debug_assert!(
+            !(retain_raw && need_full_rgb),
+            "OUT_RETAIN_RAW must not be combined with a full-output flag in one call"
+        );
         let wb_from_camera = info.wb_r.is_some() && info.wb_b.is_some();
         if should_stream_previews(need_previews, need_full_rgb || retain_raw, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
             let t = now_ms();

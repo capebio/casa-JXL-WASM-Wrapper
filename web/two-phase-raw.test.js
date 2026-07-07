@@ -35,6 +35,7 @@ const OUT_FULL_RGB8 = 1;
 const OUT_LIGHTBOX  = 2;
 const OUT_THUMB     = 4;
 const OUT_NO_ORIENT = 16;
+const OUT_RETAIN_RAW = 64; // mode 3: phase-1 retains the raw mosaic for a decompress-free finish
 
 const orfTest = existsSync(ORF_FOLDER) ? test : test.skip;
 const dngTest = existsSync(DNG_FIXTURE) ? test : test.skip;
@@ -149,13 +150,13 @@ dngTest('DNG previews-only twin differs from monolithic previews (split stays OR
     console.log('  DNG previews diverge (expected) — worker.js keeps DNG monolithic');
 }, 300_000);
 
-// Documents the waste the batch gate removes. The interactive two-phase split
-// (previews-only phase 1 + full-res phase 2) re-runs the dominant serial
-// `decompress` stage TWICE, so its summed decompress cost is ~2x the single
-// monolithic call that batch/headless exports take. The full RGB8 bytes are
-// byte-identical either way (proven by the ORF A/B test above); the gate only
-// changes WHEN the split is taken, never the pixels.
-batchTest('two-phase ORF pays ~2x decompress vs monolithic (motivates the batch gate)', async () => {
+// Documents the redundant work that TWO SEPARATE decode calls incur: a previews-only
+// call + a full-res call each re-run the dominant serial `decompress` stage, so their
+// summed decompress is ~2x a single monolithic call. Both the batch gate (single call)
+// and mode 3 (retain phase-1 raw, finish without re-decompress — see the next test)
+// eliminate this; the full RGB8 bytes are byte-identical regardless. This test measures
+// the raw-WASM cost of the old two-call shape to justify collapsing it to one decompress.
+batchTest('two separate decode calls pay ~2x decompress vs monolithic', async () => {
     await ensureRaw();
     const bytes = new Uint8Array(readFileSync(ORF_FIXTURE));
     // Warmup: cold caches/predictors on the first decode inflate the single
@@ -176,4 +177,33 @@ batchTest('two-phase ORF pays ~2x decompress vs monolithic (motivates the batch 
     // overhead is the machine-dependent swing); 1.3x keeps headroom below the
     // ~1.5 floor while staying clearly separated from the ~1.0 "decoded once" case.
     expect(twoPhaseDecompress).toBeGreaterThan(singleDecompress * 1.3);
+}, 300_000);
+
+// Mode 3 (the shipped interactive path): phase-1 retains the raw mosaic; finish_full_rgb8
+// produces full-res FROM it with NO second decompress. The full RGB8 must be byte-identical
+// to the monolithic decode (finish_from_raw is the single shared demosaic+tone source), and
+// the decompress must run exactly once. This is the committed regression gate for mode 3.
+batchTest('mode 3: retain-raw + finish_full_rgb8 == monolithic full, single decompress', async () => {
+    await ensureRaw();
+    const bytes = new Uint8Array(readFileSync(ORF_FIXTURE));
+    // Reference: monolithic full decode (one decompress, one demosaic+tone).
+    const ref = processNeutral(rawWasm.process_orf_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+    const refSha = sha(ref.take_rgb()); ref.free();
+    // Mode 3: phase-1 previews + retain raw, then finish full-res from the retained mosaic.
+    const r = processNeutral(rawWasm.process_orf_with_flags, bytes, OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW);
+    const phase1Decompress = r.decompress_ms;
+    // finish_full_rgb8(output_flags, <same 14 neutral look args as processNeutral>)
+    r.finish_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+    const modeSha = sha(r.take_rgb());
+    const afterDecompress = r.decompress_ms;
+    r.free();
+    console.log(`  mode3 decompress_ms: phase1=${phase1Decompress} afterFinish=${afterDecompress} (finish adds 0)`);
+    expect(modeSha).toBe(refSha);                    // byte-identical full output
+    expect(phase1Decompress).toBeGreaterThan(0);     // phase-1 did the (only) decompress
+    expect(afterDecompress).toBe(phase1Decompress);  // finish added NO decompress
+
+    // Contract: finish without a retained raw must throw (a plain full decode never retains).
+    const noRetain = processNeutral(rawWasm.process_orf_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+    expect(() => noRetain.finish_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0)).toThrow();
+    noRetain.free();
 }, 300_000);

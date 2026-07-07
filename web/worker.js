@@ -715,33 +715,38 @@ self.addEventListener('message', async (ev) => {
         let fullRgb, encW, encH, encTimings;
         if (canSplit) {
             const p2T0 = performance.now();
-            // Same 14 look args, same order, as process_orf_with_flags / phase 1.
-            result.finish_full_rgb8(
-                OUT_FULL_RGB8 | OUT_NO_ORIENT,
-                lookArgs.exposureEv, lookArgs.contrast, lookArgs.highlights, lookArgs.shadows,
-                lookArgs.whites, lookArgs.blacks, lookArgs.saturation, lookArgs.vibrance,
-                lookArgs.temp, lookArgs.tint, lookArgs.wbR, lookArgs.wbB,
-                lookArgs.texture, lookArgs.clarity,
-            );
-            const p2Ms = performance.now() - p2T0;
-            encW = result.width;   // full sensor dims, set by finish_full_rgb8
-            encH = result.height;
-            // Honest single-decompress cost: decompress ran ONCE (phase 1); the
-            // finish contributes demosaic+tonemap only (its orient is skipped by
-            // OUT_NO_ORIENT). Travels on ENCODE_REQUEST because THUMB (with the
-            // phase-1 partials) has already been posted; main.js patches card
-            // state at DONE.
-            encTimings = {
-                pipelineMs: pipelineMs + p2Ms,
-                phaseMs: {
-                    decompress: phaseMs.decompress,   // the single decompress
-                    demosaic:   result.demosaic_ms,   // from the finish
-                    tonemap:    result.tonemap_ms,    // from the finish
-                    orient:     result.orient_ms,
-                },
-            };
-            fullRgb = result.take_rgb();
-            result.free();
+            try {
+                // Same 14 look args, same order, as process_orf_with_flags / phase 1.
+                result.finish_full_rgb8(
+                    OUT_FULL_RGB8 | OUT_NO_ORIENT,
+                    lookArgs.exposureEv, lookArgs.contrast, lookArgs.highlights, lookArgs.shadows,
+                    lookArgs.whites, lookArgs.blacks, lookArgs.saturation, lookArgs.vibrance,
+                    lookArgs.temp, lookArgs.tint, lookArgs.wbR, lookArgs.wbB,
+                    lookArgs.texture, lookArgs.clarity,
+                );
+                const p2Ms = performance.now() - p2T0;
+                encW = result.width;   // full sensor dims, set by finish_full_rgb8
+                encH = result.height;
+                // Honest single-decompress cost: decompress ran ONCE (phase 1); the
+                // finish contributes demosaic+tonemap only (its orient is skipped by
+                // OUT_NO_ORIENT). Travels on ENCODE_REQUEST because THUMB (with the
+                // phase-1 partials) has already been posted; main.js patches card
+                // state at DONE.
+                encTimings = {
+                    pipelineMs: pipelineMs + p2Ms,
+                    phaseMs: {
+                        decompress: phaseMs.decompress,   // the single decompress
+                        demosaic:   result.demosaic_ms,   // from the finish
+                        tonemap:    result.tonemap_ms,    // from the finish
+                        orient:     result.orient_ms,
+                    },
+                };
+                fullRgb = result.take_rgb();
+            } finally {
+                // Always free the ProcessResult shell, even if finish_full_rgb8 throws
+                // (the retained raw is already freed inside the finish on its error path).
+                result.free();
+            }
         } else {
             encW = w;
             encH = h;
