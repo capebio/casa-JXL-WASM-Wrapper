@@ -28,11 +28,15 @@ void main() {
     dot(rgb, uM1) + uOff.g,
     dot(rgb, uM2) + uOff.b
   );
-  float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
-  float lift = uShadows / 100.0;
-  float compress = max(0.0, -uHighlights / 100.0);
-  if (lift > 0.0) rgb += lift * max(0.0, 0.35 - luma);
-  if (compress > 0.0) rgb -= compress * max(0.0, luma - 0.65);
+  // Tone map — must match filter-engine.applyToneMapInPlace (canonical 8-bit path).
+  // Clamp the matrix output first (the 8-bit path tone-maps the already-clamped
+  // matrix result), then luma-mask in 0..255 space with the same 128/192 knees.
+  rgb = clamp(rgb, 0.0, 1.0);
+  float luma = dot(rgb, vec3(0.299, 0.587, 0.114)) * 255.0;
+  float shadowMask = max(0.0, 128.0 - luma) / 128.0;
+  float highlightMask = max(0.0, luma - 192.0) / 63.0;
+  rgb += uShadows * 0.6 * shadowMask / 255.0;
+  rgb += uHighlights * 0.5 * highlightMask / 255.0;
   fragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }`;
 
@@ -61,11 +65,15 @@ void main() {
     dot(rgb, uM1) + uOff.g,
     dot(rgb, uM2) + uOff.b
   );
-  float luma = dot(rgb, vec3(0.299, 0.587, 0.114));
-  float lift = uShadows / 100.0;
-  float compress = max(0.0, -uHighlights / 100.0);
-  if (lift > 0.0) rgb += lift * max(0.0, 0.35 - luma);
-  if (compress > 0.0) rgb -= compress * max(0.0, luma - 0.65);
+  // Tone map — must match filter-engine.applyToneMapInPlace (canonical 8-bit path).
+  // Clamp the matrix output first (the 8-bit path tone-maps the already-clamped
+  // matrix result), then luma-mask in 0..255 space with the same 128/192 knees.
+  rgb = clamp(rgb, 0.0, 1.0);
+  float luma = dot(rgb, vec3(0.299, 0.587, 0.114)) * 255.0;
+  float shadowMask = max(0.0, 128.0 - luma) / 128.0;
+  float highlightMask = max(0.0, luma - 192.0) / 63.0;
+  rgb += uShadows * 0.6 * shadowMask / 255.0;
+  rgb += uHighlights * 0.5 * highlightMask / 255.0;
   gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
 }`;
 
@@ -314,22 +322,19 @@ export function adjustRgba16Cpu(bytes, width, height, matrix, shadows, highlight
     floats[o] = mu.m0[0] * r + mu.m0[1] * g + mu.m0[2] * b + mu.off[0];
     floats[o + 1] = mu.m1[0] * r + mu.m1[1] * g + mu.m1[2] * b + mu.off[1];
     floats[o + 2] = mu.m2[0] * r + mu.m2[1] * g + mu.m2[2] * b + mu.off[2];
-    const luma = 0.299 * floats[o] + 0.587 * floats[o + 1] + 0.114 * floats[o + 2];
-    const lift = shadows / 100;
-    const compress = -highlights / 100;
-    if (lift > 0) {
-      floats[o] += lift * Math.max(0, 0.35 - luma);
-      floats[o + 1] += lift * Math.max(0, 0.35 - luma);
-      floats[o + 2] += lift * Math.max(0, 0.35 - luma);
-    }
-    if (compress > 0) {
-      floats[o] -= compress * Math.max(0, luma - 0.65);
-      floats[o + 1] -= compress * Math.max(0, luma - 0.65);
-      floats[o + 2] -= compress * Math.max(0, luma - 0.65);
-    }
-    floats[o] = Math.min(1, Math.max(0, floats[o]));
-    floats[o + 1] = Math.min(1, Math.max(0, floats[o + 1]));
-    floats[o + 2] = Math.min(1, Math.max(0, floats[o + 2]));
+    // Clamp matrix output first (mirror filter-engine's 8-bit intermediate clamp),
+    // then tone map identically to filter-engine.applyToneMapInPlace (128/192 knees,
+    // 0..255 luma space). Keeps this CPU fallback bit-for-bit with the GLSL shaders.
+    const cr = Math.min(1, Math.max(0, floats[o]));
+    const cg = Math.min(1, Math.max(0, floats[o + 1]));
+    const cb = Math.min(1, Math.max(0, floats[o + 2]));
+    const luma = (0.299 * cr + 0.587 * cg + 0.114 * cb) * 255;
+    const shadowMask = Math.max(0, 128 - luma) / 128;
+    const highlightMask = Math.max(0, luma - 192) / 63;
+    const toneAdd = shadows * 0.6 * shadowMask / 255 + highlights * 0.5 * highlightMask / 255;
+    floats[o] = Math.min(1, Math.max(0, cr + toneAdd));
+    floats[o + 1] = Math.min(1, Math.max(0, cg + toneAdd));
+    floats[o + 2] = Math.min(1, Math.max(0, cb + toneAdd));
   }
   return floats;
 }
