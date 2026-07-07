@@ -221,6 +221,7 @@ filePicker?.loadLastPersisted?.().then(f => {
 async function decodeOrf(file, outputScale) {
     const ab = await file.arrayBuffer();
     // output_flags=1: full RGB8 only; skip lightbox (2) and thumbnail (4) RGB16 buffers
+    // TODO: migrate to process_orf_with_look (K6#1) — pass {wbR:NaN, wbB:NaN} neutral look
     const result = rawWasm.process_orf_with_flags(
         new Uint8Array(ab), 1,
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0

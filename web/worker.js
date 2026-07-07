@@ -41,6 +41,8 @@ import { WorkerMsg } from './worker-message-types.js';
 let init, rawWasm;
 // A3: rgb_to_rgba removed — send RGB8 directly to JXL worker (saves ~250ms + 25% transfer)
 let process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, LookRenderer, rotate_rgb8;
+// K6#1: named-field look API (preferred over the positional *_with_flags forms).
+let process_orf_with_look, process_dng_with_look, process_cr2_with_look;
 // Multi-format ingest: EXR/TIFF decode to a DecodedImage (mirrors jxl-benchmark.js bindings).
 let decode_exr, decode_tiff;
 async function loadWasm() {
@@ -53,6 +55,7 @@ async function loadWasm() {
     rawWasm = await import('./pkg/raw_converter_wasm.js');
     init = rawWasm.default;
     ({ process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, LookRenderer, rotate_rgb8,
+       process_orf_with_look, process_dng_with_look, process_cr2_with_look,
        decode_exr, decode_tiff } = rawWasm);
 }
 
@@ -89,6 +92,10 @@ function basename(name) {
 // process_cr2_with_flags / process_dng_with_flags). Behaviour is identical —
 // it just maps a named object onto the bare positional literals so the live
 // decode call site is readable and the argument order is checked in one place.
+//
+// TODO: migrate callers to process_orf_with_look / process_dng_with_look /
+//       process_cr2_with_look (K6#1) — pass (bytes, flags, lookObj) where
+//       lookObj = {wbR, wbB, exposureEv, ...}. Keep this wrapper for back-compat.
 //
 // Positional order (MUST match src/lib.rs):
 //   (bytes, flags, exposureEv, contrast, highlights, shadows, whites, blacks,
@@ -410,16 +417,27 @@ function processImageFormat(id, bytes, opts, look, route) {
     }
 }
 
+// K6#1: migrated from 14-positional render() to named-field render_look().
+// wbR/wbB still come from state (the camera WB cached at decode time; NaN means
+// "use camera WB from MakerNote"); slider values null-coalesced to 0 before
+// passing so render_look's from_js parser never sees a non-number value.
 function applyLookToState(state, look) {
-    return state.renderer.render(
-        state.wbR, state.wbB,
-        look.exposureEv  ?? 0, look.contrast   ?? 0,
-        look.highlights  ?? 0, look.shadows    ?? 0,
-        look.whites      ?? 0, look.blacks      ?? 0,
-        look.saturation  ?? 0, look.vibrance    ?? 0,
-        look.temp        ?? 0, look.tint        ?? 0,
-        look.texture     ?? 0, look.clarity     ?? 0,
-    );
+    return state.renderer.render_look({
+        wbR:        state.wbR,
+        wbB:        state.wbB,
+        exposureEv: look.exposureEv  ?? 0,
+        contrast:   look.contrast    ?? 0,
+        highlights: look.highlights  ?? 0,
+        shadows:    look.shadows     ?? 0,
+        whites:     look.whites      ?? 0,
+        blacks:     look.blacks      ?? 0,
+        saturation: look.saturation  ?? 0,
+        vibrance:   look.vibrance    ?? 0,
+        temp:       look.temp        ?? 0,
+        tint:       look.tint        ?? 0,
+        texture:    look.texture     ?? 0,
+        clarity:    look.clarity     ?? 0,
+    });
 }
 
 self.addEventListener('message', async (ev) => {
