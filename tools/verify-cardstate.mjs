@@ -148,15 +148,12 @@ try {
     t3.threw === null && t3.removedOne === true, t3);
 
   // ---- console-error gate (cross-cutting regression signal) ----
-  // Two console errors are PRE-EXISTING and unrelated to the CardState work:
-  //   - dist/scheduler.js signalDrain references `process.env.NODE_ENV` (a Node
-  //     global) which is undefined in the browser -> ReferenceError on every drain.
-  //     Lives in shipped scheduler dist (commit c8e57886), not web/main.js.
-  //   - a bare 404 == Chrome's default favicon.ico probe (no asset ref in index.html).
-  // The gate passes when no OTHER (unexpected) console errors surface from the
-  // exercised paths; the known ones are reported separately, not silenced.
+  // Only truly environmental noise is whitelisted: a bare 404 == Chrome's default
+  // favicon.ico probe (no asset ref in index.html). The scheduler signalDrain
+  // `process is not defined` leak is NOT whitelisted — it was fixed in
+  // jxl-scheduler (typeof-process guard), so a recurrence must fail this gate.
   await delay(300);
-  const KNOWN = [/process is not defined/, /favicon/i, /404 \(Not Found\)/];
+  const KNOWN = [/favicon/i, /404 \(Not Found\)/];
   const unexpected = consoleErrors.filter((e) => !KNOWN.some((re) => re.test(e)));
   const preexisting = consoleErrors.filter((e) => KNOWN.some((re) => re.test(e)));
   if (preexisting.length) console.log(`[verify] pre-existing/unrelated console errors (ignored): ${preexisting.length}`);
