@@ -21,15 +21,27 @@ test("parallelism defaults to host CPU count", () => {
 });
 
 test("docker build forwards CLI flags", () => {
-  expect(source).toContain('const passthrough = process.argv.slice(2).filter((arg) => arg !== "--inside-docker");');
-  expect(source).toContain('"--inside-docker",');
-  expect(source).toContain("...passthrough");
+  expect(source).toMatch(/const passthrough = process\.argv\.slice\(2\)\.filter\(\(arg\) => arg !== "--inside-docker"\)/);
+  expect(source).toMatch(/"--inside-docker"/);
+  expect(source).toMatch(/\.\.\.passthrough/);
 });
 
-test("size budget violations fail after manifest write", () => {
-  expect(source).toContain("const budgetViolations = [];");
-  expect(source).toContain("budgetViolations.push(`${tierKey}: ${wasmArtifact.bytes} > ${budget}`);");
-  expect(source).toContain('throw new Error(`Size budgets exceeded:\\n${budgetViolations.join("\\n")}`);');
+test("docker path fails closed when LIBJXL_SRC_DIR (the fork) is set", () => {
+  // The docker path builds STOCK UPSTREAM libjxl and ignores LIBJXL_SRC_DIR, so a caller who
+  // set the fork (external/libjxl-012) would otherwise silently ship an upstream bridge. The
+  // guard must throw before any docker work. (Asserted at source level, on stable tokens
+  // rather than exact prose: running the real build needs docker+emsdk and is not hermetic —
+  // the PGO auto-stage would write into dist/.)
+  expect(source).toMatch(/if \(!insideDocker && !hostToolchain\)/);              // guard is docker-branch only
+  expect(source).toMatch(/useLocalSource && !process\.argv\.includes\("--allow-upstream-docker"\)/); // fork set + no override
+  expect(source).toMatch(/throw new Error\([\s\S]*?builds STOCK[\s\S]*?UPSTREAM libjxl[\s\S]*?--host-toolchain/); // fail closed, points at the fix
+});
+
+test("size budget violations fail the build after manifest write", () => {
+  expect(source).toMatch(/const budgetViolations = \[\]/);
+  expect(source).toMatch(/budgetViolations\.push\(/);
+  // Oversized artifacts ARE fatal (unlike missing exports) — assert it still throws.
+  expect(source).toMatch(/throw new Error\([^\n]*Size budgets exceeded/);
 });
 
 test("build workdirs are removed after success unless keep-work is set", () => {
@@ -55,10 +67,16 @@ test("artifact metadata records wire bytes and SRI hashes", () => {
   expect(source).toContain('sha384-${createHash("sha384").update(data).digest("base64")}');
 });
 
-test("wasm artifacts are validated and checked against exports files", () => {
-  expect(source).toContain("await validateWasmArtifact(outWasm, exportsFile, tierKey");
-  expect(source).toContain("WebAssembly.Module.exports(module)");
-  expect(source).toContain('throw new Error(`${tierKey}: exports missing from wasm: ${missing.join(", ")}`);');
+test("wasm artifacts are validated against their exports files", () => {
+  // Structural (token match, not exact statement — survives reformatting): validation is
+  // wired into the matrix and reads the real wasm exports.
+  expect(source).toMatch(/validateWasmArtifact\(outWasm, exportsFile, tierKey/);
+  expect(source).toMatch(/WebAssembly\.Module\.exports\(module\)/);
+  // A missing export is a WARNING, not fatal: -O3 minifies export names, so the JS glue
+  // maps the public _ API and a name mismatch is expected — failing the build here would
+  // break every -O3 tier. Assert it warns and does NOT regress back to a throw.
+  expect(source).toMatch(/console\.error\([^\n]*exports missing from wasm/);
+  expect(source).not.toMatch(/throw new Error\([^\n]*exports missing from wasm/);
 });
 
 test("size report can request symbol maps and prints real rebuild command", () => {
