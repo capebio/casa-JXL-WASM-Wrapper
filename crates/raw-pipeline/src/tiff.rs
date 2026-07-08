@@ -1164,16 +1164,24 @@ pub fn bench_decode_orf(data: &[u8]) -> Result<DecodeBench> {
 /// tone). For end-to-end profiling to locate the real cost center.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PipelineBench {
+    /// TIFF/ORF container parse (`tiff::parse`): IFD walk + makernote/tag decode.
+    pub parse_ms: f64,
     pub decompress_ms: f64,
     pub demosaic_ms: f64,
     pub tone_ms: f64,
+    /// `apply_orientation` on the tone-output rgb8 (identity move for
+    /// orientation 1 — near-zero — but a full transpose/rotate for 5–8).
+    pub orientation_ms: f64,
     pub width: u32,
     pub height: u32,
 }
 
-/// Time decompress + demosaic + tone (pipeline::process) for one ORF.
+/// Time parse + decompress + demosaic + tone (pipeline::process) + orientation
+/// for one ORF.
 pub fn bench_pipeline_orf(data: &[u8]) -> Result<PipelineBench> {
+    let t = std::time::Instant::now();
     let info = parse(data)?;
+    let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
     if info.compression != 1 {
         bail!("compression {} not supported for bench", info.compression);
     }
@@ -1198,13 +1206,19 @@ pub fn bench_pipeline_orf(data: &[u8]) -> Result<PipelineBench> {
 
     let params = crate::pipeline::PipelineParams::default_olympus();
     let t = std::time::Instant::now();
-    let _rgb8 = crate::pipeline::process(&rgb16, &params);
+    let rgb8 = crate::pipeline::process(&rgb16, &params);
     let tone_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+    let t = std::time::Instant::now();
+    let _oriented = crate::pipeline::apply_orientation(rgb8, w, h, info.orientation);
+    let orientation_ms = t.elapsed().as_secs_f64() * 1000.0;
+
     Ok(PipelineBench {
+        parse_ms,
         decompress_ms,
         demosaic_ms,
         tone_ms,
+        orientation_ms,
         width: info.width,
         height: info.height,
     })
