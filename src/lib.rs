@@ -4607,6 +4607,16 @@ pub fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
+/// Decode a JPEG to RGBA8 for the developed-image edit path (mirrors
+/// `decode_tiff`/`decode_exr`). The lossless archival transcode is a separate
+/// facade path (`transcodeJpegToJxl`); this is the editable-pixels decode.
+#[wasm_bindgen]
+pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
+    raw_pipeline::image_formats::decode_jpeg_bytes(bytes)
+        .map(decoded_to_wasm)
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
 // ───────────── FableBraid bench/parity forwarders (tools/fable-wasm-flip.mjs) ─────────────
 // Thin wasm exports so the codec's scalar vs +simd128 wasm artifacts can be
 // flipflopped and parity-checked from node. Not called by the app UI.
