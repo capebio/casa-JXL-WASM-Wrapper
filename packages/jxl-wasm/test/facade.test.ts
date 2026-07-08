@@ -118,6 +118,48 @@ describe("@casabio/jxl-wasm facade", () => {
     await encoder.dispose();
   });
 
+  test("copyInput:false borrows the caller buffer (no defensive slice) and encodes identically", async () => {
+    const inputBytes = [10, 20, 30, 40, 50, 60, 70, 80]; // 2×1 rgba8
+    const opts = { ...encodeOptions, width: 2, height: 1, quality: 90 };
+
+    async function encodeCapturingUploads(copyInput?: boolean) {
+      const module = createFakeStreamingInputLibjxlModule();
+      const uploadedBuffers: ArrayBufferLike[] = [];
+      const originalSet = module.HEAPU8.set.bind(module.HEAPU8);
+      (module.HEAPU8 as unknown as { set: typeof module.HEAPU8.set }).set = (
+        source: ArrayLike<number> & { buffer?: ArrayBufferLike },
+        offset?: number,
+      ) => {
+        if (source && source.buffer) uploadedBuffers.push(source.buffer);
+        originalSet(source as ArrayLike<number>, offset);
+      };
+      setJxlModuleFactoryForTesting(async () => module);
+
+      const input = new Uint8Array(inputBytes);
+      const encoder = createEncoder(
+        copyInput === undefined ? opts : { ...opts, copyInput },
+      );
+      await encoder.pushPixels(input);
+      await encoder.finish();
+      const out: number[] = [];
+      for await (const chunk of encoder.chunks()) out.push(...new Uint8Array(chunk));
+      await encoder.dispose();
+      return { out, borrowedInput: uploadedBuffers.includes(input.buffer) };
+    }
+
+    const dflt = await encodeCapturingUploads(undefined); // copyInput defaults to true
+    const borrow = await encodeCapturingUploads(false);
+
+    // Fake module round-trips the pushed pixels — copyInput:false is byte-for-byte
+    // behaviour-preserving.
+    expect(dflt.out).toEqual(inputBytes);
+    expect(borrow.out).toEqual(inputBytes);
+    // Default takes the defensive .slice() (the caller's buffer never reaches the
+    // heap set); copyInput:false hands the caller's own buffer straight through.
+    expect(dflt.borrowedInput).toBe(false);
+    expect(borrow.borrowedInput).toBe(true);
+  });
+
   test("streaming rgba16 encode does not require legacy rgba16 encode export", async () => {
     const module = createFakeStreamingInputLibjxlModule() as any;
     delete module._jxl_wasm_encode_rgba16;
