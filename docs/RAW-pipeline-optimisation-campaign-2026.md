@@ -225,3 +225,56 @@ decode; worker-pool repair). The pipeline now operates at a stable optimised flo
 where further latency reductions on these paths are small; the productive frontier
 has shifted to the encode core (isolated at ~426 ms) and to features rather than
 raw decode speed.
+
+---
+
+## Appendix A — Smoothing parameters
+
+All trend curves are LOWESS (locally-weighted linear regression):
+
+- **Kernel:** tricube, `w = (1 − (d/h)³)³`, where `d` is the distance to the query
+  point and `h` is the distance to the ⌈`frac`·`n`⌉-th nearest neighbour.
+- **Robustness:** two bisquare re-weighting iterations with residual scale set to the
+  median absolute deviation; this down-weights thermal/power outliers.
+- **Domain:** fitted on **log-latency** and back-transformed by exponentiation
+  (multiplicative improvement, heteroscedastic noise). Fig 4 (a ratio) is fitted
+  linearly.
+- **Bandwidth (`frac`):** 0.25 (Fig 1); 0.30 (Figs 3, 5); 0.22 (Fig 4).
+
+Implementation: `benchmark/journal_figures.py`, function `lowess()`.
+
+## Appendix B — Corpus
+
+**Standard test — 8 files, 237 runs** (target 1920 px, quality 85, effort 3):
+
+| File | Format | Sensor | Resolution | MP |
+|---|---|---|---|---|
+| P1110226.ORF | ORF | Olympus E-M5 II | 5240×3912 † | 20.5 |
+| P2200474.ORF | ORF | Olympus | ~5240×3912 | ~20 |
+| _MG_1750.CR2 | CR2 | Canon (lossless-JPEG) | ~5184×3456 | ~17.9 |
+| ADH 1248.CR2 | CR2 | Canon (lossless-JPEG) | ~5184×3456 | ~17.9 |
+| PXL_20260527_180319603…dng | DNG | Pixel | 3628×2732 † | 9.9 |
+| PXL_20260501_093507165…dng | DNG | Pixel | ~3628×2732 | ~9.9 |
+| P1110226 windows.jpg | JPEG | — (reference) | — | — |
+| small_file.jpg | JPEG | — (reference) | — | — |
+
+† Resolution verified from decode output; other RAW dimensions are approximate
+(same camera family). JPEGs are non-RAW references and are excluded from the
+per-format RAW analysis (Fig 3 / §3.3).
+
+**Ancestor sweep — 36 files** (`benchmark/raw-format-sweep-results.json`,
+2026-05-28): 10 ORF, 11 CR2, 15 DNG; ROI 512, batch size 2,
+`standardVariants` × `tiers` × `tileSizes` = 432 timing rows.
+
+## Appendix C — Supplementary figure
+
+![Baseline encode operating envelope](outputs/timing%20tests/journal-figures/fig6_rate_latency_envelope.png)
+
+**Figure S1.** Encoded JPEG-XL size vs encode latency for the 2026-05-28 sweep
+(each point = one file × config, log–log, coloured by format). Characterises the
+baseline encoder's size/speed operating envelope: CR2 (largest sensors,
+lossless-JPEG) sits upper-right, DNG lower-left. Baseline encode latency spanned
+~2–13 s; the campaign moved the operating latency ~3–7× left at fixed visual
+quality (Figs 1, 4). Encode/decode are not compared *across* the 2026-05-28
+boundary (different configuration — §2.2); this figure characterises the baseline
+only.

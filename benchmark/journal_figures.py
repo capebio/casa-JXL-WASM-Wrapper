@@ -217,6 +217,27 @@ fig.suptitle("RAW decode latency by format  (★ = 2026-05-28 ancestor)", fontsi
 fig.tight_layout(rect=[0, 0, 1, 0.94])
 save(fig, "fig5_per_format")
 
+# ---- Figure 6: baseline encode rate-latency operating envelope (2026-05-28) --
+_sw = json.load(open(os.path.join(ROOT, "benchmark", "raw-format-sweep-results.json")))
+fig, ax = plt.subplots(figsize=(7.0, 4.7))
+fcol = {"ORF": C["blue"], "CR2": C["green"], "DNG": C["purple"]}
+for fm in ("ORF", "CR2", "DNG"):
+    rs = [r for r in _sw["rows"] if r["format"] == fm and r.get("encodeMs") and r.get("sizeKB")]
+    ax.scatter([r["encodeMs"] for r in rs], [r["sizeKB"] for r in rs],
+               s=24, color=fcol[fm], alpha=0.55, edgecolor="none", label=fm)
+ax.set_xscale("log"); ax.set_yscale("log")
+for axis in (ax.xaxis, ax.yaxis):
+    axis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:.0f}"))
+    axis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+ax.set_xlabel("Encode latency  (ms, log scale)")
+ax.set_ylabel("Encoded JPEG-XL size  (KB, log scale)")
+ax.set_title("Baseline encode operating envelope (2026-05-28 sweep)")
+ax.legend(title="Format", title_fontsize=9, loc="lower right")
+ax.text(0.0, -0.17, "Each point = one file × config (mode × tier), 36-file sweep. Baseline encode "
+        "latency spanned ~2–13 s. The campaign cut latency ~3–7× at fixed visual quality (Figs 1, 4), "
+        "shifting the whole envelope left.", transform=ax.transAxes, fontsize=7.6, color=C["grey"], va="top")
+save(fig, "fig6_rate_latency_envelope")
+
 # ---- summary ----------------------------------------------------------------
 print("floor(raw)= %.0f ms | ancestor= %.0f | x= %.1f" % (floor, anc["raw"], anc["raw"]/floor))
 print("stage drops: decompress %.0f->%.0f  demosaic %.0f->%.0f  tonemap %.0f->%.0f"
