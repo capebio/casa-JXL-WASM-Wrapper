@@ -17,6 +17,7 @@
 
 import {
   isRawName, buildRawEncodeRequest, rawFramesCliString,
+  encodeFableTimelapse, suggestTimelapseName,
 } from './timelapse-core.js';
 import { PRESETS } from './casv-lightbox/casv-lightbox-core.js';
 
@@ -285,15 +286,16 @@ export class TimelapseStudio {
       }
     } catch (_) { /* NO_INPUT etc. — leave the template */ }
 
-    // Encode button + native note.
+    // Encode button + note. Browser: in-page FableBraid **lossless** encode (no
+    // sidecar) → downloads the .casv. Tauri: the native casv_encode sidecar (all tiers).
     const tauri = isTauri();
-    this.el.encodeGo.disabled = !(tauri && hasPaths);
+    this.el.encodeGo.disabled = tauri ? !hasPaths : (n === 0);
     if (!tauri) {
-      this.el.nativeNote.innerHTML =
-        '<span class="warn">Encoding runs in the desktop app.</span> ' +
-        'The browser can preview the strip and build the command, but the CASAVA ' +
-        'video encoder is native-only. Open this page in the Tauri build, or run the ' +
-        'command above with the <code>casv_encode</code> sidecar.';
+      this.el.nativeNote.innerHTML = n === 0
+        ? 'Add RAW files to encode.'
+        : 'Browser mode encodes a <b>lossless FableBraid</b> time-lapse in-page (no sidecar) ' +
+          'and downloads the <code>.casv</code>. The lossy libjxl tiers (rate / effort / ' +
+          'distance) are native-only — open the desktop app or run the command above for those.';
     } else if (n === 0) {
       this.el.nativeNote.textContent = 'Add RAW files to encode.';
     } else if (!hasPaths) {
@@ -309,7 +311,7 @@ export class TimelapseStudio {
 
   // ── encode (Tauri sidecar) ─────────────────────────────────────────────────
   async _encode() {
-    if (!isTauri()) { this._status('Native encode only (desktop app).'); return; }
+    if (!isTauri()) { return this._encodeInBrowser(); }
     const paths = this.items.map((it) => it.path).filter(Boolean);
     if (!paths.length || paths.length !== this.items.length) {
       this._status('Add files via the native picker so the sidecar gets absolute paths.');
@@ -347,6 +349,62 @@ export class TimelapseStudio {
       this.el.encodeGo.disabled = false;
     }
   }
+  // ── encode (in-browser, no sidecar): FableBraid lossless → download .casv ────
+  async _encodeInBrowser() {
+    const items = this.items.slice();
+    if (!items.length) { this._status('Add RAW files to encode.'); return; }
+    const form = this._form();
+    this.el.encodeGo.disabled = true;
+    this.el.progressWrap.hidden = false;
+    this._progress({ stage: 'decoding', done: 0, total: items.length });
+    try {
+      const mod = await ensureWasm();
+      if (typeof mod.FableVideoEncoder !== 'function') {
+        throw new Error('this web/pkg has no FableVideoEncoder — rebuild with build-parallel-wasm.ps1');
+      }
+      // Gather frame bytes (in-page File or, on desktop, a filesystem path).
+      const frames = [];
+      for (const it of items) {
+        const bytes = await this._itemBytes(it);
+        if (!bytes) throw new Error(`no bytes for ${it.name}`);
+        frames.push({ bytes, name: it.name });
+      }
+      const casv = encodeFableTimelapse(
+        mod, frames,
+        { fpsNum: form.fpsNum, fpsDen: form.fpsDen, gop: form.gop },
+        (done, total) => this._progress({ stage: 'encoding', done, total }),
+      );
+      const name = suggestTimelapseName(items.map((it) => it.name));
+      this._downloadCasv(casv, name);
+      this.lastOutput = name;
+      const mb = (casv.length / 1e6).toFixed(1);
+      this._status(`Encoded ${frames.length} frames → ${name} (${mb} MB, lossless FableBraid)`);
+      this._progress({ stage: 'done', done: frames.length, total: frames.length });
+      // Best-effort preview in the embedded player.
+      try {
+        const lb = await this._ensurePlayer();
+        await lb.loadBytes(casv, name);
+      } catch (e) { console.warn('[timelapse] player preview failed:', e); }
+    } catch (e) {
+      this._status('In-browser encode failed: ' + (e?.message || e));
+      this.el.progressWrap.hidden = true;
+    } finally {
+      this.el.encodeGo.disabled = false;
+    }
+  }
+
+  /** Trigger a browser download of the encoded .casv bytes. */
+  _downloadCasv(bytes, name) {
+    const blob = new Blob([bytes], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = name || 'timelapse.casv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
   _progress({ stage, done, total }) {
     const bar = this.el.bar;
     const fill = bar.querySelector('i');

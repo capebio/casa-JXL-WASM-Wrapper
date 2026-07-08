@@ -273,6 +273,79 @@ export class FableDeltaSession {
 if (Symbol.dispose) FableDeltaSession.prototype[Symbol.dispose] = FableDeltaSession.prototype.free;
 
 /**
+ * Browser (no-sidecar) **FableBraid RAW→CASV video** encoder — the libjxl-free
+ * lossless timelapse path. Decode each RAW still in JS (`process_orf`/`process_dng`/
+ * `process_cr2` → RGB8), `push_rgb8` them in order, then `finish()` for the `.casv`
+ * bytes. Output is byte-identical to the native `casv_encode --raw-frames` fable tier
+ * (`raw_pipeline::fable_video` `parity_with_native_streaming` test), so the shipping
+ * browser player (casv-web `playFable` + `FableDeltaSession`) plays it unchanged.
+ * Uses only the FableBraid codec + the container writer — no libjxl bridge.
+ */
+export class FableVideoEncoder {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        FableVideoEncoderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_fablevideoencoder_free(ptr, 0);
+    }
+    /**
+     * Assemble the `.casv` bytes (consumes the encoder). Errors if no frames pushed.
+     * @returns {Uint8Array}
+     */
+    finish() {
+        const ptr = this.__destroy_into_raw();
+        const ret = wasm.fablevideoencoder_finish(ptr);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * Frames pushed so far.
+     * @returns {number}
+     */
+    frame_count() {
+        const ret = wasm.fablevideoencoder_frame_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * New encoder: `width`×`height` frames at `fps_num/fps_den`, keyframe every
+     * `gop_len` frames (clamped ≥1).
+     * @param {number} width
+     * @param {number} height
+     * @param {number} fps_num
+     * @param {number} fps_den
+     * @param {number} gop_len
+     */
+    constructor(width, height, fps_num, fps_den, gop_len) {
+        const ret = wasm.fablevideoencoder_new(width, height, fps_num, fps_den, gop_len);
+        this.__wbg_ptr = ret;
+        FableVideoEncoderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Encode + append one RGB8 frame (`len == width*height*3`). I-frame on GOP
+     * boundaries, else a P-frame delta vs the previous pushed frame.
+     * @param {Uint8Array} rgb
+     */
+    push_rgb8(rgb) {
+        const ptr0 = passArray8ToWasm0(rgb, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.fablevideoencoder_push_rgb8(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+}
+if (Symbol.dispose) FableVideoEncoder.prototype[Symbol.dispose] = FableVideoEncoder.prototype.free;
+
+/**
  * WASM-resident rendering state for a single image (lightbox or thumbnail).
  *
  * Owns the pre-tonemapped RGB16 buffer.  Slider changes call `render()` without
@@ -2547,6 +2620,9 @@ const DecodedImageFinalization = (typeof FinalizationRegistry === 'undefined')
 const FableDeltaSessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_fabledeltasession_free(ptr, 1));
+const FableVideoEncoderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_fablevideoencoder_free(ptr, 1));
 const LookRendererFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_lookrenderer_free(ptr, 1));
