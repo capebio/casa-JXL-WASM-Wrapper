@@ -483,26 +483,27 @@ fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
             _ => {}
         }
     }
-    let to_deg = |dms: [(u32, u32); 3], r: u8| -> f64 {
-        let d = dms[0].0 as f64 / dms[0].1.max(1) as f64;
-        let m = dms[1].0 as f64 / dms[1].1.max(1) as f64;
-        let s = dms[2].0 as f64 / dms[2].1.max(1) as f64;
-        let v = d + m / 60.0 + s / 3600.0;
-        if r == b'S' || r == b'W' {
-            -v
-        } else {
-            v
-        }
+    // Convert DMS→decimal degrees. A zero denominator is corrupt metadata, not
+    // n/1 — reject that coordinate rather than fabricate a plausible-but-false one
+    // (the old `.max(1)` silently turned 45/0 into 45.0). Metadata-only: no pixels.
+    let to_deg = |dms: [(u32, u32); 3], rf: u8| -> Option<f64> {
+        let conv = |(n, d): (u32, u32)| -> Option<f64> { (d != 0).then(|| n as f64 / d as f64) };
+        let v = conv(dms[0])? + conv(dms[1])? / 60.0 + conv(dms[2])? / 3600.0;
+        Some(if rf == b'S' || rf == b'W' { -v } else { v })
     };
+    // Reject out-of-range coordinates (corrupt/garbage EXIF): latitude is bounded
+    // to ±90°, longitude to ±180°. An out-of-range value → None (drops has_gps).
     if let Some(d) = lat_dms {
-        info.gps_lat = Some(to_deg(d, lat_ref));
+        info.gps_lat = to_deg(d, lat_ref).filter(|v| v.abs() <= 90.0);
     }
     if let Some(d) = lon_dms {
-        info.gps_lon = Some(to_deg(d, lon_ref));
+        info.gps_lon = to_deg(d, lon_ref).filter(|v| v.abs() <= 180.0);
     }
     if let Some((n, d)) = alt {
-        let v = n as f64 / d.max(1) as f64;
-        info.gps_alt = Some(if alt_ref == 1 { -v } else { v });
+        if d != 0 {
+            let v = n as f64 / d as f64;
+            info.gps_alt = Some(if alt_ref == 1 { -v } else { v });
+        }
     }
 }
 
@@ -1359,5 +1360,191 @@ mod tests {
         // II*\0 magic, IFD0 offset = 8 (LE). Exactly 8 bytes — must not be rejected.
         let hdr = [0x49u8, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
         assert!(parse_header(&hdr).is_ok());
+    }
+
+    // ── GPS metadata parsing (bounds + zero-denominator correctness) ──────────
+    // Ported from the Tauri fork (`origin/handoff/phase0-slice-20260706`, §A.1.2).
+    // These are metadata-only (gps_lat/gps_lon/gps_alt fields); they never touch
+    // decoded pixels, so the parity_corpus digests are unaffected.
+
+    /// Write one 12-byte IFD entry (tag, dtype, count, inline-value/offset), LE.
+    fn push_entry(buf: &mut Vec<u8>, tag: u16, dtype: u16, count: u32, value: u32) {
+        buf.extend_from_slice(&tag.to_le_bytes());
+        buf.extend_from_slice(&dtype.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Minimal little-endian ORF: header + IFD0 with width/height/strip tags,
+    /// then a GPS IFD (0x8825) with inline lat/lon refs and a DMS rational pool.
+    /// `lat`/`lon` are the raw (num, den) DMS triplets stored in the pool, so a
+    /// caller can inject an out-of-range degree or a zero denominator. `lat_ref`/
+    /// `lon_ref` are ASCII bytes (e.g. b'S', b'W') stored inline in the value field.
+    fn build_orf_with_gps_dms(
+        lat_ref: u8,
+        lon_ref: u8,
+        lat: [(u32, u32); 3],
+        lon: [(u32, u32); 3],
+    ) -> Vec<u8> {
+        let ifd0_next = 10 + 5 * 12; // 70
+        let gps_ifd = ifd0_next + 4; // 74
+        let gps_next = (gps_ifd + 2) + 4 * 12; // 124
+        let pool = gps_next + 4; // 128
+        let lat_ptr = pool; // 128
+        let lon_ptr = pool + 24; // 152
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"IIRS"); // 0..4 magic (LE)
+        buf.extend_from_slice(&8u32.to_le_bytes()); // 4..8 ifd0 offset
+
+        // IFD0 @ 8
+        buf.extend_from_slice(&5u16.to_le_bytes());
+        push_entry(&mut buf, 0x0100, 4, 1, 4); // width
+        push_entry(&mut buf, 0x0101, 4, 1, 4); // height
+        push_entry(&mut buf, 0x0111, 4, 1, 8); // strip_offset (nonzero)
+        push_entry(&mut buf, 0x0117, 4, 1, 1); // strip_byte_count (nonzero)
+        push_entry(&mut buf, 0x8825, 4, 1, gps_ifd as u32); // GPS IFD ptr
+        buf.extend_from_slice(&0u32.to_le_bytes()); // next=0
+
+        // GPS IFD @ 74
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        push_entry(&mut buf, 0x0001, 2, 2, lat_ref as u32); // GPSLatitudeRef "X\0"
+        push_entry(&mut buf, 0x0002, 5, 3, lat_ptr as u32); // GPSLatitude DMS
+        push_entry(&mut buf, 0x0003, 2, 2, lon_ref as u32); // GPSLongitudeRef "X\0"
+        push_entry(&mut buf, 0x0004, 5, 3, lon_ptr as u32); // GPSLongitude DMS
+        buf.extend_from_slice(&0u32.to_le_bytes()); // next=0
+
+        // rational pool @ 128
+        for &(n, d) in &lat {
+            buf.extend_from_slice(&n.to_le_bytes());
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        for &(n, d) in &lon {
+            buf.extend_from_slice(&n.to_le_bytes());
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        assert_eq!(buf.len(), 176);
+        buf
+    }
+
+    /// Convenience: sane coords (lat 45°30'00", lon 12°00'00") with given refs.
+    fn build_orf_with_gps(lat_ref: u8, lon_ref: u8) -> Vec<u8> {
+        build_orf_with_gps_dms(
+            lat_ref,
+            lon_ref,
+            [(45, 1), (30, 1), (0, 1)],
+            [(12, 1), (0, 1), (0, 1)],
+        )
+    }
+
+    /// Southern/western refs must NEGATE the coordinate. The regression this
+    /// guards: dropping the inline N/S/E/W ref byte flips the hemisphere sign.
+    #[test]
+    fn gps_south_west_yield_negative_coords() {
+        let info = parse(&build_orf_with_gps(b'S', b'W')).unwrap();
+        assert!(
+            (info.gps_lat.unwrap() - -45.5).abs() < 1e-9,
+            "lat={:?}",
+            info.gps_lat
+        );
+        assert!(
+            (info.gps_lon.unwrap() - -12.0).abs() < 1e-9,
+            "lon={:?}",
+            info.gps_lon
+        );
+    }
+
+    #[test]
+    fn gps_north_east_yield_positive_coords() {
+        let info = parse(&build_orf_with_gps(b'N', b'E')).unwrap();
+        assert!((info.gps_lat.unwrap() - 45.5).abs() < 1e-9);
+        assert!((info.gps_lon.unwrap() - 12.0).abs() < 1e-9);
+    }
+
+    /// Out-of-range coordinates (garbage/corrupt EXIF) are rejected → None, so
+    /// `has_gps` is false rather than shipping a nonsense pin. lat 200° > 90.
+    #[test]
+    fn gps_out_of_range_latitude_rejected() {
+        let info = parse(&build_orf_with_gps_dms(
+            b'N',
+            b'E',
+            [(200, 1), (0, 1), (0, 1)], // 200° — impossible latitude
+            [(12, 1), (0, 1), (0, 1)],
+        ))
+        .unwrap();
+        assert_eq!(info.gps_lat, None, "lat 200° must be rejected");
+        // Longitude is in range, but has_gps requires BOTH → false.
+        let meta = parse_orf_metadata(&build_orf_with_gps_dms(
+            b'N',
+            b'E',
+            [(200, 1), (0, 1), (0, 1)],
+            [(12, 1), (0, 1), (0, 1)],
+        ))
+        .unwrap();
+        assert!(
+            !meta.has_gps,
+            "has_gps must be false when latitude is dropped"
+        );
+    }
+
+    /// Out-of-range longitude (300° > 180) is rejected → None.
+    #[test]
+    fn gps_out_of_range_longitude_rejected() {
+        let info = parse(&build_orf_with_gps_dms(
+            b'N',
+            b'E',
+            [(45, 1), (0, 1), (0, 1)],
+            [(300, 1), (0, 1), (0, 1)], // 300° — impossible longitude
+        ))
+        .unwrap();
+        assert_eq!(info.gps_lon, None, "lon 300° must be rejected");
+    }
+
+    /// A zero denominator is corrupt metadata, not `n/1`. The degree term 45/0
+    /// must poison the whole coordinate to None (old `.max(1)` fabricated 45.0).
+    #[test]
+    fn gps_zero_denominator_rejected() {
+        let info = parse(&build_orf_with_gps_dms(
+            b'N',
+            b'E',
+            [(45, 0), (30, 1), (0, 1)], // corrupt degree denominator
+            [(12, 1), (0, 1), (0, 1)],
+        ))
+        .unwrap();
+        assert_eq!(info.gps_lat, None, "45/0 degree term must reject the coord");
+        // The longitude with valid denominators still parses.
+        assert!((info.gps_lon.unwrap() - 12.0).abs() < 1e-9);
+    }
+
+    /// If the real dev-box ORF is present and carries GPS, its parsed coordinates
+    /// must be within valid bounds (sanity on real metadata, not a fixture).
+    #[test]
+    fn real_orf_gps_within_bounds_if_present() {
+        let data = match std::fs::read(r"C:\Foo\raw-converter\tests\P1110226.ORF") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP: real ORF not present");
+                return;
+            }
+        };
+        let meta = parse_orf_metadata(&data).expect("parse_orf_metadata");
+        if meta.has_gps {
+            assert!(
+                meta.gps_lat.abs() <= 90.0,
+                "real ORF latitude out of range: {}",
+                meta.gps_lat
+            );
+            assert!(
+                meta.gps_lon.abs() <= 180.0,
+                "real ORF longitude out of range: {}",
+                meta.gps_lon
+            );
+            println!(
+                "real ORF GPS  lat={:.6} lon={:.6} alt={:.1}",
+                meta.gps_lat, meta.gps_lon, meta.gps_alt
+            );
+        } else {
+            println!("real ORF present but carries no GPS");
+        }
     }
 }
