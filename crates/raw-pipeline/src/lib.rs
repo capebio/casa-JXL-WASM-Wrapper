@@ -36,6 +36,10 @@ pub mod ljpeg;
 // S3: additive, behavior-neutral memory preflight (peak/retained working-set
 // projection from dims + output flags). Pure; native + wasm.
 pub mod mem_budget;
+// One-time hardware calibration foundation (registry / fractal corpus / prober /
+// parity). Pure + additive; native + wasm. See
+// docs/2026-07-08-hardware-adaptive-calibration-design.md.
+pub mod calibration;
 pub mod perceptual;
 pub mod pipeline;
 pub mod stream_preview;
