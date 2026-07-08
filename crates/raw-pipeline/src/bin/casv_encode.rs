@@ -314,6 +314,191 @@ impl VideoFrameSource for FfmpegPngSource {
     }
 }
 
+// ── rawvideo frame source (fast path) ─────────────────────────────────────────
+//
+// The PNG source above pays for a PNG *encode* inside ffmpeg and a PNG *decode*
+// here on every frame — three codec passes purely to shuttle already-decoded
+// pixels across the pipe. This source asks ffmpeg for packed `rgb24` rawvideo
+// instead (no compression on either side), so a frame is a plain read off the
+// pipe. rawvideo carries no per-frame header, so the exact output size must be
+// known up front: we probe it (honouring rotation) and *force* `scale=W:H`, which
+// makes ffmpeg emit precisely `W*H*3` bytes per frame. That fixed stride means the
+// splitter can never desync (unlike the PNG magic scan), the whole video is never
+// buffered, and `next_frame_into` fills a caller buffer with zero per-frame alloc.
+
+/// Apply an ffprobe rotation (degrees, possibly negative) to coded dimensions: a
+/// quarter-turn swaps width and height, matching ffmpeg's default autorotation.
+fn apply_rotation(w: u32, h: u32, rotation: i32) -> (u32, u32) {
+    if rotation.rem_euclid(180) == 90 {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// *Display* dimensions of the video's first stream (rotation applied), or `None`
+/// when ffprobe is unavailable or reports nothing parseable — the caller then
+/// falls back to the self-describing PNG source.
+fn probe_display_dims(video: &str) -> Option<(u32, u32)> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height:stream_side_data=rotation:stream_tags=rotate",
+            "-of",
+            "default=noprint_wrappers=1",
+            video,
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut w, mut h, mut rot) = (None, None, 0i32);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("width=") {
+            w = v.trim().parse().ok();
+        } else if let Some(v) = line.strip_prefix("height=") {
+            h = v.trim().parse().ok();
+        } else if let Some((k, v)) = line.split_once('=') {
+            // `rotation=` (side_data) or `TAG:rotate=` / `rotate=` (container tag).
+            if k.ends_with("rotation") || k.ends_with("rotate") {
+                if let Ok(r) = v.trim().parse::<i32>() {
+                    rot = r;
+                }
+            }
+        }
+    }
+    let (w, h) = (w?, h?);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some(apply_rotation(w, h, rot))
+}
+
+/// Even, aspect-preserving target dims for the `dim` request. `exact` (or an
+/// unparseable / zero box) keeps the display dims; a positive box `n` shrinks the
+/// longest edge to fit `n×n` (never enlarging) and floors each side to even — the
+/// same result the old `scale=n:n:force_original_aspect_ratio=decrease` +
+/// `trunc(_/2)*2` filter produced, computed here so we know the exact stride.
+fn scaled_even_dims(w: u32, h: u32, dim: &str) -> (u32, u32) {
+    let n = if dim == "exact" { 0 } else { dim.parse::<u32>().unwrap_or(0) };
+    if n == 0 || w == 0 || h == 0 {
+        return (w, h);
+    }
+    let f = (n as f64 / w as f64).min(n as f64 / h as f64).min(1.0);
+    let ow = ((w as f64 * f).round() as u32) & !1;
+    let oh = ((h as f64 * f).round() as u32) & !1;
+    (ow.max(2), oh.max(2))
+}
+
+/// Spawn ffmpeg emitting forced-size packed `rgb24` frames on stdout (optionally
+/// downscaled). stderr is discarded so draining only stdout can't deadlock.
+fn spawn_ffmpeg_raw(video: &str, w: u32, h: u32) -> std::io::Result<std::process::Child> {
+    std::process::Command::new("ffmpeg")
+        .args(["-i", video])
+        .args(["-vf", &format!("scale={w}:{h},setsar=1")])
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
+/// A streaming `VideoFrameSource` over ffmpeg's packed `rgb24` rawvideo stdout.
+struct FfmpegRawSource {
+    child: std::process::Child,
+    out: Option<std::process::ChildStdout>,
+    frame_size: usize,
+    w: u32,
+    h: u32,
+    fps_num: u32,
+    fps_den: u32,
+}
+
+impl FfmpegRawSource {
+    /// Spawn the rawvideo pipeline, or `None` when the output dims can't be
+    /// determined up front (→ PNG fallback in [`spawn_video_source`]).
+    fn try_spawn(video: &str, dim: &str, fps_num: u32, fps_den: u32) -> Option<Self> {
+        let (dw, dh) = probe_display_dims(video)?;
+        let (w, h) = scaled_even_dims(dw, dh, dim);
+        let mut child = spawn_ffmpeg_raw(video, w, h).ok()?;
+        let out = child.stdout.take();
+        Some(FfmpegRawSource {
+            child,
+            out,
+            frame_size: (w as usize) * (h as usize) * 3,
+            w,
+            h,
+            fps_num,
+            fps_den,
+        })
+    }
+
+    /// Fill `buf` with exactly one frame (`false` at clean end of stream). A
+    /// truncated trailing frame — never produced by a forced-size stream — is
+    /// dropped so the encoder never sees a short frame.
+    fn fill(&mut self, buf: &mut Vec<u8>) -> bool {
+        use std::io::Read;
+        let Some(out) = self.out.as_mut() else {
+            return false;
+        };
+        buf.clear();
+        buf.resize(self.frame_size, 0);
+        let mut got = 0;
+        while got < self.frame_size {
+            match out.read(&mut buf[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) => fail(format!("ffmpeg read failed: {e}")),
+            }
+        }
+        if got == self.frame_size {
+            return true;
+        }
+        self.out = None;
+        let _ = self.child.wait();
+        buf.clear();
+        false
+    }
+}
+
+impl VideoFrameSource for FfmpegRawSource {
+    fn dims(&self) -> (u32, u32) {
+        (self.w, self.h)
+    }
+    fn fps(&self) -> (u32, u32) {
+        (self.fps_num, self.fps_den)
+    }
+    fn next_frame(&mut self) -> Option<Vec<u8>> {
+        let mut v = Vec::new();
+        if self.fill(&mut v) {
+            Some(v)
+        } else {
+            None
+        }
+    }
+    fn next_frame_into(&mut self, buf: &mut Vec<u8>) -> bool {
+        self.fill(buf)
+    }
+}
+
+/// Build the video frame source: prefer the fast packed-`rgb24` rawvideo path,
+/// falling back to the self-describing PNG stream when the output dimensions can't
+/// be probed up front (odd container / no ffprobe).
+fn spawn_video_source(
+    video: &str,
+    dim: &str,
+    fps_num: u32,
+    fps_den: u32,
+) -> Box<dyn VideoFrameSource + Send> {
+    match FfmpegRawSource::try_spawn(video, dim, fps_num, fps_den) {
+        Some(s) => Box::new(s),
+        None => Box::new(FfmpegPngSource::spawn(video, dim, fps_num, fps_den)),
+    }
+}
+
 /// Drain a source into a resident frame vector (for the all-frames-resident batch
 /// tiers: proxy, lossless, skip=none), reporting per-frame decode progress.
 fn drain_all(src: &mut dyn VideoFrameSource, total: usize) -> Vec<Vec<u8>> {
@@ -397,12 +582,12 @@ fn run_video_mode(args: &[String]) -> ! {
     };
     let _ = std::fs::remove_file(&audio_tmp);
 
-    // Streaming ffmpeg source: frames decoded on demand from ffmpeg's PNG stdout
-    // — the whole video is never buffered. ffprobe gives a best-effort frame
-    // total for the progress bars.
+    // Streaming ffmpeg source: frames pulled on demand as packed rgb24 rawvideo
+    // (PNG fallback if dims can't be probed) — the whole video is never buffered.
+    // ffprobe gives a best-effort frame total for the progress bars.
     let probed = probe_frame_count(in_video).unwrap_or(0);
     progress("extract", 0, probed);
-    let mut src = FfmpegPngSource::spawn(in_video, dim_str, fps_num.max(1), fps_den.max(1));
+    let mut src = spawn_video_source(in_video, dim_str, fps_num.max(1), fps_den.max(1));
     let (w, h) = src.dims();
 
     // Full-dimensioned editor proxy: rate = "proxy2" / "proxy4". All-intra and
@@ -411,7 +596,7 @@ fn run_video_mode(args: &[String]) -> ! {
         .strip_prefix("proxy")
         .and_then(|s| s.parse::<u32>().ok())
     {
-        let frames = drain_all(&mut src, probed);
+        let frames = drain_all(&mut *src, probed);
         let n = frames.len();
         progress("encode", 0, n);
         let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
@@ -438,7 +623,7 @@ fn run_video_mode(args: &[String]) -> ! {
     if args[5] == "fable" {
         progress("encode", 0, probed);
         let bytes = encode_casv_fable_streaming_with_audio(
-            &mut src,
+            &mut *src,
             gop.max(1),
             ogg_bytes.as_deref(),
             &mut |done| progress("encode", done, probed),
@@ -477,7 +662,7 @@ fn run_video_mode(args: &[String]) -> ! {
         && !matches!(skip, SkipMode::None))
         || matches!(rate, VideoRate::Lossless);
     if !streaming_capable {
-        let frames = drain_all(&mut src, probed);
+        let frames = drain_all(&mut *src, probed);
         let n = frames.len();
         if ogg_bytes.is_some() {
             eprintln!(
@@ -502,7 +687,7 @@ fn run_video_mode(args: &[String]) -> ! {
     // ffprobe estimate drives the bar).
     progress("encode", 0, probed);
     let bytes = encode_casv_video_streaming_with_audio_progress(
-        &mut src,
+        &mut *src,
         &opts,
         ogg_bytes.as_deref(),
         &mut |done| progress("encode", done, probed),
@@ -772,5 +957,163 @@ mod tests {
                 assert_eq!(got, want, "frames {frame_lens:?} chunk {chunk}");
             }
         }
+    }
+
+    #[test]
+    fn scaled_even_dims_fits_box_without_upscaling() {
+        // `exact` / zero / garbage box → keep source dims.
+        assert_eq!(scaled_even_dims(1920, 1080, "exact"), (1920, 1080));
+        assert_eq!(scaled_even_dims(1920, 1080, "0"), (1920, 1080));
+        assert_eq!(scaled_even_dims(1920, 1080, "abc"), (1920, 1080));
+        // Fit the longest edge into the n×n box, preserving aspect.
+        assert_eq!(scaled_even_dims(1920, 1080, "640"), (640, 360));
+        assert_eq!(scaled_even_dims(1080, 1920, "640"), (360, 640));
+        // Decrease only — never enlarge a frame already inside the box.
+        assert_eq!(scaled_even_dims(320, 240, "640"), (320, 240));
+        // Each side is floored to even (rawvideo needs no even dims, but the old
+        // filter produced them and even chroma keeps downstream encoders happy).
+        let (w, h) = scaled_even_dims(1001, 999, "500");
+        assert_eq!((w % 2, h % 2), (0, 0));
+        // Extreme aspect never collapses a side to zero.
+        let (w, h) = scaled_even_dims(1, 1000, "2");
+        assert!(w >= 2 && h >= 2);
+    }
+
+    #[test]
+    fn apply_rotation_swaps_on_quarter_turn_only() {
+        assert_eq!(apply_rotation(1920, 1080, 0), (1920, 1080));
+        assert_eq!(apply_rotation(1920, 1080, 180), (1920, 1080));
+        assert_eq!(apply_rotation(1920, 1080, -180), (1920, 1080));
+        assert_eq!(apply_rotation(1920, 1080, 90), (1080, 1920));
+        assert_eq!(apply_rotation(1920, 1080, 270), (1080, 1920));
+        assert_eq!(apply_rotation(1920, 1080, -90), (1080, 1920));
+    }
+
+    /// Gold parity check: the fast rawvideo source must deliver frames that are
+    /// byte-for-byte identical to the PNG source (PNG is lossless of the same
+    /// decoded frames, so any divergence is a bug in the rawvideo path). Needs
+    /// ffmpeg + ffprobe; skips cleanly when they're absent so the suite still
+    /// passes on machines without them.
+    #[test]
+    fn rawvideo_source_matches_png_source() {
+        let tmp =
+            std::env::temp_dir().join(format!("casv_rvparity_{}.mp4", std::process::id()));
+        let synth = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=160x120:rate=10:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&tmp)
+            .status();
+        if !matches!(synth, Ok(s) if s.success()) {
+            eprintln!("skip rawvideo_source_matches_png_source: ffmpeg unavailable");
+            return;
+        }
+        let video = tmp.to_str().unwrap();
+
+        let mut raw = match FfmpegRawSource::try_spawn(video, "exact", 10, 1) {
+            Some(s) => s,
+            None => {
+                let _ = std::fs::remove_file(&tmp);
+                eprintln!("skip rawvideo_source_matches_png_source: no ffprobe dims");
+                return;
+            }
+        };
+        let mut png = FfmpegPngSource::spawn(video, "exact", 10, 1);
+        let (w, h) = raw.dims();
+        assert_eq!((w, h), png.dims(), "raw vs png dims differ");
+
+        let mut raw_frames = Vec::new();
+        while let Some(f) = raw.next_frame() {
+            raw_frames.push(f);
+        }
+        let mut png_frames = Vec::new();
+        while let Some(f) = png.next_frame() {
+            png_frames.push(f);
+        }
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(!raw_frames.is_empty(), "no frames extracted");
+        assert_eq!(raw_frames.len(), png_frames.len(), "frame count differs");
+        let expect = (w as usize) * (h as usize) * 3;
+        for (i, (a, b)) in raw_frames.iter().zip(&png_frames).enumerate() {
+            assert_eq!(a.len(), expect, "raw frame {i} wrong size");
+            assert_eq!(a, b, "rawvideo vs png frame {i} bytes differ");
+        }
+    }
+
+    /// Ingest-throughput A/B: drains the same clip through both sources via
+    /// `next_frame_into` (the streaming encoder's real call). Grainy content keeps
+    /// PNG from trivially compressing, so this reflects the CPU the PNG roundtrip
+    /// actually spends (ffmpeg zlib encode + image-crate zlib decode + per-frame
+    /// alloc) that the packed rawvideo path skips. Run explicitly:
+    /// `cargo test --bin casv_encode -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "perf benchmark; shells ffmpeg"]
+    fn bench_rawvideo_vs_png_ingest() {
+        use std::time::Instant;
+        // Prefer a real clip via CASV_BENCH_VIDEO (e.g. one built from the
+        // deterministic fractal-seahorse frame corpus) for a representative number;
+        // otherwise synthesize grainy content so PNG can't trivially compress.
+        let env_video = std::env::var("CASV_BENCH_VIDEO").ok().filter(|p| !p.is_empty());
+        let tmp =
+            std::env::temp_dir().join(format!("casv_rvbench_{}.mp4", std::process::id()));
+        if env_video.is_none() {
+            let synth = std::process::Command::new("ffmpeg")
+                .args([
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=1280x720:rate=30:duration=4",
+                    "-vf",
+                    "noise=alls=30:allf=t+u",
+                    "-pix_fmt",
+                    "yuv420p",
+                ])
+                .arg(&tmp)
+                .status();
+            if !matches!(synth, Ok(s) if s.success()) {
+                eprintln!("skip bench: ffmpeg unavailable");
+                return;
+            }
+        }
+        let video = env_video.as_deref().unwrap_or_else(|| tmp.to_str().unwrap());
+
+        fn drain(mut s: Box<dyn VideoFrameSource + Send>) -> usize {
+            let mut n = 0;
+            let mut buf = Vec::new();
+            while s.next_frame_into(&mut buf) {
+                n += 1;
+            }
+            n
+        }
+
+        let t = Instant::now();
+        let rn = drain(Box::new(
+            FfmpegRawSource::try_spawn(video, "exact", 30, 1).expect("raw source"),
+        ));
+        let raw_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = Instant::now();
+        let pn = drain(Box::new(FfmpegPngSource::spawn(video, "exact", 30, 1)));
+        let png_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(rn, pn, "frame counts differ");
+        eprintln!(
+            "ingest {rn} frames @1280x720: rawvideo={raw_ms:.0}ms png={png_ms:.0}ms \
+             speedup={:.2}x",
+            png_ms / raw_ms
+        );
     }
 }
