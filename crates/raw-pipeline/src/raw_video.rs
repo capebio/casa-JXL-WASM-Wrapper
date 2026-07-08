@@ -425,17 +425,16 @@ pub fn encode_casv_from_raws<W: std::io::Write>(
         }
         r?
     } else {
-        // Batch tiers need every frame resident. Pull with the buffer-filling
-        // override (no per-frame heap frame inside the source), taking ownership
-        // of each filled buffer.
-        let mut frames: Vec<Vec<u8>> = Vec::new();
-        let mut buf = Vec::new();
-        while src.next_frame_into(&mut buf) {
-            frames.push(std::mem::take(&mut buf));
-        }
-        if let Some(err) = src.take_error() {
-            return Err(VideoError::Raw(err));
-        }
+        // Batch tiers (lossless / lossy skip=none) materialise every frame before
+        // encoding. Each RAW is an independent decode, so decode the whole sequence
+        // concurrently (rayon, order-preserving → byte-identical to the serial drain)
+        // rather than one frame at a time ahead of the already-parallel batch encoder.
+        // This mirrors the `casv_encode --raw-frames` CLI batch path (which was already
+        // parallel); the previous serial `next_frame_into` drain here was leftover
+        // drift. The N result frames are the same resident set batch already held; the
+        // only added peak is a bounded pool of in-flight full-res decode transients
+        // (≤ rayon thread count) — see `decode_all_parallel`'s doc.
+        let frames = src.decode_all_parallel(&|_done| {})?;
         if frames.is_empty() {
             return Err(VideoError::Empty);
         }
