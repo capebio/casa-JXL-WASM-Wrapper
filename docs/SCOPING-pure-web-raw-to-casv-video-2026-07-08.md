@@ -79,3 +79,43 @@ trait, wasm impl calls the bridge) or a TS reimplementation — both LARGE with 
    native goldens to test against. Autonomously implementable + verifiable.
 2. **Defer the JXL lossy tiers** unless in-browser lossy is a hard requirement — that is a genuine
    project (cross-module bridge + port the tier engine), not an incremental win.
+
+---
+
+## Implemented — FableBraid MVP (Option B, 2026-07-08)
+
+The MVP is **built and verified**. No native path was touched (`casa_video` unchanged).
+
+**New Rust:**
+- `crates/raw-pipeline/src/casv_container.rs` — `pub fn write_container_v1(...)` (the single
+  wasm-portable v1 writer, byte-identical to `assemble_header_casv` per
+  `write_container_v1_matches_native_layout`) + `pub const CASV_HDR_FABLE_FLAG` (pinned to
+  `casv-format.json`).
+- `crates/raw-pipeline/src/fable_video.rs` — `FableVideoEncoder` (`new` → `push_rgb8` → `finish`),
+  uses only `fable_braid` + `casv_container` (no libjxl; compiles to wasm). Proven **byte-identical
+  to `casa_video::encode_casv_fable_streaming`** (`parity_with_native_streaming`) and lossless
+  round-trip (`round_trips_lossless`).
+
+**New WASM export** (`src/lib.rs`): `#[wasm_bindgen] struct FableVideoEncoder`
+(`new(width,height,fps_num,fps_den,gop_len)`, `push_rgb8(&[u8])`, `frame_count()`, `finish() → Vec<u8>`).
+
+**Browser usage** (no sidecar):
+```js
+import init, { process_orf_with_flags, FableVideoEncoder, downscale_rgb } from "./pkg/raw_converter_wasm.js";
+// … init(wasm) …
+const enc = new FableVideoEncoder(w, h, fpsNum, 1, gopLen);
+for (const rawBytes of files) {
+  const r = process_orf_with_flags(rawBytes, OUT_FULL_RGB8 | OUT_NO_ORIENT, /*look…*/);
+  enc.push_rgb8(r.take_rgb());          // optionally downscale_rgb(...) first
+}
+const casv = enc.finish();               // .casv bytes — play with casv-web playFable + FableDeltaSession
+```
+
+**Verification:** `FableVideoEncodeTest.mjs` (node --test) drives the real wasm boundary
+`FableVideoEncoder → .casv → FableDeltaSession` and asserts a lossless round-trip — passes.
+
+**To ship to the app:** rebuild the committed **threaded** `web/pkg` (the app's loaded build) via
+`build-parallel-wasm.ps1` so `FableVideoEncoder` is present there too (the verification used a
+throwaway `pkg-fable/` non-threaded build). The Rust + format + wasm-bindgen layers are done and
+byte-parity-locked; that rebuild + a few lines of UI wiring (RAW picker → the loop above → download)
+are all that remain.

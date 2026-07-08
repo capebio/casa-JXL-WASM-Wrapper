@@ -25,6 +25,10 @@ pub mod demosaic;
 pub mod dng;
 pub mod exif;
 pub mod fable_braid;
+// Pure-Rust FableBraid CASV **video** encoder (no libjxl): powers the browser
+// (no-sidecar) RAW→timelapse path. Byte-identical to casa_video::encode_casv_fable_streaming
+// (parity-tested). Native + wasm — uses only fable_braid + casv_container.
+pub mod fable_video;
 pub mod frame_pipeline;
 pub mod frame_stats;
 pub mod image_formats;
