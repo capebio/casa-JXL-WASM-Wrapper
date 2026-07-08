@@ -82,6 +82,17 @@ pub fn decode_exr_bytes(bytes: &[u8]) -> Result<DecodedRgba, ImageFormatError> {
     })
 }
 
+/// Decode a baseline/progressive JPEG to RGBA8. JPEG is always 8-bit, so the
+/// output is RGBA8 (bit_depth == 8). Mirrors `decode_tiff_bytes`; rides the same
+/// `image` crate (jpeg feature already enabled in Cargo.toml) and the shared
+/// decompression-bomb guard.
+pub fn decode_jpeg_bytes(bytes: &[u8]) -> Result<DecodedRgba, ImageFormatError> {
+    guard_dimensions(bytes, image::ImageFormat::Jpeg)?;
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+        .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
+    Ok(dynamic_to_rgba(img))
+}
+
 /// Pick 16-bit output when the source is >8-bit, else 8-bit. Always RGBA.
 fn dynamic_to_rgba(img: DynamicImage) -> DecodedRgba {
     let (width, height) = (img.width(), img.height());
@@ -207,5 +218,32 @@ mod tests {
                                  // sRGB(0.5 linear) ~ 0.7353 -> ~188
         assert!((out[4] as i32 - 188).abs() <= 1, "got {}", out[4]);
         assert_eq!(out[7], 64); // alpha 0.25 -> 64 (linear, no sRGB on alpha)
+    }
+
+    // Small RGB JPEG encoded by the image crate itself (baseline).
+    fn make_jpeg(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]);
+        }
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("encode jpeg fixture");
+        buf.into_inner()
+    }
+
+    #[test]
+    fn decode_jpeg_bytes_returns_rgba8() {
+        let jpeg = make_jpeg(16, 12);
+        let d = decode_jpeg_bytes(&jpeg).expect("decode jpeg");
+        assert_eq!((d.width, d.height, d.bit_depth), (16, 12, 8));
+        assert_eq!(d.u8.len(), 16 * 12 * 4); // RGBA
+        assert!(d.u16.is_empty() && d.f32.is_empty());
+    }
+
+    #[test]
+    fn decode_jpeg_bytes_rejects_garbage() {
+        assert!(decode_jpeg_bytes(&[0, 1, 2, 3, 4, 5]).is_err());
     }
 }
