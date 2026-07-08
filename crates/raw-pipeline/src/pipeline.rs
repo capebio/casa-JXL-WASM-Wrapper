@@ -953,25 +953,6 @@ fn build_post16_lut(t: &TonePost) -> Vec<u16> {
     lut
 }
 
-/// Compact 4096-entry post-LUT for u8 output. ~16x smaller (4KB vs 65KB).
-/// Access via `idx = (tone_index >> 4)` with linear interpolation for precision.
-const COMPACT_POST_LUT_LEN: usize = 4096;
-const COMPACT_POST_LUT_SHIFT: u32 = 4; // 65536 / 4096 = 16 = 1 << 4
-
-fn build_post_lut_strided(t: &TonePost) -> Vec<u8> {
-    let mut lut = vec![0u8; COMPACT_POST_LUT_LEN];
-    let fill = |i: usize, o: &mut u8| {
-        let raw_input = (i << COMPACT_POST_LUT_SHIFT) as f32; // map 4k index back to 65k range
-        let y = tone_curve(raw_input / 65535.0, t);
-        *o = (y * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-    };
-    #[cfg(feature = "parallel")]
-    lut.par_iter_mut().enumerate().for_each(|(i, o)| fill(i, o));
-    #[cfg(not(feature = "parallel"))]
-    lut.iter_mut().enumerate().for_each(|(i, o)| fill(i, o));
-    lut
-}
-
 /// Build the three pre-LUTs (black/WB/exposure/highlight-shoulder linearisation). Shared by the
 /// full build and the partial (pre-only) rebuild in `ensure_lut`. Returns `(r,g,b,len,shift)`.
 fn build_pre_luts(
