@@ -1,0 +1,65 @@
+TestName: StandardMultifileTest - ancestor-sweep
+RunTimestamp: 2026-05-28T00:00:00.000Z
+Agent: raw-format-sweep (spliced 2026-07-08)
+Tier: simd+simd-mt
+Source: multi-format
+Target: sweep
+Quality: sweep
+Efforts: sweep
+TimeBase: timeBase
+
+# Provenance / caveat
+# Converted from benchmark/raw-format-sweep-results.json (2026-05-28) - the earliest saved
+# multifile timing result (36-file ORF/CR2/DNG corpus, encode-option sweep, roiSize=512).
+# RAW-decode metrics (raw/decompress/demosaic/tonemap) are config-independent => directly
+# comparable to later StandardMultifileTest runs. shot_enc/shot_dec are the std one-shot
+# rows at the sweep's heavier settings (NOT q85/e3) => indicative only, not apples-to-apples
+# with post-2026-06-09 encode/decode numbers.
+
+---
+runs[36]{file|raw_ms|raw_decompress_ms|raw_demosaic_ms|raw_tonemap_ms|shot_enc_simd_ms|shot_enc_mt_ms|shot_dec_simd_ms|shot_dec_mt_ms}:
+  P2200475 Kissenia capensis.ORF | 4460 | 1753 | 653 | 2038 | 12095 | 6847 | 13834 | 4591
+  P2200476 Pogonospermum cleomoides.ORF | 3549 | 1396 | 459 | 1686 | 9757 | 5817 | 7494 | 4988
+  P2200477.ORF | 2975 | 1184 | 391 | 1397 | 7447 | 4849 | 6732 | 4349
+  P2200478 .ORF | 3248 | 1326 | 400 | 1517 | 7783 | 4881 | 7721 | 4434
+  P2200479 Hermannia boraginiflora.ORF | 5053 | 2522 | 623 | 1899 | 12854 | 5098 | 10618 | 4539
+  P2200482.ORF | 3613 | 1230 | 458 | 1493 | 6875 | 4787 | 5679 | 4444
+  P2200483.ORF | 3173 | 1122 | 393 | 1336 | 6766 | 4895 | 6049 | 4656
+  P2200484.ORF | 3075 | 1118 | 346 | 1239 | 6847 | 4801 | 6521 | 4453
+  P2200485.ORF | 3079 | 1201 | 396 | 1475 | 7540 | 4764 | 6642 | 4411
+  P2200486.ORF | 3021 | 1253 | 429 | 1335 | 7100 | 4750 | 7860 | 4401
+  _MG_1744.CR2 | 3917 | 2338 | 339 | 1234 | 8087 | 5442 | 6901 | 4561
+  _MG_1747.CR2 | 13224 | 7187 | 1287 | 4744 | 15355 | 5676 | 18712 | 4668
+  _MG_1749.CR2 | 4904 | 2311 | 568 | 2017 | 9175 | 5390 | 7829 | 4631
+  _MG_1750.CR2 | 2644 | 1093 | 349 | 1198 | 6256 | 5047 | 5414 | 4410
+  ADH 1234.CR2 | 3296 | 1576 | 377 | 1334 | 7950 | 6734 | 6620 | 5719
+  ADH 1248.CR2 | 3522 | 1636 | 421 | 1454 | 8517 | 5919 | 8740 | 5282
+  ADH 1455.CR2 | 4646 | 2214 | 618 | 1796 | 9023 | 5692 | 8017 | 5203
+  ADH 1490.CR2 | 3828 | 1825 | 461 | 1534 | 7673 | 5236 | 7317 | 4870
+  ADH 1514.CR2 | 4038 | 1880 | 464 | 1689 | 8621 | 5807 | 7727 | 5289
+  ADH 1559.CR2 | 3957 | 1856 | 466 | 1623 | 8089 | 5494 | 7314 | 5000
+  ADH 1570.CR2 | 6969 | 3803 | 793 | 2366 | 17806 | 6553 | 19630 | 5766
+  PXL_20260501_093507165.RAW-02.ORIGINAL.dng | 1963 | 876 | 238 | 840 | 5138 | 3485 | 4110 | 2952
+  PXL_20260501_095020990.RAW-02.ORIGINAL.dng | 2013 | 755 | 189 | 935 | 4758 | 3094 | 3214 | 2734
+  PXL_20260501_095114043.RAW-02.ORIGINAL.dng | 1944 | 834 | 200 | 767 | 4547 | 3372 | 3525 | 2993
+  PXL_20260501_100404049.RAW-02.ORIGINAL.dng | 1687 | 793 | 194 | 696 | 4182 | 3357 | 3488 | 2870
+  PXL_20260501_100809178.RAW-02.ORIGINAL.dng | 1839 | 784 | 182 | 754 | 3902 | 3387 | 3351 | 2916
+  PXL_20260526_194439088.RAW-02.ORIGINAL.dng | 2167 | 929 | 242 | 837 | 4403 | 3226 | 3913 | 2881
+  PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.dng | 1744 | 751 | 181 | 693 | 3769 | 2577 | 3210 | 2266
+  PXL_20260527_145756882.RAW-02.ORIGINAL.dng | 1614 | 770 | 170 | 671 | 3803 | 2770 | 3267 | 2446
+  PXL_20260527_145805406.RAW-02.ORIGINAL.dng | 1625 | 782 | 182 | 658 | 3919 | 2801 | 3346 | 2431
+  PXL_20260527_175312330.RAW-02.ORIGINAL.dng | 1761 | 812 | 173 | 649 | 3751 | 2795 | 3357 | 2456
+  PXL_20260527_175945329.RAW-02.ORIGINAL.dng | 2121 | 964 | 217 | 789 | 4225 | 2875 | 3893 | 2626
+  PXL_20260527_180311682.RAW-02.ORIGINAL.dng | 2251 | 1355 | 190 | 703 | 6875 | 2476 | 5997 | 2226
+  PXL_20260527_180319603.RAW-02.ORIGINAL.dng | 3684 | 2073 | 384 | 1225 | 5122 | 2186 | 4078 | 2080
+  PXL_20260527_200222810.RAW-02.ORIGINAL.dng | 1772 | 816 | 211 | 742 | 4709 | 3214 | 3916 | 2856
+  PXL_20260528_091745096.RAW-02.ORIGINAL.dng | 1995 | 848 | 205 | 812 | 4489 | 3153 | 3863 | 2816
+
+# Aggregates
+TotalRecords: 36
+
+# Averages (RAW-decode = comparable; shot enc/dec = sweep-config, indicative)
+AvgRawMs: 3344
+AvgRawDecompressMs: 1555 | AvgRawDemosaicMs: 385 | AvgRawTonemapMs: 1338
+AvgShotEncSimdMs: 7200 | AvgShotEncMtMs: 4424
+AvgShotDecSimdMs: 6664 | AvgShotDecMtMs: 3895
