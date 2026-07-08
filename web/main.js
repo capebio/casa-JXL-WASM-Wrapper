@@ -1969,6 +1969,14 @@ function startConvert(file, existingCard) {
             // TIFF-magic RAW (orf/dng/cr2) from developed TIFF. Detection still
             // works on magic bytes alone if name is absent (e.g. EXR/CR2).
             opts.name = file.name || '';
+            // opts.batch (left unset here) opts a task out of the worker's
+            // interactive two-phase ORF split (previews first, full-res second)
+            // and decodes each file once — a total-CPU win for headless/batch
+            // exports that need no on-screen preview. This is the INTERACTIVE
+            // viewer: every card shows previews, so we keep batch unset and the
+            // first-paint-optimized split. opts survives postMessage (pool.submit
+            // forwards `options` verbatim to the worker), so a future batch/
+            // scheduler entry only needs to set opts.batch = true to opt in.
             const initialPriority = getCardState(card)._pendingPriority || 'normal';
             getCardState(card)._pendingPriority = null;
             const taskId = pool.submit(bytes, opts, {

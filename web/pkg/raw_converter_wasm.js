@@ -967,6 +967,38 @@ export class ProcessResult {
         }
     }
     /**
+     * Mode 3 (single-decompress preview-first): finish the full-resolution RGB8
+     * output FROM the raw mosaic retained by a phase-1 `OUT_RETAIN_RAW` decode —
+     * demosaic + tone (+ optional disp16 / orientation) only, NO second
+     * decompress. Byte-identical to a fresh `OUT_FULL_RGB8` decode because both
+     * go through `finish_from_raw`. After this returns, `take_rgb()` yields the
+     * full RGB8 and `width`/`height`/`orient_ms`/`demosaic_ms`/`tonemap_ms`
+     * reflect the full-res render. Errors (JsError) if the result was not
+     * produced with `OUT_RETAIN_RAW`. The 14 look args match the trailing
+     * arguments of `process_orf_with_flags`, in the same order.
+     * @param {number} output_flags
+     * @param {number} exposure_ev
+     * @param {number} contrast
+     * @param {number} highlights
+     * @param {number} shadows
+     * @param {number} whites
+     * @param {number} blacks
+     * @param {number} saturation
+     * @param {number} vibrance
+     * @param {number} temp
+     * @param {number} tint
+     * @param {number} wb_r
+     * @param {number} wb_b
+     * @param {number} texture
+     * @param {number} clarity
+     */
+    finish_full_rgb8(output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, wb_r, wb_b, texture, clarity) {
+        const ret = wasm.processresult_finish_full_rgb8(this.__wbg_ptr, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, wb_r, wb_b, texture, clarity);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
      * @returns {string}
      */
     get lens() {

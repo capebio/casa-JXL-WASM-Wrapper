@@ -99,9 +99,16 @@ git add web/worker.js web/main.js web/two-phase-raw.test.js .flipflop/dom-tests/
 git commit -m "perf(worker): decode ORF once for batch exports (skip two-phase double-decompress)"
 ```
 
-### Task 1.2: Borrow (not copy) the encode input buffer
+### Task 1.2: Borrow (not copy) the encode input buffer — ❌ DROPPED (inert, already done upstream)
+
+**Rejected 2026-07-07 after code trace.** The premise was wrong: the encode input is TRANSFERRED as an ArrayBuffer (`encode-session.ts:214`), and the facade's `copyOrBorrowInput` (`facade.ts:2921`, the ENCODER path — the original plan mislabeled the DECODER slice at `facade.ts:1486`) always returns a zero-copy `new Uint8Array(value)` VIEW for an ArrayBuffer regardless of `copyInput`. The `.slice()` only fires for a `Uint8Array` input with `copy===true`, which never happens here. The worker already passes `copyInput:false` (`encode-handler.ts:198`, upstream `36400b87`), and the session `EncodeOptions` (`types.ts:152`) has no `copyInput` field to forward — so adding it to `main.js` is a dead property. There is no ~60MB slice to remove; the only encode-input copy is the intrinsic `HEAPU8.set` into the WASM heap. **No code change.** (Lesson: the earlier browser-orchestration trace conflated the decoder `copyInput` slice with the encode path.)
+
+<details><summary>Original (rejected) task text</summary>
 
 `encodeJxlSession` doesn't set `copyInput`, so the facade does a defensive `.slice()` of the full RGB8 (`facade.ts:1485`) before the mandatory `HEAPU8.set`. That buffer is a single-owner ArrayBuffer transferred into the encode worker and discarded after `finish()` — never mutated — so borrowing is safe. Saves one ~60 MB memcpy/file.
+</details>
+
+*(Steps below are VOID — task dropped. Original for reference only.)*
 
 **Files:**
 - Modify: `web/main.js:970-991` (`encodeJxlSession` — pass `copyInput:false` into `encOpts`)
@@ -192,9 +199,20 @@ git commit -m "perf(raw_video): drain exact-dims frame directly into buf (delete
 
 ---
 
-## Phase 2 — RESHAPE parallelism for batch throughput (evidence-gated)
+## Phase 2 — RESHAPE parallelism for batch throughput — ❌ NO THROUGHPUT WIN (measured 2026-07-07)
 
-The browser runs POOL_SIZE decode workers, EACH calling `initThreadPool(hardwareConcurrency)` — 12×12=144 threads on 12 cores. Since `decompress` (the dominant stage) is serial, threading one file buys only 1.2× while oversubscribing 12×. Batch throughput wants **N single-threaded file-decoders**; interactive single-file wants **few workers × many threads** (tone-bound editing is 3.84× MT). Unify via an adaptive core budget. **Heuristic change → REQUIRES bench data before landing** (CLAUDE.md).
+**Debunked by measurement.** A native proxy (`crates/raw-pipeline/examples/batch_concurrency_flip.rs`, commit `b9e81714`) reproduced the exact contention physics: N=12 concurrent full decodes (decompress+demosaic+tone), each confined to a per-worker rayon pool of T threads, on a 12-core AC-powered machine, flip-flop median of 7 rounds, RGB8 byte-identical across T. Result: **T=1 (proposed fix, 12 total threads) vs T=12=C (browser today, 144 total threads) = 0.99× — a dead heat.** T=2 marginally best (~1.01×) but within noise. At full batch saturation the machine is CPU+bandwidth-bound regardless of thread slicing: the 132 "extra" threads sleep during the serial `decompress` (74% of decode) and can't exceed shared memory bandwidth during the memory-bound demosaic/tone (DS-ROWPAR). **The oversubscription does NOT hurt throughput; the fix does NOT help it.**
+
+Residual (non-throughput) merits of the fix — memory footprint (144 live thread stacks) and per-worker `initThreadPool` spawn/teardown — are real but out of scope for a throughput pass, and a possible small browser-only scheduling win is unproven and would need the expensive in-page harness (low ROI). **Do not land Tasks 2.2/2.3 on throughput grounds.**
+
+**Key reframe (drives the rest of the plan):** on a saturated batch you cannot win with *more parallelism* — it is already maxed. You win only by **deleting work per file** (mode 3 single-decompress, Task 1.1, memsets, copies). Work-deletion helps BOTH single-file latency AND batch throughput (fewer CPU-seconds × N files). Parallelism reshuffling (Phase 2) is a dead end here.
+
+<details><summary>Original (rejected-for-throughput) Phase 2 text + tasks</summary>
+
+The browser runs POOL_SIZE decode workers, EACH calling `initThreadPool(hardwareConcurrency)` — 12×12=144 threads on 12 cores. Since `decompress` (the dominant stage) is serial, threading one file buys only 1.2× while oversubscribing 12×. Batch throughput wants **N single-threaded file-decoders**; interactive single-file wants **few workers × many threads** (tone-bound editing is 3.84× MT). Unify via an adaptive core budget. **Heuristic change → REQUIRES bench data before landing** (CLAUDE.md). — MEASURED: no throughput win (see above). Tasks 2.1–2.3 below are VOID for throughput.
+</details>
+
+*(Tasks 2.1–2.3 below are VOID for throughput — retained for reference only.)*
 
 ### Task 2.1: Record the batch baseline (measure before changing)
 
