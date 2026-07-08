@@ -492,11 +492,15 @@ impl VideoFrameSource for RawVideoSource {
         // Produce the downscaled (or exact) frame into the ping-pong buffer.
         let (w, h) = (self.cur_w, self.cur_h);
         let (dw, dh) = (self.dw as usize, self.dh as usize);
-        let src = &self.full_rgb8[..w * h * 3];
         if dw == w && dh == h {
-            buf.clear();
-            buf.extend_from_slice(src);
+            // Exact dims: move the decoded frame into buf instead of copying it.
+            // full_rgb8 and buf ping-pong across frames; the next decode reuses the
+            // swapped-out alloc (drain_full_rgb8 clears + resizes + fully overwrites
+            // it, so no stale bytes leak into a later frame).
+            std::mem::swap(&mut self.full_rgb8, buf);
+            buf.truncate(w * h * 3); // decode may leave extra capacity; match the old exact len
         } else {
+            let src = &self.full_rgb8[..w * h * 3];
             buf.clear();
             buf.resize(dw * dh * 3, 0);
             if !box_downscale_rgb8(src, w as u32, h as u32, buf, self.dw, self.dh) {
