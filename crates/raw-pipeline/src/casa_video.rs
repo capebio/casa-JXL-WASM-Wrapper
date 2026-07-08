@@ -871,6 +871,10 @@ struct StreamCtx {
     lossless: bool,
     /// Reused u16 residual scratch for the lossless P-frame path (whole-frame).
     resid16: Vec<u16>,
+    /// Reused per-tile changed-flag scratch for the streaming Tile P-frame path
+    /// (`changed_tile_map_thresh_into` clears+resizes it each frame; capacity
+    /// persists so no fresh `Vec<bool>` alloc per P-frame).
+    tile_map: Vec<bool>,
 }
 
 /// Confidence-scheduled tile admission state for the streaming Tile tier:
@@ -939,6 +943,7 @@ fn stream_ctx(width: u32, height: u32, opts: &CasaVideoOptions) -> Result<Stream
             }),
         lossless,
         resid16: Vec::new(),
+        tile_map: Vec::new(),
     })
 }
 
@@ -1135,7 +1140,8 @@ fn encode_stream_frame(
                 let t = ctx.tile.max(1);
                 let (txn, _tyn) = tile_grid(width, height, t);
                 let ts = t as usize;
-                let map = changed_tile_map_thresh(px, prev_src, width, height, t, ctx.thresh);
+                let mut map = std::mem::take(&mut ctx.tile_map);
+                changed_tile_map_thresh_into(px, prev_src, width, height, t, ctx.thresh, &mut map);
                 ctx.changed.clear();
                 ctx.changed
                     .extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
@@ -1173,6 +1179,7 @@ fn encode_stream_frame(
                         payload,
                     )?;
                 }
+                ctx.tile_map = map; // return scratch (capacity persists for next frame)
                 return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG);
             }
             // SkipMode::None
@@ -1194,13 +1201,18 @@ fn encode_stream_frame(
         let t = ctx.tile.max(1);
         let (txn, _tyn) = tile_grid(width, height, t);
         let (wus, ts) = (width as usize, t as usize);
+        // Take the reused tile-map scratch first (mutable borrow of one field)
+        // so the following immutable `reference` borrow of `ctx.admission` does
+        // not overlap it (the field-disjoint borrows would otherwise conflict
+        // through the shared `ctx` once `reference` erases the field path).
+        let mut map = std::mem::take(&mut ctx.tile_map);
         // Admission mode detects vs the last-SENT state (not the previous
         // source frame) so a deferred tile stays "changed" until delivered.
         let reference: &[u8] = match ctx.admission.as_ref() {
             Some(adm) => &adm.ref_frame,
             None => prev_src,
         };
-        let map = changed_tile_map_thresh(px, reference, width, height, t, ctx.thresh);
+        changed_tile_map_thresh_into(px, reference, width, height, t, ctx.thresh, &mut map);
         ctx.changed.clear();
         ctx.changed
             .extend(map.iter().enumerate().filter(|(_, &c)| c).map(|(i, _)| i));
@@ -1290,6 +1302,7 @@ fn encode_stream_frame(
                 });
             }
         }
+        ctx.tile_map = map; // return scratch (capacity persists for next frame)
         return Ok(CASV_PFRAME_FLAG | CASV_TILE_FLAG | CASV_REPLACE_FLAG);
     }
     match changed_bbox_thresh(px, prev_src, width, height, ctx.thresh) {
@@ -2600,9 +2613,30 @@ fn changed_tile_map_thresh(
     tile: u32,
     thresh: u8,
 ) -> Vec<bool> {
+    let mut map = Vec::new();
+    changed_tile_map_thresh_into(cur, prev, width, height, tile, thresh, &mut map);
+    map
+}
+
+/// Fill a caller-provided buffer with the per-tile changed flags (row-major,
+/// index = ty*tiles_x + tx). Identical result to [`changed_tile_map_thresh`] but
+/// reuses `map`'s allocation across calls (streaming P-frame hot path holds this
+/// scratch in `StreamCtx.tile_map`) instead of allocating a fresh bool Vec per
+/// frame. The buffer is cleared+resized to the exact tile count, so no stale
+/// entries survive between frames.
+fn changed_tile_map_thresh_into(
+    cur: &[u8],
+    prev: &[u8],
+    width: u32,
+    height: u32,
+    tile: u32,
+    thresh: u8,
+    map: &mut Vec<bool>,
+) {
     let (txn, tyn) = tile_grid(width, height, tile);
     let (w, t) = (width as usize, tile as usize);
-    let mut map = vec![false; (txn * tyn) as usize];
+    map.clear();
+    map.resize((txn * tyn) as usize, false);
     for ty in 0..tyn as usize {
         for tx in 0..txn as usize {
             let x0 = tx * t;
@@ -2622,7 +2656,6 @@ fn changed_tile_map_thresh(
             map[ty * txn as usize + tx] = changed;
         }
     }
-    map
 }
 
 /// Per-tile changed flags with exact detection (`thresh=0`).
