@@ -93,6 +93,10 @@ self.onmessage = async ({ data }) => {
       progressive: !!progressive,
       previewFirst: false,
       chunked: false,
+      // This worker owns `rgba` (structured-cloned / transferred in via onmessage)
+      // and never touches it before finish() resolves, so skip the facade's
+      // defensive pushPixels .slice() — saves one full-frame copy + GC per encode.
+      copyInput: false,
     });
 
     // Collect all chunks. Start the chunks() drain in a separate task BEFORE
