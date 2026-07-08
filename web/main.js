@@ -2158,11 +2158,12 @@ async function handleFileList(fileList) {
 }
 
 // Supported pipeline formats: RAW (Olympus ORF, Canon CR2, Adobe/Pixel DNG) plus
-// developed high-bit images (EXR, TIFF) which the worker decodes via decode_exr/
-// decode_tiff and renders through the same LookRenderer live-edit engine. (Name
-// kept `isOrf` for the many existing call sites.)
+// developed images (EXR, TIFF, JPEG) which the worker decodes via decode_exr/
+// decode_tiff/decode_jpeg and renders through the same LookRenderer live-edit
+// engine. JPEG additionally supports lossless archival export (transcodeJpegToJxl).
+// (Name kept `isOrf` for the many existing call sites.)
 function isOrf(file) {
-    return /\.(orf|cr2|dng|exr|tif|tiff)$/i.test(file.name);
+    return /\.(orf|cr2|dng|exr|tif|tiff|jpg|jpeg|jfif)$/i.test(file.name);
 }
 
 // Walk a DataTransfer entry tree (only available on `drop` via
