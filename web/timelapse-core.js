@@ -139,3 +139,78 @@ export function rawFramesCliString(request, outPath = 'out.casv') {
   const q = (s) => (/\s/.test(s) ? `"${s}"` : s);
   return ['casv_encode', ...rawFramesSidecarArgs(request, outPath)].map(q).join(' ');
 }
+
+// ── Pure-web (no-sidecar) FableBraid encode ─────────────────────────────────
+// These take the initialised WASM module as an argument (dependency injection),
+// so this file stays free of a hard `./pkg` import and remains node-testable.
+
+/** Pick the WASM RAW decoder export for a filename (by extension). */
+export function pickRawDecoder(mod, name) {
+  switch (extOf(name)) {
+    case 'orf': return mod.process_orf;
+    case 'dng': return mod.process_dng;
+    case 'cr2': return mod.process_cr2;
+    default: throw err('UNSUPPORTED_RAW', 'unsupported RAW: ' + name);
+  }
+}
+
+/**
+ * Decode one RAW still to oriented full-res **neutral** RGB8 `{ rgb, w, h }`.
+ * Positional look args mirror `src/lib.rs` (all sliders 0; WB `NaN` = keep each
+ * file's metadata white balance, constant for a locked time-lapse). Moves the RGB
+ * out and frees the `ProcessResult`.
+ */
+export function decodeRawNeutralRgb(mod, bytes, name) {
+  const fn = pickRawDecoder(mod, name);
+  const r = fn(bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+  try {
+    return { rgb: r.take_rgb(), w: r.width, h: r.height };
+  } finally {
+    r.free();
+  }
+}
+
+/**
+ * Encode a RAW still sequence to a **FableBraid lossless** `.casv`, entirely
+ * in-process via the WASM `FableVideoEncoder` — the pure-web (no native sidecar)
+ * time-lapse path. `frames` is `[{ bytes: Uint8Array, name }]` in capture order;
+ * every frame must decode to the same dimensions (locked time-lapse). Returns the
+ * `.casv` bytes (Uint8Array). `onProgress(done, total)` fires per encoded frame.
+ *
+ * Lossless-only: the FableBraid tier ignores rate/distance/effort (those are the
+ * libjxl tiers, native-only). Memory note: compressed frames accumulate in WASM
+ * memory until `finish()`, so cap the count or pre-downscale very long / full-res
+ * clips to stay under the heap ceiling.
+ */
+export function encodeFableTimelapse(mod, frames, opts = {}, onProgress = () => {}) {
+  const list = Array.isArray(frames) ? frames : [];
+  if (list.length === 0) throw err('NO_INPUT', 'no frames to encode');
+  if (typeof mod.FableVideoEncoder !== 'function') {
+    throw err('NO_ENCODER', 'this WASM build has no FableVideoEncoder (rebuild web/pkg)');
+  }
+  const fpsNum = Math.round(CLAMP(opts.fpsNum, 1, 240, 24));
+  const fpsDen = Math.round(CLAMP(opts.fpsDen, 1, 1001, 1));
+  const gop = Math.round(CLAMP(opts.gop, 1, 600, 24));
+
+  const first = decodeRawNeutralRgb(mod, list[0].bytes, list[0].name);
+  const { w, h } = first;
+  let enc = new mod.FableVideoEncoder(w, h, fpsNum, fpsDen, gop);
+  try {
+    enc.push_rgb8(first.rgb);
+    onProgress(1, list.length);
+    for (let i = 1; i < list.length; i++) {
+      const f = decodeRawNeutralRgb(mod, list[i].bytes, list[i].name);
+      if (f.w !== w || f.h !== h) {
+        throw err('DIM_MISMATCH',
+          `frame ${i} (${list[i].name}) is ${f.w}x${f.h}, expected ${w}x${h} — time-lapse frames must match`);
+      }
+      enc.push_rgb8(f.rgb);
+      onProgress(i + 1, list.length);
+    }
+    const out = enc.finish(); // consumes the encoder
+    enc = null;
+    return out;
+  } finally {
+    if (enc) { try { enc.free(); } catch (_) { /* not yet consumed */ } }
+  }
+}

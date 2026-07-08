@@ -47,6 +47,10 @@ required-features = ["parallel"]
 name = "raw_video_exact_sha"
 required-features = ["jxl-codec"]
 
+[[example]]
+name = "raw_video_decode_par_flip"
+required-features = ["jxl-codec"]
+
 [dev-dependencies]
 jxl-oxide = "0.11"
 # golden-corpus hashing for the casa_video decode harnesses (examples only)

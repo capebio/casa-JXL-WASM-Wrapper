@@ -2009,6 +2009,8 @@ function startConvert(file, existingCard) {
                     getCardState(card)._colorMatrixFromMn = msg.colorMatrixFromMn;
                     getCardState(card)._camera = [msg.make, msg.model].filter(Boolean).join(' ') || '?';
                     getCardState(card)._exif = msg.exif || null;
+                    getCardState(card)._cameraWb = (msg.exif?.wbFromCamera && isFinite(msg.exif.wbR) && isFinite(msg.exif.wbB))
+                        ? { r: msg.exif.wbR, g: 1.0, b: msg.exif.wbB } : null;
                     card.querySelector('.thumb-dl-btn').hidden = false;
                     card.classList.remove('busy', 'embedded-thumb');
                     card.classList.add('encoding');
@@ -2946,6 +2948,11 @@ function fmtWb(exif) {
     return [mode, gains, `via ${source}`].filter(Boolean).join(' · ');
 }
 
+function fmtCameraWb(card) {
+    const wb = getCardState(card)?._cameraWb;
+    if (!wb) return null;
+    return `r\xD7${wb.r.toFixed(2)}  g\xD71.00  b\xD7${wb.b.toFixed(2)}`;
+}
 function buildInfoRows(card) {
     const ex = getCardState(card)._exif;
     if (!ex) return [];
@@ -2961,6 +2968,7 @@ function buildInfoRows(card) {
         ['Focal',     fmtFocal(ex.focalLength, ex.focalLength35)],
         ['GPS',       fmtGps(ex.gps)],
         ['WB',        fmtWb(ex)],
+        ['Camera WB', fmtCameraWb(card)],
         ['Orientation', ORIENTATION_LABEL[ex.orientation] || (ex.orientation != null ? String(ex.orientation) : null)],
         ['Dimensions', dim],
         ['Format',    'ORF (Olympus 12-bit)'],
@@ -5701,11 +5709,13 @@ if (new URLSearchParams(location.search).has('debug')) {
       };
     },
   };
-  window.__perfDebug = {
-    scheduler: _schedulerAdapter,
-    assetStore: peepDecodedStore,
-    // jxl-cache (JxlCacheBrowser) is not instantiated in main.js; null tells
-    // the dashboard to show "—" for OPFS hit rate.
-    jxlCache: null,
-  };
+  if (new URLSearchParams(location.search).has('debug')) {
+    window.__perfDebug = {
+      scheduler: _schedulerAdapter,
+      assetStore: peepDecodedStore,
+      // jxl-cache (JxlCacheBrowser) is not instantiated in main.js; null tells
+      // the dashboard to show "—" for OPFS hit rate.
+      jxlCache: null,
+    };
+  }
 }

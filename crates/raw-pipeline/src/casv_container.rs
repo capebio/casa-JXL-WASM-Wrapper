@@ -45,6 +45,11 @@ pub const CASV_V1_INDEX_ENTRY_BYTES: usize = 8;
 pub const CASV_PFRAME_FLAG: u32 = 0x8000_0000;
 /// v1 flag nibble stolen from the top of the `len` field (PFRAME|BBOX|TILE|REPLACE).
 pub const CASV_V1_FLAG_BITS: u32 = 0xF000_0000;
+/// Header-flags bit marking the whole file as the **FableBraid** (lossless, libjxl-free)
+/// tier. Mirrors `casa_video::CASV_HDR_FABLE_FLAG`; pinned to `casv-format.json` below.
+/// Shared so the wasm (browser, no-sidecar) FableBraid video encoder can set it without
+/// pulling the native `jxl-codec` module.
+pub const CASV_HDR_FABLE_FLAG: u32 = 0x0000_0002;
 
 // ── v2 additions (promote into casv-format.json when P3 is fully wired — see handoff) ────
 /// v2 container version.
@@ -329,6 +334,51 @@ pub fn write_container_v2(
     out
 }
 
+// ── Write (v1) ──────────────────────────────────────────────────────────────────────────
+
+/// Serialize a **v1** container: 32-B header + packed 8-B index
+/// `[u32 abs_offset][u32 len|flags(top nibble)]` + payloads in frame order. This is the
+/// single wasm-portable v1 writer — byte-identical to `casa_video::assemble_header_casv`
+/// (proven by `write_container_v1_matches_native_layout`), so the browser (no-sidecar)
+/// FableBraid encoder produces exactly what the native encoder does and the shipping
+/// decoder plays it unchanged.
+///
+/// `entries` is `(flags, len)` per frame (`flags` = `CASV_PFRAME_FLAG` etc.); `header_flags`
+/// carries e.g. `CASV_HDR_FABLE_FLAG`; `write_data` appends the concatenated payloads in one
+/// pass (`total_data_len` sizes the single allocation).
+pub fn write_container_v1(
+    width: u32,
+    height: u32,
+    frame_count: u32,
+    fps_num: u32,
+    fps_den: u32,
+    header_flags: u32,
+    entries: &[(u32, u32)],
+    total_data_len: usize,
+    write_data: impl FnOnce(&mut Vec<u8>),
+) -> Vec<u8> {
+    let data_start = CASV_HEADER_BYTES + entries.len() * CASV_V1_INDEX_ENTRY_BYTES;
+    let mut out = Vec::with_capacity(data_start + total_data_len);
+    // 32-byte header (magic | ver=1 | w | h | frame_count | fps_num | fps_den | flags).
+    out.extend_from_slice(&CASV_MAGIC.to_le_bytes());
+    out.extend_from_slice(&CASV_V1_VERSION.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&frame_count.to_le_bytes());
+    out.extend_from_slice(&fps_num.to_le_bytes());
+    out.extend_from_slice(&fps_den.to_le_bytes());
+    out.extend_from_slice(&header_flags.to_le_bytes());
+    // Packed 8-byte index: absolute offset + (len with the flag nibble OR'd into the top).
+    let mut offset = data_start;
+    for &(flags, len) in entries {
+        out.extend_from_slice(&(offset as u32).to_le_bytes());
+        out.extend_from_slice(&(len | flags).to_le_bytes());
+        offset += len as usize;
+    }
+    write_data(&mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,12 +391,13 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../casv-format.json");
         let json = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let pairs: [(&str, u64); 5] = [
+        let pairs: [(&str, u64); 6] = [
             ("CASV_MAGIC", CASV_MAGIC as u64),
             ("CASV_VERSION", CASV_V1_VERSION as u64),
             ("CASV_HEADER_BYTES", CASV_HEADER_BYTES as u64),
             ("CASV_INDEX_ENTRY_BYTES", CASV_V1_INDEX_ENTRY_BYTES as u64),
             ("CASV_PFRAME_FLAG", CASV_PFRAME_FLAG as u64),
+            ("CASV_HDR_FABLE_FLAG", CASV_HDR_FABLE_FLAG as u64),
         ];
         for (name, val) in pairs {
             let needle = format!("\"{name}\": {val}");
@@ -378,6 +429,41 @@ mod tests {
             out.extend_from_slice(p);
         }
         out
+    }
+
+    #[test]
+    fn write_container_v1_matches_native_layout() {
+        // `write_container_v1` must be byte-identical to the hand-rolled v1 layout
+        // (`build_v1`, which mirrors casa_video::assemble_header_casv). Same frames,
+        // same fps (30/1) and header flags (0) build_v1 hardcodes.
+        let f0: &[u8] = b"keyframe-0";
+        let f1: &[u8] = b"pframe-1";
+        let f2: &[u8] = b"keyframe-2-longer";
+        let want = build_v1(&[(0, f0), (CASV_PFRAME_FLAG, f1), (0, f2)], 640, 480);
+
+        let entries = [(0u32, f0.len() as u32), (CASV_PFRAME_FLAG, f1.len() as u32), (0u32, f2.len() as u32)];
+        let data_len = f0.len() + f1.len() + f2.len();
+        let got = write_container_v1(640, 480, 3, 30, 1, 0, &entries, data_len, |out| {
+            out.extend_from_slice(f0);
+            out.extend_from_slice(f1);
+            out.extend_from_slice(f2);
+        });
+        assert_eq!(got, want, "write_container_v1 != native v1 layout");
+
+        // And it round-trips through the reader with the fable header flag set.
+        let fable = write_container_v1(
+            640, 480, 3, 30, 1, CASV_HDR_FABLE_FLAG, &entries, data_len, |out| {
+                out.extend_from_slice(f0);
+                out.extend_from_slice(f1);
+                out.extend_from_slice(f2);
+            });
+        let c = parse_container(&fable).expect("v1 parse");
+        assert_eq!(c.version, CASV_V1_VERSION);
+        assert_eq!(c.flags & CASV_HDR_FABLE_FLAG, CASV_HDR_FABLE_FLAG);
+        assert_eq!(c.frame_payload(&fable, 0), Some(f0));
+        assert_eq!(c.frame_payload(&fable, 1), Some(f1));
+        assert_eq!(c.frame_payload(&fable, 2), Some(f2));
+        assert!(c.frames[0].keyframe && !c.frames[1].keyframe && c.frames[2].keyframe);
     }
 
     #[test]

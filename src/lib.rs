@@ -1450,9 +1450,10 @@ fn process_orf_impl(
         fast_preview,
     } = decoded;
 
-    // Camera black pedestal is format-fixed and untouched by the look; capture it
-    // before `params` is moved into the finish / retain path.
+    // Camera black pedestal + white saturation are format-fixed and untouched by the
+    // look; capture them before `params` is moved into the finish / retain path.
     let black_used = params.black;
+    let white_used = params.white;
 
     // Previews (already built in decode_orf_raw) are surfaced per requested flags.
     let (rgb16_lb, out_lb_w, out_lb_h) = if output_flags & OUT_LIGHTBOX != 0 {
@@ -1586,10 +1587,12 @@ fn process_orf_impl(
         preview_demosaic_ms,
         preview_downscale_ms,
         fast_preview,
-        wb_r_used: params.wb_r,
-        wb_b_used: params.wb_b,
-        black_used: params.black,
-        white_used: params.white,
+        // Reported WB is the look-adjusted WB (tuple locals, post-look per the branch
+        // arms above); black/white are the format-fixed camera locals captured pre-move.
+        wb_r_used,
+        wb_b_used,
+        black_used,
+        white_used,
         color_matrix_from_mn,
         make: info.make,
         model: info.model,
@@ -1825,8 +1828,28 @@ pub fn process_region(
         w: w as usize,
         h: h as usize,
     };
-    let region =
-        pipeline::process_region(&decoded.rgb16, decoded.w, decoded.h, rect, 1, &decoded.params);
+    // The full-res RGB16 that used to ride on `OrfDecoded` now comes from the shared
+    // `finish_from_raw` (the mode-3 refactor moved MHC demosaic + ISO-gated NR out of the
+    // decode): pre-tone, neutral look, sensor orientation — the exact buffer that
+    // `pipeline::process_region` crops and tonemaps. `region_params` is the pre-look camera
+    // params (neutral look ⇒ finish leaves them unchanged), matching the tone stage of the
+    // full `OUT_FULL_RGB8 | OUT_NO_ORIENT` neutral decode this region is asserted to mirror.
+    let (iw, ih) = (decoded.w, decoded.h);
+    let iso = decoded.info.iso.unwrap_or(0);
+    let orientation = decoded.info.orientation;
+    let region_params = decoded.params.clone();
+    let finished = finish_from_raw(
+        decoded.raw,
+        iw,
+        ih,
+        decoded.params,
+        &LookOverrides::neutral(),
+        orientation,
+        iso,
+        OUT_FULL_16,
+    )
+    .map_err(JsValue::from)?;
+    let region = pipeline::process_region(&finished.rgb16_full, iw, ih, rect, 1, &region_params);
     Ok(region.rgb8)
 }
 
@@ -4596,6 +4619,56 @@ pub fn fable_encode_rgb8(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
 #[wasm_bindgen]
 pub fn fable_encode_rgb8_delta(cur: &[u8], prev: &[u8], width: u32, height: u32) -> Vec<u8> {
     raw_pipeline::fable_braid::encode_rgb8_delta(cur, prev, width, height)
+}
+
+/// Browser (no-sidecar) **FableBraid RAW→CASV video** encoder — the libjxl-free
+/// lossless timelapse path. Decode each RAW still in JS (`process_orf`/`process_dng`/
+/// `process_cr2` → RGB8), `push_rgb8` them in order, then `finish()` for the `.casv`
+/// bytes. Output is byte-identical to the native `casv_encode --raw-frames` fable tier
+/// (`raw_pipeline::fable_video` `parity_with_native_streaming` test), so the shipping
+/// browser player (casv-web `playFable` + `FableDeltaSession`) plays it unchanged.
+/// Uses only the FableBraid codec + the container writer — no libjxl bridge.
+#[wasm_bindgen]
+pub struct FableVideoEncoder {
+    inner: raw_pipeline::fable_video::FableVideoEncoder,
+}
+
+#[wasm_bindgen]
+impl FableVideoEncoder {
+    /// New encoder: `width`×`height` frames at `fps_num/fps_den`, keyframe every
+    /// `gop_len` frames (clamped ≥1).
+    #[wasm_bindgen(constructor)]
+    pub fn new(
+        width: u32,
+        height: u32,
+        fps_num: u32,
+        fps_den: u32,
+        gop_len: u32,
+    ) -> FableVideoEncoder {
+        FableVideoEncoder {
+            inner: raw_pipeline::fable_video::FableVideoEncoder::new(
+                width, height, fps_num, fps_den, gop_len,
+            ),
+        }
+    }
+
+    /// Encode + append one RGB8 frame (`len == width*height*3`). I-frame on GOP
+    /// boundaries, else a P-frame delta vs the previous pushed frame.
+    pub fn push_rgb8(&mut self, rgb: &[u8]) -> Result<(), JsError> {
+        self.inner
+            .push_rgb8(rgb)
+            .map_err(|e| JsError::new(&e.to_string()))
+    }
+
+    /// Frames pushed so far.
+    pub fn frame_count(&self) -> usize {
+        self.inner.frame_count()
+    }
+
+    /// Assemble the `.casv` bytes (consumes the encoder). Errors if no frames pushed.
+    pub fn finish(self) -> Result<Vec<u8>, JsError> {
+        self.inner.finish().map_err(|e| JsError::new(&e.to_string()))
+    }
 }
 
 #[wasm_bindgen]
