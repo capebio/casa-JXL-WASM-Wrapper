@@ -32,6 +32,7 @@ pub mod ljpeg;
 // S3: additive, behavior-neutral memory preflight (peak/retained working-set
 // projection from dims + output flags). Pure; native + wasm.
 pub mod mem_budget;
+pub mod orf_proxy;
 pub mod perceptual;
 pub mod pipeline;
 pub mod stream_preview;

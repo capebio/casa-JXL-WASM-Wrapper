@@ -432,11 +432,210 @@ impl StreamingBandSource<Cr2RowSource> {
     }
 }
 
+/// Even strip height for the pipelined decode: each band starts on an even (R) CFA
+/// row so the band demosaic's local parity matches the global row (stream_band contract).
+const PIPE_STRIP: usize = 128;
+
+/// Assemble the `(k+4)`-row band context for strip `[first, first+k)` — 2 halo rows each
+/// side, edge-clamped (repeat row 0 / row h-1), byte-identical to stream_band's band ctx.
+/// Rows are copied from `window` (rows `[win_first, decoded)`), which must contain them.
+#[inline]
+fn pipe_build_ctx(
+    window: &[u16], win_first: usize, decoded: usize, first: usize, k: usize, w: usize, h: usize,
+) -> Result<Vec<u16>, String> {
+    let ctx_h = k + 4;
+    let mut ctx = vec![0u16; ctx_h * w];
+    for i in 0..ctx_h {
+        let g = (first as isize - 2 + i as isize).clamp(0, h as isize - 1) as usize;
+        if g < win_first || g >= decoded {
+            return Err(format!("pipeline: row {g} outside window [{win_first},{decoded})"));
+        }
+        let li = g - win_first;
+        ctx[i * w..i * w + w].copy_from_slice(&window[li * w..li * w + w]);
+    }
+    Ok(ctx)
+}
+
+/// Demosaic (MHC, 2-row halo band) + tone one strip's `ctx` into `dst` (k*w*3 bytes).
+/// Byte-identical to whole-frame `demosaic_rggb_mhc → process_into_auto` (proven by
+/// `streaming_source_matches_whole`), computed per-strip so strips are independent.
+#[inline]
+fn pipe_process_strip(
+    ctx: &[u16], k: usize, w: usize, phase: (u8, u8), params: &PipelineParams, dst: &mut [u8],
+) -> Result<(), String> {
+    let mut rgb16 = vec![0u16; k * w * 3];
+    demosaic_bayer_mhc_band(ctx, w, k + 4, 2, phase, 0, k, &mut rgb16)?;
+    pipeline::process_into_auto(&rgb16, params, dst);
+    Ok(())
+}
+
+/// Pipelined tone-only RAW→RGB8 decode: a producer decodes strips serially (the
+/// unavoidable serial Olympus VLC) while `par_bridge` consumers demosaic+tone each strip
+/// on the remaining pool threads — hiding the parallel demosaic+tone behind the serial
+/// decode. `out_rgb8` must be `w*h*3`. Byte-identical to the whole-frame
+/// `demosaic_rggb_mhc → process_into_auto` path (no spatial NR/unsharp — the batch
+/// full-decode path). Sequential fallback when `parallel` is off.
+#[cfg(feature = "parallel")]
+pub fn decode_demosaic_tone_pipelined<S>(
+    mut src: S,
+    params: &PipelineParams,
+    phase: (u8, u8),
+    out_rgb8: &mut [u8],
+) -> Result<(), String>
+where
+    S: RawRowSource + Send,
+{
+    use rayon::iter::{ParallelBridge, ParallelIterator};
+    use std::sync::{mpsc::sync_channel, Mutex};
+
+    let (w, h) = (src.width(), src.height());
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    if out_rgb8.len() < w * h * 3 {
+        return Err(format!("pipeline: out too small ({} < {})", out_rgb8.len(), w * h * 3));
+    }
+
+    struct Strip { first: usize, k: usize, ctx: Vec<u16> }
+    // Consumers write disjoint row ranges of out_rgb8. Pass the base as a usize address
+    // (trivially Send+Sync — no closure disjoint-capture pitfall) and rebuild the pointer
+    // per strip. Each strip writes only its own [first, first+k) slice → no overlap.
+    let out_addr = out_rgb8.as_mut_ptr() as usize;
+
+    let (tx, rx) = sync_channel::<Strip>(4); // bounded → producer backpressure, O(few strips) mem
+    let prod_err: Mutex<Option<String>> = Mutex::new(None);
+    let cons_err: Mutex<Option<String>> = Mutex::new(None);
+    let prod_err_ref = &prod_err;
+
+    rayon::scope(|sc| {
+        // Producer owns `src` + `tx` (must drop tx to end the stream); references the error mutex.
+        sc.spawn(move |_| {
+            let mut src = src;
+            let mut window: Vec<u16> = Vec::new(); // rows [win_first, decoded)
+            let (mut win_first, mut decoded) = (0usize, 0usize);
+            let mut rowbuf = vec![0u16; w];
+            let mut first = 0usize;
+            while first < h {
+                let k = PIPE_STRIP.min(h - first);
+                let need = (first + k + 2).min(h);
+                while decoded < need {
+                    match src.next_row_into(&mut rowbuf) {
+                        Ok(true) => { window.extend_from_slice(&rowbuf); decoded += 1; }
+                        Ok(false) => break,
+                        Err(e) => { *prod_err_ref.lock().unwrap() = Some(e); return; }
+                    }
+                }
+                match pipe_build_ctx(&window, win_first, decoded, first, k, w, h) {
+                    Ok(ctx) => { if tx.send(Strip { first, k, ctx }).is_err() { return; } }
+                    Err(e) => { *prod_err_ref.lock().unwrap() = Some(e); return; }
+                }
+                first += k;
+                let keep = first.saturating_sub(2); // keep 2 halo rows for the next strip's top
+                if keep > win_first {
+                    window.drain(0..(keep - win_first) * w);
+                    win_first = keep;
+                }
+            }
+            drop(tx);
+        });
+
+        let cons_err_ref = &cons_err;
+        rx.into_iter().par_bridge().for_each(move |strip| {
+            let mut local = vec![0u8; strip.k * w * 3];
+            if let Err(e) = pipe_process_strip(&strip.ctx, strip.k, w, phase, params, &mut local) {
+                *cons_err_ref.lock().unwrap() = Some(e);
+                return;
+            }
+            // SAFETY: strips cover disjoint row ranges; each writes only its own
+            // [first, first+k) slice of out_rgb8 (bounds checked above). No overlap.
+            unsafe {
+                let base = (out_addr as *mut u8).add(strip.first * w * 3);
+                std::ptr::copy_nonoverlapping(local.as_ptr(), base, strip.k * w * 3);
+            }
+        });
+    });
+
+    if let Some(e) = prod_err.lock().unwrap().take() { return Err(e); }
+    if let Some(e) = cons_err.lock().unwrap().take() { return Err(e); }
+    Ok(())
+}
+
+/// Sequential fallback (no `parallel`): same byte-exact strip path, no threads/overlap.
+#[cfg(not(feature = "parallel"))]
+pub fn decode_demosaic_tone_pipelined<S: RawRowSource>(
+    mut src: S,
+    params: &PipelineParams,
+    phase: (u8, u8),
+    out_rgb8: &mut [u8],
+) -> Result<(), String> {
+    let (w, h) = (src.width(), src.height());
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    if out_rgb8.len() < w * h * 3 {
+        return Err(format!("pipeline: out too small ({} < {})", out_rgb8.len(), w * h * 3));
+    }
+    let mut window: Vec<u16> = Vec::new();
+    let (mut win_first, mut decoded) = (0usize, 0usize);
+    let mut rowbuf = vec![0u16; w];
+    let mut first = 0usize;
+    while first < h {
+        let k = PIPE_STRIP.min(h - first);
+        let need = (first + k + 2).min(h);
+        while decoded < need {
+            if !src.next_row_into(&mut rowbuf)? { break; }
+            window.extend_from_slice(&rowbuf);
+            decoded += 1;
+        }
+        let ctx = pipe_build_ctx(&window, win_first, decoded, first, k, w, h)?;
+        pipe_process_strip(&ctx, k, w, phase, params, &mut out_rgb8[first * w * 3..(first + k) * w * 3])?;
+        first += k;
+        let keep = first.saturating_sub(2);
+        if keep > win_first {
+            window.drain(0..(keep - win_first) * w);
+            win_first = keep;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decompress::OrfRowDecoder;
     use crate::{decompress, demosaic};
+
+    // #3 pipelined decode∥demosaic+tone must be byte-identical to the whole-frame
+    // `demosaic_rggb_mhc → process_into_auto`. Sizes cross the 128-row strip boundary,
+    // exercise odd width/height, the top+bottom edge clamps, and a tiny frame.
+    #[test]
+    fn pipelined_decode_matches_whole() {
+        for (w, h, seed) in [
+            (64usize, 96usize, 0xC0FFEEu64),
+            (66, 130, 0xABCD),
+            (40, 300, 0x1234),
+            (128, 129, 0x5EED),
+            (50, 257, 0xF00D),
+            (300, 620, 0xBEEF),
+        ] {
+            let strip = decompress::tests_synth_payload(w, h, seed);
+            let raw = decompress::decompress(&strip, w, h).unwrap();
+            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let params = pipeline::PipelineParams::default_olympus();
+            let mut want = vec![0u8; w * h * 3];
+            pipeline::process_into_auto(&rgb16, &params, &mut want);
+
+            let src = OrfRowDecoder::new(&strip, w, h).unwrap();
+            let mut got = vec![0u8; w * h * 3];
+            decode_demosaic_tone_pipelined(src, &params, (0, 0), &mut got).unwrap();
+            assert_eq!(got, want, "pipelined != whole for {}x{}", w, h);
+        }
+        // truncated stream surfaces as Err (not silent garbage / partial write)
+        let short = decompress::tests_synth_payload(64, 200, 7)[..7 + 40].to_vec();
+        let src = OrfRowDecoder::new(&short, 64, 200).unwrap();
+        let mut out = vec![0u8; 64 * 200 * 3];
+        assert!(decode_demosaic_tone_pipelined(src, &pipeline::PipelineParams::default_olympus(), (0, 0), &mut out).is_err());
+    }
 
     #[test]
     fn streaming_source_matches_whole() {

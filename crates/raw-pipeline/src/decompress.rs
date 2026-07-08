@@ -194,6 +194,44 @@ pub fn decompress_rows_into(
     max_rows: usize,
     out: &mut [u16],
 ) -> Result<usize, String> {
+    decompress_rows_into_generic::<WIDE_FILL>(compressed, width, height, max_rows, out)
+}
+
+/// Bench-only: decode with an explicit refill strategy so a single wasm build can A/B
+/// the byte loop (`WIDE=false`) against the u64 wide/SIMD refill (`WIDE=true`).
+/// Byte-identical to [`decompress_rows_into`] for the matching `WIDE`.
+pub fn bench_decode_rows_into<const WIDE: bool>(
+    compressed: &[u8],
+    width: usize,
+    height: usize,
+    max_rows: usize,
+    out: &mut [u16],
+) -> Result<usize, String> {
+    decompress_rows_into_generic::<WIDE>(compressed, width, height, max_rows, out)
+}
+
+/// Deterministic synthetic ORF bitstream (4 bytes/pixel ⇒ full decode never truncates).
+/// Public twin of the test-only `synth_payload` for the wasm decompress bench harness.
+pub fn bench_synth_payload(width: usize, height: usize, seed: u64) -> Vec<u8> {
+    let nbytes = HEADER_SKIP + width * height * 4;
+    let mut v = Vec::with_capacity(nbytes);
+    let mut s = seed | 1;
+    for _ in 0..nbytes {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        v.push((s >> 24) as u8);
+    }
+    v
+}
+
+fn decompress_rows_into_generic<const WIDE: bool>(
+    compressed: &[u8],
+    width: usize,
+    height: usize,
+    max_rows: usize,
+    out: &mut [u16],
+) -> Result<usize, String> {
     let nrows = max_rows.min(height);
     let n = width
         .checked_mul(nrows)
@@ -221,7 +259,7 @@ pub fn decompress_rows_into(
     if width == 0 {
         return Ok(nrows);
     }
-    let mut br = BitReader::<WIDE_FILL>::new(&compressed[HEADER_SKIP..]);
+    let mut br = BitReader::<WIDE>::new(&compressed[HEADER_SKIP..]);
 
     for row in 0..nrows {
         let row_base = row * width;
@@ -234,7 +272,7 @@ pub fn decompress_rows_into(
         } else {
             &[]
         };
-        decode_row_into::<WIDE_FILL>(&mut br, row, width, nrows, north_row, &mut cur[..width])?;
+        decode_row_into::<WIDE>(&mut br, row, width, nrows, north_row, &mut cur[..width])?;
     }
     if br.truncated {
         return Err(bitstream_exhausted(width, nrows));
@@ -350,12 +388,42 @@ pub fn for_each_strip<S: RawRowSource>(
     Ok(())
 }
 
-/// Native targets use the u64 wide-load refill; wasm keeps the byte loop (no
-/// cheap byteswap there — see `docs`/Questions_deferred D-wide-refill).
+/// Native targets use the u64 wide-load refill. wasm ALSO uses it now: with simd128 a
+/// single `i8x16.swizzle` byte-reverse ([`load_be_u64`]) makes the wide load cheap,
+/// disproving the old "wasm has no cheap byteswap → keep the byte loop" deferral
+/// (Questions_deferred D-wide-refill). The A/B harness (`decompress_bench_*` +
+/// tools/decompress-flipflop.mjs) measured wide at 1.03–1.05× the byte loop,
+/// bit-identical (equal=true), sign-stable across 1/3/20 MP — enabled on both targets.
 #[cfg(not(target_arch = "wasm32"))]
 const WIDE_FILL: bool = true;
 #[cfg(target_arch = "wasm32")]
-const WIDE_FILL: bool = false;
+const WIDE_FILL: bool = true;
+
+/// Load `data[pos..pos+8]` big-endian as a u64 (data[pos] = MSB) — identical to
+/// `u64::from_be_bytes(data[pos..pos+8])`. On wasm+simd128 a v128 load + one
+/// `i8x16.swizzle` byte-reverse replaces LLVM's scalar bswap lowering (the
+/// "no cheap byteswap" concern that kept the wide refill off wasm). Caller must
+/// guarantee `pos + 8 <= data.len()`.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline(always)]
+fn load_be_u64(data: &[u8], pos: usize) -> u64 {
+    use core::arch::wasm32::*;
+    // SAFETY: caller guarantees pos + 8 <= data.len(); v128_load64_zero reads 8 bytes.
+    let v = unsafe { v128_load64_zero(data.as_ptr().add(pos) as *const u64) };
+    // Reverse the low 8 lanes: result lane i = v[7-i]; extracting the low u64 yields
+    // data[pos]<<56 | … | data[pos+7] == from_be_bytes. High 8 lanes stay zero (unused).
+    let rev = i8x16_swizzle(
+        v,
+        u8x16(7, 6, 5, 4, 3, 2, 1, 0, 8, 9, 10, 11, 12, 13, 14, 15),
+    );
+    u64x2_extract_lane::<0>(rev)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
+#[inline(always)]
+fn load_be_u64(data: &[u8], pos: usize) -> u64 {
+    u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap())
+}
 
 /// MSB-first bit reader.  No byte stuffing (Olympus does not set `zero_after_ff`).
 /// `WIDE` selects the refill strategy (see [`BitReader::fill`]); it is a const
@@ -403,7 +471,7 @@ impl<'a, const WIDE: bool> BitReader<'a, WIDE> {
             // from_be_bytes puts data[pos] in the MSB; keeping the top `in_bounds`
             // bytes (>> the rest) reproduces the byte loop's MSB-first packing
             // EXACTLY. in_bounds is 1..=7, so the shift is 8..=56 (never 64/UB).
-            let word = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
+            let word = load_be_u64(self.data, self.pos);
             let chunk = word >> ((8 - in_bounds) as u32 * 8);
             self.buf = (self.buf << (in_bounds as u32 * 8)) | chunk;
         } else {
