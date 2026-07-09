@@ -659,6 +659,44 @@ function ensureU16Heap(module, arr) {
     module.HEAPU8.set(new Uint8Array(arr.buffer, arr.byteOffset, bytes), ptr);
     return ptr;
 }
+/**
+ * Encode a packed interleaved RGBA16 image to a standard JXL bitstream.
+ * Pixels must be 4 channels × 2 bytes per channel (little-endian uint16) = 8 bytes/pixel.
+ *
+ * Falls back to CapabilityMissing when the shipped WASM lacks the rgba16 encode
+ * entry point. Use JxlEncoder({ format: "rgba16" }) for the streaming-capable path
+ * which can fall through to the buffered encode path using the same WASM symbol.
+ *
+ * @param pixels  Packed RGBA16 data — Uint16Array, Uint8Array, or ArrayBuffer.
+ * @param width   Image width in pixels.
+ * @param height  Image height in pixels.
+ * @param quality JXL quality 0–100 (default 90). Maps to Butteraugli distance.
+ */
+export async function encodeRgba16(pixels, width, height, quality = 90) {
+    const module = await loadLibjxlModule();
+    if (typeof module._jxl_wasm_encode_rgba16 !== "function") {
+        throw new CapabilityMissing("encodeRgba16 requires a WASM build with multi-format bridge (_jxl_wasm_encode_rgba16)");
+    }
+    const distance = distanceFromQuality(quality);
+    const byteLen = width * height * 4 * 2; // 4 channels × 2 bytes/channel
+    const view = pixels instanceof Uint16Array
+        ? new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength)
+        : copyOrBorrowInput(pixels, false);
+    if (view.byteLength < byteLen) {
+        throw new Error(`encodeRgba16: buffer too small — expected ${byteLen} bytes for ${width}×${height} RGBA16, got ${view.byteLength}`);
+    }
+    const ptr = mallocOrThrow(module, byteLen, "encodeRgba16 pixels");
+    try {
+        module.HEAPU8.set(view.subarray(0, byteLen), ptr);
+        const handle = module._jxl_wasm_encode_rgba16(ptr, width, height, distance, /*effort=*/ 7, /*has_alpha=*/ 1, 
+        /*progressive_dc=*/ 0, /*progressive_ac=*/ 0, /*qprogressive_ac=*/ 0, 
+        /*buffering=*/ 0, /*group_order=*/ 0, /*resampling=*/ 1);
+        return takeBuffer(module, handle, "encodeRgba16").data;
+    }
+    finally {
+        module._free(ptr);
+    }
+}
 async function encodeTileContainer(pixels, width, height, options, format) {
     const module = await loadLibjxlModule();
     const encodeFn = format === "rgba16"
@@ -1760,7 +1798,7 @@ class LibjxlEncoder {
                                 module.HEAPU8[dimsPtr + i * 4 + 3] = (v >>> 24) & 0xff;
                             }
                         }
-                        let handle = module._jxl_wasm_encode_rgba8_with_sidecars(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, dimsPtr, sortedSizes.length);
+                        let handle = module._jxl_wasm_encode_rgba8_with_sidecars(ptr, this.options.width, this.options.height, distance, this.options.effort, hasAlpha, dimsPtr, sortedSizes.length, resampling);
                         while (handle !== 0) {
                             // Capture next pointer before takeBuffer frees handle.
                             const next = module._jxl_wasm_buffer_next(handle);
@@ -1791,7 +1829,7 @@ class LibjxlEncoder {
                     const fmtIndex = this.options.format === "rgbaf32" ? 2 : this.options.format === "rgba16" ? 1 : this.options.format === "rgb8" ? 3 : 0;
                     const encState = module._jxl_wasm_enc_create();
                     try {
-                        const rc = module._jxl_wasm_enc_push_pixels(encState, ptr, this.options.width, this.options.height, distance, this.options.effort, fmtIndex, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering);
+                        const rc = module._jxl_wasm_enc_push_pixels(encState, ptr, this.options.width, this.options.height, distance, this.options.effort, fmtIndex, hasAlpha, progressiveDc, progressiveAc, qProgressiveAc, buffering, groupOrder, resampling);
                         if (rc !== 0)
                             throw new Error(`JXL streaming encode failed (${rc})`);
                         let chunkHandle;
@@ -2771,5 +2809,122 @@ export async function perceptualConstancyApplyBulk(r, g, b, sat, vib, vibZero, o
         targetG.set(g);
     if (targetB !== b)
         targetB.set(b);
+}
+// ---------------------------------------------------------------------------
+// Pyramid helpers: pure-JS area downscale + monolithic RGBA8 pyramid encode.
+//
+// downscale is memory-bandwidth-bound (a trivial box average). A flipflop A/B
+// (docs/outputs/timing tests/flipflop/flipflopjournal.toon, "downscale-js-vs-wasm")
+// measured pure-JS ~2x faster than the WASM downscale_rgba bridge across all
+// sizes, because the wasm-bindgen copy in/out dominates for a JS-resident buffer.
+// So downscale stays in JS; the JXL encode (compute-bound) stays in WASM.
+// ---------------------------------------------------------------------------
+/**
+ * Area-average ("box") downscale of an RGBA8 buffer from src dims to dst dims.
+ * Pure JS — no WASM round-trip (faster than a bridge for this memory-bound op).
+ * dst must be <= src on each axis; equal dims returns a copy.
+ */
+export function downscaleRgba8(rgba, srcW, srcH, dstW, dstH) {
+    if (dstW <= 0 || dstH <= 0)
+        throw new Error(`downscaleRgba8: dst dims must be positive, got ${dstW}x${dstH}`);
+    if (dstW > srcW || dstH > srcH)
+        throw new Error(`downscaleRgba8: dst ${dstW}x${dstH} exceeds src ${srcW}x${srcH}`);
+    const need = srcW * srcH * 4;
+    if (rgba.length < need)
+        throw new Error(`downscaleRgba8: buffer too small: ${rgba.length} < ${need}`);
+    if (dstW === srcW && dstH === srcH)
+        return rgba.slice();
+    const out = new Uint8Array(dstW * dstH * 4);
+    const xRatio = srcW / dstW;
+    const yRatio = srcH / dstH;
+    for (let dy = 0; dy < dstH; dy++) {
+        const sy0 = Math.floor(dy * yRatio);
+        const sy1 = Math.min(srcH, Math.max(sy0 + 1, Math.ceil((dy + 1) * yRatio)));
+        for (let dx = 0; dx < dstW; dx++) {
+            const sx0 = Math.floor(dx * xRatio);
+            const sx1 = Math.min(srcW, Math.max(sx0 + 1, Math.ceil((dx + 1) * xRatio)));
+            let r = 0, g = 0, b = 0, a = 0, n = 0;
+            for (let sy = sy0; sy < sy1; sy++) {
+                let i = (sy * srcW + sx0) * 4;
+                for (let sx = sx0; sx < sx1; sx++) {
+                    r += rgba[i];
+                    g += rgba[i + 1];
+                    b += rgba[i + 2];
+                    a += rgba[i + 3];
+                    i += 4;
+                    n++;
+                }
+            }
+            const o = (dy * dstW + dx) * 4;
+            out[o] = (r / n + 0.5) | 0;
+            out[o + 1] = (g / n + 0.5) | 0;
+            out[o + 2] = (b / n + 0.5) | 0;
+            out[o + 3] = (a / n + 0.5) | 0;
+        }
+    }
+    return out;
+}
+async function encodePlainRgba8(rgba, width, height, distance, effort, hasAlpha) {
+    const eff = Math.min(9, Math.max(1, Math.round(effort)));
+    const encoder = createEncoder({
+        format: "rgba8",
+        width,
+        height,
+        hasAlpha,
+        iccProfile: null,
+        exif: null,
+        xmp: null,
+        distance,
+        quality: null,
+        effort: eff,
+        progressive: false,
+        previewFirst: false,
+        chunked: false,
+    });
+    const chunks = [];
+    const drain = (async () => {
+        for await (const c of encoder.chunks()) {
+            chunks.push(c instanceof Uint8Array ? c : new Uint8Array(c));
+        }
+    })();
+    await encoder.pushPixels(rgba);
+    await encoder.finish();
+    await drain;
+    let total = 0;
+    for (const c of chunks)
+        total += c.byteLength;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+        out.set(c, off);
+        off += c.byteLength;
+    }
+    return out;
+}
+/**
+ * Encode an RGBA8 image into a monolithic pyramid: one whole-frame JXL per sidecar
+ * size (area-downscaled + encoded at its distance) followed by the full level. Levels
+ * are plain JXL (not JXTC tiles) — used by the proxy ladder. The compute-bound encode
+ * runs in WASM; the downscale step is pure-JS ({@link downscaleRgba8}). Sidecars whose
+ * requested long edge is >= the master's are skipped (mirrors the ingest contract).
+ */
+export async function encodeRgba8Pyramid(rgba, width, height, opts) {
+    const hasAlpha = opts.hasAlpha === true;
+    const effort = opts.effort ?? 3;
+    const longEdge = Math.max(width, height);
+    const levels = [];
+    for (let i = 0; i < opts.sidecarSizes.length; i++) {
+        const target = opts.sidecarSizes[i];
+        if (target >= longEdge)
+            continue; // sidecar must be strictly smaller than the master
+        const scale = target / longEdge;
+        const dw = Math.max(1, Math.round(width * scale));
+        const dh = Math.max(1, Math.round(height * scale));
+        const px = downscaleRgba8(rgba, width, height, dw, dh);
+        const dist = opts.sidecarDistances[i] ?? opts.fullDistance;
+        levels.push({ data: await encodePlainRgba8(px, dw, dh, dist, effort, hasAlpha), width: dw, height: dh });
+    }
+    levels.push({ data: await encodePlainRgba8(rgba, width, height, opts.fullDistance, effort, hasAlpha), width, height });
+    return levels;
 }
 //# sourceMappingURL=facade.js.map

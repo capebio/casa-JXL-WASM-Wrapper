@@ -389,13 +389,13 @@ interface LibjxlWasmModule {
     _jxl_wasm_dec_flush_zero_skips?(state: number): number;
     _jxl_wasm_dec_flush_duplicate_skips?(state: number): number;
     _jxl_wasm_dec_flush_image_ms?(state: number): number;
-    _jxl_wasm_encode_rgba8_with_sidecars?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, sidecarDimsPtr: number, numSidecars: number): number;
+    _jxl_wasm_encode_rgba8_with_sidecars?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, sidecarDimsPtr: number, numSidecars: number, resampling: number): number;
     _jxl_wasm_buffer_next?(handle: number): number;
     _jxl_wasm_decode_rgba8_region?(inputPtr: number, inputSize: number, cx: number, cy: number, cw: number, ch: number, downsample: number): number;
     _jxl_wasm_decode_rgba16_region?(inputPtr: number, inputSize: number, cx: number, cy: number, cw: number, ch: number, downsample: number): number;
     _jxl_wasm_decode_rgbaf32_region?(inputPtr: number, inputSize: number, cx: number, cy: number, cw: number, ch: number, downsample: number): number;
     _jxl_wasm_enc_create?(): number;
-    _jxl_wasm_enc_push_pixels?(state: number, pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number): number;
+    _jxl_wasm_enc_push_pixels?(state: number, pixelsPtr: number, width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number, resampling: number): number;
     _jxl_wasm_enc_take_chunk?(state: number): number;
     _jxl_wasm_enc_error?(state: number): number;
     _jxl_wasm_enc_free?(state: number): void;
@@ -600,6 +600,20 @@ export declare function encodeTileContainerRgba16(pixels: ArrayBuffer | Uint8Arr
 }): Promise<Uint8Array>;
 export declare function encodeRgb16Planar(r: Uint16Array | number, g: Uint16Array | number, b: Uint16Array | number, width: number, height: number, distance?: number, effort?: number, progressiveDc?: number, progressiveAc?: number, qProgressiveAc?: number, buffering?: number, groupOrder?: number, resampling?: number): Promise<Uint8Array>;
 /**
+ * Encode a packed interleaved RGBA16 image to a standard JXL bitstream.
+ * Pixels must be 4 channels × 2 bytes per channel (little-endian uint16) = 8 bytes/pixel.
+ *
+ * Falls back to CapabilityMissing when the shipped WASM lacks the rgba16 encode
+ * entry point. Use JxlEncoder({ format: "rgba16" }) for the streaming-capable path
+ * which can fall through to the buffered encode path using the same WASM symbol.
+ *
+ * @param pixels  Packed RGBA16 data — Uint16Array, Uint8Array, or ArrayBuffer.
+ * @param width   Image width in pixels.
+ * @param height  Image height in pixels.
+ * @param quality JXL quality 0–100 (default 90). Maps to Butteraugli distance.
+ */
+export declare function encodeRgba16(pixels: Uint16Array | ArrayBuffer | Uint8Array, width: number, height: number, quality?: number): Promise<Uint8Array>;
+/**
  * Decode a rectangular region from a JXTC tile container produced by
  * encodeTileContainerRgba8. Each overlapping tile is decoded as a standalone
  * JXL bitstream — zero frame-walk overhead. Performance is linear in number
@@ -703,5 +717,34 @@ export declare function getPerceptualConstancySupport(): Promise<PerceptualConst
  * This is the direct JS hook for the lightbox progressive paint path (toggleable, runtime only).
  */
 export declare function perceptualConstancyApplyBulk(r: Float32Array, g: Float32Array, b: Float32Array, sat: number, vib: number, vibZero: boolean, outR?: Float32Array, outG?: Float32Array, outB?: Float32Array): Promise<void>;
+/**
+ * Area-average ("box") downscale of an RGBA8 buffer from src dims to dst dims.
+ * Pure JS — no WASM round-trip (faster than a bridge for this memory-bound op).
+ * dst must be <= src on each axis; equal dims returns a copy.
+ */
+export declare function downscaleRgba8(rgba: Uint8Array, srcW: number, srcH: number, dstW: number, dstH: number): Uint8Array;
+/** Options for {@link encodeRgba8Pyramid}. Mirrors the pyramid-ingest backend contract. */
+export interface Rgba8PyramidOptions {
+    fullDistance: number;
+    sidecarSizes: readonly number[];
+    sidecarDistances: readonly number[];
+    effort: number;
+    hasAlpha?: boolean;
+    resampling?: number;
+}
+/** One produced pyramid level: a whole-frame JXL plus its pixel dimensions. */
+export interface Rgba8PyramidLevel {
+    data: Uint8Array;
+    width: number;
+    height: number;
+}
+/**
+ * Encode an RGBA8 image into a monolithic pyramid: one whole-frame JXL per sidecar
+ * size (area-downscaled + encoded at its distance) followed by the full level. Levels
+ * are plain JXL (not JXTC tiles) — used by the proxy ladder. The compute-bound encode
+ * runs in WASM; the downscale step is pure-JS ({@link downscaleRgba8}). Sidecars whose
+ * requested long edge is >= the master's are skipped (mirrors the ingest contract).
+ */
+export declare function encodeRgba8Pyramid(rgba: Uint8Array, width: number, height: number, opts: Rgba8PyramidOptions): Promise<Rgba8PyramidLevel[]>;
 export {};
 //# sourceMappingURL=facade.d.ts.map
