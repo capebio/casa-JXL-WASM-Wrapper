@@ -8,6 +8,7 @@
 
 import { getContext } from './jxl-browser-context.js';
 import { WorkerMsg } from './worker-message-types.js';
+import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
@@ -97,7 +98,7 @@ const ALPHA_PROGRESSIVE = (() => {
 
 // Build tag the page reports — lets you tell at a glance whether the
 // browser is on the latest version after a refresh.
-const BUILD_TAG = '2026-05-13j / live-lightbox + toggle fixes';
+const BUILD_TAG = '2026-07-09a / LibRaw RAW ingest filters';
 
 // Visible build badge — top-left corner, always present.
 {
@@ -142,6 +143,7 @@ const grid = document.getElementById('grid');
 const drop = document.getElementById('drop');
 const pick = document.getElementById('pick');
 const fileInput = document.getElementById('file-input');
+fileInput.accept = `${RAW_ACCEPT},.exr,.EXR,.tif,.TIF,.tiff,.TIFF`;
 const statusBar = document.getElementById('status');
 const progressEl = document.getElementById('progress');
 const statusText = document.getElementById('status-text');
@@ -1361,7 +1363,7 @@ function makeCard(name) {
             <span class="size"></span>
         </div>
     `;
-    card.querySelector('.name').textContent = name.replace(/\.(orf|cr2|dng)$/i, '');
+    card.querySelector('.name').textContent = stripRawExtension(name);
     card.querySelector('.thumb-select').addEventListener('click', (e) => {
         e.stopPropagation();
         card.classList.toggle('selected');
@@ -1371,7 +1373,7 @@ function makeCard(name) {
     });
     card.querySelector('.thumb-dl-btn').addEventListener('click', (e) => {
         e.stopPropagation();
-        const stem = (getCardState(card)._file?.name || 'image').replace(/\.(orf|cr2|dng)$/i, '');
+        const stem = stripRawExtension(getCardState(card)._file?.name || 'image');
         const cv = card.querySelector('canvas');
         cv.toBlob((blob) => {
             if (!blob) return;
@@ -1987,7 +1989,7 @@ function startConvert(file, existingCard) {
             const opts = currentOptions();
             opts.userRotation = userRotations[file.name] || 0;
             // Carry the filename so the worker's detectFormat can disambiguate
-            // TIFF-magic RAW (orf/dng/cr2) from developed TIFF. Detection still
+            // TIFF-magic RAW from developed TIFF. Detection still
             // works on magic bytes alone if name is absent (e.g. EXR/CR2).
             opts.name = file.name || '';
             // opts.batch (left unset here) opts a task out of the worker's
@@ -2171,26 +2173,26 @@ function refreshStatus() {
 // File / folder ingest
 // ---------------------------------------------------------------------------
 async function handleFileList(fileList) {
-    const orfs = [...fileList].filter(isOrf);
-    if (!orfs.length) return;
+    const inputs = [...fileList].filter(isPipelineInputFile);
+    if (!inputs.length) return;
 
     window.dockSidebar();
 
     resetLookSliders();
-    for (const f of orfs) startConvert(f);
+    for (const f of inputs) startConvert(f);
 }
 
-// Supported pipeline formats: RAW (Olympus ORF, Canon CR2, Adobe/Pixel DNG) plus
-// developed images (EXR, TIFF, JPEG) which the worker decodes via decode_exr/
+// Supported pipeline formats: RAW (native ORF/CR2/DNG + LibRaw browser families)
+// plus developed images (EXR, TIFF, JPEG) which the worker decodes via decode_exr/
 // decode_tiff/decode_jpeg and renders through the same LookRenderer live-edit
 // engine. JPEG additionally supports lossless archival export (transcodeJpegToJxl).
-// (Name kept `isOrf` for the many existing call sites.)
-function isOrf(file) {
-    return /\.(orf|cr2|dng|exr|tif|tiff|jpg|jpeg|jfif)$/i.test(file.name);
+function isPipelineInputFile(file) {
+    const name = file?.name || '';
+    return isRawFilename(name) || /\.(exr|tif|tiff|jpg|jpeg|jfif)$/i.test(name);
 }
 
 // Walk a DataTransfer entry tree (only available on `drop` via
-// `dataTransfer.items[*].webkitGetAsEntry()`).  Returns all ORF files
+// `dataTransfer.items[*].webkitGetAsEntry()`).  Returns all supported pipeline files
 // found at any depth.
 async function gatherFromItems(items) {
     const entries = [];
@@ -2203,7 +2205,7 @@ async function gatherFromItems(items) {
     const out = [];
     async function walk(entry) {
         if (entry.isFile) {
-            await new Promise((res, rej) => entry.file((f) => { if (isOrf(f)) out.push(f); res(); }, rej));
+            await new Promise((res, rej) => entry.file((f) => { if (isPipelineInputFile(f)) out.push(f); res(); }, rej));
         } else if (entry.isDirectory) {
             const reader = entry.createReader();
             let batch;
@@ -2317,7 +2319,7 @@ if (IS_TAURI) {
         if (e.dataTransfer.items && e.dataTransfer.items.length) {
             files = await gatherFromItems(e.dataTransfer.items);
         }
-        if (!files.length) files = [...e.dataTransfer.files].filter(isOrf);
+        if (!files.length) files = [...e.dataTransfer.files].filter(isPipelineInputFile);
         await handleFileList(files);
     });
 }
@@ -3567,7 +3569,7 @@ if (lbToggleJpegBtn) {
 lbDownloadBtn.addEventListener('click', () => {
     const card = cards[lightboxIndex];
     if (!card) return;
-    const stem = (getCardState(card)._file?.name || 'image').replace(/\.(orf|cr2|dng)$/i, '');
+    const stem = stripRawExtension(getCardState(card)._file?.name || 'image');
     lightboxCanvas.toBlob((blob) => {
         if (!blob) return;
         const url = URL.createObjectURL(blob);
