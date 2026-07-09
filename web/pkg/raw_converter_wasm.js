@@ -2431,6 +2431,44 @@ export function process_orf_with_look(data, output_flags, look) {
 }
 
 /**
+ * @param {Uint16Array} raw
+ * @param {number} width
+ * @param {number} height
+ * @param {number} cfa_phase
+ * @param {number} black
+ * @param {number} white
+ * @param {number} wb_r
+ * @param {number} wb_b
+ * @param {number} orientation
+ * @param {Float32Array} color_matrix_flat
+ * @param {number} output_flags
+ * @param {number} exposure_ev
+ * @param {number} contrast
+ * @param {number} highlights
+ * @param {number} shadows
+ * @param {number} whites
+ * @param {number} blacks
+ * @param {number} saturation
+ * @param {number} vibrance
+ * @param {number} temp
+ * @param {number} tint
+ * @param {number} texture
+ * @param {number} clarity
+ * @returns {ProcessResult}
+ */
+export function process_raw_mosaic_with_flags(raw, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity) {
+    const ptr0 = passArray16ToWasm0(raw, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.process_raw_mosaic_with_flags(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
  * S6 — decode only a rectangular region of an Olympus ORF file.
  *
  * Parses + decompresses + MHC-demosaics the ORF to full-resolution, pre-tonemapped RGB16

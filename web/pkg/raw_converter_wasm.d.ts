@@ -696,6 +696,8 @@ export function process_orf_with_flags(data: Uint8Array, output_flags: number, e
  */
 export function process_orf_with_look(data: Uint8Array, output_flags: number, look: any): ProcessResult;
 
+export function process_raw_mosaic_with_flags(raw: Uint16Array, width: number, height: number, cfa_phase: number, black: number, white: number, wb_r: number, wb_b: number, orientation: number, color_matrix_flat: Float32Array, output_flags: number, exposure_ev: number, contrast: number, highlights: number, shadows: number, whites: number, blacks: number, saturation: number, vibrance: number, temp: number, tint: number, texture: number, clarity: number): ProcessResult;
+
 /**
  * S6 — decode only a rectangular region of an Olympus ORF file.
  *
@@ -902,6 +904,7 @@ export interface InitOutput {
     readonly process_orf: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number, number];
     readonly process_orf_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => [number, number, number];
     readonly process_orf_with_look: (a: number, b: number, c: number, d: any) => [number, number, number];
+    readonly process_raw_mosaic_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => [number, number, number];
     readonly process_region: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly processresult_color_matrix_used: (a: number) => [number, number];
     readonly processresult_datetime: (a: number) => [number, number];

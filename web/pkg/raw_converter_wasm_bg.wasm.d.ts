@@ -154,6 +154,7 @@ export const process_dng_with_look: (a: number, b: number, c: number, d: any) =>
 export const process_orf: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number, number];
 export const process_orf_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => [number, number, number];
 export const process_orf_with_look: (a: number, b: number, c: number, d: any) => [number, number, number];
+export const process_raw_mosaic_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => [number, number, number];
 export const process_region: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
 export const processresult_color_matrix_used: (a: number) => [number, number];
 export const processresult_datetime: (a: number) => [number, number];
