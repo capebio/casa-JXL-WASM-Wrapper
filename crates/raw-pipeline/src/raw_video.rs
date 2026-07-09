@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 
 use crate::casa_video::{
-    encode_casv_video, encode_casv_video_streaming, CasaVideoOptions, SkipMode, VideoError,
-    VideoFrameSource, VideoRate,
+    encode_casv_video, encode_casv_video_streaming, CasaVideoOptions, ConcurrentDecode, SceneCut,
+    SkipMode, VideoError, VideoFrameSource, VideoRate,
 };
 use crate::casabio_encode::box_downscale_rgb8;
 use crate::decompress::RawRowSource;
@@ -521,6 +521,31 @@ impl VideoFrameSource for RawVideoSource {
     }
     fn force_iframe(&self) -> bool {
         self.pending_force_iframe
+    }
+    /// K4/D8: RAW time-lapse is decode-bound (a full decompress+demosaic+tone photo
+    /// pipeline per frame ≫ the tiny P-frame encode), and each RAW file is an
+    /// independent decode — so expose concurrent indexed decode so the streaming
+    /// encoder parallelises decode across frames while encoding in order. The closure
+    /// is exactly `decode_frame_downscaled` (the byte-identical per-frame work
+    /// `next_frame_into` performs, minus the order-dependent scene-cut bookkeeping),
+    /// so a pooled decode is byte-identical to the serial drain. Scene-cut is handed
+    /// to the ordered consumer via [`SceneCut`] (the pool never computes it).
+    fn concurrent_decode(&self) -> Option<ConcurrentDecode> {
+        let files = std::sync::Arc::new(self.files.clone());
+        let look = self.look;
+        let nr = self.nr_strength;
+        let (dw, dh) = (self.dw, self.dh);
+        let decode = std::sync::Arc::new(move |i: usize| -> Result<Vec<u8>, VideoError> {
+            decode_frame_downscaled(&files[i], &look, nr, dw, dh)
+        });
+        Some(ConcurrentDecode {
+            frame_count: self.files.len(),
+            decode,
+            scene_cut: self.scene_cut.map(|thresh| SceneCut {
+                thresh,
+                luma_mean: luma_mean_rgb8,
+            }),
+        })
     }
 }
 

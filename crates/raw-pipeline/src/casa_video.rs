@@ -771,6 +771,44 @@ pub fn encode_casv_video(
     Ok(out)
 }
 
+/// Scene-cut recipe carried alongside a [`ConcurrentDecode`] so the ORDERED encode
+/// consumer can reproduce a stateful `force_iframe()` decision itself — the decoder
+/// pool must NOT compute it (the luma-mean delta is order-dependent: it compares each
+/// frame against the *previous delivered* frame). See [`ConcurrentDecode`].
+pub struct SceneCut {
+    /// Luma-mean delta threshold (0..255). A frame forces an I-frame when
+    /// `|luma_mean(frame_i) − luma_mean(frame_{i-1})| > thresh` (never on frame 0).
+    pub thresh: f32,
+    /// Luma-mean of one RGB8 frame — the SAME function the serial source uses, so the
+    /// reproduced decision is byte-identical. Must be pure (no per-frame state).
+    pub luma_mean: fn(&[u8]) -> f32,
+}
+
+/// A source's optional capability to decode any frame by index, independently and
+/// concurrently. When present, the streaming encoder replaces its depth-1 producer
+/// with a K-way decoder pool (K ≈ physical cores) whose results are delivered to the
+/// encode consumer IN INDEX ORDER — so decode-bound sources (RAW time-lapse: full
+/// decompress+demosaic+tone per frame) parallelise across frames while the codestream
+/// stays byte-identical (encode + rate-control + admission still run strictly in
+/// index order on the single consumer). A semaphore caps in-flight decodes to K, so
+/// peak memory ≈ K frames, NOT all N.
+///
+/// `decode(i)` MUST be pure and independent of every other frame — byte-identical to
+/// what the serial `next_frame_into` produces at index `i`. `scene_cut` (if any)
+/// lets the ordered consumer reproduce the source's `force_iframe()` without the pool
+/// needing frame order.
+pub struct ConcurrentDecode {
+    /// Number of frames in the sequence.
+    pub frame_count: usize,
+    /// Decode frame `i` to its final downscaled RGB8 target buffer (`len == w*h*3`),
+    /// independent of any other frame. `Send + Sync` so the pool can call it from any
+    /// worker thread.
+    pub decode: std::sync::Arc<dyn Fn(usize) -> Result<Vec<u8>, VideoError> + Send + Sync>,
+    /// If `Some`, the ordered consumer computes each frame's `force_iframe` from this
+    /// recipe (reproducing the serial source's scene-cut). `None` = never force.
+    pub scene_cut: Option<SceneCut>,
+}
+
 /// A pull source of RGB8 video frames (from disk, a decode pipeline, a camera…).
 /// Frames are pulled one at a time so the whole video need not be resident.
 pub trait VideoFrameSource {
@@ -798,6 +836,14 @@ pub trait VideoFrameSource {
     /// safe and needs no GOP-counter rework.
     fn force_iframe(&self) -> bool {
         false
+    }
+    /// Optional capability: decode any frame by index, concurrently and independently.
+    /// `None` (default) means the source is sequential-only (e.g. an ffmpeg pipe) and
+    /// the streaming encoder keeps its depth-1 single-producer overlap. `Some` unlocks
+    /// the K-way ordered decoder pool — see [`ConcurrentDecode`]. Only consulted on the
+    /// overlap path; the serial A/B baseline always uses `next_frame_into`.
+    fn concurrent_decode(&self) -> Option<ConcurrentDecode> {
+        None
     }
 }
 
@@ -1450,6 +1496,20 @@ fn stream_encode_frames(
         return Ok(idx);
     }
 
+    // ── CONCURRENT-DECODE POOL (default when the source supports indexed decode). ──
+    // Decode-bound sources (RAW time-lapse: full decompress+demosaic+tone per frame,
+    // ~475 ms vs a ~62 ms P-frame encode) leave the depth-1 producer starving the
+    // encode consumer: a single decoder can't outrun a 7.6:1 decode:encode ratio. A
+    // POOL of K ≈ physical-core decoder threads decodes frames CONCURRENTLY, delivered
+    // to the encode consumer IN INDEX ORDER via a reorder buffer, with a semaphore
+    // capping in-flight frames to K (peak ≈ K frames, not all N). The consumer keeps
+    // all StreamCtx/RateState/emit state and encodes strictly in index order — so the
+    // codestream is byte-identical to the serial loop, only decode SCHEDULING changes.
+    // Scene-cut/force_iframe is reproduced here (ordered), never in the pool.
+    if let Some(cap) = src.concurrent_decode() {
+        return stream_encode_pooled(cap, expected, gop, opts, &mut ctx, &mut rc, on_frame, emit);
+    }
+
     // ── OVERLAPPED scheduler (default): decode(N+1) ∥ encode(N). ─────────────────
     std::thread::scope(|scope| -> Result<usize, VideoError> {
         // Depth-1 bounded channel: the producer may be at most one frame ahead, so the
@@ -1497,6 +1557,176 @@ fn stream_encode_frames(
         }
         Ok(idx)
     })
+}
+
+/// Number of concurrent decoder threads for the [`ConcurrentDecode`] streaming pool.
+/// Defaults to physical/logical cores (RAW decode is one full photo pipeline per frame
+/// — CPU-bound and embarrassingly parallel across frames, so K = cores saturates the
+/// lanes). `CASV_DECODE_THREADS` overrides for A/B (`1` = single decoder, matching the
+/// depth-1 producer's throughput). Independent of `CASV_ENC_THREADS` (the in-frame
+/// libjxl I-frame runner) — those are orthogonal parallelism axes.
+fn resolve_decode_threads() -> usize {
+    if let Ok(v) = std::env::var("CASV_DECODE_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n >= 1 {
+                return n;
+            }
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Concurrent-decode scheduler for the streaming encoder. A pool of `K` worker threads
+/// decodes frames by index CONCURRENTLY via `cap.decode`; results land in a shared
+/// reorder buffer and the single consumer (this thread) encodes them STRICTLY IN INDEX
+/// ORDER — byte-identical to the serial loop. A permit budget of `K` caps in-flight
+/// decodes (workers block before claiming work until the consumer frees a slot by
+/// consuming a frame), so peak memory ≈ `K` decoded frames, not all `N`.
+///
+/// **Scene-cut decoupling.** The pool never computes `force_iframe` (the luma-mean
+/// delta is order-dependent). The ordered consumer reproduces it here from
+/// `cap.scene_cut`, comparing each delivered frame's luma-mean against the previous
+/// delivered frame's — exactly the serial source's logic — so the I-frame schedule
+/// (and therefore the codestream) is identical. GOP / rate-control / tile-admission /
+/// encode all run in index order on the consumer, unchanged.
+#[allow(clippy::too_many_arguments)]
+fn stream_encode_pooled(
+    cap: ConcurrentDecode,
+    expected: usize,
+    gop: usize,
+    opts: &CasaVideoOptions,
+    ctx: &mut StreamCtx,
+    rc: &mut Option<RateState>,
+    on_frame: &mut dyn FnMut(usize),
+    emit: &mut dyn FnMut(u32, &[u8]) -> Result<(), VideoError>,
+) -> Result<usize, VideoError> {
+    use std::sync::{Condvar, Mutex};
+
+    let n = cap.frame_count;
+    if n == 0 {
+        return Ok(0);
+    }
+    let k = resolve_decode_threads().min(n).max(1);
+
+    // Shared reorder buffer + coordination. `slots[i]` holds frame `i`'s decode result
+    // once a worker finishes it; the consumer takes them in order. `next_claim` is the
+    // next index a worker will decode (monotonic work distribution). `in_flight` is the
+    // count of frames decoded-or-decoding but not yet consumed; workers wait until it
+    // drops below `k` before claiming, bounding peak memory to ~k frames.
+    struct Shared {
+        slots: Vec<Option<Result<Vec<u8>, VideoError>>>,
+        next_claim: usize,
+        in_flight: usize,
+        err: bool, // a decode failed → stop claiming new work
+    }
+    let shared = Mutex::new(Shared {
+        slots: (0..n).map(|_| None).collect(),
+        next_claim: 0,
+        in_flight: 0,
+        err: false,
+    });
+    // Signalled when: a slot is filled (wake consumer), or a slot is consumed (wake a
+    // worker waiting on the in-flight budget). One condvar keeps it simple; spurious
+    // wakeups are handled by re-checking predicates in the loops.
+    let cv = Condvar::new();
+
+    let decode = cap.decode;
+
+    let result = std::thread::scope(|scope| -> Result<usize, VideoError> {
+        // ── DECODER POOL: K workers, each loops claiming the next index under the
+        // in-flight budget, decoding it (outside the lock), and depositing the result.
+        for _ in 0..k {
+            let shared = &shared;
+            let cv = &cv;
+            let decode = &decode;
+            scope.spawn(move || {
+                loop {
+                    // Claim the next index, waiting until the in-flight budget allows it.
+                    let idx = {
+                        let mut g = shared.lock().unwrap();
+                        loop {
+                            if g.err || g.next_claim >= n {
+                                return; // done or aborted
+                            }
+                            if g.in_flight < k {
+                                let i = g.next_claim;
+                                g.next_claim += 1;
+                                g.in_flight += 1;
+                                break i;
+                            }
+                            g = cv.wait(g).unwrap();
+                        }
+                    };
+                    // Decode OUTSIDE the lock (the expensive, parallel part).
+                    let r = (decode)(idx);
+                    let is_err = r.is_err();
+                    {
+                        let mut g = shared.lock().unwrap();
+                        g.slots[idx] = Some(r);
+                        if is_err {
+                            g.err = true;
+                        }
+                        cv.notify_all(); // wake the consumer (slot ready) + workers
+                    }
+                    if is_err {
+                        return;
+                    }
+                }
+            });
+        }
+
+        // ── CONSUMER: take frame `idx` in order, reproduce force_iframe, encode.
+        let mut payload = Vec::new();
+        let mut prev_src: Vec<u8> = Vec::new();
+        let mut prev_luma: Option<f32> = None;
+        let mut idx = 0usize;
+        while idx < n {
+            // Wait for slot `idx` to be filled by some worker.
+            let cur = {
+                let mut g = shared.lock().unwrap();
+                loop {
+                    if let Some(slot) = g.slots[idx].take() {
+                        // Free a budget permit so a blocked worker can claim more work.
+                        g.in_flight -= 1;
+                        cv.notify_all();
+                        break slot?; // propagate a decode error (aborts the scope)
+                    }
+                    g = cv.wait(g).unwrap();
+                }
+            };
+            if cur.len() != expected {
+                return Err(VideoError::FrameSize {
+                    idx,
+                    expected,
+                    got: cur.len(),
+                });
+            }
+            // Reproduce the serial source's scene-cut EXACTLY (ordered, on the delivered
+            // frame): force an I-frame when the luma-mean delta vs the previous frame
+            // exceeds the threshold (never on frame 0). Identical to
+            // `RawVideoSource::next_frame_into`'s `pending_force_iframe`.
+            let force_i = match &cap.scene_cut {
+                Some(sc) => {
+                    let m = (sc.luma_mean)(&cur);
+                    let f = prev_luma.is_some_and(|p| (p - m).abs() > sc.thresh);
+                    prev_luma = Some(m);
+                    f
+                }
+                None => false,
+            };
+            let flags = stream_encode_one(
+                &cur, &prev_src, force_i, idx, gop, opts, ctx, rc, &mut payload,
+            )?;
+            emit(flags, &payload)?;
+            idx += 1;
+            on_frame(idx);
+            prev_src = cur; // P-frame reference for the next frame
+        }
+        Ok(idx)
+    });
+    result
 }
 
 /// **Streaming** lossy-tier encode (header-indexed, buffered output): pulls frames
