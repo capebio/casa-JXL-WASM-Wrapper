@@ -139,6 +139,7 @@ const lbZoomIn = lightbox.querySelector('.lb-zoom-in');
 const lbZoomOut = lightbox.querySelector('.lb-zoom-out');
 const lbZoomReset = lightbox.querySelector('.lb-zoom-reset');
 const lbDownloadBtn = lightbox.querySelector('.lb-download-btn');
+const lbArchivalBtn = lightbox.querySelector('.lb-archival-btn');
 const lbPreviewBadge = lightbox.querySelector('.lb-preview-badge');
 const lbLoadingBadge = lightbox.querySelector('.lb-loading-badge');
 const lbToggleJpegBtn = lightbox.querySelector('.lb-toggle-jpeg');
@@ -2160,11 +2161,12 @@ async function handleFileList(fileList) {
 }
 
 // Supported pipeline formats: RAW (Olympus ORF, Canon CR2, Adobe/Pixel DNG) plus
-// developed high-bit images (EXR, TIFF) which the worker decodes via decode_exr/
-// decode_tiff and renders through the same LookRenderer live-edit engine. (Name
-// kept `isOrf` for the many existing call sites.)
+// developed images (EXR, TIFF, JPEG) which the worker decodes via decode_exr/
+// decode_tiff/decode_jpeg and renders through the same LookRenderer live-edit
+// engine. JPEG additionally supports lossless archival export (transcodeJpegToJxl).
+// (Name kept `isOrf` for the many existing call sites.)
 function isOrf(file) {
-    return /\.(orf|cr2|dng|exr|tif|tiff)$/i.test(file.name);
+    return /\.(orf|cr2|dng|exr|tif|tiff|jpg|jpeg|jfif)$/i.test(file.name);
 }
 
 // Walk a DataTransfer entry tree (only available on `drop` via
@@ -2831,6 +2833,12 @@ function updateToggleButtonState(card) {
         lbToggleJpegBtn.setAttribute('data-mode', mode);
         // Legacy class kept for any external CSS hooks.
         lbToggleJpegBtn.classList.toggle('showing-jpeg', mode === 'jpeg');
+    }
+    // Lossless archival JXL export is only meaningful for JPEG sources — show the
+    // button only when the card's source file is a JPEG.
+    if (lbArchivalBtn) {
+        const isJpegCard = /\.(jpg|jpeg|jfif)$/i.test(getCardState(card)?._file?.name || '');
+        lbArchivalBtn.hidden = !isJpegCard;
     }
 }
 
@@ -3548,6 +3556,37 @@ lbDownloadBtn.addEventListener('click', () => {
         setTimeout(() => URL.revokeObjectURL(url), 30000);
     }, 'image/jpeg', 0.95);
 });
+
+// Archival (lossless) export for JPEG cards: transcode the ORIGINAL jpeg bytes
+// to a lossless JXL (bit-exact recoverable, ~20% smaller), independent of any
+// edits. Edits live in the sidecar; this ships the untouched original as JXL.
+async function exportArchivalJxl(card) {
+    const file = getCardState(card)?._file;
+    if (!file || typeof file.arrayBuffer !== 'function') return; // browser File only (Tauri path is a follow-up)
+    const name = file.name || 'image';
+    if (!/\.(jpg|jpeg|jfif)$/i.test(name)) return;
+    let transcodeJpegToJxl;
+    try {
+        ({ transcodeJpegToJxl } = await import('../packages/jxl-wasm/dist/facade.js'));
+    } catch (e) { console.error('archival: facade import failed', e); return; }
+    let jxl;
+    try {
+        jxl = await transcodeJpegToJxl(new Uint8Array(await file.arrayBuffer()));
+    } catch (e) { console.error('archival transcode failed', e); return; }
+    const stem = name.replace(/\.(jpg|jpeg|jfif)$/i, '');
+    const url = URL.createObjectURL(new Blob([jxl], { type: 'image/jxl' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = stem + '.archival.jxl'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+window.exportArchivalJxl = exportArchivalJxl;
+if (lbArchivalBtn) {
+    lbArchivalBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const card = cards[lightboxIndex];
+        if (card) exportArchivalJxl(card);
+    });
+}
 
 // Straighten slider (Phase 2) — immediate visual feedback using the geometry + render path
 if (lbStraighten) {

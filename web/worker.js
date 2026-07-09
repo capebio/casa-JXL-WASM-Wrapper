@@ -68,7 +68,7 @@ async function loadWasm() {
     init = rawWasm.default;
     ({ process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, LookRenderer, rotate_rgb8,
        process_orf_with_look, process_dng_with_look, process_cr2_with_look,
-       decode_exr, decode_tiff } = rawWasm);
+       decode_exr, decode_tiff, decode_jpeg } = rawWasm);
 }
 
 // Route a RAW buffer to its WASM decoder via the SINGLE-SOURCE sniffer in
@@ -357,11 +357,13 @@ function makeImageLiveState(rgb16Bytes, w, h) {
     return { renderer, nativeW: w, nativeH: h, outW: w, outH: h, orientation: 1, wbR: NaN, wbB: NaN };
 }
 
-// Decode + emit thumb/lightbox/live-edit/encode for an EXR or TIFF file.
+// Decode + emit thumb/lightbox/live-edit/encode for an EXR, TIFF or JPEG file.
 // Posts the SAME message shapes as the RAW path so main.js needs no new handler.
 function processImageFormat(id, bytes, opts, look, route) {
     const pT0 = performance.now();
-    const dec = route === 'exr' ? decode_exr(bytes) : decode_tiff(bytes);
+    const dec = route === 'exr' ? decode_exr(bytes)
+              : route === 'jpeg' ? decode_jpeg(bytes)
+              : decode_tiff(bytes);
     try {
         const w = dec.width, h = dec.height;
         const bitDepth = dec.bit_depth;
@@ -564,10 +566,10 @@ self.addEventListener('message', async (ev) => {
         const look = opts.look || {};
 
         // Multi-format routing by magic bytes (+ optional name). RAW keeps its
-        // exact existing path; EXR/TIFF take the image-format path; sdr/jxl/
-        // unknown are rejected here rather than misrouted to the ORF decoder.
+        // exact existing path; EXR/TIFF/JPEG take the developed-image path; sdr/
+        // jxl/unknown are rejected here rather than misrouted to the ORF decoder.
         const route = detectFormat(bytes, opts.name || '');
-        if (route === 'exr' || route === 'tiff') {
+        if (route === 'exr' || route === 'tiff' || route === 'jpeg') {
             processImageFormat(id, bytes, opts, look, route);
             return;
         }
@@ -575,7 +577,7 @@ self.addEventListener('message', async (ev) => {
             self.postMessage({
                 id, type: WorkerMsg.ERROR,
                 error: route === 'sdr'
-                    ? 'Standard images (PNG/JPEG/etc.) use the browser decode path, not the RAW pipeline.'
+                    ? 'Standard images (PNG/GIF/WebP/etc.) use the browser decode path, not the RAW pipeline.'
                     : route === 'jxl'
                         ? 'JXL files use the JXL decode path, not the RAW pipeline.'
                         : `Unsupported or unrecognized file format (${opts.name || 'unknown'}).`,

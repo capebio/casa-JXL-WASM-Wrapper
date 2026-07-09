@@ -22,7 +22,6 @@ import { basename, dirname, extname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 import { Worker as NodeWorker } from "node:worker_threads";
-import sharp from "sharp";
 import { buildGraphAggregateHtml, buildGraphHistory } from "./benchmark/standard-multifile-history-graph.mjs";
 import { consolidateBenchmarkHistory } from "./benchmark/benchmark-history-conversion.mjs";
 import { assessSeamComparison } from "./benchmark/seam-comparison-threshold.mjs";
@@ -60,6 +59,7 @@ import initRaw, {
   process_cr2_with_flags,
   process_dng_with_flags,
   rgb_to_rgba,
+  decode_jpeg,
 } from "./pkg/raw_converter_wasm.js";
 
 const {
@@ -71,6 +71,9 @@ const {
   setForcedTier,
   encodeRgb16Planar
 } = await import("./packages/jxl-wasm/dist/index.js");
+
+// Lossless archival JPEG->JXL transcode lives in the facade (not re-exported by index).
+const { transcodeJpegToJxl, extractJpegReconstructionFromJxl } = await import("./packages/jxl-wasm/dist/facade.js");
 
 await initRaw({ module_or_path: readFileSync(new URL("./pkg/raw_converter_wasm_bg.wasm", import.meta.url)) });
 
@@ -361,13 +364,32 @@ async function main() {
     const heapBefore = process.memoryUsage().heapUsed;
     const tRawStart = performance.now();
     let rgb, srcW, srcH;
+    let jpegTranscodeMs = null, jpegArchivalRatio = null, jpegReversible = null;
     let rawDecompress = 0, rawDemosaic = 0, rawTonemap = 0, rawOrient = 0;
     let previewDem = 0, previewDown = 0, fastPrev = false;
     let lbPack = null, lbWw = 0, lbHh = 0, thPack = null, thWw = 0, thHh = 0;
 
-    if (ext === ".jpg" || ext === ".jpeg") {
-      const { data, info } = await sharp(resolvedPath).raw().toBuffer({ resolveWithObject: true });
-      rgb = data; srcW = info.width; srcH = info.height;
+    if (ext === ".jpg" || ext === ".jpeg" || ext === ".jfif") {
+      // DEVELOPED/LOSSY pathway: decode via the SAME wasm decoder the app uses
+      // (decode_jpeg), dropping the sharp Node-native dependency on the JPEG path.
+      const dec = decode_jpeg(raw);
+      const rgba = dec.take_rgba8();          // RGBA8
+      srcW = dec.width; srcH = dec.height; dec.free();
+      rgb = new Uint8Array(srcW * srcH * 3);  // RGBA8 -> RGB8 (harness expects rgb)
+      for (let i = 0, o = 0; i < rgba.length; i += 4, o += 3) {
+        rgb[o] = rgba[i]; rgb[o + 1] = rgba[i + 1]; rgb[o + 2] = rgba[i + 2];
+      }
+      // LOSSLESS/ARCHIVAL pathway: measure the JPEG->JXL transcode + size ratio.
+      // In-app bit-exact reconstruction (extract) is JXTC-only today, so it
+      // returns null for the standard-JXL transcode; the JXL is still losslessly
+      // reconstructable via `djxl --jpeg` (see docs plan C1 Step 3a).
+      const tT0 = performance.now();
+      const archivalJxl = await transcodeJpegToJxl(raw);
+      jpegTranscodeMs = performance.now() - tT0;
+      jpegArchivalRatio = archivalJxl.byteLength / raw.byteLength;
+      const recovered = extractJpegReconstructionFromJxl(archivalJxl);
+      jpegReversible = recovered ? (Buffer.compare(Buffer.from(recovered), Buffer.from(raw)) === 0) : null;
+      console.log(`  JPEG archival: transcode=${Math.round(jpegTranscodeMs)}ms ratio=${jpegArchivalRatio.toFixed(3)} reconstruct=${jpegReversible === null ? 'via djxl (in-app bridge pending)' : jpegReversible}`);
     } else {
       let decoded;
       // Use preview bits only for ORF (fast planar + packed implemented there).
@@ -406,7 +428,7 @@ async function main() {
     const scaleMs = performance.now() - tScaleStart;
 
     console.log(`  Loaded ${basename(resolvedPath)}: decode=${Math.round(rawMs)}ms scale=${Math.round(scaleMs)}ms (${tgtW}x${tgtH}) heap_delta=${rawHeapDeltaMb}MB preview_demosaic=${Math.round(previewDem)} down=${Math.round(previewDown)} fast=${fastPrev}`);
-    loadedFiles.push({ file: basename(resolvedPath), rgba, tgtW, tgtH, rawMs, scaleMs, rawDecompress, rawDemosaic, rawTonemap, rawOrient, previewDem, previewDown, fastPrev, lbPack, lbW: lbWw, lbH: lbHh, thPack, thW: thWw, thH: thHh });
+    loadedFiles.push({ file: basename(resolvedPath), rgba, tgtW, tgtH, rawMs, scaleMs, rawDecompress, rawDemosaic, rawTonemap, rawOrient, previewDem, previewDown, fastPrev, lbPack, lbW: lbWw, lbH: lbHh, thPack, thW: thWw, thH: thHh, jpegTranscodeMs, jpegArchivalRatio, jpegReversible });
   }
   console.log("");
 

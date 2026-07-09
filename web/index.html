@@ -98,7 +98,7 @@
         <div class="file-sidebar-panel" id="sidebar-panel">
             <div class="resize-handle" id="files-resize"></div>
             <section id="drop" class="drop-target">
-                <input type="file" id="file-input" multiple accept=".orf,.ORF,.cr2,.CR2,.dng,.DNG" class="visually-hidden" />
+                <input type="file" id="file-input" multiple accept=".orf,.ORF,.cr2,.CR2,.dng,.DNG,.jpg,.jpeg,.jfif,.JPG,.JPEG,.JFIF" class="visually-hidden" />
                 <button id="pick">Pick image files</button>
                 <p class="hint">or drop files / folders here</p>
             </section>
@@ -336,6 +336,8 @@
             <button class="lb-btn lb-crop-cancel" id="lb-crop-cancel" hidden title="Discard (Esc)">Cancel</button>
             <span class="lb-sep"></span>
             <button class="lb-download-btn" aria-label="Download full-res JPEG">⬇ JPEG</button>
+            <span class="lb-sep"></span>
+            <button class="lb-download-btn lb-archival-btn" aria-label="Export lossless archival JXL (JPEG sources only)" title="Lossless archival JXL — bit-exact original JPEG, ~20% smaller" hidden>⬇ Archival JXL</button>
             <span class="lb-sep"></span>
             <!-- Straighten control (Phase 2) - sets corrective angle + triggers largest-rect crop -->
             <label style="display:flex;align-items:center;gap:4px;font-size:10px;color:#9ca3af;margin-left:4px">
