@@ -45,7 +45,7 @@ async function imgMean(url){ const blob=await (await fetch(url)).blob(); const b
   try {
     await initRaw();
     log('crossOriginIsolated=' + self.crossOriginIsolated);
-    if (typeof initThreadPool === 'function' && self.crossOriginIsolated) { try { await initThreadPool(navigator.hardwareConcurrency); log('threadpool='+navigator.hardwareConcurrency); } catch(e){ log('threadpool failed: '+e.message); } }
+    if (typeof initThreadPool === 'function' && self.crossOriginIsolated) { try { await Promise.race([initThreadPool(navigator.hardwareConcurrency), new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),20000))]); log('threadpool='+navigator.hardwareConcurrency); } catch(e){ log('threadpool failed: '+e.message); } }
     const orf = new Uint8Array(await (await fetch('/__file?which=raw')).arrayBuffer());
     log('raw bytes='+orf.length);
     const t0 = performance.now();
@@ -74,7 +74,7 @@ function startServer() {
     const full = normalize(join(REPO, decodeURIComponent(u.pathname).replace(/^\/+/, "")));
     const rel = relative(REPO, full);
     if (rel.startsWith("..") || rel.split(sep).includes("..")) { res.writeHead(403, HEADERS("text/plain")); res.end("no"); return; }
-    try { res.writeHead(200, HEADERS(MIME.get(extname(full).toLowerCase()) ?? "application/octet-stream")); res.end(readFileSync(full)); }
+    try { const body = readFileSync(full); res.writeHead(200, HEADERS(MIME.get(extname(full).toLowerCase()) ?? "application/octet-stream")); res.end(body); }
     catch { res.writeHead(404, HEADERS("text/plain")); res.end("404 " + u.pathname); }
   });
   return new Promise((r) => server.listen(0, "127.0.0.1", () => r({ server, port: server.address().port })));
