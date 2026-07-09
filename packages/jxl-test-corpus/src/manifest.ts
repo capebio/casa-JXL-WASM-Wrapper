@@ -23,7 +23,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['basic', 'srgb'],
-      sha256: '7806e18bdc3ac323c0f602204fde06544dcc57c2ecbacdcf251dba7bcecbe1cf',
+      sha256: 'c1dbe5e9bbf2bc2467e9d19ca26bbb2b22c92cec937483356e8d0e4758c5ad72',
       description: 'A basic 8-bit sRGB gradient without alpha.'
     },
     {
@@ -40,7 +40,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['alpha'],
-      sha256: 'ecf549be4e9ee30ed06526c274752fea23262e7027efc239ad792b8e477a0d05',
+      sha256: 'f12dd729bbac0a5920283b521857f42822e4a42793325b990150314a85a6e2a5',
       description: 'An 8-bit sRGB gradient with a progressive alpha channel.'
     },
     {
@@ -57,10 +57,10 @@ export const manifest: CorpusManifest = {
       hasXmp: true,
       expectedPass: true,
       tags: ['scientific', '16bit', 'icc', 'exif'],
-      sha256: 'a66c63e886967da02c2ee8bc0e1bad84583204b771697e25d53faaf27928b08b',
+      sha256: '047f20b29564a646f84f108954796a787bf3418509c2988c4f4fa7c79801d7f4',
       attribution: 'Casabio-Internal',
       occurrenceId: 'urn:lsid:casabio.org:occurrence:12345',
-      description: 'A 16-bit wide-gamut Adobe RGB calibration image with embedded mock ICC, Exif, and Xmp metadata.'
+      description: 'A 16-bit wide-gamut calibration image with an embedded sRGB ICC profile plus mock Exif and Xmp metadata.'
     },
     {
       id: 'truncated-header',
@@ -75,7 +75,7 @@ export const manifest: CorpusManifest = {
       expectedPass: false,
       expectedError: 'JXL_DEC_ERROR', // expected fail substring
       tags: ['truncated', 'malformed'],
-      sha256: '251e78b8141d77bacb5f31b15f797f70373667f49562f0b1e57ca62a6dc109e8',
+      sha256: 'bb51164afe84d75195791fa46c7eae51589185d93d429c5afe63405e2f320f29',
       description: 'A malformed JXL file truncated at byte 32 whose headers and dimensions are unknowable.'
     },
     {
@@ -92,7 +92,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['gray-ramp', 'colour-engine', '16bit'],
-      sha256: 'c73a4414b7f593e01d394398796a3e51f9b454d3302297404666d3bb064724fb',
+      sha256: '8946473bcdcfea5950a800f16950be5310644be9eeff9eb38a55a2951bbc7bd9',
       description: 'A 16-bit neutral-gray axis calibration ramp for testing non-Riemannian colour engine stability.'
     },
     {
@@ -109,7 +109,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['gamut-green', 'colour-engine', '16bit'],
-      sha256: '5f0e5659c9940853c7c11031badf6fd7e5948acaed87b2bc9cf449b891e77738',
+      sha256: '3f4ecaa53cc9b570fcd1fab041d7389e698ba982c8af9f64800849089d5dcb34',
       description: 'A saturated 16-bit green patch for profiling Molchanov residual density transform boundaries.'
     },
     {
@@ -124,7 +124,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['progressive', 'dc-only', 'ar-latency'],
-      sha256: '2dc0ce4bdf013f331eaad128b8c72038c6734e0d78355ab20b246151bda45ae2',
+      sha256: '2f26cfaedb20954b38801fccb208a905da26887158fa751c2734363330cc74c4',
       description: 'A progressive JXL bitstream truncated after the DC layer for low-latency AR stream testing.'
     },
     {
@@ -141,7 +141,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['lossless', 'archival', 'digital-twin', '16bit'],
-      sha256: '7ed5cfe999aa6438f4aa48388821d09f5522ad44cd51dd7339d7549ad2702e44',
+      sha256: '5d2dfeab94b8f426041f5ec988e0cc83095cb76c0323abbaca86d35307da72b4',
       description: 'A 16-bit lossless archival/digital-twin specimen calibration frame.'
     },
     {
@@ -158,7 +158,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['multiview', 'photogrammetry'],
-      sha256: '6fa5f866f4f6e18190e92704f783bd51028bcfd98f21f03c1423b16fc34e3cbc',
+      sha256: 'c49b1029c894a9071a193ecb1638f7056e46c1ba26fa5fd747b595edbfd5f9d7',
       groupId: 'multiview-specimen',
       viewIndex: 0,
       description: 'Viewpoint A of a multi-view photogrammetry synthetic specimen pair.'
@@ -177,7 +177,7 @@ export const manifest: CorpusManifest = {
       hasXmp: false,
       expectedPass: true,
       tags: ['multiview', 'photogrammetry'],
-      sha256: '1ad32afcd07ecd715125298334c34ffe60851429453d42e46fac4feb3ad81ae3',
+      sha256: '12ec1ea30c7be99807ec516e2b8cefe1308f91960b3db5d773c87da547d400b5',
       groupId: 'multiview-specimen',
       viewIndex: 1,
       description: 'Viewpoint B of a multi-view photogrammetry synthetic specimen pair.'

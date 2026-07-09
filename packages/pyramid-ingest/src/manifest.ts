@@ -98,12 +98,17 @@ const dec = new TextDecoder();
  * [u8 proxy][u8 hasProducedBy][producedBy fields...]
  */
 export function manifestToBinary(manifest: Manifest): Uint8Array {
-  // Pre-allocate with slack for optional fields; JSON serialization as fallback for unknown fields
+  // Pre-allocate with slack for optional fields; JSON serialization as fallback for unknown fields.
+  // V1 manifests leave geometry/levels optional; default to a well-formed empty layout.
+  const levels = manifest.levels ?? [];
+  const width = manifest.width ?? 0;
+  const height = manifest.height ?? 0;
+  const aspect = manifest.aspect ?? 0;
   let cap = 100;
   cap += 2 + (manifest.imageId?.length ?? 0) * 4;
   cap += 2 + (manifest.master?.name?.length ?? 0) * 4;
-  cap += 4 * manifest.levels.length;
-  for (const lv of manifest.levels) {
+  cap += 4 * levels.length;
+  for (const lv of levels) {
     cap += 2 + 2 + 4 + 1 + 16 + 1 + 1;
     if (lv.convergedByteEnd) cap += 4;
     if (lv.qualityCurve?.length) cap += 1 + lv.qualityCurve.length * (4 + 4 + 4);
@@ -123,13 +128,13 @@ export function manifestToBinary(manifest: Manifest): Uint8Array {
   dv.setUint16(p, nameEnc.written, true); p += 2 + nameEnc.written;
 
   dv.setUint32(p, manifest.master.mtimeMs, true); p += 4;
-  dv.setUint16(p, manifest.width, true); p += 2;
-  dv.setUint16(p, manifest.height, true); p += 2;
-  dv.setFloat64(p, manifest.aspect, true); p += 8;
+  dv.setUint16(p, width, true); p += 2;
+  dv.setUint16(p, height, true); p += 2;
+  dv.setFloat64(p, aspect, true); p += 8;
   dv.setUint8(p, manifest.orientation === "source" ? 1 : 0); p += 1;
-  dv.setUint32(p, manifest.levels.length, true); p += 4;
+  dv.setUint32(p, levels.length, true); p += 4;
 
-  for (const lv of manifest.levels) {
+  for (const lv of levels) {
     const sizeVal = lv.size === "full" ? 0xffff : (lv.size as number);
     dv.setUint16(p, sizeVal, true); p += 2;
     dv.setUint16(p, lv.w, true); p += 2;
@@ -203,7 +208,7 @@ export function binaryToManifest(data: Uint8Array): Manifest {
       convergedByteEnd = dv.getUint32(p, true); p += 4;
     }
     const hasCurve = dv.getUint8(p) === 1; p += 1;
-    let qualityCurve: Array<typeof qualityCurvePointSchema._type> | undefined;
+    let qualityCurve: NonNullable<LevelEntry["qualityCurve"]> | undefined;
     if (hasCurve) {
       const curveLen = dv.getUint8(p); p += 1;
       qualityCurve = [];
@@ -270,7 +275,7 @@ export function binaryToManifest(data: Uint8Array): Manifest {
 }
 
 /** Encode gallery index to tight binary format (−71% vs JSON). Record layout:
- * [u32 version][u32 numImages]
+ * [u32 schema][u32 numImages]
  * [foreach image: u8(16) imageId, f64 aspect, u8(16) l0.contenthash, u16 l0.w, u16 l0.h]
  */
 export function indexToBinary(index: GalleryIndex): Uint8Array {
@@ -281,7 +286,7 @@ export function indexToBinary(index: GalleryIndex): Uint8Array {
   const dv = new DataView(out.buffer);
   let p = 0;
 
-  dv.setUint32(p, index.version, true); p += 4;
+  dv.setUint32(p, index.schema, true); p += 4;
   dv.setUint32(p, index.images.length, true); p += 4;
 
   for (const img of index.images) {
@@ -302,7 +307,7 @@ export function binaryToGalleryIndex(data: Uint8Array): GalleryIndex {
   const dv = new DataView(data.buffer, data.byteOffset, data.length);
   let p = 0;
 
-  const version = dv.getUint32(p, true); p += 4;
+  p += 4; // u32 schema discriminant (galleryIndex is always schema 1)
   const numImages = dv.getUint32(p, true); p += 4;
 
   const images: IndexEntry[] = [];
@@ -320,5 +325,5 @@ export function binaryToGalleryIndex(data: Uint8Array): GalleryIndex {
     });
   }
 
-  return { version, images };
+  return { schema: 1, images };
 }

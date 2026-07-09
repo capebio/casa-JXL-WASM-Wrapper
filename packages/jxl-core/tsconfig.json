@@ -16,7 +16,7 @@
     "rootDir": "./src",
     "esModuleInterop": false,
     "allowSyntheticDefaultImports": false,
-    "ignoreDeprecations": "6.0",
+    "ignoreDeprecations": "5.0",
     "verbatimModuleSyntax": true,
     "skipLibCheck": false
   },

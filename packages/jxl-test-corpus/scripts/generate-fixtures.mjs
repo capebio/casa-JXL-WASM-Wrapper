@@ -214,11 +214,21 @@ async function main() {
 
   // 3. adobe-rgb-16bit (Adobe RGB, hasIcc, hasExif, hasXmp)
   const adobe16Bytes = renderAdobeRgb16(width, height);
-  // Create mock Exif (non-empty), Xmp (non-empty), ICC (non-empty)
-  // To avoid any issues with libjxl parsing ICC, let's make a mock valid-ish header if needed,
-  // or a small 128-byte Uint8Array. Let's make mock metadata.
-  const mockIcc = new Uint8Array(128);
-  mockIcc.set([0, 0, 0, 128, 109, 111, 99, 107, 2, 32, 0, 0, 109, 110, 116, 114, 82, 71, 66, 32]); // acsp, etc
+  // ICC/EXIF/XMP metadata boxes. Current libjxl (skcms) validates the ICC profile and rejects a
+  // malformed one with encode error 51, so this must be a COMPLETE, valid profile — a stub header
+  // is not enough. Bytes below are a standard sRGB ICC profile ('acsp' signature + wtpt/rXYZ/rTRC/…
+  // tags) emitted by lcms, which JxlEncoderSetICCProfile accepts.
+  const mockIcc = Uint8Array.from(Buffer.from(
+    "AAAB4GxjbXMEIAAAbW50clJHQiBYWVogB+IAAwAUAAkADgAdYWNzcE1TRlQAAAAAc2F3c2N0cmwAAAAA" +
+    "AAAAAAAAAAAAAPbWAAEAAAAA0y1oYW5keem/Vlo+AbaDI4VVRvdPqgAAAAAAAAAAAAAAAAAAAAAAAAAA" +
+    "AAAAAAAAAAAAAAAKZGVzYwAAAPwAAAAkY3BydAAAASAAAAAid3RwdAAAAUQAAAAUY2hhZAAAAVgAAAAs" +
+    "clhZWgAAAYQAAAAUZ1hZWgAAAZgAAAAUYlhZWgAAAawAAAAUclRSQwAAAcAAAAAgZ1RSQwAAAcAAAAAg" +
+    "YlRSQwAAAcAAAAAgbWx1YwAAAAAAAAABAAAADGVuVVMAAAAIAAAAHABzAFIARwBCbWx1YwAAAAAAAAAB" +
+    "AAAADGVuVVMAAAAGAAAAHABDAEMAMAAAWFlaIAAAAAAAAPbWAAEAAAAA0y1zZjMyAAAAAAABDD8AAAXd" +
+    "///zJgAAB5AAAP2S///7of///aIAAAPcAADAcVhZWiAAAAAAAABvoAAAOPIAAAOPWFlaIAAAAAAAAGKW" +
+    "AAC3iQAAGNpYWVogAAAAAAAAJKAAAA+FAAC2xHBhcmEAAAAAAAMAAAACZmkAAPKnAAANWQAAE9AAAApb",
+    "base64",
+  ));
   const mockExif = new Uint8Array([69, 120, 105, 102, 0, 0, 73, 73, 42, 0, 8, 0, 0, 0, 0, 0]);
   const mockXmp = new Uint8Array(Buffer.from("<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'></rdf:RDF></x:xmpmeta>", "utf-8"));
 

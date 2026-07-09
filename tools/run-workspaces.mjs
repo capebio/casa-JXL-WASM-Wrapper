@@ -27,7 +27,11 @@ if (!["build", "typecheck", "test"].includes(task)) {
 
 function runNpm(args) {
   const npmCli = process.env.npm_execpath;
-  if (npmCli) {
+  // npm sets npm_execpath to npm-cli.js (a JS file node can run). bun sets it to
+  // the bun *binary*, which node cannot parse (PE header -> "Invalid token").
+  // Only take the node path for a JS CLI; otherwise fall through to npm, which
+  // understands the --workspace/--if-present flags below (bun does not).
+  if (npmCli && /\.[cm]?js$/i.test(npmCli)) {
     execFileSync(process.execPath, [npmCli, ...args], { stdio: "inherit" });
     return;
   }
