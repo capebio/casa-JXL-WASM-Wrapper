@@ -1,7 +1,7 @@
 # Hardware-Adaptive Calibration — Design
 
 **Date:** 2026-07-08
-**Status:** Design approved; ready for implementation planning
+**Status:** Implemented (phases 1–7) on branch `feat/hw-adaptive-calibration-jul09` — see Implementation Status at end.
 **Scope owner:** David (capebio)
 **Topic:** One-time, per-machine calibration that discovers the accessible encode/decode pathways, measures them, and persists the throughput-optimal settings for this hardware.
 
@@ -270,3 +270,57 @@ Each phase is independently shippable and leaves the system correct if later pha
 - Corpus resolved: **procedural fractals** (seahorse/julia/burning-ship, optional dithered-entropy variant). Open sub-question: exact `max_iter`/zoom/palette per dataset, and whether the dithered variant is needed for the encode bench or fractals already stress entropy enough.
 - Profile file location convention on the server fleet (per-node vs baked-at-image + revalidate).
 - Whether `calibrate` should also emit a machine-readable capability report for fleet telemetry.
+
+---
+
+## 13. Implementation Status (2026-07-09)
+
+All eight components landed on branch `feat/hw-adaptive-calibration-jul09` (native +
+browser), additive and fallback-safe: every shipped-selector hook is a **no-op until a
+profile is written**, so an uncalibrated process behaves exactly as before.
+
+**Native (`crates/raw-pipeline/src/calibration/`):**
+
+| Component | File | Notes |
+|-----------|------|-------|
+| Pathway registry (§4.1) | `registry.rs` | 6 native routes; declarative catalog |
+| Accessibility prober (§4.2) | `prober.rs` | cgroup-aware `effective_core_budget()` |
+| Fractal corpus (§4.3) | `fractal.rs` | seahorse/full/julia-a/b/burning-ship + dither |
+| Parity gate (§4.4) | `parity.rs` | strict tol 1e-4 / rsqrt 5e-3 (fmadd not bit-exact) |
+| Bench harness (§4.4) | `bench.rs` | warmup + median-of-N + CoV; backend + thread scaling |
+| Profile store (§4.5) | `profile.rs` | signature-keyed, self-invalidating, serde_json |
+| Runtime hook (§4.6) | `perceptual/mod.rs` `resolve_backend` + `casa_video.rs` `resolve_enc_threads` | backend + encode-thread overrides |
+| Orchestrator (§4.7) | `orchestrator.rs` | `run_calibration` / `ensure_calibrated` + lockfile |
+| Broadcast (§4.8) | via `emit` sink | shown == persisted (`measurements`) |
+| Fallback prior (§7) | `prior.rs` | conservative; AVX2 even when AVX-512 present |
+
+Run: `cargo run -p raw-pipeline --example calibrate --no-default-features --features parallel --release`
+(add `--fresh` to force recalibration; first positional arg overrides the profile path).
+Inspect routes: `cargo run -p raw-pipeline --example routes --no-default-features --features parallel`.
+Tests: `cargo test -p raw-pipeline --lib --no-default-features --features parallel calibration` (33 pass).
+
+**Browser (`web/calibration/`, phase 6):** `fractal.mjs` (Rust-matched generator),
+`grid.mjs` (joint worker×thread split, product ≤ HC — fixes the 144-thread
+oversubscription), `profile.mjs` (localStorage + signature match), `calibrate.mjs`
+(`ensureCalibrated`, injected measurer, safe default). Wired into `web/main.js`
+(`POOL_SIZE` reads a persisted, HC-gated profile) and `web/worker.js`
+(`initThreadPool` honours `self.__calibratedThreads`). Tests:
+`node --test web/calibration/calibration.test.mjs` (10 pass).
+
+**Deltas from design (honest notes):**
+- **Parity is not bit-exact vs scalar** — the butteraugli *score* carries fmadd-vs-mul-add
+  rounding (~2e-7 rel); the gate uses tight documented tolerances, not bit-equality.
+- **Macro thread bench uses a perceptual-kernel proxy**, not real JXL encode. It runs the
+  real XYB/blur/downsample/butteraugli kernels under memory-bandwidth pressure (faithful
+  to the hot path) and needs no `jxl-codec`. A real end-to-end encode variant is a gated
+  follow-up.
+- **Browser per-worker thread cap is a hook** (`self.__calibratedThreads`): the worker
+  side honours it, but posting it from the main thread to each worker is a small plumbing
+  follow-up. `POOL_SIZE` (worker count) is fully wired.
+- **Cross-language fractal byte-parity** is best-effort (f64 transcendental last-ULP); the
+  algorithm matches and structural tests pass on both sides. Pinning a shared golden
+  vector is a follow-up.
+- **First-run auto-trigger** is provided as `ensure_calibrated()` (library) + the
+  `calibrate` example, not force-injected into every encode entry (a surprising 1–3 min
+  pause inside a library call is worse than an explicit call). Wire it where the app
+  wants it.
