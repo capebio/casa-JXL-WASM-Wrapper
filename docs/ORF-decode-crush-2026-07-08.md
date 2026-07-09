@@ -72,10 +72,15 @@ win < 2%, inside noise. Not built.
 
 ## STATE + morning clean-run
 
-- Source committed to `perf/orf-decode-crush-jul08` @ `0c2df0db`. NOT pushed, NOT merged.
-- `web/pkg` in the worktree is a **parallel-wasm-only measurement build** (dropped
-  c-perceptual) — left uncommitted. **Before shipping: rebuild properly**
-  (`.\build-parallel-wasm.ps1` = parallel-wasm + c-perceptual) and run the colour-drift gate.
+- Committed to `perf/orf-decode-crush-jul08` (NOT pushed/merged): source `0c2df0db`,
+  doc `86506289`, **shipped `web/pkg` `ad69e3dc`** (parallel-wasm build with all wins).
+- **c-perceptual CANNOT ship to wasm** (verified): it references the native-only
+  `perceptual_apply_full` C FFI → `rust-lld` undefined-symbol at link. So
+  `-Features parallel-wasm` (NOT the ps1 default `parallel-wasm,c-perceptual`) is the
+  only valid wasm build. c-perceptual is native-only AVX2 tone; wasm uses portable-Rust
+  tone regardless → the committed web/pkg is colour-identical (my engine changes are
+  byte-exact). The colour-verify harness has a pre-existing crash bug (ERR_HTTP_HEADERS_SENT
+  on a 404) — byte-exactness is the correctness proof here.
 - Tonight's #3 median (1.036×) is **contention-noisy** — measured while the 48-agent
   optimize-codec-times workflow ran concurrently. The min (1.17×) is the clean signal.
 
@@ -93,3 +98,25 @@ cd C:\Foo\rcw-orf-crush ; $env:RUSTFLAGS="-C target-feature=+simd128" ; wasm-pac
 Expect cleaner medians (no concurrent workflow). If #3 min drops below ~1.1× on an idle
 machine, the deadlock-risk redesign (producer on calling thread + explicit spawned consumers)
 is the fallback — see stream_band.rs note.
+
+## Follow-ups completed (2026-07-09)
+
+Both items previously flagged "needs you / verification" were done:
+
+1. **JPEG-proxy browser wiring** — `web/main.js` `127b31d9`. Opt-in `proxyViewMode`
+   (localStorage; `setProxyView(true)` in console). When on, a card completes from its
+   embedded camera-JPEG preview and the RAW decode is **skipped** (~25–30×); RAW fallback
+   when there is no usable preview; the decode-peak admission gate is skipped in proxy
+   mode. Default OFF is byte-identical (every branch `proxyViewMode`-guarded). `node --check`
+   clean. **Needs an in-app click-test** (not headless-verifiable): enable, re-ingest an
+   ORF, confirm instant completion with no RAW decode; `setProxyView(false)` restores.
+2. **web/pkg ship rebuild** — `ad69e3dc` (parallel-wasm). **Finding: c-perceptual cannot
+   build for wasm** — it references the native-only `perceptual_apply_full` C FFI (no wasm
+   provider → `rust-lld` undefined-symbol). So `-Features parallel-wasm` is the *only* valid
+   wasm build (the ps1 default `parallel-wasm,c-perceptual` fails on wasm). c-perceptual is
+   native-only AVX2 tone; wasm uses portable-Rust tone regardless → colour-identical (engine
+   changes are byte-exact). `colour-verify.mjs` has a pre-existing crash bug
+   (`ERR_HTTP_HEADERS_SENT`, double `writeHead` on a 404 at ~line 77–78) — fix or eyeball.
+
+Commits on `perf/orf-decode-crush-jul08`: `0c2df0db` (engine) · `86506289` (docs) ·
+`ad69e3dc` (web/pkg) · `127b31d9` (proxy wiring). NOT pushed, NOT merged.
