@@ -7,7 +7,7 @@ test('magic bytes classify', () => {
   expect(detectFormat(bytes(0x76, 0x2f, 0x31, 0x01), 'x.exr')).toBe('exr');
   expect(detectFormat(bytes(0x49, 0x49, 0x2a, 0x00), 'x.tif')).toBe('tiff');
   expect(detectFormat(bytes(0x89, 0x50, 0x4e, 0x47), 'x.png')).toBe('sdr');
-  expect(detectFormat(bytes(0xff, 0xd8, 0xff, 0xe0), 'x.jpg')).toBe('sdr');
+  expect(detectFormat(bytes(0xff, 0xd8, 0xff, 0xe0), 'x.jpg')).toBe('jpeg');
   expect(detectFormat(bytes(0x47, 0x49, 0x46, 0x38), 'x.gif')).toBe('sdr');
 });
 
@@ -62,7 +62,7 @@ test('worker routing: RAW still wins over the new TIFF path', () => {
 });
 
 test('worker routing: sdr/jxl/unknown are rejected, never sent to RAW decoder', () => {
-  expect(detectFormat(bytes(0xff, 0xd8, 0xff, 0xe0), 'x.jpg')).toBe('sdr');
+  expect(detectFormat(bytes(0xff, 0xd8, 0xff, 0xe0), 'x.jpg')).toBe('jpeg');
   expect(detectFormat(bytes(0xff, 0x0a), 'x.jxl')).toBe('jxl');
   expect(detectFormat(bytes(0, 0, 0, 0), 'x.weird')).toBe('unknown');
 });
