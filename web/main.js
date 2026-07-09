@@ -61,7 +61,27 @@ window.IS_TAURI = IS_TAURI;
 const { invoke } = IS_TAURI ? window.__TAURI__.core : {};
 const { listen } = IS_TAURI ? window.__TAURI__.event : {};
 
-const POOL_SIZE = Math.min(navigator.hardwareConcurrency || 4, 12);
+// Apply a persisted hardware-calibration profile (if any) BEFORE pool sizing, so the
+// worker count reflects this machine's measured throughput-optimal split. Synchronous
+// localStorage read (fast); the full (re)calibration measurement runs async elsewhere
+// and persists for the next load. Canonical schema: web/calibration/profile.mjs.
+// HC-gated so a profile from a differently-sized machine is ignored.
+try {
+    const __calRaw = localStorage.getItem('rawpipe.calibration.v1');
+    if (__calRaw) {
+        const __cal = JSON.parse(__calRaw);
+        if (
+            __cal && __cal.schemaVersion === 1 && __cal.selections && __cal.signature &&
+            __cal.signature.hardwareConcurrency === (navigator.hardwareConcurrency || 4)
+        ) {
+            globalThis.__rawCalibration = { ...__cal.selections };
+        }
+    }
+} catch { /* storage blocked / unparseable → uncalibrated defaults */ }
+
+const POOL_SIZE = (globalThis.__rawCalibration && globalThis.__rawCalibration.workers)
+    ? Math.max(1, globalThis.__rawCalibration.workers)
+    : Math.min(navigator.hardwareConcurrency || 4, 12);
 
 // Assessment switch (default OFF = blob/O1 behaviour unchanged). Add
 // `?alphaProgressive=1` to the page URL to let alpha/extra-channel VarDCT
