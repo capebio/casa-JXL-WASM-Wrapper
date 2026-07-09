@@ -91,7 +91,7 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 /** Encode manifest to tight binary format (−73% vs JSON). Record layout:
- * [u32 schema][u16 imageIdLen][imageId][u16 masterNameLen][masterName][u32 mtimeMs]
+ * [u32 schema][u16 imageIdLen][imageId][u16 masterNameLen][masterName][f64 mtimeMs]
  * [u16 width][u16 height][f64 aspect][u8 orientation][u32 numLevels]
  * [foreach level: u16 w, u16 h, u32 bytes, u8 bps, u8(16) contenthash, u8 tiled,
  *                 u8 hasConverged, u32 convergedByteEnd?, u8 hasCurve, u8(n) curve]
@@ -127,7 +127,8 @@ export function manifestToBinary(manifest: Manifest): Uint8Array {
   const nameEnc = enc.encodeInto(manifest.master.name, out.subarray(p + 2));
   dv.setUint16(p, nameEnc.written, true); p += 2 + nameEnc.written;
 
-  dv.setUint32(p, manifest.master.mtimeMs, true); p += 4;
+  // mtimeMs is ms-since-epoch (~1.75e12) which overflows u32; store as f64 (exact to 2^53).
+  dv.setFloat64(p, manifest.master.mtimeMs, true); p += 8;
   dv.setUint16(p, width, true); p += 2;
   dv.setUint16(p, height, true); p += 2;
   dv.setFloat64(p, aspect, true); p += 8;
@@ -185,7 +186,7 @@ export function binaryToManifest(data: Uint8Array): Manifest {
   const imageId = dec.decode(data.subarray(p, p + idLen)); p += idLen;
   const nameLen = dv.getUint16(p, true); p += 2;
   const masterName = dec.decode(data.subarray(p, p + nameLen)); p += nameLen;
-  const mtimeMs = dv.getUint32(p, true); p += 4;
+  const mtimeMs = dv.getFloat64(p, true); p += 8;
   const width = dv.getUint16(p, true); p += 2;
   const height = dv.getUint16(p, true); p += 2;
   const aspect = dv.getFloat64(p, true); p += 8;

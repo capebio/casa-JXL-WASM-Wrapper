@@ -48,8 +48,10 @@ async function migrateManifests(
     if (txt === null) return;
 
     try {
-      parseManifest(txt);          // validate current manifest (throws on invalid)
-      const raw = JSON.parse(txt);  // MIG-2: preserve fields the zod schema would strip
+      const parsed = parseManifest(txt); // validate current manifest (throws on invalid)
+      // MIG-2: preserve fields the zod schema would strip. Only JSON manifests can carry extra
+      // fields; the binary format encodes only known fields, so the decoded object is complete.
+      const raw = txt[0] === 0x7b /* '{' */ ? JSON.parse(new TextDecoder().decode(txt)) : parsed;
       if (!shouldMigrate(raw)) { report.skipped++; return; }
 
       // MIG-1: per-image write lock; a failure to acquire must NOT fall through to an unlocked write.

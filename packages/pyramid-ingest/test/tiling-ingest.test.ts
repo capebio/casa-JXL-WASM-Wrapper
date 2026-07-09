@@ -8,6 +8,7 @@ import { ingestImage } from "../src/ingest";
 import { createJxlBackend, type DecodedMaster, type RawBackend, type RawFormat } from "../src/backends";
 import { imageIdForPath } from "../src/hash";
 import type { Manifest } from "../src/manifest";
+import { parseManifest } from "../src/schema";
 import { loadScalarModule, scalarFactory } from "./scalar";
 
 async function writeMaster(dir: string, name: string): Promise<string> {
@@ -53,11 +54,11 @@ test("massive RAW ingest tiles only the full level; sidecars stay whole-frame", 
   const backends = { raw: fakeRaw(8001, 400), jxl: createJxlBackend() };
   const master = await writeMaster(out, "scan.orf");
 
-  expect(await ingestImage(master, backends, { outDir: out })).toBe("written");
+  expect((await ingestImage(master, backends, { outDir: out })).outcome).toBe("written");
 
-  const imageId = imageIdForPath(master);
-  const manifest = JSON.parse(
-    await readFile(join(out, "images", imageId, "manifest.json"), "utf8"),
+  const imageId = await imageIdForPath(master);
+  const manifest = parseManifest(
+    await readFile(join(out, "images", imageId, "manifest.json")),
   ) as Manifest;
 
   const full = manifest.levels.find((l) => l.size === "full");
@@ -79,11 +80,11 @@ test("standard RAW ingest keeps whole-frame full level", { timeout: WASM_TIMEOUT
   const backends = { raw: fakeRaw(1280, 960), jxl: createJxlBackend() };
   const master = await writeMaster(out, "photo.orf");
 
-  expect(await ingestImage(master, backends, { outDir: out })).toBe("written");
+  expect((await ingestImage(master, backends, { outDir: out })).outcome).toBe("written");
 
-  const imageId = imageIdForPath(master);
-  const manifest = JSON.parse(
-    await readFile(join(out, "images", imageId, "manifest.json"), "utf8"),
+  const imageId = await imageIdForPath(master);
+  const manifest = parseManifest(
+    await readFile(join(out, "images", imageId, "manifest.json")),
   ) as Manifest;
 
   const full = manifest.levels.find((l) => l.size === "full");

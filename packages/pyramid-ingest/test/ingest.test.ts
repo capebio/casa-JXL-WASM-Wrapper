@@ -6,7 +6,7 @@ import { setJxlModuleFactoryForTesting } from "@casabio/jxl-wasm";
 import type { Backends, IngestPlan } from "../src/ingest";
 import type { DecodedMaster, RawBackend, RawFormat } from "../src/backends";
 import type { GalleryIndex, Manifest } from "../src/manifest";
-import { parseManifest } from "../src/schema";
+import { parseManifest, parseGalleryIndex } from "../src/schema";
 import { loadScalarModule, scalarFactory } from "./scalar";
 
 // Install fs mock *before* any import of the SUT modules so their static
@@ -157,8 +157,8 @@ test("identical level content across masters is stored once (content-addressed d
   await ingestImage(m1, b, { outDir: out });
   await ingestImage(m2, b, { outDir: out });
 
-  const man1 = parseManifest(await readFile(join(out, "images", await imageIdForPath(m1), "manifest.json"), "utf8")) as Manifest;
-  const man2 = parseManifest(await readFile(join(out, "images", await imageIdForPath(m2), "manifest.json"), "utf8")) as Manifest;
+  const man1 = parseManifest(await readFile(join(out, "images", await imageIdForPath(m1), "manifest.json"))) as Manifest;
+  const man2 = parseManifest(await readFile(join(out, "images", await imageIdForPath(m2), "manifest.json"))) as Manifest;
   expect(man1.levels.map((l) => l.contenthash)).toEqual(man2.levels.map((l) => l.contenthash));
 
   const levelFiles = await readdir(join(out, "levels"));
@@ -227,8 +227,8 @@ test("proxy mode writes exactly one level and flags the manifest", { timeout: WA
   const master = await writeMaster(out, "P3.orf");
   expect((await ingestImage(master, b, { outDir: out, proxy: 512 })).outcome).toBe("written");
 
-  const manifest = JSON.parse(
-    await readFile(join(out, "images", await imageIdForPath(master), "manifest.json"), "utf8"),
+  const manifest = parseManifest(
+    await readFile(join(out, "images", await imageIdForPath(master), "manifest.json")),
   ) as Manifest;
   expect(manifest.proxy).toBe(true);
   expect(manifest.levels).toHaveLength(1);
@@ -261,7 +261,7 @@ test("ingestBatch isolates failures; rebuildIndex inlines L0 for non-proxy image
   expect(g1.l0.w).toBe(256);
   expect([...ids].sort()).toEqual(ids);
 
-  const onDisk = parseManifest(await readFile(join(out, "index.json"), "utf8")) as GalleryIndex;
+  const onDisk = parseGalleryIndex(await readFile(join(out, "index.json")));
   expect(onDisk.images.length).toBe(index.images.length);
 });
 
@@ -415,28 +415,22 @@ test("B9 index atomic: reader loop never observes partial/truncated index.json d
     for (let i = 0; i < 30; i++) {
       let bad = false;
       try {
-        const txt = await readFile(join(out, "index.json"), "utf8");
-        JSON.parse(txt);
-      } catch (e: any) {
-        const msg = String(e && (e.message || e));
-        if ((e && e.name === "SyntaxError") || /JSON|parse|token|Unexpected/i.test(msg)) {
-          // Multiple quick re-probes to ride out transient visibility windows around rename()
-          // on this platform/FS (Windows + Bun). Only count as a real "partial observed" if
-          // several consecutive reads all fail to parse.
-          let stillBad = true;
-          for (let p = 0; p < 3 && stillBad; p++) {
-            await new Promise((r) => setTimeout(r, 2));
-            try {
-              const txt2 = await readFile(join(out, "index.json"), "utf8");
-              JSON.parse(txt2);
-              stillBad = false;
-            } catch (e2: any) {
-              const msg2 = String(e2 && (e2.message || e2));
-              stillBad = (e2 && e2.name === "SyntaxError") || /JSON|parse|token|Unexpected/i.test(msg2);
-            }
+        parseGalleryIndex(await readFile(join(out, "index.json")));
+      } catch {
+        // A complete index (JSON or binary) parses cleanly; a failure here means we observed a
+        // partial/truncated write. Re-probe to ride out transient rename-visibility windows
+        // (Windows + Bun) before counting it as a real "partial observed".
+        let stillBad = true;
+        for (let p = 0; p < 3 && stillBad; p++) {
+          await new Promise((r) => setTimeout(r, 2));
+          try {
+            parseGalleryIndex(await readFile(join(out, "index.json")));
+            stillBad = false;
+          } catch {
+            stillBad = true;
           }
-          if (stillBad) bad = true;
         }
+        if (stillBad) bad = true;
       }
       if (bad) parseErrs++;
       await new Promise((r) => setTimeout(r, 5));

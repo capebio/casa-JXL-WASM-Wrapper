@@ -144,11 +144,12 @@ export async function fileExists(p: string): Promise<boolean> {
   }
 }
 
-/** Read a UTF-8 file, returning null if it does not exist. Collapses the fileExists()+readFile()
- *  double-stat used across the admin commands (cli/validate/migrate/rm) into a single syscall. */
-export async function readFileOrNull(p: string): Promise<string | null> {
+/** Read a file as raw bytes, returning null if it does not exist. Collapses the fileExists()+readFile()
+ *  double-stat used across the admin commands (cli/validate/migrate/rm) into a single syscall.
+ *  Returns bytes (not utf8) so parseManifest/parseGalleryIndex can auto-detect the binary format. */
+export async function readFileOrNull(p: string): Promise<Uint8Array | null> {
   try {
-    return await readFile(p, "utf8");
+    return await readFile(p);
   } catch (err: any) {
     if (err && err.code === "ENOENT") return null;
     throw err;

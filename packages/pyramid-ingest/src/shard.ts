@@ -25,7 +25,6 @@ export function boundedConcurrency(
  * n<=0 => all (no sharding); i<0 or i>=n => [] (empty for this worker).
  */
 export function planShard<T>(items: readonly T[], i: number, n: number): T[] {
-  if (n <= 0) return items.slice();
-  if (i < 0 || i >= n) return [];
+  if (n < 1 || i < 0 || i >= n) throw new RangeError(`invalid shard i=${i}/N=${n} (expected N >= 1 and 0 <= i < N)`);
   return items.filter((_, k) => (k % n) === i);
 }
