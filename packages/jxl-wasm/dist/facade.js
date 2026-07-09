@@ -2810,6 +2810,91 @@ export async function perceptualConstancyApplyBulk(r, g, b, sat, vib, vibZero, o
     if (targetB !== b)
         targetB.set(b);
 }
+let _rawWasmPromise;
+let _rawWasmTestFactory = null;
+/** Override the raw WASM loader for testing. Pass null to restore auto-load. */
+export function setRawWasmModuleForTesting(factory) {
+    _rawWasmTestFactory = factory;
+    _rawWasmPromise = undefined;
+}
+async function loadRawWasmModule() {
+    if (_rawWasmPromise === undefined) {
+        const p = (_rawWasmTestFactory ?? _loadRawWasmFromPkg)();
+        _rawWasmPromise = p;
+        p.catch(() => { if (_rawWasmPromise === p)
+            _rawWasmPromise = undefined; });
+    }
+    return _rawWasmPromise;
+}
+async function _loadRawWasmFromPkg() {
+    // Resolve relative to this source file so it works both from dist/ and from
+    // source (bun resolves TS directly). The RAW converter WASM lives at
+    // web/pkg/raw_converter_wasm.js three directories above packages/jxl-wasm/src/.
+    // In the primary repo the same content lives at pkg/raw_converter_wasm.js
+    // (two directories above packages/jxl-wasm/src/), so we try both.
+    const candidates = [
+        new URL("../../../web/pkg/raw_converter_wasm.js", import.meta.url),
+        new URL("../../../pkg/raw_converter_wasm.js", import.meta.url),
+    ];
+    let lastErr;
+    for (const url of candidates) {
+        try {
+            const mod = await import(url.href);
+            // wasm-bindgen modules export `default` as the init function.
+            if (typeof mod.default === "function") {
+                // In Node/Bun: pre-read the .wasm binary so init doesn't attempt a fetch.
+                if (typeof process !== "undefined" && !!process.versions?.node) {
+                    try {
+                        const fsPromises = await import("node:fs/promises");
+                        const urlMod = await import("node:url");
+                        const wasmUrl = new URL(url.href.replace(/\.js$/, "_bg.wasm"));
+                        const wasmBytes = await fsPromises.readFile(urlMod.fileURLToPath(wasmUrl));
+                        await mod.default({ module_or_path: wasmBytes });
+                    }
+                    catch {
+                        // Fallback: let the module resolve the WASM on its own.
+                        await mod.default();
+                    }
+                }
+                else {
+                    await mod.default();
+                }
+            }
+            if (typeof mod.process_region !== "function") {
+                throw new Error("[jxl-wasm] raw_converter_wasm.js does not export process_region");
+            }
+            return mod;
+        }
+        catch (err) {
+            lastErr = err;
+        }
+    }
+    throw new CapabilityMissing("RAW converter WASM (raw_converter_wasm.js) could not be loaded — run wasm-pack build first", lastErr);
+}
+/**
+ * Decode a rectangular sub-region of an Olympus ORF RAW file.
+ *
+ * Internally: parses + decompresses + MHC-demosaics the ORF to full-resolution
+ * pre-tonemapped RGB16 (sensor orientation), then runs the per-pixel tone/colour
+ * pipeline over only `[x, x+w) × [y, y+h)`. This is byte-for-byte identical to
+ * the same crop of a full `process_orf_with_flags(..., OUT_FULL_RGB8 | OUT_NO_ORIENT)`
+ * decode at neutral look.
+ *
+ * Output pixels are **RGB8** (3 bytes per pixel, no alpha). To get RGBA8, expand
+ * with alpha=255 after the call.
+ *
+ * @throws {Error} if `bytes` is not a valid ORF, or `x+w > imageWidth` / `y+h > imageHeight`.
+ * @throws {CapabilityMissing} if the RAW converter WASM is not available.
+ */
+export async function processRegion(rawBytes, x, y, width, height) {
+    const wasm = await loadRawWasmModule();
+    if (typeof wasm.process_region !== "function") {
+        throw new CapabilityMissing("raw_converter_wasm.js does not export process_region — rebuild the RAW converter WASM");
+    }
+    // process_region returns RGB8 bytes (w*h*3) or throws a JS error from the Rust JsValue.
+    const pixels = wasm.process_region(rawBytes, x >>> 0, y >>> 0, width >>> 0, height >>> 0);
+    return { pixels, width, height };
+}
 // ---------------------------------------------------------------------------
 // Pyramid helpers: pure-JS area downscale + monolithic RGBA8 pyramid encode.
 //

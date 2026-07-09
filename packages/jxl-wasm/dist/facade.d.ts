@@ -717,6 +717,32 @@ export declare function getPerceptualConstancySupport(): Promise<PerceptualConst
  * This is the direct JS hook for the lightbox progressive paint path (toggleable, runtime only).
  */
 export declare function perceptualConstancyApplyBulk(r: Float32Array, g: Float32Array, b: Float32Array, sat: number, vib: number, vibZero: boolean, outR?: Float32Array, outG?: Float32Array, outB?: Float32Array): Promise<void>;
+interface RawWasmModule {
+    /** S6 ORF region decode: returns RGB8 bytes (w*h*3), throws on error. */
+    process_region(bytes: Uint8Array, x: number, y: number, w: number, h: number): Uint8Array;
+}
+/** Override the raw WASM loader for testing. Pass null to restore auto-load. */
+export declare function setRawWasmModuleForTesting(factory: (() => Promise<RawWasmModule>) | null): void;
+/**
+ * Decode a rectangular sub-region of an Olympus ORF RAW file.
+ *
+ * Internally: parses + decompresses + MHC-demosaics the ORF to full-resolution
+ * pre-tonemapped RGB16 (sensor orientation), then runs the per-pixel tone/colour
+ * pipeline over only `[x, x+w) × [y, y+h)`. This is byte-for-byte identical to
+ * the same crop of a full `process_orf_with_flags(..., OUT_FULL_RGB8 | OUT_NO_ORIENT)`
+ * decode at neutral look.
+ *
+ * Output pixels are **RGB8** (3 bytes per pixel, no alpha). To get RGBA8, expand
+ * with alpha=255 after the call.
+ *
+ * @throws {Error} if `bytes` is not a valid ORF, or `x+w > imageWidth` / `y+h > imageHeight`.
+ * @throws {CapabilityMissing} if the RAW converter WASM is not available.
+ */
+export declare function processRegion(rawBytes: Uint8Array, x: number, y: number, width: number, height: number): Promise<{
+    pixels: Uint8Array;
+    width: number;
+    height: number;
+}>;
 /**
  * Area-average ("box") downscale of an RGBA8 buffer from src dims to dst dims.
  * Pure JS — no WASM round-trip (faster than a bridge for this memory-bound op).
