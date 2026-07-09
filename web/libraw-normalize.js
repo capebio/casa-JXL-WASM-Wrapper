@@ -42,14 +42,20 @@ export function orientationFromLibRawFlip(flip) {
   }
 }
 
+function multipliersToWb(mul) {
+  if (!Array.isArray(mul) || mul.length < 3) return null;
+  const gs = [mul[1], mul[3]].filter(isFiniteNumber).filter((v) => v > 0);
+  const g = gs.length ? gs.reduce((a, b) => a + b, 0) / gs.length : 0;
+  if (!(g > 0) || !isFiniteNumber(mul[0]) || mul[0] <= 0 || !isFiniteNumber(mul[2]) || mul[2] <= 0) return null;
+  return [mul[0] / g, mul[2] / g];
+}
 function extractWb(color) {
-  const cam = Array.isArray(color?.cam_mul) ? color.cam_mul : null;
-  if (!cam || cam.length < 3) return [1, 1];
-  const gCandidates = [cam[1], cam[3]].filter(isFiniteNumber).filter((v) => v > 0);
-  const g = gCandidates.length ? gCandidates.reduce((a, b) => a + b, 0) / gCandidates.length : 1;
-  const wbR = isFiniteNumber(cam[0]) && cam[0] > 0 ? cam[0] / g : 1;
-  const wbB = isFiniteNumber(cam[2]) && cam[2] > 0 ? cam[2] / g : 1;
-  return [wbR, wbB];
+  // Prefer the camera white balance (cam_mul). LibRaw leaves cam_mul invalid
+  // (e.g. [0,1,0,0]) for some bodies — notably old Canon CRW — where its own
+  // useCameraWb render falls back to pre_mul (the default/daylight multipliers).
+  // Mirror that: cam_mul -> pre_mul -> neutral. Without this the raw green-heavy
+  // sensor colour renders as a green cast (verified: canon_a570is/ixus900ti CRW).
+  return multipliersToWb(color?.cam_mul) || multipliersToWb(color?.pre_mul) || [1, 1];
 }
 
 function extractMatrix(color) {
