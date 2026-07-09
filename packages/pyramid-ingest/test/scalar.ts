@@ -1,14 +1,15 @@
 import type { JxlModuleFactory } from "@casabio/jxl-wasm";
 import type { JxlBackend, DecodedMaster, PyramidLevelBytes } from "../src/backends.js";
 
-// Loads a baseline (dec simd) WASM from dist for tests that want a real module handle.
-// Scalar tier dropped (P3-1); use dec.simd as the min shipped tier. Tests override encode paths anyway.
+// Loads a real WASM module handle for tests. Real encode/transcode tests (tiling, jpg, backends)
+// inject this via scalarFactory, so we prefer the `enc` module (decoderOnly:false) which carries
+// the encode + JPEG-transcode + tile-container bridges. Falls back to dec/mono, then a stub.
 export async function loadScalarModule() {
-  // Post P3 split: artifacts are jxl-core.{dec,enc}.*.js. Pre-rebuild the file may be absent.
-  // Tests that reach here override encodeTileContainer etc via makeTestJxlBackend; provide a
-  // minimal stub module so import doesn't hard-fail the suite before rebuild.
-  // Fallback order: dec split (post-P3) -> monolithic simd (current shipped dist) -> stub.
-  for (const artifact of ["jxl-core.dec.simd.js", "jxl-core.simd.js"]) {
+  // Post P3 split: artifacts are jxl-core.{dec,enc}.*.js. Prefer enc (has the encode bridges);
+  // dec is decoder-only, mono is the pre-split shipped artifact. A stub keeps import from
+  // hard-failing the suite when no real module is present.
+  // Fallback order: enc split -> dec split -> monolithic simd -> stub.
+  for (const artifact of ["jxl-core.enc.simd.js", "jxl-core.dec.simd.js", "jxl-core.simd.js"]) {
     try {
       const imported = await import(`../../jxl-wasm/dist/${artifact}`);
       if (typeof imported.default === "function") {
