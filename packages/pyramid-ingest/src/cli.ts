@@ -91,6 +91,7 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     options: {
       out: { type: "string" },
       proxy: { type: "string" },
+      tiling: { type: "string" },
       force: { type: "boolean", default: false },
       concurrency: { type: "string" },
       "mem-budget-mb": { type: "string" },
@@ -427,6 +428,7 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
       ...(parsed.resume ? { resume: true } : {}),
       ...(parsed["chaos-test"] ? { chaosTest: true } : {}),
       ...(parsed["retry-failed"] ? { retryFailed: true } : {}),
+      tiling: parsed.tiling,
       statMap,
     };
     const result = await ingestBatch(files, backends, batchOpts);

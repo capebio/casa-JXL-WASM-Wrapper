@@ -29,7 +29,7 @@ test("buildRawLadder keeps every encoded level, ascending, full last, all 8-bit 
   const W = 1280, H = 960;
   const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
 
-  const ladder = await buildRawLadder(jxl, decoded);
+  const ladder = await buildRawLadder(jxl, decoded, false, "tile-all");
   expect(ladder.orientation).toBe("baked");
   expect(ladder.width).toBe(W);
   expect(ladder.height).toBe(H);
@@ -55,7 +55,7 @@ test("buildRawLadder attaches qualityCurve + convergedByteEnd from profileConver
   };
   const W = 1280, H = 960;
   const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
-  const ladder = await buildRawLadder(jxl, decoded, true);
+  const ladder = await buildRawLadder(jxl, decoded, true, "tile-all");
   for (const lvl of ladder.levels) {
     if (Math.max(lvl.width, lvl.height) >= 1024) {
       expect(lvl.qualityCurve).toEqual(curve);
@@ -81,10 +81,10 @@ test("buildJpgLadder produces all levels (incl full) as tiled JXTC (no transcode
     // encodePyramid no longer used by buildJpgLadder
     async encodePyramid() { return []; },
   };
-  const ladder = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]));
+  const ladder = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]), false, "source", "tile-all");
   expect(ladder.orientation).toBe("source");
   // L9 signature accepts explicit orientation (default "source" for back-compat)
-  const ladder2 = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]), false, "source");
+  const ladder2 = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]), false, "source", "tile-all");
   expect(ladder2.orientation).toBe("source");
   expect(ladder.levels.map((l) => l.width)).toEqual([256, 512, 1024, 1280]);
   const full = ladder.levels[ladder.levels.length - 1]!;
@@ -123,7 +123,7 @@ test("L1/L2 regression: descending cascade (never upscales), grid bounded by mas
     async encodePyramid() { return []; },
   };
   // 800px master: grid filter must drop 1024 ( > master and would dup full); 8bit path also
-  const ladder = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]));
+  const ladder = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]), false, "source", "tile-all");
   const widths = ladder.levels.map((l) => l.width);
   expect(widths).toEqual([256, 512, 800]); // 1024 excluded by <masterLong; full (800) always emitted; ascending L7
   // L1: every downscale src >= dst (cascade down only)
@@ -140,7 +140,7 @@ test("L1/L2 regression: descending cascade (never upscales), grid bounded by mas
     async encodePyramid() { return []; },
   };
   const decoded: DecodedMaster = { rgba: gradientRgba(2100, 1500), width: 2100, height: 1500, orientation: "baked" };
-  const ladderRaw = await buildRawLadder(fakeRaw, decoded);
+  const ladderRaw = await buildRawLadder(fakeRaw, decoded, false, "tile-all");
   const ws = ladderRaw.levels.map((l) => l.width);
   // 256,512,1024,2100 (2048 skipped by ratio; no 2048)
   expect(ws).toEqual([256, 512, 1024, 2100]);
@@ -158,7 +158,7 @@ test("L1 rgb16 branch + L7 order: grid ascending + big ascending after combined 
   // provide rgb16 to hit the branch; master 3000 -> grid 256/512/1024 + big 2048 + full
   const rgb16 = new Uint8Array(3000 * 2000 * 6); // dummy packed
   const decoded: DecodedMaster = { rgba: gradientRgba(3000, 2000), rgb16, width: 3000, height: 2000, orientation: "baked" };
-  const ladder = await buildRawLadder(fake, decoded);
+  const ladder = await buildRawLadder(fake, decoded, false, "tile-all");
   const longs = ladder.levels.map((l) => Math.max(l.width, l.height));
   expect(longs).toEqual([256, 512, 1024, 2048, 3000]); // L7 ascending
   for (const c of downCalls) expect(c.dst).toBeLessThanOrEqual(c.src);

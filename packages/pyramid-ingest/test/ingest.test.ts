@@ -196,7 +196,7 @@ test("computeIngestPlan is side-effect free (no FS writes) and deterministic", a
   const identity = { imageId: "0123456789abcdef", masterName: "synthetic.orf", mtimeMs: 1234567890000 };
 
   // first compute
-  const plan1 = await computeIngestPlan(bytes, format, b, identity, { outDir: out, force: false });
+  const plan1 = await computeIngestPlan(bytes, format, b, identity, { outDir: out, force: false, tiling: "tile-all" });
   // assert plan shape (pure data)
   expect(plan1.imageId).toBe(identity.imageId);
   expect(plan1.levels.length).toBe(2);
@@ -205,7 +205,7 @@ test("computeIngestPlan is side-effect free (no FS writes) and deterministic", a
   expect(plan1.manifest.levels.length).toBe(2);
 
   // second compute identical inputs -> identical output (deterministic, including content hashes from bytes)
-  const plan2 = await computeIngestPlan(bytes, format, b, identity, { outDir: out, force: false });
+  const plan2 = await computeIngestPlan(bytes, format, b, identity, { outDir: out, force: false, tiling: "tile-all" });
   expect(plan2.imageId).toBe(plan1.imageId);
   expect(plan2.levels.length).toBe(plan1.levels.length);
   expect(plan2.manifest.levels.map((l) => l.contenthash)).toEqual(plan1.manifest.levels.map((l) => l.contenthash));

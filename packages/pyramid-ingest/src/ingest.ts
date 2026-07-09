@@ -2,7 +2,7 @@ import { access, mkdir, readFile, readdir, rename, rm, stat, unlink, writeFile }
 import { basename, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { contentHash16, imageIdForPath } from "./hash.js";
-import { buildJpgLadder, buildProxyLadder, buildRawLadder, type LadderResult } from "./ladder.js";
+import { buildJpgLadder, buildProxyLadder, buildRawLadder, type LadderResult, type TilingPolicy } from "./ladder.js";
 import {
   buildIndexEntry, buildManifest, isUpToDate, toEntry, manifestToBinary, binaryToManifest,
   indexToBinary, binaryToGalleryIndex,
@@ -37,6 +37,7 @@ export interface IngestOptions {
   statMap?: Record<string, { size: number; mtimeMs: number }>;  // C1: from upfront collect to avoid re-stat
   stripGps?: boolean; // F4: privacy for sensitive species (biodiversity)
   idMap?: Record<string, string>;  // B5/B11 extension: precomputed imageIds to elide re-hash in batch dispatchers (mirrors statMap pattern)
+  tiling?: TilingPolicy; // per-batch tiling policy (--tiling): "adaptive" (default) | "tile-all"
 }
 
 export type IngestOutcome = "written" | "skipped";
@@ -342,14 +343,14 @@ export async function computeIngestPlan(
     );
   } else if (format === "jpg") {
     // F6/L9: jpg decode does not bake EXIF rotation (verified); pass "source" (or real EXIF when plumbed in caller)
-    ladder = await buildJpgLadder(b.jxl, bytes, !!opts.profileConvergence, "source");
+    ladder = await buildJpgLadder(b.jxl, bytes, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive");
     if (await probeOrientation(bytes) === "baked") {
       (ladder as any).orientation = "baked";
     }
   } else {
     const decoded = await b.raw.decode(bytes, format);
     tel?.stage("decode-master", { w: decoded.width, h: decoded.height });
-    ladder = await buildRawLadder(b.jxl, decoded, !!opts.profileConvergence);
+    ladder = await buildRawLadder(b.jxl, decoded, !!opts.profileConvergence, opts.tiling ?? "adaptive");
   }
 
   tel?.stage("ladder-built", { levels: ladder.levels.length, w: ladder.width, h: ladder.height });
@@ -553,7 +554,7 @@ async function buildFallbackPlan(
       const dec = await b.jxl.decodeToRgba8(fullJxl);
       ladder = await buildProxyLadder(b.jxl, dec.rgba, dec.width, dec.height, opts.proxy, "source", !!opts.profileConvergence);
     } else {
-      ladder = await buildJpgLadder(b.jxl, jpeg, !!opts.profileConvergence);
+      ladder = await buildJpgLadder(b.jxl, jpeg, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive");
       // F6 (embedded path): same map as master jpg; ladder override (deferred full plumb)
       if (await probeOrientation(jpeg) === "baked") {
         (ladder as any).orientation = "baked";

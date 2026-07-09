@@ -12,7 +12,26 @@ export interface LadderResult {
 const GRID_MAX_LONG = 1024;
 const TILE_SIZE = 256;
 
-export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, profileConvergence = false): Promise<LadderResult> {
+// Long-edge / pixel thresholds above which a scan is "massive" (ingest.ts:273): in adaptive
+// mode its full level becomes a JXTC tile container for pan/zoom region decode.
+const MASSIVE_LONG_EDGE = 8000;
+const MASSIVE_PIXELS = 40_000_000;
+
+/**
+ * Per-batch tiling policy (chosen at encode time, e.g. `--tiling`):
+ * - "adaptive" (default): whole-frame levels; tile ONLY a massive scan's full level; a JPEG
+ *   master's full level is the bit-exact lossless transcode. Faster + lossless full (see the
+ *   jpg-full-transcode-vs-jxtc flipflop: transcode ~3.5x faster than JXTC re-encode).
+ * - "tile-all" (Phase 3): every level is a JXTC tile container (uniform tile/region random-access
+ *   decode; the full level is a lossy re-encode even for JPEG masters).
+ */
+export type TilingPolicy = "adaptive" | "tile-all";
+
+function isMassive(width: number, height: number): boolean {
+  return Math.max(width, height) > MASSIVE_LONG_EDGE || width * height > MASSIVE_PIXELS;
+}
+
+export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, profileConvergence = false, tiling: TilingPolicy = "adaptive"): Promise<LadderResult> {
   const { rgba, rgb16, width, height } = decoded;
   const masterLong = Math.max(width, height);
 
@@ -90,7 +109,8 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     return { levels: outLevels, orientation: decoded.orientation, width, height };
   }
 
-  // 8-bit only path (all levels via downscale + encodeTileContainer)
+  // 8-bit only path. Adaptive: whole-frame levels, tile only a massive scan's full level.
+  // Tile-all (Phase 3): every level is a JXTC tile container.
   const levels: PyramidLevelBytes[] = [];
   let cur = rgba;
   let cw = width, ch = height;
@@ -98,6 +118,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
   const p = planLadder(masterLong);
   const targets = [...p.sidecars, { size: masterLong, distance: p.fullDistance }];
   targets.sort((a, b) => b.size - a.size); // L1: descend for correct cascade (full first)
+  const massive = isMassive(width, height);
   let lastW = -1, lastH = -1;
   for (const t of targets) {
     const dst = targetDimsForLongEdge(width, height, t.size);
@@ -107,13 +128,13 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
       cw = dst.w; ch = dst.h;
     }
     lastW = cw; lastH = ch;
+    const isFull = cw === width && ch === height;
+    const tiled = tiling === "tile-all" || (isFull && massive);
     const stagedBytes = cur.byteLength;
-    const data = await jxl.encodeTileContainer(cur, cw, ch, {
-      tileSize: TILE_SIZE,
-      distance: t.distance,
-      effort: EFFORT,
-    });
-    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: true, stagedBytes });
+    const data = tiled
+      ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT })
+      : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }))[0]!.data;
+    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, stagedBytes });
   }
   levels.reverse(); // L1: restore ascending
   // L7
@@ -157,24 +178,23 @@ export async function buildJpgLadder(
   jpeg: Uint8Array,
   profileConvergence = false,
   orientation: Orientation = "source",
+  tiling: TilingPolicy = "adaptive",
 ): Promise<LadderResult> {
-  // For JPG, transcode then decode solely to obtain rgba pixels representing the decoded source;
-  // all levels (incl. full) are then produced as JXTC via encodeTileContainer (no monolithic fallback).
+  // Transcode (lossless JPEG->JXL), then decode once for the downscaled sidecar levels.
   const fullJxl = await jxl.transcodeJpeg(jpeg);
   const decoded = await jxl.decodeToRgba8(fullJxl);
   const w = decoded.width, h = decoded.height;
   const masterLong = Math.max(w, h);
 
-  // consume Agent5: planLadder(master) gives ratio-guarded sides; use its fullDistance for the explicit full
+  // consume Agent5: planLadder(master) gives ratio-guarded sidecars (all < master)
   const p = planLadder(masterLong);
-  const targets = [...p.sidecars, { size: masterLong, distance: p.fullDistance }];
-  targets.sort((a, b) => b.size - a.size); // L1: descend
+  const sidecarTargets = [...p.sidecars].sort((a, b) => b.size - a.size); // L1: descend cascade
 
   const levels: PyramidLevelBytes[] = [];
   let cur = decoded.rgba;
   let cw = w, ch = h;
   let lastW = -1, lastH = -1;
-  for (const t of targets) {
+  for (const t of sidecarTargets) {
     const dst = targetDimsForLongEdge(w, h, t.size);
     if (dst.w === lastW && dst.h === lastH) continue; // L2
     if (dst.w !== cw || dst.h !== ch) {
@@ -182,16 +202,22 @@ export async function buildJpgLadder(
       cw = dst.w; ch = dst.h;
     }
     lastW = cw; lastH = ch;
+    const tiled = tiling === "tile-all";
     const stagedBytes = cur.byteLength;
-    const data = await jxl.encodeTileContainer(cur, cw, ch, {
-      tileSize: TILE_SIZE,
-      distance: t.distance,
-      effort: EFFORT,
-    });
-    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: true, stagedBytes });
+    const data = tiled
+      ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT })
+      : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }))[0]!.data;
+    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, stagedBytes });
   }
-  levels.reverse(); // L1
-  levels.sort((a, b) => Math.max(a.width, a.height) - Math.max(b.width, b.height)); // L7: levels are ascending by long edge
+  // Full level. Adaptive: reuse the bit-exact lossless transcode (fast + lossless — see the
+  // jpg-full-transcode-vs-jxtc flipflop). Tile-all: a lossy JXTC re-encode for uniform tiled decode.
+  if (tiling === "tile-all") {
+    const data = await jxl.encodeTileContainer(decoded.rgba, w, h, { tileSize: TILE_SIZE, distance: p.fullDistance, effort: EFFORT });
+    levels.push({ data, width: w, height: h, bitsPerSample: 8, tiled: true, stagedBytes: decoded.rgba.byteLength });
+  } else {
+    levels.push({ data: fullJxl, width: w, height: h, bitsPerSample: 8, tiled: false, stagedBytes: decoded.rgba.byteLength });
+  }
+  levels.sort((a, b) => Math.max(a.width, a.height) - Math.max(b.width, b.height)); // L7: ascending by long edge
   if (profileConvergence) await attachConverged(jxl, levels);
   return {
     levels,

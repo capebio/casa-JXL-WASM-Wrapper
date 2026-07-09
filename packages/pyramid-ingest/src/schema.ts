@@ -229,6 +229,7 @@ export const cliArgsSchema = z.object({
       message: '--shard must be "i/N" (0-based)',
     }),
   tier: z.enum(["simd", "scalar", "auto"]).optional().default("simd"),
+  tiling: z.enum(["adaptive", "tile-all"]).optional().default("adaptive"),
   "reindex-only": z.boolean().optional().default(false),
   "encoder-threads": z
     .string()
