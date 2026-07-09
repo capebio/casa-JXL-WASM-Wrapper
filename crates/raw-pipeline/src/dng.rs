@@ -1728,6 +1728,16 @@ pub fn decode_bytes_demosaiced(data: &[u8]) -> Result<DngDemosaiced> {
     decode_bytes_demosaiced_impl(data, true)
 }
 
+/// Fused decode + MHC demosaic while preserving the sensor black pedestal.
+///
+/// This is byte-equivalent to `decode_bytes(data)` followed by
+/// `demosaic_bayer_mhc(..., cfa_phase(img.cfa))`, but avoids keeping the full
+/// Bayer mosaic live alongside the full RGB16 buffer for tiled RGGB DNGs.
+#[doc(hidden)]
+pub fn decode_bytes_demosaiced_preserve_black(data: &[u8]) -> Result<DngDemosaiced> {
+    decode_bytes_demosaiced_impl(data, false)
+}
+
 /// Internal impl with switch for "newer code" (subtract_black=true, clean linear for Lens17/photogram/AR)
 /// vs "old code" (false, preserve bias like pre-clean-linear change). Used for targeted flip-flop tests.
 pub(crate) fn decode_bytes_demosaiced_impl(
@@ -1890,7 +1900,6 @@ pub(crate) fn decode_bytes_demosaiced_impl(
 
         let tdec = Instant::now();
         band.resize(width * row_h, 0);
-        band.fill(0);
         for tc in 0..coltiles {
             let idx = tr * coltiles + tc;
             let off = raw.tile_offsets[idx] as usize;
@@ -1922,7 +1931,6 @@ pub(crate) fn decode_bytes_demosaiced_impl(
         // ctx = [top halo | band | bottom (replicate for this pass)]
         let ctx_h = halo + row_h + halo;
         ctx.resize(width * ctx_h, 0);
-        ctx.fill(0);
         if tr == 0 {
             if row_h > 0 {
                 let first = &band[0..width];

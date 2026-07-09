@@ -4254,65 +4254,6 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     let t = now_ms();
     let mut rgb16 = demosaic::demosaic_bayer_mhc(&cr2.raw, w, h, cr2.cfa_phase)
         .map_err(|e| JsError::new(&format!("CR2 demosaic: {}", e)))?;
-
-    // Guard: detect Bayer phase mismatch by checking green channel sanity.
-    // A correctly demosaiced natural image has G roughly between R and B and
-    // the green mean > 1/8 of the red mean.  When the crop origin lands on a
-    // wrong CFA site (e.g. due to odd left_margin on this body), green
-    // collapses to near-zero while R and B stay plausible.  In that case
-    // re-try the three remaining Bayer phases and accept the first one that
-    // restores G to a sensible fraction of max(R, B).  This fires only on
-    // pathological input and does not change output for correctly-phased files.
-    {
-        let n = rgb16.len() / 3;
-        if n > 0 {
-            let (mut sum_r, mut sum_g, mut sum_b) = (0u64, 0u64, 0u64);
-            // Sample at most 4096 pixels evenly to keep the check O(1) for large images.
-            let step = (n / 4096).max(1);
-            let mut count = 0u64;
-            let mut i = 0;
-            while i < n {
-                sum_r += rgb16[i * 3] as u64;
-                sum_g += rgb16[i * 3 + 1] as u64;
-                sum_b += rgb16[i * 3 + 2] as u64;
-                count += 1;
-                i += step;
-            }
-            let mean_r = (sum_r / count) as u32;
-            let mean_g = (sum_g / count) as u32;
-            let mean_b = (sum_b / count) as u32;
-            let max_rb = mean_r.max(mean_b);
-            // Phase error signature: G << max(R,B)/8 while R and B are plausible.
-            if max_rb > 0 && mean_g < max_rb / 8 {
-                // Try the other three phases; accept the first that brings G into
-                // the range [max_rb/4 .. 4*max_rb].
-                const ALT_PHASES: [(u8, u8); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
-                for &phase in &ALT_PHASES {
-                    if phase == cr2.cfa_phase {
-                        continue;
-                    }
-                    if let Ok(candidate) = demosaic::demosaic_bayer_mhc(&cr2.raw, w, h, phase) {
-                        let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
-                        let mut ci = 0;
-                        let mut k = 0u64;
-                        while ci < n {
-                            sr += candidate[ci * 3] as u64;
-                            sg += candidate[ci * 3 + 1] as u64;
-                            sb += candidate[ci * 3 + 2] as u64;
-                            k += 1;
-                            ci += step;
-                        }
-                        let cg = (sg / k) as u32;
-                        let crb = ((sr / k) as u32).max((sb / k) as u32);
-                        if crb > 0 && cg >= crb / 4 && cg <= crb * 4 {
-                            rgb16 = candidate;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
     let demosaic_ms = now_ms() - t;
 
     let mut params = pipeline::PipelineParams::default_olympus();

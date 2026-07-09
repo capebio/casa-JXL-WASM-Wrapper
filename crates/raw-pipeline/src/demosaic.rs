@@ -1531,6 +1531,13 @@ pub fn demosaic_bayer_mhc_band(
     let w_max = (width - 1) as isize;
     let h_max = (ctx_h - 1) as isize;
     let phase = (phase.0 as usize, phase.1 as usize);
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = width >= 20 && ctx_h >= 5 && std::is_x86_feature_detected!("avx2");
+    let (int_start, int_end) = if width >= 4 {
+        (2usize, width - 2)
+    } else {
+        (width, width)
+    };
 
     // Safety: ctx_row is checked below against ctx_h-1; col is clamped to width-1.
     // The unsafe at() call uses get_unchecked only when the bounds have been validated above.
@@ -1548,7 +1555,8 @@ pub fn demosaic_bayer_mhc_band(
         let r_n2 = clamp(r - 2, 0, h_max);
         let r_s2 = clamp(r + 2, 0, h_max);
         let out_base = local_row * width * 3;
-        for col in 0..width {
+        let out_row = &mut rgb_out[out_base..out_base + width * 3];
+        for col in 0..int_start {
             let c = col as isize;
             let (rr, gg, bb) = mhc_pixel_phased(
                 ctx,
@@ -1565,10 +1573,61 @@ pub fn demosaic_bayer_mhc_band(
                 clamp(c + 2, 0, w_max),
                 phase,
             );
-            let o = out_base + col * 3;
-            rgb_out[o] = rr as u16;
-            rgb_out[o + 1] = gg as u16;
-            rgb_out[o + 2] = bb as u16;
+            let o = col * 3;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
+        }
+        let mut scalar_start = int_start;
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 && ctx_row >= 2 && ctx_row + 2 <= h_max as usize && int_end > int_start {
+            // SAFETY: AVX2 detected; ctx_row +/- 2 and cols [2, width-2) are in-bounds.
+            scalar_start = unsafe {
+                mhc_row_interior_avx2(ctx, width, ctx_row, int_start, int_end, phase, out_row)
+            };
+        }
+        for col in scalar_start..int_end {
+            let (rr, gg, bb) = mhc_pixel_phased(
+                ctx,
+                width,
+                ctx_row,
+                r_n,
+                r_s,
+                r_n2,
+                r_s2,
+                col,
+                col - 1,
+                col + 1,
+                col - 2,
+                col + 2,
+                phase,
+            );
+            let o = col * 3;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
+        }
+        for col in int_end..width {
+            let c = col as isize;
+            let (rr, gg, bb) = mhc_pixel_phased(
+                ctx,
+                width,
+                ctx_row,
+                r_n,
+                r_s,
+                r_n2,
+                r_s2,
+                col,
+                clamp(c - 1, 0, w_max),
+                clamp(c + 1, 0, w_max),
+                clamp(c - 2, 0, w_max),
+                clamp(c + 2, 0, w_max),
+                phase,
+            );
+            let o = col * 3;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
         }
     }
 
@@ -1921,6 +1980,15 @@ pub fn demosaic_rggb_mhc_band(
     }
     let w_max = (width - 1) as isize;
     let h_max = (ctx_h - 1) as isize;
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = width >= 20 && ctx_h >= 5 && std::is_x86_feature_detected!("avx2");
+    let (int_start, int_end) = if width >= 4 {
+        (2usize, width - 2)
+    } else {
+        (width, width)
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = int_end;
 
     // Uses shared mhc_pixel_phased(..., (0,0)) below for RGGB band (dng fused path).
     // (The local copy was removed for DRY; phase param makes it general.)
@@ -1950,10 +2018,32 @@ pub fn demosaic_rggb_mhc_band(
         let row_here = &ctx[r_c * width..r_c * width + width];
         let row_south = &ctx[r_s * width..r_s * width + width];
         let row_s2 = &ctx[r_s2 * width..r_s2 * width + width];
+        let mut scalar_start = int_start;
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 && local >= 2 && local + 2 <= h_max as usize && int_end > int_start {
+            // SAFETY: AVX2 detected; local +/- 2 and cols [2, width-2) are in-bounds.
+            scalar_start = unsafe {
+                mhc_row_interior_avx2(
+                    ctx,
+                    width,
+                    local,
+                    int_start,
+                    int_end,
+                    (0, 0),
+                    &mut rgb_out[out_base..out_base + width * 3],
+                )
+            };
+        }
         // Lens 23: pointer advance for the output row writes in the band hot loop (DNG fused path).
         // Avoids repeated mul + indexing; complements the SIMD black and bilinear paths.
         let mut out_ptr = unsafe { rgb_out.as_mut_ptr().add(out_base) };
         for col in 0..width {
+            if col == int_start && scalar_start > int_start {
+                out_ptr = unsafe { rgb_out.as_mut_ptr().add(out_base + scalar_start * 3) };
+            }
+            if col >= int_start && col < scalar_start {
+                continue;
+            }
             let c = col as isize;
             // Use pre-hoisted slices for direct indexing; fall back to clamped column access
             // at boundaries (col 0/1 and col w_max-1/w_max) via the clamp helpers below.
