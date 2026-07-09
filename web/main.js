@@ -2222,6 +2222,9 @@ async function handleFileList(fileList) {
 // plus developed images (EXR, TIFF, JPEG) which the worker decodes via decode_exr/
 // decode_tiff/decode_jpeg and renders through the same LookRenderer live-edit
 // engine. JPEG additionally supports lossless archival export (transcodeJpegToJxl).
+// The native RAW *pipeline* only decodes ORF/CR2/DNG; the other RAW families go
+// through the LibRaw decode path, and the JPEG-proxy fast path (setProxyView(true))
+// can render any of them (or a JPG as itself) from their embedded preview.
 function isPipelineInputFile(file) {
     const name = file?.name || '';
     return isRawFilename(name) || /\.(exr|tif|tiff|jpg|jpeg|jfif)$/i.test(name);
