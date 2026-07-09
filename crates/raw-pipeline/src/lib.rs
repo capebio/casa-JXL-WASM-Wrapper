@@ -40,6 +40,8 @@ pub mod mem_budget;
 // parity). Pure + additive; native + wasm. See
 // docs/2026-07-08-hardware-adaptive-calibration-design.md.
 pub mod calibration;
+// ORF fast JPEG-proxy decode path (decode-crush campaign). Additive; native + wasm.
+pub mod orf_proxy;
 pub mod perceptual;
 pub mod pipeline;
 pub mod stream_preview;

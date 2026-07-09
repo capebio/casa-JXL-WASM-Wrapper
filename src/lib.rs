@@ -224,6 +224,144 @@ pub fn demosaic_bench_shuffle_first_diff() -> i32 {
     })
 }
 
+// === WASM decompress refill A/B (bench-only; driven by tools/decompress-flipflop.mjs) ===
+// Compares the byte-loop refill (WIDE=false) against the u64 wide/SIMD refill (WIDE=true —
+// i8x16.swizzle byteswap on simd128) on a synthetic Olympus bitstream, in ONE build. This is
+// the measurement the wide-refill wasm deferral (Questions_deferred D-wide-refill) never had.
+// `_equal` is the bit-exact correctness pin. Output buffer is reused so the timed ratio isn't
+// diluted by a per-call alloc (both sides would pay it equally anyway).
+thread_local! {
+    static DECOMP_BENCH: RefCell<(Vec<u8>, usize, usize, Vec<u16>)> =
+        const { RefCell::new((Vec::new(), 0, 0, Vec::new())) };
+}
+#[wasm_bindgen]
+pub fn decompress_bench_prepare(w: usize, h: usize, seed: u32) {
+    let payload = decompress::bench_synth_payload(w, h, (seed as u64) ^ 0x9E37_79B9_7F4A_7C15);
+    DECOMP_BENCH.with(|b| *b.borrow_mut() = (payload, w, h, vec![0u16; w * h]));
+}
+#[wasm_bindgen]
+pub fn decompress_bench_byteloop() -> u32 {
+    DECOMP_BENCH.with(|b| {
+        let mut g = b.borrow_mut();
+        let (p, w, h, out) = &mut *g;
+        decompress::bench_decode_rows_into::<false>(p, *w, *h, *h, out).unwrap();
+        demo_checksum(out)
+    })
+}
+#[wasm_bindgen]
+pub fn decompress_bench_wide() -> u32 {
+    DECOMP_BENCH.with(|b| {
+        let mut g = b.borrow_mut();
+        let (p, w, h, out) = &mut *g;
+        decompress::bench_decode_rows_into::<true>(p, *w, *h, *h, out).unwrap();
+        demo_checksum(out)
+    })
+}
+#[wasm_bindgen]
+pub fn decompress_bench_equal() -> bool {
+    DECOMP_BENCH.with(|b| {
+        let g = b.borrow();
+        let (p, w, h, _) = &*g;
+        let mut a = vec![0u16; w * h];
+        let mut c = vec![0u16; w * h];
+        decompress::bench_decode_rows_into::<false>(p, *w, *h, *h, &mut a).unwrap();
+        decompress::bench_decode_rows_into::<true>(p, *w, *h, *h, &mut c).unwrap();
+        a == c
+    })
+}
+
+// === WASM demosaic(MHC)+tone MT A/B (bench-only) ===
+// The 990ms benchmark runs these SINGLE-THREADED (StandardMultifileTest never calls
+// initThreadPool). These exports let a headless-Chrome harness time them with the rayon
+// pool engaged (initThreadPool(N)) — quantifying how much of the "990ms" is a threads-off
+// artifact. The par paths are `#[cfg(feature="parallel")]`; a non-parallel pkg-bench build
+// times the ST baseline, the parallel-wasm pkg times MT.
+thread_local! {
+    static DEMTONE_BENCH: RefCell<(Vec<u16>, Vec<u16>, usize, usize, Vec<u8>)> =
+        const { RefCell::new((Vec::new(), Vec::new(), 0, 0, Vec::new())) };
+}
+#[wasm_bindgen]
+pub fn demtone_bench_prepare(w: usize, h: usize) {
+    // Deterministic synthetic Bayer mosaic + one MHC demosaic to seed the tone input.
+    let raw: Vec<u16> = (0..w * h).map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16).collect();
+    let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+    DEMTONE_BENCH.with(|b| *b.borrow_mut() = (raw, rgb16, w, h, vec![0u8; w * h * 3]));
+}
+#[wasm_bindgen]
+pub fn demtone_bench_mhc() -> u32 {
+    DEMTONE_BENCH.with(|b| {
+        let g = b.borrow();
+        let (raw, _, w, h, _) = &*g;
+        demo_checksum(&demosaic::demosaic_rggb_mhc(raw, *w, *h).unwrap())
+    })
+}
+#[wasm_bindgen]
+pub fn demtone_bench_tone() -> u32 {
+    DEMTONE_BENCH.with(|b| {
+        let mut g = b.borrow_mut();
+        let (_, rgb16, _w, _h, out) = &mut *g;
+        let params = raw_pipeline::pipeline::PipelineParams::default_olympus();
+        raw_pipeline::pipeline::process_into_auto(rgb16, &params, out);
+        out.iter().fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
+    })
+}
+
+// === WASM #3 pipeline A/B (bench-only, browser + initThreadPool) ===
+// Sequential (decompress whole → demosaic_rggb_mhc → process_into_auto, both MT via par) vs
+// pipelined (producer decodes strips serially while par_bridge consumers demosaic+tone them,
+// overlapping the parallel demosaic+tone with the serial decode). `_equal` pins byte-identity.
+struct PipeBench { payload: Vec<u8>, w: usize, h: usize, params: raw_pipeline::pipeline::PipelineParams, out: Vec<u8> }
+thread_local! {
+    static PIPE_BENCH: RefCell<Option<PipeBench>> = const { RefCell::new(None) };
+}
+#[wasm_bindgen]
+pub fn pipeline_bench_prepare(w: usize, h: usize, seed: u32) {
+    let payload = decompress::bench_synth_payload(w, h, (seed as u64) ^ 0xA5A5_1234_ABCD_0001);
+    let params = raw_pipeline::pipeline::PipelineParams::default_olympus();
+    PIPE_BENCH.with(|b| *b.borrow_mut() = Some(PipeBench { payload, w, h, params, out: vec![0u8; w * h * 3] }));
+}
+#[wasm_bindgen]
+pub fn pipeline_bench_pipelined() -> u32 {
+    PIPE_BENCH.with(|b| {
+        let mut g = b.borrow_mut();
+        let pb = g.as_mut().unwrap();
+        let src = decompress::OrfRowDecoder::new(&pb.payload, pb.w, pb.h).unwrap();
+        raw_pipeline::stream_band::decode_demosaic_tone_pipelined(src, &pb.params, (0, 0), &mut pb.out).unwrap();
+        demo_checksum_u8(&pb.out)
+    })
+}
+#[wasm_bindgen]
+pub fn pipeline_bench_sequential() -> u32 {
+    PIPE_BENCH.with(|b| {
+        let mut g = b.borrow_mut();
+        let pb = g.as_mut().unwrap();
+        let mut raw = vec![0u16; pb.w * pb.h];
+        decompress::decompress_rows_into(&pb.payload, pb.w, pb.h, pb.h, &mut raw).unwrap();
+        let rgb16 = demosaic::demosaic_rggb_mhc(&raw, pb.w, pb.h).unwrap();
+        raw_pipeline::pipeline::process_into_auto(&rgb16, &pb.params, &mut pb.out);
+        demo_checksum_u8(&pb.out)
+    })
+}
+#[wasm_bindgen]
+pub fn pipeline_bench_equal() -> bool {
+    PIPE_BENCH.with(|b| {
+        let g = b.borrow();
+        let pb = g.as_ref().unwrap();
+        let mut seq = vec![0u8; pb.w * pb.h * 3];
+        let mut raw = vec![0u16; pb.w * pb.h];
+        decompress::decompress_rows_into(&pb.payload, pb.w, pb.h, pb.h, &mut raw).unwrap();
+        let rgb16 = demosaic::demosaic_rggb_mhc(&raw, pb.w, pb.h).unwrap();
+        raw_pipeline::pipeline::process_into_auto(&rgb16, &pb.params, &mut seq);
+        let mut pip = vec![0u8; pb.w * pb.h * 3];
+        let src = decompress::OrfRowDecoder::new(&pb.payload, pb.w, pb.h).unwrap();
+        raw_pipeline::stream_band::decode_demosaic_tone_pipelined(src, &pb.params, (0, 0), &mut pip).unwrap();
+        seq == pip
+    })
+}
+fn demo_checksum_u8(v: &[u8]) -> u32 {
+    v.iter().fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
+}
+
 /// Result of processing an ORF: RGB8 buffer + dims (post-orientation).
 #[wasm_bindgen]
 pub struct ProcessResult {
