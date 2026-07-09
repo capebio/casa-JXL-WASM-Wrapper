@@ -1730,6 +1730,40 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
         Vec::new()
     };
 
+    // CFA-phase refinement — mirror the batch path (`decode_impl` calls
+    // `refine_cfa_phase_by_green` after cropping). `choose_crop_origin` derives the
+    // phase from SensorInfo/center parity, which is wrong for some bodies (green
+    // lands on the R/B diagonal → magenta). The batch path verifies against the
+    // actual cropped green sites and flips the phase; the streaming row-source MUST
+    // use the same refined phase or the band-pull demosaic diverges from the batch
+    // path (regression-gated by cr2_multi_slice_full_rgb_sha_parity — the raw rows
+    // are bit-identical, so any RGB8 divergence is a phase/params mismatch here).
+    // Materialize the cropped mosaic exactly as `decode_impl` does, refine, drop it.
+    let cfa_phase = {
+        let cropped = if have_slices {
+            reassemble_slices_crop(
+                &raw,
+                stride,
+                sof_h,
+                cr2_slices[0] as usize,
+                cr2_slices[1] as usize,
+                cr2_slices[2] as usize,
+                left,
+                top,
+                crop_w,
+                crop_h,
+            )
+        } else {
+            let mut c = Vec::with_capacity(crop_w * crop_h);
+            for row in 0..crop_h {
+                let s = (top + row) * stride + left;
+                c.extend_from_slice(&raw[s..s + crop_w]);
+            }
+            c
+        };
+        refine_cfa_phase_by_green(&cropped, crop_w, crop_h, cfa_phase)
+    };
+
     Ok(Cr2RowSource {
         raw,
         width: crop_w,
