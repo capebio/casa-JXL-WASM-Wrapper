@@ -362,6 +362,19 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
     Some(crate::dng::mul3x3(crate::dng::XYZ_D50_TO_SRGB, cam_to_xyz))
 }
 
+fn canon_default_black_white(precision: u8, model: &str) -> (u16, u16) {
+    match precision {
+        14 if model.eq_ignore_ascii_case("Canon EOS M5") => (512u16, 15300u16),
+        14 => (2048u16, 15300u16),
+        12 => (512u16, 4095u16),
+        // precision is an unchecked u8 from the LJPEG SOF3 marker. `1u16 << precision`
+        // overflows (panic in debug, wrong value in release) for precision >= 16. Guard:
+        // precision >= 16 saturates white to u16::MAX; valid 8/10-bit paths are unchanged.
+        _ if precision >= 16 => (0u16, u16::MAX),
+        _ => (0u16, (1u16 << precision).saturating_sub(1)),
+    }
+}
+
 /// Data-driven CFA (Bayer) phase correction from green-site equality.
 ///
 /// In a 2×2 Bayer cell the two GREEN sites sample the same colour, so they are the
@@ -1193,15 +1206,7 @@ fn decode_impl(
     // -----------------------------------------------------------------------
     // Black/white levels: IFD value overrides precision-table default (item 1)
     // -----------------------------------------------------------------------
-    let (mut black, white) = match precision {
-        14 => (2048u16, 15300u16),
-        12 => (512u16, 4095u16),
-        // precision is an unchecked u8 from the LJPEG SOF3 marker. `1u16 << precision`
-        // overflows (panic in debug, wrong value in release) for precision >= 16. Guard:
-        // precision >= 16 saturates white to u16::MAX; valid 8/10-bit paths are unchanged.
-        _ if precision >= 16 => (0u16, u16::MAX),
-        _ => (0u16, (1u16 << precision).saturating_sub(1)),
-    };
+    let (mut black, white) = canon_default_black_white(precision, &model);
     if black_from_ifd > 0 && black_from_ifd < white {
         black = black_from_ifd;
     }
@@ -1672,12 +1677,7 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
         .with_context(|| "CR2: LJPEG decode failed")?;
 
     // Black/white defaults from SOF precision, overridden by IFD tag
-    let (mut black, white) = match precision {
-        14 => (2048u16, 15300u16),
-        12 => (512u16, 4095u16),
-        _ if precision >= 16 => (0u16, u16::MAX),
-        _ => (0u16, (1u16 << precision).saturating_sub(1)),
-    };
+    let (mut black, white) = canon_default_black_white(precision, &model);
     if black_from_ifd > 0 && black_from_ifd < white {
         black = black_from_ifd;
     }
@@ -2238,5 +2238,18 @@ mod tests {
             );
         }
         assert!(canon_color_matrix("OM Digital Solutions", "OM-5").is_none());
+    }
+
+    #[test]
+    fn eos_m5_uses_512_black_default_when_file_has_no_black_tag() {
+        let path = std::path::Path::new(r"C:\Foo\raw-converter\tests\ADH 1248.CR2");
+        if !path.exists() {
+            eprintln!("SKIP: {:?} not present", path);
+            return;
+        }
+        let data = std::fs::read(path).expect("read M5 fixture");
+        let img = decode_bytes(&data).expect("decode M5 fixture");
+        assert_eq!(img.model, "Canon EOS M5");
+        assert_eq!(img.black, 512);
     }
 }
