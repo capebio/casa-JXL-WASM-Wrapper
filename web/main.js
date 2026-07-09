@@ -501,6 +501,29 @@ function currentOptions() {
     };
 }
 
+// --- JPEG proxy-view fast path (opt-in) --------------------------------------
+// When enabled, a card is completed from its embedded camera-JPEG preview (Phase A)
+// and the full RAW decode is SKIPPED — ~25-30x faster, at the cost of the camera's
+// rendering instead of the custom pipeline. Falls back to the RAW decode when no
+// embedded preview exists. Default OFF (the interactive editor needs the RAW decode);
+// enable via the console `setProxyView(true)` then re-ingest, or wire a UI checkbox to
+// it. Persists in localStorage.
+let proxyViewMode = (() => { try { return localStorage.getItem('proxyView') === '1'; } catch { return false; } })();
+window.setProxyView = (on) => { proxyViewMode = !!on; try { localStorage.setItem('proxyView', on ? '1' : '0'); } catch {} return proxyViewMode; };
+function proxyCompleteCard(card, largest) {
+    // The embedded preview IS the deliverable: it is already drawn on the card canvas
+    // (drawOrientedThumb in Phase A). Show the JPEG download, mark done — no RAW decode.
+    getCardState(card)._sourceMode = 'jpeg';
+    getCardState(card)._proxyView = true;
+    card.classList.remove('busy', 'embedded-thumb', 'encoding');
+    const dl = card.querySelector('.thumb-dl-btn'); if (dl) dl.hidden = false;
+    getCardState(card)._meta = `${largest.w}×${largest.h} • camera JPEG (proxy — RAW decode skipped)`;
+    const sizeEl = card.querySelector('.size'); if (sizeEl) sizeEl.textContent = 'JPEG';
+    refreshThumbToggleButton(card);
+    totalDone++;
+    refreshStatus();
+}
+
 qualityRange.addEventListener('input', () => {
     qualityLabel.textContent = qualityRange.value;
 });
@@ -1908,7 +1931,7 @@ function startConvert(file, existingCard) {
         // Fall back to JPEG EXIF only if the RAW header is unreadable.
         const rawOrientation = readOrfOrientation(bytes);
         const candidates = extractEmbeddedJpegs(bytes);
-        if (!candidates.length) return;
+        if (!candidates.length) { if (proxyViewMode) dispatchRaw(); return; }
         Promise.allSettled(
             candidates.map(c => {
                 const orientation = rawOrientation !== 1 ? rawOrientation : readJpegOrientation(c);
@@ -1934,7 +1957,7 @@ function startConvert(file, existingCard) {
             // estimate_decode_peak model. On rejection we surface a user-visible
             // error on the card instead of letting the worker OOM. Non-admission
             // errors (e.g. estimator quirks) must never break ingest.
-            try {
+            if (!proxyViewMode) try {
                 const peak = estimateDecodePeak(largest.w, largest.h, OUT_BATCH_DEFAULT).peakBytes;
                 rawDecodeGovernor.admit(peak, {
                     multiplier: RAW_DECODE_SAFETY_MULT,
@@ -1967,6 +1990,13 @@ function startConvert(file, existingCard) {
             getCardState(card)._embeddedPreview = { bmp: largest.bmp, w: largest.w, h: largest.h,
                                       orientation: largest.orientation };
             refreshThumbToggleButton(card);
+            if (proxyViewMode) {
+                // Proxy fast path: the camera JPEG is the deliverable — complete the card,
+                // skip the RAW decode. Close the non-largest candidate bitmaps first.
+                for (let vi = 0; vi < valid.length - 1; vi++) { try { valid[vi].bmp.close(); } catch {} }
+                proxyCompleteCard(card, largest);
+                return;
+            }
             if (lightboxIndex >= 0 && cards[lightboxIndex] === card) {
                 if (!getCardState(card)._lightbox) {
                     // drawLightboxForCard ends with syncZoomToDisplayLong()
@@ -1980,9 +2010,13 @@ function startConvert(file, existingCard) {
 
             for (let vi = 0; vi < valid.length - 1; vi++) valid[vi].bmp.close();
         });
-    }).catch(() => {}); // preview failure is non-fatal
+    }).catch(() => { if (proxyViewMode) dispatchRaw(); }); // preview failure is non-fatal (proxy: fall back to RAW)
 
-    // Phase B+C — full file read for WASM pipeline + JXL encode.
+    // Phase B+C — full file read for WASM pipeline + JXL encode. Wrapped in a hoisted
+    // fn so the proxy-view fast path (Phase A) can skip it. Dispatched immediately below
+    // unless proxyViewMode is on — then Phase A completes the card from the embedded JPEG,
+    // or falls back to dispatchRaw() when there is no usable preview.
+    function dispatchRaw() {
     file.arrayBuffer()
         .then((buf) => {
             const bytes = new Uint8Array(buf);
@@ -2140,6 +2174,8 @@ function startConvert(file, existingCard) {
             totalDone++;
             refreshStatus();
         });
+    } // end dispatchRaw
+    if (!proxyViewMode) dispatchRaw();
 }
 
 function fmtAvg(ms) {
