@@ -1439,6 +1439,23 @@ export function decode_exr(bytes) {
 }
 
 /**
+ * Decode a JPEG to RGBA8 for the developed-image edit path (mirrors
+ * `decode_tiff`/`decode_exr`). The lossless archival transcode is a separate
+ * facade path (`transcodeJpegToJxl`); this is the editable-pixels decode.
+ * @param {Uint8Array} bytes
+ * @returns {DecodedImage}
+ */
+export function decode_jpeg(bytes) {
+    const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.decode_jpeg(ptr0, len0);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return DecodedImage.__wrap(ret[0]);
+}
+
+/**
  * Decode a general RGB(A) TIFF (u8 or u16) to RGBA.
  * @param {Uint8Array} bytes
  * @returns {DecodedImage}
@@ -1451,6 +1468,39 @@ export function decode_tiff(bytes) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return DecodedImage.__wrap(ret[0]);
+}
+
+/**
+ * @returns {number}
+ */
+export function decompress_bench_byteloop() {
+    const ret = wasm.decompress_bench_byteloop();
+    return ret >>> 0;
+}
+
+/**
+ * @returns {boolean}
+ */
+export function decompress_bench_equal() {
+    const ret = wasm.decompress_bench_equal();
+    return ret !== 0;
+}
+
+/**
+ * @param {number} w
+ * @param {number} h
+ * @param {number} seed
+ */
+export function decompress_bench_prepare(w, h, seed) {
+    wasm.decompress_bench_prepare(w, h, seed);
+}
+
+/**
+ * @returns {number}
+ */
+export function decompress_bench_wide() {
+    const ret = wasm.decompress_bench_wide();
+    return ret >>> 0;
 }
 
 /**
@@ -1546,6 +1596,30 @@ export function demosaic_bench_shuffle_simd() {
  */
 export function demosaic_bench_simd() {
     const ret = wasm.demosaic_bench_simd();
+    return ret >>> 0;
+}
+
+/**
+ * @returns {number}
+ */
+export function demtone_bench_mhc() {
+    const ret = wasm.demtone_bench_mhc();
+    return ret >>> 0;
+}
+
+/**
+ * @param {number} w
+ * @param {number} h
+ */
+export function demtone_bench_prepare(w, h) {
+    wasm.demtone_bench_prepare(w, h);
+}
+
+/**
+ * @returns {number}
+ */
+export function demtone_bench_tone() {
+    const ret = wasm.demtone_bench_tone();
     return ret >>> 0;
 }
 
@@ -2047,6 +2121,39 @@ export function perc_xyb_simd(px, n) {
     var v2 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
     return v2;
+}
+
+/**
+ * @returns {boolean}
+ */
+export function pipeline_bench_equal() {
+    const ret = wasm.pipeline_bench_equal();
+    return ret !== 0;
+}
+
+/**
+ * @returns {number}
+ */
+export function pipeline_bench_pipelined() {
+    const ret = wasm.pipeline_bench_pipelined();
+    return ret >>> 0;
+}
+
+/**
+ * @param {number} w
+ * @param {number} h
+ * @param {number} seed
+ */
+export function pipeline_bench_prepare(w, h, seed) {
+    wasm.pipeline_bench_prepare(w, h, seed);
+}
+
+/**
+ * @returns {number}
+ */
+export function pipeline_bench_sequential() {
+    const ret = wasm.pipeline_bench_sequential();
+    return ret >>> 0;
 }
 
 /**
