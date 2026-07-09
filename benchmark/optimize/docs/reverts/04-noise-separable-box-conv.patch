@@ -1,0 +1,220 @@
+diff --git a/lib/jxl/dec_cache.cc b/lib/jxl/dec_cache.cc
+index 456513c8..0974bf9e 100644
+--- a/lib/jxl/dec_cache.cc
++++ b/lib/jxl/dec_cache.cc
+@@ -216,7 +216,8 @@ Status PassesDecoderState::PreparePipeline(const FrameHeader& frame_header,
+   // Upsampling does not have xextra as well (even if it happens before
+   // splines/patches for EC).
+   if (options.render_noise) {
+-    JXL_RETURN_IF_ERROR(builder.AddStage(GetConvolveNoiseStage(num_c)));
++    JXL_RETURN_IF_ERROR(
++        builder.AddStage(GetConvolveNoiseStage(memory_manager, num_c)));
+     JXL_RETURN_IF_ERROR(builder.AddStage(GetAddNoiseStage(
+         shared->image_features.noise_params, shared->cmap.base(), num_c)));
+   }
+diff --git a/lib/jxl/render_pipeline/stage_noise.cc b/lib/jxl/render_pipeline/stage_noise.cc
+index bd72d54e..fd92fde3 100644
+--- a/lib/jxl/render_pipeline/stage_noise.cc
++++ b/lib/jxl/render_pipeline/stage_noise.cc
+@@ -5,11 +5,15 @@
+ 
+ #include "lib/jxl/render_pipeline/stage_noise.h"
+ 
++#include <jxl/memory_manager.h>
++
++#include <algorithm>
+ #include <cstddef>
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ #include <memory>
++#include <vector>
+ 
+ #include "lib/jxl/base/common.h"
+ #include "lib/jxl/base/compiler_specific.h"
+@@ -17,6 +21,7 @@
+ #include "lib/jxl/base/status.h"
+ #include "lib/jxl/chroma_from_luma.h"
+ #include "lib/jxl/frame_dimensions.h"
++#include "lib/jxl/memory_manager_internal.h"
+ #include "lib/jxl/noise.h"
+ #include "lib/jxl/render_pipeline/render_pipeline_stage.h"
+ 
+@@ -257,43 +262,82 @@ std::unique_ptr<RenderPipelineStage> GetAddNoiseStage(
+ 
+ class ConvolveNoiseStage : public RenderPipelineStage {
+  public:
+-  explicit ConvolveNoiseStage(size_t first_c)
++  explicit ConvolveNoiseStage(JxlMemoryManager* memory_manager, size_t first_c)
+       : RenderPipelineStage(
+             RenderPipelineStage::Settings::SymmetricBorderOnly(2)),
+-        first_c_(first_c) {}
++        first_c_(first_c),
++        memory_manager_(memory_manager) {}
+ 
+   Status ProcessRow(const RowInfo& input_rows, const RowInfo& output_rows,
+                     size_t xextra_left, size_t xextra_right, size_t xsize,
+                     size_t xpos, size_t ypos, size_t thread_id) const final {
+     const HWY_FULL(float) d;
+ 
+-    // TODO(eustas): check if aligning is useful.
+-    ptrdiff_t x_start = -static_cast<ptrdiff_t>(xextra_left);
+-    ptrdiff_t x_end = static_cast<ptrdiff_t>(xsize + xextra_right);
++    // Every stage from GetConvolveNoiseStage onwards is invoked with zero
++    // xextra (see dec_cache.cc), so the horizontal span is exactly [0, xsize).
++    // The separable pass below relies on this (the column-sum scratch is only
++    // sized for the [0, xsize) window plus the +/-2 box halo).
++    JXL_ENSURE(xextra_left == 0 && xextra_right == 0);
++
++    // The 5x5 stage kernel is `out = 0.16 * others - 3.84 * center`, where
++    // `others` is the sum of the 24 non-center taps. Writing B for the full
++    // 5x5 box sum (others + center) this is algebraically
++    //   out = 0.16 * B - 4.0 * center.
++    // A box is separable (rank-1), so B = horizontal-box(vertical-colsum).
++    // Recomputing the 5-row vertical sum once per column (into `colsum`) and
++    // then a 5-wide horizontal sum drops the per-output work from ~25 loads /
++    // 24 adds to ~11 loads / 8 adds. This reassociates the float additions, so
++    // it is NOT bit-exact with the dense form; the operand is synthetic noise
++    // being shaped, so the perceptual effect is negligible (Butteraugli-gated).
++    const auto k016 = Set(d, 0.16f);
++    const auto kNeg4 = Set(d, -4.0f);
++
++    // The vector-width vertical loads may reach a few floats past `xsize + 2`
++    // (into the row's allocated slack). Unpoison that tail so a native MSan
++    // build does not flag the read; only arithmetic is done on it and the
++    // horizontal box never emits it. Mirrors AddNoiseStage / UpsamplingStage.
++    const size_t xsize_v = RoundUpTo(xsize, Lanes(d));
++    const size_t tail = (xsize_v - xsize) + 2 * Lanes(d);
+ 
+     for (size_t c = first_c_; c < first_c_ + 3; c++) {
+-      float* JXL_RESTRICT rows[5];
+-      for (size_t i = 0; i < 5; i++) {
+-        rows[i] = GetInputRow(input_rows, c, i - 2);
+-      }
++      float* JXL_RESTRICT row_in = GetInputRow(input_rows, c, 0);
++      float* JXL_RESTRICT row_t2 = GetInputRow(input_rows, c, -2);
++      float* JXL_RESTRICT row_t1 = GetInputRow(input_rows, c, -1);
++      float* JXL_RESTRICT row_b1 = GetInputRow(input_rows, c, 1);
++      float* JXL_RESTRICT row_b2 = GetInputRow(input_rows, c, 2);
+       float* JXL_RESTRICT row_out = GetOutputRow(output_rows, c, 0);
+-      for (ptrdiff_t x = x_start; x < x_end; x += Lanes(d)) {
+-        const auto p00 = LoadU(d, rows[2] + x);
+-        auto others = Zero(d);
+-        // TODO(eustas): sum loaded values to reduce the calculation chain
+-        for (ptrdiff_t i = -2; i <= 2; i++) {
+-          others = Add(others, LoadU(d, rows[0] + x + i));
+-          others = Add(others, LoadU(d, rows[1] + x + i));
+-          others = Add(others, LoadU(d, rows[3] + x + i));
+-          others = Add(others, LoadU(d, rows[4] + x + i));
++      float* JXL_RESTRICT colsum = colsum_[thread_id].address<float>();
++      msan::UnpoisonMemory(row_t2 + xsize, sizeof(float) * tail);
++      msan::UnpoisonMemory(row_t1 + xsize, sizeof(float) * tail);
++      msan::UnpoisonMemory(row_in + xsize, sizeof(float) * tail);
++      msan::UnpoisonMemory(row_b1 + xsize, sizeof(float) * tail);
++      msan::UnpoisonMemory(row_b2 + xsize, sizeof(float) * tail);
++
++      for (size_t x0 = 0; x0 < xsize; x0 += kChunkSize) {
++        const size_t len = std::min(kChunkSize, xsize - x0);
++        // Vertical pass: colsum[j] = sum over the 5 rows at source column
++        // (x0 - 2 + j), for j in [0, len + 4). Storing from index 0 folds the
++        // -2 horizontal halo into the buffer origin (same trick as upsampling).
++        const ptrdiff_t base = static_cast<ptrdiff_t>(x0) - 2;
++        for (size_t j = 0; j < len + 4; j += Lanes(d)) {
++          const ptrdiff_t sx = base + static_cast<ptrdiff_t>(j);
++          auto s = Add(LoadU(d, row_t2 + sx), LoadU(d, row_t1 + sx));
++          s = Add(s, LoadU(d, row_in + sx));
++          s = Add(s, LoadU(d, row_b1 + sx));
++          s = Add(s, LoadU(d, row_b2 + sx));
++          StoreU(s, d, colsum + j);
++        }
++        // Horizontal pass: B[x] = sum_{k=0..4} colsum[(x - x0) + k], i.e. the
++        // 5-wide box over the column sums. out = 0.16*B - 4.0*center.
++        for (size_t k = 0; k < len; k += Lanes(d)) {
++          auto box = Add(LoadU(d, colsum + k), LoadU(d, colsum + k + 1));
++          box = Add(box, LoadU(d, colsum + k + 2));
++          box = Add(box, LoadU(d, colsum + k + 3));
++          box = Add(box, LoadU(d, colsum + k + 4));
++          const auto center = LoadU(d, row_in + x0 + k);
++          const auto pixels = MulAdd(box, k016, Mul(center, kNeg4));
++          StoreU(pixels, d, row_out + x0 + k);
+         }
+-        others = Add(others, LoadU(d, rows[2] + x - 2));
+-        others = Add(others, LoadU(d, rows[2] + x - 1));
+-        others = Add(others, LoadU(d, rows[2] + x + 1));
+-        others = Add(others, LoadU(d, rows[2] + x + 2));
+-        // 4 * (1 - box kernel)
+-        auto pixels = MulAdd(others, Set(d, 0.16), Mul(p00, Set(d, -3.84)));
+-        StoreU(pixels, d, row_out + x);
+       }
+     }
+     return true;
+@@ -307,12 +351,30 @@ class ConvolveNoiseStage : public RenderPipelineStage {
+   const char* GetName() const override { return "ConvNoise"; }
+ 
+  private:
++  Status PrepareForThreads(size_t num_threads) override {
++    const HWY_FULL(float) d;
++    // colsum needs len (<= kChunkSize) + 4 halo columns; round up so the
++    // vector store of the last (len + 4) iteration stays in bounds, and the
++    // horizontal LoadU(colsum + k + 4) never reads past the written region.
++    const size_t alloc_floats = kChunkSize + 4 + Lanes(d);
++    const size_t alloc_size = sizeof(float) * alloc_floats;
++    colsum_.resize(num_threads);
++    for (size_t t = 0; t < num_threads; ++t) {
++      JXL_ASSIGN_OR_RETURN(colsum_[t],
++                           AlignedMemory::Create(memory_manager_, alloc_size));
++    }
++    return true;
++  }
++
++  static constexpr size_t kChunkSize = 1024;
+   size_t first_c_;
++  JxlMemoryManager* memory_manager_;
++  mutable std::vector<AlignedMemory> colsum_;
+ };
+ 
+ std::unique_ptr<RenderPipelineStage> GetConvolveNoiseStage(
+-    size_t noise_c_start) {
+-  return jxl::make_unique<ConvolveNoiseStage>(noise_c_start);
++    JxlMemoryManager* memory_manager, size_t noise_c_start) {
++  return jxl::make_unique<ConvolveNoiseStage>(memory_manager, noise_c_start);
+ }
+ 
+ // NOLINTNEXTLINE(google-readability-namespace-comments)
+@@ -334,8 +396,9 @@ std::unique_ptr<RenderPipelineStage> GetAddNoiseStage(
+ }
+ 
+ std::unique_ptr<RenderPipelineStage> GetConvolveNoiseStage(
+-    size_t noise_c_start) {
+-  return HWY_DYNAMIC_DISPATCH(GetConvolveNoiseStage)(noise_c_start);
++    JxlMemoryManager* memory_manager, size_t noise_c_start) {
++  return HWY_DYNAMIC_DISPATCH(GetConvolveNoiseStage)(memory_manager,
++                                                     noise_c_start);
+ }
+ 
+ }  // namespace jxl
+diff --git a/lib/jxl/render_pipeline/stage_noise.h b/lib/jxl/render_pipeline/stage_noise.h
+index 06b4cb6b..5f1a2ee9 100644
+--- a/lib/jxl/render_pipeline/stage_noise.h
++++ b/lib/jxl/render_pipeline/stage_noise.h
+@@ -6,6 +6,8 @@
+ #ifndef LIB_JXL_RENDER_PIPELINE_STAGE_NOISE_H_
+ #define LIB_JXL_RENDER_PIPELINE_STAGE_NOISE_H_
+ 
++#include <jxl/memory_manager.h>
++
+ #include <cstddef>
+ #include <memory>
+ 
+@@ -21,8 +23,10 @@ std::unique_ptr<RenderPipelineStage> GetAddNoiseStage(
+     size_t noise_c_start);
+ 
+ // Applies a 5x5 subtract-box-filter convolution to the noise input channels.
++// `memory_manager` is used to allocate per-thread column-sum scratch for the
++// separable box evaluation.
+ std::unique_ptr<RenderPipelineStage> GetConvolveNoiseStage(
+-    size_t noise_c_start);
++    JxlMemoryManager* memory_manager, size_t noise_c_start);
+ 
+ }  // namespace jxl
+ 

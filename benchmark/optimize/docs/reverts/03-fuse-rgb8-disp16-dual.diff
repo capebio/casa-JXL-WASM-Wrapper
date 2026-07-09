@@ -1,0 +1,237 @@
+diff --git a/crates/raw-pipeline/src/pipeline.rs b/crates/raw-pipeline/src/pipeline.rs
+index 51e9bfdc..eb99309b 100644
+--- a/crates/raw-pipeline/src/pipeline.rs
++++ b/crates/raw-pipeline/src/pipeline.rs
+@@ -3122,6 +3122,146 @@ pub fn process_16bit_simd(rgb16: &[u16], params: &PipelineParams) -> Vec<u16> {
+     out
+ }
+ 
++/// Dual-output tone block kernel: one pre-LUT gather + one tone matvec, scattered
++/// through BOTH the u8 post-LUT and the u16 post-LUT. Byte-for-byte identical to
++/// running `simd_block_kernel` twice (u8 then u16) over the same input — the gather,
++/// matvec and clamp are shared, only the final table lookup differs. Used by
++/// [`process_dual_simd`] for the combined `OUT_FULL_RGB8 | OUT_FULL_DISP16` decode,
++/// halving the (dominant) gather + math work vs two independent full-frame passes.
++#[inline(always)]
++#[allow(clippy::too_many_arguments)]
++fn simd_block_kernel_dual(
++    ob8: &mut [u8],
++    ob16: &mut [u16],
++    ib: &[u16],
++    r: &mut [f32],
++    g: &mut [f32],
++    b: &mut [f32],
++    pre_r: &[u16],
++    pre_g: &[u16],
++    pre_b: &[u16],
++    pre_lut_shift: u32,
++    pre_lut_mask: usize,
++    m: &[[f32; 3]; 3],
++    fused_matrix: Option<&[[f32; 3]; 3]>,
++    sat: f32,
++    vib: f32,
++    vib_zero: bool,
++    post: &[u8],
++    post16: &[u16],
++) {
++    let np = ib.len() / 3;
++    for i in 0..np {
++        r[i] = pre_r[(ib[i * 3] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
++        g[i] = pre_g[(ib[i * 3 + 1] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
++        b[i] = pre_b[(ib[i * 3 + 2] as usize >> pre_lut_shift) & pre_lut_mask] as f32;
++    }
++    match fused_matrix {
++        Some(mf) => {
++            crate::tone_simd::apply_tone_bulk_matrix(&mut r[..np], &mut g[..np], &mut b[..np], mf)
++        }
++        None => crate::tone_simd::apply_tone_bulk(
++            &mut r[..np],
++            &mut g[..np],
++            &mut b[..np],
++            m,
++            sat,
++            vib,
++            vib_zero,
++        ),
++    }
++    // One clamp+cast per channel; index BOTH post-LUTs. `post16` reproduces
++    // `process_16bit_simd` exactly and `post` reproduces `process_into_simd` exactly.
++    for i in 0..np {
++        let ci = r[i].clamp(0.0, 65535.0) as u16 as usize;
++        ob8[i * 3] = post[ci];
++        ob16[i * 3] = post16[ci];
++        let ci = g[i].clamp(0.0, 65535.0) as u16 as usize;
++        ob8[i * 3 + 1] = post[ci];
++        ob16[i * 3 + 1] = post16[ci];
++        let ci = b[i].clamp(0.0, 65535.0) as u16 as usize;
++        ob8[i * 3 + 2] = post[ci];
++        ob16[i * 3 + 2] = post16[ci];
++    }
++}
++
++/// Fused peer of `process_into_simd` + `process_16bit_simd`: tone-maps `rgb16` into
++/// BOTH an interleaved RGB8 buffer (`out8`) and an interleaved display-referred RGB16
++/// buffer (`out16`) in a single traversal. The (dominant) pre-LUT gather and tone
++/// matvec are computed once per pixel and scattered through both post-LUTs.
++///
++/// Output is byte-identical to calling `process_into_simd(rgb16, params, out8)` and
++/// `process_16bit_simd(rgb16, params)` separately (same pre-LUTs, same fused matrix,
++/// same clamp, same post/post16 tables via one `ensure_lut(need16=true)`).
++///
++/// Plain ingest path only (perceptual_constancy must be false — asserted).
++pub fn process_dual_simd(
++    rgb16: &[u16],
++    params: &PipelineParams,
++    out8: &mut [u8],
++    out16: &mut [u16],
++) {
++    debug_assert_eq!(rgb16.len() % 3, 0);
++    assert_eq!(out8.len(), rgb16.len(), "process_dual_simd: out8 must be rgb16.len() elements");
++    assert_eq!(out16.len(), rgb16.len(), "process_dual_simd: out16 must be rgb16.len() elements");
++    let ti = derive_tone_inputs(params);
++    assert!(!ti.perceptual_constancy, "process_dual_simd is the plain ingest path only");
++    let m = params.color_matrix.as_matrix();
++    let fused = ti.matrix_fused.as_ref();
++    let (pre_r, pre_g, pre_b, post, post16, pre_lut_mask, pre_lut_shift) =
++        LUT_CACHE.with(|cache_cell| {
++            ensure_lut(&mut cache_cell.borrow_mut(), params, &ti, true);
++            let c = cache_cell.borrow();
++            let cr = c.as_ref().unwrap();
++            (
++                cr.pre_r.clone(),
++                cr.pre_g.clone(),
++                cr.pre_b.clone(),
++                cr.post.clone(),
++                cr.post16.as_ref().unwrap().clone(),
++                cr.pre_lut_len - 1,
++                cr.pre_lut_shift,
++            )
++        });
++
++    const BLK: usize = 2048;
++
++    #[cfg(feature = "parallel")]
++    {
++        PARALLEL_PATH_CALLS.with(|c| c.set(c.get() + 1));
++        out8.par_chunks_mut(3 * BLK)
++            .zip(out16.par_chunks_mut(3 * BLK))
++            .zip(rgb16.par_chunks(3 * BLK))
++            .for_each(|((ob8, ob16), ib)| {
++                let mut r = [0f32; BLK];
++                let mut g = [0f32; BLK];
++                let mut b = [0f32; BLK];
++                simd_block_kernel_dual(
++                    ob8, ob16, ib, &mut r, &mut g, &mut b, &pre_r, &pre_g, &pre_b,
++                    pre_lut_shift, pre_lut_mask, m, fused, ti.sat, ti.vib, ti.vib_zero,
++                    &post, &post16,
++                );
++            });
++    }
++    #[cfg(not(feature = "parallel"))]
++    {
++        let mut r = [0f32; BLK];
++        let mut g = [0f32; BLK];
++        let mut b = [0f32; BLK];
++        for ((ob8, ob16), ib) in out8
++            .chunks_mut(3 * BLK)
++            .zip(out16.chunks_mut(3 * BLK))
++            .zip(rgb16.chunks(3 * BLK))
++        {
++            simd_block_kernel_dual(
++                ob8, ob16, ib, &mut r, &mut g, &mut b, &pre_r, &pre_g, &pre_b,
++                pre_lut_shift, pre_lut_mask, m, fused, ti.sat, ti.vib, ti.vib_zero,
++                &post, &post16,
++            );
++        }
++    }
++}
++
+ /// Box downscale RGB16 (u16 interleaved) → smaller Vec<u16>. Rayon over rows.
+ ///
+ /// Item 9 (light touch): The allocating version is the common case today. For hot paths
+@@ -4389,6 +4529,29 @@ mod tonemap_flip_flops {
+         );
+     }
+ 
++    #[test]
++    fn process_dual_simd_matches_separate_passes() {
++        // The fused dual-output kernel must be BYTE-EXACT (diff == 0) vs running
++        // process_into_simd (u8) and process_16bit_simd (u16) separately: it shares the
++        // identical gather + matvec + clamp and only differs in which post-LUT it indexes.
++        let mut params = PipelineParams::default_olympus();
++        params.vibrance = 0.0;
++        assert!(!derive_tone_inputs(&params).perceptual_constancy);
++        // n deliberately NOT a multiple of BLK(2048) so the ragged tail block is exercised.
++        let n = 2_000_001usize;
++        let rgb16: Vec<u16> = (0..n * 3)
++            .map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16)
++            .collect();
++        let mut ref8 = vec![0u8; n * 3];
++        process_into_simd(&rgb16, &params, &mut ref8);
++        let ref16 = process_16bit_simd(&rgb16, &params);
++        let mut out8 = vec![0u8; n * 3];
++        let mut out16 = vec![0u16; n * 3];
++        process_dual_simd(&rgb16, &params, &mut out8, &mut out16);
++        assert_eq!(out8, ref8, "dual u8 output diverged from process_into_simd");
++        assert_eq!(out16, ref16, "dual u16 output diverged from process_16bit_simd");
++    }
++
+     #[test]
+     #[ignore]
+     fn flipflop_lut_movement() {
+diff --git a/src/lib.rs b/src/lib.rs
+index a28a7045..888d764d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1349,14 +1349,19 @@ fn finish_from_raw(
+             // Lens 23/24: use process_into + preallocated buffer to avoid internal Vec alloc
+             // inside the tone path (reuses the "into" pattern from demosaic/pipeline).
+             let mut rgb8 = vec![0u8; w * h * 3];
+-            // Chapter 1: SIMD bulk tone on wasm/x86 for the plain path (the 90% case),
+-            // scalar parity path only for perceptual_constancy. The big full-res win.
+-            pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
+-            let tonemap_ms = now_ms() - t;
+-            // Compute display-referred 16-bit BEFORE moving rgb16 (borrow must end before move).
+             let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+-            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+-                let disp = pipeline::process_16bit(&rgb16, &params);
++            // FUSED-DUAL: when RGB8 *and* display-referred RGB16 are both requested (the
++            // 16-bit-master + 8-bit-preview export path), the two tone passes over the same
++            // rgb16 share an identical pre-LUT gather + tone matvec — differing only in the
++            // final post-LUT (u8 vs u16). `process_dual_simd` computes that once and scatters
++            // through both tables, byte-identical to the two separate SIMD passes. Falls back
++            // to the split path for perceptual_constancy (scalar) or disp16-not-requested.
++            let fuse_dual = want_disp16 && !params.perceptual_constancy;
++            let (rgb16_disp, disp16_w, disp16_h) = if fuse_dual {
++                let mut disp = vec![0u16; w * h * 3];
++                // Chapter 1: SIMD bulk tone on wasm/x86 for the plain path (the 90% case).
++                pipeline::process_dual_simd(&rgb16, &params, &mut rgb8, &mut disp);
++                // tonemap_ms now covers BOTH outputs (one fused pass) — see FUSED-DUAL.
+                 if skip_orient || orientation == 1 {
+                     (disp, w as u32, h as u32)
+                 } else {
+@@ -1364,8 +1369,23 @@ fn finish_from_raw(
+                     (d, dw as u32, dh as u32)
+                 }
+             } else {
+-                (Vec::new(), 0u32, 0u32)
++                // Chapter 1: SIMD bulk tone on wasm/x86 for the plain path (the 90% case),
++                // scalar parity path only for perceptual_constancy. The big full-res win.
++                pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
++                if want_disp16 {
++                    // perceptual_constancy path: keep the byte-exact scalar disp16 render.
++                    let disp = pipeline::process_16bit(&rgb16, &params);
++                    if skip_orient || orientation == 1 {
++                        (disp, w as u32, h as u32)
++                    } else {
++                        let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, orientation);
++                        (d, dw as u32, dh as u32)
++                    }
++                } else {
++                    (Vec::new(), 0u32, 0u32)
++                }
+             };
++            let tonemap_ms = now_ms() - t;
+             // rgb16's last read is done: move it into the 16-bit master (common, no copy),
+             // use the pre-unsharp snapshot, or release it. Freed before orientation either way.
+             let rgb16_full = if want_full16 {

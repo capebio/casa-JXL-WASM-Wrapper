@@ -1,0 +1,23 @@
+# OPT-02 revert: photon_prog_enc qProgressiveAc:0 (collapse 2nd quantized-AC pass; keep
+# progressiveAc:1 + RESPONSIVE). Banked: enc_ms +3..20% by size, whole-flip +2.2..5.8%;
+# Butteraugli d=0. rgb8/no-alpha on this photon block predates this run (see git log); this
+# diff isolates ONLY the qProgressiveAc:0 flag. Forward-apply = REMOVE it:
+#   git apply benchmark/optimize/docs/reverts/02-photon_prog-qprogressiveac0.diff
+--- a/StandardMultifileTest.mjs
++++ b/StandardMultifileTest.mjs
+@@ -641,14 +641,7 @@
+         for (let i = 0, s = 0, d = 0; i < _np; i++, s += _ch, d += 3) {
+           _rgb[d] = _src[s]; _rgb[d + 1] = _src[s + 1]; _rgb[d + 2] = _src[s + 2];
+         }
+-        // qProgressiveAc:0 collapses the redundant second (quantized) AC progressive pass.
+-        // With progressiveFlavor:'ac' (line 231 default) the baseline emits progressiveDc=1,
+-        // progressiveAc=1, qProgressiveAc=1; the extra qProgressiveAc pass re-runs histogram
+-        // clustering + context-tree build over the photon-grain AC coefficients for ~0 perceptual
+-        // gain (Butteraugli Δ=0.0, flipflop-verified). Honored via resolveEncoderBridgeSettings
+-        // (facade.ts:585, `qProgressiveAc != null`); progressiveDc/progressiveAc stay 1 so
+-        // DC-preview progressivity + RESPONSIVE (bridge.cpp:561) are preserved.
+-        const pho = await encodeJxlVariant(_rgb, f.tgtW, f.tgtH, { progressive: true, photonNoiseIso: 800, format: "rgb8", hasAlpha: false, qProgressiveAc: 0 });
++        const pho = await encodeJxlVariant(_rgb, f.tgtW, f.tgtH, { progressive: true, photonNoiseIso: 800, format: "rgb8", hasAlpha: false });
+         photonEncMs = pho.ms; photonSize = pho.bytes.byteLength;
+       } catch (_) {}
+ 

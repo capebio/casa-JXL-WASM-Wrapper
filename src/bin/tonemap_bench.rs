@@ -8,13 +8,11 @@
 //! Or via flipflop:
 //!   cd .flipflop && node tonemap_flipflop.mjs
 
-use std::time::Instant;
 use raw_pipeline::pipeline::{self, PipelineParams};
+use std::time::Instant;
 
 fn synth_rgb16(w: usize, h: usize) -> Vec<u16> {
-    (0..(w * h * 3))
-        .map(|i| ((i % 4096) as u16) << 2)
-        .collect()
+    (0..(w * h * 3)).map(|i| ((i % 4096) as u16) << 2).collect()
 }
 
 fn main() {
@@ -26,7 +24,13 @@ fn main() {
     let mut out = vec![0u8; rgb16.len()];
     let params = PipelineParams::default_olympus();
 
-    eprintln!("Tonemap bench: {}×{} = {} pixels, {} runs", W, H, W * H, RUNS);
+    eprintln!(
+        "Tonemap bench: {}×{} = {} pixels, {} runs",
+        W,
+        H,
+        W * H,
+        RUNS
+    );
     eprintln!("Feature parallel: {}", cfg!(feature = "parallel"));
 
     let mut times = Vec::new();
@@ -37,7 +41,12 @@ fn main() {
         let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
         let parallel_calls = pipeline::parallel_path_call_count();
         times.push(elapsed);
-        eprintln!("  run {}: {:.2}ms (parallel_calls={})", run + 1, elapsed, parallel_calls);
+        eprintln!(
+            "  run {}: {:.2}ms (parallel_calls={})",
+            run + 1,
+            elapsed,
+            parallel_calls
+        );
     }
 
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());

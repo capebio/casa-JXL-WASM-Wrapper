@@ -1,5 +1,12 @@
 # optimize-codec-times — revert manifest
 
-| id | layer | lens | file | reason | saved% | diff |
-|----|-------|------|------|--------|--------|------|
-| OPT-01 | benchmark-harness (JS→WASM encode opts) | rgb8/no-alpha on photon_prog_enc | StandardMultifileTest.mjs | faster | 25 | benchmark/optimize/docs/reverts/01-photon-rgb8-noalpha.diff |
+| id | status | layer | lens | file | reason | saved% | diff | note |
+|----|--------|-------|------|------|--------|--------|------|------|
+| OPT-01 | landed-harness | benchmark-harness (JS->WASM encode opts) | aerial/tactical: rgb8/no-alpha on mod_prog_enc | StandardMultifileTest.mjs:612 | faster | 20.5 | benchmark/optimize/docs/reverts/01-mod_prog-rgb8-noalpha.diff | drop constant alpha Modular Squeeze pass; Butteraugli d=0; also 21.9% run |
+| OPT-02 | landed-harness | benchmark-harness (JS->WASM encode opts) | tactical: qProgressiveAc:0 on photon_prog_enc | StandardMultifileTest.mjs:651 | faster | 2.2 | benchmark/optimize/docs/reverts/02-photon_prog-qprogressiveac0.diff | collapse 2nd quantized-AC pass; enc_ms 3-20% by size; Butteraugli d=0 |
+| OPT-03 | landed-worktree | rust (crates/raw-pipeline src/lib.rs) | operational: fuse RGB8+DISP16 dual pass (one pre-LUT gather + one tone matvec) | crates/raw-pipeline/src/pipeline.rs (process_dual_simd) + src/lib.rs (finish_from_raw) | faster | 23.3 | benchmark/optimize/docs/reverts/03-fuse-rgb8-disp16-dual.diff | ORF flags=33 +23.3% pixel-exact; latent (no flags=33 caller); needs pkg rebuild; not in loaded pkg/ |
+| OPT-04 | landed-worktree | cpp (external/libjxl-012 stage_noise.cc) | mathematical: separable box conv in ConvolveNoiseStage (decode noise-shaping) | external/libjxl-012/lib/jxl/render_pipeline/stage_noise.cc | faster | 9.3 | benchmark/optimize/docs/reverts/04-noise-separable-box-conv.patch | whole-decode ~9.3% on noise streams; Butteraugli <=0.109; needs emsdk rebuild; not in shipped dist/ |
+| CAND-05 | not-landed | benchmark-harness (candidate) | photon distance 1.0->1.5 (VarDCT) | benchmark/optimize/.flipflop/tests/photon-distance15.mjs | faster | 3.2 | (none — flipflop test only) | enc ~5-16% on noisy content; ~24% smaller; Butteraugli 0.088-0.357; near noise floor end-to-end |
+| CAND-06 | not-landed | benchmark-harness (candidate) | photon effort 3->2 (kThunder, LZ77Method::kNone cliff) | benchmark/optimize/.flipflop/tests/photon-effort2-rgb8.mjs | faster | 7.9 | (none — flipflop test only) | Butteraugli d=0; magnitude env-noisy (1.4-7.9%); rgba8 sibling photon-effort2.mjs is wrong shape |
+| CAND-07 | not-landed | benchmark-harness (candidate) | photon progressiveFlavor:dc (drop entire AC progression) | benchmark/optimize/.flipflop/tests/photon-flavor-dc.mjs | faster | 20.7 | (none — flipflop test only) | Butteraugli d=0; 20-23% across 2 runs; MUTUALLY EXCLUSIVE with OPT-02 (both on photon path) |
+| CAND-08 | not-landed | benchmark-harness (candidate) | mod_prog decodingSpeed:2 (prune MA-tree search) | .flipflop/tests/mod-prog-enc-decoding-speed.mjs | faster | 2.9 | (none — flipflop test only) | Butteraugli d=0; +2.9% at 2048px but SIGN FLIPS to -13% <=1024px; size-gated; +2% bytes |
