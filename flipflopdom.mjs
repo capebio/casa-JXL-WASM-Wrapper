@@ -52,8 +52,22 @@ function startServer() {
     const srv = http.createServer((req, rep) => {
       const u = new URL(req.url, 'http://localhost');
       if (u.pathname === '/__dom__') { rep.writeHead(200, { ...SEC, 'Content-Type': 'text/html' }); rep.end(`<!doctype html><meta charset=utf8><title>flipflopdom</title>${IMPORTMAP_HTML}<body>`); return; }
-      const fp = path.join(ROOT, decodeURIComponent(u.pathname));
-      if (!fp.startsWith(ROOT) || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()) { rep.writeHead(404, SEC); rep.end('not found'); return; }
+      let fp = path.join(ROOT, decodeURIComponent(u.pathname));
+      if (!fp.startsWith(ROOT) || !fs.existsSync(fp)) { rep.writeHead(404, SEC); rep.end('not found'); return; }
+      if (fs.statSync(fp).isDirectory()) {
+        // Resolve a directory import the way a bundler / dev-server would. Needed
+        // for threaded wasm: wasm-bindgen-rayon's worker helper does
+        // `import('../../..')` (the pkg directory) to re-load the module in each
+        // rayon thread. Prefer package.json module/main, then index.js, then a
+        // sole top-level .js. Without this the whole batch of rayon workers 404s.
+        const dir = fp; let entry = null;
+        const pj = path.join(dir, 'package.json');
+        if (fs.existsSync(pj)) { try { const j = JSON.parse(fs.readFileSync(pj, 'utf8')); entry = j.module || j.main || null; } catch {} }
+        if (!entry) for (const c of ['index.js', 'index.mjs']) if (fs.existsSync(path.join(dir, c))) { entry = c; break; }
+        if (!entry) { const js = fs.readdirSync(dir).filter((f) => f.endsWith('.js')); if (js.length === 1) entry = js[0]; }
+        if (!entry) { rep.writeHead(404, SEC); rep.end('not found (dir has no module entry)'); return; }
+        fp = path.join(dir, entry);
+      }
       rep.writeHead(200, { ...SEC, 'Content-Type': MIME[path.extname(fp).toLowerCase()] || 'application/octet-stream' });
       fs.createReadStream(fp).pipe(rep);
     });
@@ -92,6 +106,11 @@ export async function runTestDom(testFile, opts) {
   const { launch } = await import('./tools/launch-browser.mjs');
   const launched = await launch({ headless: !opts.headed });
   const page = launched.page;
+  // Surface in-page failures on stdout — otherwise a test that throws inside the
+  // page / a worker (module load 404, wasm init) just hangs silently. Errors and
+  // warnings only, to keep normal runs quiet.
+  page.on('pageerror', (e) => console.log('[page:error]', e.message));
+  page.on('console', (m) => { const t = m.type(); if (t === 'error' || t === 'warning') console.log(`[page:${t}]`, m.text()); });
   let rec;
   try {
     await page.goto(`http://127.0.0.1:${port}/__dom__`);
