@@ -29,7 +29,8 @@ thread_local! {
     static RENDER_SCRATCH: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
 fn demo_checksum(v: &[u16]) -> u32 {
-    v.iter().fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
+    v.iter()
+        .fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
 }
 
 // === P2c: streaming full-res RAW→RGB8 band producer, callable from JS =========================
@@ -69,26 +70,44 @@ impl RawStreamExporter {
     pub fn from_orf(bytes: &[u8], nr_strength: f32) -> Result<RawStreamExporter, JsError> {
         let owned: Box<[u8]> = bytes.to_vec().into_boxed_slice();
         // SAFETY: see the struct's field-drop note; `owned`'s heap bytes outlive the borrowing `src`.
-        let bref: &'static [u8] = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
-        let s = StreamingBandSource::from_orf_bytes(bref, nr_strength).map_err(|e| JsError::new(&e))?;
+        let bref: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
+        let s =
+            StreamingBandSource::from_orf_bytes(bref, nr_strength).map_err(|e| JsError::new(&e))?;
         let (w, h) = (s.width(), s.height());
-        Ok(Self { src: BandSrc::Orf(s), bytes: owned, w, h })
+        Ok(Self {
+            src: BandSrc::Orf(s),
+            bytes: owned,
+            w,
+            h,
+        })
     }
 
     /// Build from DNG container bytes (comp=7 tiled or comp=1 uncompressed).
     pub fn from_dng(bytes: &[u8], nr_strength: f32) -> Result<RawStreamExporter, JsError> {
         let owned: Box<[u8]> = bytes.to_vec().into_boxed_slice();
         // SAFETY: see the struct's field-drop note; `owned`'s heap bytes outlive the borrowing `src`.
-        let bref: &'static [u8] = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
-        let s = StreamingBandSource::from_dng_bytes(bref, nr_strength).map_err(|e| JsError::new(&e))?;
+        let bref: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
+        let s =
+            StreamingBandSource::from_dng_bytes(bref, nr_strength).map_err(|e| JsError::new(&e))?;
         let (w, h) = (s.width(), s.height());
-        Ok(Self { src: BandSrc::Dng(s), bytes: owned, w, h })
+        Ok(Self {
+            src: BandSrc::Dng(s),
+            bytes: owned,
+            w,
+            h,
+        })
     }
 
     #[wasm_bindgen(getter)]
-    pub fn width(&self) -> u32 { self.w as u32 }
+    pub fn width(&self) -> u32 {
+        self.w as u32
+    }
     #[wasm_bindgen(getter)]
-    pub fn height(&self) -> u32 { self.h as u32 }
+    pub fn height(&self) -> u32 {
+        self.h as u32
+    }
 
     /// Materialize the RGB8 band `[ypos, ypos+ysize)` and return it tightly packed
     /// (stride = width*3 ⇒ ysize*width*3 bytes). Bands MUST be pulled top-to-bottom with
@@ -107,7 +126,9 @@ impl RawStreamExporter {
 }
 #[wasm_bindgen]
 pub fn demosaic_bench_prepare(w: usize, h: usize) {
-    let raw: Vec<u16> = (0..w * h).map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16).collect();
+    let raw: Vec<u16> = (0..w * h)
+        .map(|i| (i.wrapping_mul(2654435761) & 0x3fff) as u16)
+        .collect();
     DEMO_BENCH.with(|b| *b.borrow_mut() = (raw, w, h));
 }
 #[wasm_bindgen]
@@ -128,7 +149,8 @@ pub fn demosaic_bench_simd() -> u32 {
 pub fn demosaic_bench_equal() -> bool {
     DEMO_BENCH.with(|b| {
         let g = b.borrow();
-        demosaic::demosaic_rggb(&g.0, g.1, g.2).unwrap() == demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap()
+        demosaic::demosaic_rggb(&g.0, g.1, g.2).unwrap()
+            == demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap()
     })
 }
 #[wasm_bindgen]
@@ -138,7 +160,9 @@ pub fn demosaic_bench_first_diff() -> i32 {
         let a = demosaic::demosaic_rggb(&g.0, g.1, g.2).unwrap();
         let s = demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap();
         for i in 0..a.len() {
-            if a[i] != s[i] { return i as i32; }
+            if a[i] != s[i] {
+                return i as i32;
+            }
         }
         -1
     })
@@ -186,9 +210,15 @@ pub fn demosaic_bench_planar_first_diff() -> i32 {
         let (rs, gs, bs) = demosaic::demosaic_rggb_planar_simd(&g.0, g.1, g.2).unwrap();
         let n = ra.len();
         for i in 0..n {
-            if ra[i] != rs[i] { return i as i32; }
-            if ga[i] != gs[i] { return (n + i) as i32; }
-            if ba[i] != bs[i] { return (2 * n + i) as i32; }
+            if ra[i] != rs[i] {
+                return i as i32;
+            }
+            if ga[i] != gs[i] {
+                return (n + i) as i32;
+            }
+            if ba[i] != bs[i] {
+                return (2 * n + i) as i32;
+            }
         }
         -1
     })
@@ -218,7 +248,9 @@ pub fn demosaic_bench_shuffle_first_diff() -> i32 {
         let a = demosaic::demosaic_rggb(&g.0, g.1, g.2).unwrap();
         let s = demosaic::demosaic_rggb_shuffle_simd(&g.0, g.1, g.2).unwrap();
         for i in 0..a.len() {
-            if a[i] != s[i] { return i as i32; }
+            if a[i] != s[i] {
+                return i as i32;
+            }
         }
         -1
     })
@@ -381,11 +413,11 @@ pub struct ProcessResult {
     #[wasm_bindgen(readonly)]
     pub orient_ms: f64,
     #[wasm_bindgen(readonly)]
-    pub preview_demosaic_ms: f64,  // fast planar bilinear demosaic for lb/thumb previews
+    pub preview_demosaic_ms: f64, // fast planar bilinear demosaic for lb/thumb previews
     #[wasm_bindgen(readonly)]
-    pub preview_downscale_ms: f64,  // planar downscales for previews (lb + thumb)
+    pub preview_downscale_ms: f64, // planar downscales for previews (lb + thumb)
     #[wasm_bindgen(readonly)]
-    pub fast_preview: bool,  // true if fast planar bilinear + planar down was used for lb/thumb (vs full mhc path)
+    pub fast_preview: bool, // true if fast planar bilinear + planar down was used for lb/thumb (vs full mhc path)
     #[wasm_bindgen(readonly)]
     pub wb_r_used: f32,
     #[wasm_bindgen(readonly)]
@@ -685,6 +717,7 @@ impl ProcessResult {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 fn now_ms() -> f64 {
     thread_local! {
         static PERF: std::cell::OnceCell<web_sys::Performance> = const { std::cell::OnceCell::new() };
@@ -693,14 +726,12 @@ fn now_ms() -> f64 {
         if let Some(perf) = cell.get() {
             return perf.now();
         }
-        let perf = web_sys::window()
-            .and_then(|w| w.performance())
-            .or_else(|| {
-                js_sys::global()
-                    .dyn_into::<web_sys::WorkerGlobalScope>()
-                    .ok()
-                    .and_then(|w| w.performance())
-            });
+        let perf = web_sys::window().and_then(|w| w.performance()).or_else(|| {
+            js_sys::global()
+                .dyn_into::<web_sys::WorkerGlobalScope>()
+                .ok()
+                .and_then(|w| w.performance())
+        });
         if let Some(perf) = perf {
             let now = perf.now();
             let _ = cell.set(perf);
@@ -711,11 +742,16 @@ fn now_ms() -> f64 {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    0.0
+}
+
 #[inline(always)]
 fn write_rgb16_le(out: &mut [u8], o: usize, r: u16, g: u16, b: u16) {
     // Manual LE writes — eliminates three small copy_from_slice(2) per pixel in the
     // general (non-integer) downscale fallback path.
-    out[o]     = (r & 0xff) as u8;
+    out[o] = (r & 0xff) as u8;
     out[o + 1] = (r >> 8) as u8;
     out[o + 2] = (g & 0xff) as u8;
     out[o + 3] = (g >> 8) as u8;
@@ -772,13 +808,21 @@ fn downscale_rgb_float_path<F>(
                     let mut idx = row_base + x_base;
                     for _xx in 0..xstep {
                         let (r, g, b) = read_pixel(idx);
-                        rr += r; gg += g; bb += b;
+                        rr += r;
+                        gg += g;
+                        bb += b;
                         idx += 1;
                     }
                     row_base += sw;
                 }
                 let o = (dy * dw + dx) * 6;
-                write_rgb16_le(out, o, (rr / pixel_count) as u16, (gg / pixel_count) as u16, (bb / pixel_count) as u16);
+                write_rgb16_le(
+                    out,
+                    o,
+                    (rr / pixel_count) as u16,
+                    (gg / pixel_count) as u16,
+                    (bb / pixel_count) as u16,
+                );
             }
         }
         return;
@@ -843,7 +887,13 @@ fn downscale_rgb16_impl(src: &[u16], sw: usize, sh: usize, dw: usize, dh: usize)
                     }
                     row_base += sw;
                 }
-                write_rgb16_le(&mut out, o, (rr / pixel_count) as u16, (gg / pixel_count) as u16, (bb / pixel_count) as u16);
+                write_rgb16_le(
+                    &mut out,
+                    o,
+                    (rr / pixel_count) as u16,
+                    (gg / pixel_count) as u16,
+                    (bb / pixel_count) as u16,
+                );
                 o += 6;
             }
         }
@@ -890,7 +940,13 @@ fn downscale_packed_rgb16_le(src: &[u8], sw: usize, sh: usize, dw: usize, dh: us
                     }
                     row_base += sw6;
                 }
-                write_rgb16_le(&mut out, o, (rr / pixel_count) as u16, (gg / pixel_count) as u16, (bb / pixel_count) as u16);
+                write_rgb16_le(
+                    &mut out,
+                    o,
+                    (rr / pixel_count) as u16,
+                    (gg / pixel_count) as u16,
+                    (bb / pixel_count) as u16,
+                );
                 o += 6;
             }
         }
@@ -957,15 +1013,15 @@ const OUT_FULL_RGB8: u32 = 1; // full-resolution RGB8 for JXL encoding
 const OUT_LIGHTBOX: u32 = 2; // 1800 px RGB16 for LookRenderer
 const OUT_THUMB: u32 = 4; // 360 px RGB16 for thumb LookRenderer
 const OUT_FULL_16: u32 = 8; // full-resolution RGB16 (M3: RAW {2048,full} pyramid levels; 16-bit lightbox/ROI/export). Grid levels and JPG stay 8-bit.
-// Skip apply_orientation on the OUT_FULL_RGB8 output. Pixels and width/height
-// stay in sensor orientation; consumer reads `orientation` to know how to display
-// (or to pass to JXL encoder via basic info). Saves the 60–200 MB intermediate
-// rotate when feeding the encoder (JXL stores orientation as metadata).
-// bit 4. Previously bit 8, accidentally shared with OUT_FULL_16 — b2cb8dc9 added
-// OUT_NO_ORIENT=8, then 1674aa11 added OUT_FULL_16=8 five days later. Split to its own
-// bit so full-res-16 and skip-orientation are independent. No caller sets bit 8 (all
-// pass 7 = RGB8|LIGHTBOX|THUMB), so this changed no behavior. The mhc three-sweep review
-// and the lib.rs review caught this independently and both corrected it to 16.
+                            // Skip apply_orientation on the OUT_FULL_RGB8 output. Pixels and width/height
+                            // stay in sensor orientation; consumer reads `orientation` to know how to display
+                            // (or to pass to JXL encoder via basic info). Saves the 60–200 MB intermediate
+                            // rotate when feeding the encoder (JXL stores orientation as metadata).
+                            // bit 4. Previously bit 8, accidentally shared with OUT_FULL_16 — b2cb8dc9 added
+                            // OUT_NO_ORIENT=8, then 1674aa11 added OUT_FULL_16=8 five days later. Split to its own
+                            // bit so full-res-16 and skip-orientation are independent. No caller sets bit 8 (all
+                            // pass 7 = RGB8|LIGHTBOX|THUMB), so this changed no behavior. The mhc three-sweep review
+                            // and the lib.rs review caught this independently and both corrected it to 16.
 const OUT_NO_ORIENT: u32 = 16;
 /// Full-resolution display-referred RGB16 (post WB/matrix/tone, oriented, full-range [0,65535]).
 const OUT_FULL_DISP16: u32 = 32;
@@ -1150,14 +1206,19 @@ struct OrfDecoded {
     thumb_w: usize,
     thumb_h: usize,
     preview_demosaic_ms: f64,  // fast planar bilinear demosaic for previews
-    preview_downscale_ms: f64,  // planar downscales for lb + thumb previews
-    fast_preview: bool,  // fast planar path used for previews
+    preview_downscale_ms: f64, // planar downscales for lb + thumb previews
+    fast_preview: bool,        // fast planar path used for previews
 }
 
 /// Gate for the streaming preview-only fast path: previews requested, full-res output
 /// NOT requested (so the raw is needed for nothing else), camera WB tags present (so no
 /// full-raw auto-WB scan is needed), and the frame is halve-able (¼-res superpixel path).
-fn should_stream_previews(need_previews: bool, need_full_rgb: bool, wb_from_camera: bool, can_halve: bool) -> bool {
+fn should_stream_previews(
+    need_previews: bool,
+    need_full_rgb: bool,
+    wb_from_camera: bool,
+    can_halve: bool,
+) -> bool {
     need_previews && !need_full_rgb && wb_from_camera && can_halve
 }
 
@@ -1167,7 +1228,7 @@ mod stream_gate_tests {
     #[test]
     fn gate_truth_table() {
         assert!(should_stream_previews(true, false, true, true));
-        assert!(!should_stream_previews(true, true, true, true));   // full-res wanted
+        assert!(!should_stream_previews(true, true, true, true)); // full-res wanted
         assert!(!should_stream_previews(true, false, false, true)); // no camera WB
         assert!(!should_stream_previews(false, false, true, true)); // no previews
         assert!(!should_stream_previews(true, false, true, false)); // not halve-able
@@ -1216,13 +1277,22 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
             "OUT_RETAIN_RAW must not be combined with a full-output flag in one call"
         );
         let wb_from_camera = info.wb_r.is_some() && info.wb_b.is_some();
-        if should_stream_previews(need_previews, need_full_rgb || retain_raw, wb_from_camera, preview_can_halve(w, h, lb_w, lb_h)) {
+        if should_stream_previews(
+            need_previews,
+            need_full_rgb || retain_raw,
+            wb_from_camera,
+            preview_can_halve(w, h, lb_w, lb_h),
+        ) {
             let t = now_ms();
             let previews = raw_pipeline::stream_preview::build_previews_streaming(
                 raw_pipeline::decompress::OrfRowDecoder::new(strip, w, h)
                     .map_err(|e| JsError::new(&e))?,
-                w, h, (0, 0), &[(lb_w, lb_h), (thumb_w, thumb_h)],
-            ).map_err(|e| JsError::new(&e))?;
+                w,
+                h,
+                (0, 0),
+                &[(lb_w, lb_h), (thumb_w, thumb_h)],
+            )
+            .map_err(|e| JsError::new(&e))?;
             let stream_ms = now_ms() - t;
             let mut it = previews.into_iter();
             let lb_packed = it.next().unwrap_or_default();
@@ -1230,25 +1300,39 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
 
             let mut params = pipeline::PipelineParams::default_olympus();
             params.black = OLYMPUS_BLACK_LEVEL;
-            if let Some(r) = info.wb_r { params.wb_r = r; }
-            if let Some(b) = info.wb_b { params.wb_b = b; }
-            if let Some(m) = info.color_matrix { params.color_matrix = Some(m).into(); }
+            if let Some(r) = info.wb_r {
+                params.wb_r = r;
+            }
+            if let Some(b) = info.wb_b {
+                params.wb_b = b;
+            }
+            if let Some(m) = info.color_matrix {
+                params.color_matrix = Some(m).into();
+            }
             let color_matrix_from_mn = info.color_matrix.is_some();
             let color_matrix_flat: [f32; 9] = {
                 let m = params.color_matrix.matrix();
-                [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
+                [
+                    m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+                ]
             };
 
             return Ok(OrfDecoded {
                 raw: Vec::new(),
-                w, h, info,
+                w,
+                h,
+                info,
                 decompress_ms: stream_ms,
                 wb_from_camera,
                 params,
                 color_matrix_from_mn,
                 color_matrix_flat,
-                lb_packed, lb_w, lb_h,
-                thumb_packed, thumb_w, thumb_h,
+                lb_packed,
+                lb_w,
+                lb_h,
+                thumb_packed,
+                thumb_w,
+                thumb_h,
                 preview_demosaic_ms: 0.0,
                 preview_downscale_ms: 0.0,
                 fast_preview: true,
@@ -1287,7 +1371,13 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
             let lb_packed = downscale_rgb16_impl(&half, hw, hh, lb_w, lb_h);
             let thumb_packed = downscale_rgb16_impl(&half, hw, hh, thumb_w, thumb_h);
             let preview_downscale_ms = now_ms() - t_down; // two downs (lb + thumb) over ¼ pixels
-            (lb_packed, thumb_packed, preview_demosaic_ms, preview_downscale_ms, true)
+            (
+                lb_packed,
+                thumb_packed,
+                preview_demosaic_ms,
+                preview_downscale_ms,
+                true,
+            )
         } else {
             // Full-res bilinear fallback: frame too small to halve without upsampling the lightbox.
             let t_dem = now_ms();
@@ -1298,7 +1388,13 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
             let lb_packed = downscale_rgb16_planar(&pr, &pg, &pb, w, h, lb_w, lb_h);
             let thumb_packed = downscale_rgb16_planar(&pr, &pg, &pb, w, h, thumb_w, thumb_h);
             let preview_downscale_ms = now_ms() - t_down; // two planar downs (lb + thumb)
-            (lb_packed, thumb_packed, preview_demosaic_ms, preview_downscale_ms, true)
+            (
+                lb_packed,
+                thumb_packed,
+                preview_demosaic_ms,
+                preview_downscale_ms,
+                true,
+            )
         };
 
     let mut params = pipeline::PipelineParams::default_olympus();
@@ -1520,7 +1616,17 @@ fn finish_from_raw(
             } else {
                 pipeline::apply_orientation(rgb8, w, h, orientation)
             };
-            (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
+            (
+                fr,
+                fw,
+                fh,
+                tonemap_ms,
+                now_ms() - t2,
+                rgb16_full,
+                rgb16_disp,
+                disp16_w,
+                disp16_h,
+            )
         } else {
             let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
             // Note: without OUT_FULL_RGB8 no unsharp/clarity pass runs here, so this disp16 render
@@ -1538,7 +1644,17 @@ fn finish_from_raw(
                 (Vec::new(), 0u32, 0u32)
             };
             let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
-            (vec![], 0, 0, 0.0, 0.0, rgb16_full, rgb16_disp, disp16_w, disp16_h)
+            (
+                vec![],
+                0,
+                0,
+                0.0,
+                0.0,
+                rgb16_full,
+                rgb16_disp,
+                disp16_w,
+                disp16_h,
+            )
         };
 
     Ok(FinishOutputs {
@@ -1778,7 +1894,7 @@ fn process_orf_impl(
 /// defence-in-depth but should never fire if this passes.
 fn validate_orf_structure(data: &[u8], info: &tiff::OrfInfo) -> Result<(), JsError> {
     const MAX_DIM: u32 = 16_384;
-    const MAX_PIXELS: usize = 50_000_000; // 50 MP
+    const MAX_PIXELS: usize = 120_000_000; // 120 MP
 
     if info.width == 0 || info.height == 0 {
         return Err(JsError::new("ORF: zero image dimension"));
@@ -1794,7 +1910,7 @@ fn validate_orf_structure(data: &[u8], info: &tiff::OrfInfo) -> Result<(), JsErr
         .ok_or_else(|| JsError::new("ORF: width×height overflows"))?;
     if n > MAX_PIXELS {
         return Err(JsError::new(&format!(
-            "ORF: {} pixels exceeds 50 MP limit",
+            "ORF: {} pixels exceeds 120 MP browser processing limit",
             n
         )));
     }
@@ -1942,13 +2058,7 @@ pub fn process_orf_with_look(
 /// Errors (unsupported/corrupt ORF, or a rect outside the frame) are surfaced as a `JsValue`
 /// so the caller gets a clean exception instead of a wasm panic/abort.
 #[wasm_bindgen]
-pub fn process_region(
-    bytes: &[u8],
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-) -> Result<Vec<u8>, JsValue> {
+pub fn process_region(bytes: &[u8], x: u32, y: u32, w: u32, h: u32) -> Result<Vec<u8>, JsValue> {
     // Decode to full-res, pre-tonemapped RGB16 (sensor orientation). OUT_FULL_16 fills
     // `rgb16` (MHC demosaic + ISO NR) without building the lb/thumb preview buffers.
     let decoded = decode_orf_raw(bytes, OUT_FULL_16).map_err(JsValue::from)?;
@@ -2055,7 +2165,14 @@ pub fn rotate_rgb8(
 /// masked to 0, so the truncating `sum/n` divide yields identical bytes (proven in
 /// `examples/downscale_rgb_simd_flip.rs`). Every other target uses the scalar fallback.
 #[inline]
-fn box_sum_rgb(src: &[u8], y0: usize, y1: usize, x0: usize, x_count: usize, sw: usize) -> (u32, u32, u32) {
+fn box_sum_rgb(
+    src: &[u8],
+    y0: usize,
+    y1: usize,
+    x0: usize,
+    x_count: usize,
+    sw: usize,
+) -> (u32, u32, u32) {
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
         use core::arch::wasm32::*;
@@ -2159,7 +2276,7 @@ pub fn downscale_rgb(
                     }
                     row_base += sw;
                 }
-                out[o]     = (rr / pixel_count) as u8;
+                out[o] = (rr / pixel_count) as u8;
                 out[o + 1] = (gg / pixel_count) as u8;
                 out[o + 2] = (bb / pixel_count) as u8;
                 o += 3;
@@ -2182,7 +2299,7 @@ pub fn downscale_rgb(
             let x_count = x1 - x0;
             let n = ((y1 - y0) * x_count).max(1) as u32;
             let (rr, gg, bb) = box_sum_rgb(src, y0, y1, x0, x_count, sw);
-            out[o]     = (rr / n) as u8;
+            out[o] = (rr / n) as u8;
             out[o + 1] = (gg / n) as u8;
             out[o + 2] = (bb / n) as u8;
             o += 3;
@@ -2201,13 +2318,20 @@ pub fn downscale_rgb16_pub(
     dst_w: u32,
     dst_h: u32,
 ) -> Result<Vec<u16>, JsError> {
-    let (sw, sh, dw, dh) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+    let (sw, sh, dw, dh) = (
+        src_w as usize,
+        src_h as usize,
+        dst_w as usize,
+        dst_h as usize,
+    );
     let expected_len = sw
         .checked_mul(sh)
         .and_then(|n| n.checked_mul(3))
         .ok_or_else(|| JsError::new("downscale_rgb16_pub: dimensions overflow"))?;
     if src.len() != expected_len {
-        return Err(JsError::new("downscale_rgb16_pub: src len != src_w*src_h*3"));
+        return Err(JsError::new(
+            "downscale_rgb16_pub: src len != src_w*src_h*3",
+        ));
     }
     if dw == 0 || dh == 0 || dw > sw || dh > sh {
         return Err(JsError::new("downscale_rgb16_pub: invalid target dims"));
@@ -2289,7 +2413,15 @@ fn downscale_rgba_int_simd(
 /// Planar SoA downscale (hypercar layer): 3 separate contiguous planes in (R/G/B from demosaic_planar).
 /// Zero interleave cost. Sequential per-channel box filter = massive cache win vs interleaved scatter.
 /// Outputs packed LE u8 6B/px (same as before) for drop-in use in lb/thumb paths. Integer fast path per plane.
-fn downscale_rgb16_planar(r: &[u16], g: &[u16], b: &[u16], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+fn downscale_rgb16_planar(
+    r: &[u16],
+    g: &[u16],
+    b: &[u16],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+) -> Vec<u8> {
     let mut out = vec![0u8; dw * dh * 6];
     if (sw % dw == 0) && (sh % dh == 0) {
         let xstep = sw / dw;
@@ -2304,12 +2436,20 @@ fn downscale_rgb16_planar(r: &[u16], g: &[u16], b: &[u16], sw: usize, sh: usize,
                 for _yy in 0..ystep {
                     let mut idx = row_base + x_base;
                     for _xx in 0..xstep {
-                        rr += r[idx] as u32; gg += g[idx] as u32; bb += b[idx] as u32;
+                        rr += r[idx] as u32;
+                        gg += g[idx] as u32;
+                        bb += b[idx] as u32;
                         idx += 1;
                     }
                     row_base += sw;
                 }
-                write_rgb16_le(&mut out, o, (rr / pixel_count) as u16, (gg / pixel_count) as u16, (bb / pixel_count) as u16);
+                write_rgb16_le(
+                    &mut out,
+                    o,
+                    (rr / pixel_count) as u16,
+                    (gg / pixel_count) as u16,
+                    (bb / pixel_count) as u16,
+                );
                 o += 6;
             }
         }
@@ -2378,7 +2518,7 @@ pub fn downscale_rgba(
                 for _yy in 0..ystep {
                     let mut i = (row_base + x_base) * 4;
                     for _xx in 0..xstep {
-                        rr += src[i]     as u32;
+                        rr += src[i] as u32;
                         gg += src[i + 1] as u32;
                         bb += src[i + 2] as u32;
                         aa += src[i + 3] as u32;
@@ -2386,7 +2526,7 @@ pub fn downscale_rgba(
                     }
                     row_base += sw;
                 }
-                out[o]     = (rr / pixel_count) as u8;
+                out[o] = (rr / pixel_count) as u8;
                 out[o + 1] = (gg / pixel_count) as u8;
                 out[o + 2] = (bb / pixel_count) as u8;
                 out[o + 3] = (aa / pixel_count) as u8;
@@ -2414,7 +2554,7 @@ pub fn downscale_rgba(
             for _y in y0..y1 {
                 let mut i = row_base;
                 for _ in 0..x_count {
-                    rr += src[i]     as u32;
+                    rr += src[i] as u32;
                     gg += src[i + 1] as u32;
                     bb += src[i + 2] as u32;
                     aa += src[i + 3] as u32;
@@ -2422,7 +2562,7 @@ pub fn downscale_rgba(
                 }
                 row_base += sw * 4;
             }
-            out[o]     = (rr / n) as u8;
+            out[o] = (rr / n) as u8;
             out[o + 1] = (gg / n) as u8;
             out[o + 2] = (bb / n) as u8;
             out[o + 3] = (aa / n) as u8;
@@ -2558,7 +2698,7 @@ pub fn rgb16_to_rgba16(rgb: &[u16]) -> Vec<u16> {
     let n = rgb.len() / 3;
     let mut out = vec![0u16; n * 4];
     for i in 0..n {
-        out[i * 4]     = rgb[i * 3];
+        out[i * 4] = rgb[i * 3];
         out[i * 4 + 1] = rgb[i * 3 + 1];
         out[i * 4 + 2] = rgb[i * 3 + 2];
         out[i * 4 + 3] = 0xFFFF;
@@ -2570,7 +2710,11 @@ pub fn rgb16_to_rgba16(rgb: &[u16]) -> Vec<u16> {
 // 16 bytes to `out`, so the last block must satisfy block*12 + 16 <= rgb.len().
 #[inline]
 fn rgb_to_rgba_simd_blocks(src_len: usize, n: usize) -> usize {
-    if src_len < 16 { 0 } else { ((src_len - 16) / 12 + 1).min(n / 4) }
+    if src_len < 16 {
+        0
+    } else {
+        ((src_len - 16) / 12 + 1).min(n / 4)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2640,25 +2784,36 @@ mod tests {
             for i in 0..(w * h) {
                 let o = i * 6;
                 let (r, g, b) = (src[i * 3], src[i * 3 + 1], src[i * 3 + 2]);
-                out[o] = (r & 0xff) as u8; out[o + 1] = (r >> 8) as u8;
-                out[o + 2] = (g & 0xff) as u8; out[o + 3] = (g >> 8) as u8;
-                out[o + 4] = (b & 0xff) as u8; out[o + 5] = (b >> 8) as u8;
+                out[o] = (r & 0xff) as u8;
+                out[o + 1] = (r >> 8) as u8;
+                out[o + 2] = (g & 0xff) as u8;
+                out[o + 3] = (g >> 8) as u8;
+                out[o + 4] = (b & 0xff) as u8;
+                out[o + 5] = (b >> 8) as u8;
             }
             out
         }
         fn unpack_scalar(src: &[u8]) -> Vec<u16> {
-            src.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+            src.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
         }
         let (w, h) = (37usize, 19usize); // odd dims, full RGB triples
         let mut s: u32 = 0x1234_5678;
-        let src: Vec<u16> = (0..w * h * 3).map(|_| {
-            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            ((s >> 8) & 0xffff) as u16
-        }).collect();
+        let src: Vec<u16> = (0..w * h * 3)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 8) & 0xffff) as u16
+            })
+            .collect();
         let packed = pack_rgb16_full(&src, w, h);
         assert_eq!(packed, pack_scalar(&src, w, h), "pack != scalar reference");
         let unpacked = unpack_rgb16_le(&packed);
-        assert_eq!(unpacked, unpack_scalar(&packed), "unpack != scalar reference");
+        assert_eq!(
+            unpacked,
+            unpack_scalar(&packed),
+            "unpack != scalar reference"
+        );
         assert_eq!(unpacked, src, "pack→unpack round-trip lost data");
     }
 
@@ -2753,7 +2908,10 @@ mod tests {
         let mean = sum as f64 / full.len() as f64;
         // 12-bit scale (0..4095). Correct wiring keeps the mean delta tiny on coherent content;
         // the generous bound exists to catch a gross regression, not to assert bit-equality.
-        assert!(mean < 40.0, "half preview mean delta {mean:.1} too high (12-bit 0..4095)");
+        assert!(
+            mean < 40.0,
+            "half preview mean delta {mean:.1} too high (12-bit 0..4095)"
+        );
     }
 
     #[test]
@@ -2763,18 +2921,23 @@ mod tests {
             let mut out = vec![255u8; n * 4];
             let (mut si, mut di) = (0, 0);
             for _ in 0..n {
-                out[di] = rgb[si]; out[di + 1] = rgb[si + 1]; out[di + 2] = rgb[si + 2];
-                si += 3; di += 4;
+                out[di] = rgb[si];
+                out[di + 1] = rgb[si + 1];
+                out[di + 2] = rgb[si + 2];
+                si += 3;
+                di += 4;
             }
             out
         }
         // Pixel counts spanning: empty, <4 (no SIMD), exact blocks, blocks+tail, large.
         for &px in &[0usize, 1, 2, 3, 4, 5, 7, 8, 15, 16, 17, 1000, 1001] {
             let mut s: u32 = 0xC0FFEE ^ px as u32;
-            let rgb: Vec<u8> = (0..px * 3).map(|_| {
-                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                (s >> 24) as u8
-            }).collect();
+            let rgb: Vec<u8> = (0..px * 3)
+                .map(|_| {
+                    s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (s >> 24) as u8
+                })
+                .collect();
             assert_eq!(rgb_to_rgba(&rgb), scalar(&rgb), "mismatch at {px} px");
         }
     }
@@ -2787,17 +2950,22 @@ mod tests {
         const W: usize = 100;
         const H: usize = 100;
         let mut s: u32 = 0xDEAD_BEEF;
-        let rgb: Vec<u8> = (0..W * H * 3).map(|_| {
-            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (s >> 24) as u8
-        }).collect();
+        let rgb: Vec<u8> = (0..W * H * 3)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect();
         // Reference scalar: straightforward 3→4 stride scatter.
         let n = W * H;
         let mut expected = vec![255u8; n * 4];
         let (mut si, mut di) = (0usize, 0usize);
         for _ in 0..n {
-            expected[di] = rgb[si]; expected[di + 1] = rgb[si + 1]; expected[di + 2] = rgb[si + 2];
-            si += 3; di += 4;
+            expected[di] = rgb[si];
+            expected[di + 1] = rgb[si + 1];
+            expected[di + 2] = rgb[si + 2];
+            si += 3;
+            di += 4;
         }
         let got = rgb_to_rgba(&rgb);
         assert_eq!(got.len(), n * 4, "output length wrong");
@@ -2818,6 +2986,58 @@ mod tests {
         assert_eq!(&expected[0..4], &[10, 20, 30, 255]);
     }
 
+    #[test]
+    fn process_raw_mosaic_synthetic_bayer_outputs_requested_views() {
+        let w = 8usize;
+        let h = 8usize;
+        let mut raw = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                raw[y * w + x] = if (y & 1) == 0 && (x & 1) == 0 {
+                    1800
+                } else if (y & 1) == 1 && (x & 1) == 1 {
+                    900
+                } else {
+                    1400
+                };
+            }
+        }
+        let cm = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        let result = process_raw_mosaic_impl(
+            &raw,
+            w as u32,
+            h as u32,
+            0,
+            64,
+            4095,
+            1.0,
+            1.0,
+            1,
+            &cm,
+            OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB,
+            &LookOverrides::neutral(),
+        )
+        .unwrap();
+        assert_eq!((result.width, result.height), (w as u32, h as u32));
+        assert_eq!(result.rgb.len(), w * h * 3);
+        assert_eq!(result.black_used, 64);
+        assert_eq!(result.white_used, 4095);
+        assert_eq!(result.wb_r_used, 1.0);
+        assert_eq!(result.wb_b_used, 1.0);
+        assert!(!result.rgb16_lb.is_empty());
+        assert!(!result.rgb16_thumb.is_empty());
+    }
+
+    #[test]
+    fn process_raw_mosaic_accepts_full_frame_camera_dimensions_before_sample_length_check() {
+        // Sony A7R IV class frames are roughly 9504x6336 (~60 MP). The generic
+        // LibRaw mosaic path must not reject them before it even checks samples.
+        let err = validate_raw_mosaic_shape(0, 9504, 6336).unwrap_err();
+        assert!(
+            err.contains("samples 0 != 9504x6336"),
+            "unexpected error: {err}"
+        );
+    }
     #[test]
     fn raw_pipeline_direct_rgba_available_for_native_parity() {
         // Smoke that the direct-RGBA entry (for Tauri P3 encode parity) is linked
@@ -2928,7 +3148,16 @@ impl LookRenderer {
     ) -> Result<LookRenderer, JsError> {
         // Legacy 5-arg constructor (used by the perf benchmark): black=0. The
         // colour-correct app path uses new_with_options with the per-format black.
-        Self::new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, true, 0, 0)
+        Self::new_with_options(
+            rgb16_bytes,
+            width,
+            height,
+            orientation,
+            color_matrix_flat,
+            true,
+            0,
+            0,
+        )
     }
 
     /// Variant of `new` that lets the caller opt out of CPU rotation in
@@ -3095,8 +3324,20 @@ impl LookRenderer {
     pub fn render_look(&self, look: JsValue) -> Result<Vec<u8>, JsError> {
         let l = LookOverrides::from_js(&look)?;
         self.render(
-            l.wb_r, l.wb_b, l.exposure_ev, l.contrast, l.highlights, l.shadows, l.whites,
-            l.blacks, l.saturation, l.vibrance, l.temp, l.tint, l.texture, l.clarity,
+            l.wb_r,
+            l.wb_b,
+            l.exposure_ev,
+            l.contrast,
+            l.highlights,
+            l.shadows,
+            l.whites,
+            l.blacks,
+            l.saturation,
+            l.vibrance,
+            l.temp,
+            l.tint,
+            l.texture,
+            l.clarity,
         )
     }
 }
@@ -3228,8 +3469,8 @@ struct DngDecoded {
 /// Shared DNG decode path: decode bytes → validate → align CFA → demosaic → NR → WB/params setup.
 /// Returns pre-tonemapped RGB16 and all metadata.  Called by process_dng_impl.
 fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError> {
-    const MAX_DIM: u32 = 8192;
-    const MAX_PIXELS: usize = 50_000_000;
+    const MAX_DIM: u32 = 16_384;
+    const MAX_PIXELS: usize = 120_000_000;
 
     // Streaming preview-only fast path: previews requested, full-res output not. Build
     // superpixel previews band-by-band without the full raw / full-res MHC RGB
@@ -3239,7 +3480,10 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
     if need_previews && !need_full_rgb {
         if let Ok(src) = raw_pipeline::dng::DngRowSource::new(data) {
-            let (w, h) = { let m = src.meta(); (m.width, m.height) };
+            let (w, h) = {
+                let m = src.meta();
+                (m.width, m.height)
+            };
             if (w as u32) <= MAX_DIM
                 && (h as u32) <= MAX_DIM
                 && w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) <= MAX_PIXELS
@@ -3247,8 +3491,17 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 let phase = src.phase();
                 let (black, white, wb_r, wb_b, color_matrix, orientation, iso, make, model) = {
                     let m = src.meta();
-                    (m.black, m.white, m.wb_r, m.wb_b, m.color_matrix, m.orientation,
-                     m.iso.unwrap_or(100), m.make.clone(), m.model.clone())
+                    (
+                        m.black,
+                        m.white,
+                        m.wb_r,
+                        m.wb_b,
+                        m.color_matrix,
+                        m.orientation,
+                        m.iso.unwrap_or(100),
+                        m.make.clone(),
+                        m.model.clone(),
+                    )
                 };
                 let (lb_w, lb_h) = target_dims(w, h, 1800);
                 let (thumb_w, thumb_h) = target_dims(w, h, 360);
@@ -3260,20 +3513,43 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 params.color_matrix = color_matrix.into();
                 let color_matrix_flat: [f32; 9] = {
                     let mm = params.color_matrix.matrix();
-                    [mm[0][0], mm[0][1], mm[0][2], mm[1][0], mm[1][1], mm[1][2], mm[2][0], mm[2][1], mm[2][2]]
+                    [
+                        mm[0][0], mm[0][1], mm[0][2], mm[1][0], mm[1][1], mm[1][2], mm[2][0],
+                        mm[2][1], mm[2][2],
+                    ]
                 };
                 let t = now_ms();
                 let previews = raw_pipeline::stream_preview::build_previews_streaming(
-                    src, w, h, phase, &[(lb_w, lb_h), (thumb_w, thumb_h)],
-                ).map_err(|e| JsError::new(&format!("DNG stream: {}", e)))?;
+                    src,
+                    w,
+                    h,
+                    phase,
+                    &[(lb_w, lb_h), (thumb_w, thumb_h)],
+                )
+                .map_err(|e| JsError::new(&format!("DNG stream: {}", e)))?;
                 let decode_ms = now_ms() - t;
                 let mut it = previews.into_iter();
                 let lb_packed = it.next().unwrap_or_default();
                 let thumb_packed = it.next().unwrap_or_default();
                 return Ok(DngDecoded {
-                    rgb16: Vec::new(), aw: w, ah: h, params, color_matrix_flat,
-                    decode_ms, demosaic_ms: 0.0, orientation, make, model, iso,
-                    lb_packed, lb_w, lb_h, thumb_packed, thumb_w, thumb_h, fast_preview: true,
+                    rgb16: Vec::new(),
+                    aw: w,
+                    ah: h,
+                    params,
+                    color_matrix_flat,
+                    decode_ms,
+                    demosaic_ms: 0.0,
+                    orientation,
+                    make,
+                    model,
+                    iso,
+                    lb_packed,
+                    lb_w,
+                    lb_h,
+                    thumb_packed,
+                    thumb_w,
+                    thumb_h,
+                    fast_preview: true,
                 });
             }
         }
@@ -3297,7 +3573,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     }
     if w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) > MAX_PIXELS {
         return Err(JsError::new(&format!(
-            "DNG: {} pixels exceeds 50 MP limit",
+            "DNG: {} pixels exceeds 120 MP browser processing limit",
             w * h
         )));
     }
@@ -3349,12 +3625,16 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         color_matrix_flat,
         decode_ms,
         demosaic_ms,
-          orientation: img.orientation,
-          make: img.make,
-          model: img.model,
+        orientation: img.orientation,
+        make: img.make,
+        model: img.model,
         iso,
-        lb_packed: Vec::new(), lb_w: 0, lb_h: 0,
-        thumb_packed: Vec::new(), thumb_w: 0, thumb_h: 0,
+        lb_packed: Vec::new(),
+        lb_w: 0,
+        lb_h: 0,
+        thumb_packed: Vec::new(),
+        thumb_w: 0,
+        thumb_h: 0,
         fast_preview: false,
     })
 }
@@ -3449,69 +3729,98 @@ fn process_dng_impl(
     );
 
     let t = now_ms();
-    let (final_rgb, final_w, final_h, tonemap_ms, orient_ms, rgb16_full, rgb16_disp, disp16_w, disp16_h) =
-        if output_flags & OUT_FULL_RGB8 != 0 {
-            // 16-bit master export is the pre-unsharp image; snapshot only when unsharp
-            // would mutate rgb16 (rare). Common path moves rgb16 out for free.
-            let will_unsharp = params.texture != 0.0 || params.clarity != 0.0;
-            let full16_pre = if want_full16 && will_unsharp {
-                Some(rgb16.clone())
-            } else {
-                None
-            };
-            if will_unsharp {
-                pipeline::apply_unsharp_masks(&mut rgb16, aw, ah, &params);
-            }
-            // Chapter 1: SIMD bulk tone (DNG + CR2 share this impl). See process_into_auto.
-            let rgb8 = pipeline::process_auto(&rgb16, &params);
-            let tonemap_ms = now_ms() - t;
-            // Compute display-referred 16-bit BEFORE moving rgb16 (borrow must end before move).
-            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
-            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
-                let disp = pipeline::process_16bit(&rgb16, &params);
-                if skip_orient || orientation == 1 {
-                    (disp, aw as u32, ah as u32)
-                } else {
-                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, aw, ah, orientation);
-                    (d, dw as u32, dh as u32)
-                }
-            } else {
-                (Vec::new(), 0u32, 0u32)
-            };
-            // rgb16's last read is done: move it into the 16-bit master (common, no copy),
-            // use the pre-unsharp snapshot, or release it. Freed before orientation either way.
-            let rgb16_full = if want_full16 {
-                full16_pre.unwrap_or(rgb16)
-            } else {
-                drop(rgb16);
-                Vec::new()
-            };
-            let t2 = now_ms();
-            let (fr, fw, fh) = if skip_orient || orientation == 1 {
-                (rgb8, aw, ah)
-            } else {
-                pipeline::apply_orientation(rgb8, aw, ah, orientation)
-            };
-            (fr, fw, fh, tonemap_ms, now_ms() - t2, rgb16_full, rgb16_disp, disp16_w, disp16_h)
+    let (
+        final_rgb,
+        final_w,
+        final_h,
+        tonemap_ms,
+        orient_ms,
+        rgb16_full,
+        rgb16_disp,
+        disp16_w,
+        disp16_h,
+    ) = if output_flags & OUT_FULL_RGB8 != 0 {
+        // 16-bit master export is the pre-unsharp image; snapshot only when unsharp
+        // would mutate rgb16 (rare). Common path moves rgb16 out for free.
+        let will_unsharp = params.texture != 0.0 || params.clarity != 0.0;
+        let full16_pre = if want_full16 && will_unsharp {
+            Some(rgb16.clone())
         } else {
-            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
-            // Note: without OUT_FULL_RGB8 no unsharp/clarity pass runs here, so this disp16 render
-            // is pre-unsharp — consistent with rgb16_full on this same branch. The benchmark uses
-            // default look params (texture/clarity = 0), so this matches the 8-bit render exactly.
-            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
-                let disp = pipeline::process_16bit(&rgb16, &params);
-                if skip_orient || orientation == 1 {
-                    (disp, aw as u32, ah as u32)
-                } else {
-                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, aw, ah, orientation);
-                    (d, dw as u32, dh as u32)
-                }
-            } else {
-                (Vec::new(), 0u32, 0u32)
-            };
-            let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
-            (vec![], 0, 0, 0.0, 0.0, rgb16_full, rgb16_disp, disp16_w, disp16_h)
+            None
         };
+        if will_unsharp {
+            pipeline::apply_unsharp_masks(&mut rgb16, aw, ah, &params);
+        }
+        // Chapter 1: SIMD bulk tone (DNG + CR2 share this impl). See process_into_auto.
+        let rgb8 = pipeline::process_auto(&rgb16, &params);
+        let tonemap_ms = now_ms() - t;
+        // Compute display-referred 16-bit BEFORE moving rgb16 (borrow must end before move).
+        let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+        let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+            let disp = pipeline::process_16bit(&rgb16, &params);
+            if skip_orient || orientation == 1 {
+                (disp, aw as u32, ah as u32)
+            } else {
+                let (d, dw, dh) = pipeline::apply_orientation_u16(disp, aw, ah, orientation);
+                (d, dw as u32, dh as u32)
+            }
+        } else {
+            (Vec::new(), 0u32, 0u32)
+        };
+        // rgb16's last read is done: move it into the 16-bit master (common, no copy),
+        // use the pre-unsharp snapshot, or release it. Freed before orientation either way.
+        let rgb16_full = if want_full16 {
+            full16_pre.unwrap_or(rgb16)
+        } else {
+            drop(rgb16);
+            Vec::new()
+        };
+        let t2 = now_ms();
+        let (fr, fw, fh) = if skip_orient || orientation == 1 {
+            (rgb8, aw, ah)
+        } else {
+            pipeline::apply_orientation(rgb8, aw, ah, orientation)
+        };
+        (
+            fr,
+            fw,
+            fh,
+            tonemap_ms,
+            now_ms() - t2,
+            rgb16_full,
+            rgb16_disp,
+            disp16_w,
+            disp16_h,
+        )
+    } else {
+        let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+        // Note: without OUT_FULL_RGB8 no unsharp/clarity pass runs here, so this disp16 render
+        // is pre-unsharp — consistent with rgb16_full on this same branch. The benchmark uses
+        // default look params (texture/clarity = 0), so this matches the 8-bit render exactly.
+        let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+            let disp = pipeline::process_16bit(&rgb16, &params);
+            if skip_orient || orientation == 1 {
+                (disp, aw as u32, ah as u32)
+            } else {
+                let (d, dw, dh) = pipeline::apply_orientation_u16(disp, aw, ah, orientation);
+                (d, dw as u32, dh as u32)
+            }
+        } else {
+            (Vec::new(), 0u32, 0u32)
+        };
+        let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
+        (
+            vec![],
+            0,
+            0,
+            0.0,
+            0.0,
+            rgb16_full,
+            rgb16_disp,
+            disp16_w,
+            disp16_h,
+        )
+    };
 
     Ok(ProcessResult {
         rgb: final_rgb,
@@ -3694,12 +4003,206 @@ struct Cr2Decoded {
     iso: u32,
 }
 
+fn cfa_phase_from_code(code: u32) -> Result<(u8, u8), JsError> {
+    match code {
+        0 => Ok((0, 0)),
+        1 => Ok((0, 1)),
+        2 => Ok((1, 0)),
+        3 => Ok((1, 1)),
+        _ => Err(JsError::new(&format!(
+            "raw mosaic: invalid CFA phase {code}"
+        ))),
+    }
+}
+
+fn matrix_from_flat_or_identity(color_matrix_flat: &[f32]) -> ([[f32; 3]; 3], [f32; 9]) {
+    if color_matrix_flat.len() == 9 && color_matrix_flat.iter().all(|v| v.is_finite()) {
+        let flat = [
+            color_matrix_flat[0],
+            color_matrix_flat[1],
+            color_matrix_flat[2],
+            color_matrix_flat[3],
+            color_matrix_flat[4],
+            color_matrix_flat[5],
+            color_matrix_flat[6],
+            color_matrix_flat[7],
+            color_matrix_flat[8],
+        ];
+        (
+            [
+                [flat[0], flat[1], flat[2]],
+                [flat[3], flat[4], flat[5]],
+                [flat[6], flat[7], flat[8]],
+            ],
+            flat,
+        )
+    } else {
+        let m = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        (m, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    }
+}
+
+const RAW_MOSAIC_MAX_DIM: u32 = 16_384;
+const RAW_MOSAIC_MAX_PIXELS: usize = 120_000_000;
+
+fn validate_raw_mosaic_shape(raw_len: usize, width: u32, height: u32) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err("raw mosaic: zero image dimension".to_string());
+    }
+    if width > RAW_MOSAIC_MAX_DIM || height > RAW_MOSAIC_MAX_DIM {
+        return Err(format!(
+            "raw mosaic: dimension {}x{} exceeds maximum {}",
+            width, height, RAW_MOSAIC_MAX_DIM
+        ));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let pixels = w
+        .checked_mul(h)
+        .ok_or_else(|| "raw mosaic: dimensions overflow".to_string())?;
+    if pixels > RAW_MOSAIC_MAX_PIXELS {
+        return Err(format!(
+            "raw mosaic: {} pixels exceeds 120 MP browser processing limit",
+            pixels
+        ));
+    }
+    if raw_len != pixels {
+        return Err(format!(
+            "raw mosaic: samples {} != {}x{}",
+            raw_len, width, height
+        ));
+    }
+    Ok(pixels)
+}
+
+fn process_raw_mosaic_impl(
+    raw: &[u16],
+    width: u32,
+    height: u32,
+    cfa_phase: u32,
+    black: u32,
+    white: u32,
+    wb_r: f32,
+    wb_b: f32,
+    orientation: u32,
+    color_matrix_flat: &[f32],
+    output_flags: u32,
+    look: &LookOverrides,
+) -> Result<ProcessResult, JsError> {
+    validate_raw_mosaic_shape(raw.len(), width, height).map_err(|e| JsError::new(&e))?;
+    let w = width as usize;
+    let h = height as usize;
+    let phase = cfa_phase_from_code(cfa_phase)?;
+    let t = now_ms();
+    let rgb16 = demosaic::demosaic_bayer_mhc(raw, w, h, phase)
+        .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
+    let demosaic_ms = now_ms() - t;
+
+    let (matrix, flat) = matrix_from_flat_or_identity(color_matrix_flat);
+    let mut params = pipeline::PipelineParams::default_olympus();
+    params.black = black.min(u16::MAX as u32) as u16;
+    params.white = white.min(u16::MAX as u32).max(params.black as u32 + 1) as u16;
+    params.wb_r = if wb_r.is_finite() && wb_r > 0.0 {
+        wb_r.min(8.0)
+    } else {
+        1.0
+    };
+    params.wb_b = if wb_b.is_finite() && wb_b > 0.0 {
+        wb_b.min(8.0)
+    } else {
+        1.0
+    };
+    params.color_matrix = Some(matrix).into();
+
+    process_dng_impl(
+        DngDecoded {
+            rgb16,
+            aw: w,
+            ah: h,
+            params,
+            color_matrix_flat: flat,
+            decode_ms: 0.0,
+            demosaic_ms,
+            orientation: orientation.min(u16::MAX as u32) as u16,
+            make: String::new(),
+            model: String::new(),
+            iso: 0,
+            lb_packed: Vec::new(),
+            lb_w: 0,
+            lb_h: 0,
+            thumb_packed: Vec::new(),
+            thumb_w: 0,
+            thumb_h: 0,
+            fast_preview: false,
+        },
+        output_flags,
+        look,
+    )
+}
+
+#[wasm_bindgen]
+pub fn process_raw_mosaic_with_flags(
+    raw: &[u16],
+    width: u32,
+    height: u32,
+    cfa_phase: u32,
+    black: u32,
+    white: u32,
+    wb_r: f32,
+    wb_b: f32,
+    orientation: u32,
+    color_matrix_flat: &[f32],
+    output_flags: u32,
+    exposure_ev: f32,
+    contrast: f32,
+    highlights: f32,
+    shadows: f32,
+    whites: f32,
+    blacks: f32,
+    saturation: f32,
+    vibrance: f32,
+    temp: f32,
+    tint: f32,
+    texture: f32,
+    clarity: f32,
+) -> Result<ProcessResult, JsError> {
+    let look = LookOverrides {
+        exposure_ev,
+        contrast,
+        highlights,
+        shadows,
+        whites,
+        blacks,
+        saturation,
+        vibrance,
+        temp,
+        tint,
+        wb_r: f32::NAN,
+        wb_b: f32::NAN,
+        texture,
+        clarity,
+    };
+    process_raw_mosaic_impl(
+        raw,
+        width,
+        height,
+        cfa_phase,
+        black,
+        white,
+        wb_r,
+        wb_b,
+        orientation,
+        color_matrix_flat,
+        output_flags,
+        &look,
+    )
+}
 /// Generic Canon EOS cam-to-sRGB matrix (dcraw/LibRaw coefficients).
 /// Used as the fallback when a CR2 file does not embed its own color matrix.
 const CANON_CAM_TO_SRGB: [[f32; 3]; 3] = [
-    [ 0.4592, 0.3810, 0.1595],
-    [ 0.1638, 0.7718, 0.0644],
-    [ 0.0388, 0.0791, 0.8824],
+    [0.4592, 0.3810, 0.1595],
+    [0.1638, 0.7718, 0.0644],
+    [0.0388, 0.0791, 0.8824],
 ];
 
 thread_local! {
@@ -3713,8 +4216,8 @@ thread_local! {
 }
 
 fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
-    const MAX_DIM: u32 = 8192;
-    const MAX_PIXELS: usize = 50_000_000;
+    const MAX_DIM: u32 = 16_384;
+    const MAX_PIXELS: usize = 120_000_000;
 
     // Time the LJPEG entropy decode specifically (not parse + slice-reassembly + crop)
     // so CR2 decompress_ms is apples-to-apples with the ORF path, whose decompress_ms
@@ -3738,7 +4241,7 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     }
     if w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) > MAX_PIXELS {
         return Err(JsError::new(&format!(
-            "CR2: {} pixels exceeds 50 MP limit",
+            "CR2: {} pixels exceeds 120 MP browser processing limit",
             w * h
         )));
     }
@@ -3769,7 +4272,7 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
             let mut count = 0u64;
             let mut i = 0;
             while i < n {
-                sum_r += rgb16[i * 3    ] as u64;
+                sum_r += rgb16[i * 3] as u64;
                 sum_g += rgb16[i * 3 + 1] as u64;
                 sum_b += rgb16[i * 3 + 2] as u64;
                 count += 1;
@@ -3785,13 +4288,15 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
                 // the range [max_rb/4 .. 4*max_rb].
                 const ALT_PHASES: [(u8, u8); 4] = [(0, 0), (0, 1), (1, 0), (1, 1)];
                 for &phase in &ALT_PHASES {
-                    if phase == cr2.cfa_phase { continue; }
+                    if phase == cr2.cfa_phase {
+                        continue;
+                    }
                     if let Ok(candidate) = demosaic::demosaic_bayer_mhc(&cr2.raw, w, h, phase) {
                         let (mut sr, mut sg, mut sb) = (0u64, 0u64, 0u64);
                         let mut ci = 0;
                         let mut k = 0u64;
                         while ci < n {
-                            sr += candidate[ci * 3    ] as u64;
+                            sr += candidate[ci * 3] as u64;
                             sg += candidate[ci * 3 + 1] as u64;
                             sb += candidate[ci * 3 + 2] as u64;
                             k += 1;
@@ -3818,7 +4323,9 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     params.color_matrix = cr2.color_matrix.into();
     let color_matrix_flat: [f32; 9] = {
         let m = params.color_matrix.to_option().unwrap_or(CANON_CAM_TO_SRGB);
-        [m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2]]
+        [
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        ]
     };
 
     let iso = cr2.iso.unwrap_or(100);
@@ -3850,19 +4357,23 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
 impl From<Cr2Decoded> for DngDecoded {
     fn from(c: Cr2Decoded) -> Self {
         DngDecoded {
-            rgb16:              c.rgb16,
-            aw:                 c.aw,
-            ah:                 c.ah,
-            params:             c.params,
-            color_matrix_flat:  c.color_matrix_flat,
-            decode_ms:          c.decode_ms,
-            demosaic_ms:        c.demosaic_ms,
-            orientation:        c.orientation,
-            make:               c.make,
-            model:              c.model,
-            iso:                c.iso,
-            lb_packed: Vec::new(), lb_w: 0, lb_h: 0,
-            thumb_packed: Vec::new(), thumb_w: 0, thumb_h: 0,
+            rgb16: c.rgb16,
+            aw: c.aw,
+            ah: c.ah,
+            params: c.params,
+            color_matrix_flat: c.color_matrix_flat,
+            decode_ms: c.decode_ms,
+            demosaic_ms: c.demosaic_ms,
+            orientation: c.orientation,
+            make: c.make,
+            model: c.model,
+            iso: c.iso,
+            lb_packed: Vec::new(),
+            lb_w: 0,
+            lb_h: 0,
+            thumb_packed: Vec::new(),
+            thumb_w: 0,
+            thumb_h: 0,
             fast_preview: false,
         }
     }
@@ -3999,11 +4510,17 @@ impl PerceptualComparer {
         assert!(
             ref_rgba.len() == expected,
             "PerceptualComparer: ref_rgba.len() ({}) != width*height*4 ({}×{}×4={})",
-            ref_rgba.len(), width, height, expected,
+            ref_rgba.len(),
+            width,
+            height,
+            expected,
         );
         let n = width.saturating_mul(height);
         let inner = PerceptualCore::new(ref_rgba, width, height, Opts::default());
-        PerceptualComparer { inner, scratch: vec![0u8; n.saturating_mul(4)] }
+        PerceptualComparer {
+            inner,
+            scratch: vec![0u8; n.saturating_mul(4)],
+        }
     }
 
     /// Copying convenience path: pass RGBA, get {butteraugli, ssim, psnr} as a JS object.
@@ -4049,7 +4566,11 @@ impl PerceptualComparer {
 
 fn metrics_to_js(m: &Metrics) -> JsValue {
     let o = js_sys::Object::new();
-    let _ = js_sys::Reflect::set(&o, &"butteraugli".into(), &JsValue::from_f64(m.butteraugli as f64));
+    let _ = js_sys::Reflect::set(
+        &o,
+        &"butteraugli".into(),
+        &JsValue::from_f64(m.butteraugli as f64),
+    );
     let _ = js_sys::Reflect::set(&o, &"ssim".into(), &JsValue::from_f64(m.ssim as f64));
     let _ = js_sys::Reflect::set(&o, &"psnr".into(), &JsValue::from_f64(m.psnr as f64));
     o.into()
@@ -4082,16 +4603,34 @@ mod perceptual_parity_ffi {
     #[wasm_bindgen]
     #[allow(clippy::too_many_arguments)]
     pub fn perc_scale_err_simd(
-        mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32], tx: &[f32], ty: &[f32], tb: &[f32],
-        n: usize, kx: f32, ky: f32, kb: f32,
+        mask: &[f32],
+        rx: &[f32],
+        ry: &[f32],
+        rb: &[f32],
+        tx: &[f32],
+        ty: &[f32],
+        tb: &[f32],
+        n: usize,
+        kx: f32,
+        ky: f32,
+        kb: f32,
     ) -> f32 {
         p::scale_err_simd(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb)
     }
     #[wasm_bindgen]
     #[allow(clippy::too_many_arguments)]
     pub fn perc_scale_err_scalar(
-        mask: &[f32], rx: &[f32], ry: &[f32], rb: &[f32], tx: &[f32], ty: &[f32], tb: &[f32],
-        n: usize, kx: f32, ky: f32, kb: f32,
+        mask: &[f32],
+        rx: &[f32],
+        ry: &[f32],
+        rb: &[f32],
+        tx: &[f32],
+        ty: &[f32],
+        tb: &[f32],
+        n: usize,
+        kx: f32,
+        ky: f32,
+        kb: f32,
     ) -> f32 {
         p::scale_err_scalar(mask, rx, ry, rb, tx, ty, tb, n, kx, ky, kb)
     }
@@ -4128,7 +4667,13 @@ mod perceptual_parity_ffi {
         p::downsample_simd(src, w, h, dw, dh)
     }
     #[wasm_bindgen]
-    pub fn perc_downsample_scalar(src: &[f32], w: usize, h: usize, dw: usize, dh: usize) -> Vec<f32> {
+    pub fn perc_downsample_scalar(
+        src: &[f32],
+        w: usize,
+        h: usize,
+        dw: usize,
+        dh: usize,
+    ) -> Vec<f32> {
         p::downsample_scalar(src, w, h, dw, dh)
     }
 }
@@ -4192,7 +4737,14 @@ fn fs_to_js(r: &FsRaw, px: usize) -> JsValue {
     };
     set("alphaMin", a_min as f64);
     set("alphaMax", r.a_max as f64);
-    set("alphaZeroPct", if px > 0 { (r.a_zero as f64 / px as f64) * 100.0 } else { 0.0 });
+    set(
+        "alphaZeroPct",
+        if px > 0 {
+            (r.a_zero as f64 / px as f64) * 100.0
+        } else {
+            0.0
+        },
+    );
     set("rgbNonzeroCount", r.rgb_nz as f64);
     set("lumaVariance", var);
     set("meanLuma", mean / 256.0);
@@ -4212,20 +4764,38 @@ fn fs_core_scalar(d: &[u8], px: usize) -> FsRaw {
         let g = d[i + 1] as u32;
         let b = d[i + 2] as u32;
         let a = d[i + 3] as u32;
-        hash ^= r; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= g; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= b; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= a; hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= r;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= g;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= b;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= a;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 /// De-serialized word-hash + 4-pixel-unrolled stats. The hash mixes the whole 32-bit
@@ -4255,9 +4825,15 @@ fn fs_core_fast(d: &[u8], px: usize) -> FsRaw {
             let b = (w >> 16) & 0xff;
             let a = w >> 24;
             rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-            if a < a_min { a_min = a; }
-            if a > a_max { a_max = a; }
-            if a == 0 { a_zero += 1; }
+            if a < a_min {
+                a_min = a;
+            }
+            if a > a_max {
+                a_max = a;
+            }
+            if a == 0 {
+                a_zero += 1;
+            }
             let l = 54 * r + 183 * g + 18 * b;
             let lf = l as f64;
             l_sum += lf;
@@ -4272,16 +4848,30 @@ fn fs_core_fast(d: &[u8], px: usize) -> FsRaw {
         let b = d[i + 2] as u32;
         let a = d[i + 3] as u32;
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
     let hash = (h0 ^ h1).wrapping_mul(FS_FNV_PRIME) ^ (h2 ^ h3).wrapping_mul(FS_FNV_PRIME);
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 /// Scan the resident buffer with the exact byte-FNV kernel (no per-call copy).
@@ -4330,7 +4920,9 @@ fn fs_core_simd(d: &[u8], px: usize) -> FsRaw {
     let mut h3 = FS_FNV_OFFSET ^ 0xc2b2_ae35;
 
     // RGB lanes -> 0xff so they never lower the running min; alpha lanes stay.
-    let rgb_or = u8x16(255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0);
+    let rgb_or = u8x16(
+        255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0,
+    );
     // Alpha lanes -> kept, RGB lanes -> 0 so they never raise the running max.
     let alpha_and = u8x16(0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255);
     // Per-channel luma weights, one 8-lane half = 2 pixels: [54,183,18,0, 54,183,18,0].
@@ -4348,14 +4940,15 @@ fn fs_core_simd(d: &[u8], px: usize) -> FsRaw {
         vmax = u8x16_max(vmax, v128_and(v, alpha_and));
 
         let zmask = i8x16_bitmask(u8x16_eq(v, zero16)) as u32;
-        a_zero += ((zmask >> 3) & 1) + ((zmask >> 7) & 1) + ((zmask >> 11) & 1) + ((zmask >> 15) & 1);
+        a_zero +=
+            ((zmask >> 3) & 1) + ((zmask >> 7) & 1) + ((zmask >> 11) & 1) + ((zmask >> 15) & 1);
         // RGB lanes mask = 0b0111 repeated; nonzero rgb = 12 - (zero rgb bytes)
         rgb_nz += 12 - (zmask & 0b0111_0111_0111_0111).count_ones();
 
         // luma: widen bytes -> u16, multiply by weights, pairwise-add to i32 per channel-pair.
         let lo = u16x8_extend_low_u8x16(v); // pixels 0,1: r0 g0 b0 a0 r1 g1 b1 a1
         let hi = u16x8_extend_high_u8x16(v); // pixels 2,3
-        // i16x8_mul keeps low 16 bits; 183*255=46665 < 65536 so products are exact.
+                                             // i16x8_mul keeps low 16 bits; 183*255=46665 < 65536 so products are exact.
         let plo = i32x4_extadd_pairwise_u16x8(i16x8_mul(lo, wmul)); // [54r0+183g0, 18b0+0, 54r1+183g1, 18b1+0]
         let phi = i32x4_extadd_pairwise_u16x8(i16x8_mul(hi, wmul));
         // L per pixel = lane0+lane1, lane2+lane3.
@@ -4380,16 +4973,24 @@ fn fs_core_simd(d: &[u8], px: usize) -> FsRaw {
     let mut a_min = 255u32;
     let mut a_max = 0u32;
     for &lane in &[
-        u8x16_extract_lane::<3>(vmin), u8x16_extract_lane::<7>(vmin),
-        u8x16_extract_lane::<11>(vmin), u8x16_extract_lane::<15>(vmin),
+        u8x16_extract_lane::<3>(vmin),
+        u8x16_extract_lane::<7>(vmin),
+        u8x16_extract_lane::<11>(vmin),
+        u8x16_extract_lane::<15>(vmin),
     ] {
-        if (lane as u32) < a_min { a_min = lane as u32; }
+        if (lane as u32) < a_min {
+            a_min = lane as u32;
+        }
     }
     for &lane in &[
-        u8x16_extract_lane::<3>(vmax), u8x16_extract_lane::<7>(vmax),
-        u8x16_extract_lane::<11>(vmax), u8x16_extract_lane::<15>(vmax),
+        u8x16_extract_lane::<3>(vmax),
+        u8x16_extract_lane::<7>(vmax),
+        u8x16_extract_lane::<11>(vmax),
+        u8x16_extract_lane::<15>(vmax),
     ] {
-        if (lane as u32) > a_max { a_max = lane as u32; }
+        if (lane as u32) > a_max {
+            a_max = lane as u32;
+        }
     }
 
     // tail (px not a multiple of 4): fold remaining pixels into the same 4 lanes by index%4
@@ -4405,18 +5006,35 @@ fn fs_core_simd(d: &[u8], px: usize) -> FsRaw {
         let lane = p & 3;
         lanes[lane] = (lanes[lane] ^ w).wrapping_mul(FS_FNV_PRIME);
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
     let hash = (lanes[0] ^ lanes[1]).wrapping_mul(FS_FNV_PRIME)
         ^ (lanes[2] ^ lanes[3]).wrapping_mul(FS_FNV_PRIME);
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4449,7 +5067,9 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
     let mut hash = FS_FNV_OFFSET;
 
-    let rgb_or = u8x16(255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0);
+    let rgb_or = u8x16(
+        255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0, 255, 255, 255, 0,
+    );
     let alpha_and = u8x16(0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255);
     let wmul = i16x8(54, 183, 18, 0, 54, 183, 18, 0);
     let zero16 = u8x16_splat(0);
@@ -4463,7 +5083,8 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
         vmin = u8x16_min(vmin, v128_or(v, rgb_or));
         vmax = u8x16_max(vmax, v128_and(v, alpha_and));
         let zmask = i8x16_bitmask(u8x16_eq(v, zero16)) as u32;
-        a_zero += ((zmask >> 3) & 1) + ((zmask >> 7) & 1) + ((zmask >> 11) & 1) + ((zmask >> 15) & 1);
+        a_zero +=
+            ((zmask >> 3) & 1) + ((zmask >> 7) & 1) + ((zmask >> 11) & 1) + ((zmask >> 15) & 1);
         rgb_nz += 12 - (zmask & 0b0111_0111_0111_0111).count_ones();
         let lo = i16x8_extend_low_u8x16(v);
         let hi = i16x8_extend_high_u8x16(v);
@@ -4486,16 +5107,24 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     let mut a_min = 255u32;
     let mut a_max = 0u32;
     for &lane in &[
-        u8x16_extract_lane::<3>(vmin), u8x16_extract_lane::<7>(vmin),
-        u8x16_extract_lane::<11>(vmin), u8x16_extract_lane::<15>(vmin),
+        u8x16_extract_lane::<3>(vmin),
+        u8x16_extract_lane::<7>(vmin),
+        u8x16_extract_lane::<11>(vmin),
+        u8x16_extract_lane::<15>(vmin),
     ] {
-        if (lane as u32) < a_min { a_min = lane as u32; }
+        if (lane as u32) < a_min {
+            a_min = lane as u32;
+        }
     }
     for &lane in &[
-        u8x16_extract_lane::<3>(vmax), u8x16_extract_lane::<7>(vmax),
-        u8x16_extract_lane::<11>(vmax), u8x16_extract_lane::<15>(vmax),
+        u8x16_extract_lane::<3>(vmax),
+        u8x16_extract_lane::<7>(vmax),
+        u8x16_extract_lane::<11>(vmax),
+        u8x16_extract_lane::<15>(vmax),
     ] {
-        if (lane as u32) > a_max { a_max = lane as u32; }
+        if (lane as u32) > a_max {
+            a_max = lane as u32;
+        }
     }
 
     for p in (chunks * 4)..px {
@@ -4504,21 +5133,42 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
         let g = d[i + 1] as u32;
         let b = d[i + 2] as u32;
         let a = d[i + 3] as u32;
-        hash ^= r; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= g; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= b; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= a; hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= r;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= g;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= b;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= a;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -4548,18 +5198,35 @@ fn fs_core_word_scalar(d: &[u8], px: usize) -> FsRaw {
         let lane = p & 3;
         lanes[lane] = (lanes[lane] ^ w).wrapping_mul(FS_FNV_PRIME);
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
     let hash = (lanes[0] ^ lanes[1]).wrapping_mul(FS_FNV_PRIME)
         ^ (lanes[2] ^ lanes[3]).wrapping_mul(FS_FNV_PRIME);
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 /// Truncation-safe word-hash kernel: zero-fills bytes past `limit`. Matches the JS
@@ -4583,18 +5250,35 @@ fn fs_core_trunc_word(d: &[u8], px: usize, limit: usize) -> FsRaw {
         let lane = p & 3;
         lanes[lane] = (lanes[lane] ^ w).wrapping_mul(FS_FNV_PRIME);
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
     let hash = (lanes[0] ^ lanes[1]).wrapping_mul(FS_FNV_PRIME)
         ^ (lanes[2] ^ lanes[3]).wrapping_mul(FS_FNV_PRIME);
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 /// Truncation-safe exact kernel: zero-fills bytes past `limit` (identical to the JS
@@ -4609,21 +5293,42 @@ fn fs_core_trunc_exact(d: &[u8], px: usize, limit: usize) -> FsRaw {
         let g = if i + 1 < limit { d[i + 1] as u32 } else { 0 };
         let b = if i + 2 < limit { d[i + 2] as u32 } else { 0 };
         let a = if i + 3 < limit { d[i + 3] as u32 } else { 0 };
-        hash ^= r; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= g; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= b; hash = hash.wrapping_mul(FS_FNV_PRIME);
-        hash ^= a; hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= r;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= g;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= b;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
+        hash ^= a;
+        hash = hash.wrapping_mul(FS_FNV_PRIME);
         rgb_nz += (r != 0) as u32 + (g != 0) as u32 + (b != 0) as u32;
-        if a < a_min { a_min = a; }
-        if a > a_max { a_max = a; }
-        if a == 0 { a_zero += 1; }
+        if a < a_min {
+            a_min = a;
+        }
+        if a > a_max {
+            a_max = a;
+        }
+        if a == 0 {
+            a_zero += 1;
+        }
         let l = 54 * r + 183 * g + 18 * b;
         let lf = l as f64;
         l_sum += lf;
         l_sq += lf * lf;
     }
-    if px == 0 { a_min = 255; a_max = 0; }
-    FsRaw { a_min, a_max, a_zero, rgb_nz, l_sum, l_sq, hash }
+    if px == 0 {
+        a_min = 255;
+        a_max = 0;
+    }
+    FsRaw {
+        a_min,
+        a_max,
+        a_zero,
+        rgb_nz,
+        l_sum,
+        l_sq,
+        hash,
+    }
 }
 
 /// PRODUCTION export. Returns the same numeric fields the JS analyzeProgressiveFrame
@@ -4815,7 +5520,9 @@ impl FableVideoEncoder {
 
     /// Assemble the `.casv` bytes (consumes the encoder). Errors if no frames pushed.
     pub fn finish(self) -> Result<Vec<u8>, JsError> {
-        self.inner.finish().map_err(|e| JsError::new(&e.to_string()))
+        self.inner
+            .finish()
+            .map_err(|e| JsError::new(&e.to_string()))
     }
 }
 
@@ -4893,7 +5600,9 @@ impl FableDeltaSession {
                 self.last_h = h;
                 Ok(px)
             }
-            None => Err(JsError::new("fable decode_delta failed (corrupt stream or dim mismatch)")),
+            None => Err(JsError::new(
+                "fable decode_delta failed (corrupt stream or dim mismatch)",
+            )),
         }
     }
 

@@ -36,6 +36,8 @@
 // warn up front. If a ./pkg-st/ build is ever produced, restore the COI-gated branch.
 // Bound lazily in ensureWasm(), before any message handler touches these bindings.
 import { detectFormat, detectRawKind } from './format-detect.js';
+import { tryDecodeHandRaw } from './hand-raw-decoders.js';
+import { decodeWithLibRaw } from './libraw-decode.js';
 import { WorkerMsg } from './worker-message-types.js';
 
 // Relay this worker's console to the main thread's on-page console (debug aid).
@@ -52,7 +54,7 @@ for (const __k of ['log', 'warn', 'error']) {
 
 let init, rawWasm;
 // A3: rgb_to_rgba removed — send RGB8 directly to JXL worker (saves ~250ms + 25% transfer)
-let process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, LookRenderer, rotate_rgb8;
+let process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8;
 // K6#1: named-field look API (preferred over the positional *_with_flags forms).
 let process_orf_with_look, process_dng_with_look, process_cr2_with_look;
 // Multi-format ingest: EXR/TIFF decode to a DecodedImage (mirrors jxl-benchmark.js bindings).
@@ -66,7 +68,7 @@ async function loadWasm() {
     }
     rawWasm = await import('./pkg/raw_converter_wasm.js');
     init = rawWasm.default;
-    ({ process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, LookRenderer, rotate_rgb8,
+    ({ process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8,
        process_orf_with_look, process_dng_with_look, process_cr2_with_look,
        decode_exr, decode_tiff, decode_jpeg } = rawWasm);
 }
@@ -123,6 +125,17 @@ function processRawWithFlagsNamed(decoderFn, bytes, flags, opts = RAW_NEUTRAL) {
         bytes, flags,
         o.exposureEv, o.contrast, o.highlights, o.shadows, o.whites, o.blacks,
         o.saturation, o.vibrance, o.temp, o.tint, o.wbR, o.wbB, o.texture, o.clarity,
+    );
+}
+
+function processRawMosaicWithFlagsNamed(payload, flags, opts = RAW_NEUTRAL) {
+    const o = { ...RAW_NEUTRAL, ...opts };
+    return process_raw_mosaic_with_flags(
+        payload.raw, payload.width, payload.height, payload.cfaPhase,
+        payload.black, payload.white, payload.wbR, payload.wbB,
+        payload.orientation, new Float32Array(payload.colorMatrix || []), flags,
+        o.exposureEv, o.contrast, o.highlights, o.shadows, o.whites, o.blacks,
+        o.saturation, o.vibrance, o.temp, o.tint, o.texture, o.clarity,
     );
 }
 
@@ -593,9 +606,20 @@ self.addEventListener('message', async (ev) => {
             });
             return;
         }
-        // route === 'raw' — fall through to the unchanged RAW pipeline below.
-
-        const decoderFn = pickRawDecoderWithFlags(bytes, opts.name || '');
+        // route === 'raw' — native ORF/CR2/DNG stay on hand WASM decoders;
+        // other known manufacturer RAWs decode through browser LibRaw to a raw
+        // Bayer mosaic, then reuse the shared Rust demosaic/tone pipeline.
+        const rawKind = detectRawKind(bytes, opts.name || '');
+        if (rawKind === 'unknown') {
+            self.postMessage({
+                id, type: WorkerMsg.ERROR,
+                error: `Unrecognized RAW file: ${opts.name || 'unknown'} — no matching decoder for its magic bytes.`,
+            });
+            return;
+        }
+        const nativeRaw = rawKind === 'orf' || rawKind === 'cr2' || rawKind === 'dng';
+        const decoderFn = nativeRaw ? pickRawDecoderWithFlags(bytes, opts.name || '') : null;
+        let librawPayload = null;
         const lookArgs = {
             exposureEv: look.exposureEv ?? 0,
             contrast:   look.contrast   ?? 0,
@@ -651,7 +675,7 @@ self.addEventListener('message', async (ev) => {
         // monolithic branch builds THUMB/LIGHTBOX too) — just after the full
         // decode, not before.
         const interactive = opts.batch !== true;   // default: interactive
-        const canSplit = interactive && decoderFn === process_orf_with_flags;
+        const canSplit = nativeRaw && interactive && decoderFn === process_orf_with_flags;
 
         const pT0 = performance.now();
         // OUT_NO_ORIENT: skip apply_orientation on the full RGB8 — JXL records
@@ -662,7 +686,21 @@ self.addEventListener('message', async (ev) => {
         const phase1Flags = canSplit
             ? (OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW)
             : (OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
-        const result = processRawWithFlagsNamed(decoderFn, bytes, phase1Flags, lookArgs);
+        let result;
+        if (nativeRaw) {
+            result = processRawWithFlagsNamed(decoderFn, bytes, phase1Flags, lookArgs);
+        } else {
+            if (rawKind === 'nef' || rawKind === 'nrw' || rawKind === 'rw2' || rawKind === 'rwl' || rawKind === 'crw') {
+                const hand = tryDecodeHandRaw(bytes, opts.name || '');
+                if (hand.ok) {
+                    librawPayload = hand.payload;
+                } else {
+                    console.warn(`[worker] hand ${rawKind} decoder fallback to LibRaw: ${hand.reason}`);
+                }
+            }
+            if (!librawPayload) librawPayload = await decodeWithLibRaw(bytes, opts.name || '');
+            result = processRawMosaicWithFlagsNamed(librawPayload, phase1Flags, lookArgs);
+        }
         // Best-effort cancel checkpoint: the synchronous decode could not be
         // interrupted, but if the task was cancelled while it ran, free the
         // decode result and emit nothing further (no renderer state cached yet).
@@ -685,8 +723,8 @@ self.addEventListener('message', async (ev) => {
         const wbB = result.wb_b_used;
         const black = result.black_used; // per-format pedestal for the live LookRenderer
         const white = result.white_used; // per-format white the live LookRenderer normalises by
-        const make  = result.make;
-        const model = result.model;
+        const make  = result.make || (librawPayload && librawPayload.make) || '';
+        const model = result.model || (librawPayload && librawPayload.model) || '';
         // DEBUG: the exact black/white the lightbox + thumb LookRenderers use. If
         // white != the file's white (~15300 for CR2/DNG), the live preview blows out.
         console.log(`[DBG] "${model}" black_used=${black} white_used=${white} wbR=${wbR.toFixed(3)} wbB=${wbB.toFixed(3)} lb=${result.lb_w}x${result.lb_h}`);

@@ -55,6 +55,10 @@ test('worker routing: RAW still wins over the new TIFF path', () => {
   expect(detectFormat(bytes(0x49, 0x49, 0x2a, 0x00), 'photo.orf')).toBe('raw');
   expect(detectFormat(bytes(0x49, 0x49, 0x2a, 0x00), 'photo.cr2')).toBe('raw');
   expect(detectFormat(bytes(0x49, 0x49, 0x2a, 0x00), 'photo.dng')).toBe('raw');
+  expect(detectFormat(bytes(0x4d, 0x4d, 0x00, 0x2a), 'nikon.nef')).toBe('raw');
+  expect(detectFormat(bytes(0x49, 0x49, 0x55, 0x00), 'pana.rw2')).toBe('raw');
+  expect(detectFormat(bytes(0x49, 0x49, 0x1a, 0x00), 'canon.crw')).toBe('raw');
+  expect(detectFormat(bytes(0x00, 0x00, 0x00, 0x18), 'canon.cr3')).toBe('raw');
 });
 
 test('worker routing: sdr/jxl/unknown are rejected, never sent to RAW decoder', () => {
@@ -96,14 +100,29 @@ test('detectRawKind: Adobe/DNG-family TIFF → dng', () => {
   expect(detectRawKind(bytes(...TIFF_BE), '')).toBe('dng');
 });
 
-test('detectRawKind: ARW/NEF/RW2 have no WASM decoder → unsupported (loud error)', () => {
-  // Sony ARW and Nikon NEF are TIFF-shaped but must NOT reach the DNG decoder.
-  expect(detectRawKind(bytes(...TIFF_LE), 'sony.arw')).toBe('unsupported');
-  expect(detectRawKind(bytes(...TIFF_BE), 'nikon.nef')).toBe('unsupported');
-  // Panasonic RW2 magic is 'IIU\0' — previously fell through to the ORF decoder.
-  expect(detectRawKind(bytes(0x49, 0x49, 0x55, 0x00), 'pana.rw2')).toBe('unsupported');
+test('detectRawKind: non-native RAW families route by exact kind for LibRaw/hand decoders', () => {
+  // TIFF-shaped RAW must NOT reach the DNG decoder. Exact kinds let the worker
+  // try hand decoders for selected families before falling back to LibRaw.
+  expect(detectRawKind(bytes(...TIFF_LE), 'sony.arw')).toBe('arw');
+  expect(detectRawKind(bytes(...TIFF_LE), 'sony.srf')).toBe('srf');
+  expect(detectRawKind(bytes(...TIFF_LE), 'sony.sr2')).toBe('sr2');
+  expect(detectRawKind(bytes(...TIFF_LE), 'sony.arq')).toBe('arq');
+  expect(detectRawKind(bytes(...TIFF_BE), 'nikon.nef')).toBe('nef');
+  expect(detectRawKind(bytes(...TIFF_BE), 'nikon.nrw')).toBe('nrw');
+  // Panasonic RW2 magic is 'IIU\0' - previously fell through to the ORF decoder.
+  expect(detectRawKind(bytes(0x49, 0x49, 0x55, 0x00), 'pana.rw2')).toBe('rw2');
+  expect(detectRawKind(bytes(...TIFF_LE), 'leica.rwl')).toBe('rwl');
+  expect(detectRawKind(bytes(0x49, 0x49, 0x1a, 0x00), 'canon.crw')).toBe('crw');
+  expect(detectRawKind(bytes(0x00, 0x00, 0x00, 0x18), 'canon.cr3')).toBe('cr3');
+  expect(detectRawKind(bytes(...TIFF_BE), 'fuji.raf')).toBe('raf');
+  expect(detectRawKind(bytes(...TIFF_LE), 'pentax.pef')).toBe('pef');
+  expect(detectRawKind(bytes(...TIFF_LE), 'samsung.srw')).toBe('srw');
+  expect(detectRawKind(bytes(...TIFF_LE), 'sigma.x3f')).toBe('x3f');
+  expect(detectRawKind(bytes(...TIFF_LE), 'hassy.3fr')).toBe('3fr');
+  expect(detectRawKind(bytes(...TIFF_LE), 'hassy.fff')).toBe('fff');
+  expect(detectRawKind(bytes(...TIFF_LE), 'phase.iiq')).toBe('iiq');
   // Case-insensitive on the extension.
-  expect(detectRawKind(bytes(...TIFF_LE), 'SONY.ARW')).toBe('unsupported');
+  expect(detectRawKind(bytes(...TIFF_LE), 'SONY.ARW')).toBe('arw');
 });
 
 test('detectRawKind: unrecognized magic with no supported ext → unknown (loud error)', () => {
