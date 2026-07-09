@@ -876,11 +876,19 @@ pub trait VideoFrameSource {
 /// `CASV_ENC_THREADS` overrides for A/B (`1` = single-threaded baseline,
 /// `0`/unset = auto = all cores).
 fn resolve_enc_threads() -> usize {
+    // Precedence: explicit env override (human A/B intent) > calibrated machine
+    // profile (measured throughput-optimal, cgroup-clamped) > available_parallelism
+    // (today's default). No env + no profile ⇒ unchanged behaviour.
     if let Ok(v) = std::env::var("CASV_ENC_THREADS") {
         if let Ok(n) = v.trim().parse::<usize>() {
             if n >= 1 {
                 return n;
             }
+        }
+    }
+    if let Some(n) = crate::calibration::profile::encode_threads() {
+        if n >= 1 {
+            return n;
         }
     }
     std::thread::available_parallelism()

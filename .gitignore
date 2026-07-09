@@ -126,3 +126,6 @@ target-codex*/
 # Not committed (each is ~40-82 MB RGBA8); regenerate locally before running checks.
 docs/golden-buffers/*.rgba
 pkg-fable/
+
+# calibration demo output (regenerable)
+crates/raw-pipeline/calibration-samples/

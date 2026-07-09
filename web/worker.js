@@ -179,7 +179,16 @@ async function ensureWasm() {
                 console.log('[worker] thread pool disabled (test mode)');
             } else if (crossOriginIsolated) {
                 try {
-                    await rawWasm.initThreadPool(Math.max(1, navigator.hardwareConcurrency || 4));
+                    // Calibrated per-worker thread count avoids the workers×HC
+                    // oversubscription (up to 144 threads on a 12-core box). The main
+                    // thread posts `self.__calibratedThreads` from the persisted
+                    // profile (web/calibration/profile.mjs) before init; absent it we
+                    // keep today's HC default. See docs calibration §Phase 6.
+                    const __calThreads = Math.max(0, self.__calibratedThreads | 0);
+                    const __threads = __calThreads >= 1
+                        ? __calThreads
+                        : Math.max(1, navigator.hardwareConcurrency || 4);
+                    await rawWasm.initThreadPool(__threads);
                 } catch (e) {
                     console.warn('[worker] rayon thread pool init failed, using single-thread WASM:', e.message);
                 }

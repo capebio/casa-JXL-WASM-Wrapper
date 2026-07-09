@@ -646,6 +646,14 @@ fn resolve_backend(opts: &Opts) -> Backend {
         BackendChoice::ForceScalar => Backend::Scalar,
         BackendChoice::Force(id) => resolve_forced_backend(id),
         BackendChoice::Auto => {
+            // Calibration override: if a machine profile selected a backend for this
+            // CPU, honour it (routed through resolve_forced_backend so it degrades
+            // safely if the id is not executable here). Absent a profile the override
+            // is None and behaviour is unchanged — this is the ONLY shipped-selector
+            // touch, and it is a no-op until `calibration` writes a profile.
+            if let Some(id) = crate::calibration::profile::backend_override_id() {
+                return resolve_forced_backend(id);
+            }
             #[cfg(target_arch = "x86_64")]
             {
                 detect_native(false)
