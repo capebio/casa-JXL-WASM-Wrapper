@@ -1879,3 +1879,14 @@ Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tric
   The latent hazard it guarded against (thumb-mode 3ch buffer reaching the encoder, mislabelled 4ch)
   is instead removed at the root by the `src_channels` return, which is correct under *any* mode/flag
   combination.
+- **"Fork libjxl to 0.12 with custom Huffman encoder opts (enc_ans scratch reuse, direct small-tree
+  completion, packed-scratch threading) to speed up JXL encode."** Evaluated 2026-06-28 on
+  `archive/wip-parked-20260628` with a real 0.11.2-vs-012-fork A/B harness (public JxlEncoder/Decoder,
+  identical pixels). **Measured: e3 parity (identical size + speed); e7 ~13% faster encode + ~2%
+  smaller; decode neutral.** Rejected — the win is **effort-7-only** (nothing at the common e3
+  default) yet it buys a **libjxl fork**: permanent rebase debt (re-apply the Huffman patches on every
+  upstream libjxl bump) + a Docker/Emscripten WASM rebuild + full re-validation, for a modest,
+  effort-specific gain. If 0.12 is wanted later, take **stock upstream** libjxl and propose the
+  Huffman opts as an upstream PR — no fork to maintain. The reusable A/B bench harness
+  (`benchmark/run-jxl-ab-flipflop.mjs` + `crates/raw-pipeline/examples/jxl_encdec_ab.rs`) is already
+  on main; only the dead-end fork submodule + fork-specific probes are unique to the archived branch.
