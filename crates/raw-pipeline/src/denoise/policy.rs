@@ -70,7 +70,7 @@ pub fn decide(
                         return DenoiseDecision {
                             apply: false,
                             effective_strength: 0.0,
-                            reason: DenoiseReason::NoiseThreshold,
+                            reason: DenoiseReason::BelowNoiseThreshold,
                             source: Some(m.source),
                         };
                     }
@@ -97,29 +97,15 @@ pub fn decide(
                         };
                     }
                 }
-                // No metrics at all
+                // No metrics at all — treat as unavailable regardless of ISO
+                // (we cannot trust ISO alone in Auto mode with no noise measurement)
                 None => {
-                    match iso {
-                        None => {
-                            return DenoiseDecision {
-                                apply: false,
-                                effective_strength: 0.0,
-                                reason: DenoiseReason::NoiseUnavailable,
-                                source: None,
-                            };
-                        }
-                        Some(iso_val) => {
-                            // No metrics, no confidence — treat as unavailable regardless of ISO
-                            // (we cannot trust ISO alone in Auto mode with no noise measurement)
-                            let _ = iso_val;
-                            return DenoiseDecision {
-                                apply: false,
-                                effective_strength: 0.0,
-                                reason: DenoiseReason::NoiseUnavailable,
-                                source: None,
-                            };
-                        }
-                    }
+                    return DenoiseDecision {
+                        apply: false,
+                        effective_strength: 0.0,
+                        reason: DenoiseReason::NoiseUnavailable,
+                        source: None,
+                    };
                 }
             }
         }
@@ -345,6 +331,24 @@ mod tests {
         let opts = default_opts(); // noise_threshold = 1.5
         let d = decide(&opts, Some(200), Some(low_noise_metrics()), None); // sigma_p90 = 0.5
         assert!(!d.apply);
+        assert_eq!(d.reason, DenoiseReason::BelowNoiseThreshold);
+    }
+
+    // auto mode — low confidence + ISO missing → skip as unavailable
+    #[test]
+    fn low_confidence_missing_iso_skips() {
+        let options = DenoiseOptions { enabled: true, ..Default::default() };
+        let metrics = NoiseMetrics {
+            display_sigma_p90: 2.5,
+            sigma_18: 0.005,
+            sigma_shadow: 0.015,
+            snr_18_db: 30.0,
+            confidence: 0.40, // below 0.65
+            source: NoiseSource::BlindFit,
+        };
+        let d = decide(&options, None, Some(metrics), None);
+        assert!(!d.apply);
+        assert_eq!(d.reason, DenoiseReason::NoiseUnavailable);
     }
 
     // effective_strength propagated correctly on apply

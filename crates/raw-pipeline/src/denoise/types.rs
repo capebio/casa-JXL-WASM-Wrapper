@@ -127,6 +127,8 @@ pub enum DenoiseReason {
     IsoThreshold,
     /// activation=Auto, high-confidence noise measurement met the threshold.
     NoiseThreshold,
+    /// activation=Auto, high-confidence noise measurement, below noise_threshold → skip.
+    BelowNoiseThreshold,
     /// activation=Auto, low-confidence fallback: ISO >= iso_threshold.
     LowConfidenceFallbackIso,
     /// activation=Auto, low-confidence fallback: ISO < iso_threshold.
