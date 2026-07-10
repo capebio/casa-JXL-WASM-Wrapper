@@ -71,6 +71,7 @@ pub struct PlaneCoeffs {
 /// Required provenance fields: `source_manifest_sha256` and `fit_residual`.
 /// Entries lacking these are rejected at load time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProfileEntry {
     /// Camera make (stored as-is; normalised at lookup time).
     pub make: String,
@@ -292,16 +293,16 @@ mod tests {
     ) -> String {
         format!(
             r#"{{
-                "make":"{make}","model":"{model}","gain_segment":"{seg}","iso":{iso},
+                "make":"{make}","model":"{model}","gainSegment":"{seg}","iso":{iso},
                 "planes":[
                     {{"shot":{shot},"read":{read}}},
                     {{"shot":{shot},"read":{read}}},
                     {{"shot":{shot},"read":{read}}},
                     {{"shot":{shot},"read":{read}}}
                 ],
-                "structured_sigma":[0.0,0.0,0.0,0.0],
-                "source_manifest_sha256":"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                "fit_residual":0.001
+                "structuredSigma":[0.0,0.0,0.0,0.0],
+                "sourceManifestSha256":"abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "fitResidual":0.001
             }}"#
         )
     }
@@ -422,12 +423,12 @@ mod tests {
     #[test]
     fn missing_provenance_fields_rejected() {
         let bad = r#"{"schemaVersion":1,"profiles":[{
-            "make":"Nikon","model":"D850","gain_segment":"low","iso":800,
+            "make":"Nikon","model":"D850","gainSegment":"low","iso":800,
             "planes":[{"shot":0.5,"read":0.02},{"shot":0.5,"read":0.02},
                        {"shot":0.5,"read":0.02},{"shot":0.5,"read":0.02}],
-            "structured_sigma":[0.0,0.0,0.0,0.0],
-            "source_manifest_sha256":"",
-            "fit_residual":0.001
+            "structuredSigma":[0.0,0.0,0.0,0.0],
+            "sourceManifestSha256":"",
+            "fitResidual":0.001
         }]}"#;
         assert!(CameraNoiseRegistry::from_json(bad).is_err());
     }
