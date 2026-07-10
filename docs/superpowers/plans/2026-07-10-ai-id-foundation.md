@@ -922,6 +922,16 @@ git commit -m "docs(ai-id): foundation README"
 
 These are real follow-ups; each is out of scope for v1 and noted so the wiring isn't forgotten:
 
+- **⚠ CR2/DNG GPS + datetime extraction (HIGH priority).** Verified during v1: the decode
+  populates `datetime`/GPS for **ORF** (Olympus MakerNote path → `ExifData::from_orf_info`)
+  but returns empty `datetime` and `has_gps=false` for **CR2 and DNG** — even for a Pixel DNG
+  that certainly carries both. The v1 sidecar is correct (it faithfully reports what decode
+  exposes), but `geo`/`datetime` will be null for CR2/DNG until the Rust decode paths
+  (`crates/raw-pipeline/src/{cr2,dng,tiff}.rs`) parse EXIF/GPS IFDs and feed `ExifData`.
+  This is the single most valuable enrichment — GPS is the identification accuracy lever and
+  wildlife CR2 + phone DNG are the main corpora. Requires a WASM rebuild. No sidecar-schema
+  change (fields already present, just currently null).
+
 - **Browser lightbox hook** — a "Prepare ID proxy" action that builds `[liveBufferSource(currentPixels), pyramidLevelSource(getOpfsLevel, facadeDecode), embeddedPreviewSource(...), masterDecodeSource(...), rawDecodeSource(...)]` and calls `resolveProxy` with a **canvas** JPEG encoder (`canvas.toBlob("image/jpeg", 0.8)` → but canvas gives 4:2:0 already) instead of `nodeEncodeJpeg`. The source constructors are already platform-neutral and unit-tested.
 - **Pyramid byte retrieval** — an OPFS/manifest adapter that returns the stored 1024-level JXL bytes for an image (`packages/pyramid-ingest` storage). Feeds `pyramidLevelSource`.
 - **Export integration into the real converter** — call `sidecarForFile` + append to `manifest.json` at the point the `.jxl` master is written, so every export drops a sidecar. (v1 CLI proves the logic standalone.)
