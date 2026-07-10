@@ -3456,6 +3456,8 @@ struct DngDecoded {
     make: String,
     model: String,
     iso: u32,
+    /// DNG BaselineExposure (EV); folded into the render exposure. 0.0 when absent.
+    baseline_exposure: f32,
     datetime: String,
     gps_lat: Option<f64>,
     gps_lon: Option<f64>,
@@ -3493,7 +3495,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 && w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) <= MAX_PIXELS
             {
                 let phase = src.phase();
-                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, make, model) = {
+                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, baseline_exposure, make, model) = {
                     let m = src.meta();
                     (
                         m.black,
@@ -3503,6 +3505,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                         m.color_matrix,
                         m.orientation,
                         m.iso.unwrap_or(100),
+                        m.baseline_exposure,
                         m.make.clone(),
                         m.model.clone(),
                     )
@@ -3547,6 +3550,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                     make,
                     model,
                     iso,
+                    baseline_exposure,
                     datetime: String::new(),
                     gps_lat: None,
                     gps_lon: None,
@@ -3637,6 +3641,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         make: img.make,
         model: img.model,
         iso,
+        baseline_exposure: img.baseline_exposure,
         datetime: img.datetime,
         gps_lat: img.gps_lat,
         gps_lon: img.gps_lon,
@@ -3671,6 +3676,7 @@ fn process_dng_impl(
         make,
         model,
         iso,
+        baseline_exposure,
         datetime,
         gps_lat,
         gps_lon,
@@ -3728,9 +3734,12 @@ fn process_dng_impl(
     if look.wb_b.is_finite() && look.wb_b > 0.0 {
         params.wb_b = look.wb_b.min(8.0);
     }
+    // Fold the DNG's own BaselineExposure into the render exposure so low-light / night
+    // Pixel DNGs (which set +1.3..+1.6 EV) reach their intended brightness; the user's
+    // exposure slider still composes on top. 0.0 baseline (or absent tag) = unchanged.
     raw_pipeline::pipeline::apply_look_params(
         &mut params,
-        look.exposure_ev,
+        look.exposure_ev + baseline_exposure,
         look.contrast,
         look.highlights,
         look.shadows,
@@ -4147,6 +4156,7 @@ fn process_raw_mosaic_impl(
             make: String::new(),
             model: String::new(),
             iso: 0,
+            baseline_exposure: 0.0, // generic mosaic path (LibRaw); no DNG BaselineExposure
             datetime: String::new(),
             gps_lat: None,
             gps_lon: None,
@@ -4337,6 +4347,7 @@ impl From<Cr2Decoded> for DngDecoded {
             make: c.make,
             model: c.model,
             iso: c.iso,
+            baseline_exposure: 0.0, // CR2 (Canon) has no DNG BaselineExposure tag
             datetime: c.datetime,
             gps_lat: c.gps_lat,
             gps_lon: c.gps_lon,

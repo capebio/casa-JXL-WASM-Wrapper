@@ -34,6 +34,9 @@ pub struct DngImage {
     /// grey fallback fired. Informational only; does not affect WB math.
     pub wb_from_camera: bool,
     pub iso: Option<u32>,
+    /// DNG BaselineExposure (EV) — suggested exposure shift, applied as the render's
+    /// exposure baseline. 0.0 when the tag is absent.
+    pub baseline_exposure: f32,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub make: String,
     pub model: String,
@@ -193,6 +196,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         wb_b,
         wb_from_camera: state.as_shot_neutral.is_some(),
         iso: state.iso,
+        baseline_exposure: state.baseline_exposure.unwrap_or(0.0),
         color_matrix,
         make: state.make,
         model: state.model,
@@ -215,6 +219,7 @@ pub struct DngMeta {
     pub wb_b: f32,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub iso: Option<u32>,
+    pub baseline_exposure: f32,
     pub orientation: u16,
     pub make: String,
     pub model: String,
@@ -242,6 +247,7 @@ fn dng_meta(state: &WalkState, raw: &RawIfd, width: usize, height: usize, cfa: C
             state.color_matrix_2,
         ),
         iso: state.iso,
+        baseline_exposure: state.baseline_exposure.unwrap_or(0.0),
         orientation: state.orientation.unwrap_or(1),
         make: state.make.clone(),
         model: state.model.clone(),
@@ -939,10 +945,42 @@ struct WalkState {
     forward_matrix_1: Option<[[f32; 3]; 3]>,
     forward_matrix_2: Option<[[f32; 3]; 3]>,
     iso: Option<u32>,
+    baseline_exposure: Option<f32>,
     make: String,
     model: String,
     orientation: Option<u16>,
     exif: crate::tiff::ExifGps,
+}
+
+/// Read the first value of a signed-rational (SRATIONAL, type 10) tag as f32; falls back
+/// to [`first_f32`] for unsigned types. Needed because BaselineExposure (0xC62A) is signed
+/// and can be negative (e.g. −0.08 EV on a bright scene).
+fn first_srational_f32(
+    data: &[u8],
+    dtype: u16,
+    cnt: u32,
+    val: u32,
+    inline_pos: usize,
+    le: bool,
+) -> Option<f32> {
+    if dtype != 10 {
+        return first_f32(data, dtype, cnt, val, inline_pos, le);
+    }
+    if cnt == 0 {
+        return None;
+    }
+    // SRATIONAL is 8 bytes → never inline (>4), value is at `val`.
+    let p = val as usize;
+    if p.checked_add(8).map_or(true, |e| e > data.len()) {
+        return None;
+    }
+    let num = read_u32(data, p, le) as i32 as f32;
+    let den = read_u32(data, p + 4, le) as i32 as f32;
+    if den != 0.0 {
+        Some(num / den)
+    } else {
+        None
+    }
 }
 
 fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
@@ -1057,6 +1095,14 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 0x8827 => {
                     // ISOSpeedRatings — SHORT array; take first value.
                     state.iso = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0xC62A => {
+                    // BaselineExposure (SRATIONAL, EV) — the DNG's own suggested exposure
+                    // shift. Applied as the exposure baseline so Pixel night/low-light DNGs
+                    // (which set +1.3..+1.6 EV) render at the intended brightness instead of
+                    // dark/crushed. Absent tag → 0 EV (no shift).
+                    state.baseline_exposure =
+                        first_srational_f32(data, dtype, cnt, val, inline_pos, le);
                 }
                 0xC628 => {
                     state.as_shot_neutral = read_as_shot_neutral(data, dtype, cnt, val, le);
@@ -1508,6 +1554,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn baseline_exposure_reads_signed_rational() {
+        // SRATIONAL (type 10): 8 bytes at `val`, num/den as i32. Positive: +1.61 EV.
+        let mut data = vec![0u8; 32];
+        let num: i32 = 161;
+        let den: i32 = 100;
+        data[8..12].copy_from_slice(&num.to_le_bytes());
+        data[12..16].copy_from_slice(&den.to_le_bytes());
+        let v = first_srational_f32(&data, 10, 1, 8, 0, true).unwrap();
+        assert!((v - 1.61).abs() < 1e-4, "got {v}");
+        // Negative baseline (bright scene, e.g. -0.08 EV).
+        let neg: i32 = -8;
+        let d100: i32 = 100;
+        data[8..12].copy_from_slice(&neg.to_le_bytes());
+        data[12..16].copy_from_slice(&d100.to_le_bytes());
+        let v = first_srational_f32(&data, 10, 1, 8, 0, true).unwrap();
+        assert!((v + 0.08).abs() < 1e-4, "got {v}");
+        // Zero denominator → None (rejected, falls back to 0 baseline downstream).
+        data[12..16].copy_from_slice(&0i32.to_le_bytes());
+        assert!(first_srational_f32(&data, 10, 1, 8, 0, true).is_none());
     }
 
     #[test]
