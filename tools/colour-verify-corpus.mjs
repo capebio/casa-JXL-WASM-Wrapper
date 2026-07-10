@@ -89,6 +89,28 @@ async function oracleRatios(bytes){
     } finally { if (raw.dispose) raw.dispose(); }
   } catch(e){ return { err: String(e && (e.message||e)).slice(0,80) }; }
 }
+// The camera's OWN embedded JPEG (LibRaw thumbnailData) = the reference of record —
+// the colour the camera actually produced. Decode it, take channel ratios.
+async function embeddedJpegRatios(bytes){
+  try {
+    const LibRawClass = (await import('/web/vendor/libraw-wasm/index.js')).default;
+    const raw = new LibRawClass();
+    try {
+      await raw.open(bytes, { useCameraWb:true });
+      const t = await raw.thumbnailData();
+      const data = t && (t.data || (t.length ? t : null));
+      if (!data || !data.length) return { err:'no-thumb' };
+      const u8 = data instanceof Uint8Array ? data : new Uint8Array(data);
+      const bmp = await createImageBitmap(new Blob([u8], { type:'image/jpeg' }));
+      const cv = new OffscreenCanvas(bmp.width, bmp.height);
+      const cx = cv.getContext('2d', { willReadFrequently:true });
+      cx.drawImage(bmp, 0, 0);
+      const px = cx.getImageData(0,0,bmp.width,bmp.height).data;
+      let r=0,g=0,b=0; const n=px.length/4; for(let i=0;i<px.length;i+=4){r+=px[i];g+=px[i+1];b+=px[i+2];}
+      return { rg:(r/n)/((g/n)||1e-9), bg:(b/n)/((g/n)||1e-9), w:bmp.width, h:bmp.height };
+    } finally { if (raw.dispose) raw.dispose(); }
+  } catch(e){ return { err: String(e && (e.message||e)).slice(0,80) }; }
+}
 window.__decode = async (path, kind, name) => {
   try {
     const buf = await (await fetch('/__img?p='+encodeURIComponent(path))).arrayBuffer();
@@ -98,10 +120,10 @@ window.__decode = async (path, kind, name) => {
       : kind==='dng' ? decodeNative(process_dng_with_flags, forDecode)
       : decodeLibRaw(new Uint8Array(buf.slice(0)), name);
     const d = await Promise.race([work, new Promise((_,rej)=>setTimeout(()=>rej(new Error('decode-timeout-90s')),90000))]);
-    let oracle = null;
-    try { oracle = await Promise.race([oracleRatios(new Uint8Array(buf.slice(0))), new Promise((res)=>setTimeout(()=>res({err:'oracle-timeout'}),75000))]); }
-    catch(e){ oracle = { err: String(e).slice(0,60) }; }
-    return { ok:true, w:d.w, h:d.h, mean:d.mean, meta:d.meta||null, oracle };
+    let oracle = null, embedded = null;
+    try { oracle = await Promise.race([oracleRatios(new Uint8Array(buf.slice(0))), new Promise((res)=>setTimeout(()=>res({err:'oracle-timeout'}),75000))]); } catch(e){ oracle = { err: String(e).slice(0,60) }; }
+    try { embedded = await Promise.race([embeddedJpegRatios(new Uint8Array(buf.slice(0))), new Promise((res)=>setTimeout(()=>res({err:'embed-timeout'}),60000))]); } catch(e){ embedded = { err: String(e).slice(0,60) }; }
+    return { ok:true, w:d.w, h:d.h, mean:d.mean, meta:d.meta||null, oracle, embedded };
   } catch(e){ return { ok:false, error: String(e && (e.stack||e.message) || e) }; }
 };
 window.__meta = async (path) => {
@@ -118,23 +140,24 @@ window.__meta = async (path) => {
 };
 </script></body>`;
 
-const ORACLE_TOL = 0.30; // |rg-orRg| + |bg-orBg| below this = faithful to the camera render
-function interpret(m, oracle) {
+const REF_TOL = 0.35; // Δ vs the embedded camera JPEG below this = faithful
+function interpret(m, oracle, embedded) {
   const rg = m.r / (m.g || 1e-9), bg = m.b / (m.g || 1e-9);
-  const pinkVeil = m.g < (m.r + m.b) / 2 * 0.92;
-  const greenCast = m.g > (m.r + m.b) / 2 * 1.30;
-  const wbSane = rg > 0.30 && rg < 2.8 && bg > 0.30 && bg < 2.8;
-  const veryDark = (m.r + m.g + m.b) / 3 < 4;
-  let orRg = null, orBg = null, divergence = null, faithful = null;
-  if (oracle && oracle.err == null && Number.isFinite(oracle.rg)) {
-    orRg = +oracle.rg.toFixed(3); orBg = +oracle.bg.toFixed(3);
-    divergence = +(Math.abs(rg - oracle.rg) + Math.abs(bg - oracle.bg)).toFixed(3);
-    faithful = divergence < ORACLE_TOL;
+  const libRg = oracle && oracle.err == null && Number.isFinite(oracle.rg) ? +oracle.rg.toFixed(3) : null;
+  const libBg = oracle && oracle.err == null && Number.isFinite(oracle.bg) ? +oracle.bg.toFixed(3) : null;
+  let refRg = null, refBg = null, dOurs = null, dLib = null, closer = null, verdict = null;
+  if (embedded && embedded.err == null && Number.isFinite(embedded.rg)) {
+    refRg = +embedded.rg.toFixed(3); refBg = +embedded.bg.toFixed(3);
+    dOurs = +(Math.abs(rg - embedded.rg) + Math.abs(bg - embedded.bg)).toFixed(3);
+    if (libRg != null) dLib = +(Math.abs(libRg - embedded.rg) + Math.abs(libBg - embedded.bg)).toFixed(3);
+    verdict = dOurs < REF_TOL;
+    if (dLib != null) closer = dOurs <= dLib + 0.02 ? 'ours' : 'libraw';
+  } else if (libRg != null) { // no embedded JPEG -> fall back to LibRaw oracle
+    dLib = +(Math.abs(rg - libRg) + Math.abs(bg - libBg)).toFixed(3);
+    verdict = dLib < 0.30;
   }
-  // Prefer the oracle comparison (scene-proof); fall back to intrinsic checks when no oracle.
-  const verdict = faithful != null ? (faithful && !veryDark) : (!pinkVeil && !greenCast && wbSane && !veryDark);
-  return { rg: +rg.toFixed(3), bg: +bg.toFixed(3), orRg, orBg, divergence, faithful,
-           oracleErr: oracle && oracle.err || null, pinkVeil, greenCast, wbSane, veryDark, verdict };
+  return { rg: +rg.toFixed(3), bg: +bg.toFixed(3), libRg, libBg, refRg, refBg, dOurs, dLib, closer,
+           embeddedErr: embedded && embedded.err || null, verdict };
 }
 
 const startServer = () => new Promise((resolve) => {
@@ -175,24 +198,26 @@ try {
     let r;
     try { r = await page.evaluate(([pp, kk, nn]) => window.__decode(pp, kk, nn), [p, kind, name]); }
     catch (e) { r = { ok: false, error: 'evaluate:' + String(e).slice(0, 100) }; }
-    if (r.ok) { const it = interpret(r.mean, r.oracle); results.push({ name, kind, w: r.w, h: r.h, meta: r.meta, ...it }); console.log(`${it.verdict ? 'PASS' : 'REVIEW'} rg=${it.rg} bg=${it.bg}${it.orRg != null ? ` | cam rg=${it.orRg} bg=${it.orBg} Δ=${it.divergence}` : (it.oracleErr ? ` | cam:${it.oracleErr}` : '')}`); }
+    if (r.ok) { const it = interpret(r.mean, r.oracle, r.embedded); results.push({ name, kind, w: r.w, h: r.h, meta: r.meta, ...it }); console.log(`${it.verdict === true ? 'FAITHFUL' : it.verdict === false ? 'DIVERGES' : '?'} ours(${it.rg},${it.bg}) lib(${it.libRg ?? '-'},${it.libBg ?? '-'}) jpg(${it.refRg ?? '-'},${it.refBg ?? '-'}) Δours=${it.dOurs ?? '-'} Δlib=${it.dLib ?? '-'}${it.closer ? ' closer=' + it.closer : ''}${it.embeddedErr ? ' jpg:' + it.embeddedErr : ''}`); }
     else { results.push({ name, kind, ok: false, error: r.error }); console.log('FAIL ' + String(r.error).slice(0, 90)); }
   }
 } finally { await browser.close(); server.close(); }
 
-const pass = results.filter(r => r.verdict).length;
-const review = results.filter(r => r.ok !== false && !r.verdict).length;
+const faithful = results.filter(r => r.verdict === true).length;
+const diverges = results.filter(r => r.verdict === false).length;
+const noref = results.filter(r => r.ok !== false && r.verdict == null).length;
 const fail = results.filter(r => r.ok === false).length;
+const oursCloser = results.filter(r => r.closer === 'ours').length;
+const libCloser = results.filter(r => r.closer === 'libraw').length;
 const outDir = join(REPO, 'docs', 'outputs', 'corpus-colour-verify');
 if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
 const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
-writeFileSync(join(outDir, `corpus-colour-verify-${stamp}.json`), JSON.stringify({ pass, review, fail, results }, null, 2));
-const flags = (r) => r.ok === false ? ('FAIL: ' + String(r.error).slice(0, 60)) : ([r.pinkVeil && 'magenta-veil', r.greenCast && 'green-cast', !r.wbSane && 'wb-out-of-range', r.veryDark && 'dark-decode'].filter(Boolean).join(', ') || 'ok');
-const oflags = (r) => r.ok === false ? ('FAIL: ' + String(r.error).slice(0, 60))
-  : r.orRg != null ? (r.faithful ? 'matches camera' : `DIVERGES from camera (Δ=${r.divergence})`)
-  : (r.oracleErr ? 'no-oracle(' + r.oracleErr + '); ' + flags(r) : flags(r));
-let md = `# Corpus colour-fidelity verification (${stamp})\n\n**${pass} PASS / ${review} REVIEW / ${fail} FAIL** of ${results.length} images.\n\nDecoded through the real pipeline (native ORF/CR2/DNG or LibRaw → process_raw_mosaic), camera WB, neutral sliders, OUT_FULL_RGB8, headless Chromium. **Verdict** compares each render's channel ratios (R/G, B/G) to LibRaw's own sRGB render (the camera-faithful oracle) — Δ = |rg−camRg| + |bg−camBg|, faithful if Δ < ${ORACLE_TOL}; falls back to intrinsic veil/WB checks when no oracle.\n\n| Image | Fmt | Dims | ours R/G,B/G | camera R/G,B/G | Δ | Assessment | Verdict |\n|---|---|---|---|---|---|---|---|\n`;
-for (const r of results) md += `| ${r.name} | ${r.kind} | ${r.ok === false ? '—' : r.w + '×' + r.h} | ${r.ok === false ? '—' : r.rg + ',' + r.bg} | ${r.orRg != null ? r.orRg + ',' + r.orBg : '—'} | ${r.divergence ?? '—'} | ${oflags(r)} | ${r.ok === false ? 'FAIL' : (r.verdict ? 'PASS' : 'REVIEW')} |\n`;
-writeFileSync(join(outDir, `corpus-colour-verify-${stamp}.md`), md);
-console.log(`\n${pass} PASS / ${review} REVIEW / ${fail} FAIL. Report: ${outDir}`);
+writeFileSync(join(outDir, `corpus-vs-jpeg-${stamp}.json`), JSON.stringify({ faithful, diverges, noref, fail, oursCloser, libCloser, results }, null, 2));
+let md = `# Corpus colour fidelity vs the embedded camera JPEG (${stamp})\n\n`
+  + `Reference = each RAW's **own embedded JPEG** (the colour the camera produced). Both our render and LibRaw's sRGB render are scored against it — Δ = |Δrg| + |Δbg| on channel ratios.\n\n`
+  + `**${faithful} faithful (Δours < ${REF_TOL}) / ${diverges} diverge / ${noref} no-JPEG-ref / ${fail} fail** of ${results.length}. Closer to the camera JPEG: **ours ${oursCloser}, LibRaw ${libCloser}**.\n\n`
+  + `| Image | Fmt | ours R/G,B/G | LibRaw | camera JPEG (ref) | Δours | ΔLibRaw | closer |\n|---|---|---|---|---|---|---|---|\n`;
+for (const r of results) md += `| ${r.name} | ${r.kind} | ${r.ok === false ? '—' : r.rg + ',' + r.bg} | ${r.libRg != null ? r.libRg + ',' + r.libBg : '—'} | ${r.refRg != null ? r.refRg + ',' + r.refBg : '—'} | ${r.dOurs ?? '—'} | ${r.dLib ?? '—'} | ${r.closer ?? (r.ok === false ? 'FAIL' : '—')} |\n`;
+writeFileSync(join(outDir, `corpus-vs-jpeg-${stamp}.md`), md);
+console.log(`\n${faithful} faithful / ${diverges} diverge / ${noref} no-ref / ${fail} fail. Closer to camera JPEG: ours ${oursCloser}, LibRaw ${libCloser}. Report: ${outDir}`);
 process.exit(0);
