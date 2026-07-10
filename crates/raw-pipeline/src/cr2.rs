@@ -257,6 +257,40 @@ fn extract_wb_from_raw(data: &[u8], off: usize, cnt: u32, le: bool, dtype: u16) 
     Some((r / g1, b / g1))
 }
 
+/// Per-shot black level (Canon PerChannelBlackLevel, RGGB) from the M5-style byte-blob
+/// ColorData at short index 333. The Canon EOS M5 (and other DIGIC 7+ bodies with the
+/// `dtype == 7` ColorData layout) store an **ISO-dependent** black level here — 512 at
+/// ISO 100, 2048 at higher ISO — that `canon_default_black_white` cannot know. Reading
+/// it fixes a colour cast on higher-ISO shots (pale/pink) where the hardcoded 512
+/// under-subtracts the pedestal. Verified bit-exact against dcraw's computed darkness on
+/// EOS M5 files (ADH 1234/1490/1570). All four RGGB channels are equal in the samples
+/// seen; we read the first.
+///
+/// `None` for `dtype == 3` (SHORT ColorData, pre-DIGIC-7 bodies) whose layout puts the
+/// black level at a different offset — those keep the `canon_default_black_white` value.
+fn extract_black_from_raw(data: &[u8], off: usize, cnt: u32, le: bool, dtype: u16) -> Option<u16> {
+    if dtype != 7 {
+        return None;
+    }
+    const BLACK_INDEX: usize = 333;
+    let shorts = (cnt / 2) as usize;
+    if shorts < BLACK_INDEX + 4 {
+        return None;
+    }
+    // Byte offset is file-controlled; guard the add + bounds like extract_wb_from_raw.
+    let base = off.checked_add(BLACK_INDEX * 2)?;
+    if base.checked_add(2).map_or(true, |e| e > data.len()) {
+        return None;
+    }
+    let b = read_u16(data, base, le);
+    // Plausible 14-bit pedestal; reject 0 / garbage so bad reads fall back to the default.
+    if b > 0 && b < 8192 {
+        Some(b)
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LJPEG SOF3 scan  (Response 1 item 13 — hardened)
 // ---------------------------------------------------------------------------
@@ -1024,6 +1058,7 @@ fn decode_impl(
     let mut wb_r: f32 = 2.0;
     let mut wb_b: f32 = 1.7;
     let mut wb_from_camera = false;
+    let mut black_from_colordata: Option<u16> = None;
     let mut sensor_info: Option<SensorInfo> = None;
 
     if makernote_off > 0 && makernote_len >= 2 {
@@ -1042,6 +1077,7 @@ fn decode_impl(
                         wb_b = b;
                         wb_from_camera = true;
                     }
+                    black_from_colordata = extract_black_from_raw(data, p, cnt, le, dtype);
                 }
                 0x00E0 => {
                     if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
@@ -1204,10 +1240,13 @@ fn decode_impl(
     let ljpeg_ms = elapsed(t_ljpeg);
 
     // -----------------------------------------------------------------------
-    // Black/white levels: IFD value overrides precision-table default (item 1)
+    // Black/white levels: Canon per-shot ColorData black (authoritative, ISO-dependent)
+    // wins; then the DNG-style IFD tag; else the precision-table default (item 1)
     // -----------------------------------------------------------------------
     let (mut black, white) = canon_default_black_white(precision, &model);
-    if black_from_ifd > 0 && black_from_ifd < white {
+    if let Some(b) = black_from_colordata.filter(|&b| b < white) {
+        black = b;
+    } else if black_from_ifd > 0 && black_from_ifd < white {
         black = black_from_ifd;
     }
 
@@ -1555,6 +1594,7 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
     // MakerNote: WB + SensorInfo
     let mut wb_r: f32 = 2.0;
     let mut wb_b: f32 = 1.7;
+    let mut black_from_colordata: Option<u16> = None;
     let mut sensor_info: Option<SensorInfo> = None;
 
     if makernote_off > 0 && makernote_len >= 2 {
@@ -1568,6 +1608,7 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
                         wb_r = r;
                         wb_b = b;
                     }
+                    black_from_colordata = extract_black_from_raw(data, p, cnt, le, dtype);
                 }
                 0x00E0 => {
                     if let Some(cand) = sensor_info_from_entry(data, dtype, cnt, val, ip, le) {
@@ -1678,7 +1719,9 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
 
     // Black/white defaults from SOF precision, overridden by IFD tag
     let (mut black, white) = canon_default_black_white(precision, &model);
-    if black_from_ifd > 0 && black_from_ifd < white {
+    if let Some(b) = black_from_colordata.filter(|&b| b < white) {
+        black = b;
+    } else if black_from_ifd > 0 && black_from_ifd < white {
         black = black_from_ifd;
     }
 
@@ -1876,6 +1919,36 @@ mod tests {
         let (wb_r, wb_b) = extract_wb_from_raw(&data, 0, 30, true, 3).unwrap();
         assert!((wb_r - 1800.0 / 1024.0).abs() < 1e-4);
         assert!((wb_b - 1600.0 / 1024.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn extract_black_reads_perchannel_level_at_index_333() {
+        // M5-style byte-blob ColorData (dtype 7): PerChannelBlackLevel (RGGB) at short 333.
+        // Blob must be at least (333+4) shorts. cnt is in BYTES for dtype 7.
+        let shorts = 400usize;
+        let mut data = vec![0u8; shorts * 2];
+        let black: u16 = 2048; // higher-ISO EOS M5 pedestal
+        for c in 0..4 {
+            let idx = (333 + c) * 2;
+            data[idx] = (black & 0xFF) as u8;
+            data[idx + 1] = (black >> 8) as u8;
+        }
+        let got = extract_black_from_raw(&data, 0, (shorts * 2) as u32, true, 7);
+        assert_eq!(got, Some(2048), "should read PerChannelBlackLevel at short 333");
+    }
+
+    #[test]
+    fn extract_black_none_for_short_colordata_and_dtype3() {
+        let data = vec![0u8; 800];
+        // dtype 3 (SHORT ColorData) uses a different layout — must not read index 333.
+        assert!(extract_black_from_raw(&data, 0, 800, true, 3).is_none());
+        // Blob too short to hold index 333 → None (guards OOB).
+        let short = vec![0u8; 200];
+        assert!(extract_black_from_raw(&short, 0, 200, true, 7).is_none());
+        // Zero / implausible black at 333 → None (falls back to default).
+        let mut z = vec![0u8; 800];
+        z[333 * 2] = 0; // black = 0 → rejected
+        assert!(extract_black_from_raw(&z, 0, 800, true, 7).is_none());
     }
 
     #[test]
