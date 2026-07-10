@@ -38,6 +38,12 @@ pub struct DngImage {
     pub make: String,
     pub model: String,
     pub orientation: u16,
+    /// EXIF DateTimeOriginal (or DateTime), "YYYY:MM:DD HH:MM:SS", empty if absent.
+    pub datetime: String,
+    /// Decimal GPS (None when the file has no GPS IFD or it is out of range).
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
+    pub gps_alt: Option<f64>,
 }
 
 impl DngImage {
@@ -191,6 +197,10 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         make: state.make,
         model: state.model,
         orientation: state.orientation.unwrap_or(1),
+        datetime: state.exif.datetime,
+        gps_lat: state.exif.gps_lat,
+        gps_lon: state.exif.gps_lon,
+        gps_alt: state.exif.gps_alt,
     })
 }
 
@@ -869,6 +879,9 @@ fn load_dng(data: &[u8]) -> Result<(WalkState, RawIfd, bool)> {
     let ifd0_off = read_u32(data, 4, le);
     let mut state = WalkState::default();
     walk(data, ifd0_off as usize, le, &mut state);
+    // The raw-image walk above does not read EXIF datetime / GPS tags; pull them
+    // from IFD0's standard Exif/GPS sub-IFDs (same handling ORF already has).
+    state.exif = crate::tiff::parse_exif_gps(data, le, ifd0_off);
     // Derive AsShotNeutral from AsShotWhiteXY (tag 0xC629) when tag 0xC628 is absent.
     // Pixel phone DNGs store only xy chromaticity coordinates.
     // Formula: XYZ_white = [x/y, 1, (1-x-y)/y]; cam_neutral = ColorMatrix × XYZ_white.
@@ -929,6 +942,7 @@ struct WalkState {
     make: String,
     model: String,
     orientation: Option<u16>,
+    exif: crate::tiff::ExifGps,
 }
 
 fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
