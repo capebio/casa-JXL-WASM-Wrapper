@@ -84,3 +84,33 @@ test('metadataToRawMosaicPayload extracts render params for Rust raw mosaic proc
   expect(payload.model).toBe('D850');
   expect(payload.decoder).toBe('libraw');
 });
+
+test('black is recovered from the masked margin when LibRaw reports 0 (M200/CRW case)', () => {
+  // 6x6 raw: top 2 rows masked (pedestal 8), left 2 cols contaminated bright (90),
+  // rest active (100). Visible crop is the inner 4x4. reported black = 0.
+  const rw = 6, rh = 6;
+  const raw = new Uint16Array(rw * rh).fill(100);
+  for (let y = 0; y < 2; y++) for (let x = 0; x < rw; x++) raw[y * rw + x] = 8; // masked top
+  for (let y = 2; y < rh; y++) for (let x = 0; x < 2; x++) raw[y * rw + x] = 90; // bright left
+  const meta = {
+    camera_make: 'Canon', camera_model: 'EOS M200', flip: 0,
+    filters: filtersFor('RGGB'), cdesc: 'RGBG',
+    color_data: { black: 0, maximum: 16383, cam_mul: [2, 1, 1.5, 1], rgb_cam: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]] },
+  };
+  const ri = { width: 4, height: 4, raw_width: rw, raw_height: rh, left_margin: 2, top_margin: 2, data: raw };
+  const payload = metadataToRawMosaicPayload(meta, ri, 'libraw');
+  // MIN of the margin means picks the genuinely-masked (darkest) region, not the bright left.
+  expect(payload.black).toBe(8);
+});
+
+test('a genuine reported black (>0) is preferred over margin recovery', () => {
+  const rw = 6, rh = 6;
+  const raw = new Uint16Array(rw * rh).fill(100);
+  for (let y = 0; y < 2; y++) for (let x = 0; x < rw; x++) raw[y * rw + x] = 8;
+  const meta = {
+    camera_make: 'Canon', camera_model: 'X', flip: 0, filters: filtersFor('RGGB'), cdesc: 'RGBG',
+    color_data: { black: 256, maximum: 16383, cam_mul: [2, 1, 1.5, 1], rgb_cam: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]] },
+  };
+  const ri = { width: 4, height: 4, raw_width: rw, raw_height: rh, left_margin: 2, top_margin: 2, data: raw };
+  expect(metadataToRawMosaicPayload(meta, ri, 'libraw').black).toBe(256);
+});

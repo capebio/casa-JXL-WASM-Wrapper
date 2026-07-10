@@ -69,6 +69,37 @@ function extractMatrix(color) {
   return out;
 }
 
+// LibRaw folds the sensor pedestal into per-channel cblack and reports color.black = 0
+// for many bodies (EOS M200 CR3, old-Canon CRW), yet rawImageData is the UN-subtracted
+// mosaic with the pedestal intact — and this binding does not expose cblack. Recover the
+// black from the masked optical-black margin so process_raw_mosaic subtracts the right
+// pedestal; without it, higher-ISO / old-Canon frames render with a colour cast (verified
+// EOS M200 CR3 magenta, ixus900ti CRW). Take the MEAN of each masked margin (top rows,
+// left cols) and use the MIN: masked pixels are the darkest region, so a "margin" that
+// actually overlaps active pixels (brighter) is ignored.
+function blackFromMaskedMargins(rawImageData) {
+  const raw = rawImageData?.data;
+  const rawWidth = rawImageData?.raw_width >>> 0;
+  const rawHeight = rawImageData?.raw_height >>> 0;
+  const left = rawImageData?.left_margin >>> 0;
+  const top = rawImageData?.top_margin >>> 0;
+  if (!(raw instanceof Uint16Array) || !rawWidth || !rawHeight || raw.length !== rawWidth * rawHeight) return null;
+  const means = [];
+  if (top >= 2) {
+    let s = 0, n = 0;
+    for (let y = 0; y < top - 1; y++) for (let x = 0; x < rawWidth; x++) { s += raw[y * rawWidth + x]; n++; }
+    if (n) means.push(s / n);
+  }
+  if (left >= 2) {
+    let s = 0, n = 0;
+    for (let y = 0; y < rawHeight; y++) for (let x = 0; x < left - 1; x++) { s += raw[y * rawWidth + x]; n++; }
+    if (n) means.push(s / n);
+  }
+  if (!means.length) return null;
+  const black = Math.round(Math.min(...means));
+  return black >= 0 ? black : null;
+}
+
 function cropVisibleRaw(rawImageData) {
   const raw = rawImageData?.data;
   const width = rawImageData?.width >>> 0;
@@ -104,12 +135,17 @@ export function metadataToRawMosaicPayload(meta, rawImageData, decoderName = 'li
   const white = isFiniteNumber(color.maximum) && color.maximum > 0
     ? color.maximum
     : (isFiniteNumber(color.data_maximum) && color.data_maximum > 0 ? color.data_maximum : 65535);
+  // Prefer a genuine reported black (>0); else recover it from the masked margin, since
+  // rawImageData is un-subtracted and LibRaw usually reports 0 here. Clamp below white.
+  const reportedBlack = isFiniteNumber(color.black) && color.black > 0 ? color.black : null;
+  const recoveredBlack = reportedBlack ?? blackFromMaskedMargins(rawImageData) ?? 0;
+  const black = Math.max(0, Math.min(recoveredBlack, white - 1));
   return {
     raw: cropVisibleRaw(rawImageData),
     width: rawImageData.width >>> 0,
     height: rawImageData.height >>> 0,
     cfaPhase,
-    black: isFiniteNumber(color.black) && color.black >= 0 ? color.black : 0,
+    black,
     white,
     wbR,
     wbB,
