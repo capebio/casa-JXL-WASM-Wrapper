@@ -8,6 +8,10 @@ function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+function positiveFinite(value) {
+  return isFiniteNumber(value) && value > 0 ? value : null;
+}
+
 function librawChannelAt(filters, row, col, cdesc) {
   if (!filters || typeof cdesc !== 'string' || cdesc.length < 3) return null;
   const shift = ((((row << 1) & 14) + (col & 1)) << 1);
@@ -125,6 +129,41 @@ function cropVisibleRaw(rawImageData) {
   return cropped;
 }
 
+function extractIso(meta) {
+  // LibRaw surfaces ISO speed in multiple locations depending on format and binding version.
+  // Check the most common paths; positiveFinite rejects 0, NaN, Infinity, and non-numbers.
+  return positiveFinite(meta?.iso_speed)
+    ?? positiveFinite(meta?.other?.iso_speed)
+    ?? positiveFinite(meta?.shootinginfo?.iso_speed)
+    ?? null;
+}
+
+function extractBlackLevels(color, scalarBlack) {
+  // LibRaw per-channel black levels (cblack[0..3] after pedestal fold).
+  // When available as an array of 4 positive values, use them; otherwise replicate scalar.
+  const cb = color?.cblack;
+  if (Array.isArray(cb) && cb.length >= 4) {
+    const levels = [cb[0], cb[1], cb[2], cb[3]];
+    if (levels.every((v) => isFiniteNumber(v) && v >= 0)) {
+      return levels;
+    }
+  }
+  // Replicate the scalar black across all 4 channels
+  return [scalarBlack, scalarBlack, scalarBlack, scalarBlack];
+}
+
+function extractWhiteLevels(color, scalarWhite) {
+  // LibRaw per-channel white levels (linear_max[0..3]).
+  const lm = color?.linear_max;
+  if (Array.isArray(lm) && lm.length >= 4) {
+    const levels = [lm[0], lm[1], lm[2], lm[3]];
+    if (levels.every((v) => isFiniteNumber(v) && v > 0)) {
+      return levels;
+    }
+  }
+  return [scalarWhite, scalarWhite, scalarWhite, scalarWhite];
+}
+
 export function metadataToRawMosaicPayload(meta, rawImageData, decoderName = 'libraw') {
   const color = meta?.color_data || {};
   const cfaPhase = cfaPhaseFromLibRawFilters(meta?.filters, meta?.cdesc || 'RGBG');
@@ -140,6 +179,14 @@ export function metadataToRawMosaicPayload(meta, rawImageData, decoderName = 'li
   const reportedBlack = isFiniteNumber(color.black) && color.black > 0 ? color.black : null;
   const recoveredBlack = reportedBlack ?? blackFromMaskedMargins(rawImageData) ?? 0;
   const black = Math.max(0, Math.min(recoveredBlack, white - 1));
+
+  // ISO: surface from the LibRaw metadata, null when absent
+  const iso = extractIso(meta);
+
+  // Per-channel black and white levels for noise calibration consumers
+  const blackLevels = extractBlackLevels(color, black);
+  const whiteLevels = extractWhiteLevels(color, white);
+
   return {
     raw: cropVisibleRaw(rawImageData),
     width: rawImageData.width >>> 0,
@@ -147,6 +194,9 @@ export function metadataToRawMosaicPayload(meta, rawImageData, decoderName = 'li
     cfaPhase,
     black,
     white,
+    blackLevels,
+    whiteLevels,
+    iso,
     wbR,
     wbB,
     orientation: orientationFromLibRawFlip(meta?.flip ?? 0),
