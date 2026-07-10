@@ -927,10 +927,11 @@ These are real follow-ups; each is out of scope for v1 and noted so the wiring i
   into the DNG (`load_dng`) and CR2 (`decode_impl`) paths, threading datetime/GPS through
   `DngImage`/`Cr2Image` → `DngDecoded`/`Cr2Decoded` → `ProcessResult` (was hardcoded empty).
   **datetime verified end-to-end** for CR2 (`2026-03-21T06:38:52`) and DNG (`2026-05-27T…`);
-  ORF unchanged. **GPS** goes through the same path and is native unit-tested (synthetic TIFF,
-  lat 45.5 / lon 12.25) but was not verified on a real file — none of the test RAWs carry GPS.
-  Remaining: verify real-file GPS with a GPS-tagged sample; optionally add `GPSHPositioningError`
-  → `accuracy_m`. pkg rebuilt via wasm-pack.
+  ORF unchanged. **GPS verified end-to-end** on a real GPS-tagged DNG
+  (`PXL_20260501_100404049…dng`): decode `has_gps=true`, sidecar
+  `geo = {lat:5.06109, lon:10.02773, accuracy_m:null, elevation_m:540.7}`. (A zero-coordinate
+  GPS IFD — structure present but 0/0 rationals — is correctly rejected as "no fix".)
+  Optional remaining: `GPSHPositioningError → accuracy_m`. pkg rebuilt via wasm-pack.
 
 - **Browser lightbox hook** — a "Prepare ID proxy" action that builds `[liveBufferSource(currentPixels), pyramidLevelSource(getOpfsLevel, facadeDecode), embeddedPreviewSource(...), masterDecodeSource(...), rawDecodeSource(...)]` and calls `resolveProxy` with a **canvas** JPEG encoder (`canvas.toBlob("image/jpeg", 0.8)` → but canvas gives 4:2:0 already) instead of `nodeEncodeJpeg`. The source constructors are already platform-neutral and unit-tested.
 - **Pyramid byte retrieval** — an OPFS/manifest adapter that returns the stored 1024-level JXL bytes for an image (`packages/pyramid-ingest` storage). Feeds `pyramidLevelSource`.
