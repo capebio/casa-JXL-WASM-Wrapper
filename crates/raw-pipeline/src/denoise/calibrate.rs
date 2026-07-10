@@ -43,8 +43,12 @@ pub struct PlaneFit {
 pub struct CalibrationResult {
     /// Per-plane [R, G1, G2, B] fits.
     pub planes: [PlaneFit; 4],
-    /// Dark-frame-derived read-noise estimate (independent O check), per plane.
-    pub dark_read_noise: [f64; 4],
+    /// Variance of per-frame dark means, per plane (independent O sanity check).
+    ///
+    /// This equals `σ_pixel² / pixel_count`, **not** the per-pixel read noise
+    /// variance.  It is useful as a relative consistency check across planes and
+    /// ISOs; do not compare it directly against `FitCoeffs::read`.
+    pub dark_mean_variance: [f64; 4],
 }
 
 /// Reasons why calibration can fail.
@@ -169,9 +173,8 @@ pub fn calibrate(
     let mut dark_read: [f64; 4] = [0.0; 4];
 
     for plane in 0..4 {
-        // Dark-frame read noise: variance of per-frame means
-        let dark_var = dark_frame_variance(dark_frames, plane);
-        dark_read[plane] = dark_var.sqrt();
+        // Variance of per-frame dark means (sanity check; not per-pixel read noise).
+        dark_read[plane] = dark_frame_variance(dark_frames, plane);
 
         // Build (signal, variance) data points from flat pairs
         let mut points: Vec<(f64, f64)> = Vec::with_capacity(flat_pairs.len());
@@ -197,7 +200,7 @@ pub fn calibrate(
             plane_fits[2].unwrap(),
             plane_fits[3].unwrap(),
         ],
-        dark_read_noise: dark_read,
+        dark_mean_variance: dark_read,
     })
 }
 
@@ -332,7 +335,12 @@ fn huber_irls(points: &[(f64, f64)]) -> Result<PlaneFit, CalibrationError> {
         // Robust scale estimate (MAD)
         let mut abs_res: Vec<f64> = residuals.iter().map(|r| r.abs()).collect();
         abs_res.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mad = abs_res[n / 2] / 0.6745; // convert to sigma estimate
+        let median = if n % 2 == 0 {
+            (abs_res[n / 2 - 1] + abs_res[n / 2]) / 2.0
+        } else {
+            abs_res[n / 2]
+        };
+        let mad = median / 0.6745; // convert MAD to sigma estimate
         let sigma = mad.max(1e-12);
 
         // Huber weights
@@ -599,16 +607,16 @@ mod tests {
     }
 
     #[test]
-    fn dark_read_noise_is_plausible() {
+    fn dark_mean_variance_is_plausible() {
         let known_read = 64.0; // read noise variance
         let (darks, pairs) = build_calibration_data(0.5, known_read, 512.0, 16383.0);
         let result = calibrate(&darks, &pairs, 512.0, 16383.0).unwrap();
-        // dark_read_noise is sqrt(var-of-frame-means); for 64px frames it won't be
-        // close to sqrt(known_read) but it should be finite and positive.
+        // dark_mean_variance is the variance of per-frame means, equal to
+        // sigma_pixel^2 / pixel_count.  It should be finite and non-negative.
         for plane in 0..4 {
             assert!(
-                result.dark_read_noise[plane].is_finite() && result.dark_read_noise[plane] >= 0.0,
-                "plane {plane}: dark_read_noise invalid"
+                result.dark_mean_variance[plane].is_finite() && result.dark_mean_variance[plane] >= 0.0,
+                "plane {plane}: dark_mean_variance invalid"
             );
         }
     }
