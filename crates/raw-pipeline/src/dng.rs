@@ -4,6 +4,11 @@
 //! out of the same IFD chain.
 
 use crate::demosaic;
+use crate::denoise::dng_tags::{
+    read_doubles, read_rational, NoiseTagAccumulator, RawNoiseMetadata,
+    TAG_BASELINE_NOISE, TAG_BLACK_LEVEL, TAG_CFA_PLANE_COLOR, TAG_NOISE_PROFILE,
+    TAG_NOISE_REDUCTION_APPLIED, TAG_WHITE_LEVEL,
+};
 use crate::ljpeg;
 use crate::tiff::{visit_ifd, RawImageMeta};
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,6 +49,8 @@ pub struct DngImage {
     pub gps_lat: Option<f64>,
     pub gps_lon: Option<f64>,
     pub gps_alt: Option<f64>,
+    /// Per-CFA-plane noise metadata (black/white levels, embedded NoiseProfile, etc.).
+    pub noise_metadata: RawNoiseMetadata,
 }
 
 impl DngImage {
@@ -181,6 +188,8 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
     // perceptual model (lens17). The demosaic stage (incl. optional mhc_matrix
     // fusion) + this + black/white/wb provide the clean linear starting point.
 
+    let noise_metadata = state.noise_tags.build(black as f32, white as f32);
+
     Ok(DngImage {
         width,
         height,
@@ -201,6 +210,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         gps_lat: state.exif.gps_lat,
         gps_lon: state.exif.gps_lon,
         gps_alt: state.exif.gps_alt,
+        noise_metadata,
     })
 }
 
@@ -218,12 +228,21 @@ pub struct DngMeta {
     pub orientation: u16,
     pub make: String,
     pub model: String,
+    /// Per-CFA-plane noise metadata (black/white levels, embedded NoiseProfile, etc.).
+    pub noise_metadata: RawNoiseMetadata,
 }
 
 /// Build `DngMeta` from a parsed IFD + walk state. The expressions match
 /// `decode_bytes_inner` exactly (kept in sync by construction; not shared to avoid
 /// perturbing the proven full-decode path).
-fn dng_meta(state: &WalkState, raw: &RawIfd, width: usize, height: usize, cfa: Cfa) -> DngMeta {
+fn dng_meta(
+    state: &WalkState,
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    cfa: Cfa,
+    noise_metadata: RawNoiseMetadata,
+) -> DngMeta {
     let wb_g_neutral = state.as_shot_neutral.map(|n| n[1]).unwrap_or(1.0);
     let wb_r_neutral = state.as_shot_neutral.map(|n| n[0]).unwrap_or(1.0);
     let wb_b_neutral = state.as_shot_neutral.map(|n| n[2]).unwrap_or(1.0);
@@ -245,6 +264,7 @@ fn dng_meta(state: &WalkState, raw: &RawIfd, width: usize, height: usize, cfa: C
         orientation: state.orientation.unwrap_or(1),
         make: state.make.clone(),
         model: state.model.clone(),
+        noise_metadata,
     }
 }
 
@@ -273,7 +293,7 @@ impl<'a> DngRowSource<'a> {
     /// Parse a DNG for streaming. `Err` if unsupported (caller falls back to the full
     /// path): compression not in {1,7}, cps != 1, unsupported CFA, or implausible dims.
     pub fn new(data: &'a [u8]) -> Result<Self, String> {
-        let (state, raw, le) = load_dng(data).map_err(|e| format!("DNG parse: {e}"))?;
+        let (mut state, raw, le) = load_dng(data).map_err(|e| format!("DNG parse: {e}"))?;
         let width = raw.width as usize;
         let height = raw.height as usize;
         if width == 0 || height == 0 {
@@ -296,7 +316,9 @@ impl<'a> DngRowSource<'a> {
             Some(p) => return Err(format!("DNG: unsupported CFA {p:?}")),
             None => Cfa::Rggb,
         };
-        let meta = dng_meta(&state, &raw, width, height, cfa);
+        let noise_metadata = std::mem::take(&mut state.noise_tags)
+            .build(raw.black_level.unwrap_or(0) as f32, raw.white_level.unwrap_or(16383) as f32);
+        let meta = dng_meta(&state, &raw, width, height, cfa, noise_metadata);
 
         match raw.compression {
             7 => {
@@ -943,6 +965,8 @@ struct WalkState {
     model: String,
     orientation: Option<u16>,
     exif: crate::tiff::ExifGps,
+    /// Accumulated noise-related DNG tags; converted to `RawNoiseMetadata` after the walk.
+    noise_tags: NoiseTagAccumulator,
 }
 
 fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
@@ -1047,12 +1071,70 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                     }
                 }
                 0xC61A => {
+                    // BlackLevel: scalar path for demosaic (existing) + per-plane for noise.
                     ifd.black_level = first_f32(data, dtype, cnt, val, inline_pos, le)
                         .map(|v| v.round().clamp(0.0, 65535.0) as u16);
+                    // Per-CFA-plane black levels for noise metadata. Extract up to 4 values.
+                    // Supports DOUBLE (12), RATIONAL (5), SHORT (3), LONG (4).
+                    {
+                        let n = (cnt as usize).min(4);
+                        if n > 0 {
+                            let ts = type_size(dtype);
+                            if ts > 0 {
+                                let bytes = ts.saturating_mul(n);
+                                let p = if bytes <= 4 { inline_pos } else { val as usize };
+                                let mut levels: Vec<f32> = Vec::with_capacity(n);
+                                let mut ok = true;
+                                'bl: for k in 0..n {
+                                    let off = match k.checked_mul(ts).and_then(|kt| p.checked_add(kt)) {
+                                        Some(o) => o,
+                                        None => { ok = false; break 'bl; }
+                                    };
+                                    let v: Option<f32> = match dtype {
+                                        3 => {
+                                            if off.checked_add(2).map_or(true, |e| e > data.len()) { None }
+                                            else { Some(read_u16(data, off, le) as f32) }
+                                        }
+                                        4 => {
+                                            if off.checked_add(4).map_or(true, |e| e > data.len()) { None }
+                                            else { Some(read_u32(data, off, le) as f32) }
+                                        }
+                                        5 => {
+                                            // RATIONAL
+                                            if off.checked_add(8).map_or(true, |e| e > data.len()) { None }
+                                            else {
+                                                let num = read_u32(data, off, le) as f32;
+                                                let den = read_u32(data, off + 4, le) as f32;
+                                                if den > 0.0 { Some(num / den) } else { None }
+                                            }
+                                        }
+                                        12 => {
+                                            // DOUBLE (8 bytes)
+                                            read_doubles(data, off, 1, le)
+                                                .and_then(|v| v.first().copied())
+                                                .map(|v| v as f32)
+                                        }
+                                        _ => None,
+                                    };
+                                    match v {
+                                        Some(lv) => levels.push(lv),
+                                        None => { ok = false; break 'bl; }
+                                    }
+                                }
+                                if ok && !levels.is_empty() {
+                                    state.noise_tags.black_levels = levels;
+                                }
+                            }
+                        }
+                    }
                 }
                 0xC61D => {
+                    // WhiteLevel: existing scalar path + noise metadata capture.
                     ifd.white_level = first_f32(data, dtype, cnt, val, inline_pos, le)
                         .map(|v| v.round().clamp(0.0, 65535.0) as u16);
+                    if let Some(v) = first_f32(data, dtype, cnt, val, inline_pos, le) {
+                        state.noise_tags.white_level = Some(v);
+                    }
                 }
                 0x8827 => {
                     // ISOSpeedRatings — SHORT array; take first value.
@@ -1075,6 +1157,48 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 TAG_FORWARD_MATRIX_2 => {
                     state.forward_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                // ── Additional noise-metadata tags ────────────────────────────
+                // (TAG_BLACK_LEVEL=0xC61A and TAG_WHITE_LEVEL=0xC61D are handled
+                //  in their existing literal arms above; logic merged there.)
+                TAG_CFA_PLANE_COLOR => {
+                    // BYTE array: maps CFA plane index → colour (0=R, 1=G, 2=B).
+                    if dtype == 1 && cnt > 0 {
+                        let p = if (cnt as usize) <= 4 { inline_pos } else { val as usize };
+                        let n = (cnt as usize).min(4);
+                        if let Some(slice) = p.checked_add(n).and_then(|end| data.get(p..end)) {
+                            state.noise_tags.cfa_plane_color = Some(slice.to_vec());
+                        }
+                    }
+                }
+                TAG_NOISE_PROFILE => {
+                    // DOUBLE array: 2N values for N colour planes.
+                    if dtype == 12 && cnt >= 2 {
+                        let n = cnt as usize;
+                        // Always a pointer (n*8 > 4 for any realistic count).
+                        let p = val as usize;
+                        if let Some(values) = read_doubles(data, p, n, le) {
+                            state.noise_tags.noise_profile = Some(values);
+                        }
+                    }
+                }
+                TAG_BASELINE_NOISE => {
+                    // RATIONAL (num, den).
+                    if dtype == 5 || dtype == 10 {
+                        let p = val as usize;
+                        if let Some(rat) = read_rational(data, p, le) {
+                            state.noise_tags.baseline_noise = Some(rat);
+                        }
+                    }
+                }
+                TAG_NOISE_REDUCTION_APPLIED => {
+                    // RATIONAL (num, den) in [0, 1].
+                    if dtype == 5 || dtype == 10 {
+                        let p = val as usize;
+                        if let Some(rat) = read_rational(data, p, le) {
+                            state.noise_tags.noise_reduction_applied = Some(rat);
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -1732,6 +1856,8 @@ pub struct DngDemosaiced {
     pub iso: Option<u32>,
     pub decode_ms: f64,
     pub demosaic_ms: f64,
+    /// Per-CFA-plane noise metadata (black/white levels, embedded NoiseProfile, etc.).
+    pub noise_metadata: RawNoiseMetadata,
 }
 
 /// Fused decode (ljpeg tiles) + demosaic (mhc) for DNG. RGGB fast path uses strip fusion
@@ -1803,6 +1929,9 @@ pub(crate) fn decode_bytes_demosaiced_impl(
     let iso = state.iso;
     let make = state.make.clone();
     let model = state.model.clone();
+    // Build noise metadata from the walk-state accumulator; must happen before the
+    // fallback branches that move `state` fields but after black/white are known.
+    let noise_metadata = state.noise_tags.build(black as f32, white as f32);
 
     if cfa != Cfa::Rggb {
         // Fallback: full mosaic path (still correct; only RGGB gets the X2 mem cut).
@@ -1832,6 +1961,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
             iso: img.iso,
             decode_ms,
             demosaic_ms,
+            noise_metadata,
         });
     }
 
@@ -1870,6 +2000,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
                 iso: img.iso,
                 decode_ms,
                 demosaic_ms,
+                noise_metadata,
             });
         }
     };
@@ -2059,5 +2190,6 @@ pub(crate) fn decode_bytes_demosaiced_impl(
         iso,
         decode_ms,
         demosaic_ms,
+        noise_metadata,
     })
 }
