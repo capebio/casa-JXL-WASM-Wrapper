@@ -135,6 +135,15 @@ impl NoiseTagAccumulator {
                 self.black_levels[2],
                 self.black_levels[3],
             ]
+        } else if self.black_levels.len() == 2 {
+            // 2-value BlackLevel (Sony/Sigma DNGs with 2×1 BlackLevelRepeatDim):
+            // standard RGGB mapping where v[0]=R=B and v[1]=G1=G2.
+            [
+                self.black_levels[0],
+                self.black_levels[1],
+                self.black_levels[1],
+                self.black_levels[0],
+            ]
         } else if self.black_levels.len() == 1 {
             [self.black_levels[0]; 4]
         } else {
@@ -227,19 +236,6 @@ pub fn parse_noise_profile(
                 read: profile[1] as f32,
             };
             [c; 4]
-        }
-        2 => {
-            // 4-value: treat as [R, G] → replicate G for G2, derive B if absent
-            // (unusual; map plane 0→R, 1→G, 2→G2, 3→B using best-effort).
-            let c0 = NoiseCoefficients {
-                shot: profile[0] as f32,
-                read: profile[1] as f32,
-            };
-            let c1 = NoiseCoefficients {
-                shot: profile[2] as f32,
-                read: profile[3] as f32,
-            };
-            [c0, c1, c1, c0]
         }
         3 => {
             // 6-value RGB: map through CFAPlaneColor to RGGB order.
@@ -495,8 +491,16 @@ mod tests {
 
     #[test]
     fn reject_10_value_noise_profile() {
-        // 10 values = 5 planes — not 1, 2, 3, or 4 → reject.
+        // 10 values = 5 planes — not 1, 3, or 4 → reject.
         let profile = [0.001f64; 10];
+        assert!(parse_noise_profile(&profile, None).is_none());
+    }
+
+    #[test]
+    fn reject_four_value_noise_profile() {
+        // 4 values = 2 planes — not a valid DNG plane count (1, 3, or 4) → reject.
+        // Previously this hit the removed dead `n_planes == 2` arm.
+        let profile = [0.001f64, 0.0001f64, 0.002f64, 0.0002f64];
         assert!(parse_noise_profile(&profile, None).is_none());
     }
 
@@ -581,6 +585,16 @@ mod tests {
         let m = acc.build(0.0, 0.0);
         assert_eq!(m.black, [512.0, 513.0, 513.0, 515.0]);
         assert_eq!(m.white, [15000.0; 4]);
+    }
+
+    #[test]
+    fn accumulator_build_two_value_black_maps_to_rggb() {
+        // 2-value BlackLevel from Sony/Sigma DNGs (2×1 BlackLevelRepeatDim):
+        // v[0] = R = B, v[1] = G1 = G2 → RGGB [v0, v1, v1, v0].
+        let mut acc = NoiseTagAccumulator::default();
+        acc.black_levels = vec![512.0, 514.0];
+        let m = acc.build(0.0, 16383.0);
+        assert_eq!(m.black, [512.0, 514.0, 514.0, 512.0]);
     }
 
     #[test]

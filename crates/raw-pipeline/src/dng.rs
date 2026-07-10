@@ -1184,8 +1184,11 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                     }
                 }
                 TAG_BASELINE_NOISE => {
-                    // RATIONAL (num, den).
-                    if dtype == 5 || dtype == 10 {
+                    // RATIONAL (num, den). Accept dtype=5 (unsigned RATIONAL) only.
+                    // dtype=10 (SRATIONAL) is skipped: read_rational returns (u32,u32),
+                    // so a signed numerator would be miscast to a huge positive value.
+                    // BaselineNoise is always non-negative, so unsigned RATIONAL suffices.
+                    if dtype == 5 {
                         let p = val as usize;
                         if let Some(rat) = read_rational(data, p, le) {
                             state.noise_tags.baseline_noise = Some(rat);
@@ -1193,8 +1196,8 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                     }
                 }
                 TAG_NOISE_REDUCTION_APPLIED => {
-                    // RATIONAL (num, den) in [0, 1].
-                    if dtype == 5 || dtype == 10 {
+                    // RATIONAL (num, den) in [0, 1]. Same SRATIONAL guard as above.
+                    if dtype == 5 {
                         let p = val as usize;
                         if let Some(rat) = read_rational(data, p, le) {
                             state.noise_tags.noise_reduction_applied = Some(rat);
