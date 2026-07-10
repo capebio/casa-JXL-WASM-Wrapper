@@ -1,5 +1,6 @@
 // Lean, ID-focused casava-ai/1 sidecar builder.
-import { exifDatetimeToIso, geoBlock } from "./datetime-geo.mjs";
+import { exifDatetimeToIso } from "./datetime-geo.mjs";
+import { gpsFromDecoded } from "./gps.mjs";
 
 export const SIDECAR_SCHEMA = "casava-ai/1";
 export const PROXY_SPEC = "768px/q80/4:2:0";
@@ -18,7 +19,7 @@ export function buildSidecar(input) {
     image: { width: input.width, height: input.height, orientation_applied: !!input.orientationApplied },
     colour: { space: "sRGB", icc_embedded: false },
     datetime: exifDatetimeToIso(input.datetimeExif),
-    geo: geoBlock(input.decoded),
+    geo: gpsFromDecoded(input.decoded),
     proxy: { spec: PROXY_SPEC, stored: false },
     generator: { name: "casava-ai", version: 1 },
   };

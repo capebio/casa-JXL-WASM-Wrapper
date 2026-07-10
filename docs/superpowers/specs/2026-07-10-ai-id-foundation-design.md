@@ -68,14 +68,17 @@ Assembled in JS from the decoded WASM result (which exposes `gps_lat/lon/alt`,
   "image":   { "width": 6000, "height": 4000, "orientation_applied": true },
   "colour":  { "space": "sRGB", "icc_embedded": false },
   "datetime": "2026-05-27T17:53:12",          // ISO 8601; season/phenology prior. null if absent
-  "geo":   { "lat": -25.85, "lon": 28.19, "alt": 1300.0 },  // DECIMAL (EXIF stores dms+ref). null if absent
+  "geo": { "lat": -25.85235, "lon": 28.19112, "accuracy_m": null, "elevation_m": 1300.4 },  // standardized; null if no fix
   "proxy": { "spec": "768px/q80/4:2:0", "stored": false },  // generated on demand
   "generator": { "name": "casava-ai", "version": 1 }
 }
 ```
 
 Why each field is here and not just read from EXIF:
-- **`geo`** — decimal, ready for iNat `lat`/`lng` (EXIF is rational dms + N/S/E/W refs).
+- **`geo`** — standardized by `gps.mjs` when a fix exists: signed decimal `lat`/`lon`
+  (5 dp ≈ 1.1 m; N/E +, S/W −), `accuracy_m` and `elevation_m` in metres (1 dp, null when
+  unknown). Ready for iNat `lat`/`lng` (EXIF stores rational dms + refs). `accuracy_m` stays
+  null until a decode path exposes GPSHPositioningError.
 - **`datetime`** — the one capture field with ID value (season/phenology); normalized to ISO 8601.
 - **`image` dims / `colour`** — *output-side* facts: processed dims (post-orientation, ≠ EXIF
   raw sensor dims) and the **output** colour space sRGB (the RAW is not sRGB). Not in EXIF.

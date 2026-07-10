@@ -16,7 +16,7 @@ test("buildSidecar produces the casava-ai/1 shape with decimal geo + ISO datetim
   assert.deepEqual(s.image, { width: 6000, height: 4000, orientation_applied: true });
   assert.deepEqual(s.colour, { space: "sRGB", icc_embedded: false });
   assert.equal(s.datetime, "2026-05-27T17:53:12");
-  assert.deepEqual(s.geo, { lat: -25.85, lon: 28.19, alt: 1300 });
+  assert.deepEqual(s.geo, { lat: -25.85, lon: 28.19, accuracy_m: null, elevation_m: 1300 });
   assert.deepEqual(s.proxy, { spec: "768px/q80/4:2:0", stored: false });
   assert.deepEqual(s.generator, { name: "casava-ai", version: 1 });
 });
