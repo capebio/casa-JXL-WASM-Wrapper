@@ -133,3 +133,9 @@ crates/raw-pipeline/calibration-samples/
 # secrets — API keys for AI-ID services etc. (never commit)
 .env
 .env.local
+
+# git worktrees
+.worktrees/
+
+# git worktrees
+.worktrees/
