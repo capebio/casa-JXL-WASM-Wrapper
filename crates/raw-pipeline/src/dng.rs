@@ -5,9 +5,10 @@
 
 use crate::demosaic;
 use crate::denoise::dng_tags::{
-    read_doubles, read_rational, NoiseTagAccumulator, RawNoiseMetadata,
-    TAG_BASELINE_NOISE, TAG_BLACK_LEVEL, TAG_CFA_PLANE_COLOR, TAG_NOISE_PROFILE,
-    TAG_NOISE_REDUCTION_APPLIED, TAG_WHITE_LEVEL,
+    read_doubles, read_rational, read_srational_array, NoiseTagAccumulator, RawNoiseMetadata,
+    TAG_BASELINE_NOISE, TAG_BLACK_LEVEL_DELTA_H, TAG_BLACK_LEVEL_DELTA_V,
+    TAG_BLACK_LEVEL_REPEAT_DIM, TAG_CFA_PLANE_COLOR, TAG_NOISE_PROFILE,
+    TAG_NOISE_REDUCTION_APPLIED,
 };
 use crate::ljpeg;
 use crate::tiff::{visit_ifd, RawImageMeta};
@@ -1197,6 +1198,38 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                         let p = val as usize;
                         if let Some(rat) = read_rational(data, p, le) {
                             state.noise_tags.noise_reduction_applied = Some(rat);
+                        }
+                    }
+                }
+                TAG_BLACK_LEVEL_REPEAT_DIM => {
+                    // SHORT[2]: [rows, cols] of the BlackLevel repeat pattern.
+                    // dtype=3 (SHORT), each element is 2 bytes; 2 elements = 4 bytes
+                    // which fits inline (in the IFD value field).
+                    if cnt >= 2 && dtype == 3 {
+                        // Two SHORTs = 4 bytes, always fits inline.
+                        let p = inline_pos;
+                        if p.checked_add(4).map_or(false, |e| e <= data.len()) {
+                            let rows = read_u16(data, p, le) as u32;
+                            let cols = read_u16(data, p + 2, le) as u32;
+                            state.noise_tags.black_repeat_dim = Some([rows, cols]);
+                        }
+                    }
+                }
+                TAG_BLACK_LEVEL_DELTA_H => {
+                    // SRATIONAL array (dtype=10), one value per column in the repeat pattern.
+                    if dtype == 10 && cnt > 0 {
+                        let p = val as usize; // always a pointer (cnt*8 > 4)
+                        if let Some(deltas) = read_srational_array(data, p, cnt as usize, le) {
+                            state.noise_tags.black_delta_h = Some(deltas);
+                        }
+                    }
+                }
+                TAG_BLACK_LEVEL_DELTA_V => {
+                    // SRATIONAL array (dtype=10), one value per row in the repeat pattern.
+                    if dtype == 10 && cnt > 0 {
+                        let p = val as usize;
+                        if let Some(deltas) = read_srational_array(data, p, cnt as usize, le) {
+                            state.noise_tags.black_delta_v = Some(deltas);
                         }
                     }
                 }

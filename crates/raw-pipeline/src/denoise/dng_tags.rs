@@ -55,6 +55,20 @@ pub struct RawNoiseMetadata {
     /// NoiseReductionApplied (0xC6F7): fraction of in-camera NR already applied.
     /// 0.0 = none, 1.0 = full.  `None` when the tag is absent or invalid.
     pub noise_reduction_applied: Option<f32>,
+
+    /// BlackLevelDeltaH (0xC61B): per-column black-level corrections (SRATIONAL array).
+    /// Length equals the number of columns in the BlackLevelRepeatDim repeat pattern.
+    /// `None` when the tag is absent or could not be parsed.
+    pub black_delta_h: Option<Vec<f32>>,
+
+    /// BlackLevelDeltaV (0xC61C): per-row black-level corrections (SRATIONAL array).
+    /// Length equals the number of rows in the BlackLevelRepeatDim repeat pattern.
+    /// `None` when the tag is absent or could not be parsed.
+    pub black_delta_v: Option<Vec<f32>>,
+
+    /// BlackLevelRepeatDim (0xC619): repeat pattern dimensions `[rows, cols]`
+    /// for the BlackLevel tag.  `None` when the tag is absent or malformed.
+    pub black_repeat_dim: Option<[u32; 2]>,
 }
 
 impl Default for RawNoiseMetadata {
@@ -65,6 +79,9 @@ impl Default for RawNoiseMetadata {
             embedded_noise: None,
             baseline_noise: None,
             noise_reduction_applied: None,
+            black_delta_h: None,
+            black_delta_v: None,
+            black_repeat_dim: None,
         }
     }
 }
@@ -92,6 +109,15 @@ pub struct NoiseTagAccumulator {
 
     /// NoiseReductionApplied RATIONAL (num, den).
     pub noise_reduction_applied: Option<(u32, u32)>,
+
+    /// BlackLevelDeltaH (0xC61B): per-column black delta, parsed as f32.
+    pub black_delta_h: Option<Vec<f32>>,
+
+    /// BlackLevelDeltaV (0xC61C): per-row black delta, parsed as f32.
+    pub black_delta_v: Option<Vec<f32>>,
+
+    /// BlackLevelRepeatDim (0xC619): `[rows, cols]` of the repeat pattern.
+    pub black_repeat_dim: Option<[u32; 2]>,
 }
 
 impl NoiseTagAccumulator {
@@ -158,6 +184,9 @@ impl NoiseTagAccumulator {
             embedded_noise,
             baseline_noise,
             noise_reduction_applied,
+            black_delta_h: self.black_delta_h,
+            black_delta_v: self.black_delta_v,
+            black_repeat_dim: self.black_repeat_dim,
         }
     }
 }
@@ -345,6 +374,32 @@ pub fn read_rational(data: &[u8], offset: usize, le: bool) -> Option<(u32, u32)>
         u32::from_be_bytes(d_bytes)
     };
     Some((n, d))
+}
+
+/// Read `count` SRATIONAL values (dtype=10, each 8 bytes: i32 num + i32 den) from
+/// `data` at `offset`, honoring endianness `le`.
+///
+/// Each rational is converted to `f32` (num/den). A zero denominator yields 0.0.
+/// Returns `None` on any out-of-bounds access or if `count == 0`.
+pub fn read_srational_array(data: &[u8], offset: usize, count: usize, le: bool) -> Option<Vec<f32>> {
+    if count == 0 {
+        return None;
+    }
+    const SZ: usize = 8;
+    let end = offset.checked_add(count.checked_mul(SZ)?)?;
+    if end > data.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let p = offset + i * SZ;
+        let nb: [u8; 4] = data[p..p + 4].try_into().ok()?;
+        let db: [u8; 4] = data[p + 4..p + 8].try_into().ok()?;
+        let num = if le { i32::from_le_bytes(nb) } else { i32::from_be_bytes(nb) };
+        let den = if le { i32::from_le_bytes(db) } else { i32::from_be_bytes(db) };
+        out.push(if den != 0 { num as f32 / den as f32 } else { 0.0 });
+    }
+    Some(out)
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -572,6 +627,89 @@ mod tests {
         let m = acc.build(0.0, 16383.0);
         let bn = m.baseline_noise.expect("baseline_noise present");
         assert!((bn - 1.5f32).abs() < 1e-6);
+    }
+
+    // ── read_srational_array ───────────────────────────────────────────────────
+
+    #[test]
+    fn read_srational_array_le_positive() {
+        // Two SRATIONAL values: 1/2 = 0.5, 3/4 = 0.75
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_le_bytes());
+        buf.extend_from_slice(&2i32.to_le_bytes());
+        buf.extend_from_slice(&3i32.to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes());
+        let v = read_srational_array(&buf, 0, 2, true).expect("should parse");
+        assert_eq!(v.len(), 2);
+        assert!((v[0] - 0.5).abs() < 1e-6, "v[0]={}", v[0]);
+        assert!((v[1] - 0.75).abs() < 1e-6, "v[1]={}", v[1]);
+    }
+
+    #[test]
+    fn read_srational_array_le_negative() {
+        // SRATIONAL: -1/4 = -0.25
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(-1i32).to_le_bytes());
+        buf.extend_from_slice(&4i32.to_le_bytes());
+        let v = read_srational_array(&buf, 0, 1, true).expect("should parse");
+        assert!((v[0] - (-0.25)).abs() < 1e-6, "v[0]={}", v[0]);
+    }
+
+    #[test]
+    fn read_srational_array_zero_denominator_yields_zero() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&5i32.to_le_bytes());
+        buf.extend_from_slice(&0i32.to_le_bytes()); // den=0
+        let v = read_srational_array(&buf, 0, 1, true).expect("should parse");
+        assert_eq!(v[0], 0.0);
+    }
+
+    #[test]
+    fn read_srational_array_oob_returns_none() {
+        let buf = [0u8; 7]; // not enough for one SRATIONAL (needs 8)
+        assert!(read_srational_array(&buf, 0, 1, true).is_none());
+    }
+
+    #[test]
+    fn read_srational_array_count_zero_returns_none() {
+        let buf = [0u8; 16];
+        assert!(read_srational_array(&buf, 0, 0, true).is_none());
+    }
+
+    // ── NoiseTagAccumulator — new fields ──────────────────────────────────────
+
+    #[test]
+    fn accumulator_build_propagates_black_delta_h_and_v() {
+        let mut acc = NoiseTagAccumulator::default();
+        acc.black_delta_h = Some(vec![1.0, -0.5, 0.25]);
+        acc.black_delta_v = Some(vec![0.1, -0.1]);
+        let m = acc.build(0.0, 16383.0);
+        let dh = m.black_delta_h.expect("black_delta_h present");
+        assert_eq!(dh.len(), 3);
+        assert!((dh[0] - 1.0).abs() < 1e-6);
+        assert!((dh[1] - (-0.5)).abs() < 1e-6);
+        assert!((dh[2] - 0.25).abs() < 1e-6);
+        let dv = m.black_delta_v.expect("black_delta_v present");
+        assert_eq!(dv.len(), 2);
+        assert!((dv[0] - 0.1).abs() < 1e-6);
+        assert!((dv[1] - (-0.1)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn accumulator_build_propagates_black_repeat_dim() {
+        let mut acc = NoiseTagAccumulator::default();
+        acc.black_repeat_dim = Some([2, 2]);
+        let m = acc.build(0.0, 16383.0);
+        assert_eq!(m.black_repeat_dim, Some([2, 2]));
+    }
+
+    #[test]
+    fn accumulator_build_none_when_delta_and_repeat_dim_absent() {
+        let acc = NoiseTagAccumulator::default();
+        let m = acc.build(0.0, 16383.0);
+        assert!(m.black_delta_h.is_none());
+        assert!(m.black_delta_v.is_none());
+        assert!(m.black_repeat_dim.is_none());
     }
 
     #[test]
