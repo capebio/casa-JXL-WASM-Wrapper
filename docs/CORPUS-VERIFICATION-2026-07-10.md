@@ -56,10 +56,32 @@ camera JPEG within Δ 0.02–0.2). Separate fix from the native CR2 one.
 - (The CRW WB fix already covers the a570is green cast.)
 
 ## Recommended next fixes (both camera-JPEG-justified, harness-gated)
-1. **Native CR2 per-model matrix** — re-enable `canon_cam_xyz`-derived matrices (start with EOS M5).
-   `cr2.rs` change + `web/pkg` rebuild, then re-run (ADH 1234/1570 Δ must drop, the passing
-   ADH/`_MG` must stay faithful). Note the "temporarily disabled" comment — check *why* it was
-   disabled before re-enabling.
-2. **LibRaw Canon `rgb_cam` application** in `process_raw_mosaic` (CR3/CRW residual).
-3. Re-run `node tools/colour-verify-corpus.mjs` after each change — the embedded-JPEG comparison is
-   the gate (Δours must drop; the 32 faithful must stay green).
+
+### 1. Native CR2 per-model matrix (fixes ADH 1234/1570) — ready to apply, but your call
+`canon_cam_xyz(model)` is **empty-stubbed** (`return None` for every model) → `canon_color_matrix`
+always falls through to the generic `CANON_CAM_TO_SRGB`. The *matrix method itself* is sound —
+`canon_color_matrix` mirrors the DNG path (`cam_xyz` → invert → `XYZ_D50_TO_SRGB`), and our DNG
+renders are faithful — so it should just work once fed data.
+
+**To enable EOS M5** (both ADH and `_MG` fixtures are M5), populate `canon_cam_xyz`:
+```rust
+"Canon EOS M5" => Some([8532, -701, -1167, -4095, 11879, 2508, -797, 2424, 7010]),
+```
+(LibRaw's `cam_xyz` for the M5 ×10000, read from the files themselves.) Then rebuild `web/pkg` +
+re-run the harness — ADH 1234/1570 Δ should drop toward LibRaw's ~0.07/0.12; the passing ADH/`_MG`
+must stay faithful.
+
+**⚠ Two guards before you do:** (a) a test — `canon_color_matrix_disabled_until_neutral_correction_implemented`
+— *asserts* `canon_color_matrix` returns `None` for M5, citing **"channel collapse" from
+"direct adobe_coeff use in CasaWASM's WB-first pipeline"**; that test must be updated, and the
+caveat verified stale (it likely predates the current DNG-mirrored method). (b) I did **not**
+re-enable it — you disabled per-model matrices deliberately, and channel-collapse is a real
+failure mode, so this is your colour-authority call. The harness makes it a 2-minute verify:
+enable → rebuild → `node tools/colour-verify-corpus.mjs` → confirm Δ drops with no dark/collapsed CR2.
+
+### 2. LibRaw Canon `rgb_cam` application in `process_raw_mosaic` (CR3/CRW residual)
+Non-Canon LibRaw formats track the camera JPEG (Δ 0.02–0.2), so the mosaic matrix path is right in
+general — Canon-`rgb_cam`-specific. Separate from #1.
+
+The embedded-JPEG comparison (`node tools/colour-verify-corpus.mjs`) is the gate for both — Δours
+must drop and the 32 faithful must stay green.
