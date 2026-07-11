@@ -20,6 +20,7 @@ pub fn resolve_and_score(
     raw: &[u16],
     width: usize,
     height: usize,
+    cfa: usize,
     metadata: &RawNoiseMetadata,
     embedded: Option<NoiseModel>,
     registry: Option<NoiseModel>,
@@ -30,7 +31,7 @@ pub fn resolve_and_score(
     let model = resolve_noise_model(embedded, registry, blind)
         .or_else(|| iso.map(iso_fallback_model))?;
 
-    Some(score_noise(raw, width, height, metadata, &model, wb))
+    Some(score_noise(raw, width, height, cfa, metadata, &model, wb))
 }
 
 #[cfg(test)]
@@ -60,7 +61,7 @@ mod tests {
             source: NoiseSource::DngNoiseProfile,
         });
         let wb = [1.0f32; 4];
-        let metrics = resolve_and_score(&raw, 128, 128, &meta, embedded, None, None, None, &wb);
+        let metrics = resolve_and_score(&raw, 128, 128, 0, &meta, embedded, None, None, None, &wb);
         assert!(metrics.is_some());
         let m = metrics.unwrap();
         assert_eq!(m.source, NoiseSource::DngNoiseProfile);
@@ -70,7 +71,7 @@ mod tests {
     fn resolve_and_score_falls_back_to_iso() {
         let (raw, meta) = flat_raw(128, 128, 0.20);
         let wb = [1.0f32; 4];
-        let metrics = resolve_and_score(&raw, 128, 128, &meta, None, None, None, Some(1600), &wb);
+        let metrics = resolve_and_score(&raw, 128, 128, 0, &meta, None, None, None, Some(1600), &wb);
         assert!(metrics.is_some());
         let m = metrics.unwrap();
         assert_eq!(m.source, NoiseSource::IsoFallback);
@@ -80,7 +81,7 @@ mod tests {
     fn resolve_and_score_returns_none_when_nothing_available() {
         let (raw, meta) = flat_raw(128, 128, 0.20);
         let wb = [1.0f32; 4];
-        let result = resolve_and_score(&raw, 128, 128, &meta, None, None, None, None, &wb);
+        let result = resolve_and_score(&raw, 128, 128, 0, &meta, None, None, None, None, &wb);
         assert!(result.is_none());
     }
 
@@ -131,11 +132,11 @@ mod tests {
         let wb = [1.0f32; 4];
 
         let m_low = resolve_and_score(
-            &raw, 128, 128, &meta, None, None, None, Some(200), &wb,
+            &raw, 128, 128, 0, &meta, None, None, None, Some(200), &wb,
         )
         .unwrap();
         let m_high = resolve_and_score(
-            &raw, 128, 128, &meta, None, None, None, Some(3200), &wb,
+            &raw, 128, 128, 0, &meta, None, None, None, Some(3200), &wb,
         )
         .unwrap();
 
