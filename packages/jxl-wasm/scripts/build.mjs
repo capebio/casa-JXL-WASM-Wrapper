@@ -645,6 +645,8 @@ async function writeManifest(manifest) {
     // canMergePartialTier rejects legacy (no provenance) entries and stale partial builds
     // (different inputDigest/sourceCommit/libjxlCommit) to prevent shipping unaudited artifacts.
     const existingTiers = existing.tiers ?? {};
+    // Existing-only tier entries (not rebuilt in this run) are preserved as-is and are NOT
+    // re-validated here — they were validated (including dirty checks) when first written.
     const mergedTiers = { ...existingTiers };
     for (const [key, incomingEntry] of Object.entries(manifest.tiers)) {
       const existingEntry = existingTiers[key];

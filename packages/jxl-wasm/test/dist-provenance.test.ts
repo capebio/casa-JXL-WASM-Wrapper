@@ -573,3 +573,88 @@ describe("verifyManifest — pgo field", () => {
     expect(result.pgo?.profileDigest).toBe("abc123");
   });
 });
+
+// ---------------------------------------------------------------------------
+// I-A: release build with unknown sourceCommit is rejected
+// ---------------------------------------------------------------------------
+
+describe("validateProvenance — unknown sourceCommit in release mode (I-A)", () => {
+  test("sourceCommit='unknown' is rejected in release mode", () => {
+    const p = makeProvenance({ sourceCommit: "unknown", sourceDirty: false });
+    expect(() => validateProvenance(p, { releaseMode: true })).toThrow(
+      /unknown.*release|release.*unknown|sourceCommit.*unknown/i
+    );
+  });
+
+  test("sourceCommit='unknown' is allowed in non-release mode", () => {
+    const p = makeProvenance({ sourceCommit: "unknown", sourceDirty: false });
+    expect(() => validateProvenance(p, { releaseMode: false })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I-B: missing sourceDirty / libjxlDirty fields are rejected
+// ---------------------------------------------------------------------------
+
+describe("validateProvenance — missing dirty boolean fields (I-B)", () => {
+  test("sourceDirty absent (undefined) is rejected", () => {
+    const p = makeProvenance();
+    // Delete the field entirely to simulate absent (not present in JSON)
+    const pMissing = { ...p } as Record<string, unknown>;
+    delete pMissing["sourceDirty"];
+    expect(() => validateProvenance(pMissing as BuildProvenance, { releaseMode: false })).toThrow(
+      /sourceDirty.*boolean|boolean.*sourceDirty/i
+    );
+  });
+
+  test("libjxlDirty absent (undefined) is rejected", () => {
+    const p = makeProvenance();
+    const pMissing = { ...p } as Record<string, unknown>;
+    delete pMissing["libjxlDirty"];
+    expect(() => validateProvenance(pMissing as BuildProvenance, { releaseMode: false })).toThrow(
+      /libjxlDirty.*boolean|boolean.*libjxlDirty/i
+    );
+  });
+
+  test("sourceDirty=null (non-boolean) is rejected", () => {
+    const p = makeProvenance({ sourceDirty: null as unknown as boolean });
+    expect(() => validateProvenance(p, { releaseMode: false })).toThrow(
+      /sourceDirty.*boolean|boolean.*sourceDirty/i
+    );
+  });
+
+  test("libjxlDirty=null (non-boolean) is rejected", () => {
+    const p = makeProvenance({ libjxlDirty: null as unknown as boolean });
+    expect(() => validateProvenance(p, { releaseMode: false })).toThrow(
+      /libjxlDirty.*boolean|boolean.*libjxlDirty/i
+    );
+  });
+
+  test("valid boolean false values for both fields pass", () => {
+    const p = makeProvenance({ sourceDirty: false, libjxlDirty: false });
+    expect(() => validateProvenance(p, { releaseMode: false })).not.toThrow();
+  });
+
+  test("valid boolean true values for both fields pass in non-release mode", () => {
+    const p = makeProvenance({ sourceDirty: true, libjxlDirty: true });
+    expect(() => validateProvenance(p, { releaseMode: false })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Minor: verifyManifest with zero tiers returns ok:false (not vacuous success)
+// ---------------------------------------------------------------------------
+
+describe("verifyManifest — empty tiers guard (minor)", () => {
+  test("manifest with zero tiers returns ok:false", () => {
+    const result = verifyManifest({ buildId: "jxl-wasm-0.1.0", tiers: {} }, new Map());
+    expect(result.ok).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+
+  test("manifest with no tiers key at all returns ok:false", () => {
+    const result = verifyManifest({ buildId: "jxl-wasm-0.1.0" }, new Map());
+    expect(result.ok).toBe(false);
+    expect(result.errors.length).toBeGreaterThan(0);
+  });
+});

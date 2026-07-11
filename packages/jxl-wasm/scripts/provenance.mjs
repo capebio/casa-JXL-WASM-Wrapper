@@ -114,7 +114,9 @@ export function computeInputDigest(inputs) {
   hash.update(`libjxlCommit${sep}${inputs.libjxlCommit}\n`);
   hash.update(`libjxlDirty${sep}${inputs.libjxlDirty ? "1" : "0"}\n`);
 
-  // toolchain: sort keys for determinism
+  // toolchain: sort keys for determinism.
+  // Invariant: toolchain keys and values are version strings; they must not contain '=' or ','
+  // (those characters are used as intra-entry and inter-entry separators respectively).
   const sortedToolchain = Object.keys(inputs.toolchain)
     .sort()
     .map((k) => `${k}=${inputs.toolchain[k]}`)
@@ -205,7 +207,31 @@ export function validateProvenance(provenance, options) {
     throw new Error("provenance.tier is required but missing or empty");
   }
 
+  // I-B: dirty booleans must be present as actual booleans; undefined/null is a missing field
+  // (e.g. from stale JSON), not a safe false — reject early so callers can't pass vacuously.
+  if (typeof provenance.sourceDirty !== "boolean") {
+    throw new Error(
+      "provenance.sourceDirty must be a boolean but is " + typeof provenance.sourceDirty +
+        ". Ensure the build script sets sourceDirty explicitly."
+    );
+  }
+  if (typeof provenance.libjxlDirty !== "boolean") {
+    throw new Error(
+      "provenance.libjxlDirty must be a boolean but is " + typeof provenance.libjxlDirty +
+        ". Ensure the build script sets libjxlDirty explicitly."
+    );
+  }
+
   if (releaseMode) {
+    // I-A: git unavailable during a release build is a hard error, not a silent pass.
+    // getSourceInfo() falls back to { commit: "unknown", dirty: false }, so "unknown"
+    // would otherwise clear the dirty check — reject it explicitly.
+    if (provenance.sourceCommit === "unknown") {
+      throw new Error(
+        "Release build rejected: sourceCommit is 'unknown' (git unavailable). " +
+          "Release builds require a readable git checkout."
+      );
+    }
     if (provenance.sourceDirty) {
       throw new Error(
         "Release build rejected: sourceDirty=true. Commit or stash all changes before a release build, " +

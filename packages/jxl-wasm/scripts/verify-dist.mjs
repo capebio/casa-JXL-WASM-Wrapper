@@ -75,6 +75,13 @@ export function verifyManifest(manifest, artifacts, options = {}) {
 
   const tiers = manifest.tiers ?? {};
 
+  // A manifest with zero tiers is never a verified distribution — reject as vacuous success.
+  // (Existing-only tiers are preserved by writeManifest partial-merge but are not re-validated
+  // here by design; they were validated when first written.)
+  if (Object.keys(tiers).length === 0) {
+    return { ok: false, errors: ["Manifest has no tier entries — nothing to verify"] };
+  }
+
   for (const [tierKey, entry] of Object.entries(tiers)) {
     // --- provenance completeness ---
     if (!entry.provenance) {
