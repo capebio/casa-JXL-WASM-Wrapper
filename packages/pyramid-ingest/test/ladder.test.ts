@@ -68,6 +68,74 @@ test("buildRawLadder attaches qualityCurve + convergedByteEnd from profileConver
   }
 });
 
+// ── finding 71: bound convergence profiling + reuse reference decodes ─────────────────────────────
+
+test("finding 71: profiling reuses the level's reference pixels (refPixels passed, no separate decode)", async () => {
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+  const refCalls: Array<{ w?: number; h?: number; hasRef: boolean; refLen: number }> = [];
+  const jxl: JxlBackend = {
+    ...makeTestJxlBackend(),
+    async profileConvergenceCurve(_jxl: Uint8Array, w?: number, h?: number, refPixels?: Uint8Array) {
+      refCalls.push({ w, h, hasRef: refPixels != null, refLen: refPixels?.length ?? 0 });
+      return { curve: [{ bytes: 2, ssim: 0.999 }], convergedByteEnd: 2 };
+    },
+  };
+  const W = 2048, H = 1536;
+  const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
+  await buildRawLadder(jxl, decoded, true, "tile-all");
+  // Only levels >= 1024 are profiled; each MUST receive the pre-encode reference pixels so the
+  // profiler skips its own reference re-decode (finding 71 — reuse existing reference decodes).
+  expect(refCalls.length).toBeGreaterThan(0);
+  for (const c of refCalls) {
+    expect(c.hasRef).toBe(true);
+    expect(c.refLen).toBe(c.w! * c.h! * 4); // tight RGBA8 reference for that level
+  }
+});
+
+test("finding 71: profiling is bounded by the memory budget (byte-weighted semaphore limits concurrency)", async () => {
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+  let live = 0, peakLive = 0;
+  const jxl: JxlBackend = {
+    ...makeTestJxlBackend(),
+    async profileConvergenceCurve(_jxl: Uint8Array, _w?: number, _h?: number, _ref?: Uint8Array) {
+      live++;
+      peakLive = Math.max(peakLive, live);
+      await new Promise((r) => setTimeout(r, 25));
+      live--;
+      return { curve: [{ bytes: 2, ssim: 0.999 }], convergedByteEnd: 2 };
+    },
+  };
+  const W = 4096, H = 3072; // several levels >= 1024 (1024/2048/4096) → multiple profiling tasks
+  const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
+  // Budget only large enough for a single 1024-wide reference (1024*768*4 ≈ 3.1MB); the 2048/4096
+  // references are far larger, so they cannot run concurrently with each other.
+  await buildRawLadder(jxl, decoded, true, "tile-all", undefined, { profileMemBudgetBytes: 1024 * 768 * 4 });
+  expect(peakLive).toBe(1); // budget forces the large references to profile one at a time
+});
+
+test("finding 71: without a budget cap, profiling of independent levels runs concurrently", async () => {
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+  let live = 0, peakLive = 0;
+  const jxl: JxlBackend = {
+    ...makeTestJxlBackend(),
+    async profileConvergenceCurve() {
+      live++;
+      peakLive = Math.max(peakLive, live);
+      await new Promise((r) => setTimeout(r, 25));
+      live--;
+      return { curve: [{ bytes: 2, ssim: 0.999 }], convergedByteEnd: 2 };
+    },
+  };
+  const W = 4096, H = 3072;
+  const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
+  // Generous budget: independent levels profile in parallel (>1 concurrent).
+  await buildRawLadder(jxl, decoded, true, "tile-all", undefined, { profileMemBudgetBytes: 1 << 30 });
+  expect(peakLive).toBeGreaterThan(1);
+});
+
 test("buildJpgLadder produces all levels (incl full) as tiled JXTC (no transcode substitution)", async () => {
   const transcodeBytes = new Uint8Array([0xff, 0x0a, 0x42, 0x13]);
   const fake: JxlBackend = {

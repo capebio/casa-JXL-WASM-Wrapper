@@ -2,6 +2,7 @@ import { EFFORT, planLadder, planProxy } from "./quality.js";
 import { encodeBigLevelsRgba16, packedRgb16ToRgba16, targetDimsForLongEdge } from "./rgb16.js";
 import type { DecodedMaster, JxlBackend, Orientation, PyramidLevelBytes } from "./backends.js";
 import { throwIfAborted } from "./abort.js";
+import { ByteWeightedSemaphore } from "./byte-semaphore.js";
 
 export interface LadderResult {
   levels: PyramidLevelBytes[];
@@ -10,8 +11,21 @@ export interface LadderResult {
   height: number;
 }
 
+/** finding 71: options threaded to the ladder builders for bounded convergence profiling. */
+export interface LadderOptions {
+  /** Byte budget bounding concurrent convergence profiling (each level holds a full-res reference).
+   *  Defaults to DEFAULT_PROFILE_MEM_BUDGET when profiling is on and no budget is supplied. */
+  profileMemBudgetBytes?: number;
+}
+
 const GRID_MAX_LONG = 1024;
 const TILE_SIZE = 256;
+// Default ceiling on total in-flight profiling reference bytes (finding 71). Chosen so a couple of
+// large (e.g. 24MP) references can profile in parallel while still bounding peak memory; the ingest
+// caller passes its own --mem-budget-derived value.
+const DEFAULT_PROFILE_MEM_BUDGET = 512 * 1024 * 1024;
+// Only levels with a long edge >= this are profiled (mirrors attachConverged's small-level skip).
+const PROFILE_MIN_LONG = 1024;
 
 // Long-edge / pixel thresholds above which a scan is "massive" (ingest.ts:273): in adaptive
 // mode its full level becomes a JXTC tile container for pan/zoom region decode.
@@ -38,9 +52,11 @@ function isMassive(width: number, height: number): boolean {
   return Math.max(width, height) > MASSIVE_LONG_EDGE || width * height > MASSIVE_PIXELS;
 }
 
-export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, profileConvergence = false, tiling: TilingPolicy = "adaptive", signal?: AbortSignal): Promise<LadderResult> {
+export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, profileConvergence = false, tiling: TilingPolicy = "adaptive", signal?: AbortSignal, opts?: LadderOptions): Promise<LadderResult> {
   const { rgba, rgb16, width, height } = decoded;
   const masterLong = Math.max(width, height);
+  // finding 71: only hold a per-level reference when profiling actually runs (else it's dead memory).
+  const captureRef = profileConvergence;
 
   if (rgb16 && rgb16.length > 0) {
     // 8-bit grid levels (<=1024) via rgba8 downscale + tile
@@ -70,7 +86,10 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
       const data = gridTiled
         ? await jxl.encodeTileContainer(cur8, cw, ch, { tileSize: TILE_SIZE, distance: sc.distance, effort: EFFORT }, signal)
         : (await jxl.encodePyramid(cur8, cw, ch, { sidecars: [], fullDistance: sc.distance, effort: EFFORT }, signal))[0]!.data;
-      gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: gridTiled, ...(gridTiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
+      // finding 71: capture the RGBA8 reference for profiled grid levels (>=1024) so profiling reuses
+      // it instead of re-decoding. downscaleRgba8 returns a fresh buffer, so `cur8` is a stable snapshot.
+      const refPixels = captureRef && Math.max(cw, ch) >= PROFILE_MIN_LONG ? cur8 : undefined;
+      gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: gridTiled, ...(gridTiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes, ...(refPixels ? { refPixels } : {}) });
     }
     gridLevels.reverse(); // L1: restore ascending for manifest/levels output invariant
 
@@ -127,7 +146,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     let outLevels = [...gridLevels, ...bigLevels];
     // L7: enforce invariant for all consumers (some assume or pick by index assuming order)
     outLevels.sort((a, b) => Math.max(a.width, a.height) - Math.max(b.width, b.height)); // ascending by long edge
-    if (profileConvergence) await attachConverged(jxl, outLevels);
+    if (profileConvergence) await attachConverged(jxl, outLevels, opts?.profileMemBudgetBytes ?? DEFAULT_PROFILE_MEM_BUDGET);
     return { levels: outLevels, orientation: decoded.orientation, width, height };
   }
 
@@ -158,12 +177,15 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     const data = tiled
       ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT }, signal)
       : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }, signal))[0]!.data;
-    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
+    // finding 71: capture the RGBA8 reference for profiled levels (>=1024). `cur` is a stable snapshot
+    // (the full level uses the original `rgba`; downscaleRgba8 returns fresh buffers thereafter).
+    const refPixels = captureRef && Math.max(cw, ch) >= PROFILE_MIN_LONG ? cur : undefined;
+    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes, ...(refPixels ? { refPixels } : {}) });
   }
   levels.reverse(); // L1: restore ascending
   // L7
   levels.sort((a, b) => Math.max(a.width, a.height) - Math.max(b.width, b.height)); // levels are ascending by long edge
-  if (profileConvergence) await attachConverged(jxl, levels);
+  if (profileConvergence) await attachConverged(jxl, levels, opts?.profileMemBudgetBytes ?? DEFAULT_PROFILE_MEM_BUDGET);
   return {
     levels,
     orientation: decoded.orientation,
@@ -172,26 +194,37 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
   };
 }
 
-async function attachConverged(jxl: JxlBackend, levels: PyramidLevelBytes[]): Promise<void> {
-  // L5: run profileConvergence (Butteraugli/ssim) in parallel; each level is independent input.
-  // (b: pass refPixels to skip backend re-decode is deferred API change touching backends.ts)
+async function attachConverged(jxl: JxlBackend, levels: PyramidLevelBytes[], memBudgetBytes = DEFAULT_PROFILE_MEM_BUDGET): Promise<void> {
+  // L5: profile levels (Butteraugli/ssim) concurrently — each level is an independent input.
+  // finding 71: BOUND that fan-out with a byte-weighted semaphore so the total in-flight reference
+  // pixels never exceed the ingest memory budget, and REUSE each level's already-generated reference
+  // (lvl.refPixels) so the reference is decoded once, not re-decoded per level.
+  const sem = new ByteWeightedSemaphore(memBudgetBytes > 0 ? memBudgetBytes : DEFAULT_PROFILE_MEM_BUDGET);
   const tasks = levels.map(async (lvl) => {
     const mx = Math.max(lvl.width, lvl.height);
-    if (mx < 1024) return;
+    if (mx < PROFILE_MIN_LONG) return;
+    // Weight = the reference pixels this task holds live (tight RGBA8), so the budget bounds real
+    // peak memory. Fall back to the encoded byte size when no reference was captured.
+    const weight = lvl.refPixels?.length ?? (lvl.width * lvl.height * 4);
+    const release = await sem.acquire(weight);
     try {
+      const ref = lvl.refPixels;
       if (typeof jxl.profileConvergenceCurve === "function") {
         // full curve: persisted to manifest so clients pick any byte/quality cutoff offline
-        const prof = await jxl.profileConvergenceCurve(lvl.data, lvl.width, lvl.height);
+        const prof = await jxl.profileConvergenceCurve(lvl.data, lvl.width, lvl.height, ref);
         if (prof) {
           if (prof.convergedByteEnd != null && prof.convergedByteEnd > 0) lvl.convergedByteEnd = prof.convergedByteEnd;
           if (prof.curve.length > 0) lvl.qualityCurve = prof.curve;
         }
       } else if (typeof jxl.profileConvergence === "function") {
-        const ce = await jxl.profileConvergence(lvl.data, lvl.width, lvl.height);
+        const ce = await jxl.profileConvergence(lvl.data, lvl.width, lvl.height, ref);
         if (ce != null && ce > 0) lvl.convergedByteEnd = ce;
       }
     } catch {
       // graceful: omit on error, single-pass JXL, or no ssim
+    } finally {
+      lvl.refPixels = undefined; // drop the reference so its bytes are collectable + never persisted
+      release();
     }
   });
   await Promise.all(tasks);
@@ -204,6 +237,7 @@ export async function buildJpgLadder(
   orientation: Orientation = "source",
   tiling: TilingPolicy = "adaptive",
   signal?: AbortSignal,
+  opts?: LadderOptions,
 ): Promise<LadderResult> {
   // Transcode (lossless JPEG->JXL), then decode once for the downscaled sidecar levels.
   throwIfAborted(signal, "decode"); // finding 67: do not begin transcode/decode after the deadline
@@ -211,6 +245,7 @@ export async function buildJpgLadder(
   const decoded = await jxl.decodeToRgba8(fullJxl);
   const w = decoded.width, h = decoded.height;
   const masterLong = Math.max(w, h);
+  const captureRef = profileConvergence; // finding 71: only hold references when profiling runs
   throwIfAborted(signal, "encode"); // deadline may have fired during transcode/decode
 
   // consume Agent5: planLadder(master) gives ratio-guarded sidecars (all < master)
@@ -235,19 +270,21 @@ export async function buildJpgLadder(
     const data = tiled
       ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT }, signal)
       : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }, signal))[0]!.data;
-    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
+    const refPixels = captureRef && Math.max(cw, ch) >= PROFILE_MIN_LONG ? cur : undefined; // finding 71
+    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes, ...(refPixels ? { refPixels } : {}) });
   }
   // Full level. Adaptive: reuse the bit-exact lossless transcode (fast + lossless — see the
   // jpg-full-transcode-vs-jxtc flipflop). Tile-all: a lossy JXTC re-encode for uniform tiled decode.
   throwIfAborted(signal, "encode"); // finding 67: before the (heavy) full level
+  const fullRef = captureRef && Math.max(w, h) >= PROFILE_MIN_LONG ? decoded.rgba : undefined; // finding 71
   if (tiling === "tile-all") {
     const data = await jxl.encodeTileContainer(decoded.rgba, w, h, { tileSize: TILE_SIZE, distance: p.fullDistance, effort: EFFORT }, signal);
-    levels.push({ data, width: w, height: h, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes: decoded.rgba.byteLength });
+    levels.push({ data, width: w, height: h, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes: decoded.rgba.byteLength, ...(fullRef ? { refPixels: fullRef } : {}) });
   } else {
-    levels.push({ data: fullJxl, width: w, height: h, bitsPerSample: 8, tiled: false, stagedBytes: decoded.rgba.byteLength });
+    levels.push({ data: fullJxl, width: w, height: h, bitsPerSample: 8, tiled: false, stagedBytes: decoded.rgba.byteLength, ...(fullRef ? { refPixels: fullRef } : {}) });
   }
   levels.sort((a, b) => Math.max(a.width, a.height) - Math.max(b.width, b.height)); // L7: ascending by long edge
-  if (profileConvergence) await attachConverged(jxl, levels);
+  if (profileConvergence) await attachConverged(jxl, levels, opts?.profileMemBudgetBytes ?? DEFAULT_PROFILE_MEM_BUDGET);
   return {
     levels,
     orientation,
@@ -265,6 +302,7 @@ export async function buildProxyLadder(
   orientation: Orientation,
   profileConvergence = false,
   signal?: AbortSignal,
+  opts?: LadderOptions,
 ): Promise<LadderResult> {
   throwIfAborted(signal, "encode"); // finding 67: do not begin proxy encode after the deadline
   // L6: proxy is the only path still using encodePyramid (monolithic whole-frame JXL, no tiled:true).
@@ -276,7 +314,8 @@ export async function buildProxyLadder(
   const produced = await jxl.encodePyramid(rgba, width, height, planProxy(size), signal);
   const level = produced[0];
   if (!level) throw new Error("proxy encode produced no level");
-  const outLevels: PyramidLevelBytes[] = [{ ...level, bitsPerSample: 8, stagedBytes: rgba.byteLength }];
-  if (profileConvergence) await attachConverged(jxl, outLevels);
+  const refPixels = profileConvergence && Math.max(width, height) >= PROFILE_MIN_LONG ? rgba : undefined; // finding 71
+  const outLevels: PyramidLevelBytes[] = [{ ...level, bitsPerSample: 8, stagedBytes: rgba.byteLength, ...(refPixels ? { refPixels } : {}) }];
+  if (profileConvergence) await attachConverged(jxl, outLevels, opts?.profileMemBudgetBytes ?? DEFAULT_PROFILE_MEM_BUDGET);
   return { levels: outLevels, orientation, width, height };
 }
