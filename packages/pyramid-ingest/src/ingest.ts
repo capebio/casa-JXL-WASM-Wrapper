@@ -17,6 +17,7 @@ import type { Clock, DecodedMaster, JxlBackend, MasterFormat, Orientation, RawBa
 function now(b?: Backends): number { return b?.clock?.now?.() ?? Date.now(); }
 import { clearCheckpoint, readCheckpoint, writeCheckpoint, type CheckpointState } from "./checkpoint.js";
 import { acquireImageWriteLock, type AdvisoryLock } from "./lock.js";
+import { assertGlobalWriteHeld, type GlobalWriteToken } from "./transaction.js";
 import { inferStage, isAbortError, makeAbortError, throwIfAborted, type IngestStage } from "./abort.js";
 
 export interface Backends {
@@ -41,6 +42,10 @@ export interface IngestOptions {
   stripGps?: boolean; // F4: privacy for sensitive species (biodiversity)
   idMap?: Record<string, string>;  // B5/B11 extension: precomputed imageIds to elide re-hash in batch dispatchers (mirrors statMap pattern)
   tiling?: TilingPolicy; // per-batch tiling policy (--tiling): "adaptive" (default) | "tile-all"
+  // Task 7 (finding 68): capability proving the GLOBAL write lock is held. When present, each per-image
+  // lock acquisition asserts it is still live (GLOBAL then IMAGE). The CLI batch path threads tx.token
+  // here; callers that hold the global lock some other way may omit it.
+  globalLock?: GlobalWriteToken;
 }
 
 export type IngestOutcome = "written" | "skipped";
@@ -886,10 +891,14 @@ export async function ingestBatch(
         const path = activeFiles[idx]!;
         const imageId = (opts as any).imageId || ((opts as any).idMap && (opts as any).idMap[path]) || await imageIdForPath(path);
         // full L3: acquire per-image write lock only for real mutate (skip in dry-run to avoid side-effect dirs; cross-proc for live runs)
+        // finding 68: if a global-lock token was threaded in, assert it is still held (GLOBAL then IMAGE).
         let imgLock: AdvisoryLock | null = null;
         let lockOk = true;
         if (!opts.dryRun) {
-          try { imgLock = await acquireImageWriteLock(opts.outDir, imageId); } catch (e) {
+          try {
+            if (opts.globalLock) assertGlobalWriteHeld(opts.globalLock, "ingestBatch(in-process)");
+            imgLock = await acquireImageWriteLock(opts.outDir, imageId);
+          } catch (e) {
             lockOk = false;
             tel?.event?.("lock-failed", { path, imageId, error: e instanceof Error ? e.message : String(e) });
           }
@@ -1042,10 +1051,14 @@ export async function ingestBatch(
         const path = activeFiles[idx]!;
         const imageId = (opts as any).imageId || ((opts as any).idMap && (opts as any).idMap[path]) || await imageIdForPath(path);
         // full L3: per-image write lock held for worker job duration only for real runs (dry-run avoids mkdir side effects)
+        // finding 68: if a global-lock token was threaded in, assert it is still held (GLOBAL then IMAGE).
         let imgLock: AdvisoryLock | null = null;
         let lockOk = true;
         if (!opts.dryRun) {
-          try { imgLock = await acquireImageWriteLock(opts.outDir, imageId); } catch (e) {
+          try {
+            if (opts.globalLock) assertGlobalWriteHeld(opts.globalLock, "ingestBatch(worker-pool)");
+            imgLock = await acquireImageWriteLock(opts.outDir, imageId);
+          } catch (e) {
             lockOk = false;
             tel?.event?.("lock-failed", { path, imageId, error: e instanceof Error ? e.message : String(e) });
           }
@@ -1075,7 +1088,9 @@ export async function ingestBatch(
           // B5: send only the per-path stat entry (if any); full statMap Record can be large and is pure waste to clone per job.
           // B11 + idMap: forward single precomputed imageId; strip idMap to avoid shipping full map across postMessage.
           const preId = (opts as any).imageId || ((opts as any).idMap && (opts as any).idMap[path]) || imageId;
-          const jobOpts: any = { ...opts, statMap: undefined, statEntry: (opts as any).statMap?.[path], idMap: undefined, imageId: preId };
+          // globalLock is a main-thread capability object; the global lock is held here (asserted above),
+          // so strip it — the worker does its own per-image lock and does not (and cannot) re-check it.
+          const jobOpts: any = { ...opts, statMap: undefined, statEntry: (opts as any).statMap?.[path], idMap: undefined, imageId: preId, globalLock: undefined };
           w.postMessage({ id, path, opts: jobOpts });
           const res: any = await p;
           const outcome = res.outcome;

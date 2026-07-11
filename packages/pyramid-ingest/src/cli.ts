@@ -12,7 +12,7 @@ import { boundedConcurrency, planShard } from "./shard.js";
 import { cliArgsSchema } from "./schema.js";
 import { imageIdForPath } from "./hash.js";
 import { parseManifest } from "./schema.js";
-import { acquireReadLock, acquireWriteLock, acquireImageWriteLock, acquireImageReadLock, type AdvisoryLock } from "./lock.js";
+import { withReadTransaction, withWriteTransaction, withImageWriteTransaction } from "./transaction.js";
 import { randomUUID } from "node:crypto";
 import { makeProducedBy } from "./schema.js";
 
@@ -150,7 +150,9 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
   const ac = new AbortController();  // hoisted for onSig + subcmd/batch signal (used by ingest batch + future cmds)
 
   if (parsed["reindex-only"]) {
-    const index = await rebuildIndex(parsed.out);
+    // finding 68: reindex mutates index.json — it MUST run under the global write lock like every
+    // other mutator. It previously acquired no lock at all.
+    const index = await withWriteTransaction(parsed.out, () => rebuildIndex(parsed.out));
     process.stdout.write(`pyramid-ingest: reindexed ${index.images.length} images\n`);
     return 0;
   }
@@ -249,11 +251,11 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     subcmd = "batch";
   }
 
-  let heldLock: AdvisoryLock | null = null;
-  const onSig = () => {
-    ac.abort();
-    heldLock?.release().catch(() => {});
-  };
+  // finding 69: on a signal we ONLY abort intake here. The lock is owned by the enclosing
+  // withReadTransaction/withWriteTransaction, which releases it only AFTER the mutator (ingestBatch's
+  // worker join + checkpoint flush, or a subcommand) has settled. Releasing it in the signal handler —
+  // as the old code did — let another process grab the lock while our workers were still writing.
+  const onSig = () => { ac.abort(); };
   process.once("SIGINT", onSig);
   process.once("SIGTERM", onSig);
 
@@ -262,69 +264,72 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     // former duplicate blocks here were dead code and have been removed.
 
     if (subcmd === "gc" || parsed.gc) {
-      heldLock = await acquireWriteLock(parsed.out);
-      const { removeOrphans } = await import("./ingest.js");  // dynamic to avoid any init order
-      const res = await removeOrphans(parsed.out, { dryRun: !!parsed["dry-run"] });
-      const parseErrors = res.parseErrors || 0;
-      if (!!parsed.json) {
-        process.stdout.write(JSON.stringify({ type: "gc-result", removedLevelFiles: res.removedLevelFiles.length, removedImageDirs: res.removedImageDirs.length, parseErrors, dryRun: !!parsed["dry-run"] }) + "\n");
-      } else {
-        process.stdout.write(`pyramid-ingest: gc removed ${res.removedLevelFiles.length} levels, ${res.removedImageDirs.length} dirs${parsed["dry-run"] ? " (dry-run)" : ""}\n`);
-      }
-      if (parseErrors > 0) {
-        process.stderr.write(`warning: ${parseErrors} manifest(s) failed to parse; orphan-level deletion was skipped to protect live blobs. Run 'validate' and repair before gc.\n`);
-      }
-      if (!parsed["dry-run"]) {
-        await rebuildIndex(parsed.out).catch(() => {});
-      }
-      return 0;
+      return await withWriteTransaction(parsed.out, async () => {
+        const { removeOrphans } = await import("./ingest.js");  // dynamic to avoid any init order
+        const res = await removeOrphans(parsed.out, { dryRun: !!parsed["dry-run"] });
+        const parseErrors = res.parseErrors || 0;
+        if (!!parsed.json) {
+          process.stdout.write(JSON.stringify({ type: "gc-result", removedLevelFiles: res.removedLevelFiles.length, removedImageDirs: res.removedImageDirs.length, parseErrors, dryRun: !!parsed["dry-run"] }) + "\n");
+        } else {
+          process.stdout.write(`pyramid-ingest: gc removed ${res.removedLevelFiles.length} levels, ${res.removedImageDirs.length} dirs${parsed["dry-run"] ? " (dry-run)" : ""}\n`);
+        }
+        if (parseErrors > 0) {
+          process.stderr.write(`warning: ${parseErrors} manifest(s) failed to parse; orphan-level deletion was skipped to protect live blobs. Run 'validate' and repair before gc.\n`);
+        }
+        if (!parsed["dry-run"]) {
+          await rebuildIndex(parsed.out).catch(() => {});
+        }
+        return 0;
+      });
     }
 
     if (subcmd === "validate" || parsed.validate) {
-      heldLock = await acquireReadLock(parsed.out);
-      const { validate } = await import("./validate.js");
-      const report = await validate(parsed.out, { verifyHash: !!parsed["verify-hash"], suggestMigrations: !!parsed["suggest-migrations"] });
-      if (!!parsed.json) {
-        process.stdout.write(JSON.stringify({ type: "validate-result", totalImages: report.totalImages, totalLevels: report.totalLevels, issues: report.issues.length, verifyHash: !!parsed["verify-hash"], sampleIssues: report.issues.slice(0, 5), migrationSuggestions: report.migrationSuggestions || [] }) + "\n");
-      } else {
-        process.stdout.write(`validate: ${report.totalImages} images, ${report.totalLevels} levels, ${report.issues.length} issues\n`);
-        for (const iss of report.issues.slice(0, 20)) {
-          process.stdout.write(`  ${iss.kind} ${JSON.stringify(iss)}\n`);
+      return await withReadTransaction(parsed.out, async () => {
+        const { validate } = await import("./validate.js");
+        const report = await validate(parsed.out, { verifyHash: !!parsed["verify-hash"], suggestMigrations: !!parsed["suggest-migrations"] });
+        if (!!parsed.json) {
+          process.stdout.write(JSON.stringify({ type: "validate-result", totalImages: report.totalImages, totalLevels: report.totalLevels, issues: report.issues.length, verifyHash: !!parsed["verify-hash"], sampleIssues: report.issues.slice(0, 5), migrationSuggestions: report.migrationSuggestions || [] }) + "\n");
+        } else {
+          process.stdout.write(`validate: ${report.totalImages} images, ${report.totalLevels} levels, ${report.issues.length} issues\n`);
+          for (const iss of report.issues.slice(0, 20)) {
+            process.stdout.write(`  ${iss.kind} ${JSON.stringify(iss)}\n`);
+          }
+          if (report.migrationSuggestions && report.migrationSuggestions.length) {
+            process.stdout.write("migration suggestions:\n");
+            for (const s of report.migrationSuggestions) process.stdout.write(`  ${s}\n`);
+          }
         }
-        if (report.migrationSuggestions && report.migrationSuggestions.length) {
-          process.stdout.write("migration suggestions:\n");
-          for (const s of report.migrationSuggestions) process.stdout.write(`  ${s}\n`);
-        }
-      }
-      if (report.issues.length > 0) return 1;
-      return 0;
+        return report.issues.length > 0 ? 1 : 0;
+      });
     }
 
     if (subcmd === "rm" || parsed.rm) {
-      // full L3: image-only write lock (unlocks rm of one image concurrent with batch ingest of others; gallery only for rebuild)
       const target = parsed.rm || cmdPositionals[0];
       if (!target) { process.stderr.write("rm requires <imageId|master-path>\n"); return 1; }
       let imageId = target;
       if (target.includes("/") || target.includes("\\") || target.includes(".")) {
         try { imageId = await imageIdForPath(target); } catch {}
       }
-      const imgLock = await acquireImageWriteLock(parsed.out, imageId);
-      const { removeImage } = await import("./rm.js");
-      const doGc = !!parsed.gc;
-      const res = await removeImage(parsed.out, imageId, { dryRun: !!parsed["dry-run"], gc: doGc });
-      if (!!parsed.json) {
-        process.stdout.write(JSON.stringify({ type: "rm-result", imageId, removedDirs: res.removedDirs.length, removedLevels: res.removedLevels.length, gc: doGc, dryRun: !!parsed["dry-run"] }) + "\n");
-      } else {
-        process.stdout.write(`pyramid-ingest: rm ${imageId} dirs=${res.removedDirs.length} levels=${res.removedLevels.length}${parsed["dry-run"] ? " (dry-run)" : ""}\n`);
-      }
-      if (!parsed["dry-run"]) {
-        // brief gallery write only for index; advisory so other image work can proceed
-        const g = await acquireWriteLock(parsed.out).catch(() => null);
-        await rebuildIndex(parsed.out).catch(() => {});
-        if (g) await g.release().catch(() => {});
-      }
-      await imgLock.release().catch(() => {});
-      return 0;
+      // finding 68: rm previously took the IMAGE lock, then the GLOBAL lock for its rebuild — a
+      // GLOBAL-after-IMAGE inversion, and the global re-acquire silently swallowed its failure. Now the
+      // GLOBAL write lock is taken first and the image lock is nested under its token (GLOBAL then
+      // IMAGE, machine-checked). The rebuild runs under the same held global lock — no re-acquire.
+      return await withWriteTransaction(parsed.out, async (tx) => {
+        const { removeImage } = await import("./rm.js");
+        const doGc = !!parsed.gc;
+        const res = await withImageWriteTransaction(tx.token, parsed.out, imageId, () =>
+          removeImage(parsed.out, imageId, { dryRun: !!parsed["dry-run"], gc: doGc }),
+        );
+        if (!!parsed.json) {
+          process.stdout.write(JSON.stringify({ type: "rm-result", imageId, removedDirs: res.removedDirs.length, removedLevels: res.removedLevels.length, gc: doGc, dryRun: !!parsed["dry-run"] }) + "\n");
+        } else {
+          process.stdout.write(`pyramid-ingest: rm ${imageId} dirs=${res.removedDirs.length} levels=${res.removedLevels.length}${parsed["dry-run"] ? " (dry-run)" : ""}\n`);
+        }
+        if (!parsed["dry-run"]) {
+          await rebuildIndex(parsed.out).catch(() => {});
+        }
+        return 0;
+      });
     }
 
     if (subcmd === "relink" || parsed.relink) {
@@ -366,23 +371,24 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     }
 
     if (subcmd === "migrate" || parsed.migrate || parsed["migrate-layout"] || parsed["migrate-schema"]) {
-      heldLock = await acquireWriteLock(parsed.out);
-      const { migrateSchema, migrateLayout } = await import("./migrate.js");
-      const { CURRENT_MANIFEST_SCHEMA } = await import("./schema.js");
-      let totalMigrated = 0, totalSkipped = 0, totalErrors = 0;
-      // M1 (or specified schema target). Default target is the current schema so a plain
-      // `migrate` upgrades v1..v4 manifests all the way to v5 additively (Task 4).
-      const schemaTarget = parsed["migrate-schema"] ? (parseInt(parsed["migrate-schema"] as string, 10) as any) : CURRENT_MANIFEST_SCHEMA;
-      const sRes = await migrateSchema(parsed.out, schemaTarget, { dryRun: !!parsed["dry-run"] });
-      totalMigrated += sRes.migrated; totalSkipped += sRes.skipped; totalErrors += sRes.errors.length;
-      // M2
-      if (parsed["migrate-layout"]) {
-        const lRes = await migrateLayout(parsed.out, parsed["migrate-layout"] as any, { dryRun: !!parsed["dry-run"] });
-        totalMigrated += lRes.migrated; totalSkipped += lRes.skipped; totalErrors += lRes.errors.length;
-      }
-      if (!parsed["dry-run"]) await rebuildIndex(parsed.out).catch(() => {});
-      process.stdout.write(`pyramid-ingest: migrate ${totalMigrated} (schema+layout) skipped=${totalSkipped} errors=${totalErrors}${parsed["dry-run"] ? " (dry-run)" : ""}\n`);
-      return totalErrors > 0 ? 1 : 0;
+      return await withWriteTransaction(parsed.out, async () => {
+        const { migrateSchema, migrateLayout } = await import("./migrate.js");
+        const { CURRENT_MANIFEST_SCHEMA } = await import("./schema.js");
+        let totalMigrated = 0, totalSkipped = 0, totalErrors = 0;
+        // M1 (or specified schema target). Default target is the current schema so a plain
+        // `migrate` upgrades v1..v4 manifests all the way to v5 additively (Task 4).
+        const schemaTarget = parsed["migrate-schema"] ? (parseInt(parsed["migrate-schema"] as string, 10) as any) : CURRENT_MANIFEST_SCHEMA;
+        const sRes = await migrateSchema(parsed.out, schemaTarget, { dryRun: !!parsed["dry-run"] });
+        totalMigrated += sRes.migrated; totalSkipped += sRes.skipped; totalErrors += sRes.errors.length;
+        // M2
+        if (parsed["migrate-layout"]) {
+          const lRes = await migrateLayout(parsed.out, parsed["migrate-layout"] as any, { dryRun: !!parsed["dry-run"] });
+          totalMigrated += lRes.migrated; totalSkipped += lRes.skipped; totalErrors += lRes.errors.length;
+        }
+        if (!parsed["dry-run"]) await rebuildIndex(parsed.out).catch(() => {});
+        process.stdout.write(`pyramid-ingest: migrate ${totalMigrated} (schema+layout) skipped=${totalSkipped} errors=${totalErrors}${parsed["dry-run"] ? " (dry-run)" : ""}\n`);
+        return totalErrors > 0 ? 1 : 0;
+      });
     }
 
     // default: batch ingest (with optional --resume)
@@ -458,79 +464,95 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     const dryRun = parsed["dry-run"];
     const timeoutMs = parsed["timeout-ms"];
 
-    // acquire write lock for main ingest mutate path (L + safety for concurrent with gc/rm)
-    heldLock = await acquireWriteLock(parsed.out);
-    const startMs = Date.now(); // CLI-2: real batch start for honest durationMs/startedAt
-    const batchOpts = {
-      outDir: parsed.out,
-      ...(proxy !== undefined ? { proxy } : {}),
-      force: parsed.force,
-      concurrency,
-      acceptUnsupported: parsed["accept-unsupported"],
-      ...(dryRun ? { dryRun: true } : {}),
-      ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-      ...(parsed["profile-convergence"] ? { profileConvergence: true } : {}),
-      ...(parsed.resume ? { resume: true } : {}),
-      ...(parsed["chaos-test"] ? { chaosTest: true } : {}),
-      ...(parsed["retry-failed"] ? { retryFailed: true } : {}),
-      tiling: parsed.tiling,
-      statMap,
-    };
-    const result = await ingestBatch(files, backends, batchOpts);
-
-    process.removeListener("SIGINT", onSig);
-    process.removeListener("SIGTERM", onSig);
-
-    if (proxy === undefined && !parsed.shard && !dryRun) await rebuildIndex(parsed.out, tel);
-
-    const suffix = dryRun ? " (dry-run)" : (parsed.shard ? ` (shard ${parsed.shard})` : (parsed.resume ? (parsed["retry-failed"] ? " (resumed, retrying failed)" : " (resumed)") : ""));
-    process.stdout.write(
-      `pyramid-ingest: ${result.written} written, ${result.skipped} skipped, ${result.failed.length} failed${suffix}\n`,
-    );
-    for (const f of result.failed) {
-      const e = f.error;
-      const msg = e instanceof Error
-        ? (parsed.verbose ? `${e.message}\n${e.stack ?? ""}` : e.message)
-        : String(e);
-      process.stderr.write(`FAILED ${f.path}: ${msg}\n`);
-    }
-    // O1/O3/O6: batch-end event (json mode) + runlog append (atomic, bounded)
-    const endMs = Date.now();
-    emitJson({ type: "batch-end", written: result.written, skipped: result.skipped, failed: result.failed.length, stagedBytes: (result as any).totalStagedBytes || 0, durationMs: endMs - startMs });
-
-    if (!parsed.shard && !dryRun) {
-      // append runlog (O6) - typed RunRecord with per-image (unlocked M/I/K/C/T)
-      const logPath = join(parsed.out, ".pyramid-ingest.runlog.json");
-      const rec: any = {
-        runId,
-        startedAt: startMs,
-        endedAt: endMs,
-        producedBy: makeProducedBy(),
-        args: process.argv.slice(2),
-        summary: { written: result.written, skipped: result.skipped, failed: result.failed.length, stagedBytes: (result as any).totalStagedBytes || 0 },
-        images: result.perImage || [],
-        failures: result.failed.map(f => ({ path: f.path, error: String(f.error) })),
+    // finding 68/69: the whole mutating region (ingestBatch → rebuildIndex → runlog) runs under the
+    // GLOBAL write lock, held by this transaction. On a signal `onSig` only aborts intake; ingestBatch
+    // then terminates/joins its workers and flushes the checkpoint before it returns, and only AFTER
+    // that does withWriteTransaction release the global lock. The lock is never released mid-flight.
+    //
+    // ORDERED SHUTDOWN (finding 69) — where the mandated order is enforced in the PRODUCTION batch path:
+    //   1. abort intake .......... onSig → ac.abort() (backends.signal); ingestBatch stops dispatching.
+    //   2. cancel in-flight jobs .. ingestBatch's abort handler rejects pending worker jobs.
+    //   3. terminate/join workers . ingestBatch awaits its dispatchers, then Worker.terminate(), before
+    //                               it RETURNS (worker-pool path) / its run() loops settle (in-process).
+    //   4. flush/close checkpoint . ingestBatch force-flushes (and clears) the checkpoint before RETURN.
+    //   5. release image locks .... each per-image lock is released in ingestBatch's per-job `finally`.
+    //   6. release GLOBAL lock .... LAST — withWriteTransaction releases it only after THIS body returns.
+    // Steps 1–5 all complete inside ingestBatch's synchronous-await teardown before it returns; step 6 is
+    // structurally last (the transaction owns release). So the order is ENFORCED by ingestBatch's internal
+    // join+flush plus lock-release-last, not by chance. A separate onShutdown wiring here would have to
+    // relocate ingestBatch's already-correct, tested teardown and risk double-join/double-flush; instead
+    // the guarantee is proven end-to-end by test/transaction.shutdown-order.integration.test.ts, which
+    // drives THIS batch shape under a real mid-batch abort and asserts the order above.
+    return await withWriteTransaction(parsed.out, async (tx) => {
+      const startMs = Date.now(); // CLI-2: real batch start for honest durationMs/startedAt
+      const batchOpts = {
+        outDir: parsed.out,
+        ...(proxy !== undefined ? { proxy } : {}),
+        force: parsed.force,
+        concurrency,
+        acceptUnsupported: parsed["accept-unsupported"],
+        ...(dryRun ? { dryRun: true } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(parsed["profile-convergence"] ? { profileConvergence: true } : {}),
+        ...(parsed.resume ? { resume: true } : {}),
+        ...(parsed["chaos-test"] ? { chaosTest: true } : {}),
+        ...(parsed["retry-failed"] ? { retryFailed: true } : {}),
+        tiling: parsed.tiling,
+        statMap,
+        globalLock: tx.token, // finding 68: prove GLOBAL is held so per-image locks assert the order
       };
-      try {
-        let arr: any[] = [];
-        try { arr = JSON.parse(await readFile(logPath, "utf8") || "[]"); } catch {}
-        arr.push(rec);
-        if (arr.length > runlogKeepN) arr = arr.slice(-runlogKeepN);
-        const tmp = `${logPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-        await writeFile(tmp, JSON.stringify(arr, null, 2));
-        await rename(tmp, logPath).catch(async (e: any) => {
-          if (e && e.code === "EEXIST") { await unlink(tmp).catch(()=>{}); }
-          else throw e;
-        });
-      } catch {}
-    }
+      const result = await ingestBatch(files, backends, batchOpts);
 
-    return result.failed.length > 0 ? 1 : 0;
+      process.removeListener("SIGINT", onSig);
+      process.removeListener("SIGTERM", onSig);
+
+      if (proxy === undefined && !parsed.shard && !dryRun) await rebuildIndex(parsed.out, tel);
+
+      const suffix = dryRun ? " (dry-run)" : (parsed.shard ? ` (shard ${parsed.shard})` : (parsed.resume ? (parsed["retry-failed"] ? " (resumed, retrying failed)" : " (resumed)") : ""));
+      process.stdout.write(
+        `pyramid-ingest: ${result.written} written, ${result.skipped} skipped, ${result.failed.length} failed${suffix}\n`,
+      );
+      for (const f of result.failed) {
+        const e = f.error;
+        const msg = e instanceof Error
+          ? (parsed.verbose ? `${e.message}\n${e.stack ?? ""}` : e.message)
+          : String(e);
+        process.stderr.write(`FAILED ${f.path}: ${msg}\n`);
+      }
+      // O1/O3/O6: batch-end event (json mode) + runlog append (atomic, bounded)
+      const endMs = Date.now();
+      emitJson({ type: "batch-end", written: result.written, skipped: result.skipped, failed: result.failed.length, stagedBytes: (result as any).totalStagedBytes || 0, durationMs: endMs - startMs });
+
+      if (!parsed.shard && !dryRun) {
+        // append runlog (O6) - typed RunRecord with per-image (unlocked M/I/K/C/T)
+        const logPath = join(parsed.out, ".pyramid-ingest.runlog.json");
+        const rec: any = {
+          runId,
+          startedAt: startMs,
+          endedAt: endMs,
+          producedBy: makeProducedBy(),
+          args: process.argv.slice(2),
+          summary: { written: result.written, skipped: result.skipped, failed: result.failed.length, stagedBytes: (result as any).totalStagedBytes || 0 },
+          images: result.perImage || [],
+          failures: result.failed.map(f => ({ path: f.path, error: String(f.error) })),
+        };
+        try {
+          let arr: any[] = [];
+          try { arr = JSON.parse(await readFile(logPath, "utf8") || "[]"); } catch {}
+          arr.push(rec);
+          if (arr.length > runlogKeepN) arr = arr.slice(-runlogKeepN);
+          const tmp = `${logPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+          await writeFile(tmp, JSON.stringify(arr, null, 2));
+          await rename(tmp, logPath).catch(async (e: any) => {
+            if (e && e.code === "EEXIST") { await unlink(tmp).catch(()=>{}); }
+            else throw e;
+          });
+        } catch {}
+      }
+
+      return result.failed.length > 0 ? 1 : 0;
+    });
   } finally {
-    if (heldLock) {
-      await heldLock.release().catch(() => {});
-      heldLock = null;
-    }
     // ensure listeners cleaned (in case early return before remove)
     process.removeListener("SIGINT", onSig);
     process.removeListener("SIGTERM", onSig);
