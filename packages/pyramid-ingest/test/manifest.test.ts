@@ -137,6 +137,43 @@ test("isUpToDate requires matching mtime and proxy flag alignment (non-proxy or 
   expect(isUpToDate(pxy, 1000, false)).toBe(false);
 });
 
+describe("isSourceFresh (finding 66): fingerprint-aware freshness, mtime alone never certifies", () => {
+  function mk(fingerprint?: { byteLength: number; quickHash: string; contentHash?: string }) {
+    return buildManifest({
+      imageId: "d".repeat(16), master: { name: "x.orf", format: "orf", mtimeMs: 1000, fingerprint },
+      orientation: "baked", width: 10, height: 10,
+      levels: [{ size: "full", w: 10, h: 10, bytes: 1, bitsPerSample: 8, contenthash: "e".repeat(16), tiled: false }],
+    });
+  }
+
+  test("replaced bytes with PRESERVED mtime is STALE when a fingerprint is recorded", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const m = mk({ byteLength: 100, quickHash: "a".repeat(16) });
+    // same mtime + same size, but quickHash differs (content replaced in place) -> not fresh
+    expect(isSourceFresh(m, { byteLength: 100, mtimeMs: 1000, quickHash: "b".repeat(16) }, false)).toBe(false);
+  });
+
+  test("unchanged content with bumped mtime is FRESH when a fingerprint is recorded", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const m = mk({ byteLength: 100, quickHash: "a".repeat(16) });
+    expect(isSourceFresh(m, { byteLength: 100, mtimeMs: 9999, quickHash: "a".repeat(16) }, false)).toBe(true);
+  });
+
+  test("falls back to mtime-only freshness for legacy manifests with no fingerprint", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const legacy = mk(undefined); // no fingerprint recorded (v1..pre-task5 manifest)
+    expect(isSourceFresh(legacy, { byteLength: 100, mtimeMs: 1000, quickHash: "z".repeat(16) }, false)).toBe(true);
+    expect(isSourceFresh(legacy, { byteLength: 100, mtimeMs: 2000, quickHash: "z".repeat(16) }, false)).toBe(false);
+  });
+
+  test("proxy flag mismatch is never fresh, regardless of fingerprint match", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const m = mk({ byteLength: 100, quickHash: "a".repeat(16) });
+    // caller wants a proxy manifest but this is a non-proxy manifest -> stale
+    expect(isSourceFresh(m, { byteLength: 100, mtimeMs: 1000, quickHash: "a".repeat(16) }, true)).toBe(false);
+  });
+});
+
 test("buildManifest produces producedBy and manifestSchemaV1 roundtrips it", () => {
   const m = buildManifest({
     imageId: "9f86d081884c7d65",

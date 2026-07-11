@@ -49,6 +49,17 @@ export const levelEntrySchema = z.object({
   qualityCurve: z.array(qualityCurvePointSchema).optional(),
 });
 
+// finding 66 (Task 5): a cheap change-detection sample of the SOURCE master, persisted so freshness
+// no longer relies on mtime alone. byteLength + quickHash catch a byte replacement that preserves the
+// original mtime; the optional contentHash is the authoritative full hash when a fast-path comparison
+// is ambiguous. This is NOT the per-level `contenthash` (which hashes an encoded pyramid level).
+export const masterFingerprintSchema = z.object({
+  byteLength: z.number().int().nonnegative(),
+  quickHash: z.string().min(1),
+  contentHash: z.string().min(1).optional(),
+});
+export type MasterFingerprint = z.infer<typeof masterFingerprintSchema>;
+
 export const masterInfoSchema = z.object({
   name: z.string(),
   // SCH-1: keep in sync with ingest RAW_EXT — pef/srw/x3f are advertised there, so a manifest with
@@ -68,6 +79,9 @@ export const masterInfoV5Schema = masterInfoSchema
     // still round-trip so provenance is never erased. Any non-empty string — matches the browser
     // reader (jxl-pyramid manifest-validate.ts), which already accepts any non-empty sourceFormat.
     sourceFormat: z.string().min(1).optional(),
+    // finding 66 (Task 5): optional freshness fingerprint of the source master (size + quickHash +
+    // optional full contentHash). Additive; legacy manifests without it fall back to mtime freshness.
+    fingerprint: masterFingerprintSchema.optional(),
   })
   .passthrough();
 
@@ -151,6 +165,10 @@ export const manifestSchemaV5 = z
   .object({
     schema: z.literal(5),
     imageId: z.string().regex(/^[0-9a-f]{16}$/),
+    // finding 66 (Task 5): persistent, content-derived catalog identity. Stable across MOVES (imageId
+    // is path-derived and changes when the file moves; catalogId does not). Additive + optional so a
+    // relink can rebind imageId while keeping catalogId. NOT the per-level content hash.
+    catalogId: z.string().regex(/^[0-9a-f]{16}$/).optional(),
     master: masterInfoV5Schema,
     // M-2: REQUIRED on v5 (the writer and migration always emit an OrientationDescriptor). This
     // aligns with the jxl-pyramid browser reader, which already requires it — no cross-parser gap.

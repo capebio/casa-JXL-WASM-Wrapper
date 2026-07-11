@@ -1,6 +1,7 @@
 import { contentHash16 } from "./hash.js";
 import type { MasterFormat, Orientation, PyramidLevelBytes } from "./backends.js";
 import { makeProducedBy, manifestSchema } from "./schema.js";
+import { isFresh, type SourceFingerprint } from "./source-identity.js";
 import type {
   Manifest,
   IndexEntry,
@@ -9,6 +10,7 @@ import type {
   LevelEntryV5,
   LevelSize,
   MasterInfo,
+  MasterFingerprint,
 } from "./schema.js";
 
 export type {
@@ -61,7 +63,9 @@ export function toEntry(level: PyramidLevelBytes, masterW: number, masterH: numb
 
 export function buildManifest(args: {
   imageId: string;
-  master: MasterInfo;
+  /** finding 66: persistent content-derived identity, stable across moves (NOT the per-level hash). */
+  catalogId?: string;
+  master: MasterInfo & { fingerprint?: MasterFingerprint };
   orientation: Orientation;
   width: number;
   height: number;
@@ -80,6 +84,7 @@ export function buildManifest(args: {
   const base = {
     schema: 5 as const,
     imageId: args.imageId,
+    ...(args.catalogId ? { catalogId: args.catalogId } : {}),
     master: args.master,
     orientation,
     width: args.width,
@@ -110,6 +115,39 @@ export function isUpToDate(existing: Manifest, mtimeMs: number, proxy = false): 
   // P7: proxy flag match for skip (when caller requests proxy, only proxy manifests count as uptodate)
   const proxyOk = proxy ? existing.proxy === true : existing.proxy !== true;
   return proxyOk && existing.master.mtimeMs === mtimeMs;
+}
+
+/**
+ * finding 66 (Task 5): fingerprint-aware freshness. Supersedes the mtime-only `isUpToDate` when the
+ * existing manifest recorded a source `fingerprint`. mtime ALONE never certifies freshness:
+ *
+ *  - replaced bytes with a PRESERVED mtime → STALE (size/quickHash differ),
+ *  - a pure `touch` (bumped mtime, same size+quickHash) → FRESH.
+ *
+ * `existing`  : the persisted manifest (its `master.fingerprint`, if any, is the last-ingest sample).
+ * `observed`  : the file as seen now (SourceFingerprint incl. mtimeMs — mtime is ignored for the
+ *               freshness verdict, matching source-identity `isFresh`).
+ * `proxy`     : caller wants a proxy manifest → only proxy manifests are ever fresh (mirrors isUpToDate).
+ *
+ * Legacy manifests (no recorded fingerprint) fall back to mtime-only freshness so pre-Task-5 catalogs
+ * still skip correctly. The persisted fingerprint has no mtimeMs of its own; the manifest's
+ * `master.mtimeMs` supplies it for the SourceFingerprint shape (mtime is not used in the comparison).
+ */
+export function isSourceFresh(existing: Manifest, observed: SourceFingerprint, proxy = false): boolean {
+  const proxyOk = proxy ? existing.proxy === true : existing.proxy !== true;
+  if (!proxyOk) return false;
+  const fp = (existing.master as MasterInfo & { fingerprint?: MasterFingerprint }).fingerprint;
+  if (fp === undefined) {
+    // Pre-Task-5 manifest: no content sample recorded → fall back to mtime equality.
+    return existing.master.mtimeMs === observed.mtimeMs;
+  }
+  const existingFp: SourceFingerprint = {
+    byteLength: fp.byteLength,
+    mtimeMs: existing.master.mtimeMs,
+    quickHash: fp.quickHash,
+    ...(fp.contentHash !== undefined ? { contentHash: fp.contentHash } : {}),
+  };
+  return isFresh(existingFp, observed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
