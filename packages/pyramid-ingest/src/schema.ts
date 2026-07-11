@@ -92,6 +92,45 @@ export const manifestSchema = z.discriminatedUnion("schema", [manifestSchemaV1, 
 export type ManifestV2 = z.infer<typeof manifestSchemaV2Base>;
 export type ManifestV4 = z.infer<typeof manifestSchemaV4Base>;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MANIFEST SCHEMA VERSION POLICY — single source of truth (Packet-1, finding 65)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// This block RECORDS the approved v5 policy for Packet 1. It does NOT yet
+// implement v5 parsing or migration — that lands in Task 4. Until then the
+// discriminated union above still tops out at schema 4, so the v5 contract
+// fixtures (packages/pyramid-ingest/test/fixtures/contracts) intentionally do not
+// yet parse; contract-compat.test.ts pins that intent.
+//
+// Compatibility table:
+//   schema  status     notes
+//   ------  ---------  --------------------------------------------------------
+//   1       readable   earliest; geometry/levels optional. Migrate → 5.
+//   2       readable   V3 Phase2 discriminated bump (current writer output pre-v5).
+//   3       skipped    never emitted; reject as unsupported.
+//   4       readable   index-norm additive (tiling grid, layout, qualityCurve).
+//   5       current    additive: OrientationDescriptor + TilingDescriptor,
+//                      sourceFormat decoupled from decoder capability.
+//   >5      reject     future major written by a newer tool; refuse, never
+//                      silently reinterpret bytes.
+//
+// v5 ADDITIVE shape (target; implemented in Task 4 — do not add here yet):
+//   - master.sourceFormat: detected provenance, independent of decoder support.
+//   - orientation: OrientationDescriptor { exif: 1..8; pixels: "source"|"baked-upright" }
+//     (replaces the v1-v4 "baked"|"source" string; migration maps the old string
+//      to { exif: 1, pixels: <string> } when no EXIF orientation is recorded).
+//   - level.tiling: TilingDescriptor
+//     { container: "jxtc"; version: 1|2; tileSize; bitsPerSample: 8|16; offsetBase: "file" }
+//     (JXTC index offsets are ABSOLUTE from byte zero of the file — see
+//      packages/jxl-pyramid/src/tiling.ts and bridge.cpp:1925-1931).
+//   - Migration is additive and MUST preserve unknown fields (migrate.ts MIG-2).
+
+/** The schema version this tool writes today. */
+export const CURRENT_MANIFEST_SCHEMA = 5 as const;
+
+/** Every schema version this tool can READ (and additively migrate forward). */
+export const READABLE_MANIFEST_SCHEMAS = [1, 2, 4, 5] as const;
+
 export const indexEntrySchema = z.object({
   imageId: z.string().regex(/^[0-9a-f]{16}$/),
   aspect: z.number().finite().positive(),
