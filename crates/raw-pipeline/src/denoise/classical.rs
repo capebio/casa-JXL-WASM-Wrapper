@@ -183,6 +183,11 @@ fn denoise_rgb_ycocg(
 /// Denoise raw Bayer channels by running BM3D on each of the 4 CFA planes
 /// (RGGB) independently in the VST domain.
 ///
+/// `strength` is applied by the caller via `blend_to_u16` (output blend), not
+/// inside BM3D. This differs from the YCoCg path which scales sigma by strength.
+/// The two paths therefore have different artifact character at strength < 1.0
+/// (CFA: full-strength BM3D blended with original; YCoCg: attenuated BM3D).
+///
 /// Returns denoised raw u16 values.
 fn denoise_cfa(
     raw: &[u16],
@@ -289,13 +294,12 @@ fn demosaic_raw(
     let n = width * height;
     let mut rgb = vec![0u16; n * 3];
 
-    // Normalize to f32 for processing
-    let black = metadata.black[0]; // use R plane black as representative
-    let white = metadata.white[0];
-    let range = (white - black).max(1.0);
-
+    // Normalize to f32 per CFA plane. RGGB layout: plane 0=R, 1=G1, 2=G2, 3=B.
     let get = |r: usize, c: usize| {
         if r < height && c < width {
+            let plane = (r % 2) * 2 + (c % 2);
+            let black = metadata.black[plane];
+            let range = (metadata.white[plane] - black).max(1.0);
             (raw[r * width + c] as f32 - black) / range
         } else {
             0.0

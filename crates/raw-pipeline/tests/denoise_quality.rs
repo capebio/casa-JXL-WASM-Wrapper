@@ -413,23 +413,18 @@ fn gate3_mean_bias_below_quarter_sigma() {
 }
 
 // ─── Gate 4: Tile seam maximum ────────────────────────────────────────────────
-//
-// Tests that BM3D denoising does not introduce large discontinuities at a real
-// tile boundary. With TILE=512 and PATCH=8, the BM3D implementation mirror-pads
-// the input by PATCH pixels before tiling. An input of width=522 produces a
-// padded width of 538 (= 522 + 2*8), which splits into two tiles at padded
-// column 512. After cropping the padding, the tile seam falls between original
-// output columns 503 and 504 (= 512 - PATCH - 1 and 512 - PATCH).
-//
-// BM3D is now global (no spatial tiling). We use a perfectly constant flat-field
+// BM3D runs globally (no spatial tiling). We use a perfectly constant flat-field
 // so BM3D finds ideal patch groups (all identical) and the output must be exactly
-// constant. Any tile-like discontinuity or boundary mis-handling would appear as
-// a code difference at adjacent columns. Width 522 > old TILE=512+PATCH=8, which
-// tests that images wider than the former tile size are handled correctly.
+// constant — a max_diff of 0 at any pair of adjacent pixels. The 522-wide image
+// (> former tile threshold of 512+PATCH=520) exercises the path where the padded
+// image is wider than one block-match search window.
+//
+// Columns 503|504 are an arbitrary spot-check within the wide image; they were
+// chosen to coincide with where a tile seam would have appeared under the previous
+// tiled design. With global BM3D the check is just a uniformity assertion.
 
-// BM3D constants (must match bm3d.rs)
 const BM3D_PATCH: usize = 8;
-const BM3D_TILE: usize = 512;
+const BM3D_TILE: usize = 512; // width used to size the test image; no longer a tile boundary
 
 #[test]
 fn gate4_tile_seam_max_one_code() {
@@ -583,7 +578,7 @@ fn quality_report() {
     // Note: full MTF50 and determinism tests run as separate test cases above.
     println!("Gate 2 (MTF50 >= 95%): see gate2_slanted_edge_mtf50_retention_95pct");
     println!("Gate 3 (bias <= 0.25*sigma): see gate3_mean_bias_below_quarter_sigma");
-    println!("Gate 4 (seam max <= 3x expected): see gate4_tile_seam_max_one_code");
+    println!("Gate 4 (constant-field uniformity, max_diff <= 1): see gate4_tile_seam_max_one_code");
     println!("Gate 5 (determinism 10 runs): see gate5_determinism_10_runs");
     println!("===================================\n");
 }

@@ -478,20 +478,21 @@ fn stage2_ref_patch(
 
     // Wiener coefficients: w = |Y_hat|^2 / (|Y_hat|^2 + sigma^2)
     let sigma2 = sigma * sigma;
-    let mut sum_w2 = 0f32;
+    let mut sum_w_sq = 0f32;
     let mut filtered_group = vec![0f32; n_patches * pp];
     for i in 0..(n_patches * pp) {
         let y_hat2 = est_group[i] * est_group[i];
         let w = y_hat2 / (y_hat2 + sigma2);
         filtered_group[i] = w * noisy_group[i];
-        sum_w2 += w * w;
+        sum_w_sq += w * w;
     }
-    let weight = 1.0 / sum_w2.max(1e-12);
+    let weight = 1.0 / sum_w_sq.max(1e-12);
 
     // Inverse transform
     itransform_group(&mut filtered_group, n_patches);
 
-    // Accumulate: weight = 1/sum_w^2 * kaiser
+    // Accumulate: weight = 1/sum(w²) * kaiser  (Dabov et al. eq. 16)
+
     for (idx, &(_, r, c)) in matches.iter().enumerate() {
         let restored = &filtered_group[idx * pp..(idx + 1) * pp];
         for pr in 0..PATCH {
@@ -625,12 +626,13 @@ mod tests {
 
     #[test]
     fn bessel_i0_monotone_positive() {
-        // I0 is even and increasing for x >= 0
-        let prev = modified_bessel_i0(0.0);
+        // I0 is even and strictly increasing for x >= 0
+        let mut prev = modified_bessel_i0(0.0);
         for xi in 1..=20u32 {
             let x = xi as f32 * 0.5;
             let curr = modified_bessel_i0(x);
             assert!(curr >= prev, "I0 not monotone at x={x}");
+            prev = curr;
         }
     }
 

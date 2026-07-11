@@ -30,6 +30,12 @@ pub fn gat_forward(x: f32, shot: f32, read: f32) -> f32 {
 /// This formula is the *statistical* unbiased inverse: it corrects the
 /// expectation `E[gat_inverse(gat_forward(X+noise))] ≈ X`. For point-wise
 /// signal reconstruction use `gat_inverse_exact`.
+///
+/// # Note
+/// For z near zero (|z| < ~0.01) the `1/(4*half_z)` correction term diverges
+/// to a large positive value. The `.max(floor)` clamp prevents negative results
+/// but there is no upper clamp — callers must ensure z values come from the
+/// output of a properly-stabilized denoiser where extreme low values do not occur.
 #[inline]
 pub fn gat_inverse(z: f32, shot: f32, read: f32) -> f32 {
     let half_z = z * 0.5;
