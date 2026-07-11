@@ -32,7 +32,7 @@ const LAMBDA: f32 = 2.7;
 /// Outer tile size for parallelism.
 const TILE: usize = 512;
 /// Halo/overlap around each tile (must be >= SEARCH + PATCH).
-const HALO: usize = 64;
+const HALO: usize = 32;
 /// Kaiser window beta parameter.
 const KAISER_BETA: f32 = 2.0;
 

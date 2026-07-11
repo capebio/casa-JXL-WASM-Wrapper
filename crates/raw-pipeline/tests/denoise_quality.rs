@@ -467,9 +467,6 @@ fn gate4_tile_seam_max_one_code() {
     // appear as sudden large discontinuities. For a uniform field after denoising,
     // adjacent pixel diffs should be small (bounded by residual noise + BM3D smoothing).
     //
-    // The spec says "tile seam max <= 1 RGB16 code", but since BM3D is not perfect
-    // on a uniform field with significant noise, we allow up to sigma_u16/2 codes.
-    let seam_threshold = (sigma_u16 as u32) / 2;
     let mut max_diff = 0u32;
     let mut max_pos = (0usize, 0usize);
     for row in 0..height {
@@ -487,14 +484,11 @@ fn gate4_tile_seam_max_one_code() {
     }
 
     println!(
-        "Gate 4 — max adjacent pixel diff = {max_diff} RGB16 codes at {:?} (threshold={})",
-        max_pos, seam_threshold
+        "Gate 4 — max adjacent pixel diff = {max_diff} RGB16 codes at {:?}",
+        max_pos
     );
 
-    assert!(
-        max_diff <= seam_threshold,
-        "Max adjacent pixel diff {max_diff} > seam threshold {seam_threshold} — possible tile seam artifact"
-    );
+    assert!(max_diff <= 1, "tile seam exceeded 1 RGB16 code: max_diff={max_diff}");
 }
 
 // ─── Gate 5: Determinism (FNV-1a hash across 10 runs) ────────────────────────
