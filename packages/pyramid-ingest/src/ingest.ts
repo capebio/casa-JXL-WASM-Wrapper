@@ -17,6 +17,7 @@ import type { Clock, DecodedMaster, JxlBackend, MasterFormat, Orientation, RawBa
 function now(b?: Backends): number { return b?.clock?.now?.() ?? Date.now(); }
 import { clearCheckpoint, readCheckpoint, writeCheckpoint, type CheckpointState } from "./checkpoint.js";
 import { acquireImageWriteLock, type AdvisoryLock } from "./lock.js";
+import { inferStage, isAbortError, makeAbortError, throwIfAborted, type IngestStage } from "./abort.js";
 
 export interface Backends {
   raw: RawBackend;
@@ -95,6 +96,55 @@ const RAW_EXT: Record<string, string> = {
 };
 
 const MAX_MASTER_BYTES = 512 * 1024 * 1024; // high-master-size-unbounded guard
+
+// finding 67 (Task 6): abortable deadlines threaded end to end.
+//
+// The previous timeout was a detached `Promise.race`: the deadline promise rejected the waiter while
+// the *actual* work (decode/encode/publish) kept running, so a timed-out image could still publish a
+// manifest/level after the caller had already recorded the timeout. The fix composes ONE AbortSignal
+// per image from the caller's cancel signal + a deadline controller, threads it into every stage
+// (read, decode, encode, and the atomic-publish boundary), throws a stage-tagged ABORT_ERR at the
+// first post-deadline checkpoint, and JOINS the (now-cancelling) work before returning — no detached
+// promise, no leak past the deadline. Stage/abort primitives live in ./abort.ts (shared with ladder).
+
+/** Compose the per-image combined signal from the caller signal + an optional deadline controller.
+ *  Returns the combined signal plus a `dispose()` that clears the deadline timer. Uses the standard
+ *  `AbortSignal.any` when present (Node 18.17+/Bun); otherwise wires listeners manually so older
+ *  runtimes still get one signal that fires on either source. */
+function makeImageSignal(
+  callerSignal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal: AbortSignal | undefined; dispose: () => void } {
+  const hasTimeout = typeof timeoutMs === "number" && timeoutMs > 0;
+  if (!hasTimeout) {
+    // No deadline: the caller signal (if any) IS the per-image signal; nothing to dispose.
+    return { signal: callerSignal, dispose: () => {} };
+  }
+  const deadlineAc = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
+    deadlineAc.abort(Object.assign(new Error(`ingest deadline exceeded after ${timeoutMs}ms`), { code: "ABORT_ERR" }));
+  }, timeoutMs);
+  const dispose = () => { if (timer !== undefined) { clearTimeout(timer); timer = undefined; } };
+  if (!callerSignal) return { signal: deadlineAc.signal, dispose };
+  const anyFn = (AbortSignal as any).any as ((s: AbortSignal[]) => AbortSignal) | undefined;
+  if (typeof anyFn === "function") {
+    return { signal: anyFn([callerSignal, deadlineAc.signal]), dispose };
+  }
+  // Manual fallback: a fresh controller aborted by whichever source fires first.
+  const combined = new AbortController();
+  const onCaller = () => combined.abort((callerSignal as any).reason);
+  const onDeadline = () => combined.abort((deadlineAc.signal as any).reason);
+  if (callerSignal.aborted) combined.abort((callerSignal as any).reason);
+  else callerSignal.addEventListener("abort", onCaller, { once: true });
+  deadlineAc.signal.addEventListener("abort", onDeadline, { once: true });
+  // dispose clears the deadline timer AND detaches the caller listener so a long-lived caller signal
+  // (e.g. one shared across a whole batch) does not retain this per-image closure after we return.
+  const disposeManual = () => {
+    dispose();
+    callerSignal.removeEventListener("abort", onCaller);
+  };
+  return { signal: combined.signal, dispose: disposeManual };
+}
 
 // low-no-retry-on-ebusy + high-atomic-writes: Windows AV/locker EBUSY retry (3x 50ms).
 // Used for tmp writes + renames to guarantee durability without partials on target.
@@ -297,7 +347,7 @@ async function decodeMaster(b: Backends, format: MasterFormat, bytes: Uint8Array
     const orient = await probeOrientation(bytes);
     return { rgba: d.rgba, width: d.width, height: d.height, orientation: orient };
   }
-  return b.raw.decode(bytes, format);
+  return b.raw.decode(bytes, format, b.signal); // finding 67: thread combined per-image signal into decode
 }
 
 export async function writeLevelFiles(
@@ -346,27 +396,32 @@ export async function computeIngestPlan(
 ): Promise<IngestPlan> {
   const b = backends;
   const tel = b.telemetry;
+  const sig = b.signal; // finding 67: combined per-image signal (caller cancel + deadline), threaded by ingestImage
   tel?.stage("compute-plan-start", { imageId: identity.imageId, format, proxy: opts.proxy !== undefined });
 
   let ladder: LadderResult;
+  throwIfAborted(sig, "decode"); // do not start a decode after the deadline
   if (opts.proxy !== undefined) {
     const decoded = await decodeMaster(b, format, bytes);
     tel?.stage("decode-master", { w: decoded.width, h: decoded.height });
+    throwIfAborted(sig, "encode"); // deadline may have fired during decode; do not begin encode
     ladder = await buildProxyLadder(
-      b.jxl, decoded.rgba, decoded.width, decoded.height, opts.proxy, decoded.orientation, !!opts.profileConvergence,
+      b.jxl, decoded.rgba, decoded.width, decoded.height, opts.proxy, decoded.orientation, !!opts.profileConvergence, sig,
     );
   } else if (format === "jpg") {
     // F6/L9: jpg decode does not bake EXIF rotation (verified); pass "source" (or real EXIF when plumbed in caller)
-    ladder = await buildJpgLadder(b.jxl, bytes, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive");
+    ladder = await buildJpgLadder(b.jxl, bytes, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive", sig);
     if (await probeOrientation(bytes) === "baked") {
       (ladder as any).orientation = "baked";
     }
   } else {
-    const decoded = await b.raw.decode(bytes, format);
+    const decoded = await b.raw.decode(bytes, format, sig);
     tel?.stage("decode-master", { w: decoded.width, h: decoded.height });
-    ladder = await buildRawLadder(b.jxl, decoded, !!opts.profileConvergence, opts.tiling ?? "adaptive");
+    throwIfAborted(sig, "encode"); // deadline may have fired during decode; do not begin encode
+    ladder = await buildRawLadder(b.jxl, decoded, !!opts.profileConvergence, opts.tiling ?? "adaptive", sig);
   }
 
+  throwIfAborted(sig, "encode"); // after ladder build (encode), before manifest assembly + publish
   tel?.stage("ladder-built", { levels: ladder.levels.length, w: ladder.width, h: ladder.height });
 
   const entries = ladder.levels.map((lv) => toEntry(lv, ladder.width, ladder.height));
@@ -406,8 +461,13 @@ export async function applyIngestPlan(
   opts: IngestOptions,
 ): Promise<IngestOutcome> {
   const outDir = opts.outDir;
+  const sig = backends.signal; // finding 67: combined per-image signal (caller cancel + deadline)
   const imageDir = join(outDir, "images", plan.imageId);
   const manifestPath = join(imageDir, "manifest.json");
+
+  // finding 67: publish boundary. Refuse to write anything if the deadline/caller has already fired,
+  // so a timed-out image never leaves level files or a manifest behind.
+  throwIfAborted(sig, "publish");
 
   // med-manifesttmp-orphan + B2: clear stale tmp
   await unlink(manifestPath + ".tmp").catch(() => {});
@@ -427,6 +487,10 @@ export async function applyIngestPlan(
   await mkdir(imageDir, { recursive: true });
   const manifestTmp = `${manifestPath}.tmp`;
   try {
+    // finding 67: last gate before the manifest rename — the *only* atomic-publish point. If the
+    // deadline fired while levels were being written, stop here: the level blobs are unreferenced
+    // orphans that GC reclaims, but the manifest (which makes the image visible) is never renamed in.
+    throwIfAborted(sig, "publish");
     const json = manifestToJson(plan.manifest);
     await withEbusyRetry(() => writeFile(manifestTmp, json), "manifest-tmp");
     await withEbusyRetry(() => rename(manifestTmp, manifestPath), "manifest-rename");
@@ -465,13 +529,26 @@ export async function ingestImage(
   const imageDir = join(opts.outDir, "images", imageId);
   const manifestPath = join(imageDir, "manifest.json");
 
+  // finding 67: one combined AbortSignal per image = caller cancel + deadline (see makeImageSignal).
+  // Created BEFORE the master-bytes read so the deadline can gate the *read* stage too — the read is
+  // the first expensive step on the timed path and must abort with stage="read", not run to completion.
+  // Threaded onto a per-image backends view so decode/encode/downscale/publish stages observe it.
+  const { signal: imageSignal, dispose: disposeSignal } = makeImageSignal(backends.signal, opts.timeoutMs);
+  const stageBackends: Backends = imageSignal === backends.signal ? backends : { ...backends, signal: imageSignal };
+  try {
+
   // med-manifesttmp-orphan + B2: clear stale tmp from prior crash before any check/write
   await unlink(manifestPath + ".tmp").catch(() => {});
 
   // The master bytes are read at most once and reused for skip-check, fingerprint and ingest.
   let bytes: Uint8Array | undefined;
   const readBytesOnce = async (): Promise<Uint8Array> => {
-    if (bytes === undefined) bytes = await readFile(masterPath); // Buffer satisfies Uint8Array (low-readfile)
+    if (bytes === undefined) {
+      bytes = await readFile(masterPath); // Buffer satisfies Uint8Array (low-readfile)
+      // finding 67: read-stage checkpoint. The deadline may have expired while this I/O was in flight;
+      // abort here with stage="read" rather than proceeding into the skip-check / decode.
+      throwIfAborted(imageSignal, "read");
+    }
     return bytes;
   };
   // finding 66 (Task 5): observed source fingerprint, memoized. The fast path (size + quickHash) is
@@ -486,6 +563,10 @@ export async function ingestImage(
   };
 
   if (!opts.force) {
+    // finding 67: read-stage checkpoint. If the deadline/caller already fired, abort at "read" rather
+    // than issuing the skip-check manifest read (the first read on the timed path when a cached fresh
+    // manifest exists).
+    throwIfAborted(imageSignal, "read");
     // ING-5: single read (no fileExists+readFile); a corrupt existing manifest falls through to
     // a clean re-ingest instead of throwing and failing the image.
     // Binary format (−73%) auto-detected by parseManifest; read as binary to support both formats
@@ -537,7 +618,12 @@ export async function ingestImage(
           if (uptodate) return { outcome: "skipped" };
         }
       }
-    } catch { /* corrupt/unparseable manifest → re-ingest (overwrite) */ }
+    } catch (e) {
+      // finding 67: an abort raised by the read-stage checkpoint inside the skip-check master read must
+      // propagate — only a genuine corrupt/unparseable manifest may fall through to a clean re-ingest.
+      if (isAbortError(e)) throw makeAbortError(inferStage(e, "read"), e);
+      /* corrupt/unparseable manifest → re-ingest (overwrite) */
+    }
   }
 
   const masterBytes = await readBytesOnce();
@@ -565,29 +651,34 @@ export async function ingestImage(
   // F4: extract once on master bytes for every ingest (native/jpg/fallback). Cheap vs encode.
   const meta = await extractBasicMetadata(masterBytes, !opts.stripGps);
 
-  const timeout = opts.timeoutMs;
-  let timer: NodeJS.Timeout | undefined;
-
   const workP = (async (): Promise<IngestResult> => {
     let plan: IngestPlan | null = null;
     let usedFallback = false;
+
+    // Deadline may already have passed before we started the heavy work (e.g. slow skip-check /
+    // metadata extract on the timed path) — stop before decode rather than starting it.
+    throwIfAborted(imageSignal, "decode");
 
     const nativeFmt = isNativeRawFormat(format) ? (format as RawFormat) : null;
     if (nativeFmt) {
       try {
         // Tier 1: native via raw-converter-wasm
-        plan = await computeIngestPlan(masterBytes, nativeFmt, backends, identity, opts, meta);
+        plan = await computeIngestPlan(masterBytes, nativeFmt, stageBackends, identity, opts, meta);
       } catch (err) {
+        // An abort is terminal: never fall back (that would resume the cancelled work and could
+        // publish a degraded stub past the deadline). Re-throw so the cancellation propagates.
+        if (isAbortError(err)) throw makeAbortError(inferStage(err, "decode"), err);
         if (!accept) throw err;
+        throwIfAborted(imageSignal, "decode"); // deadline may have fired during the failed native attempt
         usedFallback = true;
-        plan = await buildFallbackPlan(masterBytes, format, backends, identity, opts, masterPath, meta);
+        plan = await buildFallbackPlan(masterBytes, format, stageBackends, identity, opts, masterPath, meta);
       }
     } else if (format === "jpg") {
-      plan = await computeIngestPlan(masterBytes, "jpg", backends, identity, opts, meta);
+      plan = await computeIngestPlan(masterBytes, "jpg", stageBackends, identity, opts, meta);
     } else if (accept) {
       // unknown ext or non-native raw: go straight to Tier3/5 (no native attempt)
       usedFallback = true;
-      plan = await buildFallbackPlan(masterBytes, format, backends, identity, opts, masterPath, meta);
+      plan = await buildFallbackPlan(masterBytes, format, stageBackends, identity, opts, masterPath, meta);
     } else {
       throw new Error(`unsupported master format: ${masterPath}`);
     }
@@ -604,23 +695,24 @@ export async function ingestImage(
       return { outcome: "written", plan: plan!, degraded: usedFallback || undefined };
     }
 
-    await applyIngestPlan(plan!, backends, opts);
+    // Atomic-publish boundary: refuse to publish if the deadline/caller has already fired. The plan
+    // is in RAM only at this point; applyIngestPlan performs the first durable writes.
+    throwIfAborted(imageSignal, "publish");
+    await applyIngestPlan(plan!, stageBackends, opts);
     const stagedBytes = (plan!.levels || []).reduce((s: number, lv: any) => s + (lv.stagedBytes || 0), 0);
 
     // P4: mtimecache deleted (no consumers outside this file; dead RMW race under workers; coordinator epilogue not needed)
     return { outcome: "written", stagedBytes: stagedBytes || undefined, degraded: usedFallback || undefined };
   })();
 
-  try {
-    if (timeout && timeout > 0) {
-      const t = new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`ingest timeout after ${timeout}ms for ${masterPath}`)), timeout); });
-      return await Promise.race([workP, t]);
-    } else {
-      return await workP;
-    }
+    // JOIN the work before returning. The deadline no longer wins a race against a still-running
+    // loser: it fires `imageSignal`, the work throws ABORT_ERR at its next checkpoint, and that
+    // settled result (or the cancelled rejection) is what we return — no detached promise.
+    return await workP;
   } finally {
-    clearTimeout(timer);
-    workP.catch(() => {}); // detach loser to avoid unhandled after timeout wins
+    // dispose runs on EVERY exit path — including an abort thrown by the read-stage checkpoint above,
+    // which now happens inside this outer try — so the deadline timer never leaks.
+    disposeSignal();
   }
 }
 
@@ -636,6 +728,7 @@ async function buildFallbackPlan(
 ): Promise<IngestPlan> {
   const b = backends;
   const tel = b.telemetry;
+  throwIfAborted(b.signal, "decode"); // finding 67: do not begin fallback decode/encode after the deadline
   const detected = format || detectFormatByMagic(bytes) || "unknown";
 
   // Tier 3
@@ -648,9 +741,9 @@ async function buildFallbackPlan(
       // F3: honor proxy in fallback (native raw failed); decode embedded jpg to rgba then proxy ladder
       const fullJxl = await b.jxl.transcodeJpeg(jpeg);
       const dec = await b.jxl.decodeToRgba8(fullJxl);
-      ladder = await buildProxyLadder(b.jxl, dec.rgba, dec.width, dec.height, opts.proxy, "source", !!opts.profileConvergence);
+      ladder = await buildProxyLadder(b.jxl, dec.rgba, dec.width, dec.height, opts.proxy, "source", !!opts.profileConvergence, b.signal);
     } else {
-      ladder = await buildJpgLadder(b.jxl, jpeg, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive");
+      ladder = await buildJpgLadder(b.jxl, jpeg, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive", b.signal);
       // F6 (embedded path): same map as master jpg; ladder override (deferred full plumb)
       if (await probeOrientation(jpeg) === "baked") {
         (ladder as any).orientation = "baked";
