@@ -8,7 +8,7 @@ import {
   type GalleryIndex, type LevelEntry, type Manifest,
 } from "./manifest.js";
 import {
-  catalogIdForContent, fingerprintFromBytes, type SourceFingerprint,
+  catalogIdForContent, fingerprintFromBytes, QUICK_SAMPLE_THRESHOLD, type SourceFingerprint,
 } from "./source-identity.js";
 
 import { detectFormatByMagic, makeProducedBy, parseManifest, manifestToJson, type MasterFingerprint } from "./schema.js";
@@ -500,8 +500,12 @@ export async function ingestImage(
         } else if (existingFp !== undefined) {
           // finding 66: fingerprint-aware freshness. mtime alone never certifies — a byte replacement
           // that preserves the original mtime must re-ingest. Fast path is size + quickHash; escalate
-          // to a full contentHash only when the fast path is ambiguous (mtime unchanged, size unchanged,
-          // but quickHash differs) AND the existing side recorded a full contentHash to compare against.
+          // to a full contentHash in two situations when the existing fingerprint carries one:
+          //   (a) Fast path says STALE but size+mtime match → quickHash diff may be a collision-miss or
+          //       benign metadata edit; contentHash is authoritative (original "ambiguous" escalation).
+          //   (b) Fast path says FRESH (size+quickHash match) but contentHash is recorded → an edit that
+          //       lands entirely in an unsampled gap preserves quickHash while changing the content;
+          //       contentHash catch confirms or overrules the fast path (I1 escalation fix).
           const proxyOk = wantProxy ? existing.proxy === true : existing.proxy !== true;
           if (proxyOk) {
             let observed = await observedFingerprint(false);
@@ -514,6 +518,14 @@ export async function ingestImage(
             if (ambiguous) {
               // Same size + same mtime but quickHash differs: a possible quickHash collision-miss or a
               // benign metadata edit. The recorded full contentHash is authoritative — read it to decide.
+              observed = await observedFingerprint(true);
+              fresh = isSourceFresh(existing, observed, wantProxy);
+            }
+            // I1 fix: fast path said fresh but the existing fingerprint carries a full contentHash,
+            // meaning this file was large enough that quickHash only sampled partial windows. A byte
+            // edit in an unsampled interior gap would pass the fast path silently. Verify with the
+            // full hash to prevent a silent stale-catalog entry.
+            if (fresh && existingFp.contentHash !== undefined) {
               observed = await observedFingerprint(true);
               fresh = isSourceFresh(existing, observed, wantProxy);
             }
@@ -534,9 +546,16 @@ export async function ingestImage(
   // from the master CONTENT (stable across moves; distinct from the path-derived imageId and from the
   // per-level content hash). The persisted fingerprint records size + quickHash for future fast-path
   // freshness; mtime lives on master.mtimeMs (not duplicated into the fingerprint block).
+  //
+  // I1 escalation fix: for large files (> QUICK_SAMPLE_THRESHOLD) quickHash only samples head/mid/tail
+  // windows, so an edit that lands entirely in an unsampled gap preserves quickHash while changing the
+  // content. We persist contentHash = catalogId (same bytes, same primitive, zero extra cost) so the
+  // escalation gate in the freshness check (existingFp.contentHash !== undefined) can actually fire on
+  // the next ingest and correctly detect the change via a full re-hash.
   const catalogId = catalogIdForContent(masterBytes);
   const observed = fingerprintFromBytes(masterBytes, info.mtimeMs, info.size);
   const persistedFingerprint: MasterFingerprint = { byteLength: observed.byteLength, quickHash: observed.quickHash };
+  if (info.size > QUICK_SAMPLE_THRESHOLD) persistedFingerprint.contentHash = catalogId;
 
   const identity: IngestIdentity = {
     imageId, masterName: basename(masterPath), mtimeMs: info.mtimeMs,

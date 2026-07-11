@@ -47,7 +47,8 @@ const TRUNC = 16; // 16 hex chars = 64-bit, matching imageId / contenthash names
 // quickHash sampling: for files larger than this, sample three windows (head, interior, tail) rather
 // than hashing every byte. The interior sample is what catches a replaced middle that a head+tail-only
 // probe would miss. Small files are hashed in full.
-const QUICK_SAMPLE_THRESHOLD = 256 * 1024; // 256 KiB
+// Exported so ingest.ts can persist contentHash exactly when quickHash is incomplete (I1 escalation fix).
+export const QUICK_SAMPLE_THRESHOLD = 256 * 1024; // 256 KiB
 const QUICK_WINDOW = 64 * 1024; // 64 KiB per window
 
 /** Path-derived change-detection key. Normalized (realpath + NFC) so equivalent spellings coincide;

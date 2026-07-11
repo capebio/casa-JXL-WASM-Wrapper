@@ -412,6 +412,54 @@ test("finding 66: manifest records catalogId + fingerprint; skips unchanged, re-
   expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
 });
 
+// I1 regression test: large-file unsampled-gap edit must be detected, not silently skipped.
+//
+// Scenario: file > QUICK_SAMPLE_THRESHOLD (256 KiB). quickHash samples only head/mid/tail windows.
+// An edit that lands entirely in an unsampled interior gap preserves byteLength AND quickHash.
+// If the original mtime is also restored, the pre-fix code would read the file as FRESH (skipped),
+// silently producing a stale catalog. The fix persists contentHash on large-file ingests so the
+// escalation gate can fire on re-ingest and detect the change via a full re-hash.
+//
+// This test MUST fail before the fix (ingest returns "skipped" instead of "written") and pass after.
+test("I1 fix: unsampled-gap edit in a large file is detected as STALE, not silently skipped", { timeout: WASM_TIMEOUT }, async () => {
+  const { utimes } = await import("node:fs/promises");
+  const out = await tmpOut();
+
+  // 4 MiB file filled with 0xAB — larger than the 256 KiB QUICK_SAMPLE_THRESHOLD.
+  const SIZE = 4 * 1024 * 1024;
+  const original = new Uint8Array(SIZE).fill(0xab);
+  const master = join(out, "LARGE.orf");
+  await writeFile(master, original);
+
+  // First ingest writes the manifest. With the fix, it persists contentHash alongside quickHash
+  // because byteLength > QUICK_SAMPLE_THRESHOLD.
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
+
+  // Verify the persisted fingerprint now carries a contentHash (post-fix assertion).
+  const imageId = await imageIdForPath(master);
+  const manPath = join(out, "images", imageId, "manifest.json");
+  const man = parseManifest(await readFile(manPath)) as any;
+  expect(man.master.fingerprint.contentHash).toBeDefined(); // only set if fix is active
+
+  // Capture the original mtime before editing.
+  const stBefore = await stat(master);
+
+  // Flip ONE byte deep in an unsampled interior gap — ~1 MiB into the file.
+  // The quickHash windows are: head 0-64KiB, mid ~1984-2048KiB, tail ~4032-4096KiB.
+  // Position 1 MiB (1 048 576) sits between head and mid: not covered by any sampled window.
+  const edited = new Uint8Array(original); // same byteLength
+  edited[1 * 1024 * 1024] ^= 0xff; // single-byte flip in unsampled gap
+  await writeFile(master, edited);
+
+  // Restore the ORIGINAL mtime so that mtime cannot disambiguate the change.
+  await utimes(master, new Date(stBefore.mtimeMs), new Date(stBefore.mtimeMs));
+
+  // byteLength unchanged, mtime unchanged, quickHash unchanged (unsampled gap).
+  // Pre-fix: would return "skipped" (silent stale-catalog bug).
+  // Post-fix: escalation gate fires, full re-hash detects change → "written".
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
+});
+
 test("low-no-retry-on-ebusy: EBUSY on rename is retried (succeeds on 2nd attempt)", async () => {
   const out = await tmpOut();
   const b = await makeBackends();
