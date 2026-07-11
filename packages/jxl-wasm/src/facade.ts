@@ -2704,7 +2704,17 @@ async function loadGeneratedLibjxlModule(): Promise<LibjxlWasmModule> {
   // Prefer the split full-feature `enc` module emitted by scripts/build.mjs (it is a superset:
   // decode + encode + planar + perceptual). Fall back to the legacy monolithic artifact when the
   // split isn't present for this tier, so the facade works across the monolithic→split migration.
-  const candidates = [`enc.${tier}`, `${tier}`];
+  return instantiateFromArtifactCandidates([`enc.${tier}`, `${tier}`]);
+}
+
+/**
+ * Load + instantiate the first available generated Emscripten artifact from an
+ * ordered candidate list (each entry is the artifact suffix, e.g. `dec.simd`,
+ * `enc.simd-mt`, or the monolithic `simd`). The first candidate whose
+ * `./jxl-core.<name>.js` module exposes a default factory wins; earlier misses
+ * are non-fatal (the split artifacts may be absent on some tiers).
+ */
+async function instantiateFromArtifactCandidates(candidates: readonly string[]): Promise<LibjxlWasmModule> {
   const baseUrl = new URL("./", import.meta.url);
   let factory: unknown;
   let chosen: string | undefined;
@@ -2735,6 +2745,187 @@ async function loadGeneratedLibjxlModule(): Promise<LibjxlWasmModule> {
     }
   }
   return await (factory as (options: Record<string, unknown>) => Promise<LibjxlWasmModule>)(options);
+}
+
+// ---------------------------------------------------------------------------
+// Role-aware module loading (Packet 3 Task 1 — findings 17, 31)
+//
+// A JXL "role" narrows which generated artifact to load: `decode` pulls the
+// decode-only `dec.<tier>` module (viewer, ~half the size), while `encode` and
+// `perceptual` pull the encoder superset `enc.<tier>` (encode + butteraugli/
+// psnr/ssim). This lets a decode-only worker avoid instantiating the encoder
+// call trees — the concrete win behind finding 17.
+//
+// Loaded modules are cached and de-duplicated per {role, tier} so simultaneous
+// callers share a single in-flight instantiation. Unknown roles/tiers fail with
+// a deterministic error rather than being silently coerced to a default.
+// ---------------------------------------------------------------------------
+
+export type JxlRole = "decode" | "encode" | "perceptual";
+export type JxlTier = "scalar-st" | "simd-st" | "scalar-mt" | "simd-mt";
+
+/**
+ * The concrete module a role loader resolves to: the instantiated libjxl WASM
+ * module plus the resolved role/tier and its detected capability flags. The
+ * `module` handle is the same `LibjxlWasmModule` the low-level facade paths use.
+ */
+export interface JxlModule {
+  readonly role: JxlRole;
+  readonly tier: JxlTier;
+  readonly module: LibjxlWasmModule;
+  readonly capabilities: JxlCapabilities;
+}
+
+export interface LoadJxlModuleRequest {
+  role: JxlRole;
+  /** Defaults to the auto-detected tier for this environment when omitted. */
+  tier?: JxlTier;
+  /** Abort the load; if already aborted, the returned promise rejects immediately. */
+  signal?: AbortSignal;
+}
+
+const VALID_ROLES: ReadonlySet<string> = new Set<JxlRole>(["decode", "encode", "perceptual"]);
+const VALID_TIERS: ReadonlySet<string> = new Set<JxlTier>(["scalar-st", "simd-st", "scalar-mt", "simd-mt"]);
+
+/**
+ * Test seam: loads the raw Emscripten module for an artifact suffix
+ * (e.g. `dec.simd`). Production uses `instantiateFromArtifactCandidates`;
+ * tests inject a spy to assert which artifacts a role requests without a
+ * real WASM build. Receives the ordered candidate list actually tried.
+ */
+export type JxlArtifactLoader = (artifact: string, candidates: readonly string[]) => Promise<LibjxlWasmModule>;
+
+let _artifactLoaderForTesting: JxlArtifactLoader | null = null;
+const _roleModuleCache = new Map<string, Promise<JxlModule>>();
+
+/** Inject a fake artifact loader (tests only). Resets the role-module cache. */
+export function setJxlArtifactLoaderForTesting(loader: JxlArtifactLoader | null): void {
+  _artifactLoaderForTesting = loader;
+  _roleModuleCache.clear();
+}
+
+/** Clear the role-module cache and any injected loader (tests only). */
+export function resetJxlRoleLoaderForTesting(): void {
+  _artifactLoaderForTesting = null;
+  _roleModuleCache.clear();
+}
+
+/** Map a public {@link JxlTier} onto the generated artifact's internal tier suffix. */
+function artifactTierForJxlTier(tier: JxlTier): Tier {
+  switch (tier) {
+    case "scalar-st":
+    case "scalar-mt":
+      // No SIMD/threaded scalar split is emitted; both map to the monolithic scalar artifact.
+      return "scalar";
+    case "simd-st":
+      return "simd";
+    case "simd-mt":
+      // Prefer the relaxed-SIMD MT artifact when the environment probes support it;
+      // it is byte-identical to simd-mt for encode and strictly a superset otherwise.
+      return probeRelaxedSimd() ? "relaxed-simd-mt" : "simd-mt";
+    default:
+      // Exhaustiveness guard — VALID_TIERS gates callers, this is defence in depth.
+      throw new CapabilityMissing(`Unknown JXL tier: ${String(tier)}`);
+  }
+}
+
+/** Default public tier from the auto-detected internal tier. */
+function defaultJxlTier(): JxlTier {
+  switch (detectTier()) {
+    case "relaxed-simd-mt":
+    case "simd-mt":
+      return "simd-mt";
+    case "simd":
+      return "simd-st";
+    case "scalar":
+    default:
+      return "scalar-st";
+  }
+}
+
+/**
+ * Ordered artifact candidates for a {role, artifactTier}. The role-specific
+ * artifact is tried first; the monolithic artifact is the fallback so the loader
+ * still works on tiers (e.g. scalar) that have no role split.
+ */
+function roleArtifactCandidates(role: JxlRole, artifactTier: Tier): string[] {
+  const rolePrefix = role === "decode" ? "dec" : "enc";
+  const roleSpecific = `${rolePrefix}.${artifactTier}`;
+  // scalar has no role split — the role-specific candidate simply won't resolve,
+  // and the monolithic fallback (which is decode+encode) is used.
+  return [roleSpecific, `${artifactTier}`];
+}
+
+/**
+ * Load a role-specific libjxl WASM module.
+ *
+ * - `decode` loads the decode-only `dec.<tier>` artifact (falls back to the
+ *   monolithic artifact when no split exists for that tier).
+ * - `encode` / `perceptual` load the encoder superset `enc.<tier>`.
+ *
+ * Concurrent calls with the same {role, tier} share one in-flight instantiation.
+ * Unknown roles or tiers reject with a {@link CapabilityMissing} error — settings
+ * are never silently ignored.
+ */
+export async function loadJxlModule(request: LoadJxlModuleRequest): Promise<JxlModule> {
+  const { role, signal } = request;
+  if (!VALID_ROLES.has(role)) {
+    throw new CapabilityMissing(`Unknown JXL role: ${String(role)}`);
+  }
+  if (request.tier !== undefined && !VALID_TIERS.has(request.tier)) {
+    throw new CapabilityMissing(`Unknown JXL tier: ${String(request.tier)}`);
+  }
+  if (signal?.aborted) {
+    throw signalAbortError(signal);
+  }
+
+  const tier: JxlTier = request.tier ?? defaultJxlTier();
+  const key = `${role} ${tier}`;
+
+  let entry = _roleModuleCache.get(key);
+  if (entry === undefined) {
+    entry = loadRoleModuleUncached(role, tier);
+    _roleModuleCache.set(key, entry);
+    // Evict a rejected load so a transient failure (bad fetch) can be retried,
+    // guarded on identity so a newer attempt isn't clobbered.
+    entry.catch(() => {
+      if (_roleModuleCache.get(key) === entry) _roleModuleCache.delete(key);
+    });
+  }
+
+  if (signal === undefined) return entry;
+  // Honour late aborts without discarding the shared cached load for other callers.
+  return raceWithAbort(entry, signal);
+}
+
+async function loadRoleModuleUncached(role: JxlRole, tier: JxlTier): Promise<JxlModule> {
+  const artifactTier = artifactTierForJxlTier(tier);
+  const candidates = roleArtifactCandidates(role, artifactTier);
+  const load = _artifactLoaderForTesting
+    ? _artifactLoaderForTesting(candidates[0]!, candidates)
+    : instantiateFromArtifactCandidates(candidates);
+  const module = await load;
+  return { role, tier, module, capabilities: getCapabilities(module) };
+}
+
+function signalAbortError(signal: AbortSignal): Error {
+  const reason = (signal as AbortSignal & { reason?: unknown }).reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error("The JXL module load was aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function raceWithAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signalAbortError(signal));
+    if (signal.aborted) { onAbort(); return; }
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+      (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+    );
+  });
 }
 
 export interface JxlCapabilities {
