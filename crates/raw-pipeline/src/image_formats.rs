@@ -2,7 +2,7 @@
 //! built on the `image` crate already in raw-pipeline's deps. Distinct from
 //! `tiff.rs`, which parses RAW (Bayer) TIFF containers. Output is always RGBA.
 
-use image::DynamicImage;
+use image::{DynamicImage, ImageDecoder};
 use std::io::Cursor;
 
 /// Maximum pixel count accepted from an untrusted developed-image header before
@@ -19,22 +19,232 @@ pub enum ImageFormatError {
     Decode(String),
     #[error("image too large: {0}x{1} ({2} px) exceeds the {3} px ingest budget")]
     TooLarge(u32, u32, u64, u64),
+    /// A header limit was exceeded at preflight, BEFORE any pixel buffer was
+    /// allocated. `what` names the limit (e.g. "pixels", "output_bytes"),
+    /// `got`/`limit` are the offending value and the ceiling.
+    #[error("developed image rejected: {what} {got} exceeds limit {limit}")]
+    LimitExceeded {
+        what: &'static str,
+        got: u64,
+        limit: u64,
+    },
 }
 
-/// True when `width*height` exceeds the ingest pixel budget. Pure so the boundary
-/// is unit-testable without constructing a multi-gigapixel fixture.
-#[inline]
-fn exceeds_pixel_budget(width: u32, height: u32) -> bool {
-    (width as u64).saturating_mul(height as u64) > MAX_INGEST_PIXELS
+/// Which developed-image container a header probe / decode targets. Selected by
+/// the caller (mirrors the wasm `decode_tiff`/`decode_exr`/`decode_jpeg` entry
+/// points) so the probe reads the correct format's structured metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevelopedFormat {
+    Tiff,
+    Exr,
+    Jpeg,
+}
+
+/// Sample representation carried by a developed image, derived from the header's
+/// colour type — NOT by decoding pixels. Drives the per-pixel output byte cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleRepr {
+    /// 8-bit unsigned per channel (JPEG, 8-bit TIFF).
+    U8,
+    /// 16-bit unsigned per channel (16-bit TIFF).
+    U16,
+    /// 32-bit float per channel (EXR, linear HDR).
+    F32,
+}
+
+impl SampleRepr {
+    /// Bytes for one RGBA pixel at this representation (the decoders always emit
+    /// RGBA, so the output cost is 4 channels wide regardless of source channels).
+    #[inline]
+    pub fn rgba_bytes_per_pixel(self) -> u64 {
+        match self {
+            SampleRepr::U8 => 4,
+            SampleRepr::U16 => 8,
+            SampleRepr::F32 => 16,
+        }
+    }
+}
+
+/// Structured, decode-free view of a developed-image header: format, dimensions,
+/// channel count, sample representation, and the CHECKED (saturating) count of
+/// bytes the RGBA decode will materialize. Produced by `probe_developed_header`
+/// and consumed by `DecodeLimits::check` so callers reject before allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderProbe {
+    pub format: DevelopedFormat,
+    pub width: u32,
+    pub height: u32,
+    /// Channels present in the SOURCE header (informational). The materialized
+    /// output is always RGBA; `output_bytes` reflects that.
+    pub channels: u8,
+    pub sample: SampleRepr,
+    /// `width * height * rgba_bytes_per_pixel(sample)`, saturating. This is the
+    /// exact size of the buffer `dynamic_to_rgba` / the EXR path will allocate.
+    pub output_bytes: u64,
+}
+
+/// Explicit resource ceilings for an untrusted developed-image decode. Owned by
+/// the preflight (Finding 59); consumers reject BEFORE allocating or decoding
+/// when any limit is exceeded. Two named profiles exist: [`DecodeLimits::wasm`]
+/// (tight, sized to the 2 GiB shared wasm heap) and [`DecodeLimits::native`]
+/// (loose, host RAM bound).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    /// Maximum accepted COMPRESSED input length in bytes.
+    pub max_input_bytes: u64,
+    /// Maximum accepted image width in pixels.
+    pub max_width: u32,
+    /// Maximum accepted image height in pixels.
+    pub max_height: u32,
+    /// Maximum accepted `width * height`.
+    pub max_pixels: u64,
+    /// Maximum accepted DECODED RGBA output size in bytes — the decompression-bomb
+    /// guard for "tiny compressed, gigantic decoded" inputs.
+    pub max_output_bytes: u64,
+}
+
+impl DecodeLimits {
+    /// Tight profile for the browser/wasm32 build. Sized so the peak working set
+    /// (input container + decoder intermediate ≈ output-sized + RGBA output +
+    /// safety margin) stays under the 2 GiB shared-memory ceiling declared by
+    /// `tools/build-mt-wasm.sh` (`--max-memory=2G`).
+    ///
+    /// Budget arithmetic (worst case = 2×output + input + margin):
+    ///   input 256 MiB + 2·output 512 MiB + margin 256 MiB = 1536 MiB ≤ 2048 MiB.
+    ///
+    /// `max_output_bytes` is the governing constraint for HDR EXR (16 B/px):
+    /// 512 MiB / 16 = 32 MP for f32, / 8 = 64 MP for u16 TIFF, / 4 = 128 MP for
+    /// u8 JPEG — each capped by the same output-byte ceiling at its own depth.
+    pub const fn wasm() -> Self {
+        DecodeLimits {
+            max_input_bytes: 256 * 1024 * 1024,   // 256 MiB
+            max_width: 30_000,
+            max_height: 30_000,
+            max_pixels: 100_000_000,              // 100 MP dimension guard
+            max_output_bytes: 512 * 1024 * 1024,  // 512 MiB decoded RGBA
+        }
+    }
+
+    /// Loose profile for native hosts (host RAM bound, not the wasm heap). Still
+    /// rejects absurd / overflowing headers but permits large legitimate images.
+    pub const fn native() -> Self {
+        DecodeLimits {
+            max_input_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB
+            max_width: 100_000,
+            max_height: 100_000,
+            max_pixels: MAX_INGEST_PIXELS,           // 400 MP (matches legacy guard)
+            max_output_bytes: 8 * 1024 * 1024 * 1024, // 8 GiB decoded RGBA
+        }
+    }
+
+    /// Reject when the input length or the probed header exceeds any ceiling.
+    /// Pure: no allocation, no decode. Returns the FIRST violated limit.
+    pub fn check(&self, probe: &HeaderProbe, input_len: u64) -> Result<(), ImageFormatError> {
+        if input_len > self.max_input_bytes {
+            return Err(ImageFormatError::LimitExceeded {
+                what: "input_bytes",
+                got: input_len,
+                limit: self.max_input_bytes,
+            });
+        }
+        if probe.width > self.max_width {
+            return Err(ImageFormatError::LimitExceeded {
+                what: "width",
+                got: probe.width as u64,
+                limit: self.max_width as u64,
+            });
+        }
+        if probe.height > self.max_height {
+            return Err(ImageFormatError::LimitExceeded {
+                what: "height",
+                got: probe.height as u64,
+                limit: self.max_height as u64,
+            });
+        }
+        let pixels = (probe.width as u64).saturating_mul(probe.height as u64);
+        if pixels > self.max_pixels {
+            return Err(ImageFormatError::LimitExceeded {
+                what: "pixels",
+                got: pixels,
+                limit: self.max_pixels,
+            });
+        }
+        if probe.output_bytes > self.max_output_bytes {
+            return Err(ImageFormatError::LimitExceeded {
+                what: "output_bytes",
+                got: probe.output_bytes,
+                limit: self.max_output_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Map an `image::ColorType` header colour type to (channels, sample-repr) using
+/// the decoder's structured metadata — never a pixel decode. Anything not RGB(A)
+/// still reports its native depth; the decoders up-convert to RGBA on decode.
+fn color_type_to_repr(ct: image::ColorType) -> (u8, SampleRepr) {
+    use image::ColorType::*;
+    let channels = ct.channel_count();
+    let sample = match ct {
+        L8 | La8 | Rgb8 | Rgba8 => SampleRepr::U8,
+        L16 | La16 | Rgb16 | Rgba16 => SampleRepr::U16,
+        Rgb32F | Rgba32F => SampleRepr::F32,
+        // Future-proof: any other colour type the image crate adds — treat as the
+        // widest (f32) so the output-byte guard over-reserves rather than under.
+        _ => SampleRepr::F32,
+    };
+    (channels, sample)
+}
+
+/// Read a developed-image header WITHOUT decoding pixels: construct the format's
+/// decoder (which parses only the header/metadata), then read its dimensions and
+/// colour type from the structured `ImageDecoder` API. Computes the CHECKED
+/// (saturating) RGBA output-byte cost. This is the preflight probe consumers use
+/// with [`DecodeLimits::check`] before allocating.
+pub fn probe_developed_header(
+    bytes: &[u8],
+    fmt: DevelopedFormat,
+) -> Result<HeaderProbe, ImageFormatError> {
+    let map = |e: image::ImageError| ImageFormatError::Decode(e.to_string());
+    let ((w, h), ct) = match fmt {
+        DevelopedFormat::Tiff => {
+            let d = image::codecs::tiff::TiffDecoder::new(Cursor::new(bytes)).map_err(map)?;
+            (d.dimensions(), d.color_type())
+        }
+        DevelopedFormat::Exr => {
+            let d = image::codecs::openexr::OpenExrDecoder::new(Cursor::new(bytes)).map_err(map)?;
+            (d.dimensions(), d.color_type())
+        }
+        DevelopedFormat::Jpeg => {
+            let d = image::codecs::jpeg::JpegDecoder::new(Cursor::new(bytes)).map_err(map)?;
+            (d.dimensions(), d.color_type())
+        }
+    };
+    let (channels, sample) = color_type_to_repr(ct);
+    let output_bytes = (w as u64)
+        .saturating_mul(h as u64)
+        .saturating_mul(sample.rgba_bytes_per_pixel());
+    Ok(HeaderProbe {
+        format: fmt,
+        width: w,
+        height: h,
+        channels,
+        sample,
+        output_bytes,
+    })
 }
 
 /// Read just the header to get dimensions, then reject decompression bombs before
-/// the full decode allocates. Cheap: header parse only, no pixel decode.
+/// the full decode allocates. Cheap: header parse only, no pixel decode. Uses the
+/// legacy [`MAX_INGEST_PIXELS`] cap so the existing unlimited entry points keep
+/// their prior behaviour; the byte-based [`DecodeLimits`] path is opt-in via the
+/// `*_limited` decoders.
 fn guard_dimensions(bytes: &[u8], fmt: image::ImageFormat) -> Result<(), ImageFormatError> {
     let (w, h) = image::ImageReader::with_format(Cursor::new(bytes), fmt)
         .into_dimensions()
         .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
-    if exceeds_pixel_budget(w, h) {
+    if (w as u64).saturating_mul(h as u64) > MAX_INGEST_PIXELS {
         return Err(ImageFormatError::TooLarge(
             w,
             h,
@@ -88,6 +298,52 @@ pub fn decode_exr_bytes(bytes: &[u8]) -> Result<DecodedRgba, ImageFormatError> {
 /// decompression-bomb guard.
 pub fn decode_jpeg_bytes(bytes: &[u8]) -> Result<DecodedRgba, ImageFormatError> {
     guard_dimensions(bytes, image::ImageFormat::Jpeg)?;
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+        .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
+    Ok(dynamic_to_rgba(img))
+}
+
+/// Preflight-gated TIFF decode: probe the header, reject via `limits` BEFORE any
+/// pixel buffer is allocated, then decode. The preferred entry point for
+/// untrusted input; `decode_tiff_bytes` remains for the legacy unguarded path.
+pub fn decode_tiff_bytes_limited(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<DecodedRgba, ImageFormatError> {
+    let probe = probe_developed_header(bytes, DevelopedFormat::Tiff)?;
+    limits.check(&probe, bytes.len() as u64)?;
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Tiff)
+        .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
+    Ok(dynamic_to_rgba(img))
+}
+
+/// Preflight-gated EXR decode. See [`decode_tiff_bytes_limited`].
+pub fn decode_exr_bytes_limited(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<DecodedRgba, ImageFormatError> {
+    let probe = probe_developed_header(bytes, DevelopedFormat::Exr)?;
+    limits.check(&probe, bytes.len() as u64)?;
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::OpenExr)
+        .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
+    let (width, height) = (img.width(), img.height());
+    let rgba = img.to_rgba32f();
+    Ok(DecodedRgba {
+        width,
+        height,
+        bit_depth: 32,
+        f32: rgba.into_raw(),
+        ..Default::default()
+    })
+}
+
+/// Preflight-gated JPEG decode. See [`decode_tiff_bytes_limited`].
+pub fn decode_jpeg_bytes_limited(
+    bytes: &[u8],
+    limits: &DecodeLimits,
+) -> Result<DecodedRgba, ImageFormatError> {
+    let probe = probe_developed_header(bytes, DevelopedFormat::Jpeg)?;
+    limits.check(&probe, bytes.len() as u64)?;
     let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
         .map_err(|e| ImageFormatError::Decode(e.to_string()))?;
     Ok(dynamic_to_rgba(img))
