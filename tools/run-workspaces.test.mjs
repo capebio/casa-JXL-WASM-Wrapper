@@ -24,6 +24,7 @@ import {
   discoverWorkspaces,
   buildDag,
   topoSort,
+  runTasks,
   assertAllTestWorkspaces,
   CONCURRENCY_DEFAULT,
 } from "./run-workspaces.mjs";
@@ -228,19 +229,33 @@ describe("assertAllTestWorkspaces", () => {
 
   it("does not throw when a build-only workspace (no test script) is absent from plan", async () => {
     // assertAllTestWorkspaces only guards test-script-bearing workspaces.
-    // Removing a package that has NO test script from the plan must not fire.
+    // A workspace that has NO "test" script (e.g. @casabio/jxl-wasm) is NOT in the test
+    // space, so omitting it from a plan must NOT trigger the guard — even if the plan
+    // was built for "build" tasks and jxl-wasm is present there.
+
+    // Case A: plan = full test workspace list, MINUS a known build-only entry.
+    // Since the build-only entry was never in the test space, the guard must not fire.
     const allTest = await discoverWorkspaces(REPO_ROOT, "test");
-    // jxl-wasm has no test script → it is not in allTest.
-    // Confirm: removing a synthetic entry that doesn't exist in test-space doesn't throw.
-    const planWithExtra = [
+    // Confirm jxl-wasm is truly build-only (not in allTest).
+    const jxlWasmInTestSpace = allTest.some((w) => w.name === "@casabio/jxl-wasm");
+    assert.ok(!jxlWasmInTestSpace, "@casabio/jxl-wasm must not have a test script");
+
+    // A build plan that includes jxl-wasm — omitting it from test guard must still pass.
+    await assert.doesNotReject(
+      async () => assertAllTestWorkspaces(allTest, REPO_ROOT),
+      "full test plan should pass guard even though build-only workspaces are absent"
+    );
+
+    // Case B: plan = all test workspaces PLUS the build-only entry added as a stub.
+    // The guard cares only about test-space membership; extra entries are fine.
+    const planWithBuildOnlyExtra = [
       ...allTest,
-      // Add a dummy build-only entry to simulate a build workspace being in the plan
       { name: "@casabio/jxl-wasm", directory: "packages/jxl-wasm", command: "build", dependencies: [] },
     ];
-    // Then remove jxl-wasm from the plan — since it has no 'test' script,
-    // assertAllTestWorkspaces must still pass.
-    const planWithoutJxlWasm = allTest; // jxl-wasm was never in test plan anyway
-    await assert.doesNotReject(async () => assertAllTestWorkspaces(planWithoutJxlWasm, REPO_ROOT));
+    await assert.doesNotReject(
+      async () => assertAllTestWorkspaces(planWithBuildOnlyExtra, REPO_ROOT),
+      "plan with extra build-only entry should also pass guard"
+    );
   });
 });
 
@@ -268,5 +283,88 @@ describe("benchmark task registration", () => {
       w.command.includes("benchmark")
     );
     assert.ok(!hasBenchmark, "benchmark scripts must not appear in the test task plan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. runTasks executor — injectable fake runner (no subprocess)
+// ---------------------------------------------------------------------------
+
+describe("runTasks executor", () => {
+  /**
+   * Build a fake runner that resolves tasks after a simulated async delay.
+   * `timings` maps task name → { delayMs, code }.
+   * Tasks not listed default to { delayMs: 0, code: 0 }.
+   */
+  function makeFakeRunner(timings = {}) {
+    const startOrder = [];
+    const runner = (task) => {
+      startOrder.push(task.name);
+      const { delayMs = 0, code = 0 } = timings[task.name] ?? {};
+      return new Promise((resolve) =>
+        setTimeout(
+          () => resolve({ name: task.name, code, stdout: `out:${task.name}`, stderr: "" }),
+          delayMs
+        )
+      );
+    };
+    runner.startOrder = startOrder;
+    return runner;
+  }
+
+  it("C1: output is emitted in stable topo order even when tasks complete out of order", async () => {
+    // A and B are independent; A finishes slowly, B finishes fast.
+    // Topo sort puts @casabio/A before @casabio/B (alphabetical tie-break).
+    // With the old code, B's printResult would fire first.
+    // With the C1 fix, A must always appear before B in collected output.
+    const taskA = ws("@casabio/A");
+    const taskB = ws("@casabio/B");
+    const ordered = [taskA, taskB]; // topo order: A, B
+
+    const printedOrder = [];
+    const origLog = console.log;
+    console.log = (...args) => {
+      // Capture the ">> [PASS] ..." header lines
+      const line = args.join(" ");
+      if (line.includes("@casabio/A") || line.includes("@casabio/B")) {
+        printedOrder.push(line.includes("@casabio/A") ? "@casabio/A" : "@casabio/B");
+      }
+    };
+
+    const runner = makeFakeRunner({
+      "@casabio/A": { delayMs: 30, code: 0 }, // slow
+      "@casabio/B": { delayMs: 0,  code: 0 }, // fast — would print first without C1 fix
+    });
+
+    try {
+      const passed = await runTasks(ordered, { concurrency: 2, runner });
+      assert.ok(passed, "both tasks should pass");
+    } finally {
+      console.log = origLog;
+    }
+
+    assert.deepEqual(
+      printedOrder,
+      ["@casabio/A", "@casabio/B"],
+      "output must appear in topo order (A before B), not completion order"
+    );
+  });
+
+  it("fail-fast: a failed task prevents its dependents from starting", async () => {
+    // Chain: A → B (B depends on A). A fails.
+    const taskA = ws("@casabio/A");
+    const taskB = ws("@casabio/B", { deps: ["@casabio/A"] });
+    const ordered = [taskA, taskB];
+
+    const runner = makeFakeRunner({
+      "@casabio/A": { delayMs: 0, code: 1 }, // A fails
+      "@casabio/B": { delayMs: 0, code: 0 }, // B would pass but must not start
+    });
+
+    const passed = await runTasks(ordered, { concurrency: 4, runner });
+
+    assert.ok(!passed, "runTasks must return false when a task fails");
+    assert.ok(runner.startOrder.includes("@casabio/A"), "A must have been started");
+    assert.ok(!runner.startOrder.includes("@casabio/B"), "B must NOT start after A fails (fail-fast)");
   });
 });
