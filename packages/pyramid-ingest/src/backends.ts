@@ -1,4 +1,5 @@
 import * as JxlWasmNS from "@casabio/jxl-wasm";
+import { throwIfAborted } from "./abort.js";
 const JW: any = JxlWasmNS;
 
 export type MasterFormat = "orf" | "dng" | "cr2" | "jpg";
@@ -67,21 +68,30 @@ export interface PyramidEncodeOptions {
 }
 
 export interface RawBackend {
-  decode(bytes: Uint8Array, format: RawFormat): Promise<DecodedMaster>;
+  // finding 67 (Task 6): optional combined per-image signal (caller cancel + deadline). A backend that
+  // can decode incrementally should abort mid-decode when it fires; backends that ignore it still get
+  // stopped at the stage boundaries in ingest.ts (throwIfAborted before/after decode).
+  decode(bytes: Uint8Array, format: RawFormat, signal?: AbortSignal): Promise<DecodedMaster>;
 }
 
 export interface JxlBackend {
+  // finding 67 (Task 6): the trailing optional `signal` is the combined per-image signal (caller
+  // cancel + deadline). Encode/downscale are the heaviest stages; a backend that can check it should
+  // stop early. Backends that ignore it are still bounded by the throwIfAborted stage checkpoints in
+  // ingest.ts (before ladder build and before publish).
   encodePyramid(
     rgba: Uint8Array,
     width: number,
     height: number,
     opts: PyramidEncodeOptions,
+    signal?: AbortSignal,
   ): Promise<PyramidLevelBytes[]>;
   encodeTileContainer(
     rgba: Uint8Array,
     width: number,
     height: number,
     opts: TileContainerEncodeOptions,
+    signal?: AbortSignal,
   ): Promise<Uint8Array>;
   /** 16-bit JXTC path (available after JXTC-16 WASM rebuild; v1 tiled top uses 8-bit). */
   encodeTileContainer16?(
@@ -89,6 +99,7 @@ export interface JxlBackend {
     width: number,
     height: number,
     opts: TileContainerEncodeOptions,
+    signal?: AbortSignal,
   ): Promise<Uint8Array>;
   /** Downscale helpers for per-level tiled encoding (Phase 3 all-levels JXTC). */
   downscaleRgba8(
@@ -97,6 +108,7 @@ export interface JxlBackend {
     srcH: number,
     dstW: number,
     dstH: number,
+    signal?: AbortSignal,
   ): Promise<Uint8Array>;
   downscaleRgba16?(
     rgba16: Uint16Array | Uint8Array,
@@ -127,7 +139,8 @@ export interface Clock {
 export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
   const tel = telemetry;
   return {
-    async encodePyramid(rgba, width, height, opts) {
+    async encodePyramid(rgba, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
       const sidecarSizes = opts.sidecars.map((s) => s.size);
       const sidecarDistances = opts.sidecars.map((s) => s.distance);
       const enc = JW.encodeRgba8Pyramid;
@@ -142,7 +155,8 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return levels.map((l: { data: Uint8Array; width: number; height: number }) => ({ data: l.data, width: l.width, height: l.height }));
     },
 
-    async encodeTileContainer(rgba, width, height, opts) {
+    async encodeTileContainer(rgba, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67: WASM encode is synchronous+uninterruptible; gate at entry
       const t0 = Date.now();
       const enc = JW.encodeTileContainerRgba8;
       const data = await enc(rgba, width, height, {
@@ -156,7 +170,8 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return data;
     },
 
-    async encodeTileContainer16(rgba16, width, height, opts) {
+    async encodeTileContainer16(rgba16, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
       const t0 = Date.now();
       const enc = JW.encodeTileContainerRgba16;
       if (typeof enc !== "function") throw new Error("encodeTileContainerRgba16 missing on jxl-wasm module (16-bit JXTC build required)"); // BK-4
@@ -171,7 +186,8 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return data;
     },
 
-    async downscaleRgba8(rgba, srcW, srcH, dstW, dstH) {
+    async downscaleRgba8(rgba, srcW, srcH, dstW, dstH, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
       const t0 = Date.now();
       const ds = JW.downscaleRgba8;
       if (typeof ds !== "function") throw new Error("downscaleRgba8 missing on jxl-wasm module");

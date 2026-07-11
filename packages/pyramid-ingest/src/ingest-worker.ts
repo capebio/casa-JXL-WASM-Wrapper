@@ -30,7 +30,12 @@ parentPort.on("message", async (msg: { id: number; path: string; opts: IngestOpt
     const dur = Date.now() - t0;
     parentPort!.postMessage({ id: msg.id, ok: true, outcome: res.outcome, stagedBytes: res.stagedBytes, durationMs: dur });
   } catch (err: unknown) {
-    const e = err instanceof Error ? { message: err.message, stack: err.stack } : { message: String(err) };
+    // finding 67 (Task 6): preserve the abort `code` ("ABORT_ERR") and `stage` across the worker
+    // boundary so the coordinator can attribute a timed-out image to its stage instead of losing it
+    // to a bare message string. (structuredClone drops Error subclass fields, so copy explicitly.)
+    const e = err instanceof Error
+      ? { message: err.message, stack: err.stack, code: (err as any).code, stage: (err as any).stage }
+      : { message: String(err), code: (err as any)?.code, stage: (err as any)?.stage };
     parentPort!.postMessage({ id: msg.id, ok: false, error: e, durationMs: Date.now() - t0 });
   }
 });

@@ -1,6 +1,7 @@
 import { EFFORT, planLadder, planProxy } from "./quality.js";
 import { encodeBigLevelsRgba16, packedRgb16ToRgba16, targetDimsForLongEdge } from "./rgb16.js";
 import type { DecodedMaster, JxlBackend, Orientation, PyramidLevelBytes } from "./backends.js";
+import { throwIfAborted } from "./abort.js";
 
 export interface LadderResult {
   levels: PyramidLevelBytes[];
@@ -31,7 +32,7 @@ function isMassive(width: number, height: number): boolean {
   return Math.max(width, height) > MASSIVE_LONG_EDGE || width * height > MASSIVE_PIXELS;
 }
 
-export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, profileConvergence = false, tiling: TilingPolicy = "adaptive"): Promise<LadderResult> {
+export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, profileConvergence = false, tiling: TilingPolicy = "adaptive", signal?: AbortSignal): Promise<LadderResult> {
   const { rgba, rgb16, width, height } = decoded;
   const masterLong = Math.max(width, height);
 
@@ -48,10 +49,11 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
       .filter((sc) => sc.size <= GRID_MAX_LONG)
       .sort((a, b) => b.size - a.size); // L1: descend
     for (const sc of gridTargets) {
+      throwIfAborted(signal, "encode"); // finding 67: stop between levels on deadline/cancel
       const dst = targetDimsForLongEdge(width, height, sc.size);
       if (dst.w === lastW && dst.h === lastH) continue; // L2: dedup exact dims (e.g. small master)
       if (dst.w !== cw || dst.h !== ch) {
-        cur8 = await jxl.downscaleRgba8(cur8, cw, ch, dst.w, dst.h);
+        cur8 = await jxl.downscaleRgba8(cur8, cw, ch, dst.w, dst.h, signal);
         cw = dst.w; ch = dst.h;
       }
       lastW = cw; lastH = ch;
@@ -60,7 +62,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
         tileSize: TILE_SIZE,
         distance: sc.distance,
         effort: EFFORT,
-      });
+      }, signal);
       gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes });
     }
     gridLevels.reverse(); // L1: restore ascending for manifest/levels output invariant
@@ -86,6 +88,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     }
     let lastW16 = -1, lastH16 = -1;
     for (const t of bigTargets) {
+      throwIfAborted(signal, "encode"); // finding 67: stop between 16-bit levels on deadline/cancel
       const dst = targetDimsForLongEdge(width, height, t.longEdge);
       if (dst.w === lastW16 && dst.h === lastH16) continue; // L2 dedup
       if (dst.w !== cw16 || dst.h !== ch16) {
@@ -98,7 +101,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
         tileSize: TILE_SIZE,
         distance: t.distance,
         effort: EFFORT,
-      });
+      }, signal);
       bigLevels.push({ data, width: cw16, height: ch16, bitsPerSample: 16, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes });
     }
 
@@ -121,10 +124,11 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
   const massive = isMassive(width, height);
   let lastW = -1, lastH = -1;
   for (const t of targets) {
+    throwIfAborted(signal, "encode"); // finding 67: stop between levels on deadline/cancel
     const dst = targetDimsForLongEdge(width, height, t.size);
     if (dst.w === lastW && dst.h === lastH) continue; // L2
     if (dst.w !== cw || dst.h !== ch) {
-      cur = await jxl.downscaleRgba8(cur, cw, ch, dst.w, dst.h);
+      cur = await jxl.downscaleRgba8(cur, cw, ch, dst.w, dst.h, signal);
       cw = dst.w; ch = dst.h;
     }
     lastW = cw; lastH = ch;
@@ -132,8 +136,8 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     const tiled = tiling === "tile-all" || (isFull && massive);
     const stagedBytes = cur.byteLength;
     const data = tiled
-      ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT })
-      : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }))[0]!.data;
+      ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT }, signal)
+      : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }, signal))[0]!.data;
     levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
   }
   levels.reverse(); // L1: restore ascending
@@ -179,12 +183,15 @@ export async function buildJpgLadder(
   profileConvergence = false,
   orientation: Orientation = "source",
   tiling: TilingPolicy = "adaptive",
+  signal?: AbortSignal,
 ): Promise<LadderResult> {
   // Transcode (lossless JPEG->JXL), then decode once for the downscaled sidecar levels.
+  throwIfAborted(signal, "decode"); // finding 67: do not begin transcode/decode after the deadline
   const fullJxl = await jxl.transcodeJpeg(jpeg);
   const decoded = await jxl.decodeToRgba8(fullJxl);
   const w = decoded.width, h = decoded.height;
   const masterLong = Math.max(w, h);
+  throwIfAborted(signal, "encode"); // deadline may have fired during transcode/decode
 
   // consume Agent5: planLadder(master) gives ratio-guarded sidecars (all < master)
   const p = planLadder(masterLong);
@@ -195,24 +202,26 @@ export async function buildJpgLadder(
   let cw = w, ch = h;
   let lastW = -1, lastH = -1;
   for (const t of sidecarTargets) {
+    throwIfAborted(signal, "encode"); // finding 67: stop between levels on deadline/cancel
     const dst = targetDimsForLongEdge(w, h, t.size);
     if (dst.w === lastW && dst.h === lastH) continue; // L2
     if (dst.w !== cw || dst.h !== ch) {
-      cur = await jxl.downscaleRgba8(cur, cw, ch, dst.w, dst.h);
+      cur = await jxl.downscaleRgba8(cur, cw, ch, dst.w, dst.h, signal);
       cw = dst.w; ch = dst.h;
     }
     lastW = cw; lastH = ch;
     const tiled = tiling === "tile-all";
     const stagedBytes = cur.byteLength;
     const data = tiled
-      ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT })
-      : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }))[0]!.data;
+      ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT }, signal)
+      : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }, signal))[0]!.data;
     levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
   }
   // Full level. Adaptive: reuse the bit-exact lossless transcode (fast + lossless — see the
   // jpg-full-transcode-vs-jxtc flipflop). Tile-all: a lossy JXTC re-encode for uniform tiled decode.
+  throwIfAborted(signal, "encode"); // finding 67: before the (heavy) full level
   if (tiling === "tile-all") {
-    const data = await jxl.encodeTileContainer(decoded.rgba, w, h, { tileSize: TILE_SIZE, distance: p.fullDistance, effort: EFFORT });
+    const data = await jxl.encodeTileContainer(decoded.rgba, w, h, { tileSize: TILE_SIZE, distance: p.fullDistance, effort: EFFORT }, signal);
     levels.push({ data, width: w, height: h, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes: decoded.rgba.byteLength });
   } else {
     levels.push({ data: fullJxl, width: w, height: h, bitsPerSample: 8, tiled: false, stagedBytes: decoded.rgba.byteLength });
@@ -235,14 +244,16 @@ export async function buildProxyLadder(
   size: number,
   orientation: Orientation,
   profileConvergence = false,
+  signal?: AbortSignal,
 ): Promise<LadderResult> {
+  throwIfAborted(signal, "encode"); // finding 67: do not begin proxy encode after the deadline
   // L6: proxy is the only path still using encodePyramid (monolithic whole-frame JXL, no tiled:true).
   // All other ladders emit JXTC via encodeTileContainer (tiled:true). The jxl-pyramid decoder
   // (level-source.ts) supports both "whole" and "tiled" LevelSource kinds; prepareDecodePlan
   // requires tiled for region/tile paths but whole is valid for the single small proxy level.
   // Monolithic is intentional here (proxy is one small level; single-shot decode has lower overhead
   // than JXTC tile index for tiny payloads). Documented; no switch to encodeTileContainer.
-  const produced = await jxl.encodePyramid(rgba, width, height, planProxy(size));
+  const produced = await jxl.encodePyramid(rgba, width, height, planProxy(size), signal);
   const level = produced[0];
   if (!level) throw new Error("proxy encode produced no level");
   const outLevels: PyramidLevelBytes[] = [{ ...level, bitsPerSample: 8, stagedBytes: rgba.byteLength }];
