@@ -66,4 +66,118 @@ describe("loadJxlModule role-aware loading", () => {
     expect(requested[0]).toContain("enc.");
     expect(requested.some((a) => a.includes("dec."))).toBe(false);
   });
+
+  test("perceptual role loads the encoder superset (butteraugli lives there)", async () => {
+    const { loader, requested } = spyLoader();
+    setJxlArtifactLoaderForTesting(loader);
+
+    await loadJxlModule({ role: "perceptual", tier: "simd-st" });
+
+    expect(requested[0]).toContain("enc.");
+  });
+
+  test("returned JxlModule reports its resolved role, tier, and capabilities", async () => {
+    const { loader } = spyLoader();
+    setJxlArtifactLoaderForTesting(loader);
+
+    const loaded = await loadJxlModule({ role: "decode", tier: "simd-st" });
+
+    expect(loaded.role).toBe("decode");
+    expect(loaded.tier).toBe("simd-st");
+    expect(loaded.capabilities.progressiveDecode).toBe(true);
+    expect(typeof loaded.module).toBe("object");
+  });
+
+  test("tier maps to the matching artifact suffix (simd-st → simd)", async () => {
+    const seen: string[][] = [];
+    setJxlArtifactLoaderForTesting(async (_artifact, candidates) => {
+      seen.push([...candidates]);
+      return fakeWasmModule(candidates[0]);
+    });
+
+    await loadJxlModule({ role: "decode", tier: "simd-st" });
+
+    // Role-specific candidate first, monolithic fallback second.
+    expect(seen[0][0]).toBe("dec.simd");
+    expect(seen[0][1]).toBe("simd");
+  });
+
+  test("scalar tier has no role split — candidates fall back to the monolithic artifact", async () => {
+    const seen: string[][] = [];
+    setJxlArtifactLoaderForTesting(async (_artifact, candidates) => {
+      seen.push([...candidates]);
+      return fakeWasmModule(candidates[0]);
+    });
+
+    await loadJxlModule({ role: "decode", tier: "scalar-st" });
+
+    expect(seen[0]).toContain("scalar");
+  });
+
+  test("unknown role rejects deterministically (never silently coerced)", async () => {
+    const { loader } = spyLoader();
+    setJxlArtifactLoaderForTesting(loader);
+
+    await expect(
+      loadJxlModule({ role: "transcode" as any, tier: "simd-st" }),
+    ).rejects.toThrow(/Unknown JXL role/);
+  });
+
+  test("unknown tier rejects deterministically", async () => {
+    const { loader } = spyLoader();
+    setJxlArtifactLoaderForTesting(loader);
+
+    await expect(
+      loadJxlModule({ role: "decode", tier: "avx512" as any }),
+    ).rejects.toThrow(/Unknown JXL tier/);
+  });
+
+  test("simultaneous callers for the same {role,tier} share one in-flight load", async () => {
+    let loads = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    setJxlArtifactLoaderForTesting(async (_artifact, candidates) => {
+      loads++;
+      await gate;
+      return fakeWasmModule(candidates[0]);
+    });
+
+    const a = loadJxlModule({ role: "decode", tier: "simd-st" });
+    const b = loadJxlModule({ role: "decode", tier: "simd-st" });
+    release();
+    const [ra, rb] = await Promise.all([a, b]);
+
+    expect(loads).toBe(1);
+    expect(ra).toBe(rb); // same cached JxlModule instance
+  });
+
+  test("different roles do NOT share a cached module", async () => {
+    let loads = 0;
+    setJxlArtifactLoaderForTesting(async (_artifact, candidates) => {
+      loads++;
+      return fakeWasmModule(candidates[0]);
+    });
+
+    await Promise.all([
+      loadJxlModule({ role: "decode", tier: "simd-st" }),
+      loadJxlModule({ role: "encode", tier: "simd-st" }),
+    ]);
+
+    expect(loads).toBe(2);
+  });
+
+  test("an already-aborted signal rejects without loading anything", async () => {
+    let loads = 0;
+    setJxlArtifactLoaderForTesting(async (_artifact, candidates) => {
+      loads++;
+      return fakeWasmModule(candidates[0]);
+    });
+    const ac = new AbortController();
+    ac.abort();
+
+    await expect(
+      loadJxlModule({ role: "decode", tier: "simd-st", signal: ac.signal }),
+    ).rejects.toThrow();
+    expect(loads).toBe(0);
+  });
 });
