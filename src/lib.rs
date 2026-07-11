@@ -3456,6 +3456,12 @@ struct DngDecoded {
     make: String,
     model: String,
     iso: u32,
+    /// DNG BaselineExposure (EV); folded into the render exposure. 0.0 when absent.
+    baseline_exposure: f32,
+    datetime: String,
+    gps_lat: Option<f64>,
+    gps_lon: Option<f64>,
+    gps_alt: Option<f64>,
     // Streaming preview cache (empty/false unless the DNG streaming fast path filled it).
     lb_packed: Vec<u8>,
     lb_w: usize,
@@ -3489,7 +3495,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 && w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) <= MAX_PIXELS
             {
                 let phase = src.phase();
-                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, make, model) = {
+                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, baseline_exposure, make, model) = {
                     let m = src.meta();
                     (
                         m.black,
@@ -3499,6 +3505,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                         m.color_matrix,
                         m.orientation,
                         m.iso.unwrap_or(100),
+                        m.baseline_exposure,
                         m.make.clone(),
                         m.model.clone(),
                     )
@@ -3543,6 +3550,11 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                     make,
                     model,
                     iso,
+                    baseline_exposure,
+                    datetime: String::new(),
+                    gps_lat: None,
+                    gps_lon: None,
+                    gps_alt: None,
                     lb_packed,
                     lb_w,
                     lb_h,
@@ -3629,6 +3641,11 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         make: img.make,
         model: img.model,
         iso,
+        baseline_exposure: img.baseline_exposure,
+        datetime: img.datetime,
+        gps_lat: img.gps_lat,
+        gps_lon: img.gps_lon,
+        gps_alt: img.gps_alt,
         lb_packed: Vec::new(),
         lb_w: 0,
         lb_h: 0,
@@ -3659,6 +3676,11 @@ fn process_dng_impl(
         make,
         model,
         iso,
+        baseline_exposure,
+        datetime,
+        gps_lat,
+        gps_lon,
+        gps_alt,
         lb_packed,
         lb_w,
         lb_h,
@@ -3712,9 +3734,12 @@ fn process_dng_impl(
     if look.wb_b.is_finite() && look.wb_b > 0.0 {
         params.wb_b = look.wb_b.min(8.0);
     }
+    // Fold the DNG's own BaselineExposure into the render exposure so low-light / night
+    // Pixel DNGs (which set +1.3..+1.6 EV) reach their intended brightness; the user's
+    // exposure slider still composes on top. 0.0 baseline (or absent tag) = unchanged.
     raw_pipeline::pipeline::apply_look_params(
         &mut params,
-        look.exposure_ev,
+        look.exposure_ev + baseline_exposure,
         look.contrast,
         look.highlights,
         look.shadows,
@@ -3855,7 +3880,7 @@ fn process_dng_impl(
         disp16_h,
         color_matrix_flat,
         lens: String::new(),
-        datetime: String::new(),
+        datetime,
         // den=0 is the absent-sentinel (same as ORF); JS checks den==0 before dividing.
         exposure_num: 0,
         exposure_den: 0,
@@ -3865,10 +3890,10 @@ fn process_dng_impl(
         focal_length_num: 0,
         focal_length_den: 0,
         focal_length_35: 0,
-        gps_lat: 0.0,
-        gps_lon: 0.0,
-        gps_alt: 0.0,
-        has_gps: false,
+        gps_lat: gps_lat.unwrap_or(0.0),
+        gps_lon: gps_lon.unwrap_or(0.0),
+        gps_alt: gps_alt.unwrap_or(0.0),
+        has_gps: gps_lat.is_some() && gps_lon.is_some(),
         quality: 0,
         wb_mode: 0xFFFF,
         wb_from_camera: true,
@@ -4001,6 +4026,10 @@ struct Cr2Decoded {
     make: String,
     model: String,
     iso: u32,
+    datetime: String,
+    gps_lat: Option<f64>,
+    gps_lon: Option<f64>,
+    gps_alt: Option<f64>,
 }
 
 fn cfa_phase_from_code(code: u32) -> Result<(u8, u8), JsError> {
@@ -4127,6 +4156,11 @@ fn process_raw_mosaic_impl(
             make: String::new(),
             model: String::new(),
             iso: 0,
+            baseline_exposure: 0.0, // generic mosaic path (LibRaw); no DNG BaselineExposure
+            datetime: String::new(),
+            gps_lat: None,
+            gps_lon: None,
+            gps_alt: None,
             lb_packed: Vec::new(),
             lb_w: 0,
             lb_h: 0,
@@ -4292,6 +4326,10 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
         make: cr2.make,
         model: cr2.model,
         iso,
+        datetime: cr2.datetime,
+        gps_lat: cr2.gps_lat,
+        gps_lon: cr2.gps_lon,
+        gps_alt: cr2.gps_alt,
     })
 }
 
@@ -4309,6 +4347,11 @@ impl From<Cr2Decoded> for DngDecoded {
             make: c.make,
             model: c.model,
             iso: c.iso,
+            baseline_exposure: 0.0, // CR2 (Canon) has no DNG BaselineExposure tag
+            datetime: c.datetime,
+            gps_lat: c.gps_lat,
+            gps_lon: c.gps_lon,
+            gps_alt: c.gps_alt,
             lb_packed: Vec::new(),
             lb_w: 0,
             lb_h: 0,
@@ -5375,18 +5418,38 @@ fn decoded_to_wasm(d: raw_pipeline::image_formats::DecodedRgba) -> DecodedImage 
     }
 }
 
-/// Decode a general RGB(A) TIFF (u8 or u16) to RGBA.
+/// Limit profile for developed-image (TIFF/EXR/JPEG) decodes on the wasm32
+/// target: the tight `DecodeLimits::wasm()` profile whose peak working set fits
+/// under the 2 GiB shared-memory ceiling (`tools/build-mt-wasm.sh --max-memory=2G`).
+/// Native builds of this crate (tests/tools) use the loose `native()` profile.
+#[inline]
+fn developed_image_limits() -> raw_pipeline::image_formats::DecodeLimits {
+    #[cfg(target_arch = "wasm32")]
+    {
+        raw_pipeline::image_formats::DecodeLimits::wasm()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        raw_pipeline::image_formats::DecodeLimits::native()
+    }
+}
+
+/// Decode a general RGB(A) TIFF (u8 or u16) to RGBA. Preflights the header
+/// against the platform decode-limit profile, rejecting oversized / bomb inputs
+/// before any pixel buffer is allocated.
 #[wasm_bindgen]
 pub fn decode_tiff(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
-    raw_pipeline::image_formats::decode_tiff_bytes(bytes)
+    raw_pipeline::image_formats::decode_tiff_bytes_limited(bytes, &developed_image_limits())
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// Decode an OpenEXR image to RGBA f32 (linear HDR preserved).
+/// Decode an OpenEXR image to RGBA f32 (linear HDR preserved). Preflights the
+/// header against the platform decode-limit profile (EXR f32 is 16 B/px, so the
+/// output-byte cap is the governing constraint) before decoding.
 #[wasm_bindgen]
 pub fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
-    raw_pipeline::image_formats::decode_exr_bytes(bytes)
+    raw_pipeline::image_formats::decode_exr_bytes_limited(bytes, &developed_image_limits())
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -5394,9 +5457,10 @@ pub fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
 /// Decode a JPEG to RGBA8 for the developed-image edit path (mirrors
 /// `decode_tiff`/`decode_exr`). The lossless archival transcode is a separate
 /// facade path (`transcodeJpegToJxl`); this is the editable-pixels decode.
+/// Preflights the header against the platform decode-limit profile first.
 #[wasm_bindgen]
 pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
-    raw_pipeline::image_formats::decode_jpeg_bytes(bytes)
+    raw_pipeline::image_formats::decode_jpeg_bytes_limited(bytes, &developed_image_limits())
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }

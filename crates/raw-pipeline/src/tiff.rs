@@ -455,7 +455,10 @@ pub fn parse(data: &[u8]) -> Result<OrfInfo> {
     Ok(info)
 }
 
-fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
+/// Parse a GPS sub-IFD's entries into decimal (lat, lon, alt). Shared by the ORF
+/// path (`parse_gps_ifd`) and the generic CR2/DNG path (`parse_exif_gps`). Returns
+/// `None` for any coordinate that is missing or out of range (corrupt EXIF).
+fn gps_from_entries(r: &Reader, entries: &[IfdEntry]) -> (Option<f64>, Option<f64>, Option<f64>) {
     let mut lat_ref = b'N';
     let mut lon_ref = b'E';
     let mut alt_ref: u8 = 0;
@@ -493,18 +496,83 @@ fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
     };
     // Reject out-of-range coordinates (corrupt/garbage EXIF): latitude is bounded
     // to ±90°, longitude to ±180°. An out-of-range value → None (drops has_gps).
-    if let Some(d) = lat_dms {
-        info.gps_lat = to_deg(d, lat_ref).filter(|v| v.abs() <= 90.0);
-    }
-    if let Some(d) = lon_dms {
-        info.gps_lon = to_deg(d, lon_ref).filter(|v| v.abs() <= 180.0);
-    }
-    if let Some((n, d)) = alt {
-        if d != 0 {
+    let lat = lat_dms.and_then(|d| to_deg(d, lat_ref)).filter(|v| v.abs() <= 90.0);
+    let lon = lon_dms.and_then(|d| to_deg(d, lon_ref)).filter(|v| v.abs() <= 180.0);
+    let alt = alt.and_then(|(n, d)| {
+        (d != 0).then(|| {
             let v = n as f64 / d as f64;
-            info.gps_alt = Some(if alt_ref == 1 { -v } else { v });
+            if alt_ref == 1 { -v } else { v }
+        })
+    });
+    (lat, lon, alt)
+}
+
+fn parse_gps_ifd(r: &Reader, entries: &[IfdEntry], info: &mut OrfInfo) {
+    let (lat, lon, alt) = gps_from_entries(r, entries);
+    info.gps_lat = lat;
+    info.gps_lon = lon;
+    info.gps_alt = alt;
+}
+
+/// Standard EXIF datetime + GPS extracted from any TIFF/EXIF byte stream. Populated
+/// by `parse_exif_gps` for the CR2/DNG paths (whose own IFD walkers do not read these
+/// tags), mirroring what the ORF `parse()` already does for Olympus files.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct ExifGps {
+    pub datetime: String,
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
+    pub gps_alt: Option<f64>,
+}
+
+/// Parse standard EXIF `DateTime`/`DateTimeOriginal` + GPS coordinates from a TIFF
+/// byte stream, given endianness and the offset of IFD0 (the main metadata IFD where
+/// Make/Model/DateTime and the Exif/GPS sub-IFD pointers live). Reuses the ORF-proven
+/// `Reader` + GPS parser, so CR2 and DNG get the same handling ORF already has.
+/// All-absent input yields an empty `ExifGps` (never errors).
+pub(crate) fn parse_exif_gps(data: &[u8], le: bool, ifd0_off: u32) -> ExifGps {
+    let r = Reader { data, le };
+    let mut out = ExifGps::default();
+    let ifd0 = match read_ifd(&r, ifd0_off) {
+        Ok(v) => v,
+        Err(_) => return out,
+    };
+    let mut exif_off = 0u32;
+    let mut gps_off = 0u32;
+    for e in &ifd0 {
+        match e.tag {
+            0x0132 => {
+                if out.datetime.is_empty() {
+                    out.datetime = e.as_ascii(&r); // DateTime (IFD0 fallback)
+                }
+            }
+            0x8769 => exif_off = e.as_u32(&r).unwrap_or(0), // ExifIFD pointer
+            0x8825 => gps_off = e.as_u32(&r).unwrap_or(0),  // GPS IFD pointer
+            _ => {}
         }
     }
+    if exif_off > 0 {
+        if let Ok(exif) = read_ifd(&r, exif_off) {
+            for e in &exif {
+                if e.tag == 0x9003 {
+                    // DateTimeOriginal — preferred over IFD0 DateTime.
+                    let s = e.as_ascii(&r);
+                    if !s.is_empty() && !s.starts_with("0000") {
+                        out.datetime = s;
+                    }
+                }
+            }
+        }
+    }
+    if gps_off > 0 {
+        if let Ok(gps) = read_ifd(&r, gps_off) {
+            let (lat, lon, alt) = gps_from_entries(&r, &gps);
+            out.gps_lat = lat;
+            out.gps_lon = lon;
+            out.gps_alt = alt;
+        }
+    }
+    out
 }
 
 fn parse_header(data: &[u8]) -> Result<(bool, u32)> {
@@ -1374,6 +1442,53 @@ mod tests {
         // II*\0 magic, IFD0 offset = 8 (LE). Exactly 8 bytes — must not be rejected.
         let hdr = [0x49u8, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00];
         assert!(parse_header(&hdr).is_ok());
+    }
+
+    // Synthetic little-endian TIFF: IFD0 (DateTime + GPS-IFD pointer) → GPS sub-IFD
+    // (lat 45°30' N = 45.5, lon 12°15' E = 12.25). Proves the generic CR2/DNG EXIF+GPS
+    // extractor reads standard tags and converts DMS→decimal, without a real GPS file.
+    #[test]
+    fn parse_exif_gps_reads_datetime_and_coords() {
+        let mut d = vec![0u8; 160];
+        let w16 = |d: &mut [u8], o: usize, v: u16| d[o..o + 2].copy_from_slice(&v.to_le_bytes());
+        let w32 = |d: &mut [u8], o: usize, v: u32| d[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        // Header
+        d[0] = 0x49; d[1] = 0x49; w16(&mut d, 2, 0x2A); w32(&mut d, 4, 8);
+        // IFD0 @8: DateTime (0x0132 ASCII@92) + GPS ptr (0x8825 LONG=38)
+        w16(&mut d, 8, 2);
+        w16(&mut d, 10, 0x0132); w16(&mut d, 12, 2); w32(&mut d, 14, 20); w32(&mut d, 18, 92);
+        w16(&mut d, 22, 0x8825); w16(&mut d, 24, 4); w32(&mut d, 26, 1); w32(&mut d, 30, 38);
+        w32(&mut d, 34, 0);
+        // GPS IFD @38: LatRef 'N', Lat@112, LonRef 'E', Lon@136
+        w16(&mut d, 38, 4);
+        w16(&mut d, 40, 0x0001); w16(&mut d, 42, 2); w32(&mut d, 44, 2); w32(&mut d, 46, 0x0000_004E);
+        w16(&mut d, 52, 0x0002); w16(&mut d, 54, 5); w32(&mut d, 56, 3); w32(&mut d, 60, 112);
+        w16(&mut d, 64, 0x0003); w16(&mut d, 66, 2); w32(&mut d, 68, 2); w32(&mut d, 72, 0x0000_0045);
+        w16(&mut d, 76, 0x0004); w16(&mut d, 78, 5); w32(&mut d, 80, 3); w32(&mut d, 84, 136);
+        w32(&mut d, 88, 0);
+        // DateTime string @92 (20 bytes incl NUL)
+        d[92..112].copy_from_slice(b"2021:01:02 03:04:05\0");
+        // Lat rationals @112: 45/1, 30/1, 0/1
+        for (i, v) in [45u32, 1, 30, 1, 0, 1].iter().enumerate() { w32(&mut d, 112 + i * 4, *v); }
+        // Lon rationals @136: 12/1, 15/1, 0/1
+        for (i, v) in [12u32, 1, 15, 1, 0, 1].iter().enumerate() { w32(&mut d, 136 + i * 4, *v); }
+
+        let g = parse_exif_gps(&d, true, 8);
+        assert_eq!(g.datetime, "2021:01:02 03:04:05");
+        assert!((g.gps_lat.unwrap() - 45.5).abs() < 1e-9, "lat {:?}", g.gps_lat);
+        assert!((g.gps_lon.unwrap() - 12.25).abs() < 1e-9, "lon {:?}", g.gps_lon);
+        assert_eq!(g.gps_alt, None);
+    }
+
+    #[test]
+    fn parse_exif_gps_empty_ifd_yields_empty() {
+        // II*\0 header, IFD0 @8 with zero entries + null next pointer.
+        let mut d = vec![0u8; 14];
+        d[0] = 0x49; d[1] = 0x49; d[2] = 0x2A; d[3] = 0x00; d[4] = 8;
+        let g = parse_exif_gps(&d, true, 8);
+        assert_eq!(g.datetime, "");
+        assert_eq!(g.gps_lat, None);
+        assert_eq!(g.gps_lon, None);
     }
 
     // ── GPS metadata parsing (bounds + zero-denominator correctness) ──────────

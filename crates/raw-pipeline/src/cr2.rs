@@ -44,6 +44,12 @@ pub struct Cr2Image {
     pub make: String,
     pub model: String,
     pub orientation: u16,
+    /// EXIF DateTimeOriginal (or DateTime), "YYYY:MM:DD HH:MM:SS", empty if absent.
+    pub datetime: String,
+    /// Decimal GPS (None when the file has no GPS IFD or it is out of range).
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
+    pub gps_alt: Option<f64>,
     /// Bayer CFA phase (row_parity, col_parity) of the top-left cropped pixel.
     /// (0,0) = RGGB origin (Red at top-left). Derived from the SensorInfo
     /// active-area origin parity when the tag is present and consistent; the
@@ -1406,6 +1412,10 @@ fn decode_impl(
     // actual pixels and flip if the green sites are on the other diagonal.
     let cfa_phase = refine_cfa_phase_by_green(&raw_out, crop_w, crop_h, cfa_phase);
 
+    // IFD0 chain above reads only raw-image + ISO tags; pull EXIF datetime + GPS from
+    // the standard Exif/GPS sub-IFDs (same handling ORF already has).
+    let exif = crate::tiff::parse_exif_gps(data, le, ifd0_off as u32);
+
     Ok((
         Cr2Image {
             width: crop_w,
@@ -1422,6 +1432,10 @@ fn decode_impl(
             make,
             model,
             orientation,
+            datetime: exif.datetime,
+            gps_lat: exif.gps_lat,
+            gps_lon: exif.gps_lon,
+            gps_alt: exif.gps_alt,
             cfa_phase,
         },
         timings,

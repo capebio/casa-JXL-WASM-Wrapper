@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "imageId": "9f86d081884c7d65",
+  "master": {
+    "name": "P2200566.ORF",
+    "format": "orf",
+    "mtimeMs": 1717689600000
+  },
+  "orientation": "baked",
+  "width": 4624,
+  "height": 3468,
+  "aspect": 1.3333,
+  "levels": [
+    {
+      "size": 256,
+      "w": 256,
+      "h": 192,
+      "bytes": 5123,
+      "bitsPerSample": 8,
+      "contenthash": "a1b2c3d4e5f60718",
+      "tiled": false
+    },
+    {
+      "size": "full",
+      "w": 4624,
+      "h": 3468,
+      "bytes": 812345,
+      "bitsPerSample": 8,
+      "contenthash": "0011223344556677",
+      "tiled": false
+    }
+  ],
+  "producedBy": {
+    "tool": "pyramid-ingest",
+    "version": "0.1.0",
+    "encoder": {
+      "effort": 3,
+      "quality": {
+        "grid": 85,
+        "big": 95,
+        "proxy": 85
+      }
+    }
+  }
+}
