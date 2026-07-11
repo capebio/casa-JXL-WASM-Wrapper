@@ -20,7 +20,7 @@
  * @typedef {{ name: string; directory: string; command: string; dependencies: string[] }} WorkspaceTask
  */
 
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,7 +51,9 @@ export async function discoverWorkspaces(repoRoot, task) {
   const rootPkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
 
   // Resolve workspace globs → package directories.
-  // We support simple "packages/*" style globs (no negation needed for this repo).
+  // LIMITATION: only "prefix/*" style globs are supported (e.g. "packages/*").
+  // Negation patterns, recursive "**", and other glob forms are silently skipped.
+  // The repo currently uses only "packages/*" so this is sufficient.
   const packageDirs = [];
   for (const pattern of rootPkg.workspaces ?? []) {
     // Split on "*" — take the prefix as the parent dir, list it.
@@ -75,7 +77,11 @@ export async function discoverWorkspaces(repoRoot, task) {
         }
       }
     } else {
-      // Literal directory reference
+      // Literal directory reference (no glob wildcard); warn for unexpected patterns.
+      if (pattern.includes("*") || pattern.includes("?") || pattern.includes("{")) {
+        process.stderr.write(`[run-workspaces] WARNING: unsupported workspace glob pattern skipped: "${pattern}"\n`);
+        continue;
+      }
       packageDirs.push(join(repoRoot, pattern));
     }
   }
@@ -186,7 +192,8 @@ export function topoSort(tasks, dag) {
   }
 
   if (result.length !== tasks.length) {
-    const remaining = tasks.filter((t) => !result.includes(t)).map((t) => t.name);
+    const doneNames = new Set(result.map((t) => t.name));
+    const remaining = tasks.filter((t) => !doneNames.has(t.name)).map((t) => t.name);
     throw new Error(`Cycle detected in workspace dependency graph. Remaining: ${remaining.join(", ")}`);
   }
 
@@ -201,8 +208,9 @@ export function topoSort(tasks, dag) {
  * Assert that every package in the repo that declares a "test" script is
  * represented in `plan`.  Throws with a descriptive message if any are missing.
  *
- * This check only applies to the "test" domain — packages without a "test"
- * script are not checked regardless of what task `plan` was built for.
+ * Deliberate scope: only "test"-script-bearing workspaces are guarded.
+ * Build/typecheck omission is intentionally NOT guarded — "test" is the CI
+ * correctness gate; build omission is a separate concern outside this check.
  *
  * @param {WorkspaceTask[]} plan   the task list being validated
  * @param {string} repoRoot
@@ -270,16 +278,17 @@ function spawnTask(task) {
 
 /**
  * Execute tasks with bounded concurrency, respecting the dependency DAG.
- * Buffers per-task output; prints in stable task-completion order.
+ * Buffers per-task output; prints in stable topo order after all tasks finish.
  * Fail-fast: once any task fails, no new tasks are started.
  *
  * @param {WorkspaceTask[]} ordered  topologically sorted tasks
- * @param {Record<string, string[]>} dag
- * @param {{ concurrency?: number, quiet?: boolean }} [opts]
+ * @param {{ concurrency?: number, quiet?: boolean, runner?: (task: WorkspaceTask) => Promise<{name:string,code:number,stdout:string,stderr:string}> }} [opts]
  * @returns {Promise<boolean>}  true = all passed
  */
-export async function runTasks(ordered, dag, opts = {}) {
+export async function runTasks(ordered, opts = {}) {
   const concurrency = opts.concurrency ?? CONCURRENCY_DEFAULT;
+  // Allow injecting a fake runner for tests (m4); defaults to the real subprocess runner.
+  const runner = opts.runner ?? spawnTask;
   const nameSet = new Set(ordered.map((t) => t.name));
 
   // Track which tasks are done and their results.
@@ -328,7 +337,7 @@ export async function runTasks(ordered, dag, opts = {}) {
       // Pick by topo order: earliest in `ordered` that is ready.
       const task = ready[0];
       remaining.splice(remaining.indexOf(task), 1);
-      const p = spawnTask(task).then((r) => {
+      const p = runner(task).then((r) => {
         done.add(r.name);
         running.delete(r.name);
         results.set(r.name, r);
@@ -336,7 +345,7 @@ export async function runTasks(ordered, dag, opts = {}) {
           failed.add(r.name);
           hasFailure = true;
         }
-        printResult(r);
+        // Do NOT print here — accumulate into results and print in stable order below.
         return r;
       });
       running.set(task.name, p);
@@ -352,11 +361,17 @@ export async function runTasks(ordered, dag, opts = {}) {
   // Seed initial tick.
   await tick();
 
+  // C1: Print all buffered results in stable topo order (ordered), not completion order.
+  for (const t of ordered) {
+    const r = results.get(t.name);
+    if (r) printResult(r);
+  }
+
   if (hasFailure) {
-    // Print which dependents were skipped.
+    // Print which tasks were not started due to fail-fast policy.
     const skipped = remaining.map((t) => t.name);
     if (skipped.length > 0) {
-      console.error(`\n[SKIP] Not started (dependency failed): ${skipped.join(", ")}`);
+      console.error(`\n[SKIP] Not started (fail-fast policy): ${skipped.join(", ")}`);
     }
   }
 
@@ -402,7 +417,7 @@ if (isMain) {
     }
     console.log("");
 
-    const passed = await runTasks(ordered, dag);
+    const passed = await runTasks(ordered);
     process.exit(passed ? 0 : 1);
   })().catch((err) => {
     console.error(err.message);
