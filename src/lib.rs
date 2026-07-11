@@ -15,6 +15,14 @@ use raw_pipeline::tiff;
 
 use wasm_bindgen::prelude::*;
 
+mod denoise_options;
+use denoise_options::RawProcessOptions;
+use raw_pipeline::denoise::{
+    classical_denoise, decide, estimate_noise, score_noise, resolve_noise_model,
+    iso_fallback_model, ActivationMode, DenoiseOptions,
+};
+use raw_pipeline::denoise::dng_tags::RawNoiseMetadata;
+
 // A2: expose rayon thread-pool init to JS when built with --features parallel-wasm
 #[cfg(feature = "parallel-wasm")]
 pub use wasm_bindgen_rayon::init_thread_pool;
@@ -508,6 +516,24 @@ pub struct ProcessResult {
     retained_params: Option<pipeline::PipelineParams>,
     retained_w: usize,
     retained_h: usize,
+    // ── Noise/denoise telemetry (process_*_with_options) ──────────────────────
+    #[wasm_bindgen(readonly)]
+    pub denoise_requested: bool,
+    #[wasm_bindgen(readonly)]
+    pub denoise_applied: bool,
+    #[wasm_bindgen(readonly)]
+    pub denoise_ms: f64,
+    /// 90th-percentile display-space sigma (0–255 scale); 0.0 if not measured.
+    #[wasm_bindgen(readonly)]
+    pub noise_score: f32,
+    /// Estimation confidence [0, 1]; 0.0 if not measured.
+    #[wasm_bindgen(readonly)]
+    pub noise_confidence: f32,
+    // String telemetry — private fields with pub getters (same pattern as make/model).
+    noise_source: String,
+    denoise_backend: String,
+    denoise_reason: String,
+    denoise_model_version: String,
 }
 
 #[wasm_bindgen]
@@ -527,6 +553,22 @@ impl ProcessResult {
     #[wasm_bindgen(getter)]
     pub fn datetime(&self) -> String {
         self.datetime.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn noise_source(&self) -> String {
+        self.noise_source.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn denoise_backend(&self) -> String {
+        self.denoise_backend.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn denoise_reason(&self) -> String {
+        self.denoise_reason.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn denoise_model_version(&self) -> String {
+        self.denoise_model_version.clone()
     }
 }
 
@@ -1518,13 +1560,16 @@ struct FinishOutputs {
     wb_b_used: f32,
 }
 
-/// Sole implementation of the full-res finish stage: MHC demosaic → ISO-gated
-/// luminance NR → look → tone → optional disp16 → optional orientation. Called
-/// by BOTH the normal `OUT_FULL_RGB8` decode path (`process_orf_impl`) and the
-/// mode-3 deferred `ProcessResult::finish_full_rgb8`, so the two are
-/// byte-identical by construction. `params` is camera-derived (pre-look); the
-/// look is applied here. `iso` gates the NR; `orientation` drives the CPU rotate
-/// unless `OUT_NO_ORIENT` is set. Consumes `raw` (freed right after demosaic).
+/// Sole implementation of the full-res finish stage: MHC demosaic → look →
+/// tone → optional disp16 → optional orientation. Called by BOTH the normal
+/// `OUT_FULL_RGB8` decode path (`process_orf_impl`) and the mode-3 deferred
+/// `ProcessResult::finish_full_rgb8`, so the two are byte-identical by
+/// construction. `params` is camera-derived (pre-look); the look is applied
+/// here. `orientation` drives the CPU rotate unless `OUT_NO_ORIENT` is set.
+/// Consumes `raw` (freed right after demosaic).
+///
+/// The `_iso` parameter is kept for ABI stability (callers already pass it)
+/// but is no longer used — ISO-gated hardcoded NR was removed in T6.
 fn finish_from_raw(
     raw: Vec<u16>,
     w: usize,
@@ -1532,7 +1577,7 @@ fn finish_from_raw(
     mut params: pipeline::PipelineParams,
     look: &LookOverrides,
     orientation: u16,
-    iso: u32,
+    _iso: u32,
     output_flags: u32,
 ) -> Result<FinishOutputs, JsError> {
     // MHC (quality) demosaic — full-res interleaved RGB16.
@@ -1540,17 +1585,6 @@ fn finish_from_raw(
     let mut rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| JsError::new(&e))?;
     let demosaic_ms = now_ms() - t;
     drop(raw);
-
-    // ISO-gated luminance NR on the MHC output.
-    let nr_strength = match iso {
-        iso if iso >= 6400 => 0.50f32,
-        iso if iso >= 3200 => 0.35,
-        iso if iso >= 1600 => 0.20,
-        _ => 0.0,
-    };
-    if nr_strength > 0.0 {
-        pipeline::apply_luminance_nr(&mut rgb16, w, h, nr_strength);
-    }
 
     // Apply the look to the camera-derived params (WB override + LR sliders).
     apply_look_to_params(&mut params, look);
@@ -1885,6 +1919,15 @@ fn process_orf_impl(
         retained_params,
         retained_w,
         retained_h,
+        denoise_requested: false,
+        denoise_applied: false,
+        denoise_ms: 0.0,
+        noise_score: 0.0,
+        noise_confidence: 0.0,
+        noise_source: String::new(),
+        denoise_backend: "none".to_string(),
+        denoise_reason: "disabled".to_string(),
+        denoise_model_version: String::new(),
     })
 }
 
@@ -2039,6 +2082,95 @@ pub fn process_orf_with_look(
 ) -> Result<ProcessResult, JsError> {
     let look = LookOverrides::from_js(&look)?;
     process_orf_impl(decode_orf_raw(data, output_flags)?, output_flags, &look)
+}
+
+/// T6 noise-aware API for ORF (see `process_dng_with_options`).
+///
+/// When `denoise.enabled` is true the full raw mosaic is always materialized
+/// (equivalent to including `OUT_FULL_RGB8`), so the streaming preview-only
+/// fast path will not fire even if only lb/thumb are requested.
+#[wasm_bindgen]
+pub fn process_orf_with_options(
+    data: &[u8],
+    output_flags: u32,
+    options: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let opts = RawProcessOptions::from_js(&options)?;
+    if !opts.denoise.enabled {
+        return process_orf_impl(decode_orf_raw(data, output_flags)?, output_flags, &opts.look);
+    }
+    // Force full-res decode so the streaming preview path doesn't drop the raw.
+    let flags_full = output_flags | OUT_FULL_RGB8;
+    let decoded = decode_orf_raw(data, flags_full)?;
+    let w = decoded.w;
+    let h = decoded.h;
+    let iso_opt = decoded.info.iso;
+    let orientation = decoded.info.orientation;
+    // Build a per-plane noise metadata from the Olympus fixed black/white levels.
+    let noise_metadata = RawNoiseMetadata {
+        black: [OLYMPUS_BLACK_LEVEL as f32; 4],
+        white: [4095.0f32; 4],
+        ..RawNoiseMetadata::default()
+    };
+    // cfa_index 0 = RGGB (Olympus is always RGGB).
+    let cfa_index = 0usize;
+    // Demosaic the raw to produce the MHC baseline.
+    let t_dem = now_ms();
+    let rgb16 = demosaic::demosaic_rggb_mhc(&decoded.raw, w, h)
+        .map_err(|e| JsError::new(&format!("ORF demosaic: {}", e)))?;
+    let demosaic_ms = now_ms() - t_dem;
+    let (tel, denoised_rgb16) = run_denoise_on_rgb16(
+        &decoded.raw,
+        rgb16,
+        w,
+        h,
+        cfa_index,
+        &noise_metadata,
+        iso_opt,
+        &opts.denoise,
+    );
+    // Convert the ORF data into a DngDecoded shell so process_dng_impl can
+    // handle the lb/thumb/tone/orient pipeline without code duplication.
+    let wb_from_camera = decoded.wb_from_camera;
+    let color_matrix_flat = decoded.color_matrix_flat;
+    let color_matrix_from_mn = decoded.color_matrix_from_mn;
+    let params = decoded.params;
+    let mut result = process_dng_impl(
+        DngDecoded {
+            rgb16: denoised_rgb16,
+            aw: w,
+            ah: h,
+            params,
+            color_matrix_flat,
+            decode_ms: decoded.decompress_ms,
+            demosaic_ms,
+            orientation,
+            make: decoded.info.make,
+            model: decoded.info.model,
+            iso: decoded.info.iso.unwrap_or(0),
+            datetime: decoded.info.datetime,
+            gps_lat: decoded.info.gps_lat,
+            gps_lon: decoded.info.gps_lon,
+            gps_alt: decoded.info.gps_alt,
+            lb_packed: decoded.lb_packed,
+            lb_w: decoded.lb_w,
+            lb_h: decoded.lb_h,
+            thumb_packed: decoded.thumb_packed,
+            thumb_w: decoded.thumb_w,
+            thumb_h: decoded.thumb_h,
+            fast_preview: decoded.fast_preview,
+            raw_mosaic: Vec::new(), // freed after denoise
+            cfa_index,
+            noise_metadata,
+        },
+        output_flags,
+        &opts.look,
+    )?;
+    // Patch ORF-specific fields that process_dng_impl doesn't set.
+    result.color_matrix_from_mn = color_matrix_from_mn;
+    result.wb_from_camera = wb_from_camera;
+    apply_denoise_telemetry(&mut result, tel, &opts.denoise);
+    Ok(result)
 }
 
 /// S6 — decode only a rectangular region of an Olympus ORF file.
@@ -3444,6 +3576,148 @@ pub fn bench_decode_orf(data: &[u8]) -> Result<DecodeBench, JsError> {
     })
 }
 
+// ─── T6 denoise orchestration helpers ─────────────────────────────────────────
+
+/// Telemetry produced by the denoise orchestration for one image.
+struct DenoiseTelemetry {
+    applied: bool,
+    elapsed_ms: f64,
+    noise_score: f32,
+    noise_confidence: f32,
+    noise_source: String,
+    backend: String, // "none" | "classical" | "webgpu"
+    reason: String,
+    model_version: String,
+}
+
+impl DenoiseTelemetry {
+    fn disabled() -> Self {
+        DenoiseTelemetry {
+            applied: false,
+            elapsed_ms: 0.0,
+            noise_score: 0.0,
+            noise_confidence: 0.0,
+            noise_source: String::new(),
+            backend: "none".to_string(),
+            reason: "disabled".to_string(),
+            model_version: String::new(),
+        }
+    }
+}
+
+/// Apply denoise telemetry to a ProcessResult.
+fn apply_denoise_telemetry(
+    result: &mut ProcessResult,
+    tel: DenoiseTelemetry,
+    opts: &DenoiseOptions,
+) {
+    result.denoise_requested = opts.enabled;
+    result.denoise_applied = tel.applied;
+    result.denoise_ms = tel.elapsed_ms;
+    result.noise_score = tel.noise_score;
+    result.noise_confidence = tel.noise_confidence;
+    result.noise_source = tel.noise_source;
+    result.denoise_backend = tel.backend;
+    result.denoise_reason = tel.reason;
+    result.denoise_model_version = tel.model_version;
+}
+
+/// Core denoise orchestration: estimate noise, score, decide, optionally run
+/// `classical_denoise` on the MHC rgb16 baseline.
+///
+/// Returns `(telemetry, denoised_rgb16)`. When the policy decides not to apply
+/// (or estimation fails), `denoised_rgb16` is the original `rgb_mhc` unchanged.
+///
+/// # Arguments
+/// - `raw`:          Raw Bayer u16 mosaic (row-major, sensor counts).
+/// - `rgb_mhc`:      MHC-demosaiced RGB16 baseline (consumed and returned).
+/// - `width`, `height`: Image dimensions.
+/// - `cfa_index`:    0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR.
+/// - `metadata`:     Per-plane black/white + optional embedded NoiseProfile.
+/// - `iso`:          Sensor ISO from EXIF (None = absent).
+/// - `opts`:         User-supplied denoise options.
+fn run_denoise_on_rgb16(
+    raw: &[u16],
+    rgb_mhc: Vec<u16>,
+    width: usize,
+    height: usize,
+    cfa_index: usize,
+    metadata: &RawNoiseMetadata,
+    iso: Option<u32>,
+    opts: &DenoiseOptions,
+) -> (DenoiseTelemetry, Vec<u16>) {
+    if !opts.enabled {
+        return (DenoiseTelemetry::disabled(), rgb_mhc);
+    }
+
+    // Blind noise estimation from the raw mosaic.
+    let blind = estimate_noise(raw, width, height, cfa_index, metadata);
+
+    // Resolve best model: embedded DNG > registry (not available here) > blind > ISO fallback.
+    let embedded = metadata.embedded_noise;
+    let model_opt = resolve_noise_model(embedded, None, blind)
+        .or_else(|| iso.map(iso_fallback_model));
+
+    let Some(model) = model_opt else {
+        // No model available at all — decision will be NoiseUnavailable.
+        let decision = decide(opts, iso, None, None);
+        let tel = DenoiseTelemetry {
+            applied: false,
+            elapsed_ms: 0.0,
+            noise_score: 0.0,
+            noise_confidence: 0.0,
+            noise_source: String::new(),
+            backend: "none".to_string(),
+            reason: format!("{:?}", decision.reason),
+            model_version: String::new(),
+        };
+        return (tel, rgb_mhc);
+    };
+
+    // Score the noise in display space. Use neutral WB [1,1,1,1] since we don't
+    // want WB gains to influence the noise threshold comparison.
+    let wb_neutral = [1.0f32; 4];
+    let metrics = score_noise(raw, width, height, cfa_index, metadata, &model, &wb_neutral);
+
+    // Policy decision.
+    let noise_reduction_applied = metadata.noise_reduction_applied;
+    let decision = decide(opts, iso, Some(metrics), noise_reduction_applied);
+
+    let noise_source_str = format!("{:?}", metrics.source).to_lowercase();
+    let reason_str = format!("{:?}", decision.reason);
+
+    if !decision.apply {
+        let tel = DenoiseTelemetry {
+            applied: false,
+            elapsed_ms: 0.0,
+            noise_score: metrics.display_sigma_p90,
+            noise_confidence: metrics.confidence,
+            noise_source: noise_source_str,
+            backend: "none".to_string(),
+            reason: reason_str,
+            model_version: String::new(),
+        };
+        return (tel, rgb_mhc);
+    }
+
+    // Run classical BM3D denoise.
+    let t_denoise = now_ms();
+    let denoised = classical_denoise(raw, &rgb_mhc, width, height, metadata, &model, &metrics, decision.effective_strength);
+    let elapsed_ms = now_ms() - t_denoise;
+
+    let tel = DenoiseTelemetry {
+        applied: true,
+        elapsed_ms,
+        noise_score: metrics.display_sigma_p90,
+        noise_confidence: metrics.confidence,
+        noise_source: noise_source_str,
+        backend: "classical".to_string(),
+        reason: reason_str,
+        model_version: "classical-bm3d-v1".to_string(),
+    };
+    (tel, denoised)
+}
+
 struct DngDecoded {
     rgb16: Vec<u16>,
     aw: usize,
@@ -3468,6 +3742,11 @@ struct DngDecoded {
     thumb_w: usize,
     thumb_h: usize,
     fast_preview: bool,
+    // Raw mosaic retained for noise-aware processing (empty unless denoise path).
+    // `cfa_index`: 0=RGGB,1=GRBG,2=GBRG,3=BGGR (matches estimate_noise / score_noise).
+    raw_mosaic: Vec<u16>,
+    cfa_index: usize,
+    noise_metadata: RawNoiseMetadata,
 }
 
 /// Shared DNG decode path: decode bytes → validate → align CFA → demosaic → NR → WB/params setup.
@@ -3558,6 +3837,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                     thumb_w,
                     thumb_h,
                     fast_preview: true,
+                    raw_mosaic: Vec::new(),
+                    cfa_index: 0,
+                    noise_metadata: RawNoiseMetadata::default(),
                 });
             }
         }
@@ -3587,13 +3869,13 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     }
 
     let t = now_ms();
-    let phase = match img.cfa {
-        raw_pipeline::dng::Cfa::Rggb => (0, 0),
-        raw_pipeline::dng::Cfa::Grbg => (0, 1),
-        raw_pipeline::dng::Cfa::Gbrg => (1, 0),
-        raw_pipeline::dng::Cfa::Bggr => (1, 1),
+    let (phase, cfa_index) = match img.cfa {
+        raw_pipeline::dng::Cfa::Rggb => ((0u8, 0u8), 0usize),
+        raw_pipeline::dng::Cfa::Grbg => ((0, 1), 1),
+        raw_pipeline::dng::Cfa::Gbrg => ((1, 0), 2),
+        raw_pipeline::dng::Cfa::Bggr => ((1, 1), 3),
     };
-    let mut rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase)
+    let rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase)
         .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
     let demosaic_ms = now_ms() - t;
     let aw = w;
@@ -3613,17 +3895,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         ]
     };
 
-    // Use ISO from DNG metadata for NR strength; fall back to 100 if absent.
-    let iso = img.iso.unwrap_or(100);
-    let nr_strength = match iso {
-        iso if iso >= 6400 => 0.50f32,
-        iso if iso >= 3200 => 0.35,
-        iso if iso >= 1600 => 0.20,
-        _ => 0.0,
-    };
-    if nr_strength > 0.0 {
-        pipeline::apply_luminance_nr(&mut rgb16, aw, ah, nr_strength);
-    }
+    let iso = img.iso.unwrap_or(0);
+    let noise_metadata = img.noise_metadata.clone();
+    let raw_mosaic = img.raw; // move raw — no longer needed by img
 
     Ok(DngDecoded {
         rgb16,
@@ -3648,6 +3922,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         thumb_w: 0,
         thumb_h: 0,
         fast_preview: false,
+        raw_mosaic,
+        cfa_index,
+        noise_metadata,
     })
 }
 
@@ -3682,6 +3959,9 @@ fn process_dng_impl(
         thumb_w,
         thumb_h,
         fast_preview,
+        raw_mosaic: _,
+        cfa_index: _,
+        noise_metadata: _,
     } = decoded;
 
     // M3 full-res 16-bit (DNG/CR2 path). A-5: capture after tone (move, no copy) and pack
@@ -3894,6 +4174,15 @@ fn process_dng_impl(
         retained_params: None,
         retained_w: 0,
         retained_h: 0,
+        denoise_requested: false,
+        denoise_applied: false,
+        denoise_ms: 0.0,
+        noise_score: 0.0,
+        noise_confidence: 0.0,
+        noise_source: String::new(),
+        denoise_backend: "none".to_string(),
+        denoise_reason: "disabled".to_string(),
+        denoise_model_version: String::new(),
     })
 }
 
@@ -4003,6 +4292,43 @@ pub fn process_dng_with_look(
     process_dng_impl(decode_dng_raw(data, output_flags)?, output_flags, &look)
 }
 
+/// T6 noise-aware API for DNG.
+///
+/// `options` is a plain JS object with two optional keys: `"look"` (same
+/// shape as `process_dng_with_look`) and `"denoise"` (see spec). Unknown
+/// key → `JsError`. When `denoise.enabled` is `false` (the default) the
+/// function is byte-identical to `process_dng_with_look`.
+#[wasm_bindgen]
+pub fn process_dng_with_options(
+    data: &[u8],
+    output_flags: u32,
+    options: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let opts = RawProcessOptions::from_js(&options)?;
+    // When denoise is disabled, fall through — identical to process_dng_with_look.
+    if !opts.denoise.enabled {
+        return process_dng_impl(decode_dng_raw(data, output_flags)?, output_flags, &opts.look);
+    }
+    // Denoise requires the full raw mosaic. Force full-res decode so the
+    // streaming preview-only fast path (which drops the raw) doesn't fire.
+    let flags_full = output_flags | OUT_FULL_RGB8;
+    let mut decoded = decode_dng_raw(data, flags_full)?;
+    let (tel, denoised_rgb16) = run_denoise_on_rgb16(
+        &decoded.raw_mosaic,
+        decoded.rgb16,
+        decoded.aw,
+        decoded.ah,
+        decoded.cfa_index,
+        &decoded.noise_metadata,
+        if decoded.iso > 0 { Some(decoded.iso) } else { None },
+        &opts.denoise,
+    );
+    decoded.rgb16 = denoised_rgb16;
+    let mut result = process_dng_impl(decoded, output_flags, &opts.look)?;
+    apply_denoise_telemetry(&mut result, tel, &opts.denoise);
+    Ok(result)
+}
+
 // ─── CR2 pipeline ─────────────────────────────────────────────────────────────
 
 struct Cr2Decoded {
@@ -4021,6 +4347,10 @@ struct Cr2Decoded {
     gps_lat: Option<f64>,
     gps_lon: Option<f64>,
     gps_alt: Option<f64>,
+    // Raw mosaic retained for noise-aware processing (empty unless denoise path).
+    raw_mosaic: Vec<u16>,
+    cfa_index: usize,
+    noise_metadata: RawNoiseMetadata,
 }
 
 fn cfa_phase_from_code(code: u32) -> Result<(u8, u8), JsError> {
@@ -4158,6 +4488,9 @@ fn process_raw_mosaic_impl(
             thumb_w: 0,
             thumb_h: 0,
             fast_preview: false,
+            raw_mosaic: Vec::new(),
+            cfa_index: 0,
+            noise_metadata: RawNoiseMetadata::default(),
         },
         output_flags,
         look,
@@ -4221,6 +4554,98 @@ pub fn process_raw_mosaic_with_flags(
         &look,
     )
 }
+/// T6 noise-aware API for a generic Bayer mosaic (see `process_dng_with_options`).
+///
+/// `raw_u16`: flat u16 Bayer mosaic (row-major). `iso` = sensor ISO (used as
+/// denoise policy hint). `options` is parsed identically to `process_dng_with_options`.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn process_raw_mosaic_with_options(
+    raw_u16: &[u16],
+    width: u32,
+    height: u32,
+    cfa_phase: u32,
+    black: u32,
+    white: u32,
+    wb_r: f32,
+    wb_b: f32,
+    orientation: u32,
+    color_matrix_flat: &[f32],
+    output_flags: u32,
+    iso: u32,
+    options: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let opts = RawProcessOptions::from_js(&options)?;
+    if !opts.denoise.enabled {
+        return process_raw_mosaic_impl(
+            raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b,
+            orientation, color_matrix_flat, output_flags, &opts.look,
+        );
+    }
+    validate_raw_mosaic_shape(raw_u16.len(), width, height).map_err(|e| JsError::new(&e))?;
+    let w = width as usize;
+    let h = height as usize;
+    let phase = cfa_phase_from_code(cfa_phase)?;
+    // Demosaic to get MHC rgb16 baseline.
+    let t_dem = now_ms();
+    let rgb16 = demosaic::demosaic_bayer_mhc(raw_u16, w, h, phase)
+        .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
+    let demosaic_ms = now_ms() - t_dem;
+    // Build noise metadata from caller-supplied black/white.
+    let b = black.min(u16::MAX as u32) as f32;
+    let wh = white.min(u16::MAX as u32) as f32;
+    let noise_metadata = RawNoiseMetadata {
+        black: [b; 4],
+        white: [wh; 4],
+        ..RawNoiseMetadata::default()
+    };
+    let cfa_index = match phase { (0, 0) => 0, (0, 1) => 1, (1, 0) => 2, _ => 3 };
+    let iso_opt = if iso > 0 { Some(iso) } else { None };
+    let (tel, denoised_rgb16) = run_denoise_on_rgb16(
+        raw_u16, rgb16, w, h, cfa_index, &noise_metadata, iso_opt, &opts.denoise,
+    );
+    let (matrix, flat) = matrix_from_flat_or_identity(color_matrix_flat);
+    let mut params = pipeline::PipelineParams::default_olympus();
+    params.black = black.min(u16::MAX as u32) as u16;
+    params.white = white.min(u16::MAX as u32).max(params.black as u32 + 1) as u16;
+    params.wb_r = if wb_r.is_finite() && wb_r > 0.0 { wb_r.min(8.0) } else { 1.0 };
+    params.wb_b = if wb_b.is_finite() && wb_b > 0.0 { wb_b.min(8.0) } else { 1.0 };
+    params.color_matrix = Some(matrix).into();
+    let mut result = process_dng_impl(
+        DngDecoded {
+            rgb16: denoised_rgb16,
+            aw: w,
+            ah: h,
+            params,
+            color_matrix_flat: flat,
+            decode_ms: 0.0,
+            demosaic_ms,
+            orientation: orientation.min(u16::MAX as u32) as u16,
+            make: String::new(),
+            model: String::new(),
+            iso,
+            datetime: String::new(),
+            gps_lat: None,
+            gps_lon: None,
+            gps_alt: None,
+            lb_packed: Vec::new(),
+            lb_w: 0,
+            lb_h: 0,
+            thumb_packed: Vec::new(),
+            thumb_w: 0,
+            thumb_h: 0,
+            fast_preview: false,
+            raw_mosaic: Vec::new(),
+            cfa_index,
+            noise_metadata,
+        },
+        output_flags,
+        &opts.look,
+    )?;
+    apply_denoise_telemetry(&mut result, tel, &opts.denoise);
+    Ok(result)
+}
+
 /// Generic Canon EOS cam-to-sRGB matrix (dcraw/LibRaw coefficients).
 /// Used as the fallback when a CR2 file does not embed its own color matrix.
 const CANON_CAM_TO_SRGB: [[f32; 3]; 3] = [
@@ -4293,16 +4718,25 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
         ]
     };
 
-    let iso = cr2.iso.unwrap_or(100);
-    let nr_strength = match iso {
-        iso if iso >= 6400 => 0.50f32,
-        iso if iso >= 3200 => 0.35,
-        iso if iso >= 1600 => 0.20,
-        _ => 0.0,
+    let iso = cr2.iso.unwrap_or(0);
+    // Build a RawNoiseMetadata from CR2 black/white (no embedded NoiseProfile in CR2).
+    let noise_metadata = {
+        let b = cr2.black as f32;
+        let wh = cr2.white as f32;
+        RawNoiseMetadata {
+            black: [b; 4],
+            white: [wh; 4],
+            ..RawNoiseMetadata::default()
+        }
     };
-    if nr_strength > 0.0 {
-        pipeline::apply_luminance_nr(&mut rgb16, w, h, nr_strength);
-    }
+    // cfa_index: (row,col) → 0=RGGB,1=GRBG,2=GBRG,3=BGGR
+    let cfa_index = match cr2.cfa_phase {
+        (0, 0) => 0usize,
+        (0, 1) => 1,
+        (1, 0) => 2,
+        _ => 3,
+    };
+    let raw_mosaic = cr2.raw; // move raw (no longer used after demosaic)
 
     Ok(Cr2Decoded {
         rgb16,
@@ -4320,6 +4754,9 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
         gps_lat: cr2.gps_lat,
         gps_lon: cr2.gps_lon,
         gps_alt: cr2.gps_alt,
+        raw_mosaic,
+        cfa_index,
+        noise_metadata,
     })
 }
 
@@ -4348,6 +4785,9 @@ impl From<Cr2Decoded> for DngDecoded {
             thumb_w: 0,
             thumb_h: 0,
             fast_preview: false,
+            raw_mosaic: c.raw_mosaic,
+            cfa_index: c.cfa_index,
+            noise_metadata: c.noise_metadata,
         }
     }
 }
@@ -4456,6 +4896,34 @@ pub fn process_cr2_with_look(
 ) -> Result<ProcessResult, JsError> {
     let look = LookOverrides::from_js(&look)?;
     process_cr2_impl(decode_cr2_raw(data)?, output_flags, &look)
+}
+
+/// T6 noise-aware API for CR2 (see `process_dng_with_options`).
+#[wasm_bindgen]
+pub fn process_cr2_with_options(
+    data: &[u8],
+    output_flags: u32,
+    options: JsValue,
+) -> Result<ProcessResult, JsError> {
+    let opts = RawProcessOptions::from_js(&options)?;
+    if !opts.denoise.enabled {
+        return process_cr2_impl(decode_cr2_raw(data)?, output_flags, &opts.look);
+    }
+    let mut decoded = decode_cr2_raw(data)?;
+    let (tel, denoised_rgb16) = run_denoise_on_rgb16(
+        &decoded.raw_mosaic,
+        decoded.rgb16,
+        decoded.aw,
+        decoded.ah,
+        decoded.cfa_index,
+        &decoded.noise_metadata,
+        if decoded.iso > 0 { Some(decoded.iso) } else { None },
+        &opts.denoise,
+    );
+    decoded.rgb16 = denoised_rgb16;
+    let mut result = process_dng_impl(decoded.into(), output_flags, &opts.look)?;
+    apply_denoise_telemetry(&mut result, tel, &opts.denoise);
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
