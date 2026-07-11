@@ -68,7 +68,7 @@ pub struct NoiseMetrics {
 /// User-facing denoise options.
 ///
 /// # Defaults
-/// enabled=false, Auto, iso_threshold=1600, noise_threshold=1.5, strength=1.0
+/// enabled=false, Auto, iso_threshold=1600, noise_threshold=4.0, strength=1.0
 ///
 /// # Clamping
 /// - iso_threshold: 25..=409600
@@ -82,7 +82,7 @@ pub struct DenoiseOptions {
     pub activation: ActivationMode,
     /// ISO threshold for Iso and Auto-fallback modes. Default: 1600.
     pub iso_threshold: u32,
-    /// Noise threshold (display_sigma_p90) for Auto mode. Default: 1.5.
+    /// Noise threshold (display_sigma_p90) for Auto mode. Default: 4.0.
     pub noise_threshold: f32,
     /// Multiplier applied to the internal filter strength. Default: 1.0.
     pub strength: f32,
@@ -94,7 +94,7 @@ impl Default for DenoiseOptions {
             enabled: false,
             activation: ActivationMode::Auto,
             iso_threshold: 1600,
-            noise_threshold: 1.5,
+            noise_threshold: 4.0,
             strength: 1.0,
         }
     }

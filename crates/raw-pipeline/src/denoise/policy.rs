@@ -14,8 +14,8 @@ use crate::denoise::types::{
 /// | activation=Iso + ISO missing | skip: IsoUnavailable |
 /// | activation=Iso + ISO < threshold | skip: BelowIsoThreshold |
 /// | activation=Iso + ISO >= threshold | apply: IsoThreshold |
-/// | activation=Auto + confidence >= 0.65 | apply iff display_sigma_p90 >= noise_threshold |
-/// | activation=Auto + confidence < 0.65 | use ISO threshold as fallback |
+/// | activation=Auto + confidence >= 0.5 | apply iff display_sigma_p90 >= noise_threshold |
+/// | activation=Auto + confidence < 0.5 | use ISO threshold as fallback |
 /// | activation=Auto + neither available | skip: NoiseUnavailable |
 ///
 /// effective_strength = strength * (1 - clamp(noise_reduction_applied, 0, 1))
@@ -63,7 +63,7 @@ pub fn decide(
 
         ActivationMode::Auto => {
             match metrics {
-                Some(m) if m.confidence >= 0.65 => {
+                Some(m) if m.confidence >= 0.5 => {
                     if m.display_sigma_p90 >= options.noise_threshold {
                         (true, DenoiseReason::NoiseThreshold, Some(m.source))
                     } else {
@@ -140,7 +140,7 @@ mod tests {
 
     fn high_noise_metrics() -> NoiseMetrics {
         NoiseMetrics {
-            display_sigma_p90: 3.0,
+            display_sigma_p90: 6.0,
             sigma_18: 0.01,
             sigma_shadow: 0.02,
             snr_18_db: 28.0,
@@ -229,7 +229,7 @@ mod tests {
     fn trusted_noise_can_trigger_at_iso_200() {
         let options = DenoiseOptions { enabled: true, ..Default::default() };
         let metrics = NoiseMetrics {
-            display_sigma_p90: 2.1,
+            display_sigma_p90: 6.0,
             sigma_18: 0.004,
             sigma_shadow: 0.012,
             snr_18_db: 33.1,
@@ -277,7 +277,7 @@ mod tests {
             sigma_18: 0.004,
             sigma_shadow: 0.009,
             snr_18_db: 31.0,
-            confidence: 0.50,
+            confidence: 0.45, // below 0.5 threshold → low-confidence ISO fallback
             source: NoiseSource::IsoFallback,
         };
         let d = decide(&opts, Some(800), Some(metrics), None);
@@ -328,7 +328,7 @@ mod tests {
     // auto mode — high confidence but noise below threshold → skip
     #[test]
     fn clean_image_high_confidence_skips() {
-        let opts = default_opts(); // noise_threshold = 1.5
+        let opts = default_opts(); // noise_threshold = 4.0
         let d = decide(&opts, Some(200), Some(low_noise_metrics()), None); // sigma_p90 = 0.5
         assert!(!d.apply);
         assert_eq!(d.reason, DenoiseReason::BelowNoiseThreshold);
@@ -343,7 +343,7 @@ mod tests {
             sigma_18: 0.005,
             sigma_shadow: 0.015,
             snr_18_db: 30.0,
-            confidence: 0.40, // below 0.65
+            confidence: 0.40, // below 0.5
             source: NoiseSource::BlindFit,
         };
         let d = decide(&options, None, Some(metrics), None);

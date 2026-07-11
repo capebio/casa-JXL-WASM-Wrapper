@@ -879,8 +879,8 @@ mod tests {
         // so no flat patches survive the 20% filter → should return None OR low confidence
         if let Some(model) = estimate_noise(&raw, w, h, 0, &meta) {
             assert!(
-                model.confidence < 0.65,
-                "checkerboard should have confidence < 0.65, got {}",
+                model.confidence < 0.5,
+                "checkerboard should have confidence < 0.5, got {}",
                 model.confidence
             );
         }
@@ -1142,8 +1142,8 @@ mod tests {
         // satisfy both assertions simultaneously:
         //   (a) display_sigma_p90 >= 1.5 — with WB[0]=2.0 on red, shot=5e-4 gives
         //       sigma_display ≈ 0.030 → ~1.9 display codes at mid-signal.
-        //   (b) confidence >= 0.65 (NoiseThreshold path) — shot/read ratio 5:1 keeps
-        //       IRLS fit residuals below 1e-4, making fit_cov = exp(−small) ≈ 1.0.
+        //   (b) confidence >= 0.5 (or triggers ISO fallback) — shot/read ratio 5:1 keeps
+        //       IRLS fit residuals low; policy uses noise_threshold=1.5 explicitly.
         //   (c) patch-count ≥ 1024 — 2048×1024 gives 256×64 = 16384 patches/plane.
         //   (d) 16 mean bins populated — gradient [0.05, 0.75].
         let shot = 5e-4f32;
@@ -1166,11 +1166,15 @@ mod tests {
             metrics.display_sigma_p90
         );
 
-        // Run through the policy gate.
-        // Use iso_threshold=200 so the low-confidence ISO fallback path also applies
-        // (blind-fit confidence on a single noisy frame is typically below 0.65; the
-        // fallback correctly uses ISO as a secondary gate).
-        let opts = DenoiseOptions { enabled: true, iso_threshold: 200, ..Default::default() };
+        // Run through the policy gate. sigma_p90 ~1.9 is below the default threshold
+        // (4.0), so set noise_threshold=1.5 explicitly to test the configurable path.
+        // Use iso_threshold=200 as secondary gate for the low-confidence fallback case.
+        let opts = DenoiseOptions {
+            enabled: true,
+            iso_threshold: 200,
+            noise_threshold: 1.5,
+            ..Default::default()
+        };
         let decision = decide(&opts, Some(200), Some(metrics), None);
         assert!(
             decision.apply,
