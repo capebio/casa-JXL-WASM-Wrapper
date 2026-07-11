@@ -11,6 +11,7 @@ import {
   parseManifest,
   CURRENT_MANIFEST_SCHEMA,
   manifestToJson,
+  indexEntrySchema,
 } from "../src/schema";
 
 // M-3: the dead binary WRITE API (manifestToBinary / indexToBinary) is removed — the canonical
@@ -116,7 +117,60 @@ test("buildManifest flags proxy and buildIndexEntry inlines L0", () => {
 
   const idx = buildIndexEntry(proxy);
   expect(idx.imageId).toBe("a".repeat(16));
+  // finding 81: a monolithic 8-bit L0 defaults to the bare seed (no tiled/bitsPerSample) so a seed
+  // decoder treats it as a whole RGBA8 bitstream — the documented default path.
   expect(idx.l0).toEqual({ contenthash: "b".repeat(16), w: 512, h: 384 });
+});
+
+// finding 81: the L0 index seed must declare precision (bitsPerSample) and transport (tiled +
+// tiling descriptor) when they differ from the monolithic-RGBA8 default, so a seed decoder chooses
+// a VALID decode path instead of assuming a whole 8-bit bitstream. L0 is the SMALLEST level after
+// the ascending sort in buildManifest.
+test("finding 81: a tiled L0 seed declares tiled + tiling descriptor so the seed decoder routes to the tile path", () => {
+  const tiledSmall: LevelEntry = {
+    size: 256, w: 256, h: 192, bytes: 9, bitsPerSample: 8, contenthash: "c".repeat(16),
+    tiled: true, tiling: { container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" },
+  } as any;
+  const bigger: LevelEntry = { size: "full", w: 4000, h: 3000, bytes: 20, bitsPerSample: 8, contenthash: "d".repeat(16), tiled: false };
+  const m = buildManifest({
+    imageId: "a".repeat(16), master: { name: "x.orf", format: "orf", mtimeMs: 1 },
+    orientation: "baked", width: 4000, height: 3000, levels: [bigger, tiledSmall],
+  });
+  const idx = buildIndexEntry(m);
+  expect(idx.l0.contenthash).toBe("c".repeat(16)); // smallest level is L0
+  expect(idx.l0.tiled).toBe(true);
+  expect(idx.l0.bitsPerSample).toBe(8);
+  // the seed carries the tiling descriptor so the seed decoder can address tiles without decoding
+  expect((idx.l0 as any).tiling).toEqual({ container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" });
+});
+
+test("finding 81: a 16-bit L0 seed declares bitsPerSample:16 so the seed decoder picks the 16-bit path", () => {
+  const wide16: LevelEntry = {
+    size: 512, w: 512, h: 384, bytes: 12, bitsPerSample: 16, contenthash: "e".repeat(16), tiled: false,
+  };
+  const bigger: LevelEntry = { size: "full", w: 4000, h: 3000, bytes: 30, bitsPerSample: 16, contenthash: "f".repeat(16), tiled: false };
+  const m = buildManifest({
+    imageId: "a".repeat(16), master: { name: "x.dng", format: "dng", mtimeMs: 1 },
+    orientation: "baked", width: 4000, height: 3000, levels: [bigger, wide16],
+  });
+  const idx = buildIndexEntry(m);
+  expect(idx.l0.contenthash).toBe("e".repeat(16));
+  expect(idx.l0.bitsPerSample).toBe(16);
+  expect(idx.l0.tiled).toBeUndefined(); // untiled 16-bit: no transport descriptor, but precision is explicit
+});
+
+test("finding 81: the index schema validates an L0 seed carrying tiled + bitsPerSample + tiling", () => {
+  const entry = indexEntrySchema.parse({
+    imageId: "a".repeat(16),
+    aspect: 1.3333,
+    l0: {
+      contenthash: "c".repeat(16), w: 256, h: 192,
+      tiled: true, bitsPerSample: 8,
+      tiling: { container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" },
+    },
+  });
+  expect((entry.l0 as any).tiled).toBe(true);
+  expect((entry.l0 as any).tiling.tileSize).toBe(256);
 });
 
 test("isUpToDate requires matching mtime and proxy flag alignment (non-proxy or proxy)", () => {

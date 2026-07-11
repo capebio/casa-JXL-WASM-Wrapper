@@ -237,10 +237,20 @@ export const READABLE_MANIFEST_SCHEMAS = [1, 2, 4, 5] as const;
 export const indexEntrySchema = z.object({
   imageId: z.string().regex(/^[0-9a-f]{16}$/),
   aspect: z.number().finite().positive(),
+  // finding 81: the L0 seed declares its PRECISION (bitsPerSample) and TRANSPORT (tiled + optional
+  // TilingDescriptor) so a seed decoder chooses a valid decode path instead of assuming a whole
+  // 8-bit RGBA bitstream. All three are optional + additive: a bare { contenthash, w, h } seed (the
+  // default) IS a monolithic 8-bit level, so pre-finding-81 indexes keep validating and decoding.
   l0: z.object({
     contenthash: z.string().length(16),
     w: z.number().int().positive(),
     h: z.number().int().positive(),
+    /** precision of the seed level's pixels; absent ⇒ 8-bit (monolithic-RGBA8 default). */
+    bitsPerSample: z.union([z.literal(8), z.literal(16)]).optional(),
+    /** whether the seed is a JXTC tile container; absent/false ⇒ a whole-frame bitstream. */
+    tiled: z.boolean().optional(),
+    /** present only when tiled: lets the seed decoder address tiles without decoding. */
+    tiling: tilingDescriptorSchema.optional(),
   }),
   // V4: optional for v2+ manifests (decoder etc not needed in index)
   schema: z.number().optional(),

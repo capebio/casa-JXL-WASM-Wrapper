@@ -103,10 +103,29 @@ export function buildIndexEntry(manifest: Manifest): IndexEntry {
   // aspect is optional on v1 manifests; the index schema requires it, so fail loudly here
   // (previously undefined would flow through and fail galleryIndexSchema.parse later).
   if (manifest.aspect == null) throw new Error(`manifest ${manifest.imageId} has no aspect`);
+  // finding 81: make the L0 seed's precision + transport EXPLICIT so a seed decoder chooses a valid
+  // path. Monolithic 8-bit is the DEFAULT: a bare { contenthash, w, h } seed is decodable as a whole
+  // RGBA8 bitstream, so those fields are emitted only when they DIFFER from that default (tiled seed,
+  // 16-bit seed). This keeps the common seed minimal while letting a tiled/16-bit L0 be decoded.
+  const bits = (l0 as { bitsPerSample?: 8 | 16 }).bitsPerSample ?? 8;
+  const tiled = (l0 as { tiled?: boolean }).tiled === true;
+  const tiling = (l0 as { tiling?: unknown }).tiling;
   return {
     imageId: manifest.imageId,
     aspect: manifest.aspect,
-    l0: { contenthash: l0.contenthash, w: l0.w, h: l0.h },
+    l0: {
+      contenthash: l0.contenthash,
+      w: l0.w,
+      h: l0.h,
+      // Emit precision explicitly when the seed is non-default (16-bit) OR tiled, so the seed decoder
+      // never has to peek into the tiling descriptor to learn precision. A bare monolithic 8-bit seed
+      // omits it (default). This keeps the common seed minimal while a tiled/16-bit L0 stays explicit.
+      ...(bits === 16 || tiled ? { bitsPerSample: bits } : {}),
+      // A tiled seed MUST carry both the flag and (when present) the descriptor so the seed decoder
+      // routes to the tile-container path; permit a tiled L0 only when it declares its transport.
+      ...(tiled ? { tiled: true } : {}),
+      ...(tiled && tiling ? { tiling: tiling as IndexEntry["l0"]["tiling"] } : {}),
+    },
   };
 }
 
