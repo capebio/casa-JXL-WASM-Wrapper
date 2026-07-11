@@ -10,8 +10,13 @@ export const PROXY_SIZES = [256, 512, 1024];
 export const DEFAULT_PROXY_SIZE = 512;
 /** Allowed master image file formats */
 export const ALLOWED_FORMATS = ["orf", "dng", "cr2", "jpg"];
-/** Allowed orientation strategies */
+/** Allowed orientation strategies (v1–v4 legacy string form). */
 export const ORIENTATION_VALUES = ["baked", "source"];
+/** v5 OrientationDescriptor.pixels values (whether stored level pixels are already upright). */
+export const ORIENTATION_PIXELS_VALUES = ["source", "baked-upright"];
+/** v5 EXIF orientation is an integer in this inclusive range. */
+export const EXIF_ORIENTATION_MIN = 1;
+export const EXIF_ORIENTATION_MAX = 8;
 /** Quality-to-Distance mappings for the libjxl encoder */
 export const QUALITY_DISTANCES = {
     /** Grid levels {256, 512, 1024} and proxy mode */

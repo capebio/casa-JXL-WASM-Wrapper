@@ -1,7 +1,32 @@
 /** Supported master image file formats. */
 export type MasterFormat = "orf" | "dng" | "cr2" | "jpg";
-/** Image orientation handling strategy. */
+/** Image orientation handling strategy (v1–v4 string form). Retained for back-compat with older
+ *  manifests; v5 uses OrientationDescriptor. */
 export type Orientation = "baked" | "source";
+/** v5 OrientationDescriptor: the exact EXIF orientation value (1..8) plus whether the stored pixels
+ *  are already upright. Decouples "what EXIF said" from "what we baked into the pixels".
+ *  Mirrors @casabio/pyramid-ingest's canonical OrientationDescriptor (finding 72 — one contract). */
+export interface OrientationDescriptor {
+    /** EXIF Orientation tag value, 1..8. */
+    exif: number;
+    /** Whether the persisted level pixels are already upright, or still in source orientation. */
+    pixels: "source" | "baked-upright";
+}
+/** v5 TilingDescriptor persisted on a tiled level. `offsetBase: "file"` records that JXTC index
+ *  offsets are ABSOLUTE from byte zero of the file. Mirrors the canonical pyramid-ingest shape. */
+export interface TilingDescriptor {
+    container: "jxtc";
+    version: 1 | 2;
+    tileSize: number;
+    bitsPerSample: 8 | 16;
+    offsetBase: "file";
+}
+/** v4 tiling grid (legacy): derivable tile grid without a container/version tag. */
+export interface TilingGrid {
+    tileSize: number;
+    cols: number;
+    rows: number;
+}
 /** Target size for a pyramid level, either a long-edge target size (number) or the string "full". */
 export type LevelSize = number | "full";
 /** Supported bit depths per sample in the JXL stream. */
@@ -11,6 +36,11 @@ export interface MasterMetadata {
     name: string;
     format: MasterFormat;
     mtimeMs: number;
+    /**
+     * v5 (finding 64): detected provenance, decoupled from `format` (decoder capability). Rejecting an
+     * unsupported decode never erases this. Optional/additive so v1–v4 masters validate unchanged.
+     */
+    sourceFormat?: string;
     /** Pair with mtimeMs for stronger staleness checks. */
     sizeBytes?: number;
 }
@@ -73,12 +103,12 @@ export interface PyramidLevel {
     bitsPerSample: BitsPerSample;
     contenthash: string;
     tiled: boolean;
-    /** Required when tiled. Grid descriptor so clients can address tiles without decoding. */
-    tiling?: {
-        tileSize: number;
-        cols: number;
-        rows: number;
-    };
+    /**
+     * Required when tiled. On v1–v4 manifests this is a TilingGrid { tileSize, cols, rows }; on v5 it
+     * is a TilingDescriptor { container, version, tileSize, bitsPerSample, offsetBase }. Either lets a
+     * client address tiles without decoding.
+     */
+    tiling?: TilingGrid | TilingDescriptor;
     /**
      * Byte offset of visual saturation for this level (precomputed butteraugli cutoff).
      * Viewer-only download optimization: progressive viewers may abort the fetch here.
@@ -97,12 +127,15 @@ export interface PyramidLevel {
      */
     capabilities?: LodCapabilities;
 }
-/** The schema definition of `manifest.json` per image. */
+/** The schema definition of `manifest.json` per image.
+ *  Readable schemas are 1|2|4|5 (3 was skipped). v1 is normalized to 2 by the reader; v4/v5 keep
+ *  their number. On v5, `orientation` is an OrientationDescriptor; on v1–v4 it is the legacy string.
+ *  Unknown fields are preserved by the reader so the contract is additive/lossless. */
 export interface PyramidManifest {
-    schema: 1 | 2;
+    schema: 1 | 2 | 4 | 5;
     imageId: string;
     master: MasterMetadata;
-    orientation: Orientation;
+    orientation: Orientation | OrientationDescriptor;
     width: number;
     height: number;
     aspect: number;
