@@ -4,7 +4,19 @@
   <meta charset="UTF-8" />
   <link rel="icon" href="data:," />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Pyramid Gallery (M1 grid)</title>
+  <title>Pyramid Gallery (legacy M1 grid — redirecting)</title>
+  <!-- Packet 2, Task 1: the modular gallery under ./pyramid-gallery/ is now the canonical
+       engine of record. This legacy M1-grid page is a temporary redirect kept for
+       compatibility (old bookmarks / links) until it is retired in Task 7. The redirect
+       carries any ?gallery=/query string forward so deep links keep working. -->
+  <meta http-equiv="refresh" content="0; url=./pyramid-gallery/pyramid-gallery.html" />
+  <script>
+    // Preserve the query string (e.g. ?gallery=...) when handing off to the canonical page.
+    (function () {
+      var target = './pyramid-gallery/pyramid-gallery.html' + location.search + location.hash;
+      location.replace(target);
+    })();
+  </script>
   <link rel="stylesheet" href="./jxl-debug-console.css" />
   <script type="importmap">
   {
@@ -50,7 +62,10 @@
     </div>
     <a href="./index.html" style="margin-left:1rem; color:#6b9; font-size:.8rem">← back</a>
   </div>
+  <p class="status" style="padding:12px">
+    This legacy gallery has moved. Redirecting to the canonical
+    <a href="./pyramid-gallery/pyramid-gallery.html" style="color:#6b9">modular Pyramid gallery</a>…
+  </p>
   <div id="grid" class="grid"></div>
-  <script type="module" src="./pyramid-gallery.js"></script>
 </body>
 </html>

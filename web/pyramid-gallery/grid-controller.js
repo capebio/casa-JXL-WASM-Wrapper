@@ -13,6 +13,7 @@ const PREFETCH_RING = 1;
  * @param {import('@casabio/jxl-cache').JxlCacheBrowser} [opts.cache]
  * @param {URL} [opts.galleryBase]
  * @param {object} [opts.imageStore] // preferred; from createImageStore S1
+ * @param {import('@casabio/jxl-pyramid').PyramidRuntime} [opts.runtime] // Packet 2 Task 1: single owned decode runtime (engine of record); Task 3 routes decode through it
  * @param {number} opts.tileSizePx
  * @param {number} [opts.devicePixelRatio]
  * @param {Map<string, IndexEntry>} [opts.indexByImageId]
@@ -23,12 +24,16 @@ export function createGridController({
   cache,
   galleryBase,
   imageStore,
+  runtime,
   tileSizePx,
   devicePixelRatio,
   indexByImageId,
   onTilePainted,
 }) {
   const store = imageStore || (cache && galleryBase ? createImageStore({ cache, galleryBase }) : null);
+  // Packet 2 Task 1: hold the single decode runtime handed down by the gallery bootstrap.
+  // Decode still flows through decodePyramidLevel today; Task 3 consolidates onto runtime.decodeLevel.
+  void runtime;
   const dpr = devicePixelRatio ?? 1;
   const paintedRank = new Map();
   const inflight = new Map();

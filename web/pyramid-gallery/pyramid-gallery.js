@@ -1,9 +1,31 @@
 import { createBrowserContext } from '@casabio/jxl-session';
 import { JxlCacheBrowser } from '@casabio/jxl-cache';
-import { APPROVED_LIGHTBOX_PRESETS, ADJUSTMENT_PARAMS } from '@casabio/jxl-pyramid';
+import { APPROVED_LIGHTBOX_PRESETS, ADJUSTMENT_PARAMS, createPyramidRuntime } from '@casabio/jxl-pyramid';
 import { createGridController } from './grid-controller.js';
 import { createPyramidLightbox } from '../lightbox/pyramid-lightbox.js';
 import { createImageStore } from './image-store.js'; // S1 wired S2/S3
+
+// Packet 2, Task 1 (findings 74, 77, 78): this modular gallery is the CANONICAL engine of
+// record. It constructs exactly ONE long-lived decode runtime at bootstrap and threads it
+// through the grid + lightbox, so decode work is orchestrated by a single owned pool instead
+// of each decode call spinning up its own (finding 78). The runtime pins the accepted decode
+// contract; Task 3 folds the grid/lightbox decode paths onto runtime.decodeLevel.
+function detectDecodeCapabilities() {
+  const workers = typeof Worker !== 'undefined';
+  const sharedMemory =
+    globalThis.crossOriginIsolated === true && typeof SharedArrayBuffer === 'function';
+  return { workers, sharedMemory, rangeRequests: true, rgba16: true };
+}
+
+// One stable worker factory for the runtime's single pool (the same tiled-decode worker the
+// pooled decode path uses). Defined once at module scope so the pool is not rebuilt per decode.
+const tiledWorkerFactory = () =>
+  new Worker(new URL('../lightbox/tiled-decode-worker.js', import.meta.url), { type: 'module' });
+
+const decodeRuntime = createPyramidRuntime({
+  workerFactory: tiledWorkerFactory,
+  capabilities: detectDecodeCapabilities(),
+});
 
 const gridEl = document.getElementById('pyramid-grid');
 const urlInput = document.getElementById('gallery-url');
@@ -91,13 +113,14 @@ async function loadGallery(baseUrl) {
     cache,
     galleryBase,
     imageStore,
+    runtime: decodeRuntime,
     tileSizePx: 220,
     devicePixelRatio: window.devicePixelRatio || 1,
     indexByImageId,
   });
   grid.observeGrid(gridEl);
 
-  lightbox = createPyramidLightbox({ ctx, cache, galleryBase, imageStore, rootEl: lightboxRoot });
+  lightbox = createPyramidLightbox({ ctx, cache, galleryBase, imageStore, runtime: decodeRuntime, rootEl: lightboxRoot });
   buildSliders(lightbox);
   presetSelect.onchange = () => lightbox.setPreset(presetSelect.value);
   resetBtn.onclick = () => {
