@@ -403,4 +403,139 @@ describe("verify.yml — static structure", () => {
       }
     }
   });
+
+  // ── GAP 1: web-tests job must exist and be PR-triggered ───────────────────
+  it("GAP1: a 'web-tests' PR job exists and runs node-safe web tests", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    const webJob = parsed.jobs.find((j) => j.id === "web-tests");
+    assert.ok(webJob, "Expected a 'web-tests' job to exist in the workflow");
+    assert.ok(isPrTriggered(webJob), "'web-tests' job must be PR-triggered (no schedule/dispatch-only guard)");
+    // Must invoke node --test with a glob covering the web/ tree.
+    const runs = webJob.steps.map((s) => s.run).join("\n");
+    assert.ok(
+      runs.includes("node --test") && (runs.includes("web/") || runs.includes("web\\") || runs.includes("'web/")),
+      `'web-tests' job must run 'node --test' over web/ tests. Got runs:\n${runs.slice(0, 400)}`
+    );
+  });
+
+  it("GAP1: web-tests job explicitly env-gates WASM-blocked tests (not silently red)", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    const webJob = parsed.jobs.find((j) => j.id === "web-tests");
+    assert.ok(webJob, "Expected a 'web-tests' job");
+    // The job or its steps must mention env-gating for tests that need pkg/ (WASM).
+    // We look for skip/pkg or CI_SKIP_WASM or similar explicit annotation.
+    const allText = webJob.steps.map((s) => s.run + " " + s.name + " " + s.stepIf).join("\n");
+    const hasEnvGate =
+      /pkg|wasm|skip|CI_SKIP|decode\.test|export\.test|proxy.e2e/i.test(allText);
+    assert.ok(
+      hasEnvGate,
+      "web-tests job must explicitly exclude or env-gate WASM-blocked tests (those importing pkg/raw_converter_wasm.js). " +
+      `Add a documented exclusion pattern (e.g. --exclude or env var). Got step text:\n${allText.slice(0, 400)}`
+    );
+  });
+
+  // ── GAP 2: benchmark-smoke job must exist and be PR-triggered ─────────────
+  it("GAP2: a 'benchmark-smoke' PR job exists and runs benchmark registration tests", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    const benchJob = parsed.jobs.find((j) => j.id === "benchmark-smoke");
+    assert.ok(benchJob, "Expected a 'benchmark-smoke' job to exist in the workflow");
+    assert.ok(isPrTriggered(benchJob), "'benchmark-smoke' job must be PR-triggered");
+    const runs = benchJob.steps.map((s) => s.run).join("\n");
+    // Must call node --test over the benchmark/ smoke tests (deterministic subset).
+    assert.ok(
+      runs.includes("node --test") && (runs.includes("benchmark/") || runs.includes("benchmark\\")),
+      `'benchmark-smoke' job must run 'node --test' over benchmark/ smoke files. Got:\n${runs.slice(0, 400)}`
+    );
+  });
+
+  // ── GAP 3: path-filter safety — no critical lane filtered away ─────────────
+  it("GAP3: critical lanes have no path filter that excludes files they own", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+
+    // Map each critical job ID to the path prefix it owns.
+    // A job with no path filter passes trivially (it runs on everything).
+    // A job with a path filter must include at least one pattern that matches the owned paths.
+    const criticalLanes = [
+      { id: "workspace-test",     owns: "packages/" },
+      { id: "workspace-build",    owns: "packages/" },
+      { id: "workspace-typecheck", owns: "packages/" },
+      { id: "web-tests",          owns: "web/" },
+      { id: "benchmark-smoke",    owns: "benchmark/" },
+      { id: "rust-parsers",       owns: "crates/" },
+      { id: "fuzz-build",         owns: "crates/" },
+      { id: "runner-self-test",   owns: "tools/" },
+    ];
+
+    for (const lane of criticalLanes) {
+      const job = parsed.jobs.find((j) => j.id === lane.id);
+      // If the job doesn't exist yet, skip — existence is covered by other assertions.
+      if (!job) continue;
+
+      const filters = job.pathFilters;
+      if (filters.length === 0) {
+        // No filter → always runs → safe.
+        continue;
+      }
+
+      // At least one filter pattern must NOT exclude the owned path.
+      // A pattern that starts with "!" is an exclusion; a pattern that matches the owned
+      // prefix as a positive include means the lane can fire on changes to owned files.
+      const positiveFilters = filters.filter((f) => !f.startsWith("!"));
+      const hasMatchingPositive = positiveFilters.some(
+        (f) => f.startsWith(lane.owns) || f.includes("**") || lane.owns.startsWith(f.replace(/\*\*?\/?$/, ""))
+      );
+      assert.ok(
+        hasMatchingPositive,
+        `Critical lane '${lane.id}' has path filters ${JSON.stringify(filters)} ` +
+        `but none match its owned path '${lane.owns}'. ` +
+        `This would prevent the job from running on changes to its own files.`
+      );
+    }
+  });
+
+  // ── GAP 4: cache keys must cover lockfile + bun.lock + build-script ────────
+  it("GAP4: workspace jobs use a cache key that includes bun.lock and tools/run-workspaces.mjs", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+
+    // The workspace jobs (workspace-test, workspace-build, workspace-typecheck) must
+    // use an explicit cache key that hashes:
+    //   - package-lock.json  (npm lockfile)
+    //   - bun.lock           (bun lockfile)
+    //   - tools/run-workspaces.mjs  (build-script)
+    // This can be done via actions/cache with hashFiles(), OR via setup-node with a
+    // cache-dependency-path that covers all three inputs.
+    const workspaceJobs = ["workspace-test", "workspace-build", "workspace-typecheck"];
+
+    for (const jobId of workspaceJobs) {
+      const job = parsed.jobs.find((j) => j.id === jobId);
+      if (!job) continue; // existence tested elsewhere
+
+      // Collect all text from the job's steps (run, name, uses, and any `with:` values
+      // we can extract from the raw YAML text that references these files).
+      const allStepText = job.steps.map((s) => s.run + " " + s.name).join("\n");
+
+      // Find the raw YAML block for this job to check the `with:` section of setup-node.
+      const jobYamlStart = yamlText.indexOf(`\n  ${jobId}:`);
+      const nextJobMatch = yamlText.slice(jobYamlStart + 1).match(/\n  \w[\w-]*:/);
+      const jobYamlBlock = nextJobMatch
+        ? yamlText.slice(jobYamlStart, jobYamlStart + 1 + nextJobMatch.index)
+        : yamlText.slice(jobYamlStart);
+
+      const hasBunLock = jobYamlBlock.includes("bun.lock");
+      const hasBuildScript =
+        jobYamlBlock.includes("run-workspaces.mjs") ||
+        jobYamlBlock.includes("run-workspaces");
+
+      assert.ok(
+        hasBunLock,
+        `Job '${jobId}' cache key must include 'bun.lock'. ` +
+        `Current YAML block does not reference bun.lock:\n${jobYamlBlock.slice(0, 600)}`
+      );
+      assert.ok(
+        hasBuildScript,
+        `Job '${jobId}' cache key must include 'tools/run-workspaces.mjs' (the build-script). ` +
+        `Current YAML block does not reference it:\n${jobYamlBlock.slice(0, 600)}`
+      );
+    }
+  });
 });
