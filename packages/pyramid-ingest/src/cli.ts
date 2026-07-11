@@ -468,6 +468,21 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     // GLOBAL write lock, held by this transaction. On a signal `onSig` only aborts intake; ingestBatch
     // then terminates/joins its workers and flushes the checkpoint before it returns, and only AFTER
     // that does withWriteTransaction release the global lock. The lock is never released mid-flight.
+    //
+    // ORDERED SHUTDOWN (finding 69) — where the mandated order is enforced in the PRODUCTION batch path:
+    //   1. abort intake .......... onSig → ac.abort() (backends.signal); ingestBatch stops dispatching.
+    //   2. cancel in-flight jobs .. ingestBatch's abort handler rejects pending worker jobs.
+    //   3. terminate/join workers . ingestBatch awaits its dispatchers, then Worker.terminate(), before
+    //                               it RETURNS (worker-pool path) / its run() loops settle (in-process).
+    //   4. flush/close checkpoint . ingestBatch force-flushes (and clears) the checkpoint before RETURN.
+    //   5. release image locks .... each per-image lock is released in ingestBatch's per-job `finally`.
+    //   6. release GLOBAL lock .... LAST — withWriteTransaction releases it only after THIS body returns.
+    // Steps 1–5 all complete inside ingestBatch's synchronous-await teardown before it returns; step 6 is
+    // structurally last (the transaction owns release). So the order is ENFORCED by ingestBatch's internal
+    // join+flush plus lock-release-last, not by chance. A separate onShutdown wiring here would have to
+    // relocate ingestBatch's already-correct, tested teardown and risk double-join/double-flush; instead
+    // the guarantee is proven end-to-end by test/transaction.shutdown-order.integration.test.ts, which
+    // drives THIS batch shape under a real mid-batch abort and asserts the order above.
     return await withWriteTransaction(parsed.out, async (tx) => {
       const startMs = Date.now(); // CLI-2: real batch start for honest durationMs/startedAt
       const batchOpts = {

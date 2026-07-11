@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "typecheck:locks": "tsc -p tsconfig.typecheck.json",
     "test": "bun test"
   },
   "dependencies": {

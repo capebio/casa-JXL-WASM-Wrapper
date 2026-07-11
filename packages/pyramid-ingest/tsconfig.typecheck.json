@@ -1,0 +1,14 @@
+{
+  // Compile-time-evidence typecheck (Task 7, findings 68/69). The package's default tsconfig only
+  // includes src/**, so the @ts-expect-error evidence in test/transaction.type-test.ts would never be
+  // checked by it. This config type-checks that one file (and only the modules it imports —
+  // transaction.ts + lock.ts — NOT raw-backend.ts, whose missing root pkg/ WASM types are a known,
+  // unrelated pre-existing error). A stale/unused @ts-expect-error here fails tsc (TS2578).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": ["test/transaction.type-test.ts"],
+  "exclude": ["dist", "node_modules"]
+}
