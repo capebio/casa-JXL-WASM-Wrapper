@@ -797,7 +797,9 @@ export class PyramidWorkerPool {
 
 // Grok3 #38-39 module-level consts (evaluated once)
 const HWC = (globalThis as any).navigator?.hardwareConcurrency ?? 4;
-const CAN_PARALLEL = canUseParallelTileWorkers();
+// NOTE: parallel-worker viability (canUseParallelTileWorkers) is queried at the decision site
+// rather than cached at module load — it depends only on `Worker` presence (finding 82) which a
+// test harness (or an SSR→hydration transition) may install after this module is first imported.
 
 /** Hoisted predicate (Grok4). */
 export function shouldUseParallel(
@@ -1198,7 +1200,7 @@ export async function decodeTiledViewportPooled(
   try {
     const wantParallel = (options?.pool != null)
       ? (options?.parallel !== false) && plan.tiles.length > 1
-      : shouldUseParallel(options, plan.tiles.length, CAN_PARALLEL);
+      : shouldUseParallel(options, plan.tiles.length, canUseParallelTileWorkers());
 
     if (!wantParallel) {
       const direct = signal ? await raceWithAbort(decodeRegion(source.bytes, vp), signal) : await decodeRegion(source.bytes, vp);
