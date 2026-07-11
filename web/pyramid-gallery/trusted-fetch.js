@@ -99,7 +99,13 @@ function assertContained(rootUrl, candidate, stage) {
  * @param {object} opts
  * @param {URL | string} opts.root            Gallery base (directory) URL. Trailing slash expected.
  * @param {string} opts.relativePath          Path relative to `root` (e.g. "levels/<hash>.jxl").
- * @param {number} opts.expectedBytes         Declared byte length; hard upper cap on the body.
+ * @param {number} opts.expectedBytes         Declared byte length; hard upper cap on the body. In the
+ *                                            default `exactBytes` mode this is ALSO the exact expected
+ *                                            length (a shorter body = truncation → reject).
+ * @param {boolean} [opts.exactBytes=true]    When false, `expectedBytes` is only a ceiling: a body
+ *                                            shorter than it is accepted (used for manifests / legacy
+ *                                            level fetches that have no precise declared size). An
+ *                                            OVERRUN of the cap is still rejected.
  * @param {string} [opts.sha256]              Expected lowercase-hex SHA-256 of the body (optional).
  * @param {AbortSignal} [opts.signal]         Caller abort signal.
  * @param {typeof fetch} [opts.fetchImpl]     Injected fetch (defaults to global fetch).
@@ -110,6 +116,7 @@ export async function fetchVerifiedAsset({
   root,
   relativePath,
   expectedBytes,
+  exactBytes = true,
   sha256,
   signal,
   fetchImpl,
@@ -164,9 +171,10 @@ export async function fetchVerifiedAsset({
 
   const body = await readCapped(res, expectedBytes);
 
-  // Truncation: fewer bytes than declared means an incomplete/interrupted body — reject before it
-  // can be cached or decoded.
-  if (body.length < expectedBytes) {
+  // Truncation: in exact-length mode, fewer bytes than declared means an incomplete/interrupted
+  // body — reject before it can be cached or decoded. In cap-only mode `expectedBytes` is just a
+  // ceiling, so a shorter body is legitimate.
+  if (exactBytes && body.length < expectedBytes) {
     fail(`body length ${body.length} is short of expected ${expectedBytes} (truncated)`, "truncated");
   }
 

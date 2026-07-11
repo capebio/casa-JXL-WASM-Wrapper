@@ -63,7 +63,9 @@ export function createPyramidLightbox(deps) {
   }
   // Delegate manifest/level acquisition to the store (no injected getManifest/getLevelBytes params).
   const getManifest = (imageId) => imageStore.getManifest(imageId);
-  const getLevelBytes = (contenthash) => imageStore.getLevelBytes(contenthash);
+  // Forward the optional { expectedBytes, sha256 } so the store's trusted boundary can cap + verify
+  // precisely (finding 73); callers with only a contenthash still work (store falls back to a cap).
+  const getLevelBytes = (contenthash, opts) => imageStore.getLevelBytes(contenthash, opts);
 
   let eng = null;
   let modal = null;
@@ -399,7 +401,9 @@ export function createPyramidLightbox(deps) {
     log?.(`plb load ${level.size || level.w} ch=${level.contenthash.slice(0,8)} ${use16 ? '16bit' : '8bit'}${level.tiled ? ' tiled' : ''}`);
 
     const entry = level;
-    const bytes = await getLevelBytes(entry.contenthash);
+    // Trusted boundary (finding 73): supply the level's declared byte size so the fetch is capped
+    // precisely; a bare l0 seed without `bytes` falls back to the store ceiling.
+    const bytes = await getLevelBytes(entry.contenthash, { expectedBytes: entry.bytes });
     if (!ctx) throw new Error('no ctx for decode');
 
     // --- Tiled level: decode only the visible ROI and render it. The bit depth
@@ -658,7 +662,7 @@ export function createPyramidLightbox(deps) {
         let lv = niItem.l0 ? {contenthash: niItem.l0.contenthash, w:niItem.l0.w, h:niItem.l0.h, size: Math.max(niItem.l0.w,niItem.l0.h)} : (niItem.levels && niItem.levels[0]);
         if (!lv || lv.tiled || lruGet(lv.contenthash)) return;
         try {
-          const b = await getLevelBytes(lv.contenthash);
+          const b = await getLevelBytes(lv.contenthash, { expectedBytes: lv.bytes });
           const s = ctx.decode({format:'rgba8', sourceKey:lv.contenthash, priority:'near', emitEveryPass:false, progressionTarget:'final'});
           await s.push(b); await s.close();
           let last = null;
@@ -850,7 +854,7 @@ export function createPyramidLightbox(deps) {
     // Use the drawn crop rect when set; fall back to the current viewport.
     const rawRegion = (cropRect && cropRect.w > 0 && cropRect.h > 0) ? cropRect : viewportRegion();
     const region = clampRegionToLevel(rawRegion, levelInfo);
-    const srcBytes = await getLevelBytes(levelInfo.contenthash);
+    const srcBytes = await getLevelBytes(levelInfo.contenthash, { expectedBytes: levelInfo.bytes });
 
     // rgba16 ROI decode (region-only; never the whole frame).
     const { pixels, width, height } = await decodePyramidRegion(srcBytes, {

@@ -13,6 +13,10 @@
 // validates the v5 OrientationDescriptor / TilingDescriptor / sourceFormat, and preserves unknown
 // fields. It is pure (no zod), so the browser stays zero-dep.
 import { parsePyramidManifest } from "../../packages/jxl-pyramid/dist/manifest-validate.js";
+// finding 73: every network asset (manifest + level bytes) is untrusted input. Route all fetches
+// through the single trusted boundary so paths are origin/root-contained (after normalization AND
+// redirects), byte-capped before + during streaming, and SHA-256-verified before cache/decode.
+import { fetchVerifiedAsset } from "./trusted-fetch.js";
 
 /**
  * Validate a fetched manifest through the shared jxl-pyramid reader. Throws on structural violation
@@ -25,11 +29,18 @@ function validateManifest(m) {
 }
 
 /**
- * @param {{ cache: import('@casabio/jxl-cache').JxlCacheBrowser; galleryBase: URL | string }} opts
+ * @param {{ cache: import('@casabio/jxl-cache').JxlCacheBrowser; galleryBase: URL | string;
+ *   fetchImpl?: typeof fetch; subtle?: SubtleCrypto }} opts
  */
 const MANIFEST_CACHE_MAX = 64;
+// A manifest.json is small (a few KB even with many levels); cap it generously so a hostile server
+// cannot stream an unbounded "manifest" body into JSON.parse as a DoS.
+const MANIFEST_MAX_BYTES = 4 * 1024 * 1024; // 4 MiB
+// Absolute ceiling for a single level's bytes when the caller does not supply an expected size. The
+// per-level manifest `bytes` is the precise cap; this is only the fallback for legacy callers.
+const LEVEL_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB (matches the persistent cache limit ceiling)
 
-export function createImageStore({ cache, galleryBase }) {
+export function createImageStore({ cache, galleryBase, fetchImpl, subtle }) {
   // Normalize galleryBase: accept a URL, an absolute URL string, or a relative path string.
   // `new URL(string)` throws on a relative input, so resolve relatives against the document
   // location (falling back to a neutral base in non-browser/test environments).
@@ -75,10 +86,19 @@ export function createImageStore({ cache, galleryBase }) {
     const pending = manifestInflight.get(imageId);
     if (pending) return pending;
     const p = (async () => {
-      const url = new URL(`images/${imageId}/manifest.json`, base).href;
-      const res = await fetch(url);
-      if (!res.ok) throw new Error(`manifest ${imageId}: ${res.status}`);
-      const raw = await res.json();
+      // Route through the trusted boundary: `images/<imageId>/manifest.json` is resolved + origin/
+      // root-contained (rejecting a traversal/absolute imageId), byte-capped so an unbounded body
+      // can't DoS JSON.parse, and its final URL re-checked after any redirect. No sha256 is available
+      // for manifests (the index carries no manifest digest), so the cap + containment are the guard.
+      const buf = await fetchVerifiedAsset({
+        root: base,
+        relativePath: `images/${imageId}/manifest.json`,
+        expectedBytes: MANIFEST_MAX_BYTES,
+        exactBytes: false, // the 4 MiB is a ceiling; a real manifest is a few KB.
+        fetchImpl,
+        subtle,
+      });
+      const raw = JSON.parse(new TextDecoder().decode(new Uint8Array(buf)));
       // Validate + normalize through the shared jxl-pyramid reader (zero-dep) before cache/return.
       const manifest = validateManifest(raw);
       manifestCacheSet(imageId, manifest);
@@ -94,9 +114,14 @@ export function createImageStore({ cache, galleryBase }) {
 
   /**
    * @param {string} contenthash
+   * @param {{ expectedBytes?: number; sha256?: string }} [opts]
+   *   expectedBytes: the level's declared `bytes` from the manifest — the precise byte cap. Callers
+   *   that hold the level object SHOULD pass it; legacy callers fall back to LEVEL_MAX_BYTES.
+   *   sha256: an optional strong integrity digest (the on-disk `contenthash` is a non-crypto FNV
+   *   storage key, so verification rides on this separately-supplied digest when present).
    * @returns {Promise<Uint8Array>}
    */
-  async function getLevelBytes(contenthash) {
+  async function getLevelBytes(contenthash, opts = {}) {
     const key = `level:${contenthash}`;
     const cached = await cache.get(key);
     if (cached) return new Uint8Array(cached);
@@ -105,10 +130,21 @@ export function createImageStore({ cache, galleryBase }) {
     let p = levelInflight.get(key);
     if (!p) {
       p = (async () => {
-        const url = new URL(`levels/${contenthash}.jxl`, base).href;
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`level ${contenthash}: ${res.status}`);
-        const buf = await res.arrayBuffer();
+        // Trusted boundary: `levels/<contenthash>.jxl` is resolved + origin/root-contained (rejecting
+        // a traversal/absolute contenthash), byte-capped before + during streaming, and — when the
+        // caller supplies a digest — SHA-256-verified BEFORE it is published to the cache.
+        // With a precise declared size we enforce it exactly (a short body = truncation). Without
+        // one we fall back to a generous ceiling and only guard against overrun.
+        const hasExact = Number.isFinite(opts.expectedBytes) && opts.expectedBytes > 0;
+        const buf = await fetchVerifiedAsset({
+          root: base,
+          relativePath: `levels/${contenthash}.jxl`,
+          expectedBytes: hasExact ? opts.expectedBytes : LEVEL_MAX_BYTES,
+          exactBytes: hasExact,
+          sha256: opts.sha256,
+          fetchImpl,
+          subtle,
+        });
         void cache.set(key, buf);
         return buf;
       })();

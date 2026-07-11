@@ -236,6 +236,38 @@ describe('byte cap enforcement', () => {
   });
 });
 
+// ── Cap-only mode (expectedBytes is a ceiling, not an exact length) ───────────
+// Some assets (manifests, or legacy level fetches with no precise declared size) only
+// have an upper bound. In `exactBytes:false` mode, a body SHORTER than the cap is fine;
+// only an OVERRUN of the cap is rejected. Truncation-below-cap must NOT fire.
+
+describe('cap-only mode', () => {
+  test('accepts a body well under the cap when exactBytes is false', async () => {
+    const small = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchReturning(streamingResponse([small], { url: `${ROOT}levels/abc.jxl` }));
+    const buf = await fetchVerifiedAsset({
+      root: ROOT, relativePath: 'levels/abc.jxl', expectedBytes: 1024, exactBytes: false, fetchImpl, subtle,
+    });
+    expect(new Uint8Array(buf)).toEqual(small);
+  });
+
+  test('still rejects an overrun of the cap when exactBytes is false', async () => {
+    const oversized = new Uint8Array(2048).fill(9);
+    const fetchImpl = fetchReturning(streamingResponse([oversized], { url: `${ROOT}levels/abc.jxl` }));
+    await expect(fetchVerifiedAsset({
+      root: ROOT, relativePath: 'levels/abc.jxl', expectedBytes: 1024, exactBytes: false, fetchImpl, subtle,
+    })).rejects.toBeInstanceOf(TrustedFetchError);
+  });
+
+  test('exact mode (default) still rejects a body shorter than the declared length', async () => {
+    const short = new Uint8Array([1, 2, 3]);
+    const fetchImpl = fetchReturning(streamingResponse([short], { url: `${ROOT}levels/abc.jxl` }));
+    await expect(fetchVerifiedAsset({
+      root: ROOT, relativePath: 'levels/abc.jxl', expectedBytes: 12, fetchImpl, subtle,
+    })).rejects.toBeInstanceOf(TrustedFetchError);
+  });
+});
+
 // ── SHA-256 verification / truncation ────────────────────────────────────────
 
 describe('sha-256 verification', () => {
