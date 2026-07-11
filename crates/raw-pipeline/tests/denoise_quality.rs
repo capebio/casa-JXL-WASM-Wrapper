@@ -414,19 +414,30 @@ fn gate3_mean_bias_below_quarter_sigma() {
 
 // ─── Gate 4: Tile seam maximum ────────────────────────────────────────────────
 //
-// Tests that BM3D denoising does not introduce large discontinuities (artifacts)
-// between adjacent pixels in an otherwise uniform flat-field image. With TILE=512,
-// a 64×64 image fits in a single tile, so this verifies intra-tile smoothness.
-// The spec gate is "tile seam max <= 1 RGB16 code", which we implement here
-// by checking that the max deviation from the uniform true value is bounded.
+// Tests that BM3D denoising does not introduce large discontinuities at a real
+// tile boundary. With TILE=512 and PATCH=8, the BM3D implementation mirror-pads
+// the input by PATCH pixels before tiling. An input of width=522 produces a
+// padded width of 538 (= 522 + 2*8), which splits into two tiles at padded
+// column 512. After cropping the padding, the tile seam falls between original
+// output columns 503 and 504 (= 512 - PATCH - 1 and 512 - PATCH).
+//
+// We use a flat-field image (constant mid-grey + tiny noise σ≈100 codes) so
+// the only source of discontinuity after denoising is the tile boundary.
+
+// BM3D constants (must match bm3d.rs)
+const BM3D_PATCH: usize = 8;
+const BM3D_TILE: usize = 512;
 
 #[test]
 fn gate4_tile_seam_max_one_code() {
-    let width = 64;
-    let height = 64;
+    // width = TILE + PATCH + 2 = 522 → forces 2 tiles in the padded domain
+    let width = BM3D_TILE + BM3D_PATCH + 2; // 522
+    let height = 64usize;
     let n = width * height;
     let true_val_u16 = 32768u16;
-    let sigma_u16 = 800.0f32;
+    // Small noise σ=100 codes — flat enough that BM3D fully smooths it,
+    // but non-zero so the denoiser actually runs its filtering path.
+    let sigma_u16 = 100.0f32;
 
     let sigma_norm = sigma_u16 / 65535.0;
     let model = NoiseModel {
@@ -438,11 +449,11 @@ fn gate4_tile_seam_max_one_code() {
         confidence: 1.0,
         source: NoiseSource::DngNoiseProfile,
     };
-    // Low-noise path (display_sigma_p90 < 4.0)
+    // Low-noise path (display_sigma_p90 < 4.0) — uses the light denoising branch
     let metrics = metrics_with_sigma(sigma_norm * 50.0);
     let metadata = default_metadata();
 
-    // Add noise to a uniform flat field
+    // Flat field with tiny Gaussian-like noise
     let mut rng = Xorshift32::new(9999);
     let rgb_mhc: Vec<u16> = (0..n * 3)
         .map(|_| {
@@ -463,32 +474,37 @@ fn gate4_tile_seam_max_one_code() {
         1.0,
     );
 
-    // Check for large jumps between adjacent pixels — tile seam artifacts would
-    // appear as sudden large discontinuities. For a uniform field after denoising,
-    // adjacent pixel diffs should be small (bounded by residual noise + BM3D smoothing).
-    //
+    // The tile seam in output (original) coordinates:
+    //   padded_width = width + 2*PATCH = 522 + 16 = 538
+    //   tile boundary at padded col 512
+    //   original col = padded col - PATCH → seam between cols (512 - PATCH - 1) and (512 - PATCH)
+    //                                     = cols 503 and 504
+    let seam_left = BM3D_TILE - BM3D_PATCH - 1;  // 503
+    let seam_right = BM3D_TILE - BM3D_PATCH;      // 504
+
     let mut max_diff = 0u32;
-    let mut max_pos = (0usize, 0usize);
+    let mut max_row = 0usize;
     for row in 0..height {
-        for col in 1..width {
-            for ch in 0..3 {
-                let i0 = (row * width + col - 1) * 3 + ch;
-                let i1 = (row * width + col) * 3 + ch;
-                let diff = (denoised[i1] as i32 - denoised[i0] as i32).unsigned_abs();
-                if diff > max_diff {
-                    max_diff = diff;
-                    max_pos = (row, col);
-                }
+        for ch in 0..3 {
+            let i_left  = (row * width + seam_left)  * 3 + ch;
+            let i_right = (row * width + seam_right) * 3 + ch;
+            let diff = (denoised[i_right] as i32 - denoised[i_left] as i32).unsigned_abs();
+            if diff > max_diff {
+                max_diff = diff;
+                max_row = row;
             }
         }
     }
 
     println!(
-        "Gate 4 — max adjacent pixel diff = {max_diff} RGB16 codes at {:?}",
-        max_pos
+        "Gate 4 — tile seam (cols {seam_left}|{seam_right}) max_diff={max_diff} RGB16 codes \
+         (worst row={max_row}, image={width}×{height})"
     );
 
-    assert!(max_diff <= 1, "tile seam exceeded 1 RGB16 code: max_diff={max_diff}");
+    assert!(
+        max_diff <= 1,
+        "tile seam exceeded 1 RGB16 code: max_diff={max_diff} at cols {seam_left}|{seam_right} row={max_row}"
+    );
 }
 
 // ─── Gate 5: Determinism (FNV-1a hash across 10 runs) ────────────────────────
