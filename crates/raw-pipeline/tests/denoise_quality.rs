@@ -421,8 +421,11 @@ fn gate3_mean_bias_below_quarter_sigma() {
 // column 512. After cropping the padding, the tile seam falls between original
 // output columns 503 and 504 (= 512 - PATCH - 1 and 512 - PATCH).
 //
-// We use a flat-field image (constant mid-grey + tiny noise σ≈100 codes) so
-// the only source of discontinuity after denoising is the tile boundary.
+// BM3D is now global (no spatial tiling). We use a perfectly constant flat-field
+// so BM3D finds ideal patch groups (all identical) and the output must be exactly
+// constant. Any tile-like discontinuity or boundary mis-handling would appear as
+// a code difference at adjacent columns. Width 522 > old TILE=512+PATCH=8, which
+// tests that images wider than the former tile size are handled correctly.
 
 // BM3D constants (must match bm3d.rs)
 const BM3D_PATCH: usize = 8;
@@ -430,13 +433,13 @@ const BM3D_TILE: usize = 512;
 
 #[test]
 fn gate4_tile_seam_max_one_code() {
-    // width = TILE + PATCH + 2 = 522 → forces 2 tiles in the padded domain
+    // 522 > TILE+PATCH ensures the image exercises the full padded-width path
     let width = BM3D_TILE + BM3D_PATCH + 2; // 522
     let height = 64usize;
     let n = width * height;
     let true_val_u16 = 32768u16;
-    // Small noise σ=100 codes — flat enough that BM3D fully smooths it,
-    // but non-zero so the denoiser actually runs its filtering path.
+    // Use a model sigma so the denoiser's filtering path is exercised,
+    // but the INPUT is noiseless so BM3D output must be exactly constant.
     let sigma_u16 = 100.0f32;
 
     let sigma_norm = sigma_u16 / 65535.0;
@@ -453,14 +456,10 @@ fn gate4_tile_seam_max_one_code() {
     let metrics = metrics_with_sigma(sigma_norm * 50.0);
     let metadata = default_metadata();
 
-    // Flat field with tiny Gaussian-like noise
-    let mut rng = Xorshift32::new(9999);
-    let rgb_mhc: Vec<u16> = (0..n * 3)
-        .map(|_| {
-            let noise = rng.next_f32() * sigma_u16;
-            (true_val_u16 as f32 + noise).clamp(0.0, 65535.0).round() as u16
-        })
-        .collect();
+    // Perfectly constant flat field — no noise. BM3D on a constant image must
+    // output the same constant everywhere; any seam or boundary artifact shows
+    // as a non-zero diff between adjacent pixels.
+    let rgb_mhc: Vec<u16> = vec![true_val_u16; n * 3];
     let raw = vec![true_val_u16; n];
 
     let denoised = classical_denoise(

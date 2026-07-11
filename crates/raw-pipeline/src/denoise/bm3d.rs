@@ -29,10 +29,6 @@ const GROUP1: usize = 16;
 const GROUP2: usize = 32;
 /// Hard threshold multiplier.
 const LAMBDA: f32 = 2.7;
-/// Outer tile size for parallelism.
-const TILE: usize = 512;
-/// Halo/overlap around each tile (must be >= SEARCH + PATCH).
-const HALO: usize = 32;
 /// Kaiser window beta parameter.
 const KAISER_BETA: f32 = 2.0;
 
@@ -517,133 +513,66 @@ fn stage2_ref_patch(
     }
 }
 
-// ─── Tiled BM3D ──────────────────────────────────────────────────────────────
+// ─── BM3D passes ─────────────────────────────────────────────────────────────
 
-/// Process a halo-extended tile through both BM3D stages.
-/// Returns (stage1_estimate, final_output), each `width_h × height_h`.
-fn process_tile(
-    tile_img: &[f32],
-    width_h: usize,
-    height_h: usize,
-    sigma: f32,
-    kaiser: &[f32; PATCH * PATCH],
-) -> (Vec<f32>, Vec<f32>) {
-    let n = width_h * height_h;
-    // Initialize num with tile_img * epsilon so that pixels which receive zero patch
-    // contributions (possible at image edges with large REF_STEP) fall back to the
-    // input value rather than returning 0.
-    let epsilon = 1e-12f32;
-    let mut num1: Vec<f32> = tile_img.iter().map(|&v| v * epsilon).collect();
-    let mut den1 = vec![epsilon; n];
-
-    // Extend ref bounds beyond `width_h - PATCH` to ensure every pixel position is
-    // visited as a reference. Patches that start near the boundary use mirror padding
-    // in `extract_patch`; accumulation bounds-checks prevent out-of-bounds writes.
-    let ref_row_end = height_h;
-    let ref_col_end = width_h;
-
-    // Stage 1
-    let mut r = 0;
-    while r < ref_row_end {
-        let mut c = 0;
-        while c < ref_col_end {
-            stage1_ref_patch(
-                tile_img, width_h, height_h, r, c, sigma, kaiser,
-                &mut num1, &mut den1,
-            );
-            c += REF_STEP;
-        }
-        r += REF_STEP;
-    }
-
-    let stage1: Vec<f32> = num1.iter().zip(den1.iter()).map(|(n, d)| n / d).collect();
-
-    // Stage 2
-    let mut num2: Vec<f32> = tile_img.iter().map(|&v| v * epsilon).collect();
-    let mut den2 = vec![epsilon; n];
-
-    let mut r = 0;
-    while r < ref_row_end {
-        let mut c = 0;
-        while c < ref_col_end {
-            stage2_ref_patch(
-                tile_img, &stage1, width_h, height_h, r, c, sigma, kaiser,
-                &mut num2, &mut den2,
-            );
-            c += REF_STEP;
-        }
-        r += REF_STEP;
-    }
-
-    let final_out: Vec<f32> = num2.iter().zip(den2.iter()).map(|(n, d)| n / d).collect();
-    (stage1, final_out)
-}
-
-/// Per-tile processing result.
-struct TileResult {
-    /// Tile position in the output grid.
-    tile_row: usize,
-    tile_col: usize,
-    /// The inner (non-halo) denoised pixels.
-    out_tile: Vec<f32>,
-    /// Inner tile dimensions.
-    t_rows: usize,
-    t_cols: usize,
-}
-
-/// Extract a halo region, run BM3D on it, and return the inner result.
-fn process_one_tile(
-    input: &[f32],
+/// BM3D stage 1 (hard thresholding) over the full image.
+fn bm3d_stage1(
+    img: &[f32],
     width: usize,
     height: usize,
     sigma: f32,
     kaiser: &[f32; PATCH * PATCH],
-    tile_row: usize,
-    tile_col: usize,
-) -> TileResult {
-    let row0 = tile_row * TILE;
-    let col0 = tile_col * TILE;
-    let t_rows = TILE.min(height.saturating_sub(row0));
-    let t_cols = TILE.min(width.saturating_sub(col0));
-
-    // Halo-extended bounds
-    let h_row0 = row0.saturating_sub(HALO);
-    let h_col0 = col0.saturating_sub(HALO);
-    let h_row1 = (row0 + TILE + HALO).min(height);
-    let h_col1 = (col0 + TILE + HALO).min(width);
-    let width_h = h_col1 - h_col0;
-    let height_h = h_row1 - h_row0;
-
-    // Extract halo region
-    let mut tile_img = vec![0f32; width_h * height_h];
-    for r in 0..height_h {
-        let src_r = h_row0 + r;
-        for c in 0..width_h {
-            let src_c = h_col0 + c;
-            tile_img[r * width_h + c] = input[src_r * width + src_c];
+) -> Vec<f32> {
+    let n = width * height;
+    let epsilon = 1e-12f32;
+    let mut num: Vec<f32> = img.iter().map(|&v| v * epsilon).collect();
+    let mut den = vec![epsilon; n];
+    let mut r = 0;
+    while r < height {
+        let mut c = 0;
+        while c < width {
+            stage1_ref_patch(img, width, height, r, c, sigma, kaiser, &mut num, &mut den);
+            c += REF_STEP;
         }
+        r += REF_STEP;
     }
+    num.iter().zip(den.iter()).map(|(n, d)| n / d).collect()
+}
 
-    let (_, final_tile) = process_tile(&tile_img, width_h, height_h, sigma, kaiser);
-
-    // Extract inner (non-halo) portion
-    let inner_row_start = row0 - h_row0;
-    let inner_col_start = col0 - h_col0;
-    let mut out_tile = vec![0f32; t_rows * t_cols];
-    for pr in 0..t_rows {
-        for pc in 0..t_cols {
-            let hr = inner_row_start + pr;
-            let hc = inner_col_start + pc;
-            out_tile[pr * t_cols + pc] = final_tile[hr * width_h + hc];
+/// BM3D stage 2 (Wiener shrinkage) over the full image using the stage-1 estimate.
+fn bm3d_stage2(
+    img: &[f32],
+    stage1: &[f32],
+    width: usize,
+    height: usize,
+    sigma: f32,
+    kaiser: &[f32; PATCH * PATCH],
+) -> Vec<f32> {
+    let n = width * height;
+    let epsilon = 1e-12f32;
+    let mut num: Vec<f32> = img.iter().map(|&v| v * epsilon).collect();
+    let mut den = vec![epsilon; n];
+    let mut r = 0;
+    while r < height {
+        let mut c = 0;
+        while c < width {
+            stage2_ref_patch(img, stage1, width, height, r, c, sigma, kaiser, &mut num, &mut den);
+            c += REF_STEP;
         }
+        r += REF_STEP;
     }
-
-    TileResult { tile_row, tile_col, out_tile, t_rows, t_cols }
+    num.iter().zip(den.iter()).map(|(n, d)| n / d).collect()
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// BM3D denoiser — deterministic two-stage (hard threshold + Wiener).
+///
+/// Both stages run on the full mirror-padded image (no spatial tiling).
+/// Tiling with independently-processed sub-images would produce visible seams:
+/// block-match context for patches near a tile boundary differs between tiles,
+/// causing stage-1 estimates to diverge, which cascades into stage-2 Wiener
+/// weights and yields ~7-code discontinuities even with generous halo overlap.
 ///
 /// # Arguments
 /// * `input` — single-channel normalized image (row-major), already VST-applied.
@@ -655,11 +584,7 @@ fn process_one_tile(
 pub fn bm3d_denoise(input: &[f32], width: usize, height: usize, sigma: f32) -> Vec<f32> {
     assert_eq!(input.len(), width * height);
 
-    // Mirror-pad the input by PATCH pixels on each side to prevent boundary artifacts.
-    // Without padding, BM3D produces artifacts at image edges because reference-patch
-    // iteration stops PATCH pixels before the boundary, leaving edge pixels with few
-    // accumulation contributions. The pad ensures every pixel is covered by at least
-    // one reference. Always removed before returning.
+    // Mirror-pad by PATCH pixels so boundary reference patches have full context.
     let pad = PATCH;
     let pw = width + 2 * pad;
     let ph = height + 2 * pad;
@@ -673,55 +598,16 @@ pub fn bm3d_denoise(input: &[f32], width: usize, height: usize, sigma: f32) -> V
     }
 
     let kaiser = kaiser2d();
+    let stage1 = bm3d_stage1(&padded, pw, ph, sigma, &kaiser);
+    let denoised_padded = bm3d_stage2(&padded, &stage1, pw, ph, sigma, &kaiser);
 
-    let tile_rows = (ph + TILE - 1) / TILE;
-    let tile_cols = (pw + TILE - 1) / TILE;
-
-    let tile_coords: Vec<(usize, usize)> = (0..tile_rows)
-        .flat_map(|tr| (0..tile_cols).map(move |tc| (tr, tc)))
-        .collect();
-
-    // Process tiles in parallel — each tile is independent (reads from `padded`, writes to its
-    // own TileResult). Output merge is sequential with no races.
-    #[cfg(feature = "parallel")]
-    let results: Vec<TileResult> = {
-        use rayon::prelude::*;
-        tile_coords
-            .par_iter()
-            .map(|&(tr, tc)| process_one_tile(&padded, pw, ph, sigma, &kaiser, tr, tc))
-            .collect()
-    };
-
-    #[cfg(not(feature = "parallel"))]
-    let results: Vec<TileResult> = tile_coords
-        .iter()
-        .map(|&(tr, tc)| process_one_tile(&padded, pw, ph, sigma, &kaiser, tr, tc))
-        .collect();
-
-    // Merge sequentially — output regions are non-overlapping
-    let mut padded_out = vec![0f32; pw * ph];
-    for r in results {
-        let row0 = r.tile_row * TILE;
-        let col0 = r.tile_col * TILE;
-        for pr in 0..r.t_rows {
-            for pc in 0..r.t_cols {
-                let ir = row0 + pr;
-                let ic = col0 + pc;
-                if ir < ph && ic < pw {
-                    padded_out[ir * pw + ic] = r.out_tile[pr * r.t_cols + pc];
-                }
-            }
-        }
-    }
-
-    // Crop inner region (remove padding) to recover the original image size
+    // Crop padding
     let mut output = vec![0f32; width * height];
     for r in 0..height {
         for c in 0..width {
-            output[r * width + c] = padded_out[(r + pad) * pw + (c + pad)];
+            output[r * width + c] = denoised_padded[(r + pad) * pw + (c + pad)];
         }
     }
-
     output
 }
 
