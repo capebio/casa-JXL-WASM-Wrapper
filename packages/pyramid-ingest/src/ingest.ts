@@ -137,7 +137,13 @@ function makeImageSignal(
   if (callerSignal.aborted) combined.abort((callerSignal as any).reason);
   else callerSignal.addEventListener("abort", onCaller, { once: true });
   deadlineAc.signal.addEventListener("abort", onDeadline, { once: true });
-  return { signal: combined.signal, dispose };
+  // dispose clears the deadline timer AND detaches the caller listener so a long-lived caller signal
+  // (e.g. one shared across a whole batch) does not retain this per-image closure after we return.
+  const disposeManual = () => {
+    dispose();
+    callerSignal.removeEventListener("abort", onCaller);
+  };
+  return { signal: combined.signal, dispose: disposeManual };
 }
 
 // low-no-retry-on-ebusy + high-atomic-writes: Windows AV/locker EBUSY retry (3x 50ms).
@@ -523,13 +529,26 @@ export async function ingestImage(
   const imageDir = join(opts.outDir, "images", imageId);
   const manifestPath = join(imageDir, "manifest.json");
 
+  // finding 67: one combined AbortSignal per image = caller cancel + deadline (see makeImageSignal).
+  // Created BEFORE the master-bytes read so the deadline can gate the *read* stage too — the read is
+  // the first expensive step on the timed path and must abort with stage="read", not run to completion.
+  // Threaded onto a per-image backends view so decode/encode/downscale/publish stages observe it.
+  const { signal: imageSignal, dispose: disposeSignal } = makeImageSignal(backends.signal, opts.timeoutMs);
+  const stageBackends: Backends = imageSignal === backends.signal ? backends : { ...backends, signal: imageSignal };
+  try {
+
   // med-manifesttmp-orphan + B2: clear stale tmp from prior crash before any check/write
   await unlink(manifestPath + ".tmp").catch(() => {});
 
   // The master bytes are read at most once and reused for skip-check, fingerprint and ingest.
   let bytes: Uint8Array | undefined;
   const readBytesOnce = async (): Promise<Uint8Array> => {
-    if (bytes === undefined) bytes = await readFile(masterPath); // Buffer satisfies Uint8Array (low-readfile)
+    if (bytes === undefined) {
+      bytes = await readFile(masterPath); // Buffer satisfies Uint8Array (low-readfile)
+      // finding 67: read-stage checkpoint. The deadline may have expired while this I/O was in flight;
+      // abort here with stage="read" rather than proceeding into the skip-check / decode.
+      throwIfAborted(imageSignal, "read");
+    }
     return bytes;
   };
   // finding 66 (Task 5): observed source fingerprint, memoized. The fast path (size + quickHash) is
@@ -544,6 +563,10 @@ export async function ingestImage(
   };
 
   if (!opts.force) {
+    // finding 67: read-stage checkpoint. If the deadline/caller already fired, abort at "read" rather
+    // than issuing the skip-check manifest read (the first read on the timed path when a cached fresh
+    // manifest exists).
+    throwIfAborted(imageSignal, "read");
     // ING-5: single read (no fileExists+readFile); a corrupt existing manifest falls through to
     // a clean re-ingest instead of throwing and failing the image.
     // Binary format (−73%) auto-detected by parseManifest; read as binary to support both formats
@@ -595,7 +618,12 @@ export async function ingestImage(
           if (uptodate) return { outcome: "skipped" };
         }
       }
-    } catch { /* corrupt/unparseable manifest → re-ingest (overwrite) */ }
+    } catch (e) {
+      // finding 67: an abort raised by the read-stage checkpoint inside the skip-check master read must
+      // propagate — only a genuine corrupt/unparseable manifest may fall through to a clean re-ingest.
+      if (isAbortError(e)) throw makeAbortError(inferStage(e, "read"), e);
+      /* corrupt/unparseable manifest → re-ingest (overwrite) */
+    }
   }
 
   const masterBytes = await readBytesOnce();
@@ -622,11 +650,6 @@ export async function ingestImage(
 
   // F4: extract once on master bytes for every ingest (native/jpg/fallback). Cheap vs encode.
   const meta = await extractBasicMetadata(masterBytes, !opts.stripGps);
-
-  // finding 67: one combined AbortSignal per image = caller cancel + deadline (see makeImageSignal).
-  // Threaded onto a per-image backends view so decode/encode/downscale/publish stages observe it.
-  const { signal: imageSignal, dispose: disposeSignal } = makeImageSignal(backends.signal, opts.timeoutMs);
-  const stageBackends: Backends = imageSignal === backends.signal ? backends : { ...backends, signal: imageSignal };
 
   const workP = (async (): Promise<IngestResult> => {
     let plan: IngestPlan | null = null;
@@ -682,12 +705,13 @@ export async function ingestImage(
     return { outcome: "written", stagedBytes: stagedBytes || undefined, degraded: usedFallback || undefined };
   })();
 
-  try {
     // JOIN the work before returning. The deadline no longer wins a race against a still-running
     // loser: it fires `imageSignal`, the work throws ABORT_ERR at its next checkpoint, and that
     // settled result (or the cancelled rejection) is what we return — no detached promise.
     return await workP;
   } finally {
+    // dispose runs on EVERY exit path — including an abort thrown by the read-stage checkpoint above,
+    // which now happens inside this outer try — so the deadline timer never leaks.
     disposeSignal();
   }
 }

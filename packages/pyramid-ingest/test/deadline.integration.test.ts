@@ -1,14 +1,33 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, mock } from "bun:test";
 import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setJxlModuleFactoryForTesting } from "@casabio/jxl-wasm";
 import type { Backends } from "../src/ingest";
 import type { DecodedMaster, JxlBackend, RawBackend, RawFormat } from "../src/backends";
-import { ingestBatch, ingestImage } from "../src/ingest";
-import { imageIdForPath } from "../src/hash";
 
-afterEach(() => setJxlModuleFactoryForTesting(null));
+// Install an overridable fs mock *before* importing the SUT so ingest.ts's static "node:fs/promises"
+// binding resolves to our wrapper. By default readFile is the real one; the read-stage test swaps in a
+// slow hook for a specific master path to make the deadline expire *during* the read. All other tests
+// (and the test helpers above, which import the real fns directly) are unaffected.
+const realFs = await import("node:fs/promises");
+// Capture the REAL readFile before mock.module mutates the live namespace — the hook's fallback must
+// call the original, or it re-enters itself (infinite recursion). (Bun replaces realFs.readFile too.)
+const REAL_READ_FILE = realFs.readFile;
+let readFileHook: ((path: string, ...rest: any[]) => Promise<any>) | null = null;
+mock.module("node:fs/promises", () => ({
+  ...realFs,
+  readFile: async (path: any, ...rest: any[]) => {
+    if (readFileHook) return readFileHook(String(path), ...rest);
+    return (REAL_READ_FILE as any)(path, ...rest);
+  },
+}));
+
+// Pull the SUT after the mock is registered so its static fs import sees the wrapper.
+const { ingestBatch, ingestImage } = await import("../src/ingest");
+const { imageIdForPath } = await import("../src/hash");
+
+afterEach(() => { readFileHook = null; setJxlModuleFactoryForTesting(null); });
 
 // A promise that resolves as soon as an AbortSignal fires (or immediately if already aborted).
 // Used by the blocking test backends so a stage settles *after* the deadline rather than hanging.
@@ -86,6 +105,52 @@ function blockingBackends(blockAt: "decode" | "encode", callerSignal?: AbortSign
   const backends: Backends = { raw, jxl, __testInProcess: true, ...(callerSignal ? { signal: callerSignal } : {}) } as any;
   return { backends, settled: () => settledFlag };
 }
+
+// Backends whose decode + encode both succeed instantly. Used by the read-stage test: if the deadline
+// did NOT gate the read, ingest would sail through decode/encode and publish — the assertion that
+// nothing is published is what fails before the fix.
+function fastBackends(): Backends {
+  const raw: RawBackend = {
+    async decode(): Promise<DecodedMaster> {
+      return { rgba: gradientRgba(64, 48), width: 64, height: 48, orientation: "baked" };
+    },
+  };
+  const jxl: JxlBackend = {
+    async encodePyramid() { return []; },
+    async encodeTileContainer(_rgba, w, h) { return new Uint8Array([0xA0, w & 0xff, h & 0xff]); },
+    async downscaleRgba8(_rgba, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
+    async transcodeJpeg(b) { return b; },
+    async decodeToRgba8(b) { return { rgba: b, width: 4, height: 3 }; },
+  } as any;
+  return { raw, jxl, __testInProcess: true } as any;
+}
+
+// Deadline expiring while the master READ is in flight: the read is the first expensive step on the
+// timed path. A slow read hook makes the deadline fire *during* the read; the read-stage checkpoint
+// must abort with stage="read" and publish nothing. Before the fix the combined signal did not exist
+// until after the read (and there was no read gate), so decode/encode ran and the image published.
+test("deadline during read: aborts at the read stage and publishes nothing", async () => {
+  const out = await tmpOut();
+  const master = await writeMaster(out, "READ_BLOCK.orf");
+  const imageId = await imageIdForPath(master);
+
+  // Slow ONLY the master read; every other read (e.g. the ENOENT manifest probe) stays real+fast.
+  // 120ms read vs a 30ms deadline → the deadline fires while the read await is pending.
+  readFileHook = async (path, ...rest) => {
+    if (path.endsWith("READ_BLOCK.orf")) {
+      await new Promise((r) => setTimeout(r, 120));
+      return (REAL_READ_FILE as any)(path, ...rest);
+    }
+    return (REAL_READ_FILE as any)(path, ...rest);
+  };
+
+  const err = await ingestImage(master, fastBackends(), { outDir: out, timeoutMs: 30 }).then(() => null, (e) => e);
+
+  expect(err).toBeTruthy();
+  expect((err as any).code).toBe("ABORT_ERR");
+  expect((err as any).stage).toBe("read");
+  await assertNoPublish(out, imageId);
+});
 
 // Deadline expiring while DECODE is blocked: the decode is joined (settled) before ingestImage
 // returns, the error is ABORT_ERR carrying stage="decode", and nothing is published.
@@ -187,6 +252,15 @@ test("deadline at the pre-rename publish boundary: manifest is never renamed in"
 
 // Batch/worker path: a caller signal that aborts mid-batch settles cleanly (the batch promise
 // resolves, does not hang) and publishes nothing for the images that were still in flight.
+//
+// NOTE (follow-up): this exercises the in-process batch path (__testInProcess). The in-process path
+// mirrors the real worker_threads protocol — each dispatcher awaits one image at a time and, on
+// abort, the pool terminates its workers and rejects their pending jobs with ABORT_ERR (ingest.ts
+// ingestBatch, onAbort handler), the same settle-not-hang contract asserted here. A dedicated test
+// that drives the REAL worker pool (dist/ingest-worker.js + real WASM backends, no __testInProcess)
+// to prove the worker settles and the stage propagates over postMessage is deferred: it needs a
+// compiled worker + real libjxl WASM in the harness and does not change the abort protocol this test
+// already covers.
 test("ingestBatch with caller cancel settles without hanging and publishes nothing", async () => {
   const out = await tmpOut();
   const m1 = await writeMaster(out, "B1.orf");
