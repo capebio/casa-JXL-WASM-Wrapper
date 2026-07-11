@@ -123,27 +123,18 @@ export function isUpToDate(existing: Manifest, mtimeMs: number, proxy = false): 
 // finding 61: the binary implementation lives in the focused, cycle-free `manifest-codec.ts`
 // module (statically imported — no CommonJS `require`). These thin wrappers validate the decoded
 // object through zod so callers get a fully-typed Manifest/GalleryIndex.
+//
+// M-3: the binary WRITE API (manifestToBinary / indexToBinary) was dead (zero callers) and lossy for
+// the v5 schema — removed. The canonical persisted form is JSON (`manifestToJson`). Only the
+// read-only DECODERS remain, so on-disk manifests already in the legacy binary format still parse.
 import {
-  manifestToBinaryObject,
   binaryToManifestObject,
-  indexToBinaryObject,
   binaryToGalleryIndexObject,
 } from "./manifest-codec.js";
-
-/** Encode a manifest to the legacy tight binary format. Lossy for v5/metadata/unknown fields —
- *  prefer `manifestToJson` for canonical persistence. */
-export function manifestToBinary(manifest: Manifest): Uint8Array {
-  return manifestToBinaryObject(manifest as any);
-}
 
 /** Decode a legacy binary manifest and validate it. */
 export function binaryToManifest(data: Uint8Array): Manifest {
   return manifestSchema.parse(binaryToManifestObject(data)) as Manifest;
-}
-
-/** Encode a gallery index to the legacy tight binary format. */
-export function indexToBinary(index: GalleryIndex): Uint8Array {
-  return indexToBinaryObject(index);
 }
 
 /** Decode a legacy binary gallery index. */

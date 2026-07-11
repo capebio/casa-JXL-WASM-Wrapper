@@ -262,6 +262,17 @@ describe("v5 manifest reading", () => {
     expect(m.schema).toBe(4);
     expect(m.levels[0].tiling).toEqual({ tileSize: 256, cols: 18, rows: 14 });
   });
+
+  // I-2 (finding 64): sourceFormat is decoupled from the closed decoder-capability `format` set.
+  // The browser reader must accept ANY non-empty sourceFormat (e.g. a "cr3" the decoder cannot
+  // handle) so provenance survives, matching the canonical ingest parser (no cross-parser divergence).
+  test("I-2: an out-of-enum master.sourceFormat (cr3) is accepted", () => {
+    const m = parsePyramidManifest(v5Base({
+      master: { name: "IMG.CR3", sourceFormat: "cr3", format: "unknown", mtimeMs: 1717900000000 },
+    }));
+    expect(m.master.sourceFormat).toBe("cr3");
+    expect(m.master.format).toBe("unknown");
+  });
 });
 
 // ── GalleryIndex ─────────────────────────────────────────────────────────────

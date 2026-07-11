@@ -97,6 +97,18 @@ describe("migrateManifestToV5 (additive, unknown-preserving)", () => {
   test("refuses to migrate an unsupported FUTURE major schema", () => {
     expect(() => migrateManifestToV5({ ...v1, schema: 6 })).toThrow();
   });
+
+  // M-2: v5 orientation is required. A pathological v1 manifest that itself lacked orientation must
+  // still migrate to a VALID v5 (orientation defaulted), so migration always emits it and the
+  // required-orientation ingest + browser readers both accept the result.
+  test("M-2: migrating a v1 manifest with NO orientation still yields a valid v5 with a default orientation", () => {
+    const noOrient: any = { ...v1 };
+    delete noOrient.orientation;
+    const out = migrateManifestToV5(noOrient);
+    expect(out.orientation).toEqual({ exif: 1, pixels: "baked-upright" });
+    // The migrated object is a valid v5 manifest (required orientation is satisfied).
+    expect(() => parseManifest(JSON.stringify(out))).not.toThrow();
+  });
 });
 
 describe("migrateSchema (filesystem walk) to schema 5", () => {

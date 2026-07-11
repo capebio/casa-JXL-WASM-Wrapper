@@ -13,6 +13,17 @@ import {
   manifestToJson,
 } from "../src/schema";
 
+// M-3: the dead binary WRITE API (manifestToBinary / indexToBinary) is removed — the canonical
+// persisted form is JSON (manifestToJson). The binary DECODERS remain for read-only compatibility.
+test("M-3: the binary write API is gone; the binary decoders remain", async () => {
+  const mod: Record<string, unknown> = await import("../src/manifest");
+  expect(mod.manifestToBinary).toBeUndefined();
+  expect(mod.indexToBinary).toBeUndefined();
+  // Decoders kept.
+  expect(typeof mod.binaryToManifest).toBe("function");
+  expect(typeof mod.binaryToGalleryIndex).toBe("function");
+});
+
 test("levelSize reports 'full' only when dims match the master", () => {
   expect(levelSize(4624, 3468, 4624, 3468)).toBe("full");
   expect(levelSize(256, 192, 4624, 3468)).toBe(256);
@@ -292,5 +303,45 @@ describe("v5 manifest schema (OrientationDescriptor + TilingDescriptor + sourceF
     try { parseManifest(JSON.stringify(v5Manifest({ orientation: { exif: 9, pixels: "baked-upright" } }))); } catch (e) { thrown = e; }
     expect(thrown).toBeDefined();
     expect(String((thrown as Error).message)).toMatch(/exif|orientation/i);
+  });
+
+  // I-2 (finding 64): sourceFormat records what the file ACTUALLY was, decoupled from the closed
+  // decoder-capability `format` enum. A source variant the decoder cannot handle (e.g. "cr3") must
+  // still round-trip so provenance is never erased. Previously the ingest schema pinned sourceFormat
+  // to the same closed enum as format, so a "cr3" master threw on parse (the browser reader already
+  // accepted any non-empty string — a cross-parser divergence).
+  test("I-2: master.sourceFormat accepts an out-of-enum value (cr3) and round-trips through parseManifest", () => {
+    const m = v5Manifest({ master: { name: "IMG.CR3", sourceFormat: "cr3", format: "unknown", mtimeMs: 1717900000000 } });
+    const parsed = parseManifest(JSON.stringify(m)) as any;
+    expect(parsed.master.sourceFormat).toBe("cr3");
+    expect(parsed.master.format).toBe("unknown");
+    // Lossless re-emit keeps the value.
+    const round = JSON.parse(manifestToJson(parsed));
+    expect(round.master.sourceFormat).toBe("cr3");
+  });
+
+  test("I-2: an empty sourceFormat is still rejected (min length 1)", () => {
+    const m = v5Manifest({ master: { name: "IMG.CR3", sourceFormat: "", format: "unknown", mtimeMs: 1 } });
+    expect(() => parseManifest(JSON.stringify(m))).toThrow();
+  });
+
+  // M-2: v5 orientation is REQUIRED (aligned with the jxl-pyramid browser reader, which already
+  // required it). The writer and migration always emit an OrientationDescriptor, so requiring it
+  // costs no readable manifest. This closes an ingest(optional)/browser(required) cross-parser gap.
+  test("M-2: a v5 manifest missing orientation is rejected by parseManifest", () => {
+    const m = v5Manifest();
+    delete (m as any).orientation;
+    expect(() => parseManifest(JSON.stringify(m))).toThrow();
+  });
+
+  test("M-2: the writer always emits an OrientationDescriptor on v5", () => {
+    const built = buildManifest({
+      imageId: "b".repeat(16), master: { name: "x.orf", format: "orf", mtimeMs: 1 },
+      orientation: "baked", width: 10, height: 10,
+      levels: [{ size: "full", w: 10, h: 10, bytes: 1, bitsPerSample: 8, contenthash: "c".repeat(16), tiled: false }],
+    });
+    expect((built as any).orientation).toEqual({ exif: 1, pixels: "baked-upright" });
+    // Its own output re-parses (writer output is always accepted by the required-orientation schema).
+    expect(() => parseManifest(JSON.stringify(built))).not.toThrow();
   });
 });

@@ -33,14 +33,18 @@ export function migrateManifestToV5(raw: any): any {
   const out: any = { ...raw, schema: 5 };
 
   // orientation: map the old string; leave an existing descriptor untouched.
+  // M-2: orientation is REQUIRED on v5, so an absent/unrecognised source orientation is defaulted
+  // to { exif: 1, pixels: "baked-upright" } (exif 1 = no rotation recorded pre-v5). This guarantees
+  // migration always emits a valid OrientationDescriptor, matching the writer and both readers.
   const o = raw.orientation;
   if (typeof o === "string") {
     const pixels = o === "source" ? "source" : "baked-upright";
     out.orientation = { exif: 1, pixels };
   } else if (o && typeof o === "object" && typeof o.exif === "number" && V5_ORIENTATION_PIXELS.has(o.pixels)) {
     out.orientation = { ...o };
+  } else {
+    out.orientation = { exif: 1, pixels: "baked-upright" };
   }
-  // (absent orientation stays absent — it is optional on v5.)
 
   // master.sourceFormat: default from format; never clobber.
   if (raw.master && typeof raw.master === "object") {
