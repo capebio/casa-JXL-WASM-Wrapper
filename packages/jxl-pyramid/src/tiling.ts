@@ -253,10 +253,11 @@ export function extractTileBitstream(
   // Trust-boundary + bounds checks (JXTC v1/v2 invariant):
   //  1. A tile must live PAST the header+index region — an offset inside it could
   //     feed index/header bytes to the JXL decoder. First tile data == 32 + N*8.
-  //  2. offset + length must not run past EOF. Use the OVERFLOW-SAFE form
-  //     `len > byteLength - off` — never add `off + len`, which wraps in fixed-width
-  //     integer readers (wasm32 size_t): 0xFFFFFFF0 + 24 → 0x8. Once (1) passes,
-  //     `off <= byteLength`, so `byteLength - off` cannot underflow.
+  //  2. offset must be within the file, and offset+length must not run past EOF.
+  //     Use the OVERFLOW-SAFE form `len > byteLength - off` — never add `off + len`,
+  //     which wraps in fixed-width integer readers (wasm32 size_t): 0xFFFFFFF0 + 24
+  //     → 0x8. The explicit `off > byteLength` guard first makes `byteLength - off`
+  //     safe from underflow (mirrored in C++/Rust; see cross-language-jxtc.test.ts).
   const indexEnd = 32 + header.tilesX * header.tilesY * 8;
   if (off < indexEnd) throw new PyramidError('JXTC_PARSE', 'tile offset inside header/index');
   if (len === 0 || off > container.byteLength || len > container.byteLength - off) {

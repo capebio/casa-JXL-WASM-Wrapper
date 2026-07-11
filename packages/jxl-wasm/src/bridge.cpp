@@ -1697,6 +1697,11 @@ static JxlWasmBuffer* DecodeRgba8RegionTiled(const uint8_t* input, size_t input_
 //                tile_size | tiles_x | tiles_y | flags (bit0=has_alpha)
 //   [Index 8B × N] per tile: offset (4B), length (4B)
 //   [N standalone JXL bitstreams]
+//
+// Offset contract (finding 60): every index offset is an ABSOLUTE byte offset from
+// byte 0 of the container — first tile offset == 32 + N*8. This is a cross-language
+// invariant shared with the TS reader (tiling.ts) and Rust reader
+// (jxl_casadecoder.rs); none of them rebase the stored value.
 #define JXTC_MAGIC          0x4354584Au  // 'JXTC' little-endian
 #define JXTC_VERSION        1u
 #define JXTC_HEADER_BYTES   32u
@@ -1922,10 +1927,15 @@ static JxlWasmBuffer* EncodeRgba8TileContainer(const uint8_t* pixels,
   h32[6] = tiles_y;
   h32[7] = has_alpha ? 1u : 0u;
 
+  // JXTC invariant (finding 60): every index offset is an ABSOLUTE byte offset from
+  // byte 0 of the container. The first tile therefore starts at header_bytes +
+  // index_bytes (== 32 + tile_count*8), and each subsequent offset is the running
+  // absolute cursor. Readers (C++ here, TS tiling.ts, Rust jxl_casadecoder.rs) must
+  // treat the stored value as absolute and MUST NOT re-add any data base.
   uint32_t cursor = static_cast<uint32_t>(header_bytes + index_bytes);
   uint32_t* index = reinterpret_cast<uint32_t*>(output + header_bytes);
   for (uint32_t i = 0; i < tile_count; ++i) {
-    index[i * 2 + 0] = cursor;
+    index[i * 2 + 0] = cursor; // ABSOLUTE offset from byte 0.
     index[i * 2 + 1] = static_cast<uint32_t>(tile_lengths[i]);
     memcpy(output + cursor, tile_bytes[i], tile_lengths[i]);
     cursor += static_cast<uint32_t>(tile_lengths[i]);
@@ -1978,9 +1988,21 @@ static JxlWasmBuffer* DecodeRgba8TileContainerRegion(const uint8_t* input, size_
     for (uint32_t tx = tx_min; tx <= tx_max; ++tx) {
       const uint32_t idx = ty * tiles_x + tx;
       if (idx >= tile_count) { free(out_pixels); return MakeError(107); }
+      // JXTC invariant: `offset` is an ABSOLUTE byte offset from byte 0 of the
+      // container (matches the writer above at line ~1925). Trust-boundary + bounds:
+      //   1. offset must land PAST the header+index region, else a crafted container
+      //      could feed index/header bytes to the JXL decoder.
+      //   2. offset must be within the file, and offset+length must not run past EOF.
+      // OVERFLOW-SAFE upper bound: `length > input_size - offset` — never compute
+      // `offset + length`, which WRAPS in fixed-width arithmetic. On wasm32 size_t is
+      // 32-bit, so the old `static_cast<size_t>(offset) + length > input_size` let
+      // offset=0xFFFFFFF0, length=24 wrap to 0x8 (< input_size) and slip through.
+      // Once (offset > input_size) is rejected, `input_size - offset` cannot underflow.
       const uint32_t offset = index[idx * 2 + 0];
       const uint32_t length = index[idx * 2 + 1];
-      if (offset < header_bytes + index_bytes || static_cast<size_t>(offset) + length > input_size) {
+      if (offset < header_bytes + index_bytes ||
+          offset > input_size ||
+          length > input_size - offset) {
         free(out_pixels); return MakeError(108);
       }
 

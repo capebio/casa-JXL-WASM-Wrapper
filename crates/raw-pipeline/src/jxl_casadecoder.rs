@@ -2113,8 +2113,14 @@ fn jxtc_tile_stream(
     let entry = container
         .get(base..entry_end)
         .ok_or(JxtcRegionError::InvalidIndex { x, y })?;
+    // JXTC invariant (finding 60): `off` is an ABSOLUTE byte offset from byte 0 of
+    // the container (matches the C++ and Rust writers, first tile at index_end); it
+    // is used directly, never rebased.
     let off = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]) as usize;
     let len = u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) as usize;
+    // OVERFLOW-SAFE upper bound: checked_add rejects any off+len that would wrap
+    // (this is the Rust form of the cross-language "len > file_len - off" guard;
+    // unlike a fixed-width `off + len`, checked_add cannot silently wrap).
     let end = off
         .checked_add(len)
         .ok_or(JxtcRegionError::InvalidIndex { x, y })?;
@@ -2709,10 +2715,12 @@ mod tests {
         let flags: u32 = 1 | if is16 { 2 } else { 0 }; // has_alpha + 16-bit
         out.extend_from_slice(&flags.to_le_bytes());
         // Index table — payloads start right after header + table (fixed size).
+        // JXTC invariant (finding 60): stored offsets are ABSOLUTE from byte 0, so the
+        // first tile's offset == payload_start (32 + num_tiles*8), not 0.
         let payload_start = JXTC_HEADER_BYTES + num_tiles * JXTC_INDEX_ENTRY_BYTES;
         let mut cur = payload_start;
         for t in tiles {
-            out.extend_from_slice(&(cur as u32).to_le_bytes());
+            out.extend_from_slice(&(cur as u32).to_le_bytes()); // absolute offset
             out.extend_from_slice(&(t.len() as u32).to_le_bytes());
             cur += t.len();
         }
@@ -3012,6 +3020,84 @@ mod tests {
         assert!(
             out.iter().all(|&b| b == 0),
             "rejected tile yields a zeroed hole"
+        );
+    }
+
+    // ── Cross-language absolute-offset golden (Task 3, finding 60) ────────────
+    // These load the SAME on-disk contract fixtures the TS golden loads
+    // (packages/pyramid-ingest/test/fixtures/contracts). The Rust reader
+    // (`jxtc_tile_stream`) must (a) treat each index offset as ABSOLUTE from byte 0
+    // and extract byte-identical tile payloads, and (b) reject the two malformed
+    // fixtures — including the wasm32-wrap overflow (0xFFFFFFF0 + 24). The Rust guard
+    // uses `off.checked_add(len)`, the overflow-safe sibling of the TS/C++
+    // "len > file_len - off" form documented in cross-language-jxtc.test.ts.
+
+    const FIX_JXTC_V1: &[u8] =
+        include_bytes!("../../../packages/pyramid-ingest/test/fixtures/contracts/jxtc-v1.bin");
+    const FIX_JXTC_OVERFLOW: &[u8] =
+        include_bytes!("../../../packages/pyramid-ingest/test/fixtures/contracts/jxtc-overflow.bin");
+    const FIX_JXTC_OFFSET_INSIDE: &[u8] = include_bytes!(
+        "../../../packages/pyramid-ingest/test/fixtures/contracts/jxtc-offset-inside-index.bin"
+    );
+
+    /// Recompute (index_start, index_end) the way JxtcRegionDecoder::new does, so a
+    /// test can call the private `jxtc_tile_stream` extractor directly on a fixture.
+    fn jxtc_index_bounds(header: &JxtcHeader) -> (usize, usize) {
+        let num_tiles = header.tiles_x as usize * header.tiles_y as usize;
+        let start = JXTC_HEADER_BYTES;
+        (start, start + num_tiles * JXTC_INDEX_ENTRY_BYTES)
+    }
+
+    #[test]
+    fn cross_language_jxtc_v1_reader_extracts_absolute_payloads() {
+        let bytes = FIX_JXTC_V1;
+        let header = parse_jxtc_header(bytes).expect("fixture parses");
+        assert_eq!((header.tiles_x, header.tiles_y), (2, 1));
+        let (istart, iend) = jxtc_index_bounds(&header);
+        assert_eq!(iend, JXTC_HEADER_BYTES + 2 * JXTC_INDEX_ENTRY_BYTES); // 48
+
+        // Tile 0 = 16 bytes of 0x01; tile 1 = 24 bytes of 0x02 (fixture filler = idx+1).
+        let t0 = jxtc_tile_stream(bytes, header, istart, iend, (0, 0)).expect("tile 0 extracts");
+        let t1 = jxtc_tile_stream(bytes, header, istart, iend, (1, 0)).expect("tile 1 extracts");
+        assert_eq!(t0.len(), 16);
+        assert_eq!(t1.len(), 24);
+        assert!(t0.iter().all(|&b| b == 1), "tile 0 payload is all 0x01");
+        assert!(t1.iter().all(|&b| b == 2), "tile 1 payload is all 0x02");
+
+        // The first tile's stored offset is absolute: 32 + tileCount*8 = 48.
+        let first_off =
+            u32::from_le_bytes(bytes[JXTC_HEADER_BYTES..JXTC_HEADER_BYTES + 4].try_into().unwrap());
+        assert_eq!(first_off as usize, iend);
+    }
+
+    #[test]
+    fn cross_language_jxtc_overflow_rejected_overflow_safe() {
+        // tile 1 offset = 0xFFFFFFF0, length = 24 → off+len wraps in 32-bit arithmetic.
+        let bytes = FIX_JXTC_OVERFLOW;
+        let header = parse_jxtc_header(bytes).expect("fixture parses");
+        let (istart, iend) = jxtc_index_bounds(&header);
+        let off1 =
+            u32::from_le_bytes(bytes[JXTC_HEADER_BYTES + 8..JXTC_HEADER_BYTES + 12].try_into().unwrap());
+        assert_eq!(off1, 0xFFFF_FFF0);
+        // Reader must refuse it (checked_add / bounds), never hand OOB bytes to decode.
+        assert!(
+            jxtc_tile_stream(bytes, header, istart, iend, (1, 0)).is_err(),
+            "overflowing offset+length rejected (overflow-safe)"
+        );
+    }
+
+    #[test]
+    fn cross_language_jxtc_offset_inside_index_rejected() {
+        // tile 0 offset = 36 (inside the 32..48 index region) → trust-boundary reject.
+        let bytes = FIX_JXTC_OFFSET_INSIDE;
+        let header = parse_jxtc_header(bytes).expect("fixture parses");
+        let (istart, iend) = jxtc_index_bounds(&header);
+        let off0 =
+            u32::from_le_bytes(bytes[JXTC_HEADER_BYTES..JXTC_HEADER_BYTES + 4].try_into().unwrap());
+        assert!((off0 as usize) < iend, "fixture offset lands inside the index");
+        assert!(
+            jxtc_tile_stream(bytes, header, istart, iend, (0, 0)).is_err(),
+            "offset inside header/index rejected"
         );
     }
 
