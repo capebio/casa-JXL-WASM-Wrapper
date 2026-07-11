@@ -4,7 +4,12 @@ import { createImageStore } from './image-store.js'; // S2; passed in or fallbac
 
 const PREFETCH_RING = 1;
 
-/** @typedef {{ contenthash: string; w: number; h: number }} IndexL0 */
+/**
+ * finding 81: the L0 seed declares precision (bitsPerSample) and transport (tiled + tiling) so this
+ * controller decodes it through a VALID path. A bare seed (no tiled/bitsPerSample) is a monolithic
+ * 8-bit level — the default. A tiled seed is decoded through the tile-container path with a region.
+ * @typedef {{ contenthash: string; w: number; h: number; bytes?: number; bitsPerSample?: 8|16; tiled?: boolean; tiling?: object }} IndexL0
+ */
 /** @typedef {{ imageId: string; aspect: number; l0: IndexL0 }} IndexEntry */
 
 /**
@@ -59,12 +64,17 @@ export function createGridController({
         // (finding 73). `level.bytes` comes from the validated manifest; undefined for a bare l0
         // seed falls back to the store's generous ceiling.
         const bytes = await store.getLevelBytes(level.contenthash, { expectedBytes: level.bytes });
+        // finding 81: honor the level's DECLARED transport + precision. A level (or L0 seed) is
+        // decoded as tiled only when it explicitly declares `tiled` — an L0 seed without it defaults
+        // to a monolithic whole-frame decode (never assumed tiled). Precision follows bitsPerSample.
         const isTiled = level.tiled === true;
+        const format = level.bitsPerSample === 16 ? 'rgba16' : 'rgba8';
         return decodePyramidLevel(ctx, bytes, {
           contenthash: level.contenthash,
           priority,
           signal: shared.signal,
           tiled: isTiled,
+          format,
           // Supply full region for tiled so decodeTiledPooled can parallel all tiles (grid targets stay <=2048 whole, but protects if large tileSize or full picked).
           region: isTiled ? { x: 0, y: 0, w: level.w, h: level.h } : undefined,
         });

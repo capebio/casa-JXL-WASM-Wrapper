@@ -494,6 +494,11 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
         ...(dryRun ? { dryRun: true } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(parsed["profile-convergence"] ? { profileConvergence: true } : {}),
+        // finding 71: split the mem budget across the concurrent images so per-image profiling fan-out
+        // (each profiled level holds a full-res reference) stays within the batch memory budget.
+        ...(parsed["profile-convergence"]
+          ? { profileMemBudgetBytes: Math.max(1, Math.floor(memBudgetBytes / Math.max(1, concurrency))) }
+          : {}),
         ...(parsed.resume ? { resume: true } : {}),
         ...(parsed["chaos-test"] ? { chaosTest: true } : {}),
         ...(parsed["retry-failed"] ? { retryFailed: true } : {}),

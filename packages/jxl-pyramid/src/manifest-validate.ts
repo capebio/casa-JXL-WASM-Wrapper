@@ -371,6 +371,24 @@ function validateLevelZeroSeed(v: unknown, path: string): LevelZeroSeed {
     if (bytes > MAX_BYTES) fail(`${path}.bytes`, `bytes exceeds maximum ${MAX_BYTES}, got ${bytes}`);
     result.bytes = bytes;
   }
+  // finding 81: the seed declares PRECISION (bitsPerSample) and TRANSPORT (tiled + tiling) so a seed
+  // decoder chooses a valid path. Validate them at the trust boundary and preserve them; a bare seed
+  // (none present) stays a monolithic 8-bit level — the default. A tiled seed MUST carry a tiling
+  // descriptor (otherwise the seed decoder can't address tiles): reject a tiled seed without one.
+  if (o["bitsPerSample"] !== undefined) {
+    const bits = requireNumber(o["bitsPerSample"], `${path}.bitsPerSample`);
+    if (bits !== 8 && bits !== 16) fail(`${path}.bitsPerSample`, `expected 8 or 16, got ${bits}`);
+    result.bitsPerSample = bits as 8 | 16;
+  }
+  const tiled = o["tiled"] === undefined ? undefined : requireBoolean(o["tiled"], `${path}.tiled`);
+  if (tiled) {
+    result.tiled = true;
+    if (o["tiling"] == null) fail(`${path}.tiling`, "required when a tiled L0 seed is declared");
+    const t = requireObject(o["tiling"], `${path}.tiling`);
+    result.tiling = validateTilingDescriptor(t, `${path}.tiling`, w, h);
+  } else if (tiled === false) {
+    result.tiled = false;
+  }
   return result;
 }
 

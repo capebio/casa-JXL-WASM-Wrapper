@@ -171,6 +171,54 @@ describe("index entry finite/bounded aspect", () => {
       images: [{ imageId: "x", aspect: 1, l0: { contenthash: "abc", w: 1e12, h: 1 } }],
     })), "w");
   });
+
+  // ── finding 81: the L0 seed declares precision + transport so the seed decoder chooses a valid path.
+  test("finding 81: a bare L0 seed stays monolithic 8-bit (no tiled/bitsPerSample carried)", () => {
+    const idx = parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192 } }],
+    }));
+    const seed = idx.images[0]!.l0;
+    expect(seed.tiled).toBeUndefined();
+    expect(seed.bitsPerSample).toBeUndefined();
+    expect(seed.tiling).toBeUndefined();
+  });
+
+  test("finding 81: a tiled L0 seed preserves tiled + tiling so the seed decoder routes to the tile path", () => {
+    const idx = parseGalleryIndex(baseIndex({
+      images: [{
+        imageId: "x", aspect: 1.333,
+        l0: {
+          contenthash: "abc123", w: 256, h: 192, bitsPerSample: 8, tiled: true,
+          tiling: { container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" },
+        },
+      }],
+    }));
+    const seed = idx.images[0]!.l0;
+    expect(seed.tiled).toBe(true);
+    expect(seed.bitsPerSample).toBe(8);
+    expect(seed.tiling).toEqual({ container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" });
+  });
+
+  test("finding 81: a 16-bit L0 seed preserves bitsPerSample:16", () => {
+    const idx = parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192, bitsPerSample: 16 } }],
+    }));
+    const seed = idx.images[0]!.l0;
+    expect(seed.bitsPerSample).toBe(16);
+    expect(seed.tiled).toBeUndefined();
+  });
+
+  test("finding 81: a tiled L0 seed WITHOUT a tiling descriptor is rejected at the trust boundary", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192, tiled: true } }],
+    })), "tiling");
+  });
+
+  test("finding 81: an invalid l0.bitsPerSample is rejected", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192, bitsPerSample: 12 } }],
+    })), "bitsPerSample");
+  });
 });
 
 // ── Level ordering ───────────────────────────────────────────────────────────

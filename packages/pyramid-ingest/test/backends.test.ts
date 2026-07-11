@@ -39,6 +39,35 @@ test("createJxlBackend transcodes a JPEG and decodes it back to RGBA8", async ()
   expect(decoded.rgba.length).toBe(640 * 480 * 4);
 });
 
+// finding 71: the real backend's profiler REUSES supplied reference pixels (skips the reference
+// decode). Encode a real level, then profile it with the ladder's reference pixels; assert the
+// stage event records reusedRef=true and the curve is still valid (real decoder in the loop).
+test("finding 71: createJxlBackend profileConvergenceCurve reuses supplied refPixels (real WASM)", async () => {
+  setForcedTier("simd");
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+
+  const stages: Array<{ name: string; fields?: Record<string, unknown> }> = [];
+  const jxl = createJxlBackend({ stage: (name, fields) => stages.push({ name, fields }), progress() {} });
+  if (typeof jxl.profileConvergenceCurve !== "function") return; // no ssim/butter build → skip
+
+  // Real 1280-wide RGBA8 reference + real JXL encode of it (single whole-frame level).
+  const W = 1280, H = 960;
+  const ref = new Uint8Array(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const o = (y * W + x) * 4;
+    ref[o] = (x * 31 + y * 17) & 0xff; ref[o + 1] = (x * 7 + y * 53) & 0xff; ref[o + 2] = (x * 13 + y * 29) & 0xff; ref[o + 3] = 255;
+  }
+  const level = (await jxl.encodePyramid(ref, W, H, { sidecars: [], fullDistance: 1.0, effort: 3 }))[0]!;
+
+  // Reuse path: pass the reference. The stage event must record reusedRef=true.
+  const prof = await jxl.profileConvergenceCurve(level.data, W, H, ref);
+  const reuseStages = stages.filter((s) => s.name === "profile-convergence" && s.fields?.reusedRef === true);
+  expect(reuseStages.length).toBe(1);
+  // Curve is either a valid array (real passes measured) or undefined (single-pass) — never a throw.
+  if (prof) expect(Array.isArray(prof.curve)).toBe(true);
+}, 180_000);
+
 test("createJxlBackend.encodePyramid returns ascending 8-bit levels, full last", async () => {
   // Use the test fake (consistent with other pyramid-ingest tests under restricted WASM exports).
   // The adapter shape + ladder size contract is what matters for this unit test.

@@ -41,11 +41,14 @@ export interface IngestOptions {
   statMap?: Record<string, { size: number; mtimeMs: number }>;  // C1: from upfront collect to avoid re-stat
   stripGps?: boolean; // F4: privacy for sensitive species (biodiversity)
   idMap?: Record<string, string>;  // B5/B11 extension: precomputed imageIds to elide re-hash in batch dispatchers (mirrors statMap pattern)
-  tiling?: TilingPolicy; // per-batch tiling policy (--tiling): "adaptive" (default) | "tile-all"
+  tiling?: TilingPolicy; // per-batch tiling policy (--tiling): "never" | "adaptive" (default) | "tile-all"
   // Task 7 (finding 68): capability proving the GLOBAL write lock is held. When present, each per-image
   // lock acquisition asserts it is still live (GLOBAL then IMAGE). The CLI batch path threads tx.token
   // here; callers that hold the global lock some other way may omit it.
   globalLock?: GlobalWriteToken;
+  /** finding 71: byte budget bounding concurrent convergence profiling (each profiled level holds a
+   *  full-res reference). Derived from --mem-budget-mb in the CLI. Absent → ladder default. */
+  profileMemBudgetBytes?: number;
 }
 
 export type IngestOutcome = "written" | "skipped";
@@ -412,10 +415,11 @@ export async function computeIngestPlan(
     throwIfAborted(sig, "encode"); // deadline may have fired during decode; do not begin encode
     ladder = await buildProxyLadder(
       b.jxl, decoded.rgba, decoded.width, decoded.height, opts.proxy, decoded.orientation, !!opts.profileConvergence, sig,
+      { profileMemBudgetBytes: opts.profileMemBudgetBytes },
     );
   } else if (format === "jpg") {
     // F6/L9: jpg decode does not bake EXIF rotation (verified); pass "source" (or real EXIF when plumbed in caller)
-    ladder = await buildJpgLadder(b.jxl, bytes, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive", sig);
+    ladder = await buildJpgLadder(b.jxl, bytes, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive", sig, { profileMemBudgetBytes: opts.profileMemBudgetBytes });
     if (await probeOrientation(bytes) === "baked") {
       (ladder as any).orientation = "baked";
     }
@@ -423,7 +427,7 @@ export async function computeIngestPlan(
     const decoded = await b.raw.decode(bytes, format, sig);
     tel?.stage("decode-master", { w: decoded.width, h: decoded.height });
     throwIfAborted(sig, "encode"); // deadline may have fired during decode; do not begin encode
-    ladder = await buildRawLadder(b.jxl, decoded, !!opts.profileConvergence, opts.tiling ?? "adaptive", sig);
+    ladder = await buildRawLadder(b.jxl, decoded, !!opts.profileConvergence, opts.tiling ?? "adaptive", sig, { profileMemBudgetBytes: opts.profileMemBudgetBytes });
   }
 
   throwIfAborted(sig, "encode"); // after ladder build (encode), before manifest assembly + publish
@@ -746,9 +750,9 @@ async function buildFallbackPlan(
       // F3: honor proxy in fallback (native raw failed); decode embedded jpg to rgba then proxy ladder
       const fullJxl = await b.jxl.transcodeJpeg(jpeg);
       const dec = await b.jxl.decodeToRgba8(fullJxl);
-      ladder = await buildProxyLadder(b.jxl, dec.rgba, dec.width, dec.height, opts.proxy, "source", !!opts.profileConvergence, b.signal);
+      ladder = await buildProxyLadder(b.jxl, dec.rgba, dec.width, dec.height, opts.proxy, "source", !!opts.profileConvergence, b.signal, { profileMemBudgetBytes: opts.profileMemBudgetBytes });
     } else {
-      ladder = await buildJpgLadder(b.jxl, jpeg, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive", b.signal);
+      ladder = await buildJpgLadder(b.jxl, jpeg, !!opts.profileConvergence, "source", opts.tiling ?? "adaptive", b.signal, { profileMemBudgetBytes: opts.profileMemBudgetBytes });
       // F6 (embedded path): same map as master jpg; ladder override (deferred full plumb)
       if (await probeOrientation(jpeg) === "baked") {
         (ladder as any).orientation = "baked";
