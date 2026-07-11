@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { brotliCompressSync, constants as zlibConstants } from "node:zlib";
 import { scanWasmForRelaxedSimd, reportRelaxedSimdScan } from "./assert-no-relaxed-simd.mjs";
+import { computeInputDigest, canMergePartialTier, validateProvenance } from "./provenance.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageRoot = resolve(__dirname, "..");
@@ -122,6 +123,35 @@ async function localSourceCommit(dir) {
   }
 }
 
+/**
+ * Get the source commit and dirty status of the jxl-wasm package tree itself.
+ * These become provenance.sourceCommit + provenance.sourceDirty.
+ * Falls back to sentinel values when git is unavailable (e.g. dist-only drop).
+ *
+ * @returns {{ commit: string, dirty: boolean }}
+ */
+async function getSourceInfo() {
+  try {
+    const { execFileSync } = await import("node:child_process");
+    const commit = execFileSync("git", ["-C", packageRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    // --porcelain exits 0 whether clean or dirty; non-empty output means dirty.
+    const status = execFileSync("git", ["-C", packageRoot, "status", "--porcelain"], { encoding: "utf8" }).trim();
+    return { commit, dirty: status.length > 0 };
+  } catch {
+    return { commit: "unknown", dirty: false };
+  }
+}
+
+/**
+ * Compute a SHA-256 hex digest of a file's contents.
+ * @param {string} filePath
+ * @returns {Promise<string>}
+ */
+async function hashFile(filePath) {
+  const data = await readFile(filePath);
+  return createHash("sha256").update(data).digest("hex");
+}
+
 async function main() {
   const insideDocker = process.argv.includes("--inside-docker");
   const hostToolchain = process.argv.includes("--host-toolchain");
@@ -208,6 +238,32 @@ async function main() {
   const budgetViolations = [];
 
   await validateBridgeExports();
+
+  // P5-T3 (Finding 23): compute structured provenance inputs once before the build matrix.
+  // bridgeSourceHash and buildScriptHash are identical across all (kind × tier) combinations.
+  // exportsHash is per-kind (dec/enc export different symbol sets).
+  const sourceInfo = await getSourceInfo();
+  const bridgeSourceHash = await hashFile(join(packageRoot, "src", "bridge.cpp"));
+  const buildScriptHash = await hashFile(join(packageRoot, "scripts", "build.mjs"));
+  // Pre-hash each kind's exports file.
+  const exportsHashByKind = {};
+  for (const kind of moduleKinds) {
+    const exportsFile = getExportsFileForKind(kind);
+    exportsHashByKind[kind] = await hashFile(join(packageRoot, exportsFile));
+  }
+  // libjxl dirty status: when building from a local tree, check its git status.
+  // When cloning pinned upstream, the checkout is always clean.
+  let libjxlDirtyStatus = false;
+  if (useLocalSource) {
+    try {
+      const { execFileSync } = await import("node:child_process");
+      const status = execFileSync("git", ["-C", sourceDir, "status", "--porcelain"], { encoding: "utf8" }).trim();
+      libjxlDirtyStatus = status.length > 0;
+    } catch {}
+  }
+  // PGO profile digest from the staged lock (if any).
+  const pgoProfileDigest = manifest.pgo?.corpusHash ?? undefined;
+
   if (useLocalSource) {
     console.log(`[build] using local libjxl source: ${sourceDir} (skipping clone + deps.sh)`);
   } else {
@@ -295,6 +351,37 @@ async function main() {
       }
       const jsArtifact = await readArtifactMetadata(outJs);
       const wasmArtifact = readArtifactMetadataFromBytes(wasmBytes);
+      const combinedFlags = [...tierFlags, ...linkOnlyExtras];
+      const libjxlCommitForTier = localLibjxlCommit ?? config.libjxlCommit;
+      const provenanceInputs = {
+        bridgeSourceHash,
+        exportsHash: exportsHashByKind[kind],
+        flags: combinedFlags,
+        libjxlCommit: libjxlCommitForTier,
+        libjxlDirty: libjxlDirtyStatus,
+        toolchain: {
+          emscripten: config.emscriptenTag,
+          ...(process.env.JXL_WASM_EMSDK_IMAGE ? { emsdkImage: process.env.JXL_WASM_EMSDK_IMAGE } : {})
+        },
+        role: /** @type {"encode"|"decode"|"perceptual"} */ (kind === "dec" ? "decode" : "encode"),
+        tier: tier.name,
+        buildScriptHash,
+        pgoProfileDigest
+      };
+      const provenance = {
+        inputDigest: computeInputDigest(provenanceInputs),
+        sourceCommit: sourceInfo.commit,
+        sourceDirty: sourceInfo.dirty,
+        libjxlCommit: libjxlCommitForTier,
+        libjxlDirty: libjxlDirtyStatus,
+        toolchain: provenanceInputs.toolchain,
+        role: provenanceInputs.role,
+        tier: tier.name,
+        flags: combinedFlags,
+        ...(pgoProfileDigest ? { pgo: { profileDigest: pgoProfileDigest, applied: !!(manifest.pgo?.applied) } } : {})
+      };
+      // Validate provenance before writing (release builds reject dirty source/libjxl).
+      validateProvenance(provenance, { releaseMode: process.argv.includes("--release") });
       manifest.tiers[tierKey] = {
         kind,
         tier: tier.name,
@@ -306,7 +393,8 @@ async function main() {
         wasmSha256: wasmArtifact.sha256,
         jsIntegrity: jsArtifact.integrity,
         wasmIntegrity: wasmArtifact.integrity,
-        flags: [...tierFlags, ...linkOnlyExtras]
+        flags: combinedFlags,
+        provenance
       };
 
       const budgetKey = `${kind}:${tier.name}`; // budgets are per module kind × cpu tier
@@ -553,7 +641,22 @@ async function writeManifest(manifest) {
     if (err.code !== "ENOENT") throw err;
   }
   if (existing && existing.buildId === manifest.buildId && existing.libjxlCommit === manifest.libjxlCommit) {
-    const mergedTiers = { ...(existing.tiers ?? {}), ...manifest.tiers };
+    // Merge existing tier entries only when their provenance key matches the incoming entry.
+    // canMergePartialTier rejects legacy (no provenance) entries and stale partial builds
+    // (different inputDigest/sourceCommit/libjxlCommit) to prevent shipping unaudited artifacts.
+    const existingTiers = existing.tiers ?? {};
+    const mergedTiers = { ...existingTiers };
+    for (const [key, incomingEntry] of Object.entries(manifest.tiers)) {
+      const existingEntry = existingTiers[key];
+      if (existingEntry && !canMergePartialTier(existingEntry, incomingEntry)) {
+        console.warn(
+          `[build] replacing stale tier entry ${key}: provenance key mismatch ` +
+          `(sourceDirty/inputDigest/libjxlCommit changed since the prior partial build). ` +
+          `The prior entry is discarded — rebuild all tiers for a consistent release.`
+        );
+      }
+      mergedTiers[key] = incomingEntry;
+    }
     const builtNames = new Set(Object.keys(manifest.tiers));
     const mergedSkipped = Array.isArray(manifest.skippedTiers)
       ? manifest.skippedTiers.filter((name) => !builtNames.has(name))
