@@ -7,12 +7,12 @@
 // offsets that land inside the header/index or whose checked `offset + length`
 // runs past EOF.
 //
-// EXPECTED INITIAL STATE: the current TypeScript reader in tiling.ts treats the
-// stored offset as RELATIVE to the end of the header+index table
+// HISTORY: Task 1 pinned this as RED. The TypeScript reader in tiling.ts used to
+// treat the stored offset as RELATIVE to the end of the header+index table
 // (`dataBase = 32 + numTiles*8; container.subarray(dataBase + off, ...)`), which
-// double-adds the base and seeks past the fixture's tile payload. The absolute
-// contract assertions below therefore FAIL until Task 3 removes `dataBase + off`.
-// That is the point of Task 1: pin intent, not fix the reader.
+// double-added the base and seeked past the fixture's tile payload. Task 3 removed
+// the `dataBase + off` rebasing so `JxtcTileIndex.offsets` are absolute and extract
+// uses overflow-safe checked bounds — these assertions are now GREEN.
 
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
