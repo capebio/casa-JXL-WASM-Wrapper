@@ -20,13 +20,19 @@ const MASSIVE_PIXELS = 40_000_000;
 
 /**
  * Per-batch tiling policy (chosen at encode time, e.g. `--tiling`):
+ * - "never": no level is a JXTC tile container — every level is a monolithic whole-frame JXL
+ *   (8-bit via encodePyramid, 16-bit via encodeRgba16). Smallest index; no region random-access.
  * - "adaptive" (default): whole-frame levels; tile ONLY a massive scan's full level; a JPEG
  *   master's full level is the bit-exact lossless transcode. Faster + lossless full (see the
  *   jpg-full-transcode-vs-jxtc flipflop: transcode ~3.5x faster than JXTC re-encode).
- * - "tile-all" (Phase 3): every level is a JXTC tile container (uniform tile/region random-access
- *   decode; the full level is a lossy re-encode even for JPEG masters).
+ * - "tile-all" (Phase 3, a.k.a. "always"): every level is a JXTC tile container (uniform
+ *   tile/region random-access decode; the full level is a lossy re-encode even for JPEG masters).
+ *
+ * finding 70: the RGB16 path honors this same policy. A 16-bit level is tiled only when the policy
+ * asks for it AND a 16-bit tile encoder (encodeTileContainer16) is available; otherwise it falls
+ * back to a monolithic 16-bit encode (encodeRgba16) — the 16-bit tile encoder is never mandatory.
  */
-export type TilingPolicy = "adaptive" | "tile-all";
+export type TilingPolicy = "never" | "adaptive" | "tile-all";
 
 function isMassive(width: number, height: number): boolean {
   return Math.max(width, height) > MASSIVE_LONG_EDGE || width * height > MASSIVE_PIXELS;
@@ -40,6 +46,9 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     // 8-bit grid levels (<=1024) via rgba8 downscale + tile
     // L8: grid from decoded.rgba (post-tonemap 8-bit render of the master); 16-bit big levels (when rgb16 present)
     // derive from the same pre-quantized rgb16 via identical look/params in the raw backend (process + pipeline::process).
+    // finding 70: grid levels are always small (<=1024, never massive) so adaptive keeps them whole;
+    // tile-all tiles them; never keeps them monolithic 8-bit. Only tile-all tiles the grid.
+    const gridTiled = tiling === "tile-all";
     const gridLevels: PyramidLevelBytes[] = [];
     let cur8 = rgba;
     let cw = width, ch = height;
@@ -58,16 +67,14 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
       }
       lastW = cw; lastH = ch;
       const stagedBytes = cur8.byteLength;
-      const data = await jxl.encodeTileContainer(cur8, cw, ch, {
-        tileSize: TILE_SIZE,
-        distance: sc.distance,
-        effort: EFFORT,
-      }, signal);
-      gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes });
+      const data = gridTiled
+        ? await jxl.encodeTileContainer(cur8, cw, ch, { tileSize: TILE_SIZE, distance: sc.distance, effort: EFFORT }, signal)
+        : (await jxl.encodePyramid(cur8, cw, ch, { sidecars: [], fullDistance: sc.distance, effort: EFFORT }, signal))[0]!.data;
+      gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: gridTiled, ...(gridTiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
     }
     gridLevels.reverse(); // L1: restore ascending for manifest/levels output invariant
 
-    // 16-bit levels (2048+) via rgb16 downscale + encodeTileContainer16
+    // 16-bit levels (2048+) via rgb16 downscale.
     // L3 memory: release full-res sources once converted / after grid consumers done
     let cur16 = packedRgb16ToRgba16(rgb16, width, height);
     (decoded as any).rgb16 = undefined; // packed source dead after conversion
@@ -82,10 +89,12 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
       ...bigSidecars.map((sc) => ({ longEdge: sc.size, distance: sc.distance })),
     ];
     const bigLevels: PyramidLevelBytes[] = [];
+    // finding 70: honor the tiling policy for 16-bit. The 16-bit tile encoder is NEVER mandatory —
+    // when a level should be tiled but encodeTileContainer16 is absent, fall back to monolithic 16-bit.
+    // encodeRgba16 is only required when a level actually takes the monolithic path (checked per level).
     const enc16 = jxl.encodeTileContainer16;
-    if (typeof enc16 !== "function") {
-      throw new Error("encodeTileContainer16 required for 16-bit tiled levels (Phase 3)");
-    }
+    const encMono16 = jxl.encodeRgba16;
+    const massive = isMassive(width, height);
     let lastW16 = -1, lastH16 = -1;
     for (const t of bigTargets) {
       throwIfAborted(signal, "encode"); // finding 67: stop between 16-bit levels on deadline/cancel
@@ -96,13 +105,23 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
         cw16 = dst.w; ch16 = dst.h;
       }
       lastW16 = cw16; lastH16 = ch16;
+      const isFull = cw16 === width && ch16 === height;
+      // Policy intent to tile THIS level: tile-all always; adaptive only for a massive full level; never = false.
+      const wantTiled = tiling === "tile-all" || (tiling === "adaptive" && isFull && massive);
+      const canTile = typeof enc16 === "function";
+      const tiled = wantTiled && canTile;
       const stagedBytes = (cur16 as any).byteLength;
-      const data = await enc16(cur16 as any, cw16, ch16, {
-        tileSize: TILE_SIZE,
-        distance: t.distance,
-        effort: EFFORT,
-      }, signal);
-      bigLevels.push({ data, width: cw16, height: ch16, bitsPerSample: 16, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes });
+      let data: Uint8Array;
+      if (tiled) {
+        data = await enc16!(cur16 as any, cw16, ch16, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT }, signal);
+      } else {
+        // monolithic 16-bit encode (policy=never, non-massive adaptive level, or tile encoder absent)
+        if (typeof encMono16 !== "function") {
+          throw new Error("encodeRgba16 required for monolithic 16-bit levels (16-bit tile encoder absent and no monolithic 16-bit encode available)");
+        }
+        data = (await encMono16(cur16 as any, cw16, ch16, { distance: t.distance, effort: EFFORT }, signal)).data;
+      }
+      bigLevels.push({ data, width: cw16, height: ch16, bitsPerSample: 16, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
     }
 
     let outLevels = [...gridLevels, ...bigLevels];
@@ -133,7 +152,8 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     }
     lastW = cw; lastH = ch;
     const isFull = cw === width && ch === height;
-    const tiled = tiling === "tile-all" || (isFull && massive);
+    // never: nothing tiles. adaptive: tile only a massive full level. tile-all: everything tiles.
+    const tiled = tiling === "tile-all" || (tiling === "adaptive" && isFull && massive);
     const stagedBytes = cur.byteLength;
     const data = tiled
       ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT }, signal)

@@ -93,7 +93,9 @@ export interface JxlBackend {
     opts: TileContainerEncodeOptions,
     signal?: AbortSignal,
   ): Promise<Uint8Array>;
-  /** 16-bit JXTC path (available after JXTC-16 WASM rebuild; v1 tiled top uses 8-bit). */
+  /** 16-bit JXTC path (available after JXTC-16 WASM rebuild; v1 tiled top uses 8-bit). Optional:
+   *  when absent (16-bit tile build not present) the ladder falls back to a monolithic 16-bit encode
+   *  via `encodeRgba16` rather than failing — finding 70. */
   encodeTileContainer16?(
     rgba16: Uint8Array,
     width: number,
@@ -101,6 +103,16 @@ export interface JxlBackend {
     opts: TileContainerEncodeOptions,
     signal?: AbortSignal,
   ): Promise<Uint8Array>;
+  /** Monolithic (whole-frame) 16-bit encode. Used for RGB16 big levels when the tiling policy is
+   *  "never" (or "adaptive" for a non-massive level), and as the mandatory fallback when the 16-bit
+   *  tile encoder is unavailable under a tiling policy (finding 70). */
+  encodeRgba16?(
+    rgba16: Uint8Array,
+    width: number,
+    height: number,
+    opts: { distance: number; effort: number },
+    signal?: AbortSignal,
+  ): Promise<{ data: Uint8Array; width: number; height: number }>;
   /** Downscale helpers for per-level tiled encoding (Phase 3 all-levels JXTC). */
   downscaleRgba8(
     rgba: Uint8Array,
@@ -184,6 +196,21 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       const ms = Date.now() - t0;
       tel?.stage?.("encode-tile-container-16", { w: width, h: height, inputBytes: (rgba16 as any).byteLength, ms });
       return data;
+    },
+
+    async encodeRgba16(rgba16, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
+      const t0 = Date.now();
+      const enc = JW.encodeRgba16;
+      if (typeof enc !== "function") throw new Error("encodeRgba16 missing on jxl-wasm module (multi-format bridge required)");
+      const out = await enc(rgba16, width, height, {
+        distance: opts.distance,
+        effort: opts.effort,
+        hasAlpha: false,
+      });
+      const ms = Date.now() - t0;
+      tel?.stage?.("encode-rgba16", { w: width, h: height, inputBytes: (rgba16 as any).byteLength, ms });
+      return { data: out.data, width: out.width, height: out.height };
     },
 
     async downscaleRgba8(rgba, srcW, srcH, dstW, dstH, signal) {
