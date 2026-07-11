@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, test, describe } from "bun:test";
 import {
   levelSize,
   toEntry,
@@ -7,7 +7,11 @@ import {
   isUpToDate,
   type LevelEntry,
 } from "../src/manifest";
-import { parseManifest } from "../src/schema";
+import {
+  parseManifest,
+  CURRENT_MANIFEST_SCHEMA,
+  manifestToJson,
+} from "../src/schema";
 
 test("levelSize reports 'full' only when dims match the master", () => {
   expect(levelSize(4624, 3468, 4624, 3468)).toBe("full");
@@ -15,9 +19,10 @@ test("levelSize reports 'full' only when dims match the master", () => {
   expect(levelSize(192, 256, 4624, 3468)).toBe(256);
 });
 
-test("toEntry records tiled=true when the level bytes are a JXTC container", () => {
-  const e = toEntry({ data: new Uint8Array(9), width: 10, height: 10, tiled: true }, 10, 10);
+test("toEntry records tiled=true and a v5 TilingDescriptor when the level bytes are a JXTC container", () => {
+  const e = toEntry({ data: new Uint8Array(9), width: 10, height: 10, tiled: true, tileSize: 512 }, 10, 10);
   expect(e.tiled).toBe(true);
+  expect((e as any).tiling).toEqual({ container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: "file" });
 });
 
 test("toEntry builds an 8-bit, untiled level entry with a content hash", () => {
@@ -50,9 +55,11 @@ test("toEntry passes qualityCurve through and omits it when empty or absent", ()
 });
 
 test("manifest schema accepts qualityCurve points and rejects non-positive bytes", () => {
-  const level: LevelEntry = {
+  const level: LevelEntry & { tiling: unknown } = {
     size: 2048, w: 2048, h: 1536, bytes: 8192, bitsPerSample: 8,
     contenthash: "c".repeat(16), tiled: true,
+    // v5 requires a TilingDescriptor on tiled levels.
+    tiling: { container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: "file" },
     qualityCurve: [{ bytes: 1024, butteraugli: 2.5 }, { bytes: 4096, ssim: 0.9996 }],
   };
   const m = buildManifest({
@@ -79,10 +86,12 @@ test("buildManifest sorts levels ascending by pixel count and rounds aspect to 4
     height: 3468,
     levels: [big, small],
   });
-  expect(m.schema).toBe(2);
+  expect(m.schema).toBe(5);
   expect(m.levels.map((l) => l.size)).toEqual([256, "full"]);
   expect(m.aspect).toBeCloseTo(1.3333, 4);
   expect(m.proxy).toBeUndefined();
+  // v5: orientation is an OrientationDescriptor.
+  expect((m as any).orientation).toEqual({ exif: 1, pixels: "baked-upright" });
 });
 
 test("buildManifest flags proxy and buildIndexEntry inlines L0", () => {
@@ -92,7 +101,7 @@ test("buildManifest flags proxy and buildIndexEntry inlines L0", () => {
     orientation: "source", width: 4000, height: 3000, levels: [small], proxy: true,
   });
   expect(proxy.proxy).toBe(true);
-  expect(proxy.orientation).toBe("source");
+  expect((proxy as any).orientation).toEqual({ exif: 1, pixels: "source" });
 
   const idx = buildIndexEntry(proxy);
   expect(idx.imageId).toBe("a".repeat(16));
@@ -174,4 +183,114 @@ test("parseManifest (B10) rejects unknown major producedBy version cleanly", () 
     producedBy: { ...base.producedBy!, version: "999.0.0" },
   };
   expect(() => parseManifest(JSON.stringify(bad))).toThrow();
+});
+
+// ── v5 additive schema: one lossless contract (Task 4, findings 61-75) ────────
+
+describe("v5 manifest schema (OrientationDescriptor + TilingDescriptor + sourceFormat)", () => {
+  // Maximum legal geometry (libjxl JXTC cap 1<<24) with an exact EXIF orientation,
+  // format provenance, metadata, a tiled level carrying a TilingDescriptor, and an
+  // UNKNOWN extension field. This is the canonical lossless round-trip fixture.
+  function v5Manifest(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      schema: 5,
+      imageId: "deadbeefcafef00d",
+      master: {
+        name: "P1000001.RW2",
+        sourceFormat: "rw2",
+        format: "rw2",
+        mtimeMs: 1717900000000,
+      },
+      orientation: { exif: 6, pixels: "baked-upright" },
+      width: 16777215,
+      height: 16777215,
+      aspect: 1,
+      layout: "sharded-2",
+      metadata: { gps: { lat: 1.23, lon: 4.56 }, camera: "GX9" },
+      levels: [
+        { size: 512, w: 512, h: 384, bytes: 15000, bitsPerSample: 8, contenthash: "abcdef0123456789", tiled: false },
+        {
+          size: "full",
+          w: 16777215,
+          h: 16777215,
+          bytes: 2400000,
+          bitsPerSample: 16,
+          contenthash: "fedcba9876543210",
+          tiled: true,
+          tiling: { container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 16, offsetBase: "file" },
+        },
+      ],
+      producedBy: {
+        tool: "pyramid-ingest",
+        version: "0.1.0",
+        encoder: { effort: 3, quality: { grid: 85, big: 95, proxy: 85 } },
+      },
+      ...extra,
+    };
+  }
+
+  test("CURRENT_MANIFEST_SCHEMA is 5", () => {
+    expect(CURRENT_MANIFEST_SCHEMA).toBe(5);
+  });
+
+  test("parses a v5 manifest with OrientationDescriptor and TilingDescriptor", () => {
+    const m = parseManifest(JSON.stringify(v5Manifest())) as any;
+    expect(m.schema).toBe(5);
+    expect(m.orientation).toEqual({ exif: 6, pixels: "baked-upright" });
+    expect(m.master.sourceFormat).toBe("rw2");
+    const full = m.levels.find((l: any) => l.size === "full");
+    expect(full.tiling).toEqual({ container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 16, offsetBase: "file" });
+  });
+
+  test("accepts every legal EXIF orientation 1..8 and rejects 0 and 9", () => {
+    for (let exif = 1; exif <= 8; exif++) {
+      const m = parseManifest(JSON.stringify(v5Manifest({ orientation: { exif, pixels: "source" } }))) as any;
+      expect(m.orientation.exif).toBe(exif);
+    }
+    expect(() => parseManifest(JSON.stringify(v5Manifest({ orientation: { exif: 0, pixels: "source" } })))).toThrow();
+    expect(() => parseManifest(JSON.stringify(v5Manifest({ orientation: { exif: 9, pixels: "source" } })))).toThrow();
+  });
+
+  test("round-trips geometry, metadata, layout, stub, tiling, and an UNKNOWN extension field losslessly through JSON", () => {
+    const src = v5Manifest({ stub: true, futureField: { nested: [1, 2, 3] }, anotherUnknown: "keep-me" });
+    const parsed = parseManifest(JSON.stringify(src)) as any;
+    const json = manifestToJson(parsed);
+    const round = JSON.parse(json);
+    // Known fields preserved.
+    expect(round.orientation).toEqual({ exif: 6, pixels: "baked-upright" });
+    expect(round.master.sourceFormat).toBe("rw2");
+    expect(round.layout).toBe("sharded-2");
+    expect(round.metadata).toEqual({ gps: { lat: 1.23, lon: 4.56 }, camera: "GX9" });
+    expect(round.stub).toBe(true);
+    expect(round.width).toBe(16777215);
+    expect(round.levels[1].tiling).toEqual({ container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 16, offsetBase: "file" });
+    // UNKNOWN extension fields must survive the round trip (finding: never drop unknown fields).
+    expect(round.futureField).toEqual({ nested: [1, 2, 3] });
+    expect(round.anotherUnknown).toBe("keep-me");
+  });
+
+  test("rejects a FUTURE major schema (6) rather than silently reinterpreting bytes", () => {
+    expect(() => parseManifest(JSON.stringify(v5Manifest({ schema: 6 })))).toThrow();
+  });
+
+  test("rejects skipped schema 3 as unsupported", () => {
+    expect(() => parseManifest(JSON.stringify(v5Manifest({ schema: 3 })))).toThrow();
+  });
+
+  test("rejects a v5 tiled level that lacks its TilingDescriptor", () => {
+    const bad = v5Manifest();
+    (bad.levels as any)[1] = { size: "full", w: 5184, h: 3888, bytes: 2400000, bitsPerSample: 8, contenthash: "fedcba9876543210", tiled: true };
+    let thrown: unknown;
+    try { parseManifest(JSON.stringify(bad)); } catch (e) { thrown = e; }
+    expect(thrown).toBeDefined();
+    // Must fail for the SPECIFIC reason (tiling missing), not a generic union error.
+    expect(String((thrown as Error).message)).toMatch(/tiling/i);
+  });
+
+  test("rejects a v5 orientation with exif out of range for its SPECIFIC reason", () => {
+    let thrown: unknown;
+    try { parseManifest(JSON.stringify(v5Manifest({ orientation: { exif: 9, pixels: "baked-upright" } }))); } catch (e) { thrown = e; }
+    expect(thrown).toBeDefined();
+    expect(String((thrown as Error).message)).toMatch(/exif|orientation/i);
+  });
 });

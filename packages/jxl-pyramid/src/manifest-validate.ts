@@ -11,9 +11,16 @@ import type {
   MasterMetadata,
   ProducedBy,
   LodCapabilities,
+  Orientation,
+  OrientationDescriptor,
+  TilingDescriptor,
+  TilingGrid,
 } from "./manifest.js";
 
-export const MANIFEST_SCHEMA_VERSION = 2;
+// Aligned with the canonical @casabio/pyramid-ingest contract (CURRENT_MANIFEST_SCHEMA = 5,
+// READABLE = [1,2,4,5]; 3 was skipped). finding 72: no divergent schema-≤2-only reader.
+export const MANIFEST_SCHEMA_VERSION = 5;
+export const READABLE_MANIFEST_SCHEMAS: readonly number[] = [1, 2, 4, 5];
 export const INDEX_SCHEMA_VERSION = 1;
 
 // Upper bounds for security/sanity checks
@@ -25,6 +32,11 @@ const MAX_TILE_SIZE = 1 << 16; // 65536 — reasonable tile limit
 const MAX_OPAQUE_KEYS = 64;
 const MAX_OPAQUE_DEPTH = 4;
 const MAX_OPAQUE_KEY_LENGTH = 128;
+
+// Master `format` values this reader accepts — mirrors the canonical pyramid-ingest masterInfoSchema.
+const ACCEPTED_MASTER_FORMATS = new Set([
+  "orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown",
+]);
 
 export class ManifestValidationError extends Error {
   constructor(message: string, public readonly path: string) {
@@ -86,13 +98,36 @@ function validateMasterMetadata(v: unknown, path: string): MasterMetadata {
   if (name.length > 256) fail(`${path}.name`, `exceeds maximum length 256`);
   if (/[/\\:]/.test(name)) fail(`${path}.name`, "must not contain path separators");
   const format = requireString(o["format"], `${path}.format`);
-  if (!["orf", "dng", "cr2", "jpg"].includes(format)) {
+  // Aligned with the canonical @casabio/pyramid-ingest masterInfoSchema format set (SCH-1). The
+  // extended RAW formats (nef/arw/raf/rw2/pef/srw/x3f) are advertised by ingest, so a manifest
+  // carrying one must validate here too — otherwise the image is lost to this reader.
+  if (!ACCEPTED_MASTER_FORMATS.has(format)) {
     fail(`${path}.format`, `unknown format "${format}"`);
   }
   const mtimeMs = requireNumber(o["mtimeMs"], `${path}.mtimeMs`);
   const result: MasterMetadata = { name, format: format as MasterMetadata["format"], mtimeMs };
+  // v5 (finding 64): provenance decoupled from decoder capability. Optional; any non-empty string
+  // (the detected source format may be a RAW variant the decoder does not support).
+  if (o["sourceFormat"] !== undefined) {
+    const sf = requireString(o["sourceFormat"], `${path}.sourceFormat`);
+    if (sf.length === 0) fail(`${path}.sourceFormat`, "must not be empty");
+    result.sourceFormat = sf;
+  }
   if (o["sizeBytes"] !== undefined) result.sizeBytes = requireNumber(o["sizeBytes"], `${path}.sizeBytes`);
   return result;
+}
+
+/** Validate an OrientationDescriptor { exif: 1..8, pixels }. */
+function validateOrientationDescriptor(v: Record<string, unknown>, path: string): OrientationDescriptor {
+  const exif = requireNumber(v["exif"], `${path}.exif`);
+  if (!Number.isInteger(exif) || exif < 1 || exif > 8) {
+    fail(`${path}.exif`, `EXIF orientation must be an integer in 1..8, got ${exif}`);
+  }
+  const pixels = requireString(v["pixels"], `${path}.pixels`);
+  if (pixels !== "source" && pixels !== "baked-upright") {
+    fail(`${path}.pixels`, `expected "source" or "baked-upright", got "${pixels}"`);
+  }
+  return { exif, pixels };
 }
 
 /** S6 (additive): validate an optional LodCapabilities bag — object of optional booleans. */
@@ -116,7 +151,41 @@ function validateProducedBy(v: unknown, path: string): ProducedBy {
   return result;
 }
 
-function validateLevel(v: unknown, path: string): PyramidLevel {
+/** Validate a v5 TilingDescriptor { container:"jxtc", version:1|2, tileSize, bitsPerSample, offsetBase:"file" }. */
+function validateTilingDescriptor(t: Record<string, unknown>, path: string, w: number, h: number): TilingDescriptor {
+  const container = requireString(t["container"], `${path}.container`);
+  if (container !== "jxtc") fail(`${path}.container`, `expected "jxtc", got "${container}"`);
+  const version = requireNumber(t["version"], `${path}.version`);
+  if (version !== 1 && version !== 2) fail(`${path}.version`, `expected 1 or 2, got ${version}`);
+  const tileSize = requireNumber(t["tileSize"], `${path}.tileSize`);
+  if (tileSize <= 0) fail(`${path}.tileSize`, `tileSize must be positive, got ${tileSize}`);
+  if (tileSize > MAX_TILE_SIZE) fail(`${path}.tileSize`, `tileSize exceeds maximum ${MAX_TILE_SIZE}, got ${tileSize}`);
+  const bitsPerSample = requireNumber(t["bitsPerSample"], `${path}.bitsPerSample`);
+  if (bitsPerSample !== 8 && bitsPerSample !== 16) fail(`${path}.bitsPerSample`, `expected 8 or 16, got ${bitsPerSample}`);
+  const offsetBase = requireString(t["offsetBase"], `${path}.offsetBase`);
+  if (offsetBase !== "file") fail(`${path}.offsetBase`, `expected "file", got "${offsetBase}"`);
+  // sanity: a tile grid at this tileSize must cover the level (guards against absurd tileSize).
+  if (Math.ceil(w / tileSize) <= 0 || Math.ceil(h / tileSize) <= 0) fail(`${path}.tileSize`, `tileSize ${tileSize} does not tile ${w}x${h}`);
+  return { container: "jxtc", version: version as 1 | 2, tileSize, bitsPerSample: bitsPerSample as 8 | 16, offsetBase: "file" };
+}
+
+/** Validate a v4 TilingGrid { tileSize, cols, rows } against the level dimensions. */
+function validateTilingGrid(t: Record<string, unknown>, path: string, w: number, h: number): TilingGrid {
+  const tileSize = requireNumber(t["tileSize"], `${path}.tileSize`);
+  const cols = requireNumber(t["cols"], `${path}.cols`);
+  const rows = requireNumber(t["rows"], `${path}.rows`);
+  if (tileSize <= 0) fail(`${path}.tileSize`, `tileSize must be positive, got ${tileSize}`);
+  if (tileSize > MAX_TILE_SIZE) fail(`${path}.tileSize`, `tileSize exceeds maximum ${MAX_TILE_SIZE}, got ${tileSize}`);
+  if (cols <= 0) fail(`${path}.cols`, `cols must be positive, got ${cols}`);
+  if (cols > MAX_DIMENSION) fail(`${path}.cols`, `cols exceeds maximum ${MAX_DIMENSION}, got ${cols}`);
+  if (rows <= 0) fail(`${path}.rows`, `rows must be positive, got ${rows}`);
+  if (rows > MAX_DIMENSION) fail(`${path}.rows`, `rows exceeds maximum ${MAX_DIMENSION}, got ${rows}`);
+  if (cols !== Math.ceil(w / tileSize)) fail(`${path}.cols`, `cols ${cols} does not match ceil(${w}/${tileSize}) = ${Math.ceil(w / tileSize)}`);
+  if (rows !== Math.ceil(h / tileSize)) fail(`${path}.rows`, `rows ${rows} does not match ceil(${h}/${tileSize}) = ${Math.ceil(h / tileSize)}`);
+  return { tileSize, cols, rows };
+}
+
+function validateLevel(v: unknown, path: string, schema: number): PyramidLevel {
   const o = requireObject(v, path);
   const size = o["size"];
   if (size !== "full" && (typeof size !== "number" || !isFinite(size as number) || (size as number) <= 0)) {
@@ -151,22 +220,12 @@ function validateLevel(v: unknown, path: string): PyramidLevel {
   if (tiled) {
     if (o["tiling"] == null) fail(`${path}.tiling`, "required when tiled=true");
     const t = requireObject(o["tiling"], `${path}.tiling`);
-    const tileSize = requireNumber(t["tileSize"], `${path}.tiling.tileSize`);
-    const cols = requireNumber(t["cols"], `${path}.tiling.cols`);
-    const rows = requireNumber(t["rows"], `${path}.tiling.rows`);
-    if (tileSize <= 0) fail(`${path}.tiling.tileSize`, `tileSize must be positive, got ${tileSize}`);
-    if (tileSize > MAX_TILE_SIZE) fail(`${path}.tiling.tileSize`, `tileSize exceeds maximum ${MAX_TILE_SIZE}, got ${tileSize}`);
-    if (cols <= 0) fail(`${path}.tiling.cols`, `cols must be positive, got ${cols}`);
-    if (cols > MAX_DIMENSION) fail(`${path}.tiling.cols`, `cols exceeds maximum ${MAX_DIMENSION}, got ${cols}`);
-    if (rows <= 0) fail(`${path}.tiling.rows`, `rows must be positive, got ${rows}`);
-    if (rows > MAX_DIMENSION) fail(`${path}.tiling.rows`, `rows exceeds maximum ${MAX_DIMENSION}, got ${rows}`);
-    if (cols !== Math.ceil(w / tileSize)) fail(`${path}.tiling.cols`, `cols ${cols} does not match ceil(${w}/${tileSize}) = ${Math.ceil(w / tileSize)}`);
-    if (rows !== Math.ceil(h / tileSize)) fail(`${path}.tiling.rows`, `rows ${rows} does not match ceil(${h}/${tileSize}) = ${Math.ceil(h / tileSize)}`);
-    level.tiling = {
-      tileSize,
-      cols,
-      rows,
-    };
+    // v5 persists a TilingDescriptor (has a `container` tag); v1–v4 persist a TilingGrid.
+    if (schema >= 5 || t["container"] !== undefined) {
+      level.tiling = validateTilingDescriptor(t, `${path}.tiling`, w, h);
+    } else {
+      level.tiling = validateTilingGrid(t, `${path}.tiling`, w, h);
+    }
   }
 
   if (o["convergedByteEnd"] !== undefined) {
@@ -194,9 +253,18 @@ function validateLevel(v: unknown, path: string): PyramidLevel {
   return level;
 }
 
+/** Known top-level keys the validator interprets. Everything else is an UNKNOWN extension field and
+ *  is carried through verbatim (finding: additive/lossless contract — never drop unknown fields). */
+const KNOWN_MANIFEST_KEYS = new Set([
+  "schema", "imageId", "master", "orientation", "width", "height", "aspect",
+  "levels", "stub", "proxy", "producedBy", "metadata", "convergedByteEnd", "capabilities",
+]);
+
 /**
- * Accepts schema 1|2 (normalizes 1 → 2 defaults: stub=false, proxy=false).
- * Throws ManifestValidationError on schema > 2 or missing/invalid fields.
+ * Reads schema 1|2|4|5 (3 was skipped). Normalizes schema 1 → 2 (stub=false, proxy=false); keeps
+ * 4 and 5. On v5, `orientation` is an OrientationDescriptor; on v1–v4 it is the legacy string.
+ * Unknown top-level fields are preserved. Throws ManifestValidationError on schema 3, schema > 5,
+ * or any invalid field.
  */
 export function parsePyramidManifest(json: unknown): PyramidManifest {
   const o = requireObject(json, "manifest");
@@ -205,16 +273,25 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
   if (schema > MANIFEST_SCHEMA_VERSION) {
     fail("manifest.schema", `schema ${schema} is newer than reader (max ${MANIFEST_SCHEMA_VERSION}); upgrade the reader`);
   }
-  if (schema < 1) {
-    fail("manifest.schema", `unsupported schema version ${schema}`);
+  if (!READABLE_MANIFEST_SCHEMAS.includes(schema)) {
+    fail("manifest.schema", `unsupported schema version ${schema} (readable: ${READABLE_MANIFEST_SCHEMAS.join(", ")})`);
   }
 
   const imageId = requireString(o["imageId"], "manifest.imageId");
   const master = validateMasterMetadata(o["master"], "manifest.master");
-  const orientation = requireString(o["orientation"], "manifest.orientation");
-  if (orientation !== "baked" && orientation !== "source") {
-    fail("manifest.orientation", `expected "baked" or "source", got "${orientation}"`);
+
+  // Orientation: v5 uses an OrientationDescriptor; v1–v4 use the "baked"|"source" string.
+  let orientation: PyramidManifest["orientation"];
+  if (schema >= 5) {
+    orientation = validateOrientationDescriptor(requireObject(o["orientation"], "manifest.orientation"), "manifest.orientation");
+  } else {
+    const os = requireString(o["orientation"], "manifest.orientation");
+    if (os !== "baked" && os !== "source") {
+      fail("manifest.orientation", `expected "baked" or "source", got "${os}"`);
+    }
+    orientation = os as Orientation;
   }
+
   const width = requireNumber(o["width"], "manifest.width");
   const height = requireNumber(o["height"], "manifest.height");
   const aspect = requireNumber(o["aspect"], "manifest.aspect");
@@ -227,7 +304,7 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
   const levelsRaw = requireArray(o["levels"], "manifest.levels");
   if (levelsRaw.length === 0) fail("manifest.levels", "must not be empty");
 
-  const levels = levelsRaw.map((l, i) => validateLevel(l, `manifest.levels[${i}]`));
+  const levels = levelsRaw.map((l, i) => validateLevel(l, `manifest.levels[${i}]`, schema));
 
   // Sizes must be strictly ascending numerically, with "full" last.
   for (let i = 1; i < levels.length; i++) {
@@ -242,10 +319,10 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
   }
 
   const result: PyramidManifest = {
-    schema: 2, // normalize schema 1 → 2
+    schema: (schema === 1 ? 2 : schema) as PyramidManifest["schema"], // normalize schema 1 → 2; keep 4/5
     imageId,
     master,
-    orientation: orientation as PyramidManifest["orientation"],
+    orientation,
     width,
     height,
     aspect,
@@ -259,6 +336,12 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
   if (o["metadata"] !== undefined) { result.metadata = sanitizeOpaqueObject(requireObject(o["metadata"], "manifest.metadata"), "manifest.metadata"); }
   if (o["convergedByteEnd"] !== undefined) result.convergedByteEnd = requireNumber(o["convergedByteEnd"], "manifest.convergedByteEnd");
   if (o["capabilities"] !== undefined) result.capabilities = validateCapabilities(o["capabilities"], "manifest.capabilities");
+
+  // Preserve UNKNOWN extension fields verbatim so the contract stays additive/lossless.
+  const extensible = result as unknown as Record<string, unknown>;
+  for (const k of Object.keys(o)) {
+    if (!KNOWN_MANIFEST_KEYS.has(k)) extensible[k] = o[k];
+  }
 
   return result;
 }

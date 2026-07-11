@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { binaryToManifestObject, binaryToGalleryIndexObject } from "./manifest-codec.js";
 
 let cachedVersion: string | null = null;
 
@@ -56,6 +57,38 @@ export const masterInfoSchema = z.object({
   mtimeMs: z.number(),
 });
 
+// v5 (finding 64): provenance is decoupled from decoder capability. `format` says what the
+// decoder was asked to handle; `sourceFormat` records what the file actually was, so rejecting an
+// unsupported decode never erases provenance. Additive + optional so v1–v4 masters validate.
+// `.passthrough()` keeps unknown master-level fields (e.g. future EXIF/GPS provenance sidecars).
+export const masterInfoV5Schema = masterInfoSchema
+  .extend({
+    sourceFormat: z
+      .enum(["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"])
+      .optional(),
+  })
+  .passthrough();
+
+/** v5 OrientationDescriptor: the exact EXIF value (1..8) plus whether the stored pixels are already
+ *  upright. Replaces the v1–v4 "baked"|"source" string; migration maps the old string to
+ *  { exif: 1, pixels: <string> } when no EXIF orientation was recorded (MIG-2). */
+export const orientationDescriptorSchema = z.object({
+  exif: z.number().int().min(1).max(8),
+  pixels: z.enum(["source", "baked-upright"]),
+});
+export type OrientationDescriptor = z.infer<typeof orientationDescriptorSchema>;
+
+/** v5 TilingDescriptor persisted on a tiled level. `offsetBase: "file"` records that JXTC index
+ *  offsets are ABSOLUTE from byte zero of the file (bridge.cpp:1925-1931 / jxl-pyramid/tiling.ts). */
+export const tilingDescriptorSchema = z.object({
+  container: z.literal("jxtc"),
+  version: z.union([z.literal(1), z.literal(2)]),
+  tileSize: z.number().int().positive(),
+  bitsPerSample: z.union([z.literal(8), z.literal(16)]),
+  offsetBase: z.literal("file"),
+});
+export type TilingDescriptor = z.infer<typeof tilingDescriptorSchema>;
+
 export const manifestSchemaV1 = z.object({
   schema: z.literal(1),
   imageId: z.string().regex(/^[0-9a-f]{16}$/),
@@ -88,19 +121,66 @@ export const manifestSchemaV1 = z.object({
 // V4/M: index norm etc (additive optional for future, e.g. more index fields; norm in rebuild for consistency)
 export const manifestSchemaV2Base = manifestSchemaV1.extend({ schema: z.literal(2) });
 export const manifestSchemaV4Base = manifestSchemaV2Base.extend({ schema: z.literal(4) }); // v4 additive
-export const manifestSchema = z.discriminatedUnion("schema", [manifestSchemaV1, manifestSchemaV2Base, manifestSchemaV4Base]);
+
+// v5 level entry: additive TilingDescriptor. A tiled level MUST carry a `tiling` block
+// (finding 75); the refinement below reports the SPECIFIC "tiling" reason so a malformed tiled
+// level fails for its intended cause, not a generic union error.
+export const levelEntryV5Schema = levelEntrySchema
+  .extend({
+    tiling: tilingDescriptorSchema.optional(),
+  })
+  .superRefine((lv, ctx) => {
+    if (lv.tiled && lv.tiling === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "tiled level requires a tiling descriptor",
+        path: ["tiling"],
+      });
+    }
+  });
+
+// v5 manifest (finding 61-75): ONE lossless contract. Additive over v4:
+//   - master.sourceFormat (provenance decoupled from decoder capability)
+//   - orientation is an OrientationDescriptor { exif: 1..8; pixels }
+//   - levels carry an explicit TilingDescriptor when tiled
+// `.passthrough()` keeps UNKNOWN top-level fields so the JSON round trip is LOSSLESS and migration
+// never silently drops bytes it does not recognise.
+export const manifestSchemaV5 = z
+  .object({
+    schema: z.literal(5),
+    imageId: z.string().regex(/^[0-9a-f]{16}$/),
+    master: masterInfoV5Schema,
+    orientation: orientationDescriptorSchema.optional(),
+    width: z.number().int().positive().optional(),
+    height: z.number().int().positive().optional(),
+    aspect: z.number().finite().positive().optional(),
+    levels: z.array(levelEntryV5Schema).optional(),
+    layout: z.string().optional(),
+    proxy: z.literal(true).optional(),
+    stub: z.literal(true).optional(),
+    metadata: z.record(z.unknown()).optional(),
+    producedBy: manifestSchemaV1.shape.producedBy,
+  })
+  .passthrough();
+
+export const manifestSchema = z.discriminatedUnion("schema", [
+  manifestSchemaV1,
+  manifestSchemaV2Base,
+  manifestSchemaV4Base,
+  manifestSchemaV5,
+]);
 export type ManifestV2 = z.infer<typeof manifestSchemaV2Base>;
 export type ManifestV4 = z.infer<typeof manifestSchemaV4Base>;
+export type ManifestV5 = z.infer<typeof manifestSchemaV5>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MANIFEST SCHEMA VERSION POLICY — single source of truth (Packet-1, finding 65)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// This block RECORDS the approved v5 policy for Packet 1. It does NOT yet
-// implement v5 parsing or migration — that lands in Task 4. Until then the
-// discriminated union above still tops out at schema 4, so the v5 contract
-// fixtures (packages/pyramid-ingest/test/fixtures/contracts) intentionally do not
-// yet parse; contract-compat.test.ts pins that intent.
+// This block owns the approved v5 policy for Packet 1. v5 parsing + migration are
+// IMPLEMENTED (Task 4): the discriminated union above now includes manifestSchemaV5, so the v5
+// contract fixtures (packages/pyramid-ingest/test/fixtures/contracts) parse, and migrate.ts maps
+// v1–v4 forward to v5 additively while preserving unknown fields.
 //
 // Compatibility table:
 //   schema  status     notes
@@ -114,7 +194,8 @@ export type ManifestV4 = z.infer<typeof manifestSchemaV4Base>;
 //   >5      reject     future major written by a newer tool; refuse, never
 //                      silently reinterpret bytes.
 //
-// v5 ADDITIVE shape (target; implemented in Task 4 — do not add here yet):
+// v5 ADDITIVE shape (implemented above: masterInfoV5Schema / orientationDescriptorSchema /
+// tilingDescriptorSchema / manifestSchemaV5):
 //   - master.sourceFormat: detected provenance, independent of decoder support.
 //   - orientation: OrientationDescriptor { exif: 1..8; pixels: "source"|"baked-upright" }
 //     (replaces the v1-v4 "baked"|"source" string; migration maps the old string
@@ -148,10 +229,14 @@ export const galleryIndexSchema = z.object({
   images: z.array(indexEntrySchema),
 });
 
-export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV4;
+export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV4 | ManifestV5;
 export type IndexEntry = z.infer<typeof indexEntrySchema>;
 export type GalleryIndex = z.infer<typeof galleryIndexSchema>;
 export type LevelEntry = z.infer<typeof levelEntrySchema>;
+/** v5 level entry (base + optional TilingDescriptor). What toEntry emits. */
+export type LevelEntryV5 = z.infer<typeof levelEntryV5Schema>;
+/** v5 TilingDescriptor as it appears on a persisted level. */
+export type LevelTilingDescriptor = z.infer<typeof tilingDescriptorSchema>;
 export type LevelSize = z.infer<typeof levelSizeSchema>;
 export type MasterInfo = z.infer<typeof masterInfoSchema>;
 export type ProducedBy = z.infer<typeof producedBySchema>;
@@ -196,15 +281,14 @@ export type CliEvent =
   | { type: "gc-result" | "validate-result" | "rm-result" | "migrate-result"; [k: string]: unknown };
 
 export function parseManifest(text: string | Uint8Array): Manifest {
-  // V3: accepts v1/v2 JSON or binary format (−73% size via manifestToBinary)
-  // Binary format detected: buffer not starting with '{' (Uint8Array first byte != '{'.charCodeAt(0) = 123)
+  // Accepts JSON (canonical, lossless) or the legacy binary format (read-only compatibility path).
+  // Binary detected: first byte != '{' (123). The binary decoder returns a PLAIN object which we
+  // still run through the same zod validation (read/migrate/reject — never a silent reinterpretation).
   if (text instanceof Uint8Array) {
     if (text[0] !== 123) {
-      // Binary format: lazy-import to avoid circular dep with manifest.ts
-      const { binaryToManifest } = require("./manifest.js");
-      return binaryToManifest(text);
+      return manifestSchema.parse(binaryToManifestObject(text)) as Manifest;
     }
-    // Fallback: treat as UTF-8 JSON if somehow starts with '{'
+    // Fallback: treat as UTF-8 JSON if it starts with '{'
     text = new TextDecoder().decode(text);
   }
 
@@ -212,13 +296,19 @@ export function parseManifest(text: string | Uint8Array): Manifest {
   return manifestSchema.parse(JSON.parse(text)) as Manifest;
 }
 
+/** Canonical LOSSLESS serialization of a manifest to JSON text. Preserves every field zod
+ *  passed through (including unknown extension fields kept via `.passthrough()`), so writing a
+ *  manifest with manifestToJson and re-reading it with parseManifest is a faithful round trip for
+ *  the complete schema. This is the canonical persisted representation on `.json` paths. */
+export function manifestToJson(manifest: Manifest, pretty = true): string {
+  return JSON.stringify(manifest, null, pretty ? 2 : undefined);
+}
+
 export function parseGalleryIndex(text: string | Uint8Array): GalleryIndex {
   // Auto-detect binary format (first byte != '{') or JSON
   if (text instanceof Uint8Array) {
     if (text[0] !== 123) {
-      // Binary format: lazy-import to avoid circular dep
-      const { binaryToGalleryIndex } = require("./manifest.js");
-      return binaryToGalleryIndex(text);
+      return galleryIndexSchema.parse(binaryToGalleryIndexObject(text));
     }
     text = new TextDecoder().decode(text);
   }

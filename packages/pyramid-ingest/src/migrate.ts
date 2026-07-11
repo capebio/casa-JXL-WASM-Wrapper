@@ -1,8 +1,80 @@
 import { readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { parseManifest, makeProducedBy } from "./schema.js";
+import { parseManifest, makeProducedBy, CURRENT_MANIFEST_SCHEMA } from "./schema.js";
 import { pMapLimit, readFileOrNull } from "./ingest.js";
 import { acquireImageWriteLock, type AdvisoryLock } from "./lock.js";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Additive v1..v4 → v5 migration (Task 4, findings 61-75).
+// ─────────────────────────────────────────────────────────────────────────────
+// Operates on the RAW parsed JSON object so unknown fields survive (MIG-2). Additive:
+//   - orientation string "baked"|"source" → OrientationDescriptor { exif: 1, pixels }
+//     (exif defaults to 1 because no EXIF orientation was recorded pre-v5; a real EXIF
+//      value is only known at ingest, never reconstructable from an old manifest).
+//   - master.sourceFormat := master.format when absent (finding 64 carry-forward: provenance
+//     must not vanish on migrate). Never overwrites an existing sourceFormat.
+//   - level.tiling v4 grid { tileSize, cols, rows } → TilingDescriptor
+//     { container:"jxtc", version:1, tileSize, bitsPerSample:<level bps>, offsetBase:"file" }.
+//   - all other fields (metadata, layout, convergedByteEnd, qualityCurve, unknown extensions)
+//     are carried through verbatim.
+// Refuses to migrate a FUTURE major schema (> CURRENT_MANIFEST_SCHEMA): never silently
+// reinterpret bytes written by a newer tool.
+
+const V5_ORIENTATION_PIXELS = new Set(["source", "baked-upright"]);
+
+/** Pure, filesystem-free additive migration of a raw manifest object to schema 5. */
+export function migrateManifestToV5(raw: any): any {
+  const from = typeof raw?.schema === "number" ? raw.schema : 1;
+  if (from > CURRENT_MANIFEST_SCHEMA) {
+    throw new Error(`cannot migrate schema ${from} (newer than current ${CURRENT_MANIFEST_SCHEMA}); refusing to reinterpret`);
+  }
+
+  // shallow clone; deep-clone only the sub-objects we rewrite so unknown fields ride along.
+  const out: any = { ...raw, schema: 5 };
+
+  // orientation: map the old string; leave an existing descriptor untouched.
+  const o = raw.orientation;
+  if (typeof o === "string") {
+    const pixels = o === "source" ? "source" : "baked-upright";
+    out.orientation = { exif: 1, pixels };
+  } else if (o && typeof o === "object" && typeof o.exif === "number" && V5_ORIENTATION_PIXELS.has(o.pixels)) {
+    out.orientation = { ...o };
+  }
+  // (absent orientation stays absent — it is optional on v5.)
+
+  // master.sourceFormat: default from format; never clobber.
+  if (raw.master && typeof raw.master === "object") {
+    const master = { ...raw.master };
+    if (master.sourceFormat === undefined && typeof master.format === "string") {
+      master.sourceFormat = master.format;
+    }
+    out.master = master;
+  }
+
+  // levels: upgrade a v4 tiling grid to a v5 TilingDescriptor; preserve everything else.
+  if (Array.isArray(raw.levels)) {
+    out.levels = raw.levels.map((lv: any) => {
+      if (!lv || typeof lv !== "object") return lv;
+      const t = lv.tiling;
+      const isV4Grid = t && typeof t === "object" && t.container === undefined && typeof t.tileSize === "number";
+      if (lv.tiled === true && isV4Grid) {
+        return {
+          ...lv,
+          tiling: {
+            container: "jxtc",
+            version: 1,
+            tileSize: t.tileSize,
+            bitsPerSample: lv.bitsPerSample === 16 ? 16 : 8,
+            offsetBase: "file",
+          },
+        };
+      }
+      return { ...lv };
+    });
+  }
+
+  return out;
+}
 
 // M1/M2/M4 per plan (unlocked by WU-6 + V3 + locks).
 // M1 schema migrate: re-emit with current producedBy + target schema.
@@ -80,7 +152,7 @@ async function migrateManifests(
   return report;
 }
 
-const SUPPORTED_SCHEMA_TARGETS = [2, 4];
+const SUPPORTED_SCHEMA_TARGETS = [2, 4, 5];
 
 export async function migrateSchema(
   outDir: string,
@@ -95,10 +167,16 @@ export async function migrateSchema(
       errors: [{ path: outDir, error: `unsupported --migrate-schema ${targetVersion} (supported: ${SUPPORTED_SCHEMA_TARGETS.join(", ")})` }],
     };
   }
+  // Target 5 needs the additive v5 mapping (orientation descriptor, sourceFormat, tiling
+  // descriptor). Targets 2/4 keep the historical bump-the-number transform.
+  const transform =
+    targetVersion === 5
+      ? (raw: any) => ({ ...migrateManifestToV5(raw), producedBy: makeProducedBy() })
+      : (raw: any) => ({ ...raw, schema: targetVersion, producedBy: makeProducedBy() });
   return migrateManifests(
     outDir,
     (raw) => (raw.schema ?? 1) < targetVersion,   // MIG-3: upgrade-only; no downgrade, no producedBy churn on no-op
-    (raw) => ({ ...raw, schema: targetVersion, producedBy: makeProducedBy() }),
+    transform,
     opts,
   );
 }

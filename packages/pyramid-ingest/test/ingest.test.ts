@@ -125,8 +125,8 @@ test("ingestImage writes a full RAW pyramid + manifest, then skips on re-run", {
   const imageId = await await imageIdForPath(master);
   const manifestPath = join(out, "images", imageId, "manifest.json");
   const manifest = parseManifest(await readFile(manifestPath)) as Manifest;
-  expect(manifest.schema).toBe(2);
-  expect(manifest.orientation).toBe("baked");
+  expect(manifest.schema).toBe(5);
+  expect(manifest.orientation).toEqual({ exif: 1, pixels: "baked-upright" });
   expect(manifest.proxy).toBeUndefined();
   expect(manifest.levels.map((l) => l.size)).toEqual([256, 512, 1024, "full"]);
   for (const l of manifest.levels) expect(l.bitsPerSample).toBe(8);
@@ -201,7 +201,7 @@ test("computeIngestPlan is side-effect free (no FS writes) and deterministic", a
   expect(plan1.imageId).toBe(identity.imageId);
   expect(plan1.levels.length).toBe(2);
   expect(plan1.manifest.imageId).toBe(identity.imageId);
-  expect(plan1.manifest.schema).toBe(2);
+  expect(plan1.manifest.schema).toBe(5);
   expect(plan1.manifest.levels.length).toBe(2);
 
   // second compute identical inputs -> identical output (deterministic, including content hashes from bytes)
