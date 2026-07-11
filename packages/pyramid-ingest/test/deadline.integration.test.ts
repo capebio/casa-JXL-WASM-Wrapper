@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setJxlModuleFactoryForTesting } from "@casabio/jxl-wasm";
 import type { Backends } from "../src/ingest";
 import type { DecodedMaster, JxlBackend, RawBackend, RawFormat } from "../src/backends";
-import { ingestImage } from "../src/ingest";
+import { ingestBatch, ingestImage } from "../src/ingest";
 import { imageIdForPath } from "../src/hash";
 
 afterEach(() => setJxlModuleFactoryForTesting(null));
@@ -136,4 +136,88 @@ test("caller cancel composes with deadline: aborting caller signal cancels the i
   expect((err as any).code).toBe("ABORT_ERR");
   expect(settled()).toBe(true);
   await assertNoPublish(out, imageId);
+});
+
+// Pre-rename checkpoint: the plan is fully built (decode + encode succeed), then the signal fires
+// right before the atomic manifest rename. applyIngestPlan's publish gate must refuse to publish —
+// no manifest appears (the sole "visible" artifact), and no manifest .tmp lingers.
+test("deadline at the pre-rename publish boundary: manifest is never renamed in", async () => {
+  const out = await tmpOut();
+  const master = await writeMaster(out, "PUBLISH_BLOCK.orf");
+  const imageId = await imageIdForPath(master);
+
+  // Decode + encode succeed; the abort is deferred to a macrotask so it lands *after* every
+  // synchronous encode checkpoint has passed (plan fully built) and fires while applyIngestPlan is
+  // awaiting its first fs op — i.e. exactly at the pre-rename publish boundary, not during encode.
+  const callerAc = new AbortController();
+  let armed = false;
+  const raw: RawBackend = {
+    async decode(): Promise<DecodedMaster> {
+      return { rgba: gradientRgba(300, 200), width: 300, height: 200, orientation: "baked" };
+    },
+  };
+  const jxl: JxlBackend = {
+    async encodePyramid() { return []; },
+    async encodeTileContainer(_rgba, w, h) {
+      // Arm the deferred abort exactly once, on the first (full-level) encode. setTimeout(0) cannot
+      // fire between the remaining synchronous plan-completion + entry checks, only once
+      // applyIngestPlan yields on an await — so the pre-rename publish gate is what catches it.
+      if (!armed) { armed = true; setTimeout(() => callerAc.abort(), 0); }
+      return new Uint8Array([0xA0, w & 0xff, h & 0xff]);
+    },
+    async downscaleRgba8(_rgba, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
+    async transcodeJpeg(b) { return b; },
+    async decodeToRgba8(b) { return { rgba: b, width: 4, height: 3 }; },
+  } as any;
+  const backends: Backends = { raw, jxl, signal: callerAc.signal, __testInProcess: true } as any;
+
+  const err = await ingestImage(master, backends, { outDir: out, tiling: "tile-all" }).then(() => null, (e) => e);
+
+  expect(err).toBeTruthy();
+  expect((err as any).code).toBe("ABORT_ERR");
+  expect((err as any).stage).toBe("publish");
+  // The manifest — the only artifact that makes an image visible — must not exist. (Level blobs may
+  // have been written before the abort; those are unreferenced orphans GC reclaims, but never a
+  // manifest, and never a lingering manifest .tmp.)
+  const manifestPath = join(out, "images", imageId, "manifest.json");
+  await expect(readFile(manifestPath)).rejects.toThrow();
+  const imgFiles = await readdir(join(out, "images", imageId)).catch(() => [] as string[]);
+  expect(imgFiles.filter((f) => f.includes(".tmp")).length).toBe(0);
+});
+
+// Batch/worker path: a caller signal that aborts mid-batch settles cleanly (the batch promise
+// resolves, does not hang) and publishes nothing for the images that were still in flight.
+test("ingestBatch with caller cancel settles without hanging and publishes nothing", async () => {
+  const out = await tmpOut();
+  const m1 = await writeMaster(out, "B1.orf");
+  const m2 = await writeMaster(out, "B2.orf");
+  const callerAc = new AbortController();
+
+  // Blocking decode so both images are still in flight when the caller cancels.
+  const raw: RawBackend = {
+    async decode(_bytes: Uint8Array, _format: RawFormat, signal?: AbortSignal): Promise<DecodedMaster> {
+      await whenAborted(signal ?? callerAc.signal);
+      const err: any = new Error("aborted during decode");
+      err.code = "ABORT_ERR";
+      throw err;
+    },
+  };
+  const jxl: JxlBackend = {
+    async encodePyramid() { return []; },
+    async encodeTileContainer(_rgba, w, h) { return new Uint8Array([0xA0, w & 0xff, h & 0xff]); },
+    async downscaleRgba8(_rgba, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
+    async transcodeJpeg(b) { return b; },
+    async decodeToRgba8(b) { return { rgba: b, width: 4, height: 3 }; },
+  } as any;
+  const backends: Backends = { raw, jxl, signal: callerAc.signal, __testInProcess: true } as any;
+
+  setTimeout(() => callerAc.abort(), 40);
+  // The batch must SETTLE (resolve) — a hang here fails the test via bun's per-test timeout.
+  const result = await ingestBatch([m1, m2], backends, { outDir: out, concurrency: 2 });
+
+  expect(result.written).toBe(0);
+  // Nothing published for either in-flight image.
+  for (const id of [await imageIdForPath(m1), await imageIdForPath(m2)]) {
+    await expect(readFile(join(out, "images", id, "manifest.json"))).rejects.toThrow();
+  }
 });
