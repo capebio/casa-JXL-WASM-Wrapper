@@ -7,29 +7,21 @@
 
 /** @typedef {import('../../packages/jxl-pyramid/dist/manifest.js').PyramidManifest} PyramidManifest */
 
+// finding 72: consume the ONE canonical reader exported from @casabio/jxl-pyramid instead of a
+// divergent browser duplicate. The previous inline validator only accepted the earliest schema, so
+// it rejected every real (schema 2/4/5) manifest. parsePyramidManifest accepts schemas 1|2|4|5,
+// validates the v5 OrientationDescriptor / TilingDescriptor / sourceFormat, and preserves unknown
+// fields. It is pure (no zod), so the browser stays zero-dep.
+import { parsePyramidManifest } from "../../packages/jxl-pyramid/dist/manifest-validate.js";
+
 /**
- * Lightweight zero-dep manifest validator (G4-D). Throws on structural violation.
+ * Validate a fetched manifest through the shared jxl-pyramid reader. Throws on structural violation
+ * (ManifestValidationError). Returns the normalized manifest.
  * @param {any} m
- * @returns {asserts m is PyramidManifest}
+ * @returns {PyramidManifest}
  */
 function validateManifest(m) {
-  if (!m || typeof m !== "object") throw new Error("manifest must be object");
-  if (m.schema !== 1) throw new Error("manifest schema must be 1");
-  if (typeof m.imageId !== "string" || m.imageId.length === 0) throw new Error("manifest imageId required");
-  if (typeof m.width !== "number" || typeof m.height !== "number" || m.width <= 0 || m.height <= 0) {
-    throw new Error("manifest width/height must be positive numbers");
-  }
-  if (!Array.isArray(m.levels)) throw new Error("manifest levels must be array");
-  for (const lvl of m.levels) {
-    if (!lvl || typeof lvl !== "object") throw new Error("level must be object");
-    if (typeof lvl.contenthash !== "string" || lvl.contenthash.length === 0) throw new Error("level contenthash required");
-    if (typeof lvl.w !== "number" || typeof lvl.h !== "number" || lvl.w <= 0 || lvl.h <= 0) {
-      throw new Error("level w/h must be positive");
-    }
-    if (typeof lvl.bytes !== "number" || lvl.bytes < 0) throw new Error("level bytes invalid");
-    if (lvl.bitsPerSample !== 8 && lvl.bitsPerSample !== 16) throw new Error("level bitsPerSample must be 8 or 16");
-    if (typeof lvl.tiled !== "boolean") throw new Error("level tiled must be boolean");
-  }
+  return parsePyramidManifest(m);
 }
 
 /**
@@ -86,9 +78,9 @@ export function createImageStore({ cache, galleryBase }) {
       const url = new URL(`images/${imageId}/manifest.json`, base).href;
       const res = await fetch(url);
       if (!res.ok) throw new Error(`manifest ${imageId}: ${res.status}`);
-      const manifest = await res.json();
-      // G4-D: lightweight zero-dep structural validation before cache/return (no Zod to keep browser zero-dep)
-      validateManifest(manifest);
+      const raw = await res.json();
+      // Validate + normalize through the shared jxl-pyramid reader (zero-dep) before cache/return.
+      const manifest = validateManifest(raw);
       manifestCacheSet(imageId, manifest);
       return manifest;
     })();

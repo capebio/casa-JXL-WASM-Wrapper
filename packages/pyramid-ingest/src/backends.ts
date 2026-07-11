@@ -3,6 +3,10 @@ const JW: any = JxlWasmNS;
 
 export type MasterFormat = "orf" | "dng" | "cr2" | "jpg";
 export type RawFormat = "orf" | "dng" | "cr2";
+// Runtime decode-time orientation signal: whether the decoder baked the EXIF rotation into the
+// returned pixels ("baked") or left them in source orientation ("source"). This is the DECODER's
+// report, distinct from the persisted v5 manifest OrientationDescriptor { exif, pixels } which is
+// assembled at manifest-build time (buildManifest). Kept as a string here on purpose.
 export type Orientation = "baked" | "source";
 
 export interface DecodedMaster {
@@ -38,6 +42,10 @@ export interface PyramidLevelBytes {
   height: number;
   bitsPerSample?: 8 | 16;
   tiled?: boolean;
+  /** JXTC tile edge (px) when `tiled` — threaded to the v5 manifest TilingDescriptor.tileSize. */
+  tileSize?: number;
+  /** JXTC container version when `tiled` (defaults to 1). */
+  tileVersion?: 1 | 2;
   /** populated by profileConvergence when --profile-convergence and saturation met on a pass */
   convergedByteEnd?: number;
   /** full per-pass quality curve measured at ingest (--profile-convergence); persisted to manifest so clients pick any byte/quality tradeoff without download-time metrics */

@@ -4,12 +4,11 @@ import { randomUUID } from "node:crypto";
 import { contentHash16, imageIdForPath } from "./hash.js";
 import { buildJpgLadder, buildProxyLadder, buildRawLadder, type LadderResult, type TilingPolicy } from "./ladder.js";
 import {
-  buildIndexEntry, buildManifest, isUpToDate, toEntry, manifestToBinary, binaryToManifest,
-  indexToBinary, binaryToGalleryIndex,
+  buildIndexEntry, buildManifest, isUpToDate, toEntry,
   type GalleryIndex, type LevelEntry, type Manifest,
 } from "./manifest.js";
 
-import { detectFormatByMagic, makeProducedBy, parseManifest } from "./schema.js";
+import { detectFormatByMagic, makeProducedBy, parseManifest, manifestToJson } from "./schema.js";
 import type { Clock, DecodedMaster, JxlBackend, MasterFormat, Orientation, RawBackend, RawFormat, Telemetry } from "./backends.js";
 
 function now(b?: Backends): number { return b?.clock?.now?.() ?? Date.now(); }
@@ -401,13 +400,16 @@ export async function applyIngestPlan(
   const existing = new Set(exFiles.filter((f) => f.endsWith(".jxl")));
   await writeLevelFiles(outDir, plan.levels, plan.width, plan.height, !!opts.verifyHash, plan.entries, existing);
 
-  // write manifest atomically (with EBUSY retry for Windows durability)
-  // Binary format (−73% vs JSON) shipped with v1 magic byte; parseManifest auto-detects
+  // write manifest atomically (with EBUSY retry for Windows durability).
+  // CANONICAL: JSON on the `.json` path (lossless for the complete schema, unknown fields
+  // preserved). The tight binary format is lossy (no v5 descriptors / metadata / unknown fields),
+  // so it is no longer written under manifest.json; parseManifest still auto-detects and reads any
+  // pre-existing binary manifests for backward compatibility.
   await mkdir(imageDir, { recursive: true });
   const manifestTmp = `${manifestPath}.tmp`;
   try {
-    const binary = manifestToBinary(plan.manifest);
-    await withEbusyRetry(() => writeFile(manifestTmp, binary), "manifest-tmp");
+    const json = manifestToJson(plan.manifest);
+    await withEbusyRetry(() => writeFile(manifestTmp, json), "manifest-tmp");
     await withEbusyRetry(() => rename(manifestTmp, manifestPath), "manifest-rename");
   } catch (e) {
     await unlink(manifestTmp).catch(() => {});
@@ -966,12 +968,12 @@ export async function rebuildIndex(outDir: string, telemetry?: Telemetry): Promi
   // INVARIANT (D3): index order deterministic across readdir / fs. Do not remove this sort.
   index.images.sort((a, b) => (a.imageId < b.imageId ? -1 : a.imageId > b.imageId ? 1 : 0));
 
-  // high-atomic-writes + B9: tmp + rename for index.json (reader never sees partial/truncated binary)
-  // Binary format (−71% vs JSON) auto-detected by parseGalleryIndex
+  // high-atomic-writes + B9: tmp + rename for index.json (reader never sees a partial/truncated file).
+  // CANONICAL: JSON on the `.json` path (parseGalleryIndex still auto-detects legacy binary on read).
   const indexPath = join(outDir, "index.json");
   const tmp = `${indexPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
-  const binary = indexToBinary(index);
-  await withEbusyRetry(() => writeFile(tmp, binary), "write-index-tmp");
+  const json = JSON.stringify(index, null, 2);
+  await withEbusyRetry(() => writeFile(tmp, json), "write-index-tmp");
   await withEbusyRetry(() => rename(tmp, indexPath), "rename-index");
   return index;
 }

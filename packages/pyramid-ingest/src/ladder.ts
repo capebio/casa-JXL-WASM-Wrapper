@@ -99,7 +99,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
         distance: t.distance,
         effort: EFFORT,
       });
-      bigLevels.push({ data, width: cw16, height: ch16, bitsPerSample: 16, tiled: true, stagedBytes });
+      bigLevels.push({ data, width: cw16, height: ch16, bitsPerSample: 16, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes });
     }
 
     let outLevels = [...gridLevels, ...bigLevels];
@@ -134,7 +134,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
     const data = tiled
       ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT })
       : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }))[0]!.data;
-    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, stagedBytes });
+    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
   }
   levels.reverse(); // L1: restore ascending
   // L7
@@ -207,7 +207,7 @@ export async function buildJpgLadder(
     const data = tiled
       ? await jxl.encodeTileContainer(cur, cw, ch, { tileSize: TILE_SIZE, distance: t.distance, effort: EFFORT })
       : (await jxl.encodePyramid(cur, cw, ch, { sidecars: [], fullDistance: t.distance, effort: EFFORT }))[0]!.data;
-    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, stagedBytes });
+    levels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled, ...(tiled ? { tileSize: TILE_SIZE, tileVersion: 1 as const } : {}), stagedBytes });
   }
   // Full level. Adaptive: reuse the bit-exact lossless transcode (fast + lossless — see the
   // jpg-full-transcode-vs-jxtc flipflop). Tile-all: a lossy JXTC re-encode for uniform tiled decode.

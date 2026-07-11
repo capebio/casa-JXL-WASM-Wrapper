@@ -6,6 +6,7 @@ import type {
   IndexEntry,
   GalleryIndex,
   LevelEntry,
+  LevelEntryV5,
   LevelSize,
   MasterInfo,
 } from "./schema.js";
@@ -15,6 +16,7 @@ export type {
   IndexEntry,
   GalleryIndex,
   LevelEntry,
+  LevelEntryV5,
   LevelSize,
   MasterInfo,
 } from "./schema.js";
@@ -28,15 +30,30 @@ export function levelSize(w: number, h: number, masterW: number, masterH: number
   return Math.max(w, h);
 }
 
-export function toEntry(level: PyramidLevelBytes, masterW: number, masterH: number): LevelEntry {
+export function toEntry(level: PyramidLevelBytes, masterW: number, masterH: number): LevelEntryV5 {
+  const tiled = level.tiled === true;
+  const bitsPerSample = level.bitsPerSample ?? 8;
   return {
     size: levelSize(level.width, level.height, masterW, masterH),
     w: level.width,
     h: level.height,
     bytes: level.data.length,
-    bitsPerSample: level.bitsPerSample ?? 8,
+    bitsPerSample,
     contenthash: contentHash16(level.data),
-    tiled: level.tiled === true,
+    tiled,
+    // v5: a tiled level persists an explicit TilingDescriptor so clients can address tiles without
+    // decoding. JXTC index offsets are absolute from byte zero of the file (offsetBase: "file").
+    ...(tiled
+      ? {
+          tiling: {
+            container: "jxtc" as const,
+            version: (level.tileVersion ?? 1) as 1 | 2,
+            tileSize: level.tileSize ?? 512,
+            bitsPerSample,
+            offsetBase: "file" as const,
+          },
+        }
+      : {}),
     ...(level.convergedByteEnd != null ? { convergedByteEnd: level.convergedByteEnd } : {}),
     ...(level.qualityCurve && level.qualityCurve.length > 0 ? { qualityCurve: level.qualityCurve } : {}),
   };
@@ -48,15 +65,23 @@ export function buildManifest(args: {
   orientation: Orientation;
   width: number;
   height: number;
-  levels: LevelEntry[];
+  levels: LevelEntryV5[];
   proxy?: boolean;
 }): Manifest {
   const levels = [...args.levels].sort((a, b) => a.w * a.h - b.w * b.h);
+  // v5: emit the current schema. The runtime orientation string is lifted into an
+  // OrientationDescriptor; exif defaults to 1 because ingest bakes the EXIF rotation into the pixels
+  // and does not (yet) thread the raw EXIF value through — pixels: "baked-upright" vs "source" carries
+  // the meaningful signal. A future ingest change can thread the real exif value here.
+  const orientation = {
+    exif: 1 as const,
+    pixels: args.orientation === "source" ? ("source" as const) : ("baked-upright" as const),
+  };
   const base = {
-    schema: 2 as const,  // V3 Phase2 (discrim + compat; v1 still readable)
+    schema: 5 as const,
     imageId: args.imageId,
     master: args.master,
-    orientation: args.orientation,
+    orientation,
     width: args.width,
     height: args.height,
     aspect: round4(args.width / args.height),
@@ -64,7 +89,7 @@ export function buildManifest(args: {
     producedBy: makeProducedBy(),
     ...(args.proxy ? { proxy: true as const } : {}),
   };
-  return manifestSchema.parse(base) as any;  // V3 union (accepts 1 or 2); emitted schema:2 now
+  return manifestSchema.parse(base) as any;  // v5 (current); v1/v2/v4 still readable on parse
 }
 
 export function buildIndexEntry(manifest: Manifest): IndexEntry {

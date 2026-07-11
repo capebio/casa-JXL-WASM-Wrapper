@@ -64,3 +64,41 @@ test('S1->S3->S2 image-store handoff: store centralizes manifest/level fetch; gr
   // index fetch stays in gallery root (per design); level/manifest now via store
   expect(galleryJs).toContain("fetch(new URL('index.json', galleryBase))");
 });
+
+test('image-store consumes the shared jxl-pyramid validator, not a schema-1-only duplicate (finding 72)', () => {
+  // The old duplicate hard-coded `m.schema !== 1` — it rejected every real (schema 2/4/5) manifest.
+  expect(storeJs).not.toContain('manifest schema must be 1');
+  expect(storeJs).not.toContain('m.schema !== 1');
+  // It now consumes the canonical reader exported from the jxl-pyramid package build.
+  expect(storeJs).toContain('parsePyramidManifest');
+  expect(storeJs).toContain('jxl-pyramid');
+});
+
+test('image-store validates a real schema-5 manifest via the shared reader', async () => {
+  const { createImageStore } = await import('./image-store.js');
+  const v5 = {
+    schema: 5,
+    imageId: 'deadbeefcafef00d',
+    master: { name: 'P1000001.RW2', sourceFormat: 'rw2', format: 'rw2', mtimeMs: 1717900000000 },
+    orientation: { exif: 6, pixels: 'baked-upright' },
+    width: 5184,
+    height: 3888,
+    aspect: 5184 / 3888,
+    levels: [
+      { size: 512, w: 512, h: 384, bytes: 15000, bitsPerSample: 8, contenthash: 'abcdef', tiled: false },
+      { size: 'full', w: 5184, h: 3888, bytes: 2400000, bitsPerSample: 8, contenthash: 'fedcba', tiled: true,
+        tiling: { container: 'jxtc', version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: 'file' } },
+    ],
+  };
+  const fakeCache = { async get() { return null; }, set() {} };
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, async json() { return v5; } });
+  try {
+    const store = createImageStore({ cache: fakeCache, galleryBase: 'https://example.test/gallery/' });
+    const m = await store.getManifest('deadbeefcafef00d');
+    expect(m.schema).toBe(5);
+    expect(m.orientation).toEqual({ exif: 6, pixels: 'baked-upright' });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});

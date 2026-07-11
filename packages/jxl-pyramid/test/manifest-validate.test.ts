@@ -199,6 +199,71 @@ test("producedBy is parsed with strong types, not any", () => {
   expect(m.producedBy?.params?.["effort"]).toBe(7);
 });
 
+// ── v5 contract: OrientationDescriptor + TilingDescriptor + sourceFormat ──────
+// The browser/jxl-pyramid reader must accept the SAME schemas (1|2|4|5) as the
+// canonical pyramid-ingest parser (finding 72 — no divergent schema-≤2-only reader).
+
+describe("v5 manifest reading", () => {
+  function v5Base(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      schema: 5,
+      imageId: "img-v5",
+      master: { name: "P1000001.RW2", sourceFormat: "rw2", format: "rw2", mtimeMs: 1717900000000 },
+      orientation: { exif: 6, pixels: "baked-upright" },
+      width: 5184,
+      height: 3888,
+      aspect: 5184 / 3888,
+      levels: [
+        { size: 512, w: 512, h: 384, bytes: 15000, bitsPerSample: 8, contenthash: "abcdef", tiled: false },
+        {
+          size: "full", w: 5184, h: 3888, bytes: 2400000, bitsPerSample: 8, contenthash: "fedcba",
+          tiled: true,
+          tiling: { container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: "file" },
+        },
+      ],
+      ...overrides,
+    };
+  }
+
+  test("MANIFEST_SCHEMA_VERSION is 5 (aligned with the canonical contract)", () => {
+    expect(MANIFEST_SCHEMA_VERSION).toBe(5);
+  });
+
+  test("a v5 manifest with an OrientationDescriptor and TilingDescriptor parses", () => {
+    const m = parsePyramidManifest(v5Base());
+    expect(m.schema).toBe(5);
+    expect(m.orientation).toEqual({ exif: 6, pixels: "baked-upright" });
+    expect(m.master.sourceFormat).toBe("rw2");
+    const full = m.levels.find((l) => l.size === "full")!;
+    expect(full.tiling).toEqual({ container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: "file" });
+  });
+
+  test("v5 orientation exif out of range (9) throws for its specific reason", () => {
+    expectValidationError(() => parsePyramidManifest(v5Base({ orientation: { exif: 9, pixels: "baked-upright" } })), "orientation");
+  });
+
+  test("v5 tiled level missing its TilingDescriptor throws for its specific reason", () => {
+    const bad = v5Base();
+    (bad.levels as any)[1] = { size: "full", w: 5184, h: 3888, bytes: 2400000, bitsPerSample: 8, contenthash: "fedcba", tiled: true };
+    expectValidationError(() => parsePyramidManifest(bad), "tiling");
+  });
+
+  test("schema 3 (skipped) is rejected", () => {
+    expectValidationError(() => parsePyramidManifest(v5Base({ schema: 3 })), "schema");
+  });
+
+  test("schema 4 with a v4 tiling grid still parses (back-compat)", () => {
+    const m = parsePyramidManifest(baseManifest({
+      schema: 4,
+      levels: [
+        { size: "full", w: 4608, h: 3456, bytes: 2000000, bitsPerSample: 8, contenthash: "abc", tiled: true, tiling: { tileSize: 256, cols: 18, rows: 14 } },
+      ],
+    }));
+    expect(m.schema).toBe(4);
+    expect(m.levels[0].tiling).toEqual({ tileSize: 256, cols: 18, rows: 14 });
+  });
+});
+
 // ── GalleryIndex ─────────────────────────────────────────────────────────────
 
 describe("parseGalleryIndex", () => {

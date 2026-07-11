@@ -233,6 +233,10 @@ export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV
 export type IndexEntry = z.infer<typeof indexEntrySchema>;
 export type GalleryIndex = z.infer<typeof galleryIndexSchema>;
 export type LevelEntry = z.infer<typeof levelEntrySchema>;
+/** v5 level entry (base + optional TilingDescriptor). What toEntry emits. */
+export type LevelEntryV5 = z.infer<typeof levelEntryV5Schema>;
+/** v5 TilingDescriptor as it appears on a persisted level. */
+export type LevelTilingDescriptor = z.infer<typeof tilingDescriptorSchema>;
 export type LevelSize = z.infer<typeof levelSizeSchema>;
 export type MasterInfo = z.infer<typeof masterInfoSchema>;
 export type ProducedBy = z.infer<typeof producedBySchema>;

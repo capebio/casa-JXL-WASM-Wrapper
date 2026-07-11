@@ -22,8 +22,15 @@ export const DEFAULT_PROXY_SIZE = 512 as const;
 /** Allowed master image file formats */
 export const ALLOWED_FORMATS: readonly MasterFormat[] = ["orf", "dng", "cr2", "jpg"] as const;
 
-/** Allowed orientation strategies */
+/** Allowed orientation strategies (v1–v4 legacy string form). */
 export const ORIENTATION_VALUES: readonly Orientation[] = ["baked", "source"] as const;
+
+/** v5 OrientationDescriptor.pixels values (whether stored level pixels are already upright). */
+export const ORIENTATION_PIXELS_VALUES = ["source", "baked-upright"] as const;
+
+/** v5 EXIF orientation is an integer in this inclusive range. */
+export const EXIF_ORIENTATION_MIN = 1 as const;
+export const EXIF_ORIENTATION_MAX = 8 as const;
 
 /** Quality-to-Distance mappings for the libjxl encoder */
 export const QUALITY_DISTANCES = {

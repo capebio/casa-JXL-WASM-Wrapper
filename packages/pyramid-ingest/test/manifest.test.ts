@@ -19,9 +19,10 @@ test("levelSize reports 'full' only when dims match the master", () => {
   expect(levelSize(192, 256, 4624, 3468)).toBe(256);
 });
 
-test("toEntry records tiled=true when the level bytes are a JXTC container", () => {
-  const e = toEntry({ data: new Uint8Array(9), width: 10, height: 10, tiled: true }, 10, 10);
+test("toEntry records tiled=true and a v5 TilingDescriptor when the level bytes are a JXTC container", () => {
+  const e = toEntry({ data: new Uint8Array(9), width: 10, height: 10, tiled: true, tileSize: 512 }, 10, 10);
   expect(e.tiled).toBe(true);
+  expect((e as any).tiling).toEqual({ container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: "file" });
 });
 
 test("toEntry builds an 8-bit, untiled level entry with a content hash", () => {
@@ -54,9 +55,11 @@ test("toEntry passes qualityCurve through and omits it when empty or absent", ()
 });
 
 test("manifest schema accepts qualityCurve points and rejects non-positive bytes", () => {
-  const level: LevelEntry = {
+  const level: LevelEntry & { tiling: unknown } = {
     size: 2048, w: 2048, h: 1536, bytes: 8192, bitsPerSample: 8,
     contenthash: "c".repeat(16), tiled: true,
+    // v5 requires a TilingDescriptor on tiled levels.
+    tiling: { container: "jxtc", version: 1, tileSize: 512, bitsPerSample: 8, offsetBase: "file" },
     qualityCurve: [{ bytes: 1024, butteraugli: 2.5 }, { bytes: 4096, ssim: 0.9996 }],
   };
   const m = buildManifest({
@@ -83,10 +86,12 @@ test("buildManifest sorts levels ascending by pixel count and rounds aspect to 4
     height: 3468,
     levels: [big, small],
   });
-  expect(m.schema).toBe(2);
+  expect(m.schema).toBe(5);
   expect(m.levels.map((l) => l.size)).toEqual([256, "full"]);
   expect(m.aspect).toBeCloseTo(1.3333, 4);
   expect(m.proxy).toBeUndefined();
+  // v5: orientation is an OrientationDescriptor.
+  expect((m as any).orientation).toEqual({ exif: 1, pixels: "baked-upright" });
 });
 
 test("buildManifest flags proxy and buildIndexEntry inlines L0", () => {
@@ -96,7 +101,7 @@ test("buildManifest flags proxy and buildIndexEntry inlines L0", () => {
     orientation: "source", width: 4000, height: 3000, levels: [small], proxy: true,
   });
   expect(proxy.proxy).toBe(true);
-  expect(proxy.orientation).toBe("source");
+  expect((proxy as any).orientation).toEqual({ exif: 1, pixels: "source" });
 
   const idx = buildIndexEntry(proxy);
   expect(idx.imageId).toBe("a".repeat(16));
