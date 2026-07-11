@@ -1,0 +1,56 @@
+{
+  "schema": 5,
+  "imageId": "deadbeefcafef00d",
+  "master": {
+    "name": "P1000001.RW2",
+    "sourceFormat": "rw2",
+    "format": "rw2",
+    "mtimeMs": 1717900000000
+  },
+  "orientation": {
+    "exif": 6,
+    "pixels": "baked-upright"
+  },
+  "width": 5184,
+  "height": 3888,
+  "aspect": 1.3333,
+  "levels": [
+    {
+      "size": 512,
+      "w": 512,
+      "h": 384,
+      "bytes": 15000,
+      "bitsPerSample": 8,
+      "contenthash": "abcdef0123456789",
+      "tiled": false
+    },
+    {
+      "size": "full",
+      "w": 5184,
+      "h": 3888,
+      "bytes": 2400000,
+      "bitsPerSample": 8,
+      "contenthash": "fedcba9876543210",
+      "tiled": true,
+      "tiling": {
+        "container": "jxtc",
+        "version": 1,
+        "tileSize": 512,
+        "bitsPerSample": 8,
+        "offsetBase": "file"
+      }
+    }
+  ],
+  "producedBy": {
+    "tool": "pyramid-ingest",
+    "version": "0.1.0",
+    "encoder": {
+      "effort": 3,
+      "quality": {
+        "grid": 85,
+        "big": 95,
+        "proxy": 85
+      }
+    }
+  }
+}

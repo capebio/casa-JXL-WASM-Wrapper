@@ -1,0 +1,28 @@
+{
+  "schema": 5,
+  "imageId": "9f86d081884c7d65",
+  "master": {
+    "name": "x.orf",
+    "sourceFormat": "orf",
+    "format": "orf",
+    "mtimeMs": 1
+  },
+  "orientation": {
+    "exif": 1,
+    "pixels": "source"
+  },
+  "width": 5184,
+  "height": 3888,
+  "aspect": 1.3333,
+  "levels": [
+    {
+      "size": "full",
+      "w": 5184,
+      "h": 3888,
+      "bytes": 2400000,
+      "bitsPerSample": 8,
+      "contenthash": "fedcba9876543210",
+      "tiled": true
+    }
+  ]
+}

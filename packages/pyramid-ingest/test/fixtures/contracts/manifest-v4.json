@@ -1,0 +1,63 @@
+{
+  "schema": 4,
+  "imageId": "aabbccddeeff0011",
+  "master": {
+    "name": "DSC09000.ARW",
+    "format": "arw",
+    "mtimeMs": 1717800000000
+  },
+  "orientation": "source",
+  "width": 9504,
+  "height": 6336,
+  "aspect": 1.5,
+  "layout": "sharded-2",
+  "levels": [
+    {
+      "size": 512,
+      "w": 512,
+      "h": 341,
+      "bytes": 12000,
+      "bitsPerSample": 8,
+      "contenthash": "5555666677778888",
+      "tiled": false
+    },
+    {
+      "size": "full",
+      "w": 9504,
+      "h": 6336,
+      "bytes": 3200000,
+      "bitsPerSample": 8,
+      "contenthash": "99aabbccddeeff00",
+      "tiled": true,
+      "tiling": {
+        "tileSize": 512,
+        "cols": 19,
+        "rows": 13
+      },
+      "convergedByteEnd": 2100000,
+      "qualityCurve": [
+        {
+          "bytes": 800000,
+          "butteraugli": 2.4
+        },
+        {
+          "bytes": 2100000,
+          "ssim": 0.9996,
+          "butteraugli": 1.05
+        }
+      ]
+    }
+  ],
+  "producedBy": {
+    "tool": "pyramid-ingest",
+    "version": "0.1.0",
+    "encoder": {
+      "effort": 3,
+      "quality": {
+        "grid": 85,
+        "big": 95,
+        "proxy": 85
+      }
+    }
+  }
+}

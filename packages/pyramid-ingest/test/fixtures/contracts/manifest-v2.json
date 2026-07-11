@@ -1,0 +1,46 @@
+{
+  "schema": 2,
+  "imageId": "1122334455667788",
+  "master": {
+    "name": "IMG_4242.CR2",
+    "format": "cr2",
+    "mtimeMs": 1717700000000
+  },
+  "orientation": "baked",
+  "width": 6000,
+  "height": 4000,
+  "aspect": 1.5,
+  "levels": [
+    {
+      "size": 512,
+      "w": 512,
+      "h": 341,
+      "bytes": 12000,
+      "bitsPerSample": 8,
+      "contenthash": "aaaabbbbccccdddd",
+      "tiled": false
+    },
+    {
+      "size": "full",
+      "w": 6000,
+      "h": 4000,
+      "bytes": 1500000,
+      "bitsPerSample": 8,
+      "contenthash": "1111222233334444",
+      "tiled": false
+    }
+  ],
+  "proxy": true,
+  "producedBy": {
+    "tool": "pyramid-ingest",
+    "version": "0.1.0",
+    "encoder": {
+      "effort": 3,
+      "quality": {
+        "grid": 85,
+        "big": 95,
+        "proxy": 85
+      }
+    }
+  }
+}
