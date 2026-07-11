@@ -16,6 +16,7 @@ use raw_pipeline::tiff;
 use wasm_bindgen::prelude::*;
 
 mod denoise_options;
+mod denoise_session;
 use denoise_options::RawProcessOptions;
 use raw_pipeline::denoise::{
     classical_denoise, decide, estimate_noise, score_noise, resolve_noise_model,
@@ -4924,6 +4925,170 @@ pub fn process_cr2_with_options(
     let mut result = process_dng_impl(decoded.into(), output_flags, &opts.look)?;
     apply_denoise_telemetry(&mut result, tel, &opts.denoise);
     Ok(result)
+}
+
+// ─── T8: tiled learned-denoise session factories ─────────────────────────────
+//
+// A worker creates a session ONLY after the denoise gate decides learned/classical
+// processing is warranted (denoise-off requests keep the fused DNG/ORF fast paths
+// via process_*_with_options above). Each factory decodes the RAW to a DngDecoded
+// carrying the raw mosaic + MHC RGB16 baseline, then hands ownership to the
+// session. The finish path always rebuilds the full RGB8 + lightbox + thumbnail
+// caches, so every session is created with that fixed output set; the `options`
+// argument is parsed at creation for fail-fast validation (the finish methods
+// re-parse their own options as the authoritative look/denoise source).
+pub use denoise_session::DenoiseSession;
+
+/// Fixed output set for denoise sessions: full RGB8 + lightbox + thumbnail.
+const DENOISE_SESSION_FLAGS: u32 = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB;
+
+/// Create a tiled denoise session from an Olympus ORF blob.
+#[wasm_bindgen]
+pub fn create_orf_denoise_session(
+    data: &[u8],
+    options: JsValue,
+) -> Result<DenoiseSession, JsError> {
+    RawProcessOptions::from_js(&options)?; // fail-fast validation
+    let output_flags = DENOISE_SESSION_FLAGS;
+    // Force full-res decode so the streaming preview path doesn't drop the raw.
+    let decoded = decode_orf_raw(data, output_flags | OUT_FULL_RGB8)?;
+    let w = decoded.w;
+    let h = decoded.h;
+    let noise_metadata = RawNoiseMetadata {
+        black: [OLYMPUS_BLACK_LEVEL as f32; 4],
+        white: [4095.0f32; 4],
+        ..RawNoiseMetadata::default()
+    };
+    let rgb16 = demosaic::demosaic_rggb_mhc(&decoded.raw, w, h)
+        .map_err(|e| JsError::new(&format!("ORF demosaic: {}", e)))?;
+    let dng = DngDecoded {
+        rgb16,
+        aw: w,
+        ah: h,
+        params: decoded.params,
+        color_matrix_flat: decoded.color_matrix_flat,
+        decode_ms: decoded.decompress_ms,
+        demosaic_ms: 0.0,
+        orientation: decoded.info.orientation,
+        make: decoded.info.make,
+        model: decoded.info.model,
+        iso: decoded.info.iso.unwrap_or(0),
+        datetime: decoded.info.datetime,
+        gps_lat: decoded.info.gps_lat,
+        gps_lon: decoded.info.gps_lon,
+        gps_alt: decoded.info.gps_alt,
+        lb_packed: Vec::new(),
+        lb_w: 0,
+        lb_h: 0,
+        thumb_packed: Vec::new(),
+        thumb_w: 0,
+        thumb_h: 0,
+        fast_preview: false,
+        raw_mosaic: decoded.raw,
+        cfa_index: 0, // Olympus is always RGGB
+        noise_metadata,
+    };
+    Ok(DenoiseSession::from_decoded(dng, output_flags))
+}
+
+/// Create a tiled denoise session from an Adobe DNG blob.
+#[wasm_bindgen]
+pub fn create_dng_denoise_session(
+    data: &[u8],
+    options: JsValue,
+) -> Result<DenoiseSession, JsError> {
+    RawProcessOptions::from_js(&options)?; // fail-fast validation
+    let output_flags = DENOISE_SESSION_FLAGS;
+    let decoded = decode_dng_raw(data, output_flags | OUT_FULL_RGB8)?;
+    Ok(DenoiseSession::from_decoded(decoded, output_flags))
+}
+
+/// Create a tiled denoise session from a Canon CR2 blob.
+#[wasm_bindgen]
+pub fn create_cr2_denoise_session(
+    data: &[u8],
+    options: JsValue,
+) -> Result<DenoiseSession, JsError> {
+    RawProcessOptions::from_js(&options)?; // fail-fast validation
+    let output_flags = DENOISE_SESSION_FLAGS;
+    let decoded: DngDecoded = decode_cr2_raw(data)?.into();
+    Ok(DenoiseSession::from_decoded(decoded, output_flags))
+}
+
+/// Create a tiled denoise session from a generic Bayer mosaic (see
+/// `process_raw_mosaic_with_options` for the argument contract).
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn create_raw_mosaic_denoise_session(
+    raw_u16: &[u16],
+    width: u32,
+    height: u32,
+    cfa_phase: u32,
+    black: u32,
+    white: u32,
+    wb_r: f32,
+    wb_b: f32,
+    orientation: u32,
+    color_matrix_flat: &[f32],
+    iso: u32,
+    options: JsValue,
+) -> Result<DenoiseSession, JsError> {
+    RawProcessOptions::from_js(&options)?; // fail-fast validation
+    let output_flags = DENOISE_SESSION_FLAGS;
+    validate_raw_mosaic_shape(raw_u16.len(), width, height).map_err(|e| JsError::new(&e))?;
+    let w = width as usize;
+    let h = height as usize;
+    let phase = cfa_phase_from_code(cfa_phase)?;
+    let rgb16 = demosaic::demosaic_bayer_mhc(raw_u16, w, h, phase)
+        .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
+    let b = black.min(u16::MAX as u32) as f32;
+    let wh = white.min(u16::MAX as u32) as f32;
+    let noise_metadata = RawNoiseMetadata {
+        black: [b; 4],
+        white: [wh; 4],
+        ..RawNoiseMetadata::default()
+    };
+    let cfa_index = match phase {
+        (0, 0) => 0,
+        (0, 1) => 1,
+        (1, 0) => 2,
+        _ => 3,
+    };
+    let (matrix, flat) = matrix_from_flat_or_identity(color_matrix_flat);
+    let mut params = pipeline::PipelineParams::default_olympus();
+    params.black = black.min(u16::MAX as u32) as u16;
+    params.white = white.min(u16::MAX as u32).max(params.black as u32 + 1) as u16;
+    params.wb_r = if wb_r.is_finite() && wb_r > 0.0 { wb_r.min(8.0) } else { 1.0 };
+    params.wb_b = if wb_b.is_finite() && wb_b > 0.0 { wb_b.min(8.0) } else { 1.0 };
+    params.color_matrix = Some(matrix).into();
+    let dng = DngDecoded {
+        rgb16,
+        aw: w,
+        ah: h,
+        params,
+        color_matrix_flat: flat,
+        decode_ms: 0.0,
+        demosaic_ms: 0.0,
+        orientation: orientation.min(u16::MAX as u32) as u16,
+        make: String::new(),
+        model: String::new(),
+        iso,
+        datetime: String::new(),
+        gps_lat: None,
+        gps_lon: None,
+        gps_alt: None,
+        lb_packed: Vec::new(),
+        lb_w: 0,
+        lb_h: 0,
+        thumb_packed: Vec::new(),
+        thumb_w: 0,
+        thumb_h: 0,
+        fast_preview: false,
+        raw_mosaic: raw_u16.to_vec(),
+        cfa_index,
+        noise_metadata,
+    };
+    Ok(DenoiseSession::from_decoded(dng, output_flags))
 }
 
 // ---------------------------------------------------------------------------
