@@ -62,6 +62,23 @@ const config = {
   ]
 };
 
+// Role → artifact-prefix contract (Packet 3 Task 1, finding 17).
+//
+// The facade's role-aware loader (`loadJxlModule({ role })` in src/facade.ts)
+// requests `jxl-core.<prefix>.<tier>.js`, where the prefix is derived from the
+// runtime JXL role. This map is the SINGLE source of truth for that prefix so
+// the emitted artifact names (`jxl-core.${kind}.${tier.name}.*`, kind ∈ dec|enc
+// from `moduleKinds`) and the loader's request names cannot drift apart:
+//   - decode      → "dec"  (decode-only viewer module)
+//   - encode      → "enc"  (encoder superset)
+//   - perceptual  → "enc"  (butteraugli/psnr/ssim live in the encoder superset)
+// Keep in lockstep with `roleArtifactCandidates()` in src/facade.ts.
+export const ARTIFACT_PREFIX_BY_ROLE = {
+  decode: "dec",
+  encode: "enc",
+  perceptual: "enc"
+};
+
 // Authoritative list of Emscripten runtime methods we depend on.
 // Must match exactly what facade.ts reads off the module (LibjxlWasmModule).
 // Current consumers: HEAPU8 (all pixel I/O), HEAPU32 (buffer metadata fast-paths + sidecar dims),

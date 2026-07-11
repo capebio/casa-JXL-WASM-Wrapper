@@ -18,7 +18,6 @@ import type {
   MsgDecodeBudgetExceeded,
 } from "@casabio/jxl-core/protocol";
 import type { ImageInfo, DecodeStage, PixelFormat, Region } from "@casabio/jxl-core/types";
-import type { DecoderPool } from "./decoder-pool.js";
 
 type DecodeState =
   | "created"
@@ -31,7 +30,6 @@ type DecodeState =
 
 interface DecodeHandlerCallbacks {
   onSessionEnd: (sessionId: string) => void;
-  decoderPool?: DecoderPool | undefined;
 }
 
 // Adaptive high-water mark: EMA of decoder.push() latency scales the drain threshold.
@@ -120,7 +118,6 @@ export class DecodeHandler {
   private readonly opts: MsgDecodeStart;
   private readonly wasm: JxlModule;
   private readonly callbacks: DecodeHandlerCallbacks;
-  private readonly decoderPool: DecoderPool | undefined;
 
   private state: DecodeState = "created";
   // ChunkRing is the single source of truth for queue depth (.size) and bytes (.bytes).
@@ -179,7 +176,6 @@ export class DecodeHandler {
     this.opts = opts;
     this.wasm = wasm;
     this.callbacks = callbacks;
-    this.decoderPool = callbacks.decoderPool;
 
     this._metricMsg.sessionId = this.sessionId;
     this._drainMsg.sessionId = this.sessionId;
@@ -245,38 +241,24 @@ export class DecodeHandler {
   // ---------------------------------------------------------------------------
 
   private async run(): Promise<void> {
-    // Acquire decoder from pool if available; otherwise create new
-    const decoder = this.decoderPool
-      ? this.decoderPool.acquire({
-          format: this.opts.format,
-          region: this.opts.region,
-          downsample: this.opts.downsample,
-          progressionTarget: this.opts.progressionTarget,
-          emitEveryPass: this.opts.emitEveryPass,
-          progressiveDetail: this.opts.progressiveDetail,
-          suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
-          preserveIcc: this.opts.preserveIcc,
-          preserveMetadata: this.opts.preserveMetadata,
-          targetWidth: this.opts.targetWidth,
-          targetHeight: this.opts.targetHeight,
-          fitMode: this.opts.fitMode,
-          onMetric: (name: string, value: number) => this.postMetric(name, value),
-        })
-      : this.wasm.createDecoder({
-          format: this.opts.format,
-          region: this.opts.region,
-          downsample: this.opts.downsample,
-          progressionTarget: this.opts.progressionTarget,
-          emitEveryPass: this.opts.emitEveryPass,
-          ...(this.opts.progressiveDetail !== null ? { progressiveDetail: this.opts.progressiveDetail } : {}),
-          suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
-          preserveIcc: this.opts.preserveIcc,
-          preserveMetadata: this.opts.preserveMetadata,
-          targetWidth: this.opts.targetWidth,
-          targetHeight: this.opts.targetHeight,
-          fitMode: this.opts.fitMode,
-          onMetric: (name: string, value: number) => this.postMetric(name, value),
-        });
+    // One libjxl decoder per session. Workers are stateless between sessions
+    // (see CLAUDE.md: caching decoder state across session lifetimes would break
+    // recycle()), and libjxl exposes no reset ABI — so there is no decoder pool.
+    const decoder = this.wasm.createDecoder({
+      format: this.opts.format,
+      region: this.opts.region,
+      downsample: this.opts.downsample,
+      progressionTarget: this.opts.progressionTarget,
+      emitEveryPass: this.opts.emitEveryPass,
+      ...(this.opts.progressiveDetail !== null ? { progressiveDetail: this.opts.progressiveDetail } : {}),
+      suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
+      preserveIcc: this.opts.preserveIcc,
+      preserveMetadata: this.opts.preserveMetadata,
+      targetWidth: this.opts.targetWidth,
+      targetHeight: this.opts.targetHeight,
+      fitMode: this.opts.fitMode,
+      onMetric: (name: string, value: number) => this.postMetric(name, value),
+    });
 
     // Store decoder reference so terminal paths can actively dispose it.
     this.decoder = decoder;

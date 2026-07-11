@@ -145,3 +145,15 @@ test("partial-tier manifest merge uses canMergePartialTier to guard stale entrie
   // key phrase independently of the console.warn call site.
   expect(source).toMatch(/stale tier entry/);
 });
+
+test("role→artifact naming is a single documented contract the facade loader mirrors", () => {
+  // The facade's role loader requests `jxl-core.<rolePrefix>.<tier>.js` where
+  // rolePrefix is `dec` for the decode role and `enc` for encode/perceptual.
+  // build.mjs must emit exactly those prefixes so the two stay in lockstep.
+  expect(source).toContain("ARTIFACT_PREFIX_BY_ROLE");
+  expect(source).toMatch(/decode:\s*"dec"/);
+  expect(source).toMatch(/encode:\s*"enc"/);
+  expect(source).toMatch(/perceptual:\s*"enc"/);
+  // Emitted artifact base name still keys on module kind × tier.
+  expect(source).toContain("jxl-core.${kind}.${tier.name}");
+});
