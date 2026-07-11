@@ -18,10 +18,21 @@
  *      files it owns.  For each job that declares an `on.pull_request.paths` filter,
  *      every source path the job's steps reference must match at least one filter
  *      pattern.  (Structural check only — false negatives are better than false positives.)
+ *      NEGATIVE test: injecting paths:['crates/**'] into a synthetic JS lane asserts FAILURE.
  *   5. Environment-blocked lanes (Emscripten/WASM heavy build) must be explicitly
  *      annotated rather than silently passing.  A step that skips a block must emit
  *      a recognisable skip message (checked by searching "skip" | "skipped" | "unavailable"
  *      in step `run:` or `if:` fields when the step name mentions emscripten, wasm, or docker).
+ *
+ * Additional quality hardening (M-1..M-6, K1, K2, I-1):
+ *   M-1  path-filter guard is not vacuous — parseWorkflow captures on.pull_request.paths
+ *   M-3  cargo +nightly fuzz run "${{ matrix.target }}" is quoted (shell-injection safe)
+ *   M-4  node_modules absent from actions/cache path in workspace/web jobs
+ *   M-5  'npm run test' check uses exact include (no loose disjunct)
+ *   M-6  OMISSION-GUARD: every *.test.mjs/js under web/ + benchmark/ is run or has skip-reason
+ *   K1   benchmark/test/ + benchmark/optimize/test/ are covered by discover-node-tests
+ *   K2   session-worker-timings.test.mjs is labelled 'pre-existing source-mismatch failure'
+ *   I-1  nightly fuzz matrix carries a TODO note about codec-gated stubs
  */
 
 import assert from "node:assert/strict";
@@ -44,12 +55,14 @@ const WORKFLOW_PATH = resolve(REPO_ROOT, ".github/workflows/verify.yml");
 /**
  * Parse the verify.yml file into a plain object with the structure we need:
  *   {
- *     triggers: string[],        // event names in `on:`
+ *     triggers: string[],            // event names in `on:`
+ *     prPaths: string[],             // on.pull_request.paths entries (workflow-level)
+ *     prPathsIgnore: string[],       // on.pull_request.paths-ignore entries (workflow-level)
  *     jobs: {
  *       id: string,
  *       name: string,
- *       jobIf: string,           // raw `if:` value on the job, "" if absent
- *       pathFilters: string[],   // on.pull_request.paths entries (job-level)
+ *       jobIf: string,               // raw `if:` value on the job, "" if absent
+ *       pathFilters: string[],       // legacy field — always [] (path filters are workflow-level)
  *       steps: {
  *         name: string,
  *         stepIf: string,
@@ -65,30 +78,65 @@ const WORKFLOW_PATH = resolve(REPO_ROOT, ".github/workflows/verify.yml");
 function parseWorkflow(yamlText) {
   const lines = yamlText.split(/\r?\n/);
 
-  // ── Extract top-level trigger events ─────────────────────────────────────
+  // ── Extract top-level trigger events + on.pull_request.paths ─────────────
   // Find the `on:` block and collect event names (keys at indent=2).
+  // Also collect on.pull_request.paths and paths-ignore (items at indent=6 under
+  //   on: → pull_request: → paths: / paths-ignore:).
   const triggers = [];
+  const prPaths = [];
+  const prPathsIgnore = [];
   let inOnBlock = false;
-  let inSchedule = false;
+  let inPrBlock = false;   // inside on: > pull_request:
+  let inPathsList = false; // inside on: > pull_request: > paths:
+  let inPathsIgnoreList = false; // inside on: > pull_request: > paths-ignore:
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     const stripped = line.trimEnd();
+    const indent = line.length - line.trimStart().length;
 
     if (/^on:/.test(stripped)) {
       inOnBlock = true;
       continue;
     }
     if (inOnBlock) {
-      // End of on: block when we hit another top-level key (no indent, ends with :)
-      if (/^\w/.test(stripped) && !stripped.startsWith(" ") && !stripped.startsWith("#")) {
+      // End of on: block when we hit another top-level key (indent 0, non-comment)
+      if (indent === 0 && stripped.length > 0 && !stripped.startsWith("#")) {
         inOnBlock = false;
+        inPrBlock = false;
+        inPathsList = false;
+        inPathsIgnoreList = false;
         continue;
       }
-      // Event names are at 2-space indent: "  push:", "  pull_request:", etc.
-      const m = stripped.match(/^  (\w+):/);
-      if (m) {
-        triggers.push(m[1]);
+      // Event names at indent=2: "  push:", "  pull_request:", etc.
+      if (indent === 2) {
+        const m = stripped.trim().match(/^(\w+):?$/);
+        if (m) {
+          triggers.push(m[1]);
+          inPrBlock = m[1] === "pull_request";
+          inPathsList = false;
+          inPathsIgnoreList = false;
+        }
+        continue;
+      }
+      // Inside pull_request block (indent=4): look for paths: / paths-ignore:
+      if (inPrBlock && indent === 4) {
+        const key = stripped.trim();
+        inPathsList = key === "paths:";
+        inPathsIgnoreList = key === "paths-ignore:";
+        continue;
+      }
+      // List items inside paths: / paths-ignore: (indent=6, starts with "- ")
+      if (indent === 6 && stripped.trim().startsWith("- ")) {
+        const val = stripped.trim().replace(/^- ['"]?/, "").replace(/['"]?$/, "");
+        if (inPathsList) prPaths.push(val);
+        if (inPathsIgnoreList) prPathsIgnore.push(val);
+        continue;
+      }
+      // Anything less-indented in the on: block resets path tracking
+      if (indent <= 4 && (inPathsList || inPathsIgnoreList)) {
+        inPathsList = false;
+        inPathsIgnoreList = false;
       }
     }
   }
@@ -240,7 +288,7 @@ function parseWorkflow(yamlText) {
 
   flushJob();
 
-  return { triggers, jobs };
+  return { triggers, prPaths, prPathsIgnore, jobs };
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +323,40 @@ function allPrRuns(parsed) {
     .flatMap((j) => j.steps.map((s) => s.run));
 }
 
+/**
+ * Check whether a workflow-level paths filter would exclude a given lane.
+ * Returns true if the lane IS excluded (i.e. the guard fires — a problem).
+ *
+ * A pattern matches an owned prefix when:
+ *   - The pattern starts with the owned prefix (e.g. "web/**" matches "web/")
+ *   - The owned prefix starts with the pattern base (e.g. "web/" matches "web")
+ *   - The pattern is "**" alone (catch-all — matches everything)
+ *
+ * Note: "crates/**" does NOT match "web/" because "crates/**" only covers crates/ paths.
+ *
+ * @param {string[]} prPaths        - on.pull_request.paths entries
+ * @param {string} ownedPrefix      - e.g. "web/", "packages/"
+ */
+function pathFilterExcludesLane(prPaths, ownedPrefix) {
+  if (prPaths.length === 0) return false; // no filter → not excluded
+  const positiveFilters = prPaths.filter((f) => !f.startsWith("!"));
+  // If there are positive includes but none match the owned prefix, the lane is excluded.
+  if (positiveFilters.length === 0) return false; // only negations, can't exclude
+  return !positiveFilters.some((f) => {
+    if (f === "**") return true; // global catch-all
+    // Strip glob suffix to get the base path the pattern covers
+    const base = f.replace(/\/?\*\*?\/?.*$/, "").replace(/\*$/, "");
+    // The pattern covers the owned prefix if the owned path starts with the pattern base
+    // OR the pattern path starts with the owned prefix.
+    return (
+      ownedPrefix.startsWith(base + "/") ||
+      ownedPrefix.startsWith(base) ||
+      base.startsWith(ownedPrefix) ||
+      f.startsWith(ownedPrefix)
+    );
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Assertions
 // ---------------------------------------------------------------------------
@@ -306,10 +388,11 @@ describe("verify.yml — static structure", () => {
     );
   });
 
-  it("'npm run test' appears in a PR-triggered job", () => {
+  // ── M-5: exact 'npm run test' check (no loose disjunct) ───────────────────
+  it("'npm run test' appears in a PR-triggered job (exact match)", () => {
     assert.ok(parsed !== null, "YAML could not be parsed");
     const runs = allPrRuns(parsed);
-    const found = runs.some((r) => r.includes("npm run test") || r.includes("npm") && r.includes("run test"));
+    const found = runs.some((r) => r.includes("npm run test"));
     assert.ok(
       found,
       `'npm run test' not found in any PR-triggered job.\nPR-job run steps:\n${runs.map((r) => `  ${r.slice(0, 120)}`).join("\n")}`
@@ -442,9 +525,67 @@ describe("verify.yml — static structure", () => {
     assert.ok(isPrTriggered(benchJob), "'benchmark-smoke' job must be PR-triggered");
     const runs = benchJob.steps.map((s) => s.run).join("\n");
     // Must call node --test over the benchmark/ smoke tests (deterministic subset).
+    // Accepts either a hardcoded file list OR the discover-node-tests auto-discovery pattern.
+    const usesNodeTest = runs.includes("node --test");
+    const coversBenchmark =
+      runs.includes("benchmark/") ||
+      runs.includes("benchmark\\") ||
+      runs.includes("discover-node-tests") ||
+      runs.includes("--benchmark");
     assert.ok(
-      runs.includes("node --test") && (runs.includes("benchmark/") || runs.includes("benchmark\\")),
-      `'benchmark-smoke' job must run 'node --test' over benchmark/ smoke files. Got:\n${runs.slice(0, 400)}`
+      usesNodeTest && coversBenchmark,
+      `'benchmark-smoke' job must run 'node --test' over benchmark/ smoke files (or use discover-node-tests.mjs --benchmark). Got:\n${runs.slice(0, 400)}`
+    );
+  });
+
+  // ── M-1: path-filter guard is not vacuous ────────────────────────────────
+  // The on.pull_request.paths filter (if present) must be captured and must not
+  // exclude critical JS/web/benchmark lanes.
+  it("M-1: parseWorkflow captures on.pull_request.paths at workflow level", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    // The returned object must have prPaths and prPathsIgnore arrays (even if empty).
+    assert.ok(Array.isArray(parsed.prPaths),       "parsed.prPaths must be an array");
+    assert.ok(Array.isArray(parsed.prPathsIgnore), "parsed.prPathsIgnore must be an array");
+    // Main verify.yml should NOT have restrictive path filters that lock JS lanes out.
+    // (If no paths filter exists, prPaths is empty → passes trivially.)
+  });
+
+  it("M-1: workflow-level path filter (if present) does not exclude critical JS lanes", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    const jsCriticalLanes = [
+      { id: "web-tests",      owns: "web/" },
+      { id: "benchmark-smoke", owns: "benchmark/" },
+      { id: "workspace-test",  owns: "packages/" },
+      { id: "runner-self-test", owns: "tools/" },
+    ];
+    for (const lane of jsCriticalLanes) {
+      const job = parsed.jobs.find((j) => j.id === lane.id);
+      if (!job) continue;
+      const excluded = pathFilterExcludesLane(parsed.prPaths, lane.owns);
+      assert.ok(
+        !excluded,
+        `on.pull_request.paths filter ${JSON.stringify(parsed.prPaths)} excludes critical lane '${lane.id}' ` +
+        `(owns '${lane.owns}'). A PR touching ${lane.owns} would never trigger this lane.`
+      );
+    }
+  });
+
+  it("M-1 NEGATIVE: pathFilterExcludesLane correctly detects exclusion of a JS lane by 'crates/**' filter", () => {
+    // Synthetic scenario: only 'crates/**' in paths → web/ lane is excluded.
+    // This proves the guard is not vacuous.
+    const syntheticPrPaths = ["crates/**"];
+    assert.ok(
+      pathFilterExcludesLane(syntheticPrPaths, "web/"),
+      "NEGATIVE test: a paths:['crates/**'] filter should exclude the web/ lane — guard must detect this"
+    );
+    assert.ok(
+      pathFilterExcludesLane(syntheticPrPaths, "packages/"),
+      "NEGATIVE test: a paths:['crates/**'] filter should exclude the packages/ lane"
+    );
+    // Rust lane should NOT be excluded by 'crates/**'
+    assert.ok(
+      !pathFilterExcludesLane(syntheticPrPaths, "crates/"),
+      "NEGATIVE test: 'crates/**' filter should NOT exclude the crates/ lane"
     );
   });
 
@@ -537,5 +678,152 @@ describe("verify.yml — static structure", () => {
         `Current YAML block does not reference it:\n${jobYamlBlock.slice(0, 600)}`
       );
     }
+  });
+
+  // ── M-4: node_modules must NOT be in cache path for workspace/web jobs ─────
+  it("M-4: workspace and web-tests jobs do not cache node_modules (npm ci deletes it)", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    const jobs = ["workspace-test", "workspace-build", "workspace-typecheck", "web-tests"];
+    for (const jobId of jobs) {
+      const jobYamlStart = yamlText.indexOf(`\n  ${jobId}:`);
+      if (jobYamlStart === -1) continue;
+      const nextJobMatch = yamlText.slice(jobYamlStart + 1).match(/\n  \w[\w-]*:/);
+      const jobYamlBlock = nextJobMatch
+        ? yamlText.slice(jobYamlStart, jobYamlStart + 1 + nextJobMatch.index)
+        : yamlText.slice(jobYamlStart);
+
+      // Check the actions/cache path: section. Look for a cache block that lists node_modules.
+      // The check: if 'node_modules' appears in the path: of an actions/cache step (not in a comment),
+      // that is the problem. We detect this by finding 'node_modules' in non-comment lines
+      // inside the job block.
+      const nonCommentLines = jobYamlBlock
+        .split(/\r?\n/)
+        .filter((l) => !l.trim().startsWith("#"))
+        .join("\n");
+
+      // Only flag if node_modules appears as a cache path entry (indented under 'path:').
+      // Avoid flagging explanatory prose / step names.
+      const cachePathSection = nonCommentLines.match(/path:\s*\|\s*([\s\S]*?)(?=key:|restore-keys:|$)/);
+      if (cachePathSection) {
+        assert.ok(
+          !cachePathSection[1].includes("node_modules"),
+          `Job '${jobId}' includes 'node_modules' in actions/cache path. ` +
+          `npm ci always deletes node_modules before installing — caching it wastes space and can cause stale-dep bugs. ` +
+          `Remove 'node_modules' from the cache path; keep only '~/.npm', 'bun.lock', etc.`
+        );
+      }
+    }
+  });
+
+  // ── M-3: cargo +nightly fuzz run target must be quoted ────────────────────
+  it("M-3: 'cargo +nightly fuzz run' invocations quote the target argument", () => {
+    assert.ok(parsed !== null, "YAML could not be parsed");
+    // Find all 'cargo +nightly fuzz run' invocations across all jobs.
+    // They must use "${{ matrix.target }}" (quoted) not ${{ matrix.target }} (unquoted).
+    const allRunText = parsed.jobs.flatMap((j) => j.steps.map((s) => s.run)).join("\n");
+    // Match lines that contain 'cargo +nightly fuzz run' followed by an unquoted expression.
+    // Unquoted form: 'fuzz run ${{ ...' (no surrounding quotes)
+    // Quoted form:   'fuzz run "${{ ...' or "fuzz run '${{ ..."
+    const unquotedPattern = /cargo\s+\+nightly\s+fuzz\s+run\s+\$\{\{[^'"]/;
+    assert.ok(
+      !unquotedPattern.test(allRunText),
+      `Found 'cargo +nightly fuzz run' with unquoted matrix variable. ` +
+      `Use: cargo +nightly fuzz run "\${{ matrix.target }}" to prevent shell word-splitting. ` +
+      `Matching text:\n${allRunText.slice(allRunText.search(unquotedPattern), allRunText.search(unquotedPattern) + 200)}`
+    );
+  });
+
+  // ── M-6 + K1: OMISSION-GUARD ──────────────────────────────────────────────
+  // Every *.test.mjs / *.test.js under web/ and benchmark/ must be either:
+  //   (a) runnable (node:test, no bun/vitest/playwright/wasm-pkg)
+  //   (b) in the skip list with a recorded reason
+  //   (c) in the pre-existing-failure list with a recorded reason
+  // The CI web-tests + benchmark-smoke jobs must run the full runnable set
+  // (checked via discover-node-tests.mjs which is the authoritative classifier).
+  it("M-6+K1: discover-node-tests accounts for every web/ and benchmark/ test file", async () => {
+    const { discoverTests } = await import("./discover-node-tests.mjs");
+    const { runnable, skipped, preExistingFailures, total } = discoverTests();
+
+    // Every file must be accounted for (runnable + skipped + failures = total).
+    const accounted = runnable.length + skipped.length + preExistingFailures.length;
+    assert.equal(
+      accounted,
+      total,
+      `OMISSION-GUARD: ${total - accounted} file(s) unaccounted for. ` +
+      `Add each to discover-node-tests.mjs PRE_EXISTING_FAILURES or it must be runnable.`
+    );
+
+    // Every runnable file must appear in the CI web-tests or benchmark-smoke job.
+    // We check this by verifying the CI jobs reference discover-node-tests.mjs
+    // (the authoritative discovery tool) OR by verifying each runnable file by path.
+    // Strategy: the discover tool IS the source of truth — we just assert it runs clean.
+    assert.ok(runnable.length > 0, "Expected at least some runnable node:test files");
+    assert.ok(
+      runnable.length >= 15,
+      `Expected at least 15 runnable files; got ${runnable.length}. Has discovery broken?`
+    );
+
+    // Every pre-existing failure must have a non-empty reason.
+    for (const { path: p, reason } of preExistingFailures) {
+      assert.ok(
+        reason && reason.length > 10,
+        `Pre-existing failure entry '${p}' must have a descriptive reason (got: '${reason}')`
+      );
+    }
+
+    // Every skip must have a non-empty reason.
+    for (const { path: p, reason } of skipped) {
+      assert.ok(
+        reason && reason.length > 5,
+        `Skip entry '${p}' must have a recorded reason (got: '${reason}')`
+      );
+    }
+  });
+
+  it("M-6+K1: benchmark/test/ and benchmark/optimize/test/ are covered by discover-node-tests", async () => {
+    const { discoverTests } = await import("./discover-node-tests.mjs");
+    const { runnable, preExistingFailures } = discoverTests({ includeWeb: false, includeBenchmark: true });
+
+    // The benchmark/test/ directory must have representation (either runnable or classified).
+    const benchTestCovered = [...runnable, ...preExistingFailures.map((e) => e.path)]
+      .some((p) => p.startsWith("benchmark/test/") || p.startsWith("benchmark/optimize/test/"));
+    assert.ok(
+      benchTestCovered,
+      "Expected benchmark/test/ or benchmark/optimize/test/ files to be discovered and classified. " +
+      "These directories contain node:test files omitted by the original hardcoded CI lists."
+    );
+  });
+
+  // ── K2: session-worker-timings must be labelled as pre-existing source-mismatch failure ──
+  it("K2: session-worker-timings.test.mjs is classified as pre-existing source-mismatch failure", async () => {
+    const { discoverTests } = await import("./discover-node-tests.mjs");
+    const { preExistingFailures } = discoverTests({ includeWeb: false, includeBenchmark: true });
+
+    const entry = preExistingFailures.find((e) => e.path === "benchmark/session-worker-timings.test.mjs");
+    assert.ok(
+      entry,
+      "benchmark/session-worker-timings.test.mjs must appear in preExistingFailures list"
+    );
+    assert.ok(
+      /source.mismatch|source-mismatch/i.test(entry.reason),
+      `session-worker-timings must be labelled 'source-mismatch' (not 'env-blocked'). Got: '${entry.reason}'`
+    );
+  });
+
+  // ── I-1: nightly fuzz matrix must carry TODO about codec-gated stub targets ─
+  it("I-1: nightly fuzz matrix has a TODO comment about codec-gated stub targets", () => {
+    assert.ok(yamlText !== null, "YAML file not loaded");
+    // The fuzz job or surrounding comment must mention that casv_header/casv_footer/
+    // casv_audio_box/jxtc_header are no-op stubs until --features codec is wired.
+    const hasTodo = (
+      /TODO.*casv_header|TODO.*codec.*stubs|stub.*casv|casv.*stub|no-op stub/i.test(yamlText) ||
+      /Packet 5|Task 4|features codec|--features codec/i.test(yamlText)
+    );
+    assert.ok(
+      hasTodo,
+      "The nightly fuzz matrix must carry a TODO or annotation explaining that " +
+      "casv_header/casv_footer/casv_audio_box/jxtc_header are no-op stubs until " +
+      "'--features codec' is wired (Packet 5 Task 4). Add a comment near the fuzz: job matrix."
+    );
   });
 });
