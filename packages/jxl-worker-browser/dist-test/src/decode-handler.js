@@ -82,7 +82,6 @@ export class DecodeHandler {
     opts;
     wasm;
     callbacks;
-    decoderPool;
     state = "created";
     // ChunkRing is the single source of truth for queue depth (.size) and bytes (.bytes).
     chunkQueue = new ChunkRing();
@@ -129,7 +128,6 @@ export class DecodeHandler {
         this.opts = opts;
         this.wasm = wasm;
         this.callbacks = callbacks;
-        this.decoderPool = callbacks.decoderPool;
         this._metricMsg.sessionId = this.sessionId;
         this._drainMsg.sessionId = this.sessionId;
         this.run().catch((err) => this.failSession("Internal", String(err)));
@@ -190,38 +188,24 @@ export class DecodeHandler {
     // Main decode loop
     // ---------------------------------------------------------------------------
     async run() {
-        // Acquire decoder from pool if available; otherwise create new
-        const decoder = this.decoderPool
-            ? this.decoderPool.acquire({
-                format: this.opts.format,
-                region: this.opts.region,
-                downsample: this.opts.downsample,
-                progressionTarget: this.opts.progressionTarget,
-                emitEveryPass: this.opts.emitEveryPass,
-                progressiveDetail: this.opts.progressiveDetail,
-                suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
-                preserveIcc: this.opts.preserveIcc,
-                preserveMetadata: this.opts.preserveMetadata,
-                targetWidth: this.opts.targetWidth,
-                targetHeight: this.opts.targetHeight,
-                fitMode: this.opts.fitMode,
-                onMetric: (name, value) => this.postMetric(name, value),
-            })
-            : this.wasm.createDecoder({
-                format: this.opts.format,
-                region: this.opts.region,
-                downsample: this.opts.downsample,
-                progressionTarget: this.opts.progressionTarget,
-                emitEveryPass: this.opts.emitEveryPass,
-                ...(this.opts.progressiveDetail !== null ? { progressiveDetail: this.opts.progressiveDetail } : {}),
-                suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
-                preserveIcc: this.opts.preserveIcc,
-                preserveMetadata: this.opts.preserveMetadata,
-                targetWidth: this.opts.targetWidth,
-                targetHeight: this.opts.targetHeight,
-                fitMode: this.opts.fitMode,
-                onMetric: (name, value) => this.postMetric(name, value),
-            });
+        // One libjxl decoder per session. Workers are stateless between sessions
+        // (see CLAUDE.md: caching decoder state across session lifetimes would break
+        // recycle()), and libjxl exposes no reset ABI — so there is no decoder pool.
+        const decoder = this.wasm.createDecoder({
+            format: this.opts.format,
+            region: this.opts.region,
+            downsample: this.opts.downsample,
+            progressionTarget: this.opts.progressionTarget,
+            emitEveryPass: this.opts.emitEveryPass,
+            ...(this.opts.progressiveDetail !== null ? { progressiveDetail: this.opts.progressiveDetail } : {}),
+            suppressDuplicateProgress: this.opts.suppressDuplicateProgress,
+            preserveIcc: this.opts.preserveIcc,
+            preserveMetadata: this.opts.preserveMetadata,
+            targetWidth: this.opts.targetWidth,
+            targetHeight: this.opts.targetHeight,
+            fitMode: this.opts.fitMode,
+            onMetric: (name, value) => this.postMetric(name, value),
+        });
         // Store decoder reference so terminal paths can actively dispose it.
         this.decoder = decoder;
         try {

@@ -1,16 +1,13 @@
 import type { JxlModule } from "./wasm-loader.js";
 import type { MsgDecodeStart } from "@casabio/jxl-core/protocol";
-import type { DecoderPool } from "./decoder-pool.js";
 interface DecodeHandlerCallbacks {
     onSessionEnd: (sessionId: string) => void;
-    decoderPool?: DecoderPool | undefined;
 }
 export declare class DecodeHandler {
     private readonly sessionId;
     private readonly opts;
     private readonly wasm;
     private readonly callbacks;
-    private readonly decoderPool;
     private state;
     private chunkQueue;
     private cancelled;

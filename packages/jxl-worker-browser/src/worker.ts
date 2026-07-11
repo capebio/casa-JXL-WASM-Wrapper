@@ -28,7 +28,6 @@ import type {
 import { DecodeHandler } from "./decode-handler.js";
 import { EncodeHandler } from "./encode-handler.js";
 import { loadWasmModule, detectTier, type JxlModule } from "./wasm-loader.js";
-import { DecoderPool } from "./decoder-pool.js";
 
 // ---------------------------------------------------------------------------
 // Queued-message types (messages arriving while a session start is in-flight)
@@ -72,7 +71,6 @@ let wasmModule: JxlModule | null = null;
 let wasmLoadPromise: Promise<JxlModule> | null = null;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
-let decoderPool: DecoderPool | null = null;
 
 // Cap per session to avoid unbounded cold-start buffering.
 const MAX_QUEUED_MESSAGES_PER_SESSION = 256;
@@ -103,10 +101,6 @@ async function getWasm(): Promise<JxlModule> {
       .then((m) => {
         clearTimeout(timeoutHandle);
         wasmModule = m;
-        // Initialize decoder pool on first WASM load
-        if (decoderPool === null) {
-          decoderPool = new DecoderPool(m);
-        }
         return m;
       })
       .catch((err: unknown) => {
@@ -412,7 +406,6 @@ async function handleDecodeStart(msg: MsgDecodeStart): Promise<void> {
       onSessionEnd: (sessionId) => {
         if (decodeSessions.get(sessionId) === handler) decodeSessions.delete(sessionId);
       },
-      decoderPool: decoderPool ?? undefined,
     });
     decodeSessions.set(msg.sessionId, handler);
     flushQueuedDecodeMessages(msg.sessionId, handler);
@@ -560,12 +553,6 @@ async function doShutdown(): Promise<void> {
   queuedDecodeBytes.clear();
   queuedEncodeBytes.clear();
   abortedStarts.clear();
-
-  // Dispose decoder pool
-  if (decoderPool !== null) {
-    await decoderPool.dispose();
-    decoderPool = null;
-  }
 
   wasmModule = null;
   wasmLoadPromise = null;
