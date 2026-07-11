@@ -365,17 +365,51 @@ test("F10 --verify-hash: corrupt level is overwritten on re-ingest with flag; wi
   let onDisk = await readFile(dest);
   expect(onDisk.length).toBe(4); // still corrupt
 
-  // Bump master mtime so the mtime-based uptodate skip in ingestImage does not short-circuit.
-  // This forces re-processing + applyIngestPlan + writeLevelFiles(verifyHash) which will detect
-  // hash mismatch on the corrupt level and rewrite it (F10).
-  await writeFile(master, await readFile(master));
-
+  // finding 66: the master content is unchanged, so fingerprint-aware freshness correctly reports the
+  // source as FRESH even after an mtime bump (rewriting identical bytes is a "touch", not an edit).
+  // To force re-processing + applyIngestPlan + writeLevelFiles(verifyHash) — which detects the hash
+  // mismatch on the corrupt level and rewrites it (F10) — use --force (the real "re-encode anyway" path).
   // with flag: overwrites
   const b3 = await makeBackends();
-  await ingestImage(master, b3, { outDir: out, verifyHash: true });
+  await ingestImage(master, b3, { outDir: out, verifyHash: true, force: true });
   onDisk = await readFile(dest);
   expect(onDisk.length).toBeGreaterThan(4);
   expect(contentHash16(onDisk)).toBe(full.contenthash);
+});
+
+test("finding 66: manifest records catalogId + fingerprint; skips unchanged, re-ingests replaced-bytes-with-preserved-mtime", { timeout: WASM_TIMEOUT }, async () => {
+  const { utimes } = await import("node:fs/promises");
+  const out = await tmpOut();
+  const master = join(out, "FRESH.orf");
+  await writeFile(master, new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]));
+
+  // First ingest writes a manifest carrying the persistent identity + freshness sample.
+  await ingestImage(master, await makeBackends(), { outDir: out });
+  const imageId = await imageIdForPath(master);
+  const manPath = join(out, "images", imageId, "manifest.json");
+  const man = parseManifest(await readFile(manPath)) as any;
+  expect(man.catalogId).toMatch(/^[0-9a-f]{16}$/);
+  expect(man.master.fingerprint).toBeTruthy();
+  expect(man.master.fingerprint.byteLength).toBe(8);
+  expect(man.master.fingerprint.quickHash).toHaveLength(16);
+  // catalogId (content-derived) is DISTINCT from imageId (path-derived) and from any level contenthash.
+  expect(man.catalogId).not.toBe(man.imageId);
+  for (const lv of man.levels) expect(lv.contenthash).not.toBe(man.catalogId);
+
+  // Unchanged content re-ingest → skipped (fingerprint fast path: size + quickHash match).
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("skipped");
+
+  // A pure mtime bump (touch) on identical content → still skipped (mtime alone never certifies).
+  const st = await stat(master);
+  await utimes(master, new Date(), new Date(st.mtimeMs + 5000));
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("skipped");
+
+  // Replace the bytes but RESTORE the original mtime: the classic trap. mtime+size unchanged, but the
+  // quickHash differs → the source reads STALE and is re-ingested (written), not skipped.
+  const before = await stat(master);
+  await writeFile(master, new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9])); // same length (8), different bytes
+  await utimes(master, new Date(before.mtimeMs), new Date(before.mtimeMs)); // preserve original mtime
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
 });
 
 test("low-no-retry-on-ebusy: EBUSY on rename is retried (succeeds on 2nd attempt)", async () => {
