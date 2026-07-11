@@ -1,11 +1,15 @@
+pub mod bm3d;
 pub mod calibrate;
+pub mod classical;
 pub mod dng_tags;
 pub mod estimate;
 pub mod policy;
 pub mod profiles;
 pub mod score;
 pub mod types;
+pub mod vst;
 
+pub use classical::denoise as classical_denoise;
 pub use dng_tags::RawNoiseMetadata;
 pub use estimate::{estimate_noise, iso_fallback_model, linear_to_srgb, resolve_noise_model, score_noise};
 pub use policy::decide;
