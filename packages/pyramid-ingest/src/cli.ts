@@ -325,9 +325,11 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     if (subcmd === "migrate" || parsed.migrate || parsed["migrate-layout"] || parsed["migrate-schema"]) {
       heldLock = await acquireWriteLock(parsed.out);
       const { migrateSchema, migrateLayout } = await import("./migrate.js");
+      const { CURRENT_MANIFEST_SCHEMA } = await import("./schema.js");
       let totalMigrated = 0, totalSkipped = 0, totalErrors = 0;
-      // M1 (or specified schema target)
-      const schemaTarget = parsed["migrate-schema"] ? (parseInt(parsed["migrate-schema"] as string, 10) as any) : 2;
+      // M1 (or specified schema target). Default target is the current schema so a plain
+      // `migrate` upgrades v1..v4 manifests all the way to v5 additively (Task 4).
+      const schemaTarget = parsed["migrate-schema"] ? (parseInt(parsed["migrate-schema"] as string, 10) as any) : CURRENT_MANIFEST_SCHEMA;
       const sRes = await migrateSchema(parsed.out, schemaTarget, { dryRun: !!parsed["dry-run"] });
       totalMigrated += sRes.migrated; totalSkipped += sRes.skipped; totalErrors += sRes.errors.length;
       // M2
