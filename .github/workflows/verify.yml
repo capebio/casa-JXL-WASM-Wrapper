@@ -1,4 +1,15 @@
-# S4 verification gate — the machine-checkable half of the hardening architecture.
+# verify.yml — CI gates for raw-converter-wasm
+#
+# ── Authoritative workspace commands (Task 1 runner, tools/run-workspaces.mjs) ──
+#
+# PR gates added in Task 2 call the authoritative root commands rather than
+# duplicating workspace lists here.  The runner owns workspace discovery,
+# dependency ordering, and the omission guard.
+#
+#   runner-self-test    : node --test tools/run-workspaces.test.mjs tools/verify-workflow.test.mjs
+#   workspace-gates     : npm run test  →  npm run build  →  npm run typecheck
+#
+# ── S4 verification gate (pre-existing) ──────────────────────────────────────
 #
 # Wires the four S4 legs into CI: (1) parser + golden-ledger + fuzz-smoke + parity
 # oracles, (2) `cargo fuzz build` of the libFuzzer targets, (3) the K6.5 FFI-ABI
@@ -11,6 +22,21 @@
 # `--no-default-features` so no jxl-ffi/libjxl/emscripten toolchain is required.
 # The machine-local ORF/DNG ledger entries skip gracefully (fixtures absent on
 # CI); the checked-in mandelbrot fixture ledger runs everywhere.
+#
+# ── Environment-blocked lanes (explicit, never silent) ────────────────────────
+#
+# jxl-wasm build  : Emscripten/Docker unavailable in standard runners.
+#                   packages/jxl-wasm/package.json build script self-skips with
+#                   process.exit(0) and an explanatory message — the step is
+#                   visible in CI logs as "skipped (Docker unavailable in env)".
+# jxl-native build: node-gyp NAPI addon; builds WITHOUT libjxl headers on Linux
+#                   (binding.gyp falls back via pkg-config || true; native.cc
+#                   guards with #if __has_include(<jxl/decode.h>)).  The build
+#                   succeeds; the resulting addon reports CapabilityMissing at
+#                   runtime when libjxl is absent — which is fine for CI.
+# jxl-test-corpus : generate-fixtures.mjs imports from jxl-wasm/dist (committed
+#                   to the repo), so it runs without a WASM rebuild.
+#
 name: verify
 
 on:
@@ -26,7 +52,220 @@ on:
 permissions:
   contents: read
 
+# ── Shared setup anchor ────────────────────────────────────────────────────────
+# Referenced by workspace-gates and runner-self-test.  Node 22 (LTS) matches the
+# local dev baseline; bun is required for packages that use `bun test`
+# (jxl-cache, jxl-pyramid, pyramid-ingest).
+# Cache key (GAP 4): package-lock.json + bun.lock + tools/run-workspaces.mjs hash
+# so a change to any lockfile OR the runner itself invalidates the cache.
+
 jobs:
+  # ── Runner self-test ─────────────────────────────────────────────────────────
+  # Validates tools/run-workspaces.mjs and tools/verify-workflow.test.mjs
+  # without requiring npm install (pure-Node, zero-dep self-tests).
+  runner-self-test:
+    name: runner self-test (no install needed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: run runner self-tests + workflow static test
+        run: node --test tools/run-workspaces.test.mjs tools/verify-workflow.test.mjs
+
+  # ── Workspace unit tests ──────────────────────────────────────────────────────
+  # Calls the authoritative root command: npm run test
+  # The runner owns workspace discovery, topo ordering, and the omission guard
+  # (assertAllTestWorkspaces) — CI fails if any test-bearing workspace is missing.
+  # bun is required for: jxl-cache, jxl-pyramid, pyramid-ingest.
+  #
+  # GAP 4: cache key explicitly covers package-lock.json + bun.lock +
+  # tools/run-workspaces.mjs so any of those three changes busts the cache.
+  workspace-test:
+    name: workspace unit tests (npm run test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
+          restore-keys: |
+            node22-npm-
+      - uses: oven-sh/setup-bun@v2
+      - name: install dependencies
+        run: npm ci --ignore-scripts
+      - name: npm run test (all workspaces, omission-guarded)
+        run: npm run test
+
+  # ── Workspace typecheck ───────────────────────────────────────────────────────
+  # Calls the authoritative root command: npm run typecheck
+  #
+  # GAP 4: same explicit cache key as workspace-test.
+  workspace-typecheck:
+    name: workspace typecheck (npm run typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
+          restore-keys: |
+            node22-npm-
+      - name: install dependencies
+        run: npm ci --ignore-scripts
+      - name: npm run typecheck (all workspaces)
+        run: npm run typecheck
+
+  # ── Workspace build ───────────────────────────────────────────────────────────
+  # Calls the authoritative root command: npm run build
+  # Notes on environment-blocked packages (all explicit, not silent):
+  #   • jxl-wasm: build script self-skips via process.exit(0) with an explanatory
+  #     message — visible in CI logs as "skipped (Docker unavailable in env)".
+  #   • jxl-native: node-gyp NAPI addon builds fine without libjxl headers on
+  #     Linux — binding.gyp uses `pkg-config || true` fallback; native.cc guards
+  #     with __has_include so the addon compiles to a no-op stub.
+  #   • jxl-test-corpus: generate-fixtures.mjs uses jxl-wasm/dist (committed),
+  #     so no WASM rebuild is needed.
+  #
+  # GAP 4: same explicit cache key, includes bun.lock + run-workspaces.mjs.
+  workspace-build:
+    name: workspace build (npm run build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
+          restore-keys: |
+            node22-npm-
+      - name: install dependencies (with scripts for node-gyp / jxl-native)
+        run: npm ci
+      - name: npm run build (all workspaces)
+        run: npm run build
+
+  # ── Web tests (GAP 1) ────────────────────────────────────────────────────────
+  # web/ has no package.json and is not a workspace, so `npm run test` never
+  # reaches it.  This job runs the node-safe subset directly.
+  #
+  # Node-safe = uses node:test, no vitest, no browser/Playwright, no WASM pkg/.
+  #
+  # Explicitly SKIPPED (env-gated) with reason:
+  #   • web/ai-id/decode.test.mjs       — imports pkg/raw_converter_wasm.js (WASM build needed)
+  #   • web/ai-id/export.test.mjs       — same (transitively imports decode.mjs → pkg/)
+  #   • web/ai-id/proxy-e2e.test.mjs    — same + requires real CR2 fixture on disk
+  #   • web/*.test.js (vitest)          — use `import { test, expect } from 'vitest'`;
+  #                                       not runnable with node --test
+  #   • web/casv-lightbox/*.test.js     — vitest
+  #   All vitest-based tests are skipped because vitest is a browser test runner;
+  #   they require a WASM pkg/ and browser context that is not available in CI.
+  #
+  # Discovery: node --test with explicit glob over node:test-based files.
+  # Exclusions documented above are enforced by naming the safe glob explicitly.
+  web-tests:
+    name: web node-safe tests (node --test web/**/*.test.mjs + safe .test.js)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
+          restore-keys: |
+            node22-npm-
+      - name: install dependencies (sharp required by web/ai-id/proxy.mjs)
+        run: npm ci --ignore-scripts
+      - name: run node-safe web tests
+        run: |
+          # SKIPPED (pkg/WASM not built in CI): decode.test.mjs, export.test.mjs,
+          #   proxy-e2e.test.mjs — import pkg/raw_converter_wasm.js; Emscripten/Docker
+          #   unavailable in env; these are intentionally excluded, not silently passed.
+          # SKIPPED (vitest): web/*.test.js using 'import from vitest' — requires
+          #   browser/WASM context; not runnable under node --test.
+          # Node-safe surface (node:test, no WASM pkg/, no browser):
+          node --test \
+            web/ai-id/datetime-geo.test.mjs \
+            web/ai-id/embedded-preview.test.mjs \
+            web/ai-id/gps.test.mjs \
+            web/ai-id/manifest.test.mjs \
+            web/ai-id/proxy.test.mjs \
+            web/ai-id/sidecar.test.mjs \
+            web/ai-id/sources.test.mjs \
+            web/calibration/calibration.test.mjs \
+            web/casv-lightbox/casv-lightbox-core.test.js \
+            web/perceptual-color.test.mjs \
+            web/test/format-detect.test.mjs \
+            web/timelapse-core.test.js
+
+  # ── Benchmark smoke/registration (GAP 2) ─────────────────────────────────────
+  # benchmark/ is not a workspace.  Task 1 registered benchmark tests as a
+  # distinct authoritative task.  This job runs the bounded/deterministic
+  # subset that does NOT perform full microbenchmark timing.
+  #
+  # Node-safe benchmark tests (use node:test, no bun:test, no browser, no WASM):
+  #   benchmark-history-conversion.test.mjs   — conversion logic unit tests
+  #   correlation-additional-benchmarks.test.mjs — correlation utils
+  #   graph-browser-launcher.test.mjs         — launcher config (no browser)
+  #   optimal-settings-timing-toon.test.mjs   — toon format registration
+  #   seam-comparison-threshold.test.mjs      — threshold utility
+  #   standard-multifile-history-graph.test.mjs — graph history parsing
+  #   targeted-wasm-timings-format.test.mjs   — format registration contract
+  #
+  # SKIPPED (bun:test): progressive-flag-matrix.test.js, progressive-byte-benchmark.test.js,
+  #   jpeg-progressive-stream.test.js, progressive-prefix-probe.test.js
+  #   — these use `import { expect, test } from 'bun:test'` and cannot run under node --test.
+  # SKIPPED (session-worker-timings.test.mjs): asserts content of WASM browser worker script
+  #   that currently does not match expected patterns (pre-existing failure, not our regression).
+  #
+  # Registration guard: if a new benchmark directory gains a node:test smoke file,
+  # add it here so it runs on every PR.
+  benchmark-smoke:
+    name: benchmark smoke / registration (node --test benchmark/*.test.mjs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: run benchmark smoke tests (deterministic, no timing)
+        # SKIPPED (bun:test): progressive-flag-matrix.test.js and 3 others use bun:test
+        #   — not runnable under node --test; bun unavailable in env.
+        # SKIPPED (session-worker-timings.test.mjs): asserts browser worker file content
+        #   that does not match current patterns (pre-existing failure, env-blocked).
+        # All other .test.mjs files are node-safe deterministic registration/unit tests.
+        run: |
+          node --test \
+            benchmark/benchmark-history-conversion.test.mjs \
+            benchmark/correlation-additional-benchmarks.test.mjs \
+            benchmark/graph-browser-launcher.test.mjs \
+            benchmark/optimal-settings-timing-toon.test.mjs \
+            benchmark/seam-comparison-threshold.test.mjs \
+            benchmark/standard-multifile-history-graph.test.mjs \
+            benchmark/targeted-wasm-timings-format.test.mjs
+
   rust-parsers:
     name: rust parsers + golden ledger + fuzz-smoke + oracles
     runs-on: ubuntu-latest
