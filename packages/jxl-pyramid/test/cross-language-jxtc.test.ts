@@ -7,12 +7,12 @@
 // offsets that land inside the header/index or whose checked `offset + length`
 // runs past EOF.
 //
-// EXPECTED INITIAL STATE: the current TypeScript reader in tiling.ts treats the
-// stored offset as RELATIVE to the end of the header+index table
+// HISTORY: Task 1 pinned this as RED. The TypeScript reader in tiling.ts used to
+// treat the stored offset as RELATIVE to the end of the header+index table
 // (`dataBase = 32 + numTiles*8; container.subarray(dataBase + off, ...)`), which
-// double-adds the base and seeks past the fixture's tile payload. The absolute
-// contract assertions below therefore FAIL until Task 3 removes `dataBase + off`.
-// That is the point of Task 1: pin intent, not fix the reader.
+// double-added the base and seeked past the fixture's tile payload. Task 3 removed
+// the `dataBase + off` rebasing so `JxtcTileIndex.offsets` are absolute and extract
+// uses overflow-safe checked bounds — these assertions are now GREEN.
 
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -106,5 +106,77 @@ test("checked offset + length beyond EOF is rejected", () => {
   const bytes = readFixture("jxtc-overflow.bin");
   const h = parseJxtcHeader(bytes);
   // Tile 1 (x in [512,1024)) has an overflowing offset+length.
+  expect(() => extractTileBitstream(bytes, { x: 512, y: 0, w: 512, h: 512 }, h)).toThrow();
+});
+
+// ── Cross-language absolute-offset golden (Task 3) ───────────────────────────
+//
+// The SAME on-disk fixture bytes are the shared contract for THREE readers:
+//   - C++    DecodeRgba8TileContainerRegion (bridge.cpp:1940-1988)
+//   - TS     extractTileBitstream           (tiling.ts)
+//   - Rust   jxtc_tile_stream               (jxl_casadecoder.rs)
+// Every reader treats each index offset as ABSOLUTE from byte 0, and rejects
+// offsets inside the header/index and (overflow-safely) offset+length past EOF.
+//
+// The two writers produce byte-identical layout:
+//   C++  bridge.cpp:1925  cursor = header_bytes + index_bytes; index[i]=cursor; cursor+=len
+//   Rust build_jxtc       payload_start = HEADER + tiles*ENTRY;  off = cursor; cursor += len
+// so this single fixture stands in for a C++-produced AND a Rust-produced file.
+// The Rust reader is exercised against these identical bytes in
+// crates/raw-pipeline/src/jxl_casadecoder.rs (test module: cross_language_*).
+//
+// OVERFLOW-SAFE GUARD (carry-forward from Task-1 review): the upper-bound check
+// must never add `offset + length` in a fixed-width type, because on wasm32
+// `size_t` is 32-bit and 0xFFFFFFF0 + 24 WRAPS to 0x8 (< input_size) — sneaking a
+// malformed tile past the guard. After the lower-bound check (offset >= indexEnd,
+// which guarantees offset <= input_size once offset is in range), the safe form is:
+//     length > input_size - offset      // no addition that can wrap
+// C++  : if (offset < indexEnd || length > input_size - offset)   → reject
+// TS   : if (offset < indexEnd || length > byteLength - offset)   → reject  (JS numbers don't wrap, but we mirror the shape)
+// Rust : off.checked_add(len) ... end > container.len()           → checked_add can't wrap
+test("the fixture layout matches BOTH the C++ and Rust writer formulas (absolute)", () => {
+  const bytes = readFixture("jxtc-v1.bin");
+  const h = parseJxtcHeader(bytes);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const tileCount = h.tilesX * h.tilesY;
+  const payloadStart = HEADER_BYTES + tileCount * INDEX_ENTRY_BYTES;
+  // Walk the index exactly as each writer built it: absolute cursor from payloadStart.
+  let cursor = payloadStart;
+  for (let i = 0; i < tileCount; i++) {
+    const off = view.getUint32(HEADER_BYTES + i * INDEX_ENTRY_BYTES, true);
+    const len = view.getUint32(HEADER_BYTES + i * INDEX_ENTRY_BYTES + 4, true);
+    expect(off).toBe(cursor); // ABSOLUTE, not relative to payloadStart
+    cursor += len;
+  }
+  expect(cursor).toBe(bytes.byteLength); // no trailing/short bytes
+});
+
+test("TS reader extracts byte-identical absolute payloads for every tile", () => {
+  // Golden bytes for the shared fixture: filler is (tileIndex+1) repeated.
+  const bytes = readFixture("jxtc-v1.bin");
+  const h = parseJxtcHeader(bytes);
+  const idx = getOrParseJxtcTileIndex(bytes, h);
+  const tileCount = h.tilesX * h.tilesY;
+  for (let i = 0; i < tileCount; i++) {
+    const off = idx.offsets[i]!; // absolute
+    const len = idx.lengths[i]!;
+    const payload = bytes.subarray(off, off + len);
+    // Every byte equals (i+1) — the deterministic filler in generate-fixtures.mjs.
+    expect([...new Set(payload)]).toEqual([i + 1]);
+    expect(payload.length).toBe(i === 0 ? 16 : 24);
+  }
+});
+
+test("overflow fixture: offset+length is caught by the overflow-SAFE upper bound", () => {
+  // jxtc-overflow.bin sets tile 1 offset = 0xFFFFFFF0, length = 24.
+  // A naive `offset + length > byteLength` in 32-bit arithmetic WRAPS
+  // (0xFFFFFFF0 + 24 = 0x8) and passes — the bug. The safe check
+  // `length > byteLength - offset` rejects it (offset itself already exceeds EOF).
+  const bytes = readFixture("jxtc-overflow.bin");
+  const h = parseJxtcHeader(bytes);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const off = view.getUint32(HEADER_BYTES + INDEX_ENTRY_BYTES, true); // tile 1 offset
+  expect(off).toBe(0xfffffff0);
+  // The reader must throw (does not silently wrap into a valid-looking range).
   expect(() => extractTileBitstream(bytes, { x: 512, y: 0, w: 512, h: 512 }, h)).toThrow();
 });

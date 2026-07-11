@@ -117,7 +117,9 @@ function createSyntheticJxtcContainer(w: number, h: number, tileSize: number, ti
   dv.setUint32(24, tilesY, true);
   dv.setUint32(28, 0, true);
   for (let i = 0; i < numTiles; i++) {
-    dv.setUint32(32 + i * 8, i * tileByteLength, true);
+    // JXTC invariant (finding 60): index offsets are ABSOLUTE from byte 0, so the
+    // first tile starts at dataBase (= 32 + numTiles*8), not at 0.
+    dv.setUint32(32 + i * 8, dataBase + i * tileByteLength, true);
     dv.setUint32(32 + i * 8 + 4, tileByteLength, true);
     out.fill((i + 1) * 9, dataBase + i * tileByteLength, dataBase + (i + 1) * tileByteLength);
   }
@@ -313,25 +315,25 @@ test("extractTileBitstream roundtrips index for interior tile (F1 support)", () 
   const dataB = 32 + indexB;
   const full = new Uint8Array(32 + indexB + 1000);
   full.set(header, 0);
-  // index: tile0 at off 0 len 100, tile1 at 100 len 100, ...
+  // index: ABSOLUTE offsets (finding 60) — tile i starts at dataB + i*100, len 100.
   const idv = new DataView(full.buffer);
   for (let i = 0; i < numTiles; i++) {
-    idv.setUint32(32 + i*8, i * 100, true);
+    idv.setUint32(32 + i*8, dataB + i * 100, true);
     idv.setUint32(32 + i*8 + 4, 100, true);
   }
-  // fake data bytes: write distinct marker at each tile's data start (the off value & 0xff for simplicity)
+  // fake data bytes: full[dataB + k] = k & 0xff, so tile i's first payload byte = (i*100) & 0xff.
   for (let i = 0; i < 1000; i++) full[dataB + i] = i & 0xff;
 
   const h: any = { tileSize: TS, tilesX, tilesY, imageW: W, imageH: H, bitsPerSample: 8, hasAlpha: false, version: 1 };
   const t0 = { x: 0, y: 0, w: 128, h: 128 };
   const b0 = extractTileBitstream(full, t0, h);
   expect(b0.length).toBe(100);
-  expect(b0[0]).toBe(0);
+  expect(b0[0]).toBe(0); // tile 0 payload starts at dataB+0 → byte value 0
 
   const t3 = { x: 128, y: 128, w: 128, h: 128 };
   const b3 = extractTileBitstream(full, t3, h);
   expect(b3.length).toBe(100);
-  // data loc for off=300 gets byte value 300&0xff written by the fill loop; extractor must land on it
+  // tile 3 payload starts at dataB+300 → byte value 300 & 0xff = 44
   expect(b3[0]).toBe(44);
 });
 
