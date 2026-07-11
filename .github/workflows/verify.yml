@@ -1,4 +1,15 @@
-# S4 verification gate — the machine-checkable half of the hardening architecture.
+# verify.yml — CI gates for raw-converter-wasm
+#
+# ── Authoritative workspace commands (Task 1 runner, tools/run-workspaces.mjs) ──
+#
+# PR gates added in Task 2 call the authoritative root commands rather than
+# duplicating workspace lists here.  The runner owns workspace discovery,
+# dependency ordering, and the omission guard.
+#
+#   runner-self-test    : node --test tools/run-workspaces.test.mjs tools/verify-workflow.test.mjs
+#   workspace-gates     : npm run test  →  npm run build  →  npm run typecheck
+#
+# ── S4 verification gate (pre-existing) ──────────────────────────────────────
 #
 # Wires the four S4 legs into CI: (1) parser + golden-ledger + fuzz-smoke + parity
 # oracles, (2) `cargo fuzz build` of the libFuzzer targets, (3) the K6.5 FFI-ABI
@@ -11,6 +22,21 @@
 # `--no-default-features` so no jxl-ffi/libjxl/emscripten toolchain is required.
 # The machine-local ORF/DNG ledger entries skip gracefully (fixtures absent on
 # CI); the checked-in mandelbrot fixture ledger runs everywhere.
+#
+# ── Environment-blocked lanes (explicit, never silent) ────────────────────────
+#
+# jxl-wasm build  : Emscripten/Docker unavailable in standard runners.
+#                   packages/jxl-wasm/package.json build script self-skips with
+#                   process.exit(0) and an explanatory message — the step is
+#                   visible in CI logs as "skipped (Docker unavailable in env)".
+# jxl-native build: node-gyp NAPI addon; builds WITHOUT libjxl headers on Linux
+#                   (binding.gyp falls back via pkg-config || true; native.cc
+#                   guards with #if __has_include(<jxl/decode.h>)).  The build
+#                   succeeds; the resulting addon reports CapabilityMissing at
+#                   runtime when libjxl is absent — which is fine for CI.
+# jxl-test-corpus : generate-fixtures.mjs imports from jxl-wasm/dist (committed
+#                   to the repo), so it runs without a WASM rebuild.
+#
 name: verify
 
 on:
@@ -26,7 +52,88 @@ on:
 permissions:
   contents: read
 
+# ── Shared setup anchor ────────────────────────────────────────────────────────
+# Referenced by workspace-gates and runner-self-test.  Node 22 (LTS) matches the
+# local dev baseline; bun is required for packages that use `bun test`
+# (jxl-cache, jxl-pyramid, pyramid-ingest).
+# Cache key: lockfile + bun.lock + tools build-script hash so a change to the
+# runner itself invalidates the cache.
+
 jobs:
+  # ── Runner self-test ─────────────────────────────────────────────────────────
+  # Validates tools/run-workspaces.mjs and tools/verify-workflow.test.mjs
+  # without requiring npm install (pure-Node, zero-dep self-tests).
+  runner-self-test:
+    name: runner self-test (no install needed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: run runner self-tests + workflow static test
+        run: node --test tools/run-workspaces.test.mjs tools/verify-workflow.test.mjs
+
+  # ── Workspace unit tests ──────────────────────────────────────────────────────
+  # Calls the authoritative root command: npm run test
+  # The runner owns workspace discovery, topo ordering, and the omission guard
+  # (assertAllTestWorkspaces) — CI fails if any test-bearing workspace is missing.
+  # bun is required for: jxl-cache, jxl-pyramid, pyramid-ingest.
+  workspace-test:
+    name: workspace unit tests (npm run test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - uses: oven-sh/setup-bun@v2
+      - name: install dependencies
+        run: npm ci --ignore-scripts
+      - name: npm run test (all workspaces, omission-guarded)
+        run: npm run test
+
+  # ── Workspace typecheck ───────────────────────────────────────────────────────
+  # Calls the authoritative root command: npm run typecheck
+  workspace-typecheck:
+    name: workspace typecheck (npm run typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: install dependencies
+        run: npm ci --ignore-scripts
+      - name: npm run typecheck (all workspaces)
+        run: npm run typecheck
+
+  # ── Workspace build ───────────────────────────────────────────────────────────
+  # Calls the authoritative root command: npm run build
+  # Notes on environment-blocked packages (all explicit, not silent):
+  #   • jxl-wasm: build script self-skips via process.exit(0) with an explanatory
+  #     message — visible in CI logs as "skipped (Docker unavailable in env)".
+  #   • jxl-native: node-gyp NAPI addon builds fine without libjxl headers on
+  #     Linux — binding.gyp uses `pkg-config || true` fallback; native.cc guards
+  #     with __has_include so the addon compiles to a no-op stub.
+  #   • jxl-test-corpus: generate-fixtures.mjs uses jxl-wasm/dist (committed),
+  #     so no WASM rebuild is needed.
+  workspace-build:
+    name: workspace build (npm run build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - name: install dependencies (with scripts for node-gyp / jxl-native)
+        run: npm ci
+      - name: npm run build (all workspaces)
+        run: npm run build
+
   rust-parsers:
     name: rust parsers + golden ledger + fuzz-smoke + oracles
     runs-on: ubuntu-latest
