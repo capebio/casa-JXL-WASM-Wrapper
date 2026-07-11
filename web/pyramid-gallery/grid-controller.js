@@ -55,7 +55,10 @@ export function createGridController({
       job = { shared, joiners: 0, promise: null };
       job.promise = (async () => {
         if (!store) throw new Error('grid-controller requires imageStore (or cache+galleryBase)');
-        const bytes = await store.getLevelBytes(level.contenthash);
+        // Pass the level's declared byte size so the trusted boundary caps the fetch precisely
+        // (finding 73). `level.bytes` comes from the validated manifest; undefined for a bare l0
+        // seed falls back to the store's generous ceiling.
+        const bytes = await store.getLevelBytes(level.contenthash, { expectedBytes: level.bytes });
         const isTiled = level.tiled === true;
         return decodePyramidLevel(ctx, bytes, {
           contenthash: level.contenthash,

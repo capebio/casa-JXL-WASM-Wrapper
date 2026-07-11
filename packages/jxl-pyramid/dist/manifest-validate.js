@@ -295,8 +295,19 @@ export function parsePyramidManifest(json) {
     const width = requireNumber(o["width"], "manifest.width");
     const height = requireNumber(o["height"], "manifest.height");
     const aspect = requireNumber(o["aspect"], "manifest.aspect");
+    // finding 73: the reader is a trust boundary for untrusted network manifests. Bound the top-level
+    // dimensions/aspect (requireNumber already rejects NaN/Infinity) so a hostile manifest cannot drive
+    // downstream allocation/tiling/aspect math off a cliff. Matches the per-level w/h caps below.
+    if (width <= 0)
+        fail("manifest.width", `width must be positive, got ${width}`);
+    if (width > MAX_DIMENSION)
+        fail("manifest.width", `width exceeds maximum ${MAX_DIMENSION}, got ${width}`);
     if (height <= 0)
         fail("manifest.height", `height must be positive, got ${height}`);
+    if (height > MAX_DIMENSION)
+        fail("manifest.height", `height exceeds maximum ${MAX_DIMENSION}, got ${height}`);
+    if (!(aspect > 0))
+        fail("manifest.aspect", `aspect must be positive, got ${aspect}`);
     if (Math.abs(aspect - width / height) > 1e-3) {
         fail("manifest.aspect", `aspect ${aspect} inconsistent with width/height ratio ${width}/${height} = ${(width / height).toFixed(6)}`);
     }
@@ -378,6 +389,11 @@ function validateGalleryIndexEntry(v, path) {
     const o = requireObject(v, path);
     const imageId = requireString(o["imageId"], `${path}.imageId`);
     const aspect = requireNumber(o["aspect"], `${path}.aspect`);
+    // finding 73: index entries also cross the trust boundary — a non-finite/non-positive aspect drives
+    // the gallery's CSS layout (--aspect) into NaN/negative territory. requireNumber caught NaN/Infinity;
+    // reject non-positive here too.
+    if (!(aspect > 0))
+        fail(`${path}.aspect`, `aspect must be positive, got ${aspect}`);
     const l0 = validateLevelZeroSeed(o["l0"], `${path}.l0`);
     const result = { imageId, aspect, l0 };
     if (o["thumbhash"] !== undefined)

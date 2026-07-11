@@ -4,6 +4,14 @@ import { APPROVED_LIGHTBOX_PRESETS, ADJUSTMENT_PARAMS, createPyramidRuntime } fr
 import { createGridController } from './grid-controller.js';
 import { createPyramidLightbox } from '../lightbox/pyramid-lightbox.js';
 import { createImageStore } from './image-store.js'; // S1 wired S2/S3
+// finding 73: the gallery index is untrusted network input too. Validate it through the SAME shared
+// schema parser the manifest uses (no divergent inline validator), and fetch it through the trusted
+// boundary so a traversal/absolute/redirected/oversized index cannot flow into the grid.
+import { parseGalleryIndex } from '../../packages/jxl-pyramid/dist/manifest-validate.js';
+import { fetchVerifiedAsset } from './trusted-fetch.js';
+
+// A gallery index.json is a flat list of image seeds; even a large gallery page is well under this.
+const INDEX_MAX_BYTES = 8 * 1024 * 1024; // 8 MiB ceiling (DoS guard on the index body)
 
 // Packet 2, Task 1 (findings 74, 77, 78): this modular gallery is the CANONICAL engine of
 // record. It constructs exactly ONE long-lived decode runtime at bootstrap and threads it
@@ -39,24 +47,6 @@ const resetBtn = document.getElementById('reset-adjust');
 const params = new URLSearchParams(location.search);
 if (params.get('gallery')) urlInput.value = params.get('gallery');
 
-/**
- * Lightweight zero-dep index.json validator. Mirrors image-store validateManifest:
- * throws on structural violation so bad/undefined l0/contenthash cannot flow into decode.
- * @param {any} idx
- */
-function validateIndex(idx) {
-  if (!idx || typeof idx !== 'object') throw new Error('index must be object');
-  if (!Array.isArray(idx.images)) throw new Error('index.images must be array');
-  for (const entry of idx.images) {
-    if (!entry || typeof entry !== 'object') throw new Error('index entry must be object');
-    if (typeof entry.imageId !== 'string' || entry.imageId.length === 0) throw new Error('index entry imageId required');
-    if (typeof entry.aspect !== 'number' || !(entry.aspect > 0)) throw new Error('index entry aspect must be positive number');
-    const l0 = entry.l0;
-    if (!l0 || typeof l0 !== 'object') throw new Error('index entry l0 required');
-    if (typeof l0.contenthash !== 'string' || l0.contenthash.length === 0) throw new Error('index entry l0 contenthash required');
-    if (typeof l0.w !== 'number' || typeof l0.h !== 'number' || l0.w <= 0 || l0.h <= 0) throw new Error('index entry l0 w/h must be positive');
-  }
-}
 
 const ctx = createBrowserContext();
 const cache = new JxlCacheBrowser({ memoryLimit: 128 * 1024 * 1024, persistentLimit: 512 * 1024 * 1024, persistent: true });
@@ -91,10 +81,16 @@ function buildSliders(lb) {
 async function loadGallery(baseUrl) {
   const galleryBase = new URL(baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
   statusEl.textContent = 'Loading index…';
-  const indexRes = await fetch(new URL('index.json', galleryBase));
-  if (!indexRes.ok) throw new Error(`index.json ${indexRes.status}`);
-  const index = await indexRes.json();
-  validateIndex(index);
+  // Fetch index.json through the trusted boundary: `galleryBase` is the user-chosen trusted root, so
+  // the index (and everything under it) must stay same-origin + root-contained, byte-capped, and
+  // redirect-checked. Then validate through the SAME shared schema parser the manifest uses.
+  const indexBuf = await fetchVerifiedAsset({
+    root: galleryBase,
+    relativePath: 'index.json',
+    expectedBytes: INDEX_MAX_BYTES,
+    exactBytes: false,
+  });
+  const index = parseGalleryIndex(JSON.parse(new TextDecoder().decode(new Uint8Array(indexBuf))));
 
   gridEl.replaceChildren();
   for (const entry of index.images) {

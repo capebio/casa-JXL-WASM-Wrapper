@@ -9,9 +9,20 @@ const lightboxJs = readFileSync(new URL('../lightbox/pyramid-lightbox.js', impor
 const storeJs = readFileSync(new URL('./image-store.js', import.meta.url), 'utf8');
 
 test('gallery fetches index.json before level bytes and lays out by aspect', () => {
-  expect(galleryJs).toContain("fetch(new URL('index.json', galleryBase))");
+  // The index is fetched through the trusted boundary (Task 8) with galleryBase as the trusted root.
+  expect(galleryJs).toContain('fetchVerifiedAsset');
+  expect(galleryJs).toContain("relativePath: 'index.json'");
   expect(galleryJs).toContain('--aspect');
   expect(html).toContain('data-pyramid-grid');
+});
+
+test('gallery validates the index through the shared schema parser and the trusted fetch boundary (finding 73)', () => {
+  // No divergent inline validator: the index flows through the SAME reader the manifest uses.
+  expect(galleryJs).toContain('parseGalleryIndex');
+  expect(galleryJs).not.toContain('function validateIndex');
+  // index + manifest + level fetches all route through fetchVerifiedAsset.
+  expect(galleryJs).toContain('fetchVerifiedAsset');
+  expect(storeJs).toContain('fetchVerifiedAsset');
 });
 
 test('grid uses scheduler one-shot decode with contenthash sourceKey', () => {
@@ -61,8 +72,9 @@ test('S1->S3->S2 image-store handoff: store centralizes manifest/level fetch; gr
   expect(lightboxJs).toContain('imageStore');
   expect(lightboxJs).toContain('getManifest');
   expect(lightboxJs).toContain('getLevelBytes');
-  // index fetch stays in gallery root (per design); level/manifest now via store
-  expect(galleryJs).toContain("fetch(new URL('index.json', galleryBase))");
+  // index fetch stays in gallery root (per design); level/manifest now via store. Task 8 routes the
+  // index through the trusted boundary while the fetch still originates in the gallery root.
+  expect(galleryJs).toContain("relativePath: 'index.json'");
 });
 
 test('image-store consumes the shared jxl-pyramid validator, not a schema-1-only duplicate (finding 72)', () => {
@@ -92,9 +104,24 @@ test('image-store validates a real schema-5 manifest via the shared reader', asy
   };
   const fakeCache = { async get() { return null; }, set() {} };
   const origFetch = globalThis.fetch;
-  globalThis.fetch = async () => ({ ok: true, status: 200, async json() { return v5; } });
+  // The manifest fetch now flows through the trusted boundary (Task 8): the mock must present a
+  // same-origin final URL and a streamable body, not just a `.json()` accessor.
+  const gallery = 'https://example.test/gallery/';
+  const bytes = new TextEncoder().encode(JSON.stringify(v5));
+  globalThis.fetch = async (url) => {
+    let sent = false;
+    return {
+      ok: true, status: 200, url: `${gallery}images/deadbeefcafef00d/manifest.json`, redirected: false,
+      headers: { get: (k) => (String(k).toLowerCase() === 'content-length' ? String(bytes.length) : null) },
+      body: { getReader() { return {
+        async read() { if (sent) return { done: true }; sent = true; return { done: false, value: bytes }; },
+        cancel() {}, releaseLock() {},
+      }; } },
+      async arrayBuffer() { return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength); },
+    };
+  };
   try {
-    const store = createImageStore({ cache: fakeCache, galleryBase: 'https://example.test/gallery/' });
+    const store = createImageStore({ cache: fakeCache, galleryBase: gallery });
     const m = await store.getManifest('deadbeefcafef00d');
     expect(m.schema).toBe(5);
     expect(m.orientation).toEqual({ exif: 6, pixels: 'baked-upright' });
