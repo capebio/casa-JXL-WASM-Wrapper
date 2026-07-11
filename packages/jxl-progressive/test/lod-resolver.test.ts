@@ -41,7 +41,8 @@ const pyramid: PyramidSource = {
   ],
 };
 
-// 2×2 tile grid, tileSize 4, 8×8 image. dataBase=100.
+// 2×2 tile grid, tileSize 4, 8×8 image. Offsets are ABSOLUTE from byte 0
+// (finding 60): the four tiles start at bytes 100, 110, 130, 145.
 const jxtc: JxtcGrid = {
   source: "tiles.jxtc",
   imageW: 8,
@@ -50,9 +51,8 @@ const jxtc: JxtcGrid = {
   tilesX: 2,
   tilesY: 2,
   index: {
-    offsets: [0, 10, 30, 45],
+    offsets: [100, 110, 130, 145],
     lengths: [10, 20, 15, 25],
-    dataBase: 100,
   },
 };
 
@@ -256,7 +256,8 @@ describe("adapters", () => {
   it("fromJxtcContainer resolves a region to tile byte ranges", () => {
     const asset = fromJxtcContainer(
       { imageW: 8, imageH: 8, tileSize: 4, tilesX: 2, tilesY: 2 },
-      { offsets: [0, 10, 30, 45], lengths: [10, 20, 15, 25], dataBase: 100 },
+      // ABSOLUTE offsets (finding 60): tiles start at 100, 110, 130, 145.
+      { offsets: [100, 110, 130, 145], lengths: [10, 20, 15, 25] },
       "tiles.jxtc",
     );
     assert.deepEqual(resolveLod(asset, { region: { x: 4, y: 4, w: 4, h: 4 } }).ranges, [{ start: 145, end: 170 }]);

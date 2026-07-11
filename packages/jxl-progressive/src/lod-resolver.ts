@@ -104,8 +104,12 @@ export interface JxtcGrid {
   tileSize: number;
   tilesX: number;
   tilesY: number;
-  /** Tile offsets are RELATIVE to `dataBase` (as produced by getOrParseJxtcTileIndex). */
-  index: { offsets: ArrayLike<number>; lengths: ArrayLike<number>; dataBase: number };
+  /**
+   * Tile offsets are ABSOLUTE byte offsets from byte 0 of the JXTC file, exactly as
+   * produced by getOrParseJxtcTileIndex (JXTC absolute-offset contract, finding 60).
+   * No `dataBase` rebasing — the stored value is already file-relative.
+   */
+  index: { offsets: ArrayLike<number>; lengths: ArrayLike<number> };
 }
 
 /** What one stored asset supports. Any combination of the three mechanisms may be present. */
@@ -158,9 +162,8 @@ function resolveRegionJxtc(grid: JxtcGrid, region: NonNullable<LodRequest["regio
     for (let tx = txMin; tx <= txMax; tx++) {
       if (tx < 0 || ty < 0 || tx >= tilesX || ty >= tilesY) continue;
       const tileIdx = ty * tilesX + tx;
-      const off = index.offsets[tileIdx]!;
+      const start = index.offsets[tileIdx]!; // ABSOLUTE offset from byte 0 — no rebasing.
       const len = index.lengths[tileIdx]!;
-      const start = index.dataBase + off;
       ranges.push({ start, end: start + len });
       // Image-space overlap of this tile with the clamped region.
       const tileX0 = tx * tileSize;
@@ -328,7 +331,7 @@ export function fromPyramidLevels(
 /** Build a JXTC `LodAsset` from a parsed JXTC header + tile index. */
 export function fromJxtcContainer(
   header: { imageW: number; imageH: number; tileSize: number; tilesX: number; tilesY: number },
-  index: { offsets: ArrayLike<number>; lengths: ArrayLike<number>; dataBase: number },
+  index: { offsets: ArrayLike<number>; lengths: ArrayLike<number> },
   source: string,
 ): LodAsset {
   return {
