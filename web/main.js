@@ -10,6 +10,7 @@ import { getContext } from './jxl-browser-context.js';
 import { WorkerMsg } from './worker-message-types.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
+import { readDenoiseOptions, denoiseNeedsReprocess } from './raw-denoise-options.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
 // `estimateDecodePeak` + `OUT_BATCH_DEFAULT` back the hard decode-admission gate
@@ -498,6 +499,10 @@ function currentOptions() {
         // tint sliders give relative shifts; auto WB used as base.
         wbR: NaN,
         wbB: NaN,
+        // Optional automatic RAW denoise (Detail column). Normalized canonical
+        // shape; travels verbatim to the worker, which forwards it to the WASM
+        // *_with_options RAW decoders. Default {enabled:false} = no-op.
+        denoise: readDenoiseOptions(document),
     };
 }
 
@@ -1137,6 +1142,48 @@ pool.setLiveHandler((msg) => {
 });
 
 contrastBoostEl.addEventListener('change', () => { scheduleLiveUpdate(); scheduleGalleryLiveUpdate(); });
+
+// ---------------------------------------------------------------------------
+// Automatic RAW denoise controls (Detail column).
+//
+// Denoise is applied inside the WASM RAW pipeline BEFORE demosaic/tone, so a
+// change requires a full re-decode from raw data — it CANNOT be served by the
+// live LookRenderer (whose cached RGB16 is already post-denoise). We therefore
+// route denoise edits through reprocessSelected() (a full startConvert re-decode),
+// never scheduleLiveUpdate() / LookRenderer.render().
+const denoiseEnabledEl = document.getElementById('denoise-enabled');
+const denoiseActivationEl = document.getElementById('denoise-activation');
+const denoiseIsoThresholdRow = document.getElementById('denoise-iso-threshold-row');
+const denoiseActivationRow = document.getElementById('denoise-activation-row');
+const denoiseSensitivityRow = document.getElementById('denoise-sensitivity-row');
+
+// Show/hide the sub-controls: they only matter when denoise is enabled, and the
+// ISO≥ threshold only matters in 'iso' activation mode.
+function syncDenoiseControlVisibility() {
+    const on = !!(denoiseEnabledEl && denoiseEnabledEl.checked);
+    if (denoiseActivationRow) denoiseActivationRow.hidden = !on;
+    if (denoiseSensitivityRow) denoiseSensitivityRow.hidden = !on;
+    const isoMode = on && denoiseActivationEl && denoiseActivationEl.value === 'iso';
+    if (denoiseIsoThresholdRow) denoiseIsoThresholdRow.hidden = !isoMode;
+}
+
+// Track the last denoise options actually dispatched so we only re-decode when a
+// change is meaningful (e.g. toggling from off→off must not reprocess).
+let lastAppliedDenoise = readDenoiseOptions(document);
+function onDenoiseControlChange() {
+    syncDenoiseControlVisibility();
+    const next = readDenoiseOptions(document);
+    const needs = denoiseNeedsReprocess(lastAppliedDenoise, next);
+    lastAppliedDenoise = next;
+    if (needs) reprocessSelected();
+}
+
+for (const el of [denoiseEnabledEl, denoiseActivationEl,
+                  document.getElementById('denoise-iso-threshold'),
+                  document.getElementById('denoise-sensitivity')]) {
+    if (el) el.addEventListener('change', onDenoiseControlChange);
+}
+syncDenoiseControlVisibility();
 
 // ---------------------------------------------------------------------------
 // Gallery live thumb re-render (debounced, fans out to all selected cards)
