@@ -5418,18 +5418,38 @@ fn decoded_to_wasm(d: raw_pipeline::image_formats::DecodedRgba) -> DecodedImage 
     }
 }
 
-/// Decode a general RGB(A) TIFF (u8 or u16) to RGBA.
+/// Limit profile for developed-image (TIFF/EXR/JPEG) decodes on the wasm32
+/// target: the tight `DecodeLimits::wasm()` profile whose peak working set fits
+/// under the 2 GiB shared-memory ceiling (`tools/build-mt-wasm.sh --max-memory=2G`).
+/// Native builds of this crate (tests/tools) use the loose `native()` profile.
+#[inline]
+fn developed_image_limits() -> raw_pipeline::image_formats::DecodeLimits {
+    #[cfg(target_arch = "wasm32")]
+    {
+        raw_pipeline::image_formats::DecodeLimits::wasm()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        raw_pipeline::image_formats::DecodeLimits::native()
+    }
+}
+
+/// Decode a general RGB(A) TIFF (u8 or u16) to RGBA. Preflights the header
+/// against the platform decode-limit profile, rejecting oversized / bomb inputs
+/// before any pixel buffer is allocated.
 #[wasm_bindgen]
 pub fn decode_tiff(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
-    raw_pipeline::image_formats::decode_tiff_bytes(bytes)
+    raw_pipeline::image_formats::decode_tiff_bytes_limited(bytes, &developed_image_limits())
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-/// Decode an OpenEXR image to RGBA f32 (linear HDR preserved).
+/// Decode an OpenEXR image to RGBA f32 (linear HDR preserved). Preflights the
+/// header against the platform decode-limit profile (EXR f32 is 16 B/px, so the
+/// output-byte cap is the governing constraint) before decoding.
 #[wasm_bindgen]
 pub fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
-    raw_pipeline::image_formats::decode_exr_bytes(bytes)
+    raw_pipeline::image_formats::decode_exr_bytes_limited(bytes, &developed_image_limits())
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
@@ -5437,9 +5457,10 @@ pub fn decode_exr(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
 /// Decode a JPEG to RGBA8 for the developed-image edit path (mirrors
 /// `decode_tiff`/`decode_exr`). The lossless archival transcode is a separate
 /// facade path (`transcodeJpegToJxl`); this is the editable-pixels decode.
+/// Preflights the header against the platform decode-limit profile first.
 #[wasm_bindgen]
 pub fn decode_jpeg(bytes: &[u8]) -> Result<DecodedImage, JsValue> {
-    raw_pipeline::image_formats::decode_jpeg_bytes(bytes)
+    raw_pipeline::image_formats::decode_jpeg_bytes_limited(bytes, &developed_image_limits())
         .map(decoded_to_wasm)
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }

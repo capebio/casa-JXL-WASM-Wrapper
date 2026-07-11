@@ -29,7 +29,29 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 OUT="${1:-pkg-mt}"
-MAXMEM=2147483648  # 2 GiB shared-memory ceiling (24MP needs ~400MB incl. worker stacks)
+
+# ── Developed-image decode-limit profile (Finding 59) ────────────────────────
+# The shared-memory ceiling below is the SAME budget DecodeLimits::wasm() in
+# crates/raw-pipeline/src/image_formats.rs is sized against, so keep them in
+# lock-step. The wasm limit profile bounds an untrusted TIFF/EXR/JPEG decode to:
+#   input  ≤ 256 MiB   (max_input_bytes)
+#   output ≤ 512 MiB   (max_output_bytes, decoded RGBA)
+# Peak working set (worst case = input + 2×output for the decoder intermediate),
+# plus a 256 MiB allocator/worker-stack safety margin, must stay under the heap:
+#   256 + 2·512 + 256 = 1536 MiB ≤ 2048 MiB (2 GiB). Verified by
+#   `wasm_profile_output_plus_input_plus_scratch_fits_under_two_gib`
+#   in crates/raw-pipeline/tests/decode_limits.rs.
+WASM_INPUT_MIB=256
+WASM_OUTPUT_MIB=512
+WASM_SAFETY_MIB=256
+WASM_HEAP_MIB=2048
+PROJECTED_PEAK_MIB=$(( WASM_INPUT_MIB + 2 * WASM_OUTPUT_MIB + WASM_SAFETY_MIB ))
+if (( PROJECTED_PEAK_MIB > WASM_HEAP_MIB )); then
+  echo "FATAL: DecodeLimits::wasm() projected peak ${PROJECTED_PEAK_MIB} MiB exceeds" \
+       "the ${WASM_HEAP_MIB} MiB shared-memory ceiling — tighten image_formats.rs" >&2
+  exit 1
+fi
+MAXMEM=$(( WASM_HEAP_MIB * 1024 * 1024 ))  # 2 GiB shared-memory ceiling (matches DecodeLimits::wasm)
 
 RUSTFLAGS="-C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals \
 -C link-arg=--shared-memory -C link-arg=--max-memory=${MAXMEM} -C link-arg=--import-memory \
