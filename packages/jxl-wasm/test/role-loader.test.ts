@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   loadJxlModule,
+  preloadJxlRole,
   resetJxlRoleLoaderForTesting,
   setJxlArtifactLoaderForTesting,
   type JxlArtifactLoader,
@@ -164,6 +165,27 @@ describe("loadJxlModule role-aware loading", () => {
     ]);
 
     expect(loads).toBe(2);
+  });
+
+  test("preloadJxlRole warms the role's module and later loads reuse it", async () => {
+    let loads = 0;
+    setJxlArtifactLoaderForTesting(async (_artifact, candidates) => {
+      loads++;
+      return fakeWasmModule(candidates[0]);
+    });
+
+    preloadJxlRole("decode", "simd-st");
+    // Give the fire-and-forget warm-up a tick to register its cache entry.
+    await new Promise((r) => setTimeout(r, 0));
+    await loadJxlModule({ role: "decode", tier: "simd-st" });
+
+    expect(loads).toBe(1); // preload + load shared one instantiation
+  });
+
+  test("preloadJxlRole is fire-and-forget (never throws synchronously on bad input)", () => {
+    setJxlArtifactLoaderForTesting(async (_a, c) => fakeWasmModule(c[0]));
+    // Invalid role must not throw synchronously from the preload call site.
+    expect(() => preloadJxlRole("bogus" as any)).not.toThrow();
   });
 
   test("an already-aborted signal rejects without loading anything", async () => {

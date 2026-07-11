@@ -2898,6 +2898,16 @@ export async function loadJxlModule(request: LoadJxlModuleRequest): Promise<JxlM
   return raceWithAbort(entry, signal);
 }
 
+/**
+ * Fire-and-forget role-aware warm-up. Kicks off (and caches) the module load for
+ * a role during app/worker startup so the first real decode/encode/perceptual op
+ * finds a hot module. Rejections are swallowed (the cold path retries and surfaces
+ * the error to its own caller); invalid roles/tiers never throw synchronously.
+ */
+export function preloadJxlRole(role: JxlRole, tier?: JxlTier): void {
+  void loadJxlModule(tier === undefined ? { role } : { role, tier }).catch(() => {});
+}
+
 async function loadRoleModuleUncached(role: JxlRole, tier: JxlTier): Promise<JxlModule> {
   const artifactTier = artifactTierForJxlTier(tier);
   const candidates = roleArtifactCandidates(role, artifactTier);
