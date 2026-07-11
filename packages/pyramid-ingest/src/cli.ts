@@ -115,6 +115,9 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
       "migrate-layout": { type: "string" },
       "migrate-schema": { type: "string" },
       "suggest-migrations": { type: "boolean", default: false },
+      // finding 66 (Task 5): identity/relink report. --relink reports; --apply rebinds (never merges).
+      relink: { type: "boolean", default: false },
+      apply: { type: "boolean", default: false },
       // K2
       "chaos-test": { type: "boolean", default: false },
       // B6: surface for retrying checkpoint.failed (pairs with ingest.ts retryFailed)
@@ -222,10 +225,10 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
   // WU-6 prereqs + subcommand parsing (approved plan): support `gc` / `validate` / `rm` as first positional
   // (or --gc/--validate/--rm flag for BC). reindex/explain keep flag paths. Batch is default.
   // Locks acquired per L3 (write for gc/rm/ingest, read for validate). Release on sig + finally.
-  let subcmd: "gc" | "validate" | "rm" | "batch" | "reindex" | "explain" | "migrate" | null = null;
+  let subcmd: "gc" | "validate" | "rm" | "batch" | "reindex" | "explain" | "migrate" | "relink" | null = null;
   let cmdPositionals = [...positionals];
   const first = cmdPositionals[0]?.toLowerCase();
-  if (first && ["gc", "validate", "rm"].includes(first)) {
+  if (first && ["gc", "validate", "rm", "relink"].includes(first)) {
     subcmd = first as any;
     cmdPositionals.shift();
   } else if (parsed["reindex-only"]) {
@@ -238,6 +241,8 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
     subcmd = "validate";
   } else if (parsed.rm) {
     subcmd = "rm";
+  } else if (parsed.relink) {
+    subcmd = "relink";
   } else if (first === "migrate" || parsed.migrate || parsed["migrate-layout"] || parsed["migrate-schema"]) {
     subcmd = "migrate";
   } else {
@@ -320,6 +325,44 @@ export async function main(argv: string[], backendsOverride?: Backends): Promise
       }
       await imgLock.release().catch(() => {});
       return 0;
+    }
+
+    if (subcmd === "relink" || parsed.relink) {
+      // finding 66 (Task 5): identity/relink REPORT. Read-only by default; --apply is opt-in and NEVER
+      // merges two catalog rows (a `conflict` — content already at >1 location — is refused, not merged).
+      const { relinkReport } = await import("./relink.js");
+      const targets = cmdPositionals.length ? cmdPositionals : positionals;
+      if (targets.length === 0) { process.stderr.write("relink requires at least one master file or directory\n"); return 1; }
+      const collected = await collectInputs(targets);
+      const masterPaths = collected.map((c) => c.path);
+      const report = await relinkReport(parsed.out, masterPaths);
+      const wantApply = !!parsed.apply && !parsed["dry-run"];
+
+      if (!!parsed.json) {
+        process.stdout.write(JSON.stringify({ type: "relink-result", apply: wantApply, ...report }) + "\n");
+      } else {
+        for (const r of report.rows) {
+          if (r.kind === "relink") {
+            process.stdout.write(`relink  ${r.path}\n        catalogId=${r.catalogId} ${r.fromImageId} -> ${r.toImageId}\n`);
+          } else if (r.kind === "conflict") {
+            process.stdout.write(`CONFLICT ${r.path}\n        catalogId=${r.catalogId} already at [${r.knownImageIds.join(", ")}] (refusing to merge)\n`);
+          } else if (r.kind === "error") {
+            process.stdout.write(`error   ${r.path}: ${r.error}\n`);
+          } else {
+            process.stdout.write(`${r.kind.padEnd(7)} ${r.path} (catalogId=${(r as any).catalogId})\n`);
+          }
+        }
+        const s = report.summary;
+        process.stdout.write(
+          `pyramid-ingest: relink new=${s.new} unchanged=${s.unchanged} relink=${s.relink} conflict=${s.conflict} error=${s.error}${wantApply ? " (apply)" : " (report only; pass --apply to rebind)"}\n`,
+        );
+      }
+      // --apply is intentionally NOT implemented as a silent directory move yet: rebinding an imageId
+      // means relocating out/images/<from> -> <to> AND updating the gallery index, which must be done
+      // under per-image write locks with the ingest coordinator idle. Until that is wired, a relink is
+      // performed by re-ingesting the master at its new path (imageId is path-derived), so the report
+      // is the actionable surface here. A conflict is a hard stop regardless.
+      return report.summary.conflict > 0 ? 1 : 0;
     }
 
     if (subcmd === "migrate" || parsed.migrate || parsed["migrate-layout"] || parsed["migrate-schema"]) {

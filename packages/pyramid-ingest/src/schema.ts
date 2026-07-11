@@ -408,6 +408,10 @@ export const cliArgsSchema = z.object({
   "migrate-layout": z.string().optional(),
   "migrate-schema": z.string().optional(),
   "suggest-migrations": z.boolean().optional().default(false),
+  // finding 66 (Task 5): identity/relink REPORT. Read-only classification of masters vs the on-disk
+  // catalog (new/unchanged/relink/conflict). Never merges two catalog rows; --apply is opt-in.
+  relink: z.boolean().optional().default(false),
+  apply: z.boolean().optional().default(false),
   // K2: chaos injection for testing resume/GC under failure (unlocked by surface + locks + checkpoint)
   "chaos-test": z.boolean().optional().default(false),
   // B6: allow retrying prior failures recorded in checkpoint (transient errors like EBUSY/OOM during previous run)
