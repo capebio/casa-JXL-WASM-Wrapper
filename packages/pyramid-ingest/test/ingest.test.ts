@@ -365,17 +365,99 @@ test("F10 --verify-hash: corrupt level is overwritten on re-ingest with flag; wi
   let onDisk = await readFile(dest);
   expect(onDisk.length).toBe(4); // still corrupt
 
-  // Bump master mtime so the mtime-based uptodate skip in ingestImage does not short-circuit.
-  // This forces re-processing + applyIngestPlan + writeLevelFiles(verifyHash) which will detect
-  // hash mismatch on the corrupt level and rewrite it (F10).
-  await writeFile(master, await readFile(master));
-
+  // finding 66: the master content is unchanged, so fingerprint-aware freshness correctly reports the
+  // source as FRESH even after an mtime bump (rewriting identical bytes is a "touch", not an edit).
+  // To force re-processing + applyIngestPlan + writeLevelFiles(verifyHash) — which detects the hash
+  // mismatch on the corrupt level and rewrites it (F10) — use --force (the real "re-encode anyway" path).
   // with flag: overwrites
   const b3 = await makeBackends();
-  await ingestImage(master, b3, { outDir: out, verifyHash: true });
+  await ingestImage(master, b3, { outDir: out, verifyHash: true, force: true });
   onDisk = await readFile(dest);
   expect(onDisk.length).toBeGreaterThan(4);
   expect(contentHash16(onDisk)).toBe(full.contenthash);
+});
+
+test("finding 66: manifest records catalogId + fingerprint; skips unchanged, re-ingests replaced-bytes-with-preserved-mtime", { timeout: WASM_TIMEOUT }, async () => {
+  const { utimes } = await import("node:fs/promises");
+  const out = await tmpOut();
+  const master = join(out, "FRESH.orf");
+  await writeFile(master, new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]));
+
+  // First ingest writes a manifest carrying the persistent identity + freshness sample.
+  await ingestImage(master, await makeBackends(), { outDir: out });
+  const imageId = await imageIdForPath(master);
+  const manPath = join(out, "images", imageId, "manifest.json");
+  const man = parseManifest(await readFile(manPath)) as any;
+  expect(man.catalogId).toMatch(/^[0-9a-f]{16}$/);
+  expect(man.master.fingerprint).toBeTruthy();
+  expect(man.master.fingerprint.byteLength).toBe(8);
+  expect(man.master.fingerprint.quickHash).toHaveLength(16);
+  // catalogId (content-derived) is DISTINCT from imageId (path-derived) and from any level contenthash.
+  expect(man.catalogId).not.toBe(man.imageId);
+  for (const lv of man.levels) expect(lv.contenthash).not.toBe(man.catalogId);
+
+  // Unchanged content re-ingest → skipped (fingerprint fast path: size + quickHash match).
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("skipped");
+
+  // A pure mtime bump (touch) on identical content → still skipped (mtime alone never certifies).
+  const st = await stat(master);
+  await utimes(master, new Date(), new Date(st.mtimeMs + 5000));
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("skipped");
+
+  // Replace the bytes but RESTORE the original mtime: the classic trap. mtime+size unchanged, but the
+  // quickHash differs → the source reads STALE and is re-ingested (written), not skipped.
+  const before = await stat(master);
+  await writeFile(master, new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9])); // same length (8), different bytes
+  await utimes(master, new Date(before.mtimeMs), new Date(before.mtimeMs)); // preserve original mtime
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
+});
+
+// I1 regression test: large-file unsampled-gap edit must be detected, not silently skipped.
+//
+// Scenario: file > QUICK_SAMPLE_THRESHOLD (256 KiB). quickHash samples only head/mid/tail windows.
+// An edit that lands entirely in an unsampled interior gap preserves byteLength AND quickHash.
+// If the original mtime is also restored, the pre-fix code would read the file as FRESH (skipped),
+// silently producing a stale catalog. The fix persists contentHash on large-file ingests so the
+// escalation gate can fire on re-ingest and detect the change via a full re-hash.
+//
+// This test MUST fail before the fix (ingest returns "skipped" instead of "written") and pass after.
+test("I1 fix: unsampled-gap edit in a large file is detected as STALE, not silently skipped", { timeout: WASM_TIMEOUT }, async () => {
+  const { utimes } = await import("node:fs/promises");
+  const out = await tmpOut();
+
+  // 4 MiB file filled with 0xAB — larger than the 256 KiB QUICK_SAMPLE_THRESHOLD.
+  const SIZE = 4 * 1024 * 1024;
+  const original = new Uint8Array(SIZE).fill(0xab);
+  const master = join(out, "LARGE.orf");
+  await writeFile(master, original);
+
+  // First ingest writes the manifest. With the fix, it persists contentHash alongside quickHash
+  // because byteLength > QUICK_SAMPLE_THRESHOLD.
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
+
+  // Verify the persisted fingerprint now carries a contentHash (post-fix assertion).
+  const imageId = await imageIdForPath(master);
+  const manPath = join(out, "images", imageId, "manifest.json");
+  const man = parseManifest(await readFile(manPath)) as any;
+  expect(man.master.fingerprint.contentHash).toBeDefined(); // only set if fix is active
+
+  // Capture the original mtime before editing.
+  const stBefore = await stat(master);
+
+  // Flip ONE byte deep in an unsampled interior gap — ~1 MiB into the file.
+  // The quickHash windows are: head 0-64KiB, mid ~1984-2048KiB, tail ~4032-4096KiB.
+  // Position 1 MiB (1 048 576) sits between head and mid: not covered by any sampled window.
+  const edited = new Uint8Array(original); // same byteLength
+  edited[1 * 1024 * 1024] ^= 0xff; // single-byte flip in unsampled gap
+  await writeFile(master, edited);
+
+  // Restore the ORIGINAL mtime so that mtime cannot disambiguate the change.
+  await utimes(master, new Date(stBefore.mtimeMs), new Date(stBefore.mtimeMs));
+
+  // byteLength unchanged, mtime unchanged, quickHash unchanged (unsampled gap).
+  // Pre-fix: would return "skipped" (silent stale-catalog bug).
+  // Post-fix: escalation gate fires, full re-hash detects change → "written".
+  expect((await ingestImage(master, await makeBackends(), { outDir: out })).outcome).toBe("written");
 });
 
 test("low-no-retry-on-ebusy: EBUSY on rename is retried (succeeds on 2nd attempt)", async () => {

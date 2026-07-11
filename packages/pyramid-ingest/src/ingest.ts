@@ -4,11 +4,14 @@ import { randomUUID } from "node:crypto";
 import { contentHash16, imageIdForPath } from "./hash.js";
 import { buildJpgLadder, buildProxyLadder, buildRawLadder, type LadderResult, type TilingPolicy } from "./ladder.js";
 import {
-  buildIndexEntry, buildManifest, isUpToDate, toEntry,
+  buildIndexEntry, buildManifest, isUpToDate, isSourceFresh, toEntry,
   type GalleryIndex, type LevelEntry, type Manifest,
 } from "./manifest.js";
+import {
+  catalogIdForContent, fingerprintFromBytes, QUICK_SAMPLE_THRESHOLD, type SourceFingerprint,
+} from "./source-identity.js";
 
-import { detectFormatByMagic, makeProducedBy, parseManifest, manifestToJson } from "./schema.js";
+import { detectFormatByMagic, makeProducedBy, parseManifest, manifestToJson, type MasterFingerprint } from "./schema.js";
 import type { Clock, DecodedMaster, JxlBackend, MasterFormat, Orientation, RawBackend, RawFormat, Telemetry } from "./backends.js";
 
 function now(b?: Backends): number { return b?.clock?.now?.() ?? Date.now(); }
@@ -71,6 +74,18 @@ export interface IngestPlan {
   entries: LevelEntry[];
   proxy: boolean;
   manifest: Manifest;
+}
+
+/** finding 66 (Task 5): identity threaded into a plan. `imageId` is the path-derived id (changes on
+ *  move); `catalogId` is the persistent content-derived identity (stable across moves); `fingerprint`
+ *  is the cheap freshness sample persisted on the manifest. catalogId/fingerprint are OPTIONAL so the
+ *  explain path and older callers that only have a path-derived identity still compute a plan. */
+export interface IngestIdentity {
+  imageId: string;
+  masterName: string;
+  mtimeMs: number;
+  catalogId?: string;
+  fingerprint?: MasterFingerprint;
 }
 
 // Extended for WU-5 adversarial: collect + format detect for common raw that may hit Tier 3/5.
@@ -325,7 +340,7 @@ export async function computeIngestPlan(
   bytes: Uint8Array,
   format: MasterFormat,
   backends: Backends,
-  identity: { imageId: string; masterName: string; mtimeMs: number },
+  identity: IngestIdentity,
   opts: IngestOptions,
   metadata?: Record<string, unknown>,
 ): Promise<IngestPlan> {
@@ -357,7 +372,11 @@ export async function computeIngestPlan(
   const entries = ladder.levels.map((lv) => toEntry(lv, ladder.width, ladder.height));
   const manifest = buildManifest({
     imageId: identity.imageId,
-    master: { name: identity.masterName, format, mtimeMs: identity.mtimeMs },
+    ...(identity.catalogId ? { catalogId: identity.catalogId } : {}),
+    master: {
+      name: identity.masterName, format, mtimeMs: identity.mtimeMs,
+      ...(identity.fingerprint ? { fingerprint: identity.fingerprint } : {}),
+    },
     orientation: ladder.orientation,
     width: ladder.width,
     height: ladder.height,
@@ -449,6 +468,23 @@ export async function ingestImage(
   // med-manifesttmp-orphan + B2: clear stale tmp from prior crash before any check/write
   await unlink(manifestPath + ".tmp").catch(() => {});
 
+  // The master bytes are read at most once and reused for skip-check, fingerprint and ingest.
+  let bytes: Uint8Array | undefined;
+  const readBytesOnce = async (): Promise<Uint8Array> => {
+    if (bytes === undefined) bytes = await readFile(masterPath); // Buffer satisfies Uint8Array (low-readfile)
+    return bytes;
+  };
+  // finding 66 (Task 5): observed source fingerprint, memoized. The fast path (size + quickHash) is
+  // built from the same bytes ingest needs anyway — no decode work is hidden inside the timed path.
+  let observedFp: SourceFingerprint | undefined;
+  const observedFingerprint = async (withContentHash = false): Promise<SourceFingerprint> => {
+    const b = await readBytesOnce();
+    if (observedFp === undefined || (withContentHash && observedFp.contentHash === undefined)) {
+      observedFp = fingerprintFromBytes(b, info.mtimeMs, info.size, { withContentHash });
+    }
+    return observedFp;
+  };
+
   if (!opts.force) {
     // ING-5: single read (no fileExists+readFile); a corrupt existing manifest falls through to
     // a clean re-ingest instead of throwing and failing the image.
@@ -457,19 +493,77 @@ export async function ingestImage(
       const existing = await readFile(manifestPath).then(buf => parseManifest(buf)).catch(() => null);
       if (existing) {
         const wantProxy = opts.proxy !== undefined;
-        // P7: allow proxy manifests to skip on mtime match (previously guarded out); match proxy flag too (no size recorded yet; schema add deferred)
-        const uptodate = isUpToDate(existing, info.mtimeMs, wantProxy) || ((existing as any).stub === true && existing.master.mtimeMs === info.mtimeMs);
-        if (uptodate) return { outcome: "skipped" };
+        const existingFp = (existing.master as { fingerprint?: MasterFingerprint }).fingerprint;
+        // A stub manifest never records a fingerprint; keep its mtime-only skip rule.
+        if ((existing as any).stub === true) {
+          if (existing.master.mtimeMs === info.mtimeMs) return { outcome: "skipped" };
+        } else if (existingFp !== undefined) {
+          // finding 66: fingerprint-aware freshness. mtime alone never certifies — a byte replacement
+          // that preserves the original mtime must re-ingest. Fast path is size + quickHash; escalate
+          // to a full contentHash in two situations when the existing fingerprint carries one:
+          //   (a) Fast path says STALE but size+mtime match → quickHash diff may be a collision-miss or
+          //       benign metadata edit; contentHash is authoritative (original "ambiguous" escalation).
+          //   (b) Fast path says FRESH (size+quickHash match) but contentHash is recorded → an edit that
+          //       lands entirely in an unsampled gap preserves quickHash while changing the content;
+          //       contentHash catch confirms or overrules the fast path (I1 escalation fix).
+          const proxyOk = wantProxy ? existing.proxy === true : existing.proxy !== true;
+          if (proxyOk) {
+            let observed = await observedFingerprint(false);
+            let fresh = isSourceFresh(existing, observed, wantProxy);
+            const ambiguous =
+              !fresh &&
+              existingFp.contentHash !== undefined &&
+              existingFp.byteLength === observed.byteLength &&
+              existing.master.mtimeMs === observed.mtimeMs;
+            if (ambiguous) {
+              // Same size + same mtime but quickHash differs: a possible quickHash collision-miss or a
+              // benign metadata edit. The recorded full contentHash is authoritative — read it to decide.
+              observed = await observedFingerprint(true);
+              fresh = isSourceFresh(existing, observed, wantProxy);
+            }
+            // I1 fix: fast path said fresh but the existing fingerprint carries a full contentHash,
+            // meaning this file was large enough that quickHash only sampled partial windows. A byte
+            // edit in an unsampled interior gap would pass the fast path silently. Verify with the
+            // full hash to prevent a silent stale-catalog entry.
+            if (fresh && existingFp.contentHash !== undefined) {
+              observed = await observedFingerprint(true);
+              fresh = isSourceFresh(existing, observed, wantProxy);
+            }
+            if (fresh) return { outcome: "skipped" };
+          }
+        } else {
+          // P7 legacy path: pre-Task-5 manifest with no fingerprint → cheap mtime-only skip (unchanged).
+          const uptodate = isUpToDate(existing, info.mtimeMs, wantProxy);
+          if (uptodate) return { outcome: "skipped" };
+        }
       }
     } catch { /* corrupt/unparseable manifest → re-ingest (overwrite) */ }
   }
 
-  const bytes = await readFile(masterPath); // Buffer satisfies Uint8Array; avoids copy (low-readfile)
+  const masterBytes = await readBytesOnce();
 
-  const identity = { imageId, masterName: basename(masterPath), mtimeMs: info.mtimeMs };
+  // finding 66: durable identity + freshness sample persisted with the manifest. catalogId is derived
+  // from the master CONTENT (stable across moves; distinct from the path-derived imageId and from the
+  // per-level content hash). The persisted fingerprint records size + quickHash for future fast-path
+  // freshness; mtime lives on master.mtimeMs (not duplicated into the fingerprint block).
+  //
+  // I1 escalation fix: for large files (> QUICK_SAMPLE_THRESHOLD) quickHash only samples head/mid/tail
+  // windows, so an edit that lands entirely in an unsampled gap preserves quickHash while changing the
+  // content. We persist contentHash = catalogId (same bytes, same primitive, zero extra cost) so the
+  // escalation gate in the freshness check (existingFp.contentHash !== undefined) can actually fire on
+  // the next ingest and correctly detect the change via a full re-hash.
+  const catalogId = catalogIdForContent(masterBytes);
+  const observed = fingerprintFromBytes(masterBytes, info.mtimeMs, info.size);
+  const persistedFingerprint: MasterFingerprint = { byteLength: observed.byteLength, quickHash: observed.quickHash };
+  if (info.size > QUICK_SAMPLE_THRESHOLD) persistedFingerprint.contentHash = catalogId;
+
+  const identity: IngestIdentity = {
+    imageId, masterName: basename(masterPath), mtimeMs: info.mtimeMs,
+    catalogId, fingerprint: persistedFingerprint,
+  };
 
   // F4: extract once on master bytes for every ingest (native/jpg/fallback). Cheap vs encode.
-  const meta = await extractBasicMetadata(bytes, !opts.stripGps);
+  const meta = await extractBasicMetadata(masterBytes, !opts.stripGps);
 
   const timeout = opts.timeoutMs;
   let timer: NodeJS.Timeout | undefined;
@@ -482,18 +576,18 @@ export async function ingestImage(
     if (nativeFmt) {
       try {
         // Tier 1: native via raw-converter-wasm
-        plan = await computeIngestPlan(bytes, nativeFmt, backends, identity, opts, meta);
+        plan = await computeIngestPlan(masterBytes, nativeFmt, backends, identity, opts, meta);
       } catch (err) {
         if (!accept) throw err;
         usedFallback = true;
-        plan = await buildFallbackPlan(bytes, format, backends, identity, opts, masterPath, meta);
+        plan = await buildFallbackPlan(masterBytes, format, backends, identity, opts, masterPath, meta);
       }
     } else if (format === "jpg") {
-      plan = await computeIngestPlan(bytes, "jpg", backends, identity, opts, meta);
+      plan = await computeIngestPlan(masterBytes, "jpg", backends, identity, opts, meta);
     } else if (accept) {
       // unknown ext or non-native raw: go straight to Tier3/5 (no native attempt)
       usedFallback = true;
-      plan = await buildFallbackPlan(bytes, format, backends, identity, opts, masterPath, meta);
+      plan = await buildFallbackPlan(masterBytes, format, backends, identity, opts, masterPath, meta);
     } else {
       throw new Error(`unsupported master format: ${masterPath}`);
     }
@@ -535,7 +629,7 @@ async function buildFallbackPlan(
   bytes: Uint8Array,
   format: string | null,
   backends: Backends,
-  identity: { imageId: string; masterName: string; mtimeMs: number },
+  identity: IngestIdentity,
   opts: IngestOptions,
   pathForTel?: string,
   metadata?: Record<string, unknown>,
@@ -570,7 +664,11 @@ async function buildFallbackPlan(
     const entries = ladder.levels.map((lv) => toEntry(lv, ladder.width, ladder.height));
     const manifest = buildManifest({
       imageId: identity.imageId,
-      master: { name: identity.masterName, format: detected as any, mtimeMs: identity.mtimeMs },
+      ...(identity.catalogId ? { catalogId: identity.catalogId } : {}),
+      master: {
+        name: identity.masterName, format: detected as any, mtimeMs: identity.mtimeMs,
+        ...(identity.fingerprint ? { fingerprint: identity.fingerprint } : {}),
+      },
       orientation: ladder.orientation,
       width: ladder.width,
       height: ladder.height,
