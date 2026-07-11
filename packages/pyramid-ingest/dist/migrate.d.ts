@@ -1,3 +1,5 @@
+/** Pure, filesystem-free additive migration of a raw manifest object to schema 5. */
+export declare function migrateManifestToV5(raw: any): any;
 export interface MigrationReport {
     migrated: number;
     skipped: number;

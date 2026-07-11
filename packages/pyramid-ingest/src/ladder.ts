@@ -61,7 +61,7 @@ export async function buildRawLadder(jxl: JxlBackend, decoded: DecodedMaster, pr
         distance: sc.distance,
         effort: EFFORT,
       });
-      gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: true, stagedBytes });
+      gridLevels.push({ data, width: cw, height: ch, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes });
     }
     gridLevels.reverse(); // L1: restore ascending for manifest/levels output invariant
 
@@ -213,7 +213,7 @@ export async function buildJpgLadder(
   // jpg-full-transcode-vs-jxtc flipflop). Tile-all: a lossy JXTC re-encode for uniform tiled decode.
   if (tiling === "tile-all") {
     const data = await jxl.encodeTileContainer(decoded.rgba, w, h, { tileSize: TILE_SIZE, distance: p.fullDistance, effort: EFFORT });
-    levels.push({ data, width: w, height: h, bitsPerSample: 8, tiled: true, stagedBytes: decoded.rgba.byteLength });
+    levels.push({ data, width: w, height: h, bitsPerSample: 8, tiled: true, tileSize: TILE_SIZE, tileVersion: 1, stagedBytes: decoded.rgba.byteLength });
   } else {
     levels.push({ data: fullJxl, width: w, height: h, bitsPerSample: 8, tiled: false, stagedBytes: decoded.rgba.byteLength });
   }

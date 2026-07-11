@@ -1,14 +1,25 @@
-export function planShard(files, i, n) {
-    if (!Number.isInteger(n) || n < 1)
-        throw new Error(`shard count must be >= 1, got ${n}`);
-    if (!Number.isInteger(i) || i < 0 || i >= n)
-        throw new Error(`shard index ${i} out of range for n=${n}`);
-    return files.filter((_, idx) => idx % n === i);
+import { availableParallelism } from "node:os";
+/**
+ * Compute safe concurrency bounded by cores, explicit request, and mem budget.
+ * PER_IMAGE_BYTES guard prevents OOM on high-MP masters.
+ */
+export function boundedConcurrency(avail, requested, memBudgetBytes, perImageBytes) {
+    let c = requested != null ? requested : avail;
+    c = Math.max(1, Math.min(c, avail || 1));
+    if (memBudgetBytes > 0 && perImageBytes > 0) {
+        const memBound = Math.max(1, Math.floor(memBudgetBytes / perImageBytes));
+        c = Math.min(c, memBound);
+    }
+    return c;
 }
-export function boundedConcurrency(cores, requested, memBudgetBytes, perImageBytes) {
-    const byMem = Math.max(1, Math.floor(memBudgetBytes / Math.max(1, perImageBytes)));
-    const byCores = Math.max(1, Math.floor(cores) || 1);
-    const ceiling = requested && requested > 0 ? Math.floor(requested) : byCores;
-    return Math.max(1, Math.min(byCores, ceiling, byMem));
+/**
+ * 0-based shard split for --shard i/N deterministic partition.
+ * Used for fan-out across machines / processes without overlap.
+ * n<=0 => all (no sharding); i<0 or i>=n => [] (empty for this worker).
+ */
+export function planShard(items, i, n) {
+    if (n < 1 || i < 0 || i >= n)
+        throw new RangeError(`invalid shard i=${i}/N=${n} (expected N >= 1 and 0 <= i < N)`);
+    return items.filter((_, k) => (k % n) === i);
 }
 //# sourceMappingURL=shard.js.map

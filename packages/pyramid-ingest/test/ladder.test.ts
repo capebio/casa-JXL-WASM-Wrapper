@@ -1,6 +1,7 @@
 import { expect, test, afterEach } from "bun:test";
 import { setJxlModuleFactoryForTesting } from "@casabio/jxl-wasm";
 import { buildRawLadder, buildJpgLadder, buildProxyLadder } from "../src/ladder";
+import { toEntry } from "../src/manifest";
 import { makeTestJxlBackend } from "./scalar.js";
 import { createJxlBackend, type JxlBackend, type DecodedMaster } from "../src/backends";
 import { loadScalarModule, scalarFactory } from "./scalar";
@@ -162,4 +163,56 @@ test("L1 rgb16 branch + L7 order: grid ascending + big ascending after combined 
   const longs = ladder.levels.map((l) => Math.max(l.width, l.height));
   expect(longs).toEqual([256, 512, 1024, 2048, 3000]); // L7 ascending
   for (const c of downCalls) expect(c.dst).toBeLessThanOrEqual(c.src);
+});
+
+// I-1: every tiled level MUST thread the encoder's real TILE_SIZE (256) into the persisted v5
+// TilingDescriptor. Previously the grid tile-all push (buildRawLadder) and the JXTC full-level push
+// (buildJpgLadder) omitted tileSize/tileVersion, so toEntry fell back to 512 while the encoder used
+// 256 — a client would address tiles at the wrong stride.
+test("I-1: buildRawLadder rgb16 grid tile-all threads tileSize=256 into the persisted TilingDescriptor", async () => {
+  // The regression site is the GRID push inside the rgb16 branch (ladder.ts ~:64), which omitted
+  // tileSize/tileVersion. Provide rgb16 to exercise that branch's 8-bit grid levels.
+  const fake: JxlBackend = {
+    async encodeTileContainer(_r, w, h) { return new Uint8Array([0xc0, w & 0xff, (w >> 8) & 0xff, h & 0xff]); },
+    async encodeTileContainer16(_r, w, h) { return new Uint8Array([0xd0, w & 0xff, (w >> 8) & 0xff, h & 0xff]); },
+    async downscaleRgba8(_r, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
+    async downscaleRgba16(_r, _sw, _sh, dw, dh) { return new Uint16Array(dw * dh * 4); },
+  };
+  const rgb16 = new Uint8Array(3000 * 2000 * 6);
+  const decoded: DecodedMaster = { rgba: gradientRgba(3000, 2000), rgb16, width: 3000, height: 2000, orientation: "baked" };
+  const ladder = await buildRawLadder(fake, decoded, false, "tile-all");
+  const gridLevels = ladder.levels.filter((l) => Math.max(l.width, l.height) <= 1024);
+  expect(gridLevels.length).toBeGreaterThan(0); // ensure we actually exercise the grid push
+  // Every tiled level (grid + big) must persist tiling.tileSize === 256 (not the 512 fallback).
+  for (const lvl of ladder.levels) {
+    expect(lvl.tiled).toBe(true);
+    const entry = toEntry(lvl, decoded.width, decoded.height) as any;
+    expect(entry.tiling).toBeDefined();
+    expect(entry.tiling.tileSize).toBe(256);
+    expect(entry.tiling.version).toBe(1);
+  }
+});
+
+test("I-1: buildJpgLadder tile-all full JXTC level threads tileSize=256 into the persisted TilingDescriptor", async () => {
+  const fake: JxlBackend = {
+    async transcodeJpeg() { return new Uint8Array([0xff, 0x0a, 0x42, 0x13]); },
+    async decodeToRgba8() { return { rgba: gradientRgba(1280, 960), width: 1280, height: 960 }; },
+    async encodeTileContainer(_r, w, h) { return new Uint8Array([0xa0, w & 0xff, (w >> 8) & 0xff, h & 0xff]); },
+    async downscaleRgba8(_r, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
+    async encodePyramid() { return []; },
+  };
+  const ladder = await buildJpgLadder(fake, new Uint8Array([1, 2, 3]), false, "source", "tile-all");
+  const full = ladder.levels[ladder.levels.length - 1]!;
+  expect(full.tiled).toBe(true);
+  // The full JXTC level (buildJpgLadder ~:216) is the regression site — assert its persisted stride.
+  const fullEntry = toEntry(full, 1280, 960) as any;
+  expect(fullEntry.tiling).toBeDefined();
+  expect(fullEntry.tiling.tileSize).toBe(256);
+  expect(fullEntry.tiling.version).toBe(1);
+  // And every other tiled sidecar level too.
+  for (const lvl of ladder.levels) {
+    expect(lvl.tiled).toBe(true);
+    const entry = toEntry(lvl, 1280, 960) as any;
+    expect(entry.tiling.tileSize).toBe(256);
+  }
 });

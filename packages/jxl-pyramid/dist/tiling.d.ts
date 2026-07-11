@@ -28,10 +28,15 @@ export declare function parseJxtcHeader(bytes: Uint8Array): JxtcHeader;
  *  v2 table reader extension point (different stride/fields can be handled here).
  */
 export interface JxtcTileIndex {
+    /**
+     * ABSOLUTE byte offsets from byte 0 of the complete JXTC file — one per tile.
+     * This mirrors the canonical writers exactly (bridge.cpp:1925-1931 and the Rust
+     * `build_jxtc`/`build_jxtc_rgba8` helpers), which store `cursor = 32 + tileCount*8`
+     * as the first offset and the running absolute cursor thereafter. Readers must NOT
+     * re-add any data base — the stored value is already file-relative (finding 60).
+     */
     offsets: Uint32Array;
     lengths: Uint32Array;
-    /** Offset in container where tile data starts (after header + index table). */
-    dataBase: number;
 }
 /** Parse (or hit memo) the tile offset/length table after the 32B header.
  *  Called on first extract per container; subsequent extracts are array lookup + subarray.
