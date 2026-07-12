@@ -255,7 +255,11 @@ function getSidecarKey(filename) {
   return SIDECAR_PREFIX + sidecarHash(filename) + ':' + filename.slice(0, 255);
 }
 
-function buildSidecarData(filename) {
+// Finding 40: accept an explicit card so crop/subjects come from the TARGET card,
+// not the ambient window.lightboxCard() global. Callers MUST pass the card whose
+// state they want to serialize; the lightbox default is just a backward-compat
+// convenience.
+function buildSidecarData(filename, cardOverride) {
   const look   = typeof window.currentLook   === 'function' ? window.currentLook()   : {};
   const levels = window.levelsState ? {
     inBlack:  window.levelsState.inBlack,
@@ -267,35 +271,53 @@ function buildSidecarData(filename) {
   const vignette = vignetteActive
     ? { amount: vignetteAmount, width: vignetteWidth, color: vignetteColor }
     : null;
-  // Crop + subjects come from the lightbox's currently-displayed card.
-  const card = (typeof window.lightboxCard === 'function') ? window.lightboxCard() : null;
+  // Finding 40: use the explicitly-passed card when available; fall back to the
+  // currently-displayed lightbox card for backward compatibility.
+  const card = cardOverride || ((typeof window.lightboxCard === 'function') ? window.lightboxCard() : null);
   const crop     = card?._crop ?? null;
   const subjects = Array.isArray(card?._subjects) ? card._subjects : [];
-  return { filename, look, profile: activeProfile, filter: activeFilter, levels, vignette,
+  // Finding 46: include assetId so the sidecar key is stable across renames.
+  const assetId = (typeof window._getCardAssetId === 'function') ? window._getCardAssetId(card) : null;
+  return { filename, assetId, look, profile: activeProfile, filter: activeFilter, levels, vignette,
            crop, subjects };
 }
 
-async function saveSidecar(filename) {
-  if (!filename) return;
-  const data = buildSidecarData(filename);
-  const json = JSON.stringify(data);
-  if (window.IS_TAURI && window.__TAURI__) {
-    try {
-      await window.__TAURI__.core.invoke('write_look', { path: filename, json });
-    } catch (e) {
-      console.error('saveSidecar Tauri error', e);
-    }
-  } else {
-    try {
-      localStorage.setItem(getSidecarKey(filename), json);
-    } catch (e) {
-      console.error('saveSidecar localStorage quota exceeded', e);
-    }
+// Finding 46: use stable assetId as sidecar key when available, so two files
+// with the same basename in different directories never share a key.
+function getAssetSidecarKey(assetId, filename) {
+  if (assetId) {
+    // Use assetId as the stable primary key, still with a human-readable prefix.
+    return SIDECAR_PREFIX + sidecarHash(assetId) + ':' + filename.slice(0, 48);
   }
-  updateSidecarDot(filename, true);
+  return getSidecarKey(filename);
 }
 
-async function loadSidecar(filename) {
+// Finding 46: saveSidecar now accepts an optional explicit card parameter.
+// It surfaces persistence errors by re-throwing after logging — the caller
+// decides how to surface the failure to the user.  updateSidecarDot is only
+// called on SUCCESS (no optimistic false-success).
+async function saveSidecar(filename, cardOverride) {
+  if (!filename) return;
+  const data = buildSidecarData(filename, cardOverride);
+  const json = JSON.stringify(data);
+  const assetId = data.assetId;
+  if (window.IS_TAURI && window.__TAURI__) {
+    // Tauri: the Rust side uses the full path, not a localStorage key.
+    await window.__TAURI__.core.invoke('write_look', { path: filename, json });
+    // Only reach here if invoke() did not throw.
+    updateSidecarDot(filename, true);
+  } else {
+    const key = getAssetSidecarKey(assetId, filename);
+    localStorage.setItem(key, json);
+    // If localStorage.setItem throws (quota exceeded), it propagates to the caller.
+    // For browsers that throw synchronously, no updateSidecarDot is called.
+    updateSidecarDot(filename, true);
+  }
+}
+
+// Finding 46: loadSidecar accepts an optional assetId for stable-key lookup.
+// Falls back to basename-hash key for backward compat with pre-existing sidecars.
+async function loadSidecar(filename, assetId) {
   if (!filename) return null;
   let json = null;
   if (window.IS_TAURI && window.__TAURI__) {
@@ -303,7 +325,13 @@ async function loadSidecar(filename) {
       json = await window.__TAURI__.core.invoke('read_look', { path: filename });
     } catch { json = null; }
   } else {
-    json = localStorage.getItem(getSidecarKey(filename));
+    // Try stable-key first; fall back to legacy basename key.
+    if (assetId) {
+      json = localStorage.getItem(getAssetSidecarKey(assetId, filename));
+    }
+    if (!json) {
+      json = localStorage.getItem(getSidecarKey(filename));
+    }
   }
   if (!json) return null;
   try { return JSON.parse(json); }
@@ -349,36 +377,50 @@ async function applySidecar(sidecar) {
     if (vigEl) { applyVignetteStyle(); vigEl.style.display = 'block'; }
     buildOverlayChips();
   }
-  // Apply crop + subjects onto the current lightbox card.
+  // Apply crop + subjects onto the currently-displayed lightbox card.
+  // applySidecar takes no card param; per-card routing goes through
+  // crop.js's applyCropAndSubjectsToCard (the correct per-card entry point).
   const card = (typeof window.lightboxCard === 'function') ? window.lightboxCard() : null;
   if (card) {
-    if (sidecar.crop && typeof sidecar.crop === 'object'
-        && Number.isFinite(sidecar.crop.x) && Number.isFinite(sidecar.crop.y)
-        && Number.isFinite(sidecar.crop.w) && Number.isFinite(sidecar.crop.h)) {
-      card._crop = {
-        x: Math.max(0, Math.min(1, sidecar.crop.x)),
-        y: Math.max(0, Math.min(1, sidecar.crop.y)),
-        w: Math.max(0.001, Math.min(1, sidecar.crop.w)),
-        h: Math.max(0.001, Math.min(1, sidecar.crop.h)),
-        ratio: typeof sidecar.crop.ratio === 'string' ? sidecar.crop.ratio : 'free',
-      };
+    // Finding 40: route through assetStateStore so the edit is keyed on the stable
+    // assetId, not the ambient current card. DOM proxy syncs it back immediately.
+    const assetId = (typeof window._getCardAssetId === 'function') ? window._getCardAssetId(card) : null;
+    if (assetId && window._assetStateStore) {
+      window._assetStateStore.applySidecarEdit(assetId, sidecar);
+      // Sync the committed state back to the card's DOM proxies.
+      const asState = window._assetStateStore.getOrCreate(assetId);
+      card._crop = asState.edit.crop;
+      card._subjects = asState.edit.subjects;
     } else {
-      card._crop = null;
+      // Fallback path (store not yet initialised or card lacks assetId).
+      if (sidecar.crop && typeof sidecar.crop === 'object'
+          && Number.isFinite(sidecar.crop.x) && Number.isFinite(sidecar.crop.y)
+          && Number.isFinite(sidecar.crop.w) && Number.isFinite(sidecar.crop.h)) {
+        card._crop = {
+          x: Math.max(0, Math.min(1, sidecar.crop.x)),
+          y: Math.max(0, Math.min(1, sidecar.crop.y)),
+          w: Math.max(0.001, Math.min(1, sidecar.crop.w)),
+          h: Math.max(0.001, Math.min(1, sidecar.crop.h)),
+          ratio: typeof sidecar.crop.ratio === 'string' ? sidecar.crop.ratio : 'free',
+        };
+      } else {
+        card._crop = null;
+      }
+      card._subjects = Array.isArray(sidecar.subjects)
+        ? sidecar.subjects.filter(s => s && Number.isFinite(s.x) && Number.isFinite(s.y)
+                                     && Number.isFinite(s.w) && Number.isFinite(s.h))
+                          .map(s => ({
+            id: s.id || ('s-' + Math.random().toString(36).slice(2, 8)),
+            x: Math.max(0, Math.min(1, s.x)),
+            y: Math.max(0, Math.min(1, s.y)),
+            w: Math.max(0.001, Math.min(1, s.w)),
+            h: Math.max(0.001, Math.min(1, s.h)),
+            label: typeof s.label === 'string' ? s.label : '',
+            note: typeof s.note === 'string' ? s.note : '',
+            status: ['unknown','tentative','confirmed'].includes(s.status) ? s.status : 'unknown',
+          }))
+        : [];
     }
-    card._subjects = Array.isArray(sidecar.subjects)
-      ? sidecar.subjects.filter(s => s && Number.isFinite(s.x) && Number.isFinite(s.y)
-                                   && Number.isFinite(s.w) && Number.isFinite(s.h))
-                        .map(s => ({
-          id: s.id || ('s-' + Math.random().toString(36).slice(2, 8)),
-          x: Math.max(0, Math.min(1, s.x)),
-          y: Math.max(0, Math.min(1, s.y)),
-          w: Math.max(0.001, Math.min(1, s.w)),
-          h: Math.max(0.001, Math.min(1, s.h)),
-          label: typeof s.label === 'string' ? s.label : '',
-          note: typeof s.note === 'string' ? s.note : '',
-          status: ['unknown','tentative','confirmed'].includes(s.status) ? s.status : 'unknown',
-        }))
-      : [];
     if (typeof window.cropApplyToCard === 'function') window.cropApplyToCard(card);
   }
   if (sidecar.levels && window.levelsState) {

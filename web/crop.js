@@ -258,10 +258,19 @@
         // Pause the canvas pan handlers while editing — let crop layer steal events.
         viewport.classList.remove('has-crop');
 
+        // Finding 41: snapshot the committed state BEFORE seeding pending UI state.
+        // applyCropEdit / cancelCropEdit will atomically commit or restore it.
+        if (window._assetStateStore && typeof window._getCardAssetId === 'function') {
+            const assetId = window._getCardAssetId(card);
+            if (assetId) window._assetStateStore.beginCropEdit(assetId);
+        }
+
         if (newMode === 'frame') {
+            // Finding 41: seed pendingCrop from committed crop; do NOT write card._crop.
             pendingCrop = card._crop
                 ? { ...card._crop }
-                : { x: 0.05, y: 0.05, w: 0.9, h: 0.9, ratio: aspectSelect.value || 'free' };
+                : { x: 0.05, y: 0.05, w: 0.9, h: 0.9, ratio: aspectSelect.value || 'free',
+                    angle: 0, inOriginalSpace: true };
             aspectSelect.value = pendingCrop.ratio || 'free';
             subjectsPanel.hidden = true;
             renderRect();
@@ -282,13 +291,52 @@
             if (save) {
                 if (mode === 'frame') {
                     pendingCrop.ratio = aspectSelect.value || 'free';
-                    card._crop = pendingCrop;
+                    // Finding 41: Apply atomically via the store; do NOT write card._crop directly.
+                    if (window._assetStateStore && typeof window._getCardAssetId === 'function') {
+                        const assetId = window._getCardAssetId(card);
+                        if (assetId) {
+                            window._assetStateStore.applyCropEdit(assetId, pendingCrop, pendingSubjects);
+                            // Sync back to card DOM proxies from the committed store state.
+                            const asState = window._assetStateStore.getOrCreate(assetId);
+                            card._crop = asState.edit.crop;
+                            card._subjects = asState.edit.subjects;
+                        } else {
+                            card._crop = pendingCrop;
+                        }
+                    } else {
+                        card._crop = pendingCrop;
+                    }
                 } else if (mode === 'subjects') {
-                    card._subjects = pendingSubjects;
+                    // Finding 41: Apply subjects atomically.
+                    if (window._assetStateStore && typeof window._getCardAssetId === 'function') {
+                        const assetId = window._getCardAssetId(card);
+                        if (assetId) {
+                            window._assetStateStore.applyCropEdit(assetId, pendingCrop, pendingSubjects);
+                            const asState = window._assetStateStore.getOrCreate(assetId);
+                            card._crop = asState.edit.crop;
+                            card._subjects = asState.edit.subjects;
+                        } else {
+                            card._subjects = pendingSubjects;
+                        }
+                    } else {
+                        card._subjects = pendingSubjects;
+                    }
                 }
                 // Save sidecar + sync sibling cards.
                 triggerSidecarSave(card);
                 rebuildSubjectCards(card);
+            } else {
+                // Finding 41: Cancel — restore snapshot via the store.
+                if (window._assetStateStore && typeof window._getCardAssetId === 'function') {
+                    const assetId = window._getCardAssetId(card);
+                    if (assetId) {
+                        window._assetStateStore.cancelCropEdit(assetId);
+                        // Sync restored state back to card DOM proxies.
+                        const asState = window._assetStateStore.getOrCreate(assetId);
+                        card._crop = asState.edit.crop;
+                        card._subjects = asState.edit.subjects;
+                    }
+                }
             }
         }
         mode = 'off';
@@ -312,9 +360,11 @@
     function triggerSidecarSave(card) {
         const filename = card?._tauriPath || card?._file?.name;
         if (filename && typeof window.saveSidecar === 'function') {
+            // Finding 46: pass the card explicitly so saveSidecar reads from the
+            // correct per-asset state, not the ambient lightboxCard() global.
             // Surface persist failures instead of silently swallowing them — a
             // failed save after Apply would otherwise be invisible to the user.
-            window.saveSidecar(filename).catch((err) => {
+            window.saveSidecar(filename, card).catch((err) => {
                 console.error('[crop] sidecar save failed for', filename, err);
             });
         }
@@ -575,11 +625,28 @@
         }
     });
     modeToggle.addEventListener('click', () => {
-        // Save current pending state before flipping so user doesn't lose it.
-        const card = window.lightboxCard?.();
-        if (mode === 'frame' && pendingCrop) card._crop = { ...pendingCrop };
-        if (mode === 'subjects')             card._subjects = pendingSubjects.map(s => ({ ...s }));
-        enterMode(mode === 'frame' ? 'subjects' : 'frame');
+        // Finding 41: when switching modes, carry the pending state into the new mode's
+        // pending variables — do NOT write card._crop / card._subjects here (that would
+        // be a pre-Apply commit of uncommitted edits). The snapshot taken in enterMode
+        // / beginCropEdit covers the committed state; the pending state is local only.
+        const _pendingCropBeforeSwitch    = pendingCrop    ? { ...pendingCrop }    : null;
+        const _pendingSubjectsBeforeSwitch = pendingSubjects.map(s => ({ ...s }));
+        const nextMode = mode === 'frame' ? 'subjects' : 'frame';
+        enterMode(nextMode);
+        // After enterMode seeds its pending state from the committed card values,
+        // restore the pending-only edits the user had in the outgoing mode so they
+        // are not lost when toggling back. enterMode() already did beginCropEdit()
+        // for the snapshot, so no second snapshot is needed.
+        if (nextMode === 'subjects' && _pendingSubjectsBeforeSwitch.length) {
+            pendingSubjects = _pendingSubjectsBeforeSwitch;
+            renderSubjectsOverlay();
+            renderSubjectsList();
+        }
+        if (nextMode === 'frame' && _pendingCropBeforeSwitch) {
+            pendingCrop = _pendingCropBeforeSwitch;
+            aspectSelect.value = pendingCrop.ratio || 'free';
+            renderRect();
+        }
     });
     applyBtn .addEventListener('click', () => exitMode(true));
     cancelBtn.addEventListener('click', () => exitMode(false));
@@ -651,6 +718,21 @@
 
     function applyCropAndSubjectsToCard(card, sidecar) {
         if (!card || !sidecar) return;
+        // Finding 40: route through assetStateStore when available so the edit is
+        // keyed on the stable assetId. Fall back to direct write for cards that
+        // don't yet have an assetId (e.g. very early in startup).
+        if (window._assetStateStore && typeof window._getCardAssetId === 'function') {
+            const assetId = window._getCardAssetId(card);
+            if (assetId) {
+                window._assetStateStore.applySidecarEdit(assetId, sidecar);
+                const asState = window._assetStateStore.getOrCreate(assetId);
+                card._crop     = asState.edit.crop;
+                card._subjects = asState.edit.subjects;
+                rebuildSubjectCards(card);
+                return;
+            }
+        }
+        // Fallback direct-write path (store unavailable or card lacks assetId).
         if (sidecar.crop && typeof sidecar.crop === 'object'
             && Number.isFinite(sidecar.crop.x) && Number.isFinite(sidecar.crop.y)
             && Number.isFinite(sidecar.crop.w) && Number.isFinite(sidecar.crop.h)) {
@@ -658,6 +740,9 @@
             card._crop = {
                 x: b.x, y: b.y, w: b.w, h: b.h,
                 ratio: typeof sidecar.crop.ratio === 'string' ? sidecar.crop.ratio : 'free',
+                // Finding 41: preserve angle + inOriginalSpace in direct-write path too.
+                angle: typeof sidecar.crop.angle === 'number' ? sidecar.crop.angle : 0,
+                inOriginalSpace: typeof sidecar.crop.inOriginalSpace === 'boolean' ? sidecar.crop.inOriginalSpace : true,
             };
         }
         if (Array.isArray(sidecar.subjects)) {
