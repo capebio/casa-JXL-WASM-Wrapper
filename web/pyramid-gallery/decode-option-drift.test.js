@@ -36,9 +36,14 @@ test('grid-controller routes tiled decode through the injected runtime, not a pe
 test('grid-controller no longer threads drifted priority/format/sourceKey into the tiled decode (finding 78)', () => {
   // The runtime demand allow-list rejects unknown keys; grid must not build a demand carrying them.
   // (priority is a scheduler concept for the whole/session path, not a tiled-pool demand.)
-  const decodeForLevel = gridJs.slice(gridJs.indexOf('async function decodeForLevel'), gridJs.indexOf('function paintCanvas'));
-  // The tiled runtime path must not pass sourceKey to the runtime (unknown demand key).
-  expect(decodeForLevel).not.toContain('sourceKey:');
+  // The decode body (startDecode) builds the tiled runtime demand. It must not pass sourceKey to
+  // the runtime (unknown demand key).
+  const startIdx = gridJs.indexOf('function startDecode');
+  const endIdx = gridJs.indexOf('function paintCanvas');
+  expect(startIdx).toBeGreaterThanOrEqual(0);
+  expect(endIdx).toBeGreaterThan(startIdx);
+  const decodeBody = gridJs.slice(startIdx, endIdx);
+  expect(decodeBody).not.toContain('sourceKey:');
 });
 
 // Functional: drive decodeForLevel through a fake runtime + store, proving the tiled decode routes

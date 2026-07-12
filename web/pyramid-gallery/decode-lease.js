@@ -115,3 +115,59 @@ export function createSharedDecode(start) {
     },
   };
 }
+
+/**
+ * A registry of in-flight shared decodes keyed by a job key (e.g.
+ * `imageId:contenthash`). Multiple callers for the same key dedupe onto ONE
+ * underlying decode and each receive their own lease. The underlying decode is
+ * cancelled only when every caller for that key has released (finding 49), and
+ * the registry entry is evicted once the decode settles so a later call for the
+ * same key starts fresh.
+ *
+ * @template T
+ * @returns {{
+ *   decode: (key: string, start: (sharedSignal: AbortSignal) => Promise<T>, signal?: AbortSignal | null) => DecodeLease<T>,
+ *   has: (key: string) => boolean,
+ *   size: () => number,
+ * }}
+ */
+export function createInflightDecodes() {
+  /** @type {Map<string, ReturnType<typeof createSharedDecode>>} */
+  const inflight = new Map();
+
+  /**
+   * @param {string} key
+   * @param {(sharedSignal: AbortSignal) => Promise<T>} start
+   * @param {AbortSignal | null} [signal]
+   * @returns {DecodeLease<T>}
+   */
+  function decode(key, start, signal = null) {
+    let shared = inflight.get(key);
+    if (!shared) {
+      const evict = () => { if (inflight.get(key) === shared) inflight.delete(key); };
+      shared = createSharedDecode((sharedSignal) => {
+        // Call the real decode SYNCHRONOUSLY (its abort listener must be wired
+        // before acquire() returns; see ensureStarted). Evict the registry entry
+        // once the decode settles (success OR failure) so the key is reusable and
+        // a settled decode is never rejoined.
+        let p;
+        try {
+          p = Promise.resolve(start(sharedSignal));
+        } catch (err) {
+          evict();
+          throw err;
+        }
+        p.then(evict, evict);
+        return p;
+      });
+      inflight.set(key, shared);
+    }
+    return shared.acquire(signal);
+  }
+
+  return {
+    decode,
+    has: (key) => inflight.has(key),
+    size: () => inflight.size,
+  };
+}

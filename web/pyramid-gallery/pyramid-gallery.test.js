@@ -33,6 +33,18 @@ test('grid uses scheduler one-shot decode with contenthash sourceKey', () => {
   expect(gridJs).toContain('shouldUpgrade');
 });
 
+test('grid owns shared decode via the refcounted lease registry, not a bespoke joiner counter (finding 49)', () => {
+  // The shared-decode ownership is delegated to createInflightDecodes so a
+  // no-signal caller cannot be made invisible by an aborting joiner.
+  expect(gridJs).toContain('createInflightDecodes');
+  expect(gridJs).toContain('inflight.decode(');
+  // Every caller owns ONE lease and releases it in a finally.
+  expect(gridJs).toContain('lease.release()');
+  expect(gridJs).toMatch(/finally\s*\{[\s\S]*lease\.release\(\)/);
+  // The old ad-hoc joiner-counting scheme must be gone.
+  expect(gridJs).not.toContain('job.joiners');
+});
+
 test('grid implements L0 seed from index then monotonic upgrade', () => {
   expect(gridJs).toContain('indexByImageId');
   expect(gridJs).toContain('entry?.l0');
