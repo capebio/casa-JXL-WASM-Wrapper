@@ -1,9 +1,65 @@
 import { expect, test, afterEach } from "bun:test";
-import { encodeTileContainerRgba8, encodeTileContainerRgba16, setJxlModuleFactoryForTesting } from "@casabio/jxl-wasm";
+import { encodeTileContainerRgba8, encodeTileContainerRgba16, decodeTileContainerRegionRgba8, setJxlModuleFactoryForTesting } from "@casabio/jxl-wasm";
 import { createLevelSource } from "../src/level-source.js";
 import { decodeTiledViewportPooled } from "../src/tiled-decode-pool.js";
 import { JXTC_TILE_SIZE } from "../src/tiling.js";
 import { loadScalarModule, scalarFactory } from "./scalar.js";
+
+/**
+ * In-process worker double that speaks the v:1 tile-decode protocol (ready/load/decode/cancel)
+ * and decodes via the same patched scalar WASM the test installed on the MAIN thread.
+ *
+ * Why not a real `new Worker(...)`? Finding 82 makes the parallel worker path active in ANY env
+ * that exposes `Worker` (Bun does), independent of cross-origin isolation. But a real spawned
+ * Worker imports its OWN copy of the WASM module — `setJxlModuleFactoryForTesting` only patches the
+ * main thread, and the real MT libjxl module fails to load inside a Bun worker. The old "real Worker"
+ * test only passed because the pre-finding-82 COI gate silently skipped the worker path and fell back
+ * to a same-thread direct decode; it never actually exercised the protocol. This double decodes on
+ * the same thread through the patched module, so it genuinely drives load/decode/ready/terminate.
+ */
+class ProtocolWorkerDouble {
+  static instances = 0;
+  loads = 0;
+  decodes = 0;
+  terminated = false;
+  private readonly listeners = new Map<string, Set<(ev: { data?: any }) => void>>();
+  private readonly byteStore = new Map<number, Uint8Array>();
+  constructor() {
+    ProtocolWorkerDouble.instances += 1;
+    for (const t of ["message", "error", "messageerror"]) this.listeners.set(t, new Set());
+    queueMicrotask(() => { if (!this.terminated) this.emit("message", { v: 1, type: "ready" }); });
+  }
+  addEventListener(t: string, l: (ev: { data?: any }) => void) { this.listeners.get(t)!.add(l); }
+  removeEventListener(t: string, l: (ev: { data?: any }) => void) { this.listeners.get(t)!.delete(l); }
+  postMessage(msg: any) {
+    if (this.terminated || !msg || msg.v !== 1) return;
+    if (msg.type === "load") {
+      this.loads += 1;
+      this.byteStore.set(msg.bytesId, msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes));
+      return;
+    }
+    if (msg.type === "cancel") return;
+    if (msg.type === "decode") {
+      this.decodes += 1;
+      const { id, bytesId, region } = msg;
+      const bytes = this.byteStore.get(bytesId);
+      void (async () => {
+        try {
+          if (!bytes) throw new Error("no bytes for bytesId");
+          const out = await decodeTileContainerRegionRgba8(bytes, { x: region.x, y: region.y, w: region.w, h: region.h });
+          if (this.terminated) return;
+          this.emit("message", { v: 1, type: "decode-reply", id, ok: true, pixels: out.pixels, w: out.width, h: out.height });
+        } catch (err) {
+          if (this.terminated) return;
+          this.emit("message", { v: 1, type: "decode-reply", id, ok: false, error: { code: "INTERNAL", message: String(err) } });
+        }
+      })();
+      return;
+    }
+  }
+  terminate() { this.terminated = true; }
+  private emit(t: string, data: any) { for (const l of this.listeners.get(t) ?? []) l({ data }); }
+}
 
 function gradient(w: number, h: number): Uint8Array {
   const px = new Uint8Array(w * h * 4);
@@ -21,34 +77,33 @@ function gradient(w: number, h: number): Uint8Array {
 
 afterEach(() => setJxlModuleFactoryForTesting(null));
 
-// Real Worker integration (Bun supports Worker in test). Exercises cold-start, load/decode, transfer, ready, terminate.
-test("decode-pool worker integration (real Worker)", async () => {
+// Worker-protocol integration: drives the pool over a message-passing worker double that decodes
+// via the patched scalar module. Exercises cold-start (ready), load-once, decode, transfer, terminate.
+// This path is only reachable because finding 82 decoupled Worker availability from cross-origin
+// isolation — without workerFactory + finding 82 the pool would silently run the direct decode.
+test("decode-pool worker-protocol integration (multi-tile parallel decode over workers)", async () => {
   const module = await loadScalarModule();
   setJxlModuleFactoryForTesting(scalarFactory(module));
+  ProtocolWorkerDouble.instances = 0;
 
   const W = 512, H = 384;
   const src = gradient(W, H);
   const container = await encodeTileContainerRgba8(src, W, H, { tileSize: 256, distance: 0, effort: 1 });
 
-  // Worker url relative from the test file to the created worker
-  const workerUrl = new URL("../../../web/lightbox/tiled-decode-worker.js", import.meta.url);
-
-  const workerFactory = () => new Worker(workerUrl.href, { type: "module" });
-
+  const workerFactory = () => new ProtocolWorkerDouble() as any;
   const source = createLevelSource({ w: W, h: H, tiled: true }, container);
 
+  // Region spanning >1 tile so the parallel worker fan-out (not the direct single-ROI path) is used.
   const region = { x: 64, y: 32, w: 200, h: 150 };
 
-  // Should go through load + decode protocol
   const decoded = await decodeTiledViewportPooled(source, region, { workerFactory, parallel: true });
 
   expect(decoded.width).toBe(region.w);
   expect(decoded.height).toBe(region.h);
   expect(decoded.pixels.length).toBe(region.w * region.h * 4);
-  // basic non-zero check
   expect(decoded.pixels.some((v, i) => i % 4 !== 3 && v !== 0)).toBe(true);
-
-  // dispose not public on default singleton in this snapshot; rely on test isolation
+  // The worker path was actually taken (workers spawned), proving finding 82's decoupling works.
+  expect(ProtocolWorkerDouble.instances).toBeGreaterThan(0);
 });
 
 // 16-bit pool decode (Grok2 root fix). The protocol (plan.format + worker 'format' field + load/decode) is exercised.

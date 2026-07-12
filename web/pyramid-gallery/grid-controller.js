@@ -1,4 +1,5 @@
 import { chooseLevelForTarget, shouldUpgrade } from '../../packages/jxl-pyramid/dist/choose-level.js';
+import { createLevelSource } from '../../packages/jxl-pyramid/dist/level-source.js';
 import { decodePyramidLevel } from './pyramid-decode.js';
 import { createImageStore } from './image-store.js'; // S2; passed in or fallback
 
@@ -36,9 +37,10 @@ export function createGridController({
   onTilePainted,
 }) {
   const store = imageStore || (cache && galleryBase ? createImageStore({ cache, galleryBase }) : null);
-  // Packet 2 Task 1: hold the single decode runtime handed down by the gallery bootstrap.
-  // Decode still flows through decodePyramidLevel today; Task 3 consolidates onto runtime.decodeLevel.
-  void runtime;
+  // Packet 2 Task 3: the single decode runtime handed down by the gallery bootstrap is the ONE
+  // orchestration surface that owns the tiled worker pool. Tiled levels decode through
+  // runtime.decodeLevel (no per-call pool, no drifted options); whole levels stay on the shared
+  // scheduler/session path via decodePyramidLevel.
   const dpr = devicePixelRatio ?? 1;
   const paintedRank = new Map();
   const inflight = new Map();
@@ -68,15 +70,24 @@ export function createGridController({
         // decoded as tiled only when it explicitly declares `tiled` — an L0 seed without it defaults
         // to a monolithic whole-frame decode (never assumed tiled). Precision follows bitsPerSample.
         const isTiled = level.tiled === true;
+        if (isTiled && runtime) {
+          // finding 77/78: tiled decode goes through the ONE injected runtime. It owns the pool
+          // (no per-call pool creation) and accepts only the declared demand keys — the runtime
+          // derives format from the JXTC header, so no `format`/`priority`/`sourceKey` drift here.
+          const source = createLevelSource({ w: level.w, h: level.h, tiled: true, bitsPerSample: level.bitsPerSample }, bytes);
+          // Full-region decode so the pool can fan every tile out in parallel (grid targets stay
+          // <=2048 whole, but this protects if a large tileSize or the full level is picked).
+          const region = { x: 0, y: 0, w: level.w, h: level.h };
+          return runtime.decodeLevel(source, region, { quality: 'final', signal: shared.signal });
+        }
+        // Whole-frame levels use the shared scheduler/session path (dedupe/priority/backpressure).
         const format = level.bitsPerSample === 16 ? 'rgba16' : 'rgba8';
         return decodePyramidLevel(ctx, bytes, {
           contenthash: level.contenthash,
           priority,
           signal: shared.signal,
-          tiled: isTiled,
+          tiled: false,
           format,
-          // Supply full region for tiled so decodeTiledPooled can parallel all tiles (grid targets stay <=2048 whole, but protects if large tileSize or full picked).
-          region: isTiled ? { x: 0, y: 0, w: level.w, h: level.h } : undefined,
         });
       })().finally(() => inflight.delete(jobKey));
       inflight.set(jobKey, job);

@@ -26,6 +26,7 @@ import {
   assertFiniteRegion,
   snapRegionToIntegers,
   stitchCropped,
+  type PyramidPoolLike,
 } from "./decode-core.js";
 import { getLevelId, makeTileCacheKey, type PyramidCache } from "./cache.js";
 import { prepareDecodePlan } from "./plan.js";
@@ -797,7 +798,9 @@ export class PyramidWorkerPool {
 
 // Grok3 #38-39 module-level consts (evaluated once)
 const HWC = (globalThis as any).navigator?.hardwareConcurrency ?? 4;
-const CAN_PARALLEL = canUseParallelTileWorkers();
+// NOTE: parallel-worker viability (canUseParallelTileWorkers) is queried at the decision site
+// rather than cached at module load — it depends only on `Worker` presence (finding 82) which a
+// test harness (or an SSR→hydration transition) may install after this module is first imported.
 
 /** Hoisted predicate (Grok4). */
 export function shouldUseParallel(
@@ -1087,40 +1090,42 @@ async function decodeTilesParallel(
 }
 
 /**
+ * The worker-pool strategy options: the full DecodeOptions surface plus the two pool-only knobs
+ * (`useSAB` zero-copy carrier, explicit `pool`). Declared once so the public overloads and the
+ * implementation agree exactly under `exactOptionalPropertyTypes` — the single orchestrator in
+ * decode-level.ts and the runtime pass full DecodeOptions here (Task 3 boundary tightening).
+ */
+export type PooledDecodeOptions = DecodeOptions & {
+  /** Opt-in SAB zero-copy for the load message when crossOriginIsolated (see canShareContainerBytes). */
+  useSAB?: boolean;
+  /**
+   * Explicit long-lived pool (owned by the runtime). Preferred over the module default singleton.
+   * Typed as the structural PyramidPoolLike so this matches DecodeOptions.pool exactly — the concrete
+   * PyramidWorkerPool satisfies it. The implementation dereferences only the PyramidPoolLike surface.
+   */
+  pool?: PyramidPoolLike;
+};
+
+/**
  * Decode a tiled viewport with optional parallel per-tile workers (Grok2 protocol).
  * Uses bytesId + load/decode split. 16-bit now wired at root via format.
  */
 export async function decodeTiledViewportPooled(
   containerBytes: Uint8Array,
   region: ImageRegion,
-  options?: {
-    parallel?: boolean;
-    decodeRegion?: RegionDecoder;
-    workerFactory?: () => WorkerLike;
-    signal?: AbortSignal;
-    /** Opt-in SAB zero-copy for the load message when crossOriginIsolated. */
-    useSAB?: boolean;
-    pool?: PyramidWorkerPool;
-  },
+  options?: PooledDecodeOptions,
 ): Promise<DecodedLevel>;
 
 export async function decodeTiledViewportPooled(
   source: Extract<LevelSource, { kind: "tiled" }>,
   region: ImageRegion,
-  options?: {
-    parallel?: boolean;
-    decodeRegion?: RegionDecoder;
-    workerFactory?: () => WorkerLike;
-    signal?: AbortSignal;
-    useSAB?: boolean;
-    pool?: PyramidWorkerPool;
-  },
+  options?: PooledDecodeOptions,
 ): Promise<DecodedLevel>;
 
 export async function decodeTiledViewportPooled(
   arg1: Uint8Array | Extract<LevelSource, { kind: "tiled" }>,
   region: ImageRegion,
-  options?: DecodeOptions & { useSAB?: boolean; pool?: PyramidWorkerPool },
+  options?: PooledDecodeOptions,
 ): Promise<DecodedLevel> {
   const signal = options?.signal;
   if (signal?.aborted) throw new PyramidError('ABORTED', 'decode aborted before start');
@@ -1198,7 +1203,7 @@ export async function decodeTiledViewportPooled(
   try {
     const wantParallel = (options?.pool != null)
       ? (options?.parallel !== false) && plan.tiles.length > 1
-      : shouldUseParallel(options, plan.tiles.length, CAN_PARALLEL);
+      : shouldUseParallel(options, plan.tiles.length, canUseParallelTileWorkers());
 
     if (!wantParallel) {
       const direct = signal ? await raceWithAbort(decodeRegion(source.bytes, vp), signal) : await decodeRegion(source.bytes, vp);
@@ -1268,7 +1273,9 @@ export async function decodeTiledViewportPooled(
     }
 
     // #41: pool from caller opts.pool (preferred) or module singleton (created once outside hot path via getOrCreate when factory provided)
-    let p: PyramidWorkerPool;
+    // PyramidPoolLike is the structural surface both an injected pool and the module singleton satisfy;
+    // the impl below dereferences only that surface (allocateBytesId/acquire/ensureLoaded/release/requestTimeout).
+    let p: PyramidPoolLike;
     if (options?.pool) {
       p = options.pool;
     } else if (options?.workerFactory) {

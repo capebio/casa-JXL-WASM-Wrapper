@@ -706,7 +706,9 @@ export class PyramidWorkerPool {
 }
 // Grok3 #38-39 module-level consts (evaluated once)
 const HWC = globalThis.navigator?.hardwareConcurrency ?? 4;
-const CAN_PARALLEL = canUseParallelTileWorkers();
+// NOTE: parallel-worker viability (canUseParallelTileWorkers) is queried at the decision site
+// rather than cached at module load — it depends only on `Worker` presence (finding 82) which a
+// test harness (or an SSR→hydration transition) may install after this module is first imported.
 /** Hoisted predicate (Grok4). */
 export function shouldUseParallel(opts, numTiles, envCanParallel) {
     return (opts?.parallel !== false) && envCanParallel && numTiles > 1 && !!(opts?.workerFactory || opts?.pool);
@@ -1045,7 +1047,7 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
     try {
         const wantParallel = (options?.pool != null)
             ? (options?.parallel !== false) && plan.tiles.length > 1
-            : shouldUseParallel(options, plan.tiles.length, CAN_PARALLEL);
+            : shouldUseParallel(options, plan.tiles.length, canUseParallelTileWorkers());
         if (!wantParallel) {
             const direct = signal ? await raceWithAbort(decodeRegion(source.bytes, vp), signal) : await decodeRegion(source.bytes, vp);
             return finalizeDirectDecode(direct, vp, bpp, outBuffer, need, plan.format, cache, cacheKeyFinal, source.tileSize, source.level ?? 0, onTile);
@@ -1108,6 +1110,8 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
             return result;
         }
         // #41: pool from caller opts.pool (preferred) or module singleton (created once outside hot path via getOrCreate when factory provided)
+        // PyramidPoolLike is the structural surface both an injected pool and the module singleton satisfy;
+        // the impl below dereferences only that surface (allocateBytesId/acquire/ensureLoaded/release/requestTimeout).
         let p;
         if (options?.pool) {
             p = options.pool;
