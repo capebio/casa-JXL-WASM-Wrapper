@@ -110,9 +110,20 @@ export function buildIndexEntry(manifest: Manifest): IndexEntry {
   const bits = (l0 as { bitsPerSample?: 8 | 16 }).bitsPerSample ?? 8;
   const tiled = (l0 as { tiled?: boolean }).tiled === true;
   const tiling = (l0 as { tiling?: unknown }).tiling;
+  // finding 76 (Task 7): forward the gallery-facing `thumbhash` + `group` from the manifest's
+  // EXISTING `metadata` dict into the index entry (both optional; only emitted when the manifest
+  // actually carries them). The gallery reads these to paint an instant placeholder and to keep
+  // multi-view specimen sets contiguous — no new manifest dialect, just population of shared fields.
+  const metadata = (manifest as { metadata?: Record<string, unknown> }).metadata;
+  const thumbhash =
+    typeof metadata?.thumbhash === "string" && metadata.thumbhash.length > 0 ? metadata.thumbhash : undefined;
+  const group =
+    typeof metadata?.group === "string" && metadata.group.length > 0 ? metadata.group : undefined;
   return {
     imageId: manifest.imageId,
     aspect: manifest.aspect,
+    ...(thumbhash ? { thumbhash } : {}),
+    ...(group ? { group } : {}),
     l0: {
       contenthash: l0.contenthash,
       w: l0.w,

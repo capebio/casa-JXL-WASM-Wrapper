@@ -254,11 +254,21 @@ export const indexEntrySchema = z.object({
   }),
   // V4: optional for v2+ manifests (decoder etc not needed in index)
   schema: z.number().optional(),
+  // finding 76 (Task 7): mirror the shared jxl-pyramid reader's OPTIONAL index-entry fields so a
+  // produced index.json can carry them (the reader already validates + returns these; ingest just
+  // populates them). NOT a new dialect — the same contract, now emitted as well as read.
+  //   thumbhash — ~28-byte placeholder hash for an instant gallery skeleton before any JXL bytes.
+  //   group     — specimen/occurrence id grouping multi-view photogrammetry sets in the gallery.
+  thumbhash: z.string().min(1).optional(),
+  group: z.string().min(1).optional(),
 });
 
 export const galleryIndexSchema = z.object({
   schema: z.literal(1),  // index stays v1 for compat; entries tolerate v2 manifests
   images: z.array(indexEntrySchema),
+  // finding 76 (Task 7): optional pagination cursor for sharded (10k+ image) galleries — the
+  // relative path of the next index shard. Mirrors the shared reader's GalleryIndex.next.
+  next: z.string().min(1).optional(),
 });
 
 export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV4 | ManifestV5;

@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 
 const galleryJs = readFileSync(new URL('./pyramid-gallery.js', import.meta.url), 'utf8');
 const gridJs = readFileSync(new URL('./grid-controller.js', import.meta.url), 'utf8');
@@ -7,6 +7,7 @@ const decodeJs = readFileSync(new URL('./pyramid-decode.js', import.meta.url), '
 const html = readFileSync(new URL('./pyramid-gallery.html', import.meta.url), 'utf8');
 const lightboxJs = readFileSync(new URL('../lightbox/pyramid-lightbox.js', import.meta.url), 'utf8');
 const storeJs = readFileSync(new URL('./image-store.js', import.meta.url), 'utf8');
+const legacyRedirectHtml = readFileSync(new URL('../pyramid-gallery.html', import.meta.url), 'utf8');
 
 test('gallery fetches index.json before level bytes and lays out by aspect', () => {
   // The index is fetched through the trusted boundary (Task 8) with galleryBase as the trusted root.
@@ -143,4 +144,66 @@ test('image-store validates a real schema-5 manifest via the shared reader', asy
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+// ── Task 7: activate existing manifest/index fields (finding 76) ──────────────
+
+test('gallery consumes the shared feature module for placeholder/group/next/metadata (finding 76)', () => {
+  // The gallery activates EXISTING fields via one shared, pure module — not a new manifest dialect.
+  expect(galleryJs).toContain("from './gallery-features.js'");
+  expect(galleryJs).toContain('orderByGroup');
+  expect(galleryJs).toContain('mergeNextPage');
+  expect(galleryJs).toContain('formatMetadata');
+});
+
+test('gallery paints a thumbhash placeholder BEFORE any JXL bytes arrive (finding 76)', () => {
+  // The L0 seed's thumbhash paints an instant colour skeleton at cell-build time (before the grid
+  // observer triggers any level decode), then the canvas overwrites it once bytes land.
+  expect(galleryJs).toContain('thumbhashPlaceholderCss');
+  expect(galleryJs).toContain('decodeThumbhash');
+  expect(galleryJs).toContain('entry.thumbhash');
+  // placeholder is applied to the cell background before the grid is observed for decodes.
+  expect(galleryJs).toMatch(/backgroundColor|background-color|dataset\.thumbhash/);
+});
+
+test('gallery groups cells by the index `group` field before layout (finding 76)', () => {
+  // Grouping is applied to the (possibly multi-page-merged) image list before cells are built, and
+  // each grouped cell records its group so the DOM reflects the specimen set.
+  expect(galleryJs).toContain('orderByGroup(images)');
+  expect(galleryJs).toContain('cell.dataset.group = entry.group');
+});
+
+test('gallery follows the index `next` cursor to fetch and merge the next page (finding 76)', () => {
+  // The shared reader returns `index.next`; the gallery fetches that shard through the SAME trusted
+  // boundary and merges it (dedup by imageId) — no new fetch path, no new dialect.
+  expect(galleryJs).toContain('index.next');
+  expect(galleryJs).toContain('mergeNextPage');
+  // the next-page shard is fetched through the trusted boundary, not a bare fetch.
+  expect(galleryJs).toMatch(/fetchVerifiedAsset[\s\S]*relativePath: index\.next|relativePath: nextPath/);
+});
+
+test('gallery shows manifest metadata on open and stays graceful when it is absent (finding 76)', () => {
+  // metadata comes from the manifest via the image store; formatMetadata returns '' when absent so
+  // an image with no EXIF never breaks the lightbox open path.
+  expect(galleryJs).toContain('getManifest');
+  expect(galleryJs).toContain('formatMetadata');
+  expect(galleryJs).toContain('.metadata');
+});
+
+// ── Task 7: retire the legacy M1 gallery (finding 74) ─────────────────────────
+
+test('legacy pyramid-gallery.html is a redirect to the modular page preserving query + hash', () => {
+  // Deep links (?gallery=…#img=…) must survive the hop to the canonical modular page.
+  expect(legacyRedirectHtml).toContain('pyramid-gallery/pyramid-gallery.html');
+  expect(legacyRedirectHtml).toContain('location.search');
+  expect(legacyRedirectHtml).toContain('location.hash');
+  expect(legacyRedirectHtml).toContain('location.replace');
+  // the legacy M1 grid script must be gone (no 648-line forked lightbox loaded here).
+  expect(legacyRedirectHtml).not.toContain('src="./pyramid-gallery.js"');
+  expect(legacyRedirectHtml).not.toContain('createFilterEngine');
+});
+
+test('the legacy M1 gallery script is deleted (single canonical gallery implementation)', () => {
+  const legacyPath = new URL('../pyramid-gallery.js', import.meta.url);
+  expect(existsSync(legacyPath)).toBe(false);
 });
