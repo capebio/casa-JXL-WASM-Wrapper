@@ -11,6 +11,8 @@ import { WorkerMsg } from './worker-message-types.js';
 import { buildCalibrationMessage, calibrationToPoolSize } from './jxl-calibration-propagation.js';
 import { createReadLane } from './jxl-read-lane.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
+// Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
+import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
@@ -1203,6 +1205,21 @@ const cardByTaskId = new Map();
 let galleryDebounceTimer = null;
 
 // ---------------------------------------------------------------------------
+// Finding 40/41/46/48: per-asset state store (edit/crop/generation isolation)
+// ---------------------------------------------------------------------------
+// All editable state (crop, subjects, look, revision) is keyed on a stable
+// assetId generated from the file's full path + size + lastModified so two
+// files with the same basename in different directories cannot collide.
+// The store is the single source of truth for crop/subject persistence and
+// for sourceGeneration — a counter incremented whenever the file's bytes
+// change (reprocess), used to reject stale async decode results.
+const assetStateStore = createAssetStateStore();
+// Expose for panels.js / crop.js which run in the same page context.
+window._assetStateStore = assetStateStore;
+window._makeAssetId     = makeAssetId;
+window._normalizeCrop   = _normalizeCrop;
+
+// ---------------------------------------------------------------------------
 // CardState WeakMap — canonical per-card state store
 // ---------------------------------------------------------------------------
 // State is keyed on the card <div> element. The WeakMap holds a plain
@@ -1220,6 +1237,8 @@ const cardState = new WeakMap();
 // Used by initCardState to install proxy getters/setters on new card elements.
 const _CARD_STATE_KEYS = [
     '_file', '_taskId', '_tauriPath', '_pendingPriority', '_pendingLookBatch',
+    // Finding 40/48: stable identity + generation counter for each card.
+    '_assetId', '_sourceGeneration',
     '_lightbox', '_embeddedPreview', '_blobUrl', '_jxlDecoded',
     '_jxlThumbBmp', '_jxlThumbW', '_jxlThumbH', '_jxlProgressCacheDecodeId',
     '_thumbRgb', '_thumbW', '_thumbH',
@@ -1229,6 +1248,7 @@ const _CARD_STATE_KEYS = [
     '_jxlPrefetching', '_largePreviewFetching', '_largePreviewFetched',
     '_wb', '_colorMatrixFromMn', '_camera', '_exif',
     '_pipelineMs', '_phaseMs', '_meta', '_tauriResult',
+    '_laneRelease', '_readAbortCtrl', '_cameraWb',
 ];
 
 /**
@@ -1984,15 +2004,37 @@ function startConvert(file, existingCard) {
         if (lightboxIndex >= 0 && cards[lightboxIndex] === card) {
             drawLightboxForCard(card);
         }
+        // Finding 48: bytes are changing (reprocess) — bump the generation so any
+        // in-flight decode results from the prior task are rejected before commit.
+        if (getCardState(card)._assetId) {
+            assetStateStore.bumpGeneration(getCardState(card)._assetId);
+            getCardState(card)._sourceGeneration = assetStateStore.getOrCreate(getCardState(card)._assetId).sourceGeneration;
+        }
     }
     totalSubmitted++;
     getCardState(card)._file = file;
+    // Finding 46/40: compute stable assetId from full path (not just basename)
+    // so two files with the same name in different directories never collide.
+    {
+        const filePath = file.webkitRelativePath || (IS_TAURI ? getCardState(card)._tauriPath : null) || file.name;
+        const assetId = makeAssetId({ path: filePath, name: file.name, size: file.size, lastModified: file.lastModified });
+        getCardState(card)._assetId = assetId;
+        // Mirror into the AssetStateStore — creates or retrieves the per-asset record.
+        const asState = assetStateStore.getOrCreate(assetId);
+        getCardState(card)._sourceGeneration = asState.sourceGeneration;
+        // Expose via window so panels.js and crop.js can read it by card reference.
+        window._getCardAssetId = (c) => getCardState(c)?._assetId;
+    }
     // Check for existing sidecar dot + hydrate crop/subjects so any focal
     // subjects show up as sibling cards before the user opens the lightbox.
+    // Finding 40: pass the assetId explicitly so applySidecarEdit targets THIS card.
     if (typeof loadSidecar === 'function' && file.name) {
+        const _assetIdForSidecar = getCardState(card)._assetId;
         loadSidecar(file.name).then(s => {
             if (!s) return;
             if (typeof updateSidecarDot === 'function') updateSidecarDot(file.name, true);
+            // Route through assetStateStore to keep edit state isolated.
+            if (_assetIdForSidecar) assetStateStore.applySidecarEdit(_assetIdForSidecar, s);
             if (typeof window.applyCropAndSubjectsToCard === 'function') {
                 window.applyCropAndSubjectsToCard(card, s);
             }
@@ -2544,7 +2586,18 @@ function repaintThumbFromJxl(card) {
             }
         }
     }
+    // Finding 48: stamp a generation tag so the callback rejects stale results
+    // from a prior encode if the card was reprocessed while the decode was in flight.
+    const _thumbDecodeTag = (() => {
+        const assetId = getCardState(card)?._assetId;
+        return assetId ? assetStateStore.makeResultTag(assetId) : null;
+    })();
     decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
+        // Finding 48: reject stale results before any canvas/cache mutation.
+        if (_thumbDecodeTag) {
+            const asState = assetStateStore.getOrCreate(_thumbDecodeTag.assetId);
+            if (assetStateStore.isStale(_thumbDecodeTag, asState)) return;
+        }
         if (msg.type === 'decode_error') {
             console.warn('JXL thumb decode error:', msg.error);
             return;
@@ -2562,6 +2615,12 @@ function repaintThumbFromJxl(card) {
         createImageBitmap(new ImageData(rgba, w, h), {
             resizeWidth: targetW, resizeHeight: targetH, resizeQuality: 'high',
         }).then(bmp => {
+            // Guard again after the async createImageBitmap — generation may have
+            // advanced while we awaited the bitmap creation.
+            if (_thumbDecodeTag) {
+                const asState = assetStateStore.getOrCreate(_thumbDecodeTag.assetId);
+                if (assetStateStore.isStale(_thumbDecodeTag, asState)) { try { bmp.close(); } catch {} return; }
+            }
             canvas.width = targetW;
             canvas.height = targetH;
             const ctx = canvas.getContext('2d');
@@ -2832,8 +2891,19 @@ function drawLightboxForCard(card) {
             // Decode in flight — keep whatever pixels are on screen, show loader.
             lbLoadingBadge.hidden = false;
             updateToggleButtonState(card);
+            // Finding 48: stamp generation at dispatch so stale results from a prior
+            // reprocess are rejected before any canvas/cache mutation.
+            const _lbDecodeTag = (() => {
+                const assetId = getCardState(card)?._assetId;
+                return assetId ? assetStateStore.makeResultTag(assetId) : null;
+            })();
             decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
                 if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
+                // Finding 48: reject stale decode before touching canvas.
+                if (_lbDecodeTag) {
+                    const asState = assetStateStore.getOrCreate(_lbDecodeTag.assetId);
+                    if (assetStateStore.isStale(_lbDecodeTag, asState)) return;
+                }
                 if (msg.type === 'decode_error') {
                     console.warn('JXL decode error:', msg.error);
                     lbLoadingBadge.hidden = true;
@@ -3191,9 +3261,20 @@ function prefetchJxl(card, priority = 'normal') {
     if (getCardState(card)._jxlDecoded) return;
     if (getCardState(card)._jxlPrefetching) return;
     getCardState(card)._jxlPrefetching = true;
+    // Finding 48: stamp the result tag at dispatch time so the callback can
+    // reject stale results that arrive after a reprocess has bumped the generation.
+    const _prefetchTag = (() => {
+        const assetId = getCardState(card)._assetId;
+        return assetId ? assetStateStore.makeResultTag(assetId) : null;
+    })();
     decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
         if (msg.type === 'decode_error' || msg.type === 'jxl_decoded' || msg.isFinal === true) {
             getCardState(card)._jxlPrefetching = false;
+        }
+        // Finding 48: reject stale results before touching the cache or canvas.
+        if (_prefetchTag) {
+            const asState = assetStateStore.getOrCreate(_prefetchTag.assetId);
+            if (assetStateStore.isStale(_prefetchTag, asState)) return;
         }
     }, priority, {
         progressive: true,
