@@ -44,3 +44,52 @@ test('levelInfo literal records contenthash, dimensions, size and bitsPerSample'
   // bits is 16 on the use16 path, 8 otherwise.
   expect(source).toMatch(/bits = 16/);
 });
+
+test('loadLevel guards against stale-load overwrite: capture token before await, recheck before commit (finding 42)', () => {
+  // A per-open generation + monotonic-rank guard.
+  expect(source).toContain('createLoadGuard');
+  // A new generation is opened on every open/navigate.
+  expect(source).toContain('loadGuard.newGeneration(item.id)');
+  // The token is captured (begin) BEFORE the fetch/decode awaits.
+  expect(source).toMatch(/const token = loadGuard\.begin\(/);
+  // Both decode branches recheck canCommit BEFORE committing decoded pixels.
+  const canCommitCount = (source.match(/loadGuard\.canCommit\(token\)/g) || []).length;
+  expect(canCommitCount).toBeGreaterThanOrEqual(2);
+  // begin() must appear before the first await in loadLevel (capture-before-await).
+  const loadStart = source.indexOf('async function loadLevel');
+  const beginIdx = source.indexOf('loadGuard.begin(', loadStart);
+  const firstAwaitIdx = source.indexOf('await getLevelBytes', loadStart);
+  expect(beginIdx).toBeGreaterThan(loadStart);
+  expect(beginIdx).toBeLessThan(firstAwaitIdx);
+});
+
+test('the guard commits only monotonically-better levels for the same generation', () => {
+  // canCommit is rank-gated and commit advances the floor.
+  expect(source).toContain('loadGuard.commit(token)');
+});
+
+test('open() guards its synchronous LRU-seed / blank-buffer writes against a stale generation (finding 42, M-1)', () => {
+  // open() bumps the generation, then awaits getManifest. The seed writes on
+  // resume (levelPixels/levelInfo/offscreen + blank-buffer fallback) must be gated
+  // so a rapid second open()/navigate() during the manifest await cannot have its
+  // view clobbered by the earlier open's stale seed.
+  const openStart = source.indexOf('async function open(');
+  expect(openStart).toBeGreaterThan(-1);
+  const openSrc = source.slice(openStart);
+
+  // A token is captured at the TOP of open(), right after the generation bump and
+  // BEFORE the manifest await.
+  const tokenIdx = openSrc.indexOf('const openToken = loadGuard.begin(');
+  expect(tokenIdx).toBeGreaterThan(-1);
+  const manifestAwaitIdx = openSrc.indexOf('await getManifest(');
+  expect(manifestAwaitIdx).toBeGreaterThan(-1);
+  // capture-before-await: the openToken is captured before the manifest await.
+  expect(tokenIdx).toBeLessThan(manifestAwaitIdx);
+
+  // The seed writes are gated on a canCommit(openToken) recheck taken AFTER the await.
+  const seedGateIdx = openSrc.indexOf('loadGuard.canCommit(openToken)');
+  expect(seedGateIdx).toBeGreaterThan(manifestAwaitIdx);
+  // The LRU-seed branch and the blank-buffer fallback both consult that gate.
+  expect(openSrc).toMatch(/if \(seedIsCurrent && init/);
+  expect(openSrc).toMatch(/else if \(!seeded && seedIsCurrent\)/);
+});

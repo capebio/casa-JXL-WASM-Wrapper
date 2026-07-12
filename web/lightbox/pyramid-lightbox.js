@@ -36,7 +36,8 @@ import {
   canUseWebGL16,
 } from './webgl-pipeline.js';
 import { decodePyramidRegion } from '../pyramid-gallery/pyramid-decode.js';
-import { chooseLevelForTarget, shouldUpgrade } from '../../packages/jxl-pyramid/dist/choose-level.js';
+import { chooseLevelForTarget, shouldUpgrade, levelRank } from '../../packages/jxl-pyramid/dist/choose-level.js';
+import { createLoadGuard } from './load-generation.js';
 
 /**
  * @param {{
@@ -74,6 +75,12 @@ export function createPyramidLightbox(deps) {
   let itemsList = [];
   let currentIdx = 0;
   let item = null;
+
+  // finding 42: a per-open generation + monotonic-rank guard so a late OLD-image
+  // (or lower-level) decode cannot overwrite the current view. Every open/navigate
+  // opens a new generation; loadLevel captures a token before its awaits and
+  // rechecks it before committing decoded pixels to the shared state below.
+  const loadGuard = createLoadGuard();
 
   const VIEW_W = 600;
   const VIEW_H = 400;
@@ -401,6 +408,15 @@ export function createPyramidLightbox(deps) {
     log?.(`plb load ${level.size || level.w} ch=${level.contenthash.slice(0,8)} ${use16 ? '16bit' : '8bit'}${level.tiled ? ' tiled' : ''}`);
 
     const entry = level;
+    // finding 42: capture the load's generation + item + monotonic rank BEFORE any
+    // await. The token is rechecked (canCommit) right before the decoded pixels are
+    // written to the shared view state, so a late OLD-image or lower-level decode
+    // cannot clobber the current image/level.
+    const token = loadGuard.begin({
+      itemId: item.id,
+      contenthash: entry.contenthash,
+      rank: levelRank({ w: entry.w || 0, h: entry.h || 0 }),
+    });
     // Trusted boundary (finding 73): supply the level's declared byte size so the fetch is capped
     // precisely; a bare l0 seed without `bytes` falls back to the store ceiling.
     const bytes = await getLevelBytes(entry.contenthash, { expectedBytes: entry.bytes });
@@ -416,6 +432,9 @@ export function createPyramidLightbox(deps) {
         format: use16 ? 'rgba16' : 'rgba8',
         region,
       });
+      // Stale-load guard: another open/navigate (or a better level) landed while we
+      // were decoding — drop this result rather than overwrite the current view.
+      if (!loadGuard.canCommit(token)) return;
       const bits = use16 ? 16 : 8;
       levelRaw16 = use16 ? pixels : null;
       levelPixels = use16 ? pixels : new Uint8ClampedArray(pixels.buffer, pixels.byteOffset, pixels.byteLength);
@@ -431,6 +450,7 @@ export function createPyramidLightbox(deps) {
       offscreen = document.createElement('canvas');
       offscreen.width = width;
       offscreen.height = height;
+      loadGuard.commit(token);
       reapplyToOffscreen();
       startCrossfade();
       redraw();
@@ -455,6 +475,8 @@ export function createPyramidLightbox(deps) {
     let last = null;
     for await (const f of session.frames()) if (f?.pixels) last = f;
     if (!last) return;
+    // Stale-load guard (finding 42): recheck the captured token before committing.
+    if (!loadGuard.canCommit(token)) return;
 
     let raw;
     let bits = 8;
@@ -477,6 +499,7 @@ export function createPyramidLightbox(deps) {
     offscreen = document.createElement('canvas');
     offscreen.width = levelInfo.w;
     offscreen.height = levelInfo.h;
+    loadGuard.commit(token);
     reapplyToOffscreen();
     startCrossfade();
     redraw();
@@ -711,6 +734,18 @@ export function createPyramidLightbox(deps) {
     item = itemsList[currentIdx];
     if (!item) return;
 
+    // finding 42: bump the load generation for this open/navigate. Any decode
+    // captured under a prior generation will be rejected at its commit point, so a
+    // late old-image load cannot overwrite the newly-opened image.
+    loadGuard.newGeneration(item.id);
+    // finding 42 (M-1): capture THIS open's generation BEFORE the manifest await
+    // below. On resume we re-check canCommit(openToken) before the synchronous
+    // LRU-seed / blank-buffer writes, so a rapid second open()/navigate() that
+    // ran during our await cannot have its view clobbered by our stale seed. Rank
+    // -Infinity keeps the seed at the monotonic floor: it commits only when it is
+    // the FIRST paint of a still-current generation, never over a real level.
+    const openToken = loadGuard.begin({ itemId: item.id, contenthash: 'open-seed', rank: -Infinity });
+
     eng = createFilterEngine(LightboxPreset.NONE);
     for (const k of ADJUSTMENT_PARAMS) adjustments[k] = 0;
     zoom = 1; panX = 0; panY = 0; crossfade = 0;
@@ -750,8 +785,14 @@ export function createPyramidLightbox(deps) {
 
     let seeded = false;
 
+    // finding 42 (M-1): if a newer open()/navigate() bumped the generation during
+    // the manifest await, this open is stale — skip the synchronous seed writes so
+    // they cannot clobber the current image's view. loadLevel() below has its own
+    // per-load guard, so only the seed / blank-fallback writes are gated here.
+    const seedIsCurrent = loadGuard.canCommit(openToken);
+
     // LRU first (8-bit decoded levels only).
-    if (init && !init.tiled && !is16bitMode) {
+    if (seedIsCurrent && init && !init.tiled && !is16bitMode) {
       const hit = lruGet(init.contenthash);
       if (hit) {
         levelPixels = new Uint8ClampedArray(hit.pixels);
@@ -759,13 +800,16 @@ export function createPyramidLightbox(deps) {
         offscreen = document.createElement('canvas');
         offscreen.width = hit.w; offscreen.height = hit.h;
         reapplyToOffscreen();
+        // Advance the monotonic floor for the LRU seed so a late equal/lower decode
+        // from this generation cannot clobber it (finding 42).
+        loadGuard.commit(loadGuard.begin({ itemId: item.id, contenthash: init.contenthash, rank: levelRank({ w: hit.w || 0, h: hit.h || 0 }) }));
         seeded = true;
       }
     }
 
     if (init && !seeded) {
       await loadLevel(init);
-    } else if (!seeded) {
+    } else if (!seeded && seedIsCurrent) {
       levelPixels = new Uint8ClampedArray(VIEW_W * VIEW_H * 4);
       levelInfo = {w: VIEW_W, h: VIEW_H, size: Math.max(VIEW_W, VIEW_H), contenthash: 'fallback', bitsPerSample: 8};
       offscreen = document.createElement('canvas');
