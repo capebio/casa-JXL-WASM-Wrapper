@@ -100,6 +100,8 @@ const TAG_COLOR_MATRIX_1: u16 = 0xC621;
 const TAG_COLOR_MATRIX_2: u16 = 0xC622;
 const TAG_FORWARD_MATRIX_1: u16 = 0xC714;
 const TAG_FORWARD_MATRIX_2: u16 = 0xC715;
+const TAG_CALIBRATION_ILLUMINANT_1: u16 = 0xC65A;
+const TAG_CALIBRATION_ILLUMINANT_2: u16 = 0xC65B;
 
 pub(crate) const XYZ_D50_TO_SRGB: [[f32; 3]; 3] = [
     [3.133_856_1, -1.616_866_7, -0.490_614_6],
@@ -179,14 +181,13 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
     let mut out = vec![0u16; width * height];
 
     // Guard: decode_uncompressed assumes 1 sample/pixel (one u16 per mosaic cell).
-    // A multi-sample uncompressed DNG (e.g. linear/demosaiced RGB, cps>1) would be
+    // A multi-sample uncompressed DNG that is NOT linear-RGB (handled above) would be
     // silently mis-decoded as Bayer data — wrong stride, garbage output. Bail early
-    // with a clear error rather than produce corrupt pixel data. Multi-sample
-    // uncompressed decode is not implemented (out of scope).
+    // with a clear error rather than produce corrupt pixel data.
     if raw.compression == 1 && cps != 1 {
         bail!(
             "DNG: uncompressed multi-sample DNG not supported (SamplesPerPixel={}); \
-             only single-sample (Bayer mosaic) is implemented",
+             only single-sample (Bayer mosaic) or linear-RGB is implemented",
             cps
         );
     }
@@ -206,12 +207,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
 
     let black = raw.black_level.unwrap_or(0);
     let white = raw.white_level.unwrap_or(16383);
-    let color_matrix = choose_camera_to_srgb_matrix(
-        state.forward_matrix_1,
-        state.forward_matrix_2,
-        state.color_matrix_1,
-        state.color_matrix_2,
-    );
+    let (color_matrix, _prov) = resolve_camera_to_srgb(&CalibrationInputs::from_state(&state));
     // Color matrix (camera native -> sRGB via XYZ) is passed through to higher
     // LookRenderer for the advanced non-Riemannian / log geodesic / Molchanov
     // perceptual model (lens17). The demosaic stage (incl. optional mhc_matrix
@@ -301,12 +297,7 @@ fn dng_meta(
         wb_b: wb_g_neutral / wb_b_neutral.max(1e-6),
         // Finding 51: honest provenance — mirrors DngImage (AsShotNeutral presence).
         wb_from_camera: state.as_shot_neutral.is_some(),
-        color_matrix: choose_camera_to_srgb_matrix(
-            state.forward_matrix_1,
-            state.forward_matrix_2,
-            state.color_matrix_1,
-            state.color_matrix_2,
-        ),
+        color_matrix: resolve_camera_to_srgb(&CalibrationInputs::from_state(state)).0,
         iso: state.iso,
         baseline_exposure: state.baseline_exposure.unwrap_or(0.0),
         orientation: state.orientation.unwrap_or(1),
@@ -1098,6 +1089,9 @@ struct WalkState {
     color_matrix_2: Option<[[f32; 3]; 3]>,
     forward_matrix_1: Option<[[f32; 3]; 3]>,
     forward_matrix_2: Option<[[f32; 3]; 3]>,
+    /// CalibrationIlluminant1/2 (EXIF LightSource enum). `None` when the tag is absent.
+    calibration_illuminant_1: Option<u16>,
+    calibration_illuminant_2: Option<u16>,
     iso: Option<u32>,
     baseline_exposure: Option<f32>,
     make: String,
@@ -1335,6 +1329,14 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 TAG_FORWARD_MATRIX_2 => {
                     state.forward_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                TAG_CALIBRATION_ILLUMINANT_1 => {
+                    state.calibration_illuminant_1 =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
+                }
+                TAG_CALIBRATION_ILLUMINANT_2 => {
+                    state.calibration_illuminant_2 =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
                 }
                 // ── Additional noise-metadata tags ────────────────────────────
                 // (TAG_BLACK_LEVEL=0xC61A and TAG_WHITE_LEVEL=0xC61D are handled
@@ -1732,18 +1734,322 @@ pub(crate) fn invert3x3(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     ])
 }
 
-fn choose_camera_to_srgb_matrix(
+/// All colour-calibration inputs pulled from the DNG IFD. Bundled so the single
+/// dual-illuminant resolver ([`resolve_camera_to_srgb`]) sees the whole picture:
+/// both endpoint calibrations, their illuminants, and the shot neutral used to
+/// pick where between the two the scene sits.
+#[derive(Clone, Copy, Default)]
+struct CalibrationInputs {
     forward_matrix_1: Option<[[f32; 3]; 3]>,
     forward_matrix_2: Option<[[f32; 3]; 3]>,
     color_matrix_1: Option<[[f32; 3]; 3]>,
     color_matrix_2: Option<[[f32; 3]; 3]>,
+    illuminant_1: Option<u16>,
+    illuminant_2: Option<u16>,
+    as_shot_neutral: Option<[f32; 3]>,
+}
+
+impl CalibrationInputs {
+    fn from_state(state: &WalkState) -> Self {
+        CalibrationInputs {
+            forward_matrix_1: state.forward_matrix_1,
+            forward_matrix_2: state.forward_matrix_2,
+            color_matrix_1: state.color_matrix_1,
+            color_matrix_2: state.color_matrix_2,
+            illuminant_1: state.calibration_illuminant_1,
+            illuminant_2: state.calibration_illuminant_2,
+            as_shot_neutral: state.as_shot_neutral,
+        }
+    }
+}
+
+/// How the camera→sRGB matrix was resolved. Surfaced by [`calibration_provenance`]
+/// for the colour sign-off sheet and for debugging.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CalibrationProvenance {
+    /// `true` when the file carries two distinct calibrations AND both are usable —
+    /// i.e. the interpolation path actually ran. `false` = single-matrix path.
+    pub dual: bool,
+    /// Interpolation fraction in [0,1]: 0 = illuminant1 endpoint, 1 = illuminant2.
+    /// For the single path this is 0.0 (illuminant1) or 1.0 (illuminant2), whichever
+    /// endpoint was used, mirroring the old `.or` precedence.
+    pub fraction: f32,
+    /// Estimated correlated colour temperature (Kelvin) of the shot, from AsShotNeutral.
+    /// `0.0` when no neutral was available (fell back to a fixed endpoint).
+    pub estimated_cct: f32,
+    /// Colour temperatures (Kelvin) the two calibrations were shot at.
+    pub cct_1: f32,
+    pub cct_2: f32,
+    /// `true` when the endpoint selection / fraction came from the shot neutral;
+    /// `false` when a fallback fired (no neutral, or degenerate CCTs).
+    pub from_neutral: bool,
+}
+
+/// Map an EXIF LightSource / DNG CalibrationIlluminant enum to a correlated colour
+/// temperature in Kelvin. Values from the DNG 1.4 spec / EXIF LightSource table. Only
+/// the common studio/daylight illuminants a DNG realistically calibrates against are
+/// listed; anything unknown returns `None` (caller then treats the pair as
+/// non-interpolatable and keeps the single-matrix path → zero drift).
+fn illuminant_to_cct(code: u16) -> Option<f32> {
+    Some(match code {
+        1 => 6504.0,  // Daylight
+        2 => 4230.0,  // Fluorescent (approx; F2-ish)
+        3 => 3200.0,  // Tungsten (incandescent)
+        4 => 5500.0,  // Flash
+        9 => 6504.0,  // Fine weather (D65-ish)
+        10 => 6504.0, // Cloudy (approx)
+        11 => 7500.0, // Shade
+        12 => 6430.0, // Daylight fluorescent (D 5700-7100K)
+        13 => 5000.0, // Day white fluorescent
+        14 => 4230.0, // Cool white fluorescent
+        15 => 3450.0, // White fluorescent
+        17 => 2856.0, // Standard illuminant A (tungsten)
+        18 => 4874.0, // Standard illuminant B
+        19 => 6774.0, // Standard illuminant C
+        20 => 5503.0, // D55
+        21 => 6504.0, // D65
+        22 => 7504.0, // D75
+        23 => 5003.0, // D50
+        24 => 3200.0, // ISO studio tungsten
+        _ => return None,
+    })
+}
+
+/// Camera→XYZ(D50) from a single ColorMatrix (`XYZ→camera`) by inversion, or from a
+/// ForwardMatrix (`camera→XYZ(D50)`) directly. ForwardMatrix wins when present. Returns
+/// the camera→XYZ(D50) matrix (NOT yet multiplied by XYZ→sRGB).
+fn camera_to_xyz_d50(
+    forward: Option<[[f32; 3]; 3]>,
+    color: Option<[[f32; 3]; 3]>,
 ) -> Option<[[f32; 3]; 3]> {
-    if let Some(m) = forward_matrix_2.or(forward_matrix_1) {
+    if let Some(fm) = forward {
+        return Some(fm);
+    }
+    invert3x3(color?)
+}
+
+/// Single-illuminant camera→sRGB from just a ColorMatrix (XYZ→camera). Public so the
+/// colour sign-off test can pin "single-matrix path is unchanged" against the exact
+/// expression the pre-T9 code produced.
+pub fn camera_to_srgb_from_single(color_matrix: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+    let camera_to_xyz = invert3x3(color_matrix)?;
+    Some(mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz))
+}
+
+/// Element-wise linear blend `a*(1-g) + b*g`.
+fn lerp3x3(a: [[f32; 3]; 3], b: [[f32; 3]; 3], g: f32) -> [[f32; 3]; 3] {
+    let mut out = [[0f32; 3]; 3];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r][c] = a[r][c] * (1.0 - g) + b[r][c] * g;
+        }
+    }
+    out
+}
+
+/// Estimate the shot's CCT and the interpolation fraction between the two calibrations
+/// from AsShotNeutral, following the DNG-spec inversion idea: the neutral, mapped through
+/// the (interpolated) camera→XYZ matrix, gives a white point whose CCT places the shot on
+/// the illuminant1↔illuminant2 axis. We iterate a few times because the mapping matrix
+/// itself depends on the fraction.
+///
+/// `cct1`/`cct2` are the two calibration CCTs (Kelvin). Returns `(fraction, est_cct)`
+/// with fraction in [0,1] (0 = illuminant1, 1 = illuminant2). DNG interpolates linearly
+/// in **1/CCT** (mired), which is perceptually even.
+fn estimate_fraction(
+    neutral: [f32; 3],
+    cct1: f32,
+    cct2: f32,
+    color_1: Option<[[f32; 3]; 3]>,
+    color_2: Option<[[f32; 3]; 3]>,
+    forward_1: Option<[[f32; 3]; 3]>,
+    forward_2: Option<[[f32; 3]; 3]>,
+) -> Option<(f32, f32)> {
+    // Guard against degenerate/equal CCTs (would divide by zero in mired space).
+    if !cct1.is_finite() || !cct2.is_finite() || (cct1 - cct2).abs() < 1.0 {
+        return None;
+    }
+    // illuminant1 is the LOWER CCT endpoint (larger mired), illuminant2 the higher.
+    let (lo_cct, hi_cct) = (cct1.min(cct2), cct1.max(cct2));
+    let mired_lo = 1.0e6 / lo_cct; // larger
+    let mired_hi = 1.0e6 / hi_cct; // smaller
+    // Whether illuminant1 is the low-CCT endpoint (so fraction maps naturally to it).
+    let one_is_low = cct1 <= cct2;
+
+    let mut g = 0.5f32; // fraction toward illuminant2
+    let mut est_cct = 0.5 * (cct1 + cct2);
+    for _ in 0..30 {
+        // Interpolate camera→XYZ at the current fraction (in the 1→2 sense).
+        let cm = match (color_1, color_2) {
+            (Some(a), Some(b)) => Some(lerp3x3(a, b, g)),
+            (a, b) => a.or(b),
+        };
+        let fm = match (forward_1, forward_2) {
+            (Some(a), Some(b)) => Some(lerp3x3(a, b, g)),
+            (a, b) => a.or(b),
+        };
+        let cam2xyz = camera_to_xyz_d50(fm, cm)?;
+        // Map the neutral (camera RGB of a grey) → XYZ → xy chromaticity → CCT.
+        let x = cam2xyz[0][0] * neutral[0] + cam2xyz[0][1] * neutral[1] + cam2xyz[0][2] * neutral[2];
+        let y = cam2xyz[1][0] * neutral[0] + cam2xyz[1][1] * neutral[1] + cam2xyz[1][2] * neutral[2];
+        let z = cam2xyz[2][0] * neutral[0] + cam2xyz[2][1] * neutral[1] + cam2xyz[2][2] * neutral[2];
+        let sum = x + y + z;
+        if sum <= 1e-9 {
+            return None;
+        }
+        let (cx, cy) = (x / sum, y / sum);
+        est_cct = xy_to_cct(cx, cy)?;
+        // Fraction in mired space between the two endpoints, clamped to [0,1].
+        let mired = 1.0e6 / est_cct.clamp(1000.0, 40000.0);
+        // frac_low_to_high: 0 at lo_cct (mired_lo) → 1 at hi_cct (mired_hi).
+        let denom = mired_hi - mired_lo;
+        let frac_lh = if denom.abs() < 1e-6 {
+            0.5
+        } else {
+            ((mired - mired_lo) / denom).clamp(0.0, 1.0)
+        };
+        // Convert to the 1→2 fraction depending on which endpoint is the low one.
+        let new_g = if one_is_low { frac_lh } else { 1.0 - frac_lh };
+        if (new_g - g).abs() < 1e-4 {
+            g = new_g;
+            break;
+        }
+        g = new_g;
+    }
+    Some((g.clamp(0.0, 1.0), est_cct))
+}
+
+/// Correlated colour temperature (Kelvin) from CIE 1931 xy via McCamy's cubic
+/// approximation. Good to ~±2K over 2000–12000K — ample for interpolation weighting.
+fn xy_to_cct(x: f32, y: f32) -> Option<f32> {
+    let denom = 0.1858 - y;
+    if denom.abs() < 1e-6 {
+        return None;
+    }
+    let n = (x - 0.3320) / denom;
+    let cct = -449.0 * n * n * n + 3525.0 * n * n - 6823.3 * n + 5520.33;
+    if cct.is_finite() && cct > 0.0 {
+        Some(cct)
+    } else {
+        None
+    }
+}
+
+/// The single owner of DNG camera→sRGB matrix resolution, dual-illuminant aware.
+///
+/// Zero-drift contract (finding 56): if the file is NOT genuinely dual-illuminant —
+/// only one ColorMatrix/ForwardMatrix, matrix1==matrix2, missing/unknown/equal
+/// illuminants, or no usable shot neutral — this resolves to the SAME matrix the
+/// pre-T9 `.or(matrix2, matrix1)` code produced, so single-matrix DNGs are byte-identical.
+///
+/// When it IS dual-illuminant (two distinct calibrations, both illuminants known, a
+/// shot neutral present), the ColorMatrix and ForwardMatrix are interpolated between the
+/// two calibrations by the shot's estimated CCT (DNG spec), then combined into camera→sRGB.
+fn resolve_camera_to_srgb(inp: &CalibrationInputs) -> (Option<[[f32; 3]; 3]>, CalibrationProvenance) {
+    // The single-matrix reference the old code would have produced (matrix2 wins).
+    let single = choose_camera_to_srgb_single(inp);
+
+    let cct1 = inp.illuminant_1.and_then(illuminant_to_cct);
+    let cct2 = inp.illuminant_2.and_then(illuminant_to_cct);
+
+    // Interpolation only when BOTH calibrations exist (at least color matrices), the two
+    // illuminants are known and distinct, and a shot neutral is available.
+    let both_color = inp.color_matrix_1.is_some() && inp.color_matrix_2.is_some();
+    let distinct = match (inp.color_matrix_1, inp.color_matrix_2) {
+        (Some(a), Some(b)) => !matrices_eq(a, b),
+        _ => false,
+    };
+    let single_prov = |from_neutral: bool| CalibrationProvenance {
+        dual: false,
+        // matrix2 (illuminant2) is the old default when both exist; else whichever endpoint.
+        fraction: if inp.color_matrix_2.is_some() || inp.forward_matrix_2.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+        estimated_cct: 0.0,
+        cct_1: cct1.unwrap_or(0.0),
+        cct_2: cct2.unwrap_or(0.0),
+        from_neutral,
+    };
+
+    if !(both_color && distinct) {
+        return (single, single_prov(false));
+    }
+    let (Some(c1), Some(c2)) = (cct1, cct2) else {
+        return (single, single_prov(false));
+    };
+    let Some(neutral) = inp.as_shot_neutral else {
+        return (single, single_prov(false));
+    };
+
+    let Some((g, est_cct)) = estimate_fraction(
+        neutral,
+        c1,
+        c2,
+        inp.color_matrix_1,
+        inp.color_matrix_2,
+        inp.forward_matrix_1,
+        inp.forward_matrix_2,
+    ) else {
+        return (single, single_prov(false));
+    };
+
+    // Interpolate both matrix families at the resolved fraction, then combine.
+    let cm = match (inp.color_matrix_1, inp.color_matrix_2) {
+        (Some(a), Some(b)) => Some(lerp3x3(a, b, g)),
+        (a, b) => a.or(b),
+    };
+    let fm = match (inp.forward_matrix_1, inp.forward_matrix_2) {
+        (Some(a), Some(b)) => Some(lerp3x3(a, b, g)),
+        (a, b) => a.or(b),
+    };
+    let cam2xyz = match camera_to_xyz_d50(fm, cm) {
+        Some(m) => m,
+        None => return (single, single_prov(false)),
+    };
+    let resolved = mul3x3(XYZ_D50_TO_SRGB, cam2xyz);
+    let prov = CalibrationProvenance {
+        dual: true,
+        fraction: g,
+        estimated_cct: est_cct,
+        cct_1: c1,
+        cct_2: c2,
+        from_neutral: true,
+    };
+    (Some(resolved), prov)
+}
+
+/// The pre-T9 single-matrix resolution: ForwardMatrix2 or 1, else ColorMatrix2 or 1
+/// inverted. Byte-identical to the old `choose_camera_to_srgb_matrix`.
+fn choose_camera_to_srgb_single(inp: &CalibrationInputs) -> Option<[[f32; 3]; 3]> {
+    if let Some(m) = inp.forward_matrix_2.or(inp.forward_matrix_1) {
         return Some(mul3x3(XYZ_D50_TO_SRGB, m));
     }
-    let color = color_matrix_2.or(color_matrix_1)?;
+    let color = inp.color_matrix_2.or(inp.color_matrix_1)?;
     let camera_to_xyz = invert3x3(color)?;
     Some(mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz))
+}
+
+fn matrices_eq(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> bool {
+    for r in 0..3 {
+        for c in 0..3 {
+            if (a[r][c] - b[r][c]).abs() > 1e-6 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Parse a DNG's calibration inputs and report how the camera→sRGB matrix would be
+/// resolved (dual-illuminant interpolation vs single-matrix), for the colour sign-off
+/// sheet. Does NOT decode pixels.
+pub fn calibration_provenance(data: &[u8]) -> Result<CalibrationProvenance> {
+    let (state, _raw, _le) = load_dng(data)?;
+    let inp = CalibrationInputs::from_state(&state);
+    let (_m, prov) = resolve_camera_to_srgb(&inp);
+    Ok(prov)
 }
 
 fn read_ascii(data: &[u8], _dtype: u16, cnt: u32, val: u32, inline_pos: usize) -> String {
@@ -1893,13 +2199,31 @@ mod tests {
         assert_matrix_close(matrix, expected);
     }
 
+    /// Helper: single-matrix resolution via the calibration bundle (no illuminants /
+    /// neutral → the dual path is inert, so this equals the pre-T9 behaviour).
+    fn single_via_inputs(
+        fm1: Option<[[f32; 3]; 3]>,
+        fm2: Option<[[f32; 3]; 3]>,
+        cm1: Option<[[f32; 3]; 3]>,
+        cm2: Option<[[f32; 3]; 3]>,
+    ) -> Option<[[f32; 3]; 3]> {
+        let inp = CalibrationInputs {
+            forward_matrix_1: fm1,
+            forward_matrix_2: fm2,
+            color_matrix_1: cm1,
+            color_matrix_2: cm2,
+            ..Default::default()
+        };
+        resolve_camera_to_srgb(&inp).0
+    }
+
     #[test]
     fn prefers_forward_matrix_2_for_camera_to_srgb() {
         let forward_1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let forward_2 = [[0.9, 0.1, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.1]];
 
-        let matrix = choose_camera_to_srgb_matrix(Some(forward_1), Some(forward_2), None, None)
-            .expect("matrix");
+        // No illuminants / neutral → single path; matrix2 still wins (unchanged).
+        let matrix = single_via_inputs(Some(forward_1), Some(forward_2), None, None).expect("matrix");
 
         assert_matrix_close(matrix, mul3x3(XYZ_D50_TO_SRGB, forward_2));
     }
@@ -1908,7 +2232,7 @@ mod tests {
     fn falls_back_to_inverted_color_matrix_when_forward_missing() {
         let color_1 = [[2.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 5.0]];
 
-        let matrix = choose_camera_to_srgb_matrix(None, None, Some(color_1), None).expect("matrix");
+        let matrix = single_via_inputs(None, None, Some(color_1), None).expect("matrix");
         let expected = mul3x3(
             XYZ_D50_TO_SRGB,
             [[0.5, 0.0, 0.0], [0.0, 0.25, 0.0], [0.0, 0.0, 0.2]],
@@ -2150,12 +2474,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
     let wb_b = wb_g_neutral / wb_b_neutral.max(1e-6);
     let black = raw.black_level.unwrap_or(0);
     let white = raw.white_level.unwrap_or(16383);
-    let color_matrix = choose_camera_to_srgb_matrix(
-        state.forward_matrix_1,
-        state.forward_matrix_2,
-        state.color_matrix_1,
-        state.color_matrix_2,
-    );
+    let (color_matrix, _prov) = resolve_camera_to_srgb(&CalibrationInputs::from_state(&state));
     // Color matrix (camera native -> sRGB via XYZ) is passed through to higher
     // LookRenderer for the advanced non-Riemannian / log geodesic / Molchanov
     // perceptual model (lens17). The demosaic stage (incl. optional mhc_matrix
