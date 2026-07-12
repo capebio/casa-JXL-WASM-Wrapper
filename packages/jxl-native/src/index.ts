@@ -133,13 +133,21 @@ export interface DecoderOptions {
 }
 
 /**
- * Memory note for emitEveryPass + progressiveDetail:"passes" (N-15):
- * Native decoder buffers events in a vector of strong refs. Each "progress" event
- * holds a full-frame ArrayBuffer (via the iterator snapshot) until .dispose().
- * With many passes this is N_passes × frame_bytes resident while the consumer
- * drains events(). (Same batch constraint as the current iterator design.)
- * Long-term streaming iterator (decode inside push, release between yields) is
- * future work; see design note at top of native.cc:DecodeAll.
+ * Live / incremental streaming (Packet-3 Task 4, finding 20).
+ *
+ * The native decoder now processes libjxl input on each push() rather than
+ * deferring everything to close(). Events (header first, then progression /
+ * frame / final) are queued into a bounded FIFO and drained by a *live* async
+ * iterator, so a consumer awaiting events() observes header/progress events
+ * BEFORE close() when libjxl can already produce them. push() returns a Promise
+ * that resolves immediately unless the bounded queue is full and no consumer is
+ * draining, in which case it parks (backpressure) until the consumer catches up
+ * — bounding retained memory to (queue HWM events) + (one active frame buffer).
+ *
+ * Memory note for emitEveryPass + progressiveDetail:"passes": each queued
+ * "progress" event still holds a full-frame ArrayBuffer until it is drained past
+ * the head cursor / .dispose(). Backpressure caps how many undrained progress
+ * events can accumulate.
  */
 
 export interface AnimationOptions { ticksPerSecond: number; loopCount?: number; }
@@ -237,9 +245,35 @@ export const JxlFrameSetting = {
   MODULAR_PREDICTOR: 27,
 } as const;
 
+/**
+ * Generic live-stream contract (Packet-3 Task 4, finding 20).
+ *
+ * A NativeStream processes incrementally: push() feeds bytes and runs codec work
+ * eagerly; events()/chunks() are *live* async iterables that surface output as it
+ * is produced (at least one event/chunk before finish() when the codec can
+ * produce it); push() applies bounded backpressure — its Promise does not resolve
+ * while the internal queue is full and no consumer is draining. finish()/cancel()/
+ * dispose() release all native references on every exit path.
+ *
+ * NativeDecoder is NativeStream<DecodeEvent, never> with push/close naming;
+ * NativeEncoder is NativeStream<never, chunk> with pushPixels/finish naming.
+ * The generic shape is exported for consumers that want to treat either uniformly.
+ */
+export interface NativeStream<TEvent, TChunk> {
+  push(bytes: Uint8Array): Promise<void>;
+  events(): AsyncIterable<TEvent>;
+  chunks(): AsyncIterable<TChunk>;
+  finish(): Promise<void>;
+  cancel(reason?: string): Promise<void>;
+  dispose(): Promise<void>;
+}
+
 export interface NativeDecoder {
+  /** Feed encoded bytes; processed incrementally. Resolves under backpressure. */
   push(chunk: ArrayBuffer | Uint8Array): void | Promise<void>;
+  /** Signal end of input and finalize decode. */
   close(): void | Promise<void>;
+  /** Live async iterable: yields events as they are produced (before close()). */
   events(): AsyncIterable<DecodeEvent>;
   cancel(reason?: string): void | Promise<void>;
   dispose(): void | Promise<void>;
@@ -248,6 +282,7 @@ export interface NativeDecoder {
 export interface NativeEncoder {
   pushPixels(chunk: ArrayBuffer | Uint8Array, region?: Region): void | Promise<void>;
   finish(): void | Promise<void>;
+  /** Live async iterable: yields encoded chunks as they are produced. */
   chunks(): AsyncIterable<ArrayBuffer | Uint8Array>;
   cancel(reason?: string): void | Promise<void>;
   dispose(): void | Promise<void>;
@@ -376,6 +411,14 @@ function guardEncoderOptions(_opts: EncoderOptions): void {
 
 function wrapDecoder(raw: NativeDecoder): NativeDecoder {
   if ((raw as any).__jxlWrappedEvents) return raw;
+  // Packet-3 Task 4: events() is now a LIVE iterator. The native side queues
+  // events as push()/close() produce them and resolves the iterator's next()
+  // against that growing queue, so consumers can drain events *concurrently*
+  // with pushing (observing header/progress before close()). We therefore no
+  // longer gate events() behind an "input done" promise.
+  //
+  // We keep a settled marker only for the seek* shims (which are software
+  // re-scans that only make sense once all input has been decoded).
   let release!: () => void;
   const inputDone = new Promise<void>((r) => (release = r));
   const w: any = {
@@ -389,12 +432,12 @@ function wrapDecoder(raw: NativeDecoder): NativeDecoder {
     dispose: async () => {
       try { await raw.dispose(); } finally { release(); }
     },
-    events: async function* () {
-      await inputDone;
-      yield* raw.events ? raw.events() : [];
-    },
+    // Live pass-through: yield directly from the native live iterator.
+    events: () => (raw.events ? raw.events() : (async function* () {})()),
   };
-  // software seek shims for parity with WASM facade and existing .d.ts / tests (native is batch-only)
+  // software seek shims for parity with WASM facade and existing .d.ts / tests.
+  // These remain "await all input then re-scan" since a seek is only meaningful
+  // over a fully-decoded stream.
   w.seekToFrame = typeof (raw as any).seekToFrame === "function"
     ? (frameIndex: number) => (raw as any).seekToFrame(frameIndex)
     : async function* (_frameIndex: number) {
