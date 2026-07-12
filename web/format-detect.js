@@ -1,4 +1,4 @@
-import { LIBRAW_RAW_EXTENSION_PATTERN, RAW_EXTENSION_PATTERN } from './raw-extensions.js';
+import { LIBRAW_RAW_EXTENSION_PATTERN, RAW_EXTENSION_PATTERN, RAW_EXTENSIONS } from './raw-extensions.js';
 
 // Classify an uploaded file into a decode route from its header bytes + name.
 // Returns: 'raw' | 'jxl' | 'sdr' | 'tiff' | 'exr' | 'jpeg' | 'unknown'
@@ -6,6 +6,30 @@ import { LIBRAW_RAW_EXTENSION_PATTERN, RAW_EXTENSION_PATTERN } from './raw-exten
 //   tiff -> wasm decode_tiff        exr -> wasm decode_exr
 //   jpeg -> wasm decode_jpeg (editable dev-image path; lossless archival via transcodeJpegToJxl)
 //   jxl  -> existing jxl path
+
+// Finding 14 (P4 T5): single source of truth for every format the pipeline accepts.
+// The file picker `accept` attribute and the drag/drop filter both derive from this
+// list — never a hand-maintained divergent copy.
+// Includes: RAW (all families), JPEG (jpg/jpeg/jfif), TIFF (tif/tiff), EXR.
+// Excludes: sdr-only (PNG/GIF/WebP/AVIF) and JXL (handled by a separate decode path).
+const PIPELINE_NON_RAW_EXTS = Object.freeze(['jpg', 'jpeg', 'jfif', 'tif', 'tiff', 'exr']);
+
+// Returns a comma-separated accept string suitable for <input type="file" accept="...">.
+// Both lower-case and UPPER-CASE variants are included (some OS file dialogs are case-sensitive).
+export function acceptExtensions() {
+  const all = [...RAW_EXTENSIONS, ...PIPELINE_NON_RAW_EXTS];
+  return all.flatMap(e => ['.' + e, '.' + e.toUpperCase()]).join(',');
+}
+
+const PIPELINE_NON_RAW_PATTERN = /\.(jpg|jpeg|jfif|tif|tiff|exr)$/i;
+
+// Returns true when a filename (or File.name) would be handled by the worker pipeline.
+// Mirrors isPipelineInputFile in main.js but derives from this canonical list.
+export function isPipelineInput(name = '') {
+  const n = String(name);
+  return RAW_EXTENSION_PATTERN.test(n) || PIPELINE_NON_RAW_PATTERN.test(n);
+}
+
 export function detectFormat(bytes, name = '') {
   const b = bytes, n = name.toLowerCase();
   const m = (...s) => s.every((v, i) => b[i] === v);

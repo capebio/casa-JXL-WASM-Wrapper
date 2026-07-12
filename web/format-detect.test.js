@@ -1,5 +1,5 @@
 import { test, expect } from 'vitest';
-import { detectFormat, detectRawKind } from './format-detect.js';
+import { detectFormat, detectRawKind, acceptExtensions, isPipelineInput } from './format-detect.js';
 
 const bytes = (...b) => new Uint8Array(b);
 
@@ -138,4 +138,85 @@ test('detectRawKind: unrecognized magic with no supported ext → unknown (loud 
 test('detectRawKind: other Olympus II* variants fall through to orf', () => {
   // 'IIU…' with no supported extension historically routed to ORF.
   expect(detectRawKind(bytes(0x49, 0x49, 0x55, 0x53), '')).toBe('orf');
+});
+
+// ---------------------------------------------------------------------------
+// Finding 14: acceptExtensions() + isPipelineInput() — single source of truth
+// Every format the detector routes must appear in the accept list and pass
+// isPipelineInput so the picker and drag/drop never silently reject a file
+// that the worker pipeline can handle.
+// ---------------------------------------------------------------------------
+
+test('acceptExtensions returns a non-empty string with comma-separated dot-extensions', () => {
+  const acc = acceptExtensions();
+  expect(typeof acc).toBe('string');
+  expect(acc.length).toBeGreaterThan(0);
+  // Each token must start with a dot
+  for (const tok of acc.split(',')) {
+    expect(tok.trim()).toMatch(/^\.[a-zA-Z0-9]+$/);
+  }
+});
+
+test('acceptExtensions includes every RAW extension (upper and lower case)', () => {
+  const acc = acceptExtensions();
+  const RAW_EXTS = ['orf','dng','cr2','raw','arw','srf','sr2','arq','nef','nrw',
+                    'rw2','rwl','crw','cr3','raf','pef','srw','x3f','3fr','fff','iiq'];
+  for (const ext of RAW_EXTS) {
+    expect(acc).toContain(`.${ext}`);
+    expect(acc).toContain(`.${ext.toUpperCase()}`);
+  }
+});
+
+test('acceptExtensions includes JPEG extensions (jpg, jpeg, jfif — all cases)', () => {
+  const acc = acceptExtensions();
+  for (const ext of ['jpg','jpeg','jfif']) {
+    expect(acc).toContain(`.${ext}`);
+    expect(acc).toContain(`.${ext.toUpperCase()}`);
+  }
+});
+
+test('acceptExtensions includes TIFF extensions', () => {
+  const acc = acceptExtensions();
+  for (const ext of ['tif','tiff']) {
+    expect(acc).toContain(`.${ext}`);
+    expect(acc).toContain(`.${ext.toUpperCase()}`);
+  }
+});
+
+test('acceptExtensions includes EXR', () => {
+  const acc = acceptExtensions();
+  expect(acc).toContain('.exr');
+  expect(acc).toContain('.EXR');
+});
+
+test('isPipelineInput matches every format the detector handles in the worker', () => {
+  // RAW
+  expect(isPipelineInput('photo.orf')).toBe(true);
+  expect(isPipelineInput('photo.DNG')).toBe(true);
+  expect(isPipelineInput('photo.cr2')).toBe(true);
+  expect(isPipelineInput('photo.ARW')).toBe(true);
+  expect(isPipelineInput('photo.nef')).toBe(true);
+  expect(isPipelineInput('photo.rw2')).toBe(true);
+  // JPEG
+  expect(isPipelineInput('photo.jpg')).toBe(true);
+  expect(isPipelineInput('photo.JPG')).toBe(true);
+  expect(isPipelineInput('photo.jpeg')).toBe(true);
+  expect(isPipelineInput('photo.jfif')).toBe(true);
+  expect(isPipelineInput('photo.JFIF')).toBe(true);
+  // TIFF
+  expect(isPipelineInput('photo.tif')).toBe(true);
+  expect(isPipelineInput('photo.TIFF')).toBe(true);
+  // EXR
+  expect(isPipelineInput('photo.exr')).toBe(true);
+  expect(isPipelineInput('photo.EXR')).toBe(true);
+});
+
+test('isPipelineInput rejects sdr-only formats (PNG, GIF, WebP) and JXL', () => {
+  expect(isPipelineInput('photo.png')).toBe(false);
+  expect(isPipelineInput('photo.PNG')).toBe(false);
+  expect(isPipelineInput('photo.gif')).toBe(false);
+  expect(isPipelineInput('photo.webp')).toBe(false);
+  expect(isPipelineInput('photo.jxl')).toBe(false);
+  expect(isPipelineInput('photo.avif')).toBe(false);
+  expect(isPipelineInput('')).toBe(false);
 });

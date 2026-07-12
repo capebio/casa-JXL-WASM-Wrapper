@@ -97,9 +97,16 @@
         <div class="file-sidebar-panel" id="sidebar-panel">
             <div class="resize-handle" id="files-resize"></div>
             <section id="drop" class="drop-target">
-                <input type="file" id="file-input" multiple accept=".orf,.ORF,.dng,.DNG,.cr2,.CR2,.raw,.RAW,.arw,.ARW,.srf,.SRF,.sr2,.SR2,.arq,.ARQ,.nef,.NEF,.nrw,.NRW,.rw2,.RW2,.rwl,.RWL,.crw,.CRW,.cr3,.CR3,.raf,.RAF,.pef,.PEF,.srw,.SRW,.x3f,.X3F,.3fr,.3FR,.fff,.FFF,.iiq,.IIQ,.exr,.EXR,.tif,.TIF,.tiff,.TIFF,.jpg,.JPG,.jpeg,.JPEG,.jfif,.JFIF" class="visually-hidden" />
+                <!-- Finding 14 (P4 T5): accept derived at runtime from format-detect.js — no hardcoded list here. -->
+                <input type="file" id="file-input" multiple class="visually-hidden" />
                 <button id="pick">Pick image files</button>
                 <p class="hint">or drop files / folders here</p>
+                <!-- Finding 10 (P4 T5): intake mode + Develop Selected -->
+                <label class="intake-mode-label" title="Proxy-first: show camera JPEG preview instantly, skip the full RAW decode. Use &#8220;Develop Selected&#8221; to run the RAW pipeline on selected cards.">
+                    <input type="checkbox" id="proxy-intake-toggle" />
+                    Proxy-first intake
+                </label>
+                <button id="develop-selected-btn" type="button" title="Run the full RAW pipeline on selected proxy-completed cards (high priority)">Develop Selected</button>
             </section>
         </div>
     </div>

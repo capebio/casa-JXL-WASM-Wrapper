@@ -11,6 +11,12 @@ import { WorkerMsg } from './worker-message-types.js';
 import { buildCalibrationMessage, calibrationToPoolSize } from './jxl-calibration-propagation.js';
 import { createReadLane } from './jxl-read-lane.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
+// Finding 14 (P4 T5): single-source accept list + pipeline input predicate derived from
+// format-detect.js. Both the picker accept attribute and the drag/drop filter now use
+// these exports instead of hand-maintained divergent lists.
+import { acceptExtensions, isPipelineInput as _isPipelineInputByName } from './format-detect.js';
+// Finding 10 (P4 T5): proxy-first intake mode + "Develop Selected" command logic.
+import { makeIntakeMode, selectCardsForDevelop, buildDevelopTask } from './proxy-develop.js';
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
 // Findings 13, 44, 45: full-resolution export service + metadata policy + real format label.
@@ -166,7 +172,8 @@ const grid = document.getElementById('grid');
 const drop = document.getElementById('drop');
 const pick = document.getElementById('pick');
 const fileInput = document.getElementById('file-input');
-fileInput.accept = `${RAW_ACCEPT},.exr,.EXR,.tif,.TIF,.tiff,.TIFF`;
+// Finding 14 (P4 T5): derive accept from the canonical format detector — one source of truth.
+fileInput.accept = acceptExtensions();
 const statusBar = document.getElementById('status');
 const progressEl = document.getElementById('progress');
 const statusText = document.getElementById('status-text');
@@ -536,15 +543,65 @@ function currentOptions() {
     };
 }
 
-// --- JPEG proxy-view fast path (opt-in) --------------------------------------
-// When enabled, a card is completed from its embedded camera-JPEG preview (Phase A)
-// and the full RAW decode is SKIPPED — ~25-30x faster, at the cost of the camera's
-// rendering instead of the custom pipeline. Falls back to the RAW decode when no
-// embedded preview exists. Default OFF (the interactive editor needs the RAW decode);
-// enable via the console `setProxyView(true)` then re-ingest, or wire a UI checkbox to
-// it. Persists in localStorage.
-let proxyViewMode = (() => { try { return localStorage.getItem('proxyView') === '1'; } catch { return false; } })();
-window.setProxyView = (on) => { proxyViewMode = !!on; try { localStorage.setItem('proxyView', on ? '1' : '0'); } catch {} return proxyViewMode; };
+// --- Finding 10 (P4 T5): intake mode control (proxy-first vs full-develop) ----
+// proxyViewMode is now backed by the makeIntakeMode() state machine from proxy-develop.js
+// instead of a raw boolean, so the UI checkbox and the console API share a single
+// source of truth. The 'proxy' checkbox in index.html reads/writes this via
+// window.setProxyView. The "Develop Selected" button calls developSelected().
+const _intakeMode = makeIntakeMode(
+    (() => { try { return localStorage.getItem('proxyView') === '1'; } catch { return false; } })()
+);
+// Backwards-compatible getter so all existing `proxyViewMode` reads below still work.
+let proxyViewMode = _intakeMode.isProxy();
+// Keep proxyViewMode in sync whenever the mode changes.
+function _syncProxyViewMode() { proxyViewMode = _intakeMode.isProxy(); }
+
+// Public API (console + UI checkbox).
+window.setProxyView = (on) => {
+    _intakeMode.set(on);
+    _syncProxyViewMode();
+    try { localStorage.setItem('proxyView', on ? '1' : '0'); } catch {}
+    // Reflect in UI checkbox if present.
+    const cb = document.getElementById('proxy-intake-toggle');
+    if (cb) cb.checked = _intakeMode.isProxy();
+    return _intakeMode.isProxy();
+};
+
+// "Develop Selected" — Finding 10 (P4 T5): develop only the selected proxy-completed
+// cards through the P4 T1 scheduler at high priority. Does NOT call reprocessSelected()
+// (which would re-ingest ALL selected cards including already-developed ones); instead
+// it submits ONLY the proxy cards that still need a full RAW decode, using startConvert
+// (the canonical ingest entry point) with the card's existing _file reference.
+// State is preserved: _embeddedPreview, crop, subjects, sidecar dot are all intact.
+window.developSelected = function developSelected() {
+    // Build the card adapter list from the gallery (DOM-level selection).
+    const adapters = cards.map(c => ({
+        selected: c.classList.contains('selected'),
+        state:    getCardState(c),
+        _card:    c,
+    }));
+    const eligible = selectCardsForDevelop(adapters);
+    if (!eligible.length) {
+        if (typeof pushStat === 'function')
+            pushStat('[develop-selected] no proxy-completed selected cards to develop');
+        return;
+    }
+    for (const adapter of eligible) {
+        const card = adapter._card;
+        const task = buildDevelopTask(adapter, currentOptions());
+        // Mark high priority so the scheduler front-queues this card.
+        getCardState(card)._pendingPriority = task.priority;
+        // _forceDevelop bypasses the global proxyViewMode gate in startConvert so the
+        // full RAW pipeline runs even if proxy-first intake is currently enabled.
+        getCardState(card)._forceDevelop = true;
+        // startConvert with the existing card re-uses card state (crop, subjects,
+        // embeddedPreview) and goes through the full RAW pipeline. No duplication
+        // of process logic — this IS the existing process path.
+        startConvert(task.file, card);
+    }
+    if (typeof pushStat === 'function')
+        pushStat(`[develop-selected] submitted ${eligible.length} card(s) at high priority`);
+};
 function proxyCompleteCard(card, largest) {
     // The embedded preview IS the deliverable: it is already drawn on the card canvas
     // (drawOrientedThumb in Phase A). Show the JPEG download, mark done — no RAW decode.
@@ -2380,7 +2437,12 @@ function startConvert(file, existingCard) {
         refreshStatus();
     });
     } // end dispatchRaw
-    if (!proxyViewMode) dispatchRaw();
+    // Finding 10 (P4 T5): _forceDevelop overrides the global proxy-first mode so
+    // "Develop Selected" can dispatch the full RAW pipeline even while proxy-first intake
+    // is on. The flag is cleared after use so normal re-ingests still respect the mode.
+    const _forceThis = !!getCardState(card)._forceDevelop;
+    if (_forceThis) getCardState(card)._forceDevelop = false;
+    if (!proxyViewMode || _forceThis) dispatchRaw();
 }
 
 function fmtAvg(ms) {
@@ -2423,16 +2485,10 @@ async function handleFileList(fileList) {
     for (const f of inputs) startConvert(f);
 }
 
-// Supported pipeline formats: RAW (native ORF/CR2/DNG + LibRaw browser families)
-// plus developed images (EXR, TIFF, JPEG) which the worker decodes via decode_exr/
-// decode_tiff/decode_jpeg and renders through the same LookRenderer live-edit
-// engine. JPEG additionally supports lossless archival export (transcodeJpegToJxl).
-// The native RAW *pipeline* only decodes ORF/CR2/DNG; the other RAW families go
-// through the LibRaw decode path, and the JPEG-proxy fast path (setProxyView(true))
-// can render any of them (or a JPG as itself) from their embedded preview.
+// Finding 14 (P4 T5): single source of truth. Delegates to format-detect.js so the
+// drag/drop filter and picker accept attribute always agree with the worker's routing table.
 function isPipelineInputFile(file) {
-    const name = file?.name || '';
-    return isRawFilename(name) || /\.(exr|tif|tiff|jpg|jpeg|jfif)$/i.test(name);
+    return _isPipelineInputByName(file?.name || '');
 }
 
 // Walk a DataTransfer entry tree (only available on `drop` via
@@ -2566,6 +2622,22 @@ if (IS_TAURI) {
         if (!files.length) files = [...e.dataTransfer.files].filter(isPipelineInputFile);
         await handleFileList(files);
     });
+}
+
+// Finding 10 (P4 T5): wire intake mode checkbox + "Develop Selected" button.
+{
+    const proxyToggle = document.getElementById('proxy-intake-toggle');
+    if (proxyToggle) {
+        // Initialise checkbox state from persisted mode.
+        proxyToggle.checked = _intakeMode.isProxy();
+        proxyToggle.addEventListener('change', () => {
+            window.setProxyView(proxyToggle.checked);
+        });
+    }
+    const developBtn = document.getElementById('develop-selected-btn');
+    if (developBtn) {
+        developBtn.addEventListener('click', () => window.developSelected());
+    }
 }
 
 // ---------------------------------------------------------------------------
