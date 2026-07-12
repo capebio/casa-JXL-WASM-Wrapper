@@ -260,9 +260,11 @@ describe('main.js source-text: calibration propagation (finding 9)', () => {
     });
 
     test('posts calibration to workers before or at PRELOAD', () => {
-        // __calibratedThreads must be set on the worker before PRELOAD, so that
-        // initThreadPool in worker.js receives the calibrated thread count.
-        expect(mainSrc).toContain('__calibratedThreads');
+        // buildCalibrationMessage is called in _spawnWorker before PRELOAD is sent,
+        // so initThreadPool in worker.js receives the calibrated thread count.
+        // Worker.js receives 'set_calibration' and stores self.__calibratedThreads.
+        expect(mainSrc).toContain('buildCalibrationMessage');
+        expect(workerSrc).toContain('__calibratedThreads');
     });
 
     test('calibration-propagation module is imported', () => {
@@ -281,11 +283,9 @@ describe('main.js source-text: byte-admission lane (finding 39)', () => {
 
     test('file.arrayBuffer() is called inside admit().then() or after await admit()', () => {
         // The full-file read must start only after admission. Verify the pattern:
-        // either "await lane.admit" appears before "file.arrayBuffer()" in dispatchRaw,
-        // or the arrayBuffer call is inside a .then() on the admit promise.
-        // A simple source check: admit must appear in the dispatchRaw function,
-        // which contains the arrayBuffer() call.
-        expect(mainSrc).toMatch(/lane\.admit[\s\S]{0,200}arrayBuffer\(\)|arrayBuffer[\s\S]{0,200}lane\.release/);
+        // readLane.admit(...).then(lane_release => { ... file.arrayBuffer() ... })
+        // The admit call must precede arrayBuffer in the source (within dispatchRaw).
+        expect(mainSrc).toMatch(/readLane\.admit[\s\S]{0,300}arrayBuffer\(\)/);
     });
 });
 
