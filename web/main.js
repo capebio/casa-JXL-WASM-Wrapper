@@ -1060,55 +1060,61 @@ function decodeJxlViaSession(url, callback, priority = 'normal', options = {}) {
             return;
         }
 
-        const session = getContext().decode({
-            format: 'rgba8',
-            priority: sessionPriority,
-            signal: abortCtrl.signal,
-            emitEveryPass: options?.progressive !== false,
-            progressiveDetail: options?.progressiveDetail ?? 'lastPasses',
-            region: options?.region ?? null,
-            downsample: options?.downsample ?? 1,
-            frameIndex: options?.frameIndex ?? 0,
-            preserveIcc: true,
-            preserveMetadata: true,
-        });
-
-        // Consume frames as they arrive, bridging to the legacy message format.
-        const framesPromise = (async () => {
-            for await (const frame of session.frames()) {
-                const w = frame.info?.width ?? 0;
-                const h = frame.info?.height ?? 0;
-                // Normalise pixels to Uint8ClampedArray for ImageData compatibility.
-                let rgba;
-                if (frame.pixels instanceof Uint8ClampedArray
-                    && frame.pixels.byteOffset === 0
-                    && frame.pixels.byteLength === frame.pixels.buffer.byteLength) {
-                    rgba = frame.pixels;
-                } else if (frame.pixels instanceof Uint8Array
-                    && frame.pixels.byteOffset === 0
-                    && frame.pixels.byteLength === frame.pixels.buffer.byteLength) {
-                    rgba = new Uint8ClampedArray(frame.pixels.buffer);
-                } else {
-                    rgba = new Uint8ClampedArray(
-                        frame.pixels instanceof ArrayBuffer ? frame.pixels : frame.pixels,
-                    );
-                }
-                const isFinal = frame.stage === 'final';
-                if (isFinal) {
-                    // Emit jxl_progress with isFinal:true first (same pattern as jxl-decode-worker).
-                    const copy = new Uint8ClampedArray(rgba);
-                    broadcast({ type: 'jxl_progress', decodeId, rgba, w, h, isFinal: true,
-                                 stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
-                    broadcast({ type: 'jxl_decoded',  decodeId, rgba: copy, w, h, isFinal: true,
-                                 stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
-                } else {
-                    broadcast({ type: 'jxl_progress', decodeId, rgba, w, h, isFinal: false,
-                                 stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
-                }
-            }
-        })();
-
+        // I-2: the try block starts here — BEFORE getContext().decode() — so a
+        // synchronous throw from getContext() (context-creation failure) runs
+        // cleanup() via the finally and evicts the _jxlDecodeByUrl entry.
+        // A dangling entry would cause a subsequent same-URL decode to fan out
+        // to a dead session that never emits.
+        let session;
         try {
+            session = getContext().decode({
+                format: 'rgba8',
+                priority: sessionPriority,
+                signal: abortCtrl.signal,
+                emitEveryPass: options?.progressive !== false,
+                progressiveDetail: options?.progressiveDetail ?? 'lastPasses',
+                region: options?.region ?? null,
+                downsample: options?.downsample ?? 1,
+                frameIndex: options?.frameIndex ?? 0,
+                preserveIcc: true,
+                preserveMetadata: true,
+            });
+
+            // Consume frames as they arrive, bridging to the legacy message format.
+            const framesPromise = (async () => {
+                for await (const frame of session.frames()) {
+                    const w = frame.info?.width ?? 0;
+                    const h = frame.info?.height ?? 0;
+                    // Normalise pixels to Uint8ClampedArray for ImageData compatibility.
+                    let rgba;
+                    if (frame.pixels instanceof Uint8ClampedArray
+                        && frame.pixels.byteOffset === 0
+                        && frame.pixels.byteLength === frame.pixels.buffer.byteLength) {
+                        rgba = frame.pixels;
+                    } else if (frame.pixels instanceof Uint8Array
+                        && frame.pixels.byteOffset === 0
+                        && frame.pixels.byteLength === frame.pixels.buffer.byteLength) {
+                        rgba = new Uint8ClampedArray(frame.pixels.buffer);
+                    } else {
+                        rgba = new Uint8ClampedArray(
+                            frame.pixels instanceof ArrayBuffer ? frame.pixels : frame.pixels,
+                        );
+                    }
+                    const isFinal = frame.stage === 'final';
+                    if (isFinal) {
+                        // Emit jxl_progress with isFinal:true first (same pattern as jxl-decode-worker).
+                        const copy = new Uint8ClampedArray(rgba);
+                        broadcast({ type: 'jxl_progress', decodeId, rgba, w, h, isFinal: true,
+                                     stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
+                        broadcast({ type: 'jxl_decoded',  decodeId, rgba: copy, w, h, isFinal: true,
+                                     stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
+                    } else {
+                        broadcast({ type: 'jxl_progress', decodeId, rgba, w, h, isFinal: false,
+                                     stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
+                    }
+                }
+            })();
+
             await session.push(buf);
             await session.close();
             await framesPromise;
@@ -1116,6 +1122,10 @@ function decodeJxlViaSession(url, callback, priority = 'normal', options = {}) {
             if (!abortCtrl.signal.aborted) {
                 broadcast({ type: 'decode_error', decodeId, error: String(err?.message ?? err) });
             }
+            // I-2: if push()/close() threw (not from a worker-terminal message),
+            // cancel the session best-effort so the scheduler slot is released
+            // and the dangling framesPromise stream ends.
+            try { session?.cancel(); } catch {}
         } finally {
             cleanup();
         }
@@ -1298,6 +1308,16 @@ const cards = []; // ordered list of card elements for lightbox prev/next
 // route through here rather than dropping the element directly.
 function removeCard(card) {
     if (!card) return;
+    // I-1: release the read-lane byte reservation for this card if it is still
+    // held. This fires when the worker cancelled the task (emits neither DONE
+    // nor ERROR), preventing activeBytes from leaking permanently.
+    // _laneRelease is nulled by onDone/onError/arrayBuffer-catch before they
+    // call lane_release(), so the release() here only fires on the cancel path.
+    if (getCardState(card)._laneRelease) { try { getCardState(card)._laneRelease(); } catch {} getCardState(card)._laneRelease = null; }
+    // M-3: abort any still-queued or in-flight read so the AbortSignal wired
+    // into readLane.admit() cancels the queued waiter, and the fetch/session
+    // signal fires for an in-progress request.
+    if (getCardState(card)._readAbortCtrl) { try { getCardState(card)._readAbortCtrl.abort(); } catch {} getCardState(card)._readAbortCtrl = null; }
     if (getCardState(card)._taskId != null) {
         pool.cancelTask(getCardState(card)._taskId);
         try { pool.releaseState(getCardState(card)._taskId); } catch {}
@@ -2079,8 +2099,17 @@ function startConvert(file, existingCard) {
     // full file bytes are never loaded into memory until there is capacity. The
     // release() is called on task done/error or on read error, so bytes are never
     // orphaned in-memory while a card is waiting for a worker slot.
+    //
+    // I-1/M-1/M-3: create a per-card AbortController so removeCard() can (a)
+    // cancel a still-queued admission and (b) abort an in-flight fetch/session.
+    // The controller is stored on card state so removeCard() can reach it.
+    const _readAbortCtrl = new AbortController();
+    getCardState(card)._readAbortCtrl = _readAbortCtrl;
     const _readPriority = getCardState(card)._pendingPriority || 'normal';
-    readLane.admit(file.size || 0, null, _readPriority).then(lane_release => {
+    readLane.admit(file.size || 0, _readAbortCtrl.signal, _readPriority).then(lane_release => {
+    // I-1: store lane_release on card state so removeCard() can call it even
+    // when the worker cancels the task without emitting DONE or ERROR.
+    getCardState(card)._laneRelease = lane_release;
     file.arrayBuffer()
         .then((buf) => {
             const bytes = new Uint8Array(buf);
@@ -2154,7 +2183,7 @@ function startConvert(file, existingCard) {
                     }
                 },
                 onDone(msg) {
-                    lane_release(); // finding 39: release byte slot — task is complete
+                    getCardState(card)._laneRelease = null; lane_release(); // finding 39: release byte slot — task is complete
                     card.classList.remove('encoding');
                     // TTFP-4 (two-phase RAW split): THUMB carried phase-1-only
                     // timings and exif with width/height 0 (lib.rs previews-only
@@ -2221,7 +2250,7 @@ function startConvert(file, existingCard) {
                     }
                 },
                 onError(msg) {
-                    lane_release(); // finding 39: release byte slot on task error
+                    getCardState(card)._laneRelease = null; lane_release(); // finding 39: release byte slot on task error
                     card.classList.remove('busy', 'encoding');
                     card.classList.add('error');
                     card.dataset.error = msg.error;
@@ -2235,7 +2264,7 @@ function startConvert(file, existingCard) {
             cardByTaskId.set(taskId, card);
         })
         .catch((e) => {
-            lane_release(); // finding 39: release byte slot on read error
+            getCardState(card)._laneRelease = null; lane_release(); // finding 39: release byte slot on read error
             card.classList.add('error');
             card.dataset.error = e.message || String(e);
             totalDone++;

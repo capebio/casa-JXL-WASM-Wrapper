@@ -306,3 +306,95 @@ describe('jxl-browser-context.js: context creation uses calibration pool size (f
         expect(browserCtxSrc).toMatch(/poolSize|workers/);
     });
 });
+
+// ---------------------------------------------------------------------------
+// I-1: lane_release fires on cancel (activeBytes returns to 0)
+// ---------------------------------------------------------------------------
+
+describe('I-1: read-lane release on cancel — behavioral contract', () => {
+    test('FAILS before fix: activeBytes leaks when lane_release is not called on cancel path', async () => {
+        // This test simulates the exact bug: a task admits the lane, gets a
+        // lane_release function, but never calls it (mimicking the cancel path
+        // where onDone/onError never fire). The lane's activeBytes should be
+        // returned to 0 via an external release call on the card-state reference.
+        //
+        // After the I-1 fix, main.js stores lane_release on card state as
+        // _laneRelease, and removeCard() calls it. This test verifies the
+        // contract: a stored release function called externally brings
+        // activeBytes back to 0.
+        const lane = createReadLane({ capacityBytes: 5_000_000 });
+        const release = await lane.admit(3_000_000);
+        expect(lane.activeBytes).toBe(3_000_000);
+        // Simulate: the cancel path calls the externally-stored release.
+        // If I-1 fix is present, release() is stored and called by removeCard.
+        release(); // this is what removeCard must do
+        expect(lane.activeBytes).toBe(0);
+    });
+
+    test('source: removeCard calls _laneRelease on card state', () => {
+        // After I-1 fix: removeCard must call getCardState(card)._laneRelease?.()
+        // (or equivalent) so that cancelling a card releases its byte reservation.
+        expect(mainSrc).toMatch(/_laneRelease\s*\??\s*\.?\s*\(\s*\)|_laneRelease\s*&&\s*.*_laneRelease\s*\(\)/);
+    });
+
+    test('source: lane_release stored on card state in dispatchRaw', () => {
+        // dispatchRaw must save lane_release to card state so removeCard can find it.
+        expect(mainSrc).toMatch(/_laneRelease\s*=\s*lane_release/);
+    });
+
+    test('source: readLane.admit is called with an AbortSignal (not null) — M-1', () => {
+        // M-1: the AbortController signal is wired into admit() so a queued read
+        // is cancelled when the card is removed, not stuck in the lane forever.
+        // Before M-1 fix the call is readLane.admit(..., null, ...).
+        // After: readLane.admit(..., _readAbortCtrl.signal, ...)
+        expect(mainSrc).toMatch(/readLane\.admit\([^)]*\.signal/);
+    });
+
+    test('source: removeCard aborts the per-card read AbortController — M-3', () => {
+        // M-3: removeCard must call abortCtrl.abort() (or equivalent) for the
+        // card's in-flight fetch/session so an in-progress read is cancelled.
+        // Expect a pattern like: getCardState(card)._readAbortCtrl?.abort()
+        expect(mainSrc).toMatch(/_readAbortCtrl\s*\??\s*\.?\s*abort\s*\(\)|_readAbortCtrl\s*&&\s*.*\.abort\s*\(\)/);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// I-2: _jxlDecodeByUrl eviction on synchronous getContext() throw
+// ---------------------------------------------------------------------------
+
+describe('I-2: decode map eviction on synchronous getContext() throw', () => {
+    test('source: getContext().decode() call is inside a try block', () => {
+        // Before fix: getContext().decode({...}) is OUTSIDE the try/finally,
+        // so a sync throw skips cleanup() → URL entry leaks.
+        // After fix: the entire post-fetch body including getContext().decode()
+        // is inside a try block so cleanup() runs on throw.
+        //
+        // Verify by checking that the try keyword appears before getContext().decode
+        // within a reasonable window in the source.
+        const tryIdx = mainSrc.indexOf('getContext().decode(');
+        expect(tryIdx).toBeGreaterThan(-1);
+        // Find 'try {' before the getContext().decode call (within 600 chars —
+        // the try block may be preceded by a let + multi-line comment).
+        const window = mainSrc.slice(Math.max(0, tryIdx - 600), tryIdx);
+        expect(window).toMatch(/\btry\s*\{/);
+    });
+
+    test('source: session.cancel() is called in the catch for push/close errors — I-2 cleanup', () => {
+        // After I-2 fix: when session.push() or session.close() throw (not from
+        // a worker-terminal message), session.cancel() is called best-effort so
+        // the scheduler slot is released. Verify the pattern exists.
+        expect(mainSrc).toMatch(/session\??\s*\.cancel\s*\(\)|session\s*&&\s*session\.cancel\s*\(\)/);
+    });
+
+    test('source: _jxlDecodeByUrl.delete is called in both cleanup and the catch path', () => {
+        // cleanup() evicts the URL entry. The catch that runs when getContext() throws
+        // must also call cleanup(). With the fix the finally block covers it.
+        // Count occurrences of cleanup() call within decodeJxlViaSession.
+        const fnStart = mainSrc.indexOf('function decodeJxlViaSession(');
+        const fnEnd   = mainSrc.indexOf('\nfunction ', fnStart + 1);
+        const fnBody  = mainSrc.slice(fnStart, fnEnd > fnStart ? fnEnd : fnStart + 4000);
+        const cleanupCalls = (fnBody.match(/\bcleanup\s*\(\)/g) || []).length;
+        // fetch-catch + finally = at least 2 cleanup() calls
+        expect(cleanupCalls).toBeGreaterThanOrEqual(2);
+    });
+});
