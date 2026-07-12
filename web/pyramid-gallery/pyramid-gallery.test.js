@@ -29,7 +29,10 @@ test('grid uses scheduler one-shot decode with contenthash sourceKey', () => {
   expect(decodeJs).toContain('progressionTarget: \'final\'');
   expect(decodeJs).toContain('emitEveryPass: false');
   expect(decodeJs).toContain('sourceKey: opts.contenthash');
-  expect(gridJs).toContain('chooseLevelForTarget');
+  // finding 26: the grid routes level selection through the ONE resolver, not a local
+  // chooseLevelForTarget copy. The resolver internally owns that selection.
+  expect(gridJs).toContain('resolveLod');
+  expect(gridJs).not.toContain('chooseLevelForTarget(');
   expect(gridJs).toContain('shouldUpgrade');
 });
 

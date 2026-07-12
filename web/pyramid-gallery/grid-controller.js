@@ -1,4 +1,9 @@
-import { chooseLevelForTarget, shouldUpgrade } from '../../packages/jxl-pyramid/dist/choose-level.js';
+import { shouldUpgrade } from '../../packages/jxl-pyramid/dist/choose-level.js';
+// finding 26: ONE resolver across consumers. The grid no longer calls chooseLevelForTarget
+// directly — it routes demand through resolveLod, which owns the (shared) level selection and
+// tells us the delivery kind. The grid's targets stay <=2048 whole, so the resolution axis is the
+// one it exercises; the resolver's region/quality axes are used by the lightbox.
+import { resolveLod } from '../../packages/jxl-pyramid/dist/lod-resolver.js';
 import { createLevelSource } from '../../packages/jxl-pyramid/dist/level-source.js';
 import { decodePyramidLevel } from './pyramid-decode.js';
 import { createImageStore } from './image-store.js'; // S2; passed in or fallback
@@ -53,6 +58,18 @@ export function createGridController({
 
   function targetLongEdge() {
     return Math.ceil(tileSizePx * dpr);
+  }
+
+  // Capabilities for the resolver. The grid decodes whole levels (targets <=2048), so it does not
+  // request Range delivery here — it reports rangeRequests:false so the resolver always yields a
+  // whole-level for the grid. (The lightbox, which owns zoom/ROI, is the range-capable consumer.)
+  function gridCapabilities() {
+    return {
+      workers: runtime?.capabilities?.workers ?? true,
+      sharedMemory: runtime?.capabilities?.sharedMemory ?? false,
+      rangeRequests: false,
+      rgba16: runtime?.capabilities?.rgba16 ?? false,
+    };
   }
 
   // Runs the actual decode under the shared signal handed down by the lease
@@ -171,8 +188,11 @@ export function createGridController({
 
     if (!store) throw new Error('grid-controller requires imageStore (or cache+galleryBase)');
     const manifest = await store.getManifest(imageId);
-    const target = targetLongEdge();
-    const level = chooseLevelForTarget(manifest.levels, target);
+    // finding 26: route selection through the ONE resolver. For the grid this yields a whole-level
+    // (rangeRequests:false), and its `.level` is the same level the shared chooseLevelForTarget
+    // would pick — the resolver simply owns that selection now.
+    const resolution = resolveLod(manifest, { targetLongEdge: targetLongEdge(), dpr }, gridCapabilities());
+    const level = resolution?.level;
     if (!level) return;
 
     await paintLevel(cellEl, imageId, level, { priority, signal });
