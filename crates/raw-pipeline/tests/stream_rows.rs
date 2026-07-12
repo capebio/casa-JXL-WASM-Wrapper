@@ -1,18 +1,62 @@
-//! Packet-3 Task 6 finding 53: the DNG streaming row source must reproduce the batch
-//! decode bit-for-bit WITHOUT decoding a full compression-1 mosaic up front.
+//! Packet-3 Task 6 (findings 53,54): the DNG + CR2 streaming row sources must
+//! reproduce the batch decode bit-for-bit WITHOUT building a hidden full-size
+//! auxiliary mosaic during construction.
 //!
-//! BIT-EXACT full-vs-row parity — the concatenated streamed rows equal
-//! `decode_bytes().raw` for: all four CFA phases, compression 1 (strips AND tiles),
-//! both endian cases, crop-edge (odd/off-by-one) dims, and a malformed truncation that
-//! must error rather than panic; plus a real comp=7 LJPEG DNG when the fixture present.
+//! Two axes are gated here:
+//!   1. BIT-EXACT full-vs-row parity — the concatenated streamed rows equal
+//!      `decode_bytes().raw` for:
+//!        * DNG: all four CFA phases, compression 1 (strips AND tiles), both
+//!          endian cases, crop-edge (odd/off-by-one) dims, and a malformed
+//!          truncation that must error rather than panic; plus a real comp=7
+//!          LJPEG DNG when the fixture is present.
+//!        * CR2: single-slice (raster mosaic) and multi-slice (stacked slices).
+//!   2. LOWER PEAK ALLOCATION — `cr2::cr2_row_source` must NOT allocate a second
+//!      crop_w×crop_h mosaic just to gather the CFA-phase green statistics. A
+//!      counting global allocator caps the construction's peak transient at the
+//!      resident mosaic plus a small slack; a whole extra cropped mosaic (the
+//!      pre-fix behaviour) blows past that cap.
 //!
-//! The synthetic DNGs are hand-built so the non-comp=7 / non-RGGB matrix is covered
-//! without shipping a bespoke real file per case.
-//!
-//! (The CR2 finding-54 gates live alongside here, added with the CR2 change.)
+//! The synthetic DNGs are hand-built so the non-comp=7/non-RGGB matrix is covered
+//! without shipping a bespoke real file per case. The CR2 gates are fixture-gated
+//! on the real Canon corpus (skips gracefully when absent).
 
 use raw_pipeline::decompress::RawRowSource;
-use raw_pipeline::dng;
+use raw_pipeline::{cr2, dng};
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// ---------------------------------------------------------------------------
+// Counting allocator (this test binary only) for the CR2 peak-alloc probe.
+// ---------------------------------------------------------------------------
+struct Counting;
+static CUR: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Largest single live-allocation size seen while `WATCH_MIN` is armed (> 0). Lets a
+/// test detect whether a specific big buffer (e.g. a whole cropped mosaic) is still
+/// being allocated, independent of unrelated transient scratch.
+static WATCH_MIN: AtomicUsize = AtomicUsize::new(0);
+static BIG_COUNT: AtomicUsize = AtomicUsize::new(0);
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = System.alloc(l);
+        if !p.is_null() {
+            let c = CUR.fetch_add(l.size(), Ordering::Relaxed) + l.size();
+            PEAK.fetch_max(c, Ordering::Relaxed);
+            let wm = WATCH_MIN.load(Ordering::Relaxed);
+            if wm != 0 && l.size() >= wm {
+                BIG_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        CUR.fetch_sub(l.size(), Ordering::Relaxed);
+        System.dealloc(p, l);
+    }
+}
+#[global_allocator]
+static A: Counting = Counting;
 
 // ---------------------------------------------------------------------------
 // Synthetic DNG builder (little/big-endian, comp=1 strips or tiles, any CFA).
@@ -410,3 +454,111 @@ fn dng_real_comp7_full_vs_row() {
     assert!(streamed == full.raw, "comp7 streamed rows != decode_bytes().raw");
 }
 
+// ---------------------------------------------------------------------------
+// CR2 streaming: bit-exact row parity + lower peak allocation.
+// ---------------------------------------------------------------------------
+
+const CR2_SINGLE: &str = "ADH 1234.CR2";
+const CR2_MULTI: &str = "_MG_1744.CR2";
+
+fn cr2_fixture(name: &str) -> Option<Vec<u8>> {
+    let dir =
+        std::env::var("CR2_FIXTURE_DIR").unwrap_or_else(|_| r"C:\Foo\raw-converter\tests".into());
+    let p = std::path::Path::new(&dir).join(name);
+    std::fs::read(p).ok()
+}
+
+fn cr2_stream_rows(data: &[u8]) -> (usize, usize, Vec<u16>) {
+    let mut src = cr2::cr2_row_source(data).expect("cr2_row_source");
+    let (w, h) = (src.width(), src.height());
+    let mut rowbuf = vec![0u16; w];
+    let mut out = Vec::with_capacity(w * h);
+    while src.next_row_into(&mut rowbuf).expect("next_row_into") {
+        out.extend_from_slice(&rowbuf);
+    }
+    (w, h, out)
+}
+
+fn cr2_full_vs_row(name: &str) {
+    let Some(data) = cr2_fixture(name) else {
+        eprintln!("skip: no CR2 fixture ({name})");
+        return;
+    };
+    let full = cr2::decode_bytes(&data).expect("decode_bytes");
+    let (w, h, streamed) = cr2_stream_rows(&data);
+    assert_eq!((w, h), (full.width, full.height), "{name}: dims differ");
+    assert_eq!(streamed.len(), full.raw.len(), "{name}: raw len differs");
+    assert!(streamed == full.raw, "{name}: streamed rows != decode_bytes().raw");
+    // The refined CFA phase carried on the row source must match the batch path.
+    let mut src = cr2::cr2_row_source(&data).expect("cr2_row_source");
+    let _ = src.next_row_into(&mut vec![0u16; w]);
+    assert_eq!(src.cfa_phase, full.cfa_phase, "{name}: refined CFA phase differs");
+}
+
+#[test]
+fn cr2_single_slice_full_vs_row() {
+    cr2_full_vs_row(CR2_SINGLE);
+}
+
+#[test]
+fn cr2_multi_slice_full_vs_row() {
+    cr2_full_vs_row(CR2_MULTI);
+}
+
+/// Allocation gate: constructing a `Cr2RowSource` must NOT allocate a whole extra
+/// crop_w×crop_h mosaic (the pre-fix behaviour materialised the cropped mosaic just
+/// to run `refine_cfa_phase_by_green`, then dropped it).
+///
+/// The resident mosaic (`raw_buf_bytes`, ≥ the cropped mosaic) is the ONE unavoidable
+/// large buffer. Arming the allocator to count every live allocation ≥ 90% of the
+/// cropped-mosaic size isolates the two: the pre-fix code produced two such large
+/// allocations (resident + crop), the fixed code produces exactly one (resident). The
+/// reusable per-row scratch (`crop_w` u16) is orders of magnitude smaller and is not
+/// counted. Peak bytes are printed too as a secondary structural signal.
+fn cr2_peak_alloc_no_full_crop(name: &str) {
+    let Some(data) = cr2_fixture(name) else {
+        eprintln!("skip: no CR2 fixture ({name})");
+        return;
+    };
+    // Learn the resident-mosaic + cropped-mosaic sizes for this file.
+    let (_img, t) = cr2::decode_bytes_bench(&data).expect("decode_bytes_bench");
+    let resident_bytes = t.raw_buf_bytes; // stride*sof_h*2 — the mosaic we must keep
+    let crop_bytes = t.crop_buf_bytes; // crop_w*crop_h*2 — the hidden alloc to remove
+    assert!(crop_bytes > 0 && resident_bytes >= crop_bytes);
+
+    // Threshold: 90% of the cropped-mosaic size. Catches both the resident mosaic
+    // (≥ crop) and any crop-sized buffer; excludes small scratch.
+    let watch = (crop_bytes / 10) * 9;
+
+    let base = CUR.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+    BIG_COUNT.store(0, Ordering::Relaxed);
+    WATCH_MIN.store(watch, Ordering::Relaxed);
+    let src = cr2::cr2_row_source(&data).expect("cr2_row_source");
+    WATCH_MIN.store(0, Ordering::Relaxed);
+    let big = BIG_COUNT.load(Ordering::Relaxed);
+    let peak_delta = PEAK.load(Ordering::Relaxed) - base;
+    std::hint::black_box(&src);
+
+    println!(
+        "{name}: cr2_row_source big_allocs(>={watch})={big} peak_delta={peak_delta} \
+         resident={resident_bytes} crop={crop_bytes}"
+    );
+    // Exactly one crop-scale allocation (the resident mosaic). Two would mean the
+    // full cropped mosaic is still being materialised for the phase probe.
+    assert_eq!(
+        big, 1,
+        "{name}: expected exactly 1 crop-scale allocation (resident mosaic), saw {big} \
+         — a full cropped mosaic is still being allocated for CFA-phase refinement"
+    );
+}
+
+#[test]
+fn cr2_single_slice_peak_alloc() {
+    cr2_peak_alloc_no_full_crop(CR2_SINGLE);
+}
+
+#[test]
+fn cr2_multi_slice_peak_alloc() {
+    cr2_peak_alloc_no_full_crop(CR2_MULTI);
+}
