@@ -71,6 +71,47 @@ export async function decodePyramidLevel(ctx, bytes, opts) {
 }
 
 /**
+ * Decode a resolved LOD (from `@casabio/jxl-pyramid` `resolveLod`) by dispatching on its `kind` to
+ * the RIGHT existing decode path — no new decoder is introduced (Task 6, finding 2):
+ *
+ *   - 'whole-level'        → `decodePyramidLevel` over the whole level bytes.
+ *   - 'progressive-prefix' → `decodePyramidLevel` over the Range-fetched prefix bytes (a
+ *                            boundary-aligned JXL prefix decodes to its progressive tier).
+ *   - 'jxtc-ranges'        → `decodePyramidRegion` over the JXTC container for the resolved
+ *                            `region` (the tile Range fetch is the transport optimization; the
+ *                            region path is the decode). `bytes` must be the JXTC container.
+ *
+ * @param {import('@casabio/jxl-session').JxlContext} ctx
+ * @param {import('@casabio/jxl-pyramid').LodResolution} resolution
+ * @param {Uint8Array} bytes  Whole-level / prefix bytes, or the JXTC container for jxtc-ranges.
+ * @param {{ format?: 'rgba8'|'rgba16'; priority?: 'visible'|'near'|'background'; signal?: AbortSignal }} [opts]
+ */
+export async function decodeResolvedLod(ctx, resolution, bytes, opts = {}) {
+  const format = opts.format ?? (resolution.level?.bitsPerSample === 16 ? 'rgba16' : 'rgba8');
+  switch (resolution.kind) {
+    case 'whole-level':
+    case 'progressive-prefix':
+      // Whole level, or a Range-fetched progressive prefix: same monolithic-frame decode path.
+      return decodePyramidLevel(ctx, bytes, {
+        contenthash: resolution.contenthash,
+        priority: opts.priority,
+        signal: opts.signal,
+        tiled: false,
+        format,
+      });
+    case 'jxtc-ranges': {
+      // The resolver picked the overlapping tiles + a clamped region; decode that region from the
+      // JXTC container through the existing region path (reuses decodeTileContainerRegion via
+      // decodePyramidRegion). The tile Range fetch already narrowed the bytes fetched.
+      const region = resolution.region;
+      return decodePyramidRegion(bytes, { format, region });
+    }
+    default:
+      throw new Error(`decodeResolvedLod: unknown resolution kind ${resolution?.kind}`);
+  }
+}
+
+/**
  * ROI export decode via decodeRegionLod (region + optional long-edge fit).
  * Used for high-precision crop export without decoding the full frame.
  *
