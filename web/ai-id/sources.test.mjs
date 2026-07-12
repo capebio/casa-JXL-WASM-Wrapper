@@ -1,6 +1,9 @@
+// sources.test.mjs — tests for pure source constructors in sources.mjs.
+// embeddedPreviewSource (Node-only, uses sharp + node:fs) has moved to
+// node-adapter.mjs — tested separately in node-adapter.test.mjs.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { liveBufferSource, pyramidLevelSource, embeddedPreviewSource, rawDecodeSource } from "./sources.mjs";
+import { liveBufferSource, pyramidLevelSource, masterDecodeSource, rawDecodeSource } from "./sources.mjs";
 
 test("liveBufferSource yields the given pixels, or null when absent", async () => {
   const rgba = new Uint8Array(4 * 4 * 4);
@@ -15,12 +18,13 @@ test("pyramidLevelSource decodes level bytes to RGBA; null when no bytes", async
   assert.equal(await pyramidLevelSource(() => null, decodeJxl).get(), null);
 });
 
-test("embeddedPreviewSource returns RGBA for a CR2 with a large preview", async () => {
-  const sharp = (await import("sharp")).default;
-  const src = embeddedPreviewSource("c:/Foo/raw-converter/tests/ADH 1248.CR2", sharp, { minEdge: 768 });
+test("masterDecodeSource decodes master JXL bytes to RGBA; null when no bytes", async () => {
+  const decodeJxl = async (b) => ({ data: new Uint8Array(3 * 3 * 4), width: 3, height: 3 });
+  const src = masterDecodeSource(() => new Uint8Array([1, 2, 3]), decodeJxl);
   const r = await src.get();
-  assert.equal(r.w, 6000);
-  assert.equal(r.rgba.length, r.w * r.h * 4);
+  assert.equal(r.w, 3);
+  assert.equal(r.rgba.length, 3 * 3 * 4);
+  assert.equal(await masterDecodeSource(() => null, decodeJxl).get(), null);
 });
 
 test("rawDecodeSource decodes a RAW to RGBA via injected fns", async () => {

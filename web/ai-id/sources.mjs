@@ -1,6 +1,7 @@
 // Proxy source constructors for the source-priority chain (see proxy.mjs / the spec).
+// PURE: no Node built-ins, no sharp, no embedded-preview.mjs.
+// The embedded-preview source (requires node:fs + sharp) lives in node-adapter.mjs.
 // Each returns a `{ label, get }` source; `get()` yields `{ rgba, w, h }` or null.
-import { extractPreview } from "./embedded-preview.mjs";
 
 /** Already-decoded pixels (browser lightbox / batch loop). */
 export function liveBufferSource(rgba, w, h) {
@@ -16,20 +17,6 @@ export function pyramidLevelSource(getJxlBytes, decodeJxl) {
       if (!bytes) return null;
       const d = await decodeJxl(bytes);
       return { rgba: d.data, w: d.width, h: d.height };
-    },
-  };
-}
-
-/** Camera embedded preview (no decode). Rejects previews below minEdge long-edge (default 768). */
-export function embeddedPreviewSource(path, sharpMod, { minEdge = 768 } = {}) {
-  return {
-    label: "embedded-preview",
-    get: async () => {
-      let p;
-      try { p = extractPreview(path); } catch { return null; }
-      if (Math.max(p.w, p.h) < minEdge) return null;
-      const { data, info } = await sharpMod(Buffer.from(p.buffer)).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-      return { rgba: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), w: info.width, h: info.height };
     },
   };
 }

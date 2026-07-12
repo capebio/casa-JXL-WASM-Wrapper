@@ -1,16 +1,9 @@
 // AI-ID proxy encoder + source-priority chain.
-import sharp from "sharp";
+// Pure: no Node built-ins, no sharp. The Node-only encoder (nodeEncodeJpeg)
+// has moved to node-adapter.mjs; the browser encoder lives in browser-adapter.js.
 
 export const DEFAULT_MAX_EDGE = 768;
 export const DEFAULT_QUALITY = 80;
-
-/** Node JPEG encoder: RGBA raw → JPEG q, 4:2:0. */
-export async function nodeEncodeJpeg(rgba, w, h, quality) {
-  const buf = await sharp(Buffer.from(rgba.buffer, rgba.byteOffset, rgba.byteLength), { raw: { width: w, height: h, channels: 4 } })
-    .jpeg({ quality, chromaSubsampling: "4:2:0" })
-    .toBuffer();
-  return new Uint8Array(buf);
-}
 
 /** Downscale target dims for a long-edge cap, preserving aspect. Returns null if no downscale needed. */
 function targetDims(w, h, maxEdge) {
