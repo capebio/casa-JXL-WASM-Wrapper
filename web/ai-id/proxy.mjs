@@ -1,16 +1,9 @@
 // AI-ID proxy encoder + source-priority chain.
-import sharp from "sharp";
+// Pure: no Node built-ins, no sharp. The Node-only encoder (nodeEncodeJpeg)
+// has moved to node-adapter.mjs; the browser encoder lives in browser-adapter.js.
 
 export const DEFAULT_MAX_EDGE = 768;
 export const DEFAULT_QUALITY = 80;
-
-/** Node JPEG encoder: RGBA raw → JPEG q, 4:2:0. */
-export async function nodeEncodeJpeg(rgba, w, h, quality) {
-  const buf = await sharp(Buffer.from(rgba.buffer, rgba.byteOffset, rgba.byteLength), { raw: { width: w, height: h, channels: 4 } })
-    .jpeg({ quality, chromaSubsampling: "4:2:0" })
-    .toBuffer();
-  return new Uint8Array(buf);
-}
 
 /** Downscale target dims for a long-edge cap, preserving aspect. Returns null if no downscale needed. */
 function targetDims(w, h, maxEdge) {
@@ -25,7 +18,15 @@ export async function encodeProxyJpeg(rgba, w, h, opts = {}) {
   const maxEdge = opts.maxEdge ?? DEFAULT_MAX_EDGE;
   const quality = opts.quality ?? DEFAULT_QUALITY;
   const downscaleRgba = opts.downscaleRgba;
-  const encodeJpeg = opts.encodeJpeg ?? nodeEncodeJpeg;
+  // encodeJpeg is REQUIRED and injected by the caller: browser callers pass a
+  // canvas/OffscreenCanvas encoder (browser-adapter.js); Node callers pass
+  // node-adapter.nodeEncodeJpeg. This module stays free of Node/sharp/DOM.
+  const encodeJpeg = opts.encodeJpeg;
+  if (typeof encodeJpeg !== "function") {
+    throw new Error(
+      "proxy: encodeJpeg is required (browser: canvas/OffscreenCanvas; node: node-adapter.nodeEncodeJpeg)",
+    );
+  }
   const t = targetDims(w, h, maxEdge);
   let ow = w, oh = h, buf = rgba;
   if (t) {
