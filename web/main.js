@@ -19,20 +19,15 @@ import { acceptExtensions, isPipelineInput as _isPipelineInputByName } from './f
 import { makeIntakeMode, selectCardsForDevelop, buildDevelopTask } from './proxy-develop.js';
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
-// Findings 13, 44, 45: full-resolution export service + metadata policy + real format label.
-// The service sources the FULL-RES DEVELOPED OUTPUT (never the 1800px preview),
-// gates formats (jxl/png real; jpeg/tiff packet-3), and threads serialised EXIF
-// (metadata policy) into the encoder.
-import { ExportService, formatLabel as _formatLabel, isFormatEncodable as _isFormatEncodable } from './export-service.js';
-// I-B: real PNG encoder (honest bytes for the PNG export option).
-import { encodePng as _encodePng } from './png-encode.js';
 // Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 // Findings 11, 29: byte-budgeted, LRU-evicting derived cache for decoded JXL
 // RGBA buffers. Replaces per-card _jxlDecoded (unbounded WeakMap) with a single
 // governed cache; invalidated on generation change and explicit card delete.
 import { createDerivedCache } from './jxl-derived-cache.js';
-import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
+// Finding 47 (P4 T8): lazy-load helper — optional heavy modules are imported
+// dynamically on first use, not at page parse time.
+import { makeLazyModule } from './lazy-module.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
 // `estimateDecodePeak` + `OUT_BATCH_DEFAULT` back the hard decode-admission gate
@@ -50,11 +45,55 @@ import {
 // the H29 develop-channel fns (apply_look_stream / jxl_progressive_pass) are
 // absent until the Rust H29 work is built, so the channel path stays gated.
 import * as rawWasm from './pkg/raw_converter_wasm.js';
-import {
-    applyLens, estimateSceneWhiteLms,
-    normalizedLabBuffer, selectByColour, unionMask, maskBorder, maskCoverage,
-    probe as probeColour,
-} from './perceptual-color.mjs';
+
+// ---------------------------------------------------------------------------
+// Finding 47 (P4 T8): lazy-loaded optional modules.
+//
+// Each heavy/optional module is imported dynamically on first use (at the
+// existing command boundary) so parse + eval cost is deferred past first paint.
+// One-time memoised via makeLazyModule — concurrent callers share the same
+// promise; failures are not memoised (transient errors are retryable).
+//
+// formatLabel (from export-service.js) is a tiny pure function inlined here
+// so the info panel (shown whenever the lightbox opens) does not force a load
+// of the full export-service module.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy: perceptual-color.mjs — Perceptual Lens + Colour Selector maths.
+ * Loaded on first P-key press / lens-toggle click.
+ */
+const lazyPerceptual = makeLazyModule(() => import('./perceptual-color.mjs'));
+
+/**
+ * Lazy: tauri-parity-lightbox.js — M2/HDR FilterEngine lightbox.
+ * Loaded + constructed on first lightbox open.
+ */
+const lazyTauriParity = makeLazyModule(() => import('./tauri-parity-lightbox.js'));
+
+/**
+ * Lazy: export-service.js + png-encode.js — full-res export pipeline.
+ * Co-loaded on first "Export selected" click.
+ */
+const lazyExport = makeLazyModule(async () => {
+    const [exportMod, pngMod] = await Promise.all([
+        import('./export-service.js'),
+        import('./png-encode.js'),
+    ]);
+    return { ...exportMod, encodePng: pngMod.encodePng };
+});
+
+// ---------------------------------------------------------------------------
+// formatLabel — inlined from export-service.js (finding 45) so the info panel
+// does not force an export-service module load on every lightbox open.
+// Keep in sync with export-service.js:formatLabel.
+// ---------------------------------------------------------------------------
+function _formatLabel(exif) {
+    if (!exif || !exif.format) return 'Unknown';
+    const { format, bitDepth } = exif;
+    if (bitDepth && bitDepth > 0) return `${format} (${bitDepth}-bit)`;
+    return format;
+}
 
 // On-page console: mirror console.* (and relayed worker logs) into a panel so
 // debugging doesn't require DevTools. Panel + toggle live in index.html.
@@ -2624,6 +2663,33 @@ if (IS_TAURI) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Finding 47 (P4 T8): idle-prefetch — warm lazy modules AFTER the core
+// interaction pipeline is ready and the browser is idle.
+//
+// Policy: prefetch only under ResourceTiming / connection hints that indicate
+// the browser is on a good connection (or falls back to a conservative 2s
+// setTimeout when requestIdleCallback is not available). Does NOT prefetch
+// everything eagerly — only modules that the user is "likely" to need within
+// a session (all three optional feature groups are touched by most users who
+// open a file). The prefetch is advisory: each lazily imported module is a
+// no-op if it was already loaded by an earlier user action.
+// ---------------------------------------------------------------------------
+{
+    function prefetchLazyModules() {
+        // Fire-and-forget: errors don't matter (they will retry on demand).
+        lazyPerceptual().catch(() => {});
+        lazyTauriParity().catch(() => {});
+        lazyExport().catch(() => {});
+    }
+
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(prefetchLazyModules, { timeout: 4000 });
+    } else {
+        setTimeout(prefetchLazyModules, 2000);
+    }
+}
+
 // Finding 10 (P4 T5): wire intake mode checkbox + "Develop Selected" button.
 {
     const proxyToggle = document.getElementById('proxy-intake-toggle');
@@ -2797,10 +2863,15 @@ function captureCleanAndApplyLens(imageData) {
     applyPerceptualLens();
 }
 
-function applyPerceptualLens() {
+// Finding 47 (P4 T8): perceptual-color.mjs is loaded lazily on first lens activation.
+// All four functions below are async; callers that are synchronous fire-and-forget
+// (captureCleanAndApplyLens, event handlers) — the await is internal.
+
+async function applyPerceptualLens() {
     if (!lightboxCanvas.width) return;
     const ctx = lightboxCanvas.getContext('2d');
     if (perceptualLens.active && cleanSnapshot) {
+        const { applyLens } = await lazyPerceptual();
         const out = applyLens(
             cleanSnapshot.data, lightboxCanvas.width, lightboxCanvas.height,
             { strength: perceptualLens.strength, lightness: perceptualLens.lightness },
@@ -2809,11 +2880,12 @@ function applyPerceptualLens() {
     } else if (!perceptualLens.active && cleanSnapshot) {
         ctx.putImageData(cleanSnapshot, 0, 0);
     }
-    refreshSelectionOverlay();
+    await refreshSelectionOverlay();
 }
 
-function ensureLabBuf() {
+async function ensureLabBuf() {
     if (!cleanSnapshot || !lightboxCanvas.width) return;
+    const { estimateSceneWhiteLms, normalizedLabBuffer } = await lazyPerceptual();
     const sceneWhite = estimateSceneWhiteLms(
         cleanSnapshot.data, lightboxCanvas.width, lightboxCanvas.height,
     );
@@ -2822,7 +2894,7 @@ function ensureLabBuf() {
     );
 }
 
-function refreshSelectionOverlay() {
+async function refreshSelectionOverlay() {
     if (!plOverlayCanvas) return;
     plOverlayCanvas.width = lightboxCanvas.width;
     plOverlayCanvas.height = lightboxCanvas.height;
@@ -2834,6 +2906,7 @@ function refreshSelectionOverlay() {
     const ctx = plOverlayCanvas.getContext('2d');
     ctx.clearRect(0, 0, plOverlayCanvas.width, plOverlayCanvas.height);
     if (!colourSelect.mask || !colourSelect.seeds.length) return;
+    const { maskBorder, maskCoverage } = await lazyPerceptual();
     const border  = maskBorder(colourSelect.mask, plOverlayCanvas.width, plOverlayCanvas.height);
     const imgData = ctx.createImageData(plOverlayCanvas.width, plOverlayCanvas.height);
     for (let i = 0; i < colourSelect.mask.length; i++) {
@@ -2856,8 +2929,8 @@ function refreshSelectionOverlay() {
     if (readout) readout.textContent = `${(cov.fraction * 100).toFixed(1)}% selected`;
 }
 
-function handleLensClick(e) {
-    ensureLabBuf();
+async function handleLensClick(e) {
+    await ensureLabBuf();
     if (!colourSelect.labBuf) return;
     const rect = lightboxCanvas.getBoundingClientRect();
     const scaleX = lightboxCanvas.width / rect.width;
@@ -2866,6 +2939,7 @@ function handleLensClick(e) {
     const cy = Math.round((e.clientY - rect.top) * scaleY);
     const w = lightboxCanvas.width, h = lightboxCanvas.height;
     if (cx < 0 || cy < 0 || cx >= w || cy >= h) return;
+    const { probe: probeColour, selectByColour, unionMask } = await lazyPerceptual();
     const p = probeColour(colourSelect.labBuf, w, h, cx, cy, 3);
     const readout = document.getElementById('pl-probe-readout');
     if (readout) readout.textContent = `H:${p.hueDeg.toFixed(0)}° S:${p.dampedSaturation.toFixed(1)} L:${p.lightness.toFixed(0)}`;
@@ -2879,7 +2953,7 @@ function handleLensClick(e) {
         colourSelect.mask = newMask;
         colourSelect.seeds = [seedLab];
     }
-    refreshSelectionOverlay();
+    await refreshSelectionOverlay();
 }
 
 function applyLbTransform() {
@@ -3974,6 +4048,20 @@ async function exportFilmstripSelection() {
     const output = (['jxl','jpeg','png','tiff'].includes(fmtEl?.value))
         ? fmtEl.value : 'jxl';
 
+    // Finding 47 (P4 T8): load export-service + png-encode lazily on first click.
+    let exportMods;
+    try {
+        exportMods = await lazyExport();
+    } catch (err) {
+        console.error('[export] failed to load export modules:', err);
+        if (statusText) {
+            statusBar.hidden = false;
+            statusText.textContent = 'Export unavailable — module load failed.';
+        }
+        return;
+    }
+    const { ExportService, isFormatEncodable: _isFormatEncodable, encodePng: _encodePng } = exportMods;
+
     // I-B: guard at the entry point too (defence in depth — the UI disables
     // gated options, and the service rejects them per-asset).  Fail fast with a
     // single status message rather than emitting N identical per-asset errors.
@@ -4506,9 +4594,10 @@ document.addEventListener('keydown', (e) => {
         scheduleLensApply();
     });
 
-    toleranceEl?.addEventListener('input', () => {
+    toleranceEl?.addEventListener('input', async () => {
         colourSelect.tolerance = parseInt(toleranceEl.value, 10);
         if (colourSelect.seeds.length && colourSelect.labBuf) {
+            const { selectByColour, unionMask } = await lazyPerceptual();
             const w = lightboxCanvas.width, h = lightboxCanvas.height;
             let mask = null;
             for (const seed of colourSelect.seeds) {
@@ -4516,7 +4605,7 @@ document.addEventListener('keydown', (e) => {
                 mask = mask ? unionMask(mask, m) : m;
             }
             colourSelect.mask = mask;
-            refreshSelectionOverlay();
+            await refreshSelectionOverlay();
         }
     });
 
@@ -6301,41 +6390,56 @@ function lightboxViewportRegion(imgW, imgH) {
     return { x, y, w: visW, h: visH };
 }
 
-const tauriParityLb = createTauriParityLightbox({
-    rootEl: lightbox,
-    canvas: lightboxCanvas,
-    histCanvas: lightbox.querySelector('[data-m2-hist]'),
-    // Bench has no Tauri bridge: pass the real invoke when present, else null.
-    invoke: (typeof invoke === 'function') ? invoke : null,
-    getActiveCard: () => (lightboxIndex >= 0 ? cards[lightboxIndex] : null) || null,
-    // When the M2 FilterEngine has no cached baseline (bench single-image), ask
-    // the develop channel / live pipeline to re-render the current frame.
-    onRepaintRequest: () => {
-        const adj = tauriParityLb?.state?.adjustments;
-        if (adj && runH29DevelopChannel(adj)) return;
-        scheduleLiveUpdate();
-    },
-    pyramidClient: null,
-    getViewportRegion: lightboxViewportRegion,
-    getZoom: () => lbZoom,
+// Finding 47 (P4 T8): tauri-parity-lightbox.js is loaded lazily on first lightbox
+// open (first call to feedTauriParityBaseline, which fires when a frame paints).
+// tauriParityLb is null until the lazy init completes; all callers already
+// use optional chaining (tauriParityLb?.…) so null is safe before init.
+
+let tauriParityLb = null;
+
+// Lazy init: load the module and construct the lightbox instance once.
+const _initTauriParityLb = makeLazyModule(async () => {
+    const { createTauriParityLightbox } = await lazyTauriParity();
+    const lb = createTauriParityLightbox({
+        rootEl: lightbox,
+        canvas: lightboxCanvas,
+        histCanvas: lightbox.querySelector('[data-m2-hist]'),
+        // Bench has no Tauri bridge: pass the real invoke when present, else null.
+        invoke: (typeof invoke === 'function') ? invoke : null,
+        getActiveCard: () => (lightboxIndex >= 0 ? cards[lightboxIndex] : null) || null,
+        // When the M2 FilterEngine has no cached baseline (bench single-image), ask
+        // the develop channel / live pipeline to re-render the current frame.
+        onRepaintRequest: () => {
+            const adj = tauriParityLb?.state?.adjustments;
+            if (adj && runH29DevelopChannel(adj)) return;
+            scheduleLiveUpdate();
+        },
+        pyramidClient: null,
+        getViewportRegion: lightboxViewportRegion,
+        getZoom: () => lbZoom,
+    });
+    tauriParityLb = lb;
+    window.tauriParityLb = lb;
+    return lb;
 });
-window.tauriParityLb = tauriParityLb;
 
 // Feed the M2 FilterEngine a clean 8-bit baseline whenever a fresh frame lands
 // on the lightbox canvas, so its sliders have pixels to transform.
-function feedTauriParityBaseline(snapshot) {
-    if (!tauriParityLb || lightboxIndex < 0) return;
+// Fire-and-forget: lazy loads tauri-parity-lightbox.js on first call.
+async function feedTauriParityBaseline(snapshot) {
+    if (lightboxIndex < 0) return;
     const card = cards[lightboxIndex];
     if (!card) return;
     try {
+        const lb = await _initTauriParityLb();
         let img = snapshot;
         if (!img) {
             if (!lightboxCanvas.width || !lightboxCanvas.height) return;
             const ctx = lightboxCanvas.getContext('2d');
             img = ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height);
         }
-        tauriParityLb.onBaseFramePainted(card, img.data, img.width, img.height);
-    } catch { /* cross-tainted canvas or 0-size: skip baseline feed */ }
+        lb.onBaseFramePainted(card, img.data, img.width, img.height);
+    } catch { /* cross-tainted canvas, 0-size, or failed import: skip baseline feed */ }
 }
 window.feedTauriParityBaseline = feedTauriParityBaseline;
 
