@@ -56,6 +56,32 @@ describe('finding-47: optional modules not in static import block', () => {
         // After:  dynamic import only.
         expect(staticImports).not.toMatch(/from\s+['"]\.\/png-encode\.js['"]/);
     });
+
+    // --- Finding 47, Group A additions (benchmark harness + pixel-peep) ------
+
+    test('tools/benchmark.js is NOT a static top-level import', () => {
+        // The benchmark harness (~750 lines) was inline in main.js.
+        // After extraction it must only appear as a dynamic import().
+        expect(staticImports).not.toMatch(/from\s+['"]\.\/tools\/benchmark\.js['"]/);
+    });
+
+    test('tools/pixel-peep.js is NOT a static top-level import', () => {
+        // The pixel-peep compare tool (~320 lines) was inline in main.js.
+        // After extraction it must only appear as a dynamic import().
+        expect(staticImports).not.toMatch(/from\s+['"]\.\/tools\/pixel-peep\.js['"]/);
+    });
+
+    test('BENCH_CONFIGS is NOT defined at main.js module scope', () => {
+        // BENCH_CONFIGS was the first top-level const of the benchmark harness.
+        // After extraction it lives inside tools/benchmark.js only.
+        expect(mainSrc).not.toMatch(/^const BENCH_CONFIGS\s*=/m);
+    });
+
+    test('PEEP_QUALITIES is NOT defined at main.js module scope', () => {
+        // PEEP_QUALITIES was the first const of the pixel-peep section.
+        // After extraction it lives inside tools/pixel-peep.js only.
+        expect(mainSrc).not.toMatch(/^const PEEP_QUALITIES\s*=/m);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -78,6 +104,27 @@ describe('finding-47: dynamic import() present for each optional module', () => 
 
     test('main.js contains dynamic import of png-encode.js', () => {
         expect(mainSrc).toMatch(/import\s*\(\s*['"]\.\/png-encode\.js['"]\s*\)/);
+    });
+
+    // --- Finding 47, Group B additions (benchmark + pixel-peep) ---------------
+
+    test('main.js contains dynamic import of tools/benchmark.js', () => {
+        expect(mainSrc).toMatch(/import\s*\(\s*['"]\.\/tools\/benchmark\.js['"]\s*\)/);
+    });
+
+    test('main.js contains dynamic import of tools/pixel-peep.js', () => {
+        expect(mainSrc).toMatch(/import\s*\(\s*['"]\.\/tools\/pixel-peep\.js['"]\s*\)/);
+    });
+
+    test('lazyBenchmark is a memoised makeLazyModule call', () => {
+        // The benchmark module must be wrapped in makeLazyModule so it is not
+        // loaded until the first button click (or idle-prefetch fires).
+        expect(mainSrc).toMatch(/makeLazyModule\s*\(\s*\(\s*\)\s*=>\s*import\s*\(\s*['"]\.\/tools\/benchmark\.js['"]\s*\)\s*\)/);
+    });
+
+    test('lazyPixelPeep is a memoised makeLazyModule call', () => {
+        // The pixel-peep module must be wrapped in makeLazyModule for the same reason.
+        expect(mainSrc).toMatch(/makeLazyModule\s*\(async\s*\(\s*\)\s*=>/);
     });
 });
 
