@@ -140,6 +140,19 @@ export class DecodedImage {
         return ret >>> 0;
     }
     /**
+     * PRODUCT PATH entry: convert the resident RGBA pixels to the packed linear
+     * RGB16-LE full buffer ONCE, inside wasm, and hand back a [`ResidentDeveloped`]
+     * handle that builds the full / lightbox / thumbnail `LookRenderer`s from that
+     * resident buffer — the full pixels never cross the wasm boundary (finding 58).
+     * Consumes the source pixels (emptied afterwards). Call a `take_*` escape hatch
+     * first if you also need the raw typed pixels out of wasm.
+     * @returns {ResidentDeveloped}
+     */
+    into_resident() {
+        const ret = wasm.decodedimage_into_resident(this.__wbg_ptr);
+        return ResidentDeveloped.__wrap(ret);
+    }
+    /**
      * RGBA16 packed little-endian, 8 bytes/px (bit_depth == 16). Empty otherwise.
      * @returns {Uint8Array}
      */
@@ -180,6 +193,22 @@ export class DecodedImage {
         return v1;
     }
     /**
+     * Resident RGBA → packed **linear RGB16-LE** (6 B/px, alpha dropped) — the
+     * buffer `LookRenderer` consumes. Byte-identical to the worker's legacy
+     * `decodedToLinearRgb16` (proven in the raw-pipeline test suite), but the
+     * source pixels never leave wasm. Compatibility helper for any JS caller that
+     * wants the packed bytes directly; the product path uses
+     * [`Self::into_full_renderer`] which additionally keeps the packed bytes
+     * resident when constructing the renderer.
+     * @returns {Uint8Array}
+     */
+    to_linear_rgb16_le() {
+        const ret = wasm.decodedimage_to_linear_rgb16_le(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
      * @returns {number}
      */
     get width() {
@@ -188,6 +217,130 @@ export class DecodedImage {
     }
 }
 if (Symbol.dispose) DecodedImage.prototype[Symbol.dispose] = DecodedImage.prototype.free;
+
+/**
+ * Tiled learned-denoise session. Owns decoded inputs and the assembled output;
+ * exposes packed input tiles and residual commits to a JS model runner.
+ */
+export class DenoiseSession {
+    static __wrap(ptr) {
+        const obj = Object.create(DenoiseSession.prototype);
+        obj.__wbg_ptr = ptr;
+        DenoiseSessionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        DenoiseSessionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_denoisesession_free(ptr, 0);
+    }
+    /**
+     * @returns {boolean}
+     */
+    all_tiles_committed() {
+        const ret = wasm.denoisesession_all_tiles_committed(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Commits a `[12, 256, 256]` residual tensor for `(tile_x, tile_y)`.
+     * @param {number} tile_x
+     * @param {number} tile_y
+     * @param {Float32Array} residuals
+     */
+    commit_output_tile(tile_x, tile_y, residuals) {
+        const ptr0 = passArrayF32ToWasm0(residuals, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.denoisesession_commit_output_tile(this.__wbg_ptr, tile_x, tile_y, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Finish via the classical (model-free) denoiser from Task 5. No tile commits
+     * are required — the raw mosaic and MHC baseline drive the classical path.
+     * @param {any} options
+     * @returns {ProcessResult}
+     */
+    finish_classical(options) {
+        const ret = wasm.denoisesession_finish_classical(this.__wbg_ptr, options);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ProcessResult.__wrap(ret[0]);
+    }
+    /**
+     * Finish via the learned model output. Every tile must be committed. The
+     * assembled (already normalised) RGB16 becomes the pipeline input, so black
+     * and white are pinned to 0/65535 before the look/tone path runs.
+     * @param {any} options
+     * @returns {ProcessResult}
+     */
+    finish_with_options(options) {
+        const ret = wasm.denoisesession_finish_with_options(this.__wbg_ptr, options);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ProcessResult.__wrap(ret[0]);
+    }
+    /**
+     * @returns {number}
+     */
+    height() {
+        const ret = wasm.denoisesession_height(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {number} tile_x
+     * @param {number} tile_y
+     * @returns {boolean}
+     */
+    is_tile_committed(tile_x, tile_y) {
+        const ret = wasm.denoisesession_is_tile_committed(this.__wbg_ptr, tile_x, tile_y);
+        return ret !== 0;
+    }
+    /**
+     * Returns the packed CHW `[20, 320, 320]` input tensor for `(tile_x, tile_y)`.
+     * @param {number} tile_x
+     * @param {number} tile_y
+     * @returns {Float32Array}
+     */
+    take_input_tile(tile_x, tile_y) {
+        const ret = wasm.denoisesession_take_input_tile(this.__wbg_ptr, tile_x, tile_y);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @returns {number}
+     */
+    tiles_x() {
+        const ret = wasm.denoisesession_tiles_x(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    tiles_y() {
+        const ret = wasm.denoisesession_tiles_y(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    width() {
+        const ret = wasm.denoisesession_width(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) DenoiseSession.prototype[Symbol.dispose] = DenoiseSession.prototype.free;
 
 /**
  * K6#4: stateful FableBraid decode session for browser CASV playback. Mirrors the
@@ -771,6 +924,27 @@ export class ProcessResult {
         return ret;
     }
     /**
+     * @returns {boolean}
+     */
+    get denoise_applied() {
+        const ret = wasm.__wbg_get_processresult_denoise_applied(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @returns {number}
+     */
+    get denoise_ms() {
+        const ret = wasm.__wbg_get_processresult_denoise_ms(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {boolean}
+     */
+    get denoise_requested() {
+        const ret = wasm.__wbg_get_processresult_denoise_requested(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
      * @returns {number}
      */
     get disp16_h() {
@@ -911,6 +1085,22 @@ export class ProcessResult {
         return ret >>> 0;
     }
     /**
+     * Estimation confidence [0, 1]; 0.0 if not measured.
+     * @returns {number}
+     */
+    get noise_confidence() {
+        const ret = wasm.__wbg_get_processresult_noise_confidence(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * 90th-percentile display-space sigma (0–255 scale); 0.0 if not measured.
+     * @returns {number}
+     */
+    get noise_score() {
+        const ret = wasm.__wbg_get_processresult_noise_score(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @returns {number}
      */
     get orient_ms() {
@@ -1042,6 +1232,51 @@ export class ProcessResult {
         }
     }
     /**
+     * @returns {string}
+     */
+    get denoise_backend() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.processresult_denoise_backend(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get denoise_model_version() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.processresult_denoise_model_version(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get denoise_reason() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.processresult_denoise_reason(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * Mode 3 (single-decompress preview-first): finish the full-resolution RGB8
      * output FROM the raw mosaic retained by a phase-1 `OUT_RETAIN_RAW` decode —
      * demosaic + tone (+ optional disp16 / orientation) only, NO second
@@ -1111,6 +1346,21 @@ export class ProcessResult {
         let deferred1_1;
         try {
             const ret = wasm.processresult_model(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {string}
+     */
+    get noise_source() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.processresult_noise_source(this.__wbg_ptr);
             deferred1_0 = ret[0];
             deferred1_1 = ret[1];
             return getStringFromWasm0(ret[0], ret[1]);
@@ -1319,6 +1569,93 @@ export class RawStreamExporter {
 if (Symbol.dispose) RawStreamExporter.prototype[Symbol.dispose] = RawStreamExporter.prototype.free;
 
 /**
+ * A developed image kept RESIDENT in wasm as a packed linear RGB16-LE full buffer
+ * (finding 58). Produced by [`DecodedImage::into_resident`]. Builds the full-res
+ * encode renderer and the downscaled lightbox / thumbnail live-edit renderers
+ * entirely inside wasm linear memory, so the full pixel buffer never round-trips
+ * out to JS (`take_*`) and back in (`LookRenderer.new_with_options`).
+ *
+ * Every renderer is byte-identical to the legacy worker path: the resident
+ * RGBA→RGB16-LE conversion mirrors `decodedToLinearRgb16`, the resident downscale
+ * mirrors `downscaleRgb16LE`, and `from_packed_le` reproduces `new_with_options`
+ * for the same bytes/dims (all proven in
+ * `crates/raw-pipeline/tests/resident_image_pipeline.rs`).
+ */
+export class ResidentDeveloped {
+    static __wrap(ptr) {
+        const obj = Object.create(ResidentDeveloped.prototype);
+        obj.__wbg_ptr = ptr;
+        ResidentDevelopedFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ResidentDevelopedFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_residentdeveloped_free(ptr, 0);
+    }
+    /**
+     * @returns {number}
+     */
+    get height() {
+        const ret = wasm.residentdeveloped_height(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Build a downscaled preview `LookRenderer` (lightbox at long-edge 1800, thumb
+     * at 360) from the resident full buffer, resident. The downscale is byte-exact
+     * vs the worker's `downscaleRgb16LE` at the `targetDims`-derived size. Does NOT
+     * consume the full buffer, so lightbox and thumb can both be built before
+     * [`Self::take_full_renderer`] moves it out.
+     * @param {number} long_edge
+     * @returns {LookRenderer}
+     */
+    preview_renderer(long_edge) {
+        const ret = wasm.residentdeveloped_preview_renderer(this.__wbg_ptr, long_edge);
+        return LookRenderer.__wrap(ret);
+    }
+    /**
+     * Build the full-resolution encode `LookRenderer`, MOVING the resident full
+     * buffer into it (no copy, no boundary crossing). After this call the resident
+     * buffer is empty, so build the lightbox/thumb renderers (which downscale from
+     * the full buffer) BEFORE calling this — matching the worker, which builds the
+     * downscaled previews from `fullRgb16` first and constructs the full renderer
+     * last for the transient encode.
+     * @returns {LookRenderer}
+     */
+    take_full_renderer() {
+        const ret = wasm.residentdeveloped_take_full_renderer(this.__wbg_ptr);
+        return LookRenderer.__wrap(ret);
+    }
+    /**
+     * Compatibility ESCAPE HATCH (finding 58): move the packed linear RGB16-LE full
+     * buffer out to JS. NOT the product path — the product path keeps the buffer
+     * resident via [`Self::take_full_renderer`] / [`Self::preview_renderer`]. Kept
+     * so a JS consumer that still needs the packed bytes (e.g. a bespoke downscale)
+     * can obtain them without re-deriving the resident conversion.
+     * @returns {Uint8Array}
+     */
+    take_full_rgb16_le() {
+        const ret = wasm.residentdeveloped_take_full_rgb16_le(this.__wbg_ptr);
+        var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v1;
+    }
+    /**
+     * @returns {number}
+     */
+    get width() {
+        const ret = wasm.residentdeveloped_width(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) ResidentDeveloped.prototype[Symbol.dispose] = ResidentDeveloped.prototype.free;
+
+/**
  * Rotated RGB8 buffer with updated dimensions.
  */
 export class RotateResult {
@@ -1424,7 +1761,86 @@ export function bench_decode_orf(data) {
 }
 
 /**
- * Decode an OpenEXR image to RGBA f32 (linear HDR preserved).
+ * Create a tiled denoise session from a Canon CR2 blob.
+ * @param {Uint8Array} data
+ * @param {any} options
+ * @returns {DenoiseSession}
+ */
+export function create_cr2_denoise_session(data, options) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.create_cr2_denoise_session(ptr0, len0, options);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return DenoiseSession.__wrap(ret[0]);
+}
+
+/**
+ * Create a tiled denoise session from an Adobe DNG blob.
+ * @param {Uint8Array} data
+ * @param {any} options
+ * @returns {DenoiseSession}
+ */
+export function create_dng_denoise_session(data, options) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.create_dng_denoise_session(ptr0, len0, options);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return DenoiseSession.__wrap(ret[0]);
+}
+
+/**
+ * Create a tiled denoise session from an Olympus ORF blob.
+ * @param {Uint8Array} data
+ * @param {any} options
+ * @returns {DenoiseSession}
+ */
+export function create_orf_denoise_session(data, options) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.create_orf_denoise_session(ptr0, len0, options);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return DenoiseSession.__wrap(ret[0]);
+}
+
+/**
+ * Create a tiled denoise session from a generic Bayer mosaic (see
+ * `process_raw_mosaic_with_options` for the argument contract).
+ * @param {Uint16Array} raw_u16
+ * @param {number} width
+ * @param {number} height
+ * @param {number} cfa_phase
+ * @param {number} black
+ * @param {number} white
+ * @param {number} wb_r
+ * @param {number} wb_b
+ * @param {number} orientation
+ * @param {Float32Array} color_matrix_flat
+ * @param {number} iso
+ * @param {any} options
+ * @returns {DenoiseSession}
+ */
+export function create_raw_mosaic_denoise_session(raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, iso, options) {
+    const ptr0 = passArray16ToWasm0(raw_u16, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.create_raw_mosaic_denoise_session(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, iso, options);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return DenoiseSession.__wrap(ret[0]);
+}
+
+/**
+ * Decode an OpenEXR image to RGBA f32 (linear HDR preserved). Preflights the
+ * header against the platform decode-limit profile (EXR f32 is 16 B/px, so the
+ * output-byte cap is the governing constraint) before decoding.
  * @param {Uint8Array} bytes
  * @returns {DecodedImage}
  */
@@ -1442,6 +1858,7 @@ export function decode_exr(bytes) {
  * Decode a JPEG to RGBA8 for the developed-image edit path (mirrors
  * `decode_tiff`/`decode_exr`). The lossless archival transcode is a separate
  * facade path (`transcodeJpegToJxl`); this is the editable-pixels decode.
+ * Preflights the header against the platform decode-limit profile first.
  * @param {Uint8Array} bytes
  * @returns {DecodedImage}
  */
@@ -1456,7 +1873,9 @@ export function decode_jpeg(bytes) {
 }
 
 /**
- * Decode a general RGB(A) TIFF (u8 or u16) to RGBA.
+ * Decode a general RGB(A) TIFF (u8 or u16) to RGBA. Preflights the header
+ * against the platform decode-limit profile, rejecting oversized / bomb inputs
+ * before any pixel buffer is allocated.
  * @param {Uint8Array} bytes
  * @returns {DecodedImage}
  */
@@ -1604,6 +2023,30 @@ export function demosaic_bench_simd() {
  */
 export function demtone_bench_mhc() {
     const ret = wasm.demtone_bench_mhc();
+    return ret >>> 0;
+}
+
+/**
+ * @returns {boolean}
+ */
+export function demtone_bench_mhc_equal() {
+    const ret = wasm.demtone_bench_mhc_equal();
+    return ret !== 0;
+}
+
+/**
+ * @returns {number}
+ */
+export function demtone_bench_mhc_scalar() {
+    const ret = wasm.demtone_bench_mhc_scalar();
+    return ret >>> 0;
+}
+
+/**
+ * @returns {number}
+ */
+export function demtone_bench_mhc_simd128() {
+    const ret = wasm.demtone_bench_mhc_simd128();
     return ret >>> 0;
 }
 
@@ -2239,6 +2682,23 @@ export function process_cr2_with_look(data, output_flags, look) {
 }
 
 /**
+ * T6 noise-aware API for CR2 (see `process_dng_with_options`).
+ * @param {Uint8Array} data
+ * @param {number} output_flags
+ * @param {any} options
+ * @returns {ProcessResult}
+ */
+export function process_cr2_with_options(data, output_flags, options) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.process_cr2_with_options(ptr0, len0, output_flags, options);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
  * Parse + decode a DNG file blob. Returns an error string on failure.
  * (Rayon when parallel-wasm feature active.) Look params: LR-style (-1..+1), except
  * exposure_ev in stops.  Pass NaN/≤0 for wb_r_override/wb_b_override to use defaults.
@@ -2322,6 +2782,28 @@ export function process_dng_with_look(data, output_flags, look) {
     const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.process_dng_with_look(ptr0, len0, output_flags, look);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
+ * T6 noise-aware API for DNG.
+ *
+ * `options` is a plain JS object with two optional keys: `"look"` (same
+ * shape as `process_dng_with_look`) and `"denoise"` (see spec). Unknown
+ * key → `JsError`. When `denoise.enabled` is `false` (the default) the
+ * function is byte-identical to `process_dng_with_look`.
+ * @param {Uint8Array} data
+ * @param {number} output_flags
+ * @param {any} options
+ * @returns {ProcessResult}
+ */
+export function process_dng_with_options(data, output_flags, options) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.process_dng_with_options(ptr0, len0, output_flags, options);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -2431,6 +2913,27 @@ export function process_orf_with_look(data, output_flags, look) {
 }
 
 /**
+ * T6 noise-aware API for ORF (see `process_dng_with_options`).
+ *
+ * When `denoise.enabled` is true the full raw mosaic is always materialized
+ * (equivalent to including `OUT_FULL_RGB8`), so the streaming preview-only
+ * fast path will not fire even if only lb/thumb are requested.
+ * @param {Uint8Array} data
+ * @param {number} output_flags
+ * @param {any} options
+ * @returns {ProcessResult}
+ */
+export function process_orf_with_options(data, output_flags, options) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.process_orf_with_options(ptr0, len0, output_flags, options);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
  * @param {Uint16Array} raw
  * @param {number} width
  * @param {number} height
@@ -2462,6 +2965,38 @@ export function process_raw_mosaic_with_flags(raw, width, height, cfa_phase, bla
     const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
     const ret = wasm.process_raw_mosaic_with_flags(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ProcessResult.__wrap(ret[0]);
+}
+
+/**
+ * T6 noise-aware API for a generic Bayer mosaic (see `process_dng_with_options`).
+ *
+ * `raw_u16`: flat u16 Bayer mosaic (row-major). `iso` = sensor ISO (used as
+ * denoise policy hint). `options` is parsed identically to `process_dng_with_options`.
+ * @param {Uint16Array} raw_u16
+ * @param {number} width
+ * @param {number} height
+ * @param {number} cfa_phase
+ * @param {number} black
+ * @param {number} white
+ * @param {number} wb_r
+ * @param {number} wb_b
+ * @param {number} orientation
+ * @param {Float32Array} color_matrix_flat
+ * @param {number} output_flags
+ * @param {number} iso
+ * @param {any} options
+ * @returns {ProcessResult}
+ */
+export function process_raw_mosaic_with_options(raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, output_flags, iso, options) {
+    const ptr0 = passArray16ToWasm0(raw_u16, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.process_raw_mosaic_with_options(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, iso, options);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -2602,6 +3137,11 @@ function __wbg_get_imports(memory) {
         __wbg_Error_bce6d499ff0a4aff: function(arg0, arg1) {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return ret;
+        },
+        __wbg___wbindgen_boolean_get_2304fb8c853028c8: function(arg0) {
+            const v = arg0;
+            const ret = typeof(v) === 'boolean' ? v : undefined;
+            return isLikeNone(ret) ? 0xFFFFFF : ret ? 1 : 0;
         },
         __wbg___wbindgen_is_null_2042690d351e14f0: function(arg0) {
             const ret = arg0 === null;
@@ -2762,6 +3302,9 @@ const DecodePeakEstimateFinalization = (typeof FinalizationRegistry === 'undefin
 const DecodedImageFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_decodedimage_free(ptr, 1));
+const DenoiseSessionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_denoisesession_free(ptr, 1));
 const FableDeltaSessionFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_fabledeltasession_free(ptr, 1));
@@ -2783,6 +3326,9 @@ const ProcessResultFinalization = (typeof FinalizationRegistry === 'undefined')
 const RawStreamExporterFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_rawstreamexporter_free(ptr, 1));
+const ResidentDevelopedFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_residentdeveloped_free(ptr, 1));
 const RotateResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_rotateresult_free(ptr, 1));
