@@ -14,8 +14,14 @@
 // Run with: bun test web/jxl-decode-cache-policy.test.js
 
 import { expect, test, describe, beforeEach } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 import { createAssetStateStore } from './asset-state-store.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const mainSrc = readFileSync(join(__dirname, 'main.js'), 'utf8');
 
 describe('commitJxlDecodeCache: stale-gate BEFORE cache write (Finding 48)', () => {
     let store;
@@ -137,5 +143,35 @@ describe('commitJxlDecodeCache: stale-gate BEFORE cache write (Finding 48)', () 
             target: null, tag: null, store, seen,
             decodeId: 1, pixels, w: 2, h: 1, isFinal: true, policy: 'onFinal',
         })).not.toThrow();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Source-text assertion: decodeFullJxlFor passes cacheTag (Finding 48 gate)
+// ---------------------------------------------------------------------------
+
+describe('main.js source-text: decodeFullJxlFor passes cacheTag (Finding 48)', () => {
+    test('decodeFullJxlFor dispatch includes cacheTag', () => {
+        // The decodeFullJxlFor site must capture a result-tag at dispatch time
+        // and pass it as cacheTag so the cache-write is gated on generation.
+        // A missing cacheTag lets stale pixels from a pre-bump decode commit to
+        // _jxlDecoded unguarded (the original F48 race).
+        //
+        // Strategy: find the function body (window.decodeFullJxlFor = function ...
+        // up to the next window.* assignment that closes it), then assert cacheTag
+        // appears within that span.
+        const fnStart = mainSrc.indexOf('window.decodeFullJxlFor = function decodeFullJxlFor');
+        expect(fnStart).toBeGreaterThan(-1);
+        // The function ends with "};" — grab up to 1200 chars from the definition.
+        const fnBody = mainSrc.slice(fnStart, fnStart + 1200);
+        expect(fnBody).toContain('cacheTag');
+    });
+
+    test('decodeFullJxlFor cacheTag is derived from assetStateStore.makeResultTag', () => {
+        // The tag must be a fresh result-tag, not a hardcoded value.
+        const fnStart = mainSrc.indexOf('window.decodeFullJxlFor = function decodeFullJxlFor');
+        expect(fnStart).toBeGreaterThan(-1);
+        const fnBody = mainSrc.slice(fnStart, fnStart + 1200);
+        expect(fnBody).toContain('makeResultTag');
     });
 });

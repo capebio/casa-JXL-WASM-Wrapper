@@ -447,6 +447,13 @@ window.decodeFullJxlFor = function decodeFullJxlFor(card) {
     return new Promise((resolve) => {
         if (!getCardState(card)?._blobUrl) { resolve(null); return; }
         if (getCardState(card)._jxlDecoded) { resolve(getCardState(card)._jxlDecoded); return; }
+        // Finding 48: stamp the generation tag at dispatch so a stale result
+        // from a prior reprocess cannot commit to _jxlDecoded via the cache path.
+        // Keep null for a genuinely id-less card (backward compatible).
+        const _fullTag = (() => {
+            const id = getCardState(card)?._assetId;
+            return id ? assetStateStore.makeResultTag(id) : null;
+        })();
         decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
             if (msg.type === 'decode_error') { resolve(null); return; }
             if (msg.type !== 'jxl_decoded' && msg.isFinal !== true) return;
@@ -456,6 +463,7 @@ window.decodeFullJxlFor = function decodeFullJxlFor(card) {
             cachePolicy: 'onFinal',
             progressiveDetail: 'lastPasses',
             cacheTarget: card,
+            cacheTag: _fullTag, // Finding 48: gate cache write on generation
         });
     });
 };
@@ -3776,7 +3784,7 @@ function applyLookToFilmstripSelection() {
                 statusBar.hidden = false;
                 statusText.textContent = `save failed: ${failures.length} file${failures.length === 1 ? '' : 's'}`;
             }
-        })();
+        })().catch(() => {});
     }
 }
 

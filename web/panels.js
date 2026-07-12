@@ -377,8 +377,9 @@ async function applySidecar(sidecar) {
     if (vigEl) { applyVignetteStyle(); vigEl.style.display = 'block'; }
     buildOverlayChips();
   }
-  // Finding 40: apply crop + subjects onto the EXPLICITLY-provided card when given;
-  // fall back to the currently-displayed lightbox card for backward compatibility.
+  // Apply crop + subjects onto the currently-displayed lightbox card.
+  // applySidecar takes no card param; per-card routing goes through
+  // crop.js's applyCropAndSubjectsToCard (the correct per-card entry point).
   const card = (typeof window.lightboxCard === 'function') ? window.lightboxCard() : null;
   if (card) {
     // Finding 40: route through assetStateStore so the edit is keyed on the stable
