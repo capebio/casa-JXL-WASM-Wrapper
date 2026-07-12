@@ -52,7 +52,16 @@ export interface ImageRegion {
 export declare function tilesOverlappingRegion(imageW: number, imageH: number, tileSize: number, region: ImageRegion): ImageRegion[];
 /** Compat wrapper used by prepareDecodePlan (plan.ts). Delegates to tilesOverlappingRegion. */
 export declare function tilesForClampedRegion(imageW: number, imageH: number, tileSize: number, x: number, y: number, w: number, h: number): ImageRegion[];
-/** COOP/COEP + Worker availability — parallel tile workers are viable. */
+/**
+ * Worker availability — parallel tile workers are viable.
+ *
+ * Finding 82: Worker availability is INDEPENDENT of cross-origin isolation. Per-tile parallel
+ * decode works in any environment that exposes `Worker`; it does not require COOP/COEP. Cross-origin
+ * isolation only unlocks the zero-copy SharedArrayBuffer carrier (see `canShareContainerBytes`),
+ * which the pool uses opt-in — without it, container bytes are transferred/copied to each worker,
+ * still fully parallel. Gating the whole parallel path on `crossOriginIsolated` silently downgraded
+ * every non-isolated browser to single-threaded decode.
+ */
 export declare function canUseParallelTileWorkers(): boolean;
 /** Whether SharedArrayBuffer + crossOriginIsolated allows SAB-backed container bytes for zero-copy fanout to workers (Grok2 SAB opt-in). Split from canUseParallelTileWorkers. */
 export declare function canShareContainerBytes(): boolean;

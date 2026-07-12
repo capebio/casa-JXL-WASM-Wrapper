@@ -461,11 +461,15 @@ export interface PyramidPoolLike {
   allocateBytesId(source: any): number;
   acquire(count: number, opts?: { maxWaitMs?: number }): Promise<any[]>;
   release(handles: any[]): void;
-  readonly requestTimeout?: number;
+  /** Load container bytes into the acquired handles once per bytesId (SAB carrier when useSAB). */
+  ensureLoaded(handles: any[], bytesId: number, bytes: Uint8Array, useSAB: boolean): void;
+  // `| undefined` is explicit so a concrete pool whose getter returns `number | undefined`
+  // (PyramidWorkerPool.requestTimeout) satisfies this under exactOptionalPropertyTypes.
+  readonly requestTimeout?: number | undefined;
   // Lifecycle surface for holders that manage the pool outside a single decode call.
   destroy?(graceMs?: number): Promise<void> | void;
-  readonly destroyed?: boolean;
-  readonly poolState?: string;
+  readonly destroyed?: boolean | undefined;
+  readonly poolState?: string | undefined;
   prewarm?(count: number): void;
 }
 

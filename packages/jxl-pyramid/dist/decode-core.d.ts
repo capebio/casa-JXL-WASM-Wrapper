@@ -185,10 +185,12 @@ export interface PyramidPoolLike {
         maxWaitMs?: number;
     }): Promise<any[]>;
     release(handles: any[]): void;
-    readonly requestTimeout?: number;
+    /** Load container bytes into the acquired handles once per bytesId (SAB carrier when useSAB). */
+    ensureLoaded(handles: any[], bytesId: number, bytes: Uint8Array, useSAB: boolean): void;
+    readonly requestTimeout?: number | undefined;
     destroy?(graceMs?: number): Promise<void> | void;
-    readonly destroyed?: boolean;
-    readonly poolState?: string;
+    readonly destroyed?: boolean | undefined;
+    readonly poolState?: string | undefined;
     prewarm?(count: number): void;
 }
 /** Init/options bag passed to jxl-wasm createDecoder (local name for cast sites; structural). */
