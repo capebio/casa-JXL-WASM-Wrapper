@@ -58,10 +58,23 @@ Fresh-context browser harness, 20.5 MP `P2200619-prog-p6-q85.jxl`:
 
 | ID | Hypothesis | State | Local delta | End-to-end delta | Parity |
 |---|---|---|---:|---:|---|
+| MT-1 | Match libjxl runner width to the four-thread Emscripten pool and charge that measured width to the scheduler | accepted | legacy width 0 hard-stalled past 65 s; fixed width 4 median 641.0 ms | 66.94% lower than SIMD fallback (1939.0 ms), paired n=12/arm, high-trust IQR | exact: hash 2196883031, 0 differing pixels |
 
 ## Rejections
 
-No candidates measured yet.
+- Decoder runner width 2: median 1175.6 ms versus width 4 at 880.1 ms in
+  independent tournaments; 33.6% slower single-decode. Under concurrency 4,
+  width 2 remained 27.93% slower per decode (2409.8 ms versus 1736.8 ms).
+- Runner width 0: controlled artifact reproduced the shipped MT hard stall.
+
+## Measurement Notes
+
+- Host was shared with other agents. No claim of thermal isolation.
+- The accepted final A/B used round-interleaved arms and no outcome tolerance.
+  Both arms had high-trust IQR despite background load.
+- Concurrency measurements were noisy and are supporting evidence only. Width 4
+  produced about 47.2 MP/s aggregate at concurrency 4 versus 32.0 MP/s for one
+  final MT decode, but that run was low-trust.
 
 ## Conclusion
 

@@ -9,6 +9,7 @@ export interface JxlContext {
 }
 export declare function validateWasmUrl(url: string): void;
 export declare function hardwareConcurrency(): number;
+export declare const DECODER_MT_WORKER_COST = 4;
 export declare function computeWorkerCostForWasmUrl(url: string | undefined): number;
 declare abstract class CapabilityAwareContext implements JxlContext {
     protected caps: Capabilities;
