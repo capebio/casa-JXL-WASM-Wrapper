@@ -60,6 +60,8 @@ let process_orf_with_look, process_dng_with_look, process_cr2_with_look;
 // Task 7: options API — carries {look, denoise} so the RAW pipeline can apply
 // noise-aware denoise before demosaic. Preferred over *_with_flags when present.
 let process_orf_with_options, process_dng_with_options, process_cr2_with_options, process_raw_mosaic_with_options;
+// Task 8: tiled denoise session API (create_*_denoise_session exports).
+let create_orf_denoise_session, create_dng_denoise_session, create_cr2_denoise_session, create_raw_mosaic_denoise_session;
 // Multi-format ingest: EXR/TIFF decode to a DecodedImage (mirrors jxl-benchmark.js bindings).
 let decode_exr, decode_tiff;
 async function loadWasm() {
@@ -74,6 +76,7 @@ async function loadWasm() {
     ({ process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8,
        process_orf_with_look, process_dng_with_look, process_cr2_with_look,
        process_orf_with_options, process_dng_with_options, process_cr2_with_options, process_raw_mosaic_with_options,
+       create_orf_denoise_session, create_dng_denoise_session, create_cr2_denoise_session, create_raw_mosaic_denoise_session,
        decode_exr, decode_tiff, decode_jpeg } = rawWasm);
 }
 
@@ -150,6 +153,71 @@ function processRawMosaicWithFlagsNamed(payload, flags, opts = RAW_NEUTRAL) {
 // shape from raw-denoise-options.js; default {enabled:false} = pipeline no-op.
 function buildWasmOptions(lookArgs, denoise) {
     return { look: lookArgs, denoise: denoise || { enabled: false } };
+}
+
+// Task 11: Lazy ORT WebGPU denoise runtime (one per worker).
+// Null until first learned-denoise request; remains set for the worker lifetime.
+let denoiseRuntime = null;
+// Set to true if runtime init fails so we don't retry on every frame.
+let denoiseRuntimeFailed = false;
+
+async function getDenoiseRuntime() {
+    if (denoiseRuntime) return denoiseRuntime;
+    if (denoiseRuntimeFailed) return null;
+    try {
+        const { createRawDenoiseRuntime } = await import('./raw-denoise-runtime.js');
+        const ort = await import('onnxruntime-web/webgpu');
+        denoiseRuntime = await createRawDenoiseRuntime({
+            ort,
+            modelUrl: new URL('./models/raw-denoise-v1.ort', self.location.href).href,
+            manifestUrl: new URL('./models/raw-denoise-v1.json', self.location.href).href,
+        });
+        return denoiseRuntime;
+    } catch (err) {
+        console.warn('[worker] denoise runtime init failed, will use classical path:', err?.message || err);
+        denoiseRuntimeFailed = true;
+        return null;
+    }
+}
+
+// Pick the session-create function for a rawKind, or null if not available.
+function pickDenoiseSessionCreator(rawKind) {
+    switch (rawKind) {
+        case 'orf': return create_orf_denoise_session || null;
+        case 'cr2': return create_cr2_denoise_session || null;
+        case 'dng': return create_dng_denoise_session || null;
+        default: return null;
+    }
+}
+
+// Run the learned denoise path for a native RAW format.
+// Returns the ProcessResult from finish_with_options (learned) or finish_classical (fallback).
+// Also returns backend/modelVersion/denoiseMs for surfacing in diagnostics.
+async function decodeWithLearnedDenoise(createSessionFn, bytes, wasmOptions, signal) {
+    let session;
+    try {
+        session = createSessionFn(bytes, wasmOptions);
+        const runtime = await getDenoiseRuntime();
+        if (!runtime) {
+            // Runtime init failed — use classical path
+            const result = session.finish_classical(wasmOptions);
+            return { result, denoiseBackend: 'classical', modelVersion: 'classical-bm3d-v1', denoiseMs: 0 };
+        }
+        const { backend, modelVersion, inferenceMs } = await runtime.run(session, wasmOptions, signal);
+        const result = session.finish_with_options(wasmOptions);
+        return { result, denoiseBackend: backend, modelVersion, denoiseMs: inferenceMs };
+    } catch (err) {
+        // Any failure (inference error, device loss, abort) → classical fallback
+        if (session) {
+            try {
+                const result = session.finish_classical(wasmOptions);
+                return { result, denoiseBackend: 'classical', modelVersion: 'classical-bm3d-v1', denoiseMs: 0 };
+            } catch (fallbackErr) {
+                console.warn('[worker] denoise classical fallback also failed:', fallbackErr?.message || fallbackErr);
+            }
+        }
+        throw err;
+    }
 }
 
 // Pick the native *_with_options decoder for a rawKind (orf/cr2/dng), or null if
@@ -717,16 +785,31 @@ self.addEventListener('message', async (ev) => {
             ? (OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW)
             : (OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
         let result;
+        // Task 11: learned denoise metadata, surfaced in phaseMs diagnostics.
+        let learnedDenoiseBackend = null, learnedModelVersion = null, learnedDenoiseMs = 0;
         if (nativeRaw) {
-            // Preferred path: the *_with_options API carries {look, denoise} so the
-            // RAW pipeline can apply noise-aware denoise pre-demosaic. Fall back to
-            // the positional *_with_flags wrapper when the options build isn't shipped
-            // (kept for back-compat; never the primary path when options exist).
-            const optDecoder = pickRawDecoderWithOptions(rawKind);
-            if (optDecoder) {
-                result = optDecoder(bytes, phase1Flags, buildWasmOptions(lookArgs, denoise));
+            // Task 11: when learned denoise is requested (high-quality path), use the
+            // tiled session API so ORT WebGPU residuals are committed before finish.
+            // Falls back to classical BM3D path on any error (never a partial image).
+            const sessionCreator = denoise.enabled ? pickDenoiseSessionCreator(rawKind) : null;
+            if (sessionCreator) {
+                const wasmOpts = buildWasmOptions(lookArgs, denoise);
+                const learned = await decodeWithLearnedDenoise(sessionCreator, bytes, wasmOpts, opts.signal);
+                result = learned.result;
+                learnedDenoiseBackend = learned.denoiseBackend;
+                learnedModelVersion = learned.modelVersion;
+                learnedDenoiseMs = learned.denoiseMs;
             } else {
-                result = processRawWithFlagsNamed(decoderFn, bytes, phase1Flags, lookArgs);
+                // Classical path: the *_with_options API carries {look, denoise} so the
+                // RAW pipeline can apply noise-aware denoise pre-demosaic. Fall back to
+                // the positional *_with_flags wrapper when the options build isn't shipped
+                // (kept for back-compat; never the primary path when options exist).
+                const optDecoder = pickRawDecoderWithOptions(rawKind);
+                if (optDecoder) {
+                    result = optDecoder(bytes, phase1Flags, buildWasmOptions(lookArgs, denoise));
+                } else {
+                    result = processRawWithFlagsNamed(decoderFn, bytes, phase1Flags, lookArgs);
+                }
             }
         } else {
             if (rawKind === 'nef' || rawKind === 'nrw' || rawKind === 'rw2' || rawKind === 'rwl' || rawKind === 'crw') {
@@ -769,6 +852,10 @@ self.addEventListener('message', async (ev) => {
             tonemap:    result.tonemap_ms,
             orient:     result.orient_ms,
             denoise:    result.denoise_ms || 0,
+            // Task 11: learned-denoise inference time (0 when classical path used).
+            denoiseInference: learnedDenoiseMs,
+            denoiseBackend:   learnedDenoiseBackend,
+            denoiseModel:     learnedModelVersion,
         };
         const wbR = result.wb_r_used;
         const wbB = result.wb_b_used;
