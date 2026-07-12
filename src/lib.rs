@@ -4336,8 +4336,16 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         raw_pipeline::dng::Cfa::Gbrg => ((1, 0), 2),
         raw_pipeline::dng::Cfa::Bggr => ((1, 1), 3),
     };
-    let rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase)
-        .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
+    // Finding 57: linear/uncompressed-RGB DNGs are ALREADY demosaiced — `img.raw` is the
+    // interleaved w*h*3 RGB16 buffer. Bypass MHC (running it on non-mosaic data would
+    // produce garbage). The tone/matrix/black-white contracts below are unchanged.
+    let rgb16 = if img.is_linear_rgb {
+        debug_assert_eq!(img.raw.len(), w * h * 3, "linear-RGB raw must be w*h*3");
+        img.raw.clone()
+    } else {
+        demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase)
+            .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?
+    };
     let demosaic_ms = now_ms() - t;
     let aw = w;
     let ah = h;

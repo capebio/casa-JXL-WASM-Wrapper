@@ -77,6 +77,10 @@ pub struct DngImage {
     pub gps_alt: Option<f64>,
     /// Per-CFA-plane noise metadata (black/white levels, embedded NoiseProfile, etc.).
     pub noise_metadata: RawNoiseMetadata,
+    /// `true` when this DNG is already-demosaiced linear/uncompressed RGB (finding 57):
+    /// `raw` then holds interleaved RGB (`width*height*3` u16), NOT a Bayer mosaic, and the
+    /// consumer must BYPASS demosaic. `false` = normal CFA mosaic (`raw` is `width*height`).
+    pub is_linear_rgb: bool,
 }
 
 impl DngImage {
@@ -167,6 +171,49 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         bail!("DNG: implausible dimensions {width}×{height}");
     }
     let cps = raw.samples_per_pixel.max(1) as usize;
+
+    // Finding 57: already-demosaiced linear/uncompressed RGB (PhotometricInterpretation
+    // = RGB(2) or LinearRaw(34892), SamplesPerPixel=3). No CFA mosaic — decode straight
+    // to interleaved RGB (`out` is width*height*3) and bypass demosaic downstream.
+    if is_linear_rgb_ifd(&raw) {
+        let out = decode_linear_rgb(data, &raw, width, height, le)?;
+        let wb_r_neutral = state.as_shot_neutral.map(|n| n[0]).unwrap_or(1.0);
+        let wb_g_neutral = state.as_shot_neutral.map(|n| n[1]).unwrap_or(1.0);
+        let wb_b_neutral = state.as_shot_neutral.map(|n| n[2]).unwrap_or(1.0);
+        let wb_r = wb_g_neutral / wb_r_neutral.max(1e-6);
+        let wb_b = wb_g_neutral / wb_b_neutral.max(1e-6);
+        let black = raw.black_level.unwrap_or(0);
+        // Linear RGB defaults to full 16-bit white unless BlackLevel/WhiteLevel say otherwise;
+        // 65535 keeps the 8/16-bit ramp we decode un-clipped when no WhiteLevel tag is set.
+        let white = raw.white_level.unwrap_or(65535);
+        let (color_matrix, _prov) = resolve_camera_to_srgb(&CalibrationInputs::from_state(&state));
+        let noise_metadata = state.noise_tags.build(black as f32, white as f32);
+        return Ok(DngImage {
+            width,
+            height,
+            raw: out,
+            cfa: Cfa::Rggb, // unused for linear RGB (is_linear_rgb bypasses demosaic)
+            black,
+            white,
+            wb_r,
+            wb_g: 1.0,
+            wb_b,
+            wb_from_camera: state.as_shot_neutral.is_some(),
+            iso: state.iso,
+            baseline_exposure: state.baseline_exposure.unwrap_or(0.0),
+            color_matrix,
+            make: state.make,
+            model: state.model,
+            orientation: state.orientation.unwrap_or(1),
+            datetime: state.exif.datetime,
+            gps_lat: state.exif.gps_lat,
+            gps_lon: state.exif.gps_lon,
+            gps_alt: state.exif.gps_alt,
+            noise_metadata,
+            is_linear_rgb: true,
+        });
+    }
+
     let cfa = match raw.cfa_pattern {
         Some(p) => match p {
             [0, 1, 1, 2] => Cfa::Rggb,
@@ -237,7 +284,110 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         gps_lon: state.exif.gps_lon,
         gps_alt: state.exif.gps_alt,
         noise_metadata,
+        is_linear_rgb: false,
     })
+}
+
+/// `true` when the raw IFD is already-demosaiced linear/uncompressed RGB (finding 57):
+/// PhotometricInterpretation = RGB(2) or LinearRaw(34892) AND SamplesPerPixel = 3.
+/// A CFA DNG (photometric 32803, 1 sample) returns `false` → normal Bayer path.
+fn is_linear_rgb_ifd(raw: &RawIfd) -> bool {
+    let cps = raw.samples_per_pixel.max(1);
+    matches!(raw.photometric, Some(2) | Some(34892)) && cps == 3
+}
+
+/// Decode already-demosaiced linear/uncompressed RGB (finding 57) into an interleaved
+/// `width*height*3` u16 buffer. Handles chunky (RGBRGB…) vs planar (RR…GG…BB…) via
+/// PlanarConfiguration, 8-bit or 16-bit samples, either endianness, and strip storage.
+/// Only compression=1 (uncompressed) is supported; compressed or tiled linear RGB
+/// (no known producer) returns a clear error.
+fn decode_linear_rgb(
+    data: &[u8],
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    le: bool,
+) -> Result<Vec<u16>> {
+    if raw.compression != 1 {
+        bail!(
+            "DNG linear-RGB: only uncompressed (compression=1) supported, got {}",
+            raw.compression
+        );
+    }
+    let bps = raw.bits_per_sample;
+    if bps != 8 && bps != 16 {
+        bail!("DNG linear-RGB: unsupported BitsPerSample {bps} (want 8 or 16)");
+    }
+    let bytes_per_sample = (bps / 8) as usize;
+    let planar = raw.planar_config == Some(2);
+    let npix = width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("DNG linear-RGB: dimension overflow"))?;
+    let total_samples = npix
+        .checked_mul(3)
+        .ok_or_else(|| anyhow!("DNG linear-RGB: sample count overflow"))?;
+    let mut out = vec![0u16; total_samples];
+
+    // Tiled linear RGB is uncommon (no known producer); support only strip / whole-image.
+    if !raw.tile_offsets.is_empty() {
+        bail!("DNG linear-RGB: tiled layout not supported");
+    }
+    if raw.strip_offsets.is_empty() {
+        bail!("DNG linear-RGB: missing strip offsets");
+    }
+    if raw.strip_offsets.len() != raw.strip_byte_counts.len() {
+        bail!("DNG linear-RGB: strip offset/byte-count mismatch");
+    }
+
+    // Materialise the contiguous sample byte stream by concatenating strips in file order
+    // (each range validated against the buffer). checked_add guards wasm32 usize wrap.
+    let expected_bytes = total_samples
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| anyhow!("DNG linear-RGB: byte count overflow"))?;
+    let mut stream: Vec<u8> = Vec::with_capacity(expected_bytes);
+    for (o, c) in raw.strip_offsets.iter().zip(raw.strip_byte_counts.iter()) {
+        let off = *o as usize;
+        let end = off
+            .checked_add(*c as usize)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| anyhow!("DNG linear-RGB: strip range OOB"))?;
+        stream.extend_from_slice(&data[off..end]);
+    }
+    if stream.len() < expected_bytes {
+        bail!(
+            "DNG linear-RGB: truncated pixel data ({} bytes, need {})",
+            stream.len(),
+            expected_bytes
+        );
+    }
+
+    // Decode one sample from the stream at byte position `bp` (bounds guaranteed by the
+    // length check above; bp ranges over [0, expected_bytes)).
+    let read_sample = |stream: &[u8], bp: usize| -> u16 {
+        if bps == 8 {
+            stream[bp] as u16
+        } else if le {
+            u16::from_le_bytes([stream[bp], stream[bp + 1]])
+        } else {
+            u16::from_be_bytes([stream[bp], stream[bp + 1]])
+        }
+    };
+
+    if planar {
+        // Planar: plane c occupies samples [c*npix, (c+1)*npix). Scatter to interleaved.
+        for c in 0..3usize {
+            for i in 0..npix {
+                let bp = (c * npix + i) * bytes_per_sample;
+                out[i * 3 + c] = read_sample(&stream, bp);
+            }
+        }
+    } else {
+        // Chunky: samples already interleaved R,G,B per pixel → straight decode.
+        for si in 0..total_samples {
+            out[si] = read_sample(&stream, si * bytes_per_sample);
+        }
+    }
+    Ok(out)
 }
 
 /// Preview-path metadata (no raw). Mirrors the fields `decode_bytes_inner` derives.
@@ -1078,6 +1228,12 @@ struct RawIfd {
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
+    /// PhotometricInterpretation (0x0106). CFA(32803) is the Bayer path; RGB(2) or
+    /// LinearRaw(34892) with 3 samples/pixel = already-demosaiced linear RGB (finding 57).
+    photometric: Option<u16>,
+    /// PlanarConfiguration (0x011C): 1 = chunky (RGBRGB…), 2 = planar (RR…GG…BB…).
+    /// Absent → chunky (TIFF default).
+    planar_config: Option<u16>,
 }
 
 #[derive(Default, Debug)]
@@ -1184,6 +1340,17 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 0x0103 => {
                     ifd.compression = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                }
+                0x0106 => {
+                    // PhotometricInterpretation. CFA(32803) → Bayer; RGB(2)/LinearRaw(34892)
+                    // with 3 samples/pixel → already-demosaiced linear RGB (finding 57).
+                    ifd.photometric =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
+                }
+                0x011C => {
+                    // PlanarConfiguration: 1 chunky, 2 planar.
+                    ifd.planar_config =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
                 }
                 0x0115 => {
                     ifd.samples_per_pixel =
