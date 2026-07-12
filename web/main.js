@@ -13,6 +13,13 @@ import { createReadLane } from './jxl-read-lane.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
+// Findings 13, 44, 45: full-resolution export service + metadata policy + real format label.
+// The service sources the FULL-RES DEVELOPED OUTPUT (never the 1800px preview),
+// gates formats (jxl/png real; jpeg/tiff packet-3), and threads serialised EXIF
+// (metadata policy) into the encoder.
+import { ExportService, formatLabel as _formatLabel, isFormatEncodable as _isFormatEncodable } from './export-service.js';
+// I-B: real PNG encoder (honest bytes for the PNG export option).
+import { encodePng as _encodePng } from './png-encode.js';
 // Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 // Findings 11, 29: byte-budgeted, LRU-evicting derived cache for decoded JXL
@@ -957,7 +964,14 @@ pool.init();
 // Finding 3: the dedicated JXL decode worker is no longer spawned here.
 // JXL decode routes through decodeJxlViaSession() → getContext() (jxl-session scheduler).
 
-async function encodeJxlSession(pixels, width, height, quality, effort, lossless, progressive, format = 'rgba8', orientation) {
+// Finding 44: optional `metadata` param carries { exif?: Uint8Array, xmp?: Uint8Array }
+// through to the JXL encode session so EXIF/XMP bytes are embedded in the output file.
+// The RAW pipeline produces these bytes at the worker level; the export service applies
+// the privacy policy (keep/strip-gps/strip-all) before passing them here.
+// Packet-3 integration point: when a metadata-preserving encoder lands, it will supply
+// the exact EXIF block; for now we pass synthesized EXIF from the json exif blob if
+// available (the JXL encoder handles null gracefully — it just omits the EXIF box).
+async function encodeJxlSession(pixels, width, height, quality, effort, lossless, progressive, format = 'rgba8', orientation, metadata = null) {
     // A3: rgb8 carries 3 channels (no alpha), rgba8/rgba16/rgbaf32 carry 4.
     const hasAlpha = format !== 'rgb8';
     const encOpts = {
@@ -976,6 +990,9 @@ async function encodeJxlSession(pixels, width, height, quality, effort, lossless
     if (orientation != null && orientation >= 1 && orientation <= 8) {
         encOpts.orientation = orientation;
     }
+    // Finding 44: pass raw EXIF/XMP bytes into the JXL container when provided.
+    if (metadata?.exif instanceof Uint8Array) encOpts.exif = metadata.exif;
+    if (metadata?.xmp  instanceof Uint8Array) encOpts.xmp  = metadata.xmp;
     const session = getContext().encode(encOpts);
     const buf = pixels instanceof ArrayBuffer ? pixels : pixels.buffer;
     await session.pushPixels(buf);
@@ -3270,7 +3287,7 @@ function buildInfoRows(card) {
         ['Camera WB', fmtCameraWb(card)],
         ['Orientation', ORIENTATION_LABEL[ex.orientation] || (ex.orientation != null ? String(ex.orientation) : null)],
         ['Dimensions', dim],
-        ['Format',    'ORF (Olympus 12-bit)'],
+        ['Format',    _formatLabel(ex)],
         ['Quality',   fmtQuality(ex.quality)],
         ['Pipeline',  getCardState(card)._pipelineMs != null ? `${getCardState(card)._pipelineMs.toFixed(0)} ms` : null],
     ].filter(([_, v]) => v != null);
@@ -3661,6 +3678,18 @@ function initFilmstrip() {
             applyLookToFilmstripSelection();
         });
     }
+
+    // Finding 13 (P0): wire the "Export selected" button to ExportService.
+    // Previously this button existed in the DOM but was never connected to any
+    // handler — clicking it did nothing.  Now it drives a full-resolution export
+    // of all filmstrip-selected cards using the current metadata policy from the
+    // export settings (defaults to 'keep').
+    const exportBtn = document.getElementById('filmstrip-export-selection');
+    if (exportBtn) {
+        exportBtn.addEventListener('click', () => {
+            exportFilmstripSelection();
+        });
+    }
 }
 
 function updateFilmstripSelectionUI() {
@@ -3828,6 +3857,182 @@ function applyLookToFilmstripSelection() {
             }
         })().catch(() => {});
     }
+}
+
+// ---------------------------------------------------------------------------
+// Finding 13 (P0): Export selected via ExportService
+// ---------------------------------------------------------------------------
+
+/**
+ * Export all filmstrip-selected cards at FULL RESOLUTION.
+ *
+ * Routes through ExportService (single entry point for all export paths).
+ *
+ * I-A: full resolution is sourced from the DEVELOPED FULL-RES OUTPUT — the
+ *   full-res developed JXL (`_blobUrl`, dims from `_exif.width/height`) — NEVER
+ *   the 1800px `_lightbox` preview.  JXL/keep passes the developed bytes through
+ *   unchanged.  Other outputs decode the full-res developed JXL and re-encode.
+ * I-B: only formats that genuinely encode are offered (jxl/png real; jpeg/tiff
+ *   gated).  PNG produces honest PNG bytes from the full-res RGBA.
+ * I-C: the metadata privacy policy is serialised to EXIF bytes and threaded into
+ *   the encoder (GPS absent under strip-gps/strip-all).
+ */
+async function exportFilmstripSelection() {
+    if (filmstripSelection.size === 0) return;
+
+    const indices = [...filmstripSelection];
+    // Collect cards and their assetIds in selection order.
+    const selectedCards = indices.map(i => cards[i]).filter(Boolean);
+    if (selectedCards.length === 0) return;
+
+    // Derive assetIds; cards without one are skipped (not yet decoded).
+    const assetIds = selectedCards
+        .map(c => getCardState(c)?._assetId)
+        .filter(Boolean);
+    if (assetIds.length === 0) return;
+
+    // Read metadata policy from an optional export-settings panel element.
+    // Falls back to 'keep' when no panel element is wired yet.
+    const policyEl = document.getElementById('export-metadata-policy');
+    const metadata  = (policyEl?.value === 'strip-gps' || policyEl?.value === 'strip-all')
+        ? policyEl.value : 'keep';
+
+    // Read output format from optional export-format picker, default to 'jxl'.
+    const fmtEl = document.getElementById('export-output-format');
+    const output = (['jxl','jpeg','png','tiff'].includes(fmtEl?.value))
+        ? fmtEl.value : 'jxl';
+
+    // I-B: guard at the entry point too (defence in depth — the UI disables
+    // gated options, and the service rejects them per-asset).  Fail fast with a
+    // single status message rather than emitting N identical per-asset errors.
+    if (!_isFormatEncodable(output)) {
+        if (statusText) {
+            statusBar.hidden = false;
+            statusText.textContent = `${output.toUpperCase()} export is not available yet (packet-3).`;
+        }
+        return;
+    }
+
+    const cardForAsset = (assetId) => cards.find(c => getCardState(c)?._assetId === assetId) ?? null;
+    // Tracks which asset the service is currently processing, so decodeFullRes
+    // can find the right card (the service passes bytes, not the assetId).  Set
+    // on each 'preparing' progress event below (the service is strictly serial).
+    let _currentExportAssetId = null;
+
+    // Create the ExportService, injecting the developed-output source + encoders.
+    const svc = new ExportService({
+        getCardStateByAssetId(assetId) {
+            const c = cardForAsset(assetId);
+            return c ? getCardState(c) : null;
+        },
+        // I-A: the developed FULL-RES output.  `_blobUrl` is the full-res
+        // developed JXL blob; fetch its bytes lazily.  Dims come from the sensor
+        // dims patched onto _exif at DONE (msg.w/msg.h), never the preview.
+        async getDevelopedOutput(state) {
+            const url = state?._blobUrl;
+            const w = state?._exif?.width, h = state?._exif?.height;
+            if (!url || !w || !h) return null;
+            const resp = await fetch(url);
+            const jxlBytes = new Uint8Array(await resp.arrayBuffer());
+            return { jxlBytes, w, h };
+        },
+        // I-A: if the developed full-res JXL is not present yet, trigger the
+        // existing full-res convert flow and await it.
+        async ensureDeveloped(assetId) {
+            const c = cardForAsset(assetId);
+            if (!c) return;
+            if (getCardState(c)?._blobUrl) return;          // already developed
+            await new Promise((resolve) => {
+                const t0 = Date.now();
+                const poll = () => {
+                    if (getCardState(c)?._blobUrl || Date.now() - t0 > 60000) return resolve();
+                    setTimeout(poll, 150);
+                };
+                // Kick a full-res reprocess if one is not already in flight.
+                try { if (typeof startConvert === 'function') startConvert(getCardState(c)._file, c); } catch {}
+                poll();
+            });
+        },
+        // Decode the developed FULL-RES JXL back to full-res RGBA (never the
+        // preview).  Reuses the existing full-JXL decode path.
+        //
+        // NOTE: `_jxlBytes` is intentionally UNUSED. We decode by asset id via
+        // the card's blob URL through the shared session (decodeFullJxlFor)
+        // rather than decoding the passed buffer directly — this reuses the
+        // warm decode session and its full-dims sizing. The parameter is kept
+        // to match the ExportService capability signature; do not wire it to a
+        // fresh decode without also routing sizing/session state.
+        async decodeFullRes(_jxlBytes) {
+            // We decode via the card's blob URL through the shared session
+            // (decodeFullJxlFor), which yields { rgba, w, h } at full dims.
+            const c = cardForAsset(_currentExportAssetId);
+            if (!c) throw new Error('card not found for full-res decode');
+            const dec = await window.decodeFullJxlFor(c);
+            if (!dec || !dec.rgba) throw new Error('full-res JXL decode failed');
+            return { pixels: dec.rgba, w: dec.w, h: dec.h, format: 'rgba8' };
+        },
+        // Re-encode full-res pixels to the requested format, embedding the
+        // policy-serialised metadata bytes (I-C).
+        async encodePixels(pixels, w, h, format, orientation, outputFmt, metadataBytes) {
+            if (outputFmt === 'png') {
+                // I-B: honest PNG bytes.  (PNG carries no EXIF here; the privacy
+                // policy is still honoured because no metadata is embedded.)
+                return _encodePng(pixels, w, h, format === 'rgb8' ? 'rgb8' : 'rgba8');
+            }
+            // jxl re-encode with serialised EXIF/XMP (I-C).
+            const quality = 90, effort = 3;
+            return encodeJxlSession(pixels, w, h, quality, effort, false, false, format, orientation, metadataBytes);
+        },
+    });
+
+    // Disable the button while exporting.
+    const exportBtn = document.getElementById('filmstrip-export-selection');
+    if (exportBtn) {
+        exportBtn.disabled = true;
+        exportBtn.textContent = 'Exporting…';
+    }
+
+    let doneCount = 0, errorCount = 0;
+
+    try {
+        const req = { assetIds, output, metadata, resolution: 'full' };
+        for await (const ev of svc.export(req)) {
+            if (ev.type === 'progress') {
+                // Track the in-flight asset so decodeFullRes finds the right card.
+                _currentExportAssetId = ev.assetId;
+                if (exportBtn) exportBtn.textContent = `Exporting… (${ev.phase})`;
+            } else if (ev.type === 'done') {
+                doneCount++;
+                // Trigger browser download for each exported file.
+                const url = URL.createObjectURL(new Blob([ev.bytes], { type: _mimeForOutput(output) }));
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = ev.filename;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 30000);
+            } else if (ev.type === 'error') {
+                errorCount++;
+                console.error('[export]', ev.assetId, ev.error);
+            }
+        }
+    } finally {
+        if (exportBtn) {
+            exportBtn.disabled = false;
+            exportBtn.textContent = errorCount > 0
+                ? `Export selected (${errorCount} error${errorCount > 1 ? 's' : ''})`
+                : 'Export selected';
+        }
+    }
+
+    if (doneCount > 0 && statusText) {
+        statusBar.hidden = false;
+        statusText.textContent = `Exported ${doneCount} file${doneCount === 1 ? '' : 's'}` +
+            (errorCount > 0 ? ` (${errorCount} failed)` : '');
+    }
+}
+
+function _mimeForOutput(fmt) {
+    return { jxl: 'image/jxl', jpeg: 'image/jpeg', png: 'image/png', tiff: 'image/tiff' }[fmt] ?? 'application/octet-stream';
 }
 
 // Toolbar buttons
