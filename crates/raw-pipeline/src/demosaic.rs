@@ -1199,6 +1199,22 @@ pub fn demosaic_bayer_mhc(
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = width >= 20 && height >= 5 && std::is_x86_feature_detected!("avx2");
 
+    // P3-T11 (Lens 22/25, finding 21): wasm SIMD128 interior kernel, the wasm sibling
+    // of mhc_row_interior_avx2. Processes cols [2, w-2) in 4-px v128 chunks for interior
+    // rows [2, h-2); borders/tails stay scalar. Bit-identical to the scalar arms by
+    // construction (same i32 op order, arithmetic `>>`, and clamp) — pinned by
+    // demosaic_bayer_mhc_simd128_bit_identical (native reference) and, on wasm, the
+    // whole-function dispatch under the same clamped-ref parity test. The kernel needs
+    // 12 interior cols for a first 4-wide chunk (widest tap col+5 for lane 3, and the
+    // loop bound col + 6 <= width) plus non-empty interior, so gate on width >= 12.
+    //
+    // OFF by default: gated behind the opt-in `mhc-simd128` cargo feature. The ≥15% median
+    // perf-acceptance gate (browser + Node WASM flipflop) is OWED — until it passes in a
+    // WASM-capable env, production wasm stays on the scalar interior. Enabling the feature
+    // is bit-exact (tests + wasm32 build prove it), it just flips which interior path runs.
+    #[cfg(all(target_arch = "wasm32", feature = "mhc-simd128"))]
+    let use_simd128 = width >= 12 && height >= 5;
+
     let do_row = |row: usize, out_row: &mut [u16]| {
         let r = row as isize;
         let r_n = clamp(r - 1, 0, h_max);
@@ -1244,6 +1260,13 @@ pub fn demosaic_bayer_mhc(
             scalar_start = unsafe {
                 mhc_row_interior_avx2(raw, width, row, int_start, int_end, phase, out_row)
             };
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "mhc-simd128"))]
+        if use_simd128 && row >= 2 && row + 2 <= h_max as usize && int_end > int_start {
+            // SAFETY: rows r±1, r±2 are unclamped (row in [2, h-2]); the kernel only
+            // reads cols [col-2, col+5] for col chunks that satisfy col + 6 <= width,
+            // enforced by its loop bound. wasm128 is always available on this target.
+            scalar_start = mhc_row_interior_simd128(raw, width, row, int_start, int_end, phase, out_row);
         }
         for col in scalar_start..int_end {
             let (rr, gg, bb) = mhc_pixel_phased(
@@ -1435,6 +1458,375 @@ unsafe fn mhc_row_interior_avx2(
         col += 8;
     }
     col
+}
+
+// ─── P3-T11 (finding 21): wasm SIMD128 MHC interior kernel ──────────────────────────────────
+//
+// `mhc_row_interior_simd128` is the wasm sibling of `mhc_row_interior_avx2`. It processes the
+// interior columns of an interior row in 4-px v128 chunks (v128 = 4 i32 lanes), computing both
+// CFA arms for all 4 lanes from 13 widening row loads and selecting them with a constant
+// alternating parity mask via `v128_bitselect` — no gathers, no per-pixel branch. Borders/tails
+// stay scalar (handled by the caller). It is BIT-IDENTICAL to the scalar `mhc_pixel_phased` arms
+// by construction: same i32 operation order, the same `>>` arithmetic shifts (`i32x4_shr`), the
+// same `sll` scalings (`i32x4_shl`), and the same clamp bounds/order (`i32x4_max` then
+// `i32x4_min`, matching `.clamp(0, 65535)`).
+//
+// Because wasm SIMD cannot be executed by the native test runner, the exact per-lane arithmetic
+// is mirrored 1:1 in `mhc_row_interior_simd128_ref` below (pure scalar, computing the same lane
+// values in the same op order). The native test `demosaic_bayer_mhc_simd128_bit_identical`
+// exercises that reference against the all-clamped scalar reference for every CFA phase / width
+// remainder / height, proving the SIMD op-order is bit-exact. The wasm32 `--lib` build compiles
+// the real v128 kernel (validity gate), and on wasm the whole-function dispatch is covered by the
+// same clamped-ref parity test that the scalar interior split uses.
+
+/// Shared per-lane MHC interior math for the SIMD128 kernel, as pure scalar i32 ops in the exact
+/// order the SIMD lanes perform them. `row_q` = `(row + phase.0) & 1` (row parity); `col_q` =
+/// `(col + phase.1) & 1` (column parity of this specific column). Returns the pre-store
+/// (r, g, b) i32 lane values (already clamped where the SIMD path clamps). `base_*` are the
+/// row-start indices into `raw` (row*width) for center/north/south/north2/south2.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn mhc_simd128_lane(
+    raw: &[u16],
+    rc: usize,
+    rn: usize,
+    rs: usize,
+    rn2: usize,
+    rs2: usize,
+    col: usize,
+    row_q: usize,
+    col_q: usize,
+) -> (i32, i32, i32) {
+    // Same 13 taps the SIMD kernel loads (all in-bounds for interior cols).
+    let c_m2 = raw[rc + col - 2] as i32;
+    let c_m1 = raw[rc + col - 1] as i32;
+    let c_0 = raw[rc + col] as i32;
+    let c_p1 = raw[rc + col + 1] as i32;
+    let c_p2 = raw[rc + col + 2] as i32;
+    let n_m1 = raw[rn + col - 1] as i32;
+    let n_0 = raw[rn + col] as i32;
+    let n_p1 = raw[rn + col + 1] as i32;
+    let s_m1 = raw[rs + col - 1] as i32;
+    let s_0 = raw[rs + col] as i32;
+    let s_p1 = raw[rs + col + 1] as i32;
+    let n2_0 = raw[rn2 + col] as i32;
+    let s2_0 = raw[rs2 + col] as i32;
+
+    // Shared cross/diagonal sums (same association as the SIMD arms — mirrors the AVX2 kernel).
+    let sum_g4 = (n_0 + c_p1) + (s_0 + c_m1); // gn+ge+gs+gw
+    let sum_h2 = c_p1 + c_m1; // e+w
+    let sum_v2 = n_0 + s_0; // n+s
+    let sum_hd2 = c_p2 + c_m2; // e2+w2
+    let sum_vd2 = n2_0 + s2_0; // n2+s2
+    let sum_d4 = sum_vd2 + sum_hd2; // n2+e2+s2+w2
+    let sum_x4 = (n_m1 + n_p1) + (s_m1 + s_p1); // 4 diagonals
+
+    let clamp16 = |v: i32| v.max(0).min(65535);
+
+    if row_q == 0 {
+        if col_q == 0 {
+            // Even arm (0,0) — R site.
+            let g00 = ((sum_g4 << 1) + (c_0 << 2) - sum_d4) >> 3;
+            let b00 = sum_x4 >> 2;
+            (c_0, clamp16(g00), clamp16(b00))
+        } else {
+            // Odd arm (0,1) — G site on R row.
+            let r01 = ((sum_h2 << 1) + (c_0 << 1) - sum_hd2) >> 2;
+            let b01 = ((sum_v2 << 1) + (c_0 << 1) - sum_vd2) >> 2;
+            (clamp16(r01), c_0, clamp16(b01))
+        }
+    } else if col_q == 0 {
+        // Even arm (1,0) — G site on B row.
+        let r10 = ((sum_v2 << 1) + (c_0 << 1) - sum_vd2) >> 2;
+        let b10 = ((sum_h2 << 1) + (c_0 << 1) - sum_hd2) >> 2;
+        (clamp16(r10), c_0, clamp16(b10))
+    } else {
+        // Odd arm (1,1) — B site.
+        let g11 = ((sum_g4 << 1) + (c_0 << 2) - sum_d4) >> 3;
+        let r11 = ((sum_x4 << 1) + (c_0 << 2) - sum_d4) >> 3;
+        (clamp16(r11), clamp16(g11), c_0)
+    }
+}
+
+/// Native scalar mirror of `mhc_row_interior_simd128` — identical lane arithmetic and 4-wide
+/// chunk loop bound, so it is bit-exact to the wasm SIMD kernel and is unit-testable on native.
+/// Processes cols [int_start, …) in 4-col chunks while `col + 6 <= width`; returns the first
+/// unprocessed column (the scalar tail start). Rows r±1/r±2 must be in-bounds (interior rows).
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn mhc_row_interior_simd128_ref(
+    raw: &[u16],
+    width: usize,
+    row: usize,
+    int_start: usize,
+    int_end: usize,
+    phase: (usize, usize),
+    out_row: &mut [u16],
+) -> usize {
+    let row_q = (row + phase.0) & 1;
+    let rn = (row - 1) * width;
+    let rs = (row + 1) * width;
+    let rn2 = (row - 2) * width;
+    let rs2 = (row + 2) * width;
+    let rc = row * width;
+
+    let mut col = int_start;
+    while col + 6 <= width && col < int_end.saturating_sub(3) {
+        for k in 0..4 {
+            let c = col + k;
+            let col_q = (c + phase.1) & 1;
+            let (r, g, b) = mhc_simd128_lane(raw, rc, rn, rs, rn2, rs2, c, row_q, col_q);
+            let o = c * 3;
+            out_row[o] = r as u16;
+            out_row[o + 1] = g as u16;
+            out_row[o + 2] = b as u16;
+        }
+        col += 4;
+    }
+    col
+}
+
+/// wasm SIMD128 MHC interior-row kernel (P3-T11). Processes cols [int_start, …) in 4-px v128
+/// chunks while `col + 6 <= width` (the widest tap is col+2 for lane 3 = col+5) and a full
+/// 4-lane chunk stays inside the interior; returns the first unprocessed column.
+///
+/// Both CFA arms are computed for all 4 lanes from 13 widening row loads (every tap is a
+/// contiguous `u16x8` load whose low 4 lanes are extended to `i32x4`), then selected with a
+/// constant alternating parity mask. Arithmetic uses the same i32 ops, `i32x4_shr` (arithmetic
+/// shift), `i32x4_shl`, and the same clamp (`i32x4_max` then `i32x4_min`) as the scalar arms —
+/// bit-identical by construction; op-order pinned on native by
+/// `demosaic_bayer_mhc_simd128_bit_identical` (via `mhc_row_interior_simd128_ref`).
+///
+/// Compiled for every wasm32 build (so the wasm32 `--lib` gate always validates the v128 code),
+/// but only *called* when the opt-in `mhc-simd128` feature is on — hence `allow(dead_code)`.
+#[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+fn mhc_row_interior_simd128(
+    raw: &[u16],
+    width: usize,
+    row: usize,
+    int_start: usize,
+    int_end: usize,
+    phase: (usize, usize),
+    out_row: &mut [u16],
+) -> usize {
+    use core::arch::wasm32::*;
+
+    // Load 4 u16 at `base` and zero-extend to i32x4 (low half of a u16x8 load).
+    #[inline(always)]
+    unsafe fn ld(raw: &[u16], base: usize) -> v128 {
+        // Widening load: read 4 u16 (8 bytes) via v128_load64_zero, then extend low to i32x4.
+        let raw16 = v128_load64_zero(raw.as_ptr().add(base) as *const u64);
+        i32x4_extend_low_u16x8(raw16)
+    }
+
+    let zero = i32x4_splat(0);
+    let vmax = i32x4_splat(65535);
+    let clamp16 = |v: v128| i32x4_min(i32x4_max(v, zero), vmax);
+
+    let row_q = (row + phase.0) & 1;
+    let rn = (row - 1) * width;
+    let rs = (row + 1) * width;
+    let rn2 = (row - 2) * width;
+    let rs2 = (row + 2) * width;
+    let rc = row * width;
+
+    let mut col = int_start;
+    while col + 6 <= width && col < int_end.saturating_sub(3) {
+        // 13 widening loads cover every tap of both arms for lanes col..col+3.
+        let (c_m2, c_m1, c_0, c_p1, c_p2, n_m1, n_0, n_p1, s_m1, s_0, s_p1, n2_0, s2_0) = unsafe {
+            (
+                ld(raw, rc + col - 2),
+                ld(raw, rc + col - 1),
+                ld(raw, rc + col),
+                ld(raw, rc + col + 1),
+                ld(raw, rc + col + 2),
+                ld(raw, rn + col - 1),
+                ld(raw, rn + col),
+                ld(raw, rn + col + 1),
+                ld(raw, rs + col - 1),
+                ld(raw, rs + col),
+                ld(raw, rs + col + 1),
+                ld(raw, rn2 + col),
+                ld(raw, rs2 + col),
+            )
+        };
+
+        let add = |a, b| i32x4_add(a, b);
+        let sub = |a, b| i32x4_sub(a, b);
+        let sll1 = |a| i32x4_shl(a, 1);
+        let sll2 = |a| i32x4_shl(a, 2);
+        let sra2 = |a| i32x4_shr(a, 2);
+        let sra3 = |a| i32x4_shr(a, 3);
+
+        // Shared cross/diagonal sums (same association as the scalar arms).
+        let sum_g4 = add(add(n_0, c_p1), add(s_0, c_m1)); // gn+ge+gs+gw
+        let sum_h2 = add(c_p1, c_m1); // e+w
+        let sum_v2 = add(n_0, s_0); // n+s
+        let sum_hd2 = add(c_p2, c_m2); // e2+w2
+        let sum_vd2 = add(n2_0, s2_0); // n2+s2
+        let sum_d4 = add(sum_vd2, sum_hd2); // n2+e2+s2+w2
+        let sum_x4 = add(add(n_m1, n_p1), add(s_m1, s_p1)); // 4 diagonals
+
+        let (r_even, g_even, b_even, r_odd, g_odd, b_odd);
+        if row_q == 0 {
+            // Even arm (0,0) — R site; Odd arm (0,1) — G site on R row.
+            let g00 = sra3(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
+            let b00 = sra2(sum_x4);
+            let r01 = sra2(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
+            let b01 = sra2(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
+            r_even = c_0;
+            g_even = clamp16(g00);
+            b_even = clamp16(b00);
+            r_odd = clamp16(r01);
+            g_odd = c_0;
+            b_odd = clamp16(b01);
+        } else {
+            // Even arm (1,0) — G site on B row; Odd arm (1,1) — B site.
+            let r10 = sra2(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
+            let b10 = sra2(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
+            let g11 = sra3(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
+            let r11 = sra3(sub(add(sll1(sum_x4), sll2(c_0)), sum_d4));
+            r_even = clamp16(r10);
+            g_even = c_0;
+            b_even = clamp16(b10);
+            r_odd = clamp16(r11);
+            g_odd = clamp16(g11);
+            b_odd = c_0;
+        }
+
+        // Column-parity blend: lane k is "odd-arm" when (col+k+phase.1) is odd. col advances by
+        // 4, so the alternating pattern depends only on (col + phase.1) & 1 — constant per chunk.
+        // v128_bitselect(a, b, m) = (a & m) | (b & !m): pick ODD where mask set, EVEN otherwise.
+        let start_odd = ((col + phase.1) & 1) == 1;
+        let odd_mask = if start_odd {
+            // lanes: [odd, even, odd, even]
+            i32x4(-1, 0, -1, 0)
+        } else {
+            // lanes: [even, odd, even, odd]
+            i32x4(0, -1, 0, -1)
+        };
+        let pick = |even: v128, odd: v128| v128_bitselect(odd, even, odd_mask);
+        let r_v = pick(r_even, r_odd);
+        let g_v = pick(g_even, g_odd);
+        let b_v = pick(b_even, b_odd);
+
+        // Interleaved RGB store via stack staging (compute dominates; 12 u16 stores are cheap).
+        let mut rs_ = [0i32; 4];
+        let mut gs_ = [0i32; 4];
+        let mut bs_ = [0i32; 4];
+        unsafe {
+            v128_store(rs_.as_mut_ptr() as *mut v128, r_v);
+            v128_store(gs_.as_mut_ptr() as *mut v128, g_v);
+            v128_store(bs_.as_mut_ptr() as *mut v128, b_v);
+        }
+        for k in 0..4 {
+            let o = (col + k) * 3;
+            out_row[o] = rs_[k] as u16;
+            out_row[o + 1] = gs_[k] as u16;
+            out_row[o + 2] = bs_[k] as u16;
+        }
+        col += 4;
+    }
+    col
+}
+
+// ─── P3-T11 flipflop bench pair (wasm only): scalar-interior vs SIMD128-interior ─────────────
+//
+// Same borders/tails/edge-rows; only the interior-row column span differs (scalar
+// mhc_pixel_phased loop vs the v128 kernel). This lets a single wasm pkg A/B the exact win the
+// `mhc-simd128` feature would ship, so the OWED ≥15%-median flipflop gate is one build away.
+// Both are BIT-EXACT (they compose the same pieces the parity tests pin). Bench-only.
+
+/// MHC demosaic with the interior forced through either the scalar loop (`simd=false`) or the
+/// v128 SIMD128 kernel (`simd=true`). Everything else (borders, tails, edge rows) is identical.
+#[cfg(target_arch = "wasm32")]
+fn demosaic_bayer_mhc_forced(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    phase: (u8, u8),
+    simd: bool,
+) -> Result<Vec<u16>, String> {
+    validate(raw, width, height)?;
+    let n3 = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| format!("demosaic: {}×{}×3 overflows usize", width, height))?;
+    let mut rgb = vec![0u16; n3];
+    let w_max = (width - 1) as isize;
+    let h_max = (height - 1) as isize;
+    let phase = (phase.0 as usize, phase.1 as usize);
+    let use_simd = simd && width >= 12 && height >= 5;
+
+    let do_row = |row: usize, out_row: &mut [u16]| {
+        let r = row as isize;
+        let r_n = clamp(r - 1, 0, h_max);
+        let r_s = clamp(r + 1, 0, h_max);
+        let r_n2 = clamp(r - 2, 0, h_max);
+        let r_s2 = clamp(r + 2, 0, h_max);
+        let (int_start, int_end) = if width >= 4 { (2usize, width - 2) } else { (width, width) };
+        for col in 0..int_start {
+            let c = col as isize;
+            let (rr, gg, bb) = mhc_pixel_phased(
+                raw, width, row, r_n, r_s, r_n2, r_s2, col,
+                clamp(c - 1, 0, w_max), clamp(c + 1, 0, w_max),
+                clamp(c - 2, 0, w_max), clamp(c + 2, 0, w_max), phase,
+            );
+            let o = col * 3;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
+        }
+        let mut scalar_start = int_start;
+        if use_simd && row >= 2 && row + 2 <= h_max as usize && int_end > int_start {
+            scalar_start = mhc_row_interior_simd128(raw, width, row, int_start, int_end, phase, out_row);
+        }
+        for col in scalar_start..int_end {
+            let (rr, gg, bb) = mhc_pixel_phased(
+                raw, width, row, r_n, r_s, r_n2, r_s2, col,
+                col - 1, col + 1, col - 2, col + 2, phase,
+            );
+            let o = col * 3;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
+        }
+        for col in int_end..width {
+            let c = col as isize;
+            let (rr, gg, bb) = mhc_pixel_phased(
+                raw, width, row, r_n, r_s, r_n2, r_s2, col,
+                clamp(c - 1, 0, w_max), clamp(c + 1, 0, w_max),
+                clamp(c - 2, 0, w_max), clamp(c + 2, 0, w_max), phase,
+            );
+            let o = col * 3;
+            out_row[o] = rr as u16;
+            out_row[o + 1] = gg as u16;
+            out_row[o + 2] = bb as u16;
+        }
+    };
+
+    #[cfg(feature = "parallel")]
+    rgb.par_chunks_mut(width * 3).enumerate().for_each(|(row, out_row)| do_row(row, out_row));
+    #[cfg(not(feature = "parallel"))]
+    rgb.chunks_mut(width * 3).enumerate().for_each(|(row, out_row)| do_row(row, out_row));
+
+    Ok(rgb)
+}
+
+/// Bench helper (wasm only): RGGB MHC demosaic with the scalar interior. Bench A/B baseline.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub fn demosaic_rggb_mhc_scalar_interior(raw: &[u16], width: usize, height: usize) -> Result<Vec<u16>, String> {
+    demosaic_bayer_mhc_forced(raw, width, height, (0, 0), false)
+}
+
+/// Bench helper (wasm only): RGGB MHC demosaic with the SIMD128 interior. Bench A/B variant.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub fn demosaic_rggb_mhc_simd128_interior(raw: &[u16], width: usize, height: usize) -> Result<Vec<u16>, String> {
+    demosaic_bayer_mhc_forced(raw, width, height, (0, 0), true)
 }
 
 /// Pre-optimization all-clamped reference (clamps every pixel's c±1/c±2). Retained for

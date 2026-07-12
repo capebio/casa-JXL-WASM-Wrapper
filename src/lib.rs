@@ -336,6 +336,41 @@ pub fn demtone_bench_mhc() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_mhc(raw, *w, *h).unwrap())
     })
 }
+
+// P3-T11 (finding 21): flipflop A/B of the MHC interior — scalar loop vs wasm SIMD128 kernel.
+// Same borders/tails/edge-rows; only the interior column span differs. These drive the OWED
+// ≥15%-median browser+Node-WASM flipflop gate (.flipflop/tests/mhc-simd128.mjs) from a single
+// pkg. `demtone_bench_mhc_equal` pins that the two are BIT-EXACT before crediting any speed.
+// wasm-only: the forced-interior helpers exist only under target_arch=wasm32.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn demtone_bench_mhc_scalar() -> u32 {
+    DEMTONE_BENCH.with(|b| {
+        let g = b.borrow();
+        let (raw, _, w, h, _) = &*g;
+        demo_checksum(&demosaic::demosaic_rggb_mhc_scalar_interior(raw, *w, *h).unwrap())
+    })
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn demtone_bench_mhc_simd128() -> u32 {
+    DEMTONE_BENCH.with(|b| {
+        let g = b.borrow();
+        let (raw, _, w, h, _) = &*g;
+        demo_checksum(&demosaic::demosaic_rggb_mhc_simd128_interior(raw, *w, *h).unwrap())
+    })
+}
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn demtone_bench_mhc_equal() -> bool {
+    DEMTONE_BENCH.with(|b| {
+        let g = b.borrow();
+        let (raw, _, w, h, _) = &*g;
+        let s = demosaic::demosaic_rggb_mhc_scalar_interior(raw, *w, *h).unwrap();
+        let v = demosaic::demosaic_rggb_mhc_simd128_interior(raw, *w, *h).unwrap();
+        s == v
+    })
+}
 #[wasm_bindgen]
 pub fn demtone_bench_tone() -> u32 {
     DEMTONE_BENCH.with(|b| {

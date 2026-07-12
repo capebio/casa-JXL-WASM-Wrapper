@@ -10,6 +10,12 @@ parallel = ["dep:rayon"]
 # Replaces the GPL jpegxl-rs / jpegxl-sys path entirely (encode + decode).
 jxl-codec = ["dep:jxl-ffi", "dep:half", "dep:rayon"]
 c-perceptual = []
+# mhc-simd128 (P3-T11, finding 21): opt-in wasm SIMD128 MHC interior demosaic kernel.
+# BIT-EXACT to scalar (proven by tests + wasm32 build), but OFF by default because the
+# ≥15% median perf-acceptance gate (browser + Node WASM flipflop) has NOT been run in a
+# WASM-capable env yet — the perf claim is OWED. Enable to build the v128 kernel into the
+# dispatch; the perf run must pass before flipping this on in a shipped pkg. No-op off-wasm.
+mhc-simd128 = []
 # image-formats: general RGB image ingestion (TIFF/EXR decoders in image_formats.rs).
 # Decoders ride the `image` crate already in deps; gate kept explicit.
 image-formats = []
