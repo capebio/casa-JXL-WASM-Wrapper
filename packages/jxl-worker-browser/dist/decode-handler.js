@@ -585,8 +585,14 @@ function toTransferablePixels(value) {
     if (typeof SharedArrayBuffer !== "undefined" && buf instanceof SharedArrayBuffer) {
         return { buffer: buf, copied: false };
     }
-    // Uint8Array frames may alias WASM/facade-owned storage across progressive passes.
-    // Transferring that backing ArrayBuffer detaches it and can break the next pass.
+    // Owned TypedArray (offset 0, covers the whole buffer): transfer without a second
+    // full-frame memcpy. Facade always hands a fresh copy for progressive frames and an
+    // ownership-transferred buffer for final — never a live WASM heap view — so detaching
+    // is safe. Sub-views (byteOffset > 0 or partial length) still must slice so we do not
+    // transfer a larger shared backing buffer.
+    if (value.byteOffset === 0 && value.byteLength === buf.byteLength) {
+        return { buffer: buf, copied: false };
+    }
     return {
         buffer: buf.slice(value.byteOffset, value.byteOffset + value.byteLength),
         copied: true,
