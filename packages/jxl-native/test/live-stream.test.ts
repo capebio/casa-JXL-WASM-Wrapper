@@ -195,6 +195,70 @@ describe("jxl-native live decode stream", () => {
     await dec.dispose();
     expect(true).toBe(true);
   });
+
+  test("bounded queue: many events with a paused consumer stay retained-bounded and all arrive", async () => {
+    // A multi-frame animation is a reliable source of many events (one per
+    // frame). We push everything, then drain slowly, and assert the terminal
+    // labelling matches batch (exactly one "final", the last frame) and every
+    // event is delivered — i.e. backpressure parking never drops events.
+    const W = 8;
+    const H = 8;
+    const N = 20;
+    const frames = [];
+    for (let f = 0; f < N; f++) {
+      const px = new Uint8Array(W * H * 4);
+      for (let i = 0; i < W * H; i++) {
+        px[i * 4 + 0] = (i * 7 + f * 11) & 0xff;
+        px[i * 4 + 1] = (i * 13 + f) & 0xff;
+        px[i * 4 + 2] = (i * 29) & 0xff;
+        px[i * 4 + 3] = 255;
+      }
+      frames.push({ data: px, width: W, height: H, duration: 5, name: `f${f}` });
+    }
+    const enc = createEncoder({
+      format: "rgba8",
+      width: W,
+      height: H,
+      hasAlpha: true,
+      iccProfile: null,
+      exif: null,
+      xmp: null,
+      distance: 0,
+      quality: null,
+      effort: 3,
+      progressive: false,
+      previewFirst: false,
+      chunked: false,
+      animation: { ticksPerSecond: 100, loopCount: 0 },
+      frames,
+    });
+    await enc.finish();
+    const encoded = concat(await Array.fromAsync(enc.chunks()));
+    await enc.dispose();
+
+    const dec = createDecoder(baseDecoderOptions());
+    await dec.push(encoded);
+    await dec.close();
+
+    // Drain slowly (simulating a paused/slow consumer) and count.
+    const types: Record<string, number> = {};
+    let total = 0;
+    let lastFinal: Extract<DecodeEvent, { type: "final" }> | undefined;
+    for await (const ev of dec.events()) {
+      types[ev.type] = (types[ev.type] ?? 0) + 1;
+      total += 1;
+      if (ev.type === "final") lastFinal = ev;
+      await new Promise((r) => setTimeout(r, 0)); // slow consumer
+    }
+
+    expect(types.header).toBe(1);
+    expect(types.final).toBe(1); // hold-back: only the terminal frame is "final"
+    expect(types.progress).toBe(N - 1);
+    expect(total).toBe(N + 1);
+    expect(lastFinal?.frameIndex).toBe(N - 1);
+    expect(lastFinal?.animTicksPerSecond).toBe(100);
+    await dec.dispose();
+  });
 });
 
 describe("jxl-native live encode stream", () => {
