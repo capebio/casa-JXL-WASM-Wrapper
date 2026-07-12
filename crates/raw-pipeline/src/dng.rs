@@ -16,7 +16,29 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// Global counter of container decodes (`decode_bytes` / `decode_bytes_inner`).
+///
+/// A DNG "container decode" is the expensive TIFF-walk + LJPEG/uncompressed
+/// un-decompress that produces the raw Bayer mosaic. The deferred-finish
+/// contract (P3-T8, finding 34) is that a preview→final two-phase flow decodes
+/// the container **exactly once** and reuses the retained mosaic for the final.
+/// This counter lets tests assert that invariant directly (`decode_count()`
+/// stays flat across a finish). Test-observability only — no effect on decode.
+static DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of DNG container decodes performed since process start (or since the
+/// last `reset_decode_count`). See [`DECODE_COUNT`].
+pub fn decode_count() -> u64 {
+    DECODE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the container-decode counter to 0. Tests call this to fence a scenario.
+pub fn reset_decode_count() {
+    DECODE_COUNT.store(0, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cfa {
@@ -128,6 +150,9 @@ pub fn decode_bytes_blit(data: &[u8]) -> Result<DngImage> {
 }
 
 fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
+    // Count every container decode so the deferred-finish contract (decode the
+    // container exactly once, then reuse the retained mosaic) is testable.
+    DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
     let (state, raw, le) = load_dng(data)?;
 
     let width = raw.width as usize;
