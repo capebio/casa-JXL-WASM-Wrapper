@@ -50,3 +50,40 @@ test("resolveProxy throws when all sources are null", async () => {
     /no proxy source available/,
   );
 });
+
+// ── BUG 3: encodeJpeg is required (no dangling nodeEncodeJpeg fallback) ───────
+
+test("encodeProxyJpeg throws a clear error (not ReferenceError) when encodeJpeg is missing", async () => {
+  // The browser proxy path passes no encodeJpeg fallback; a missing injected
+  // encoder must surface as a clear, actionable Error — never a ReferenceError
+  // from a removed Node symbol.
+  await assert.rejects(
+    () => encodeProxyJpeg(new Uint8Array(4 * 4 * 4), 4, 4, { quality: 80 }),
+    (e) => {
+      assert.ok(e instanceof Error, "must be an Error");
+      assert.ok(!(e instanceof ReferenceError), "must NOT be a ReferenceError (dangling nodeEncodeJpeg)");
+      assert.match(e.message, /encodeJpeg is required/i);
+      return true;
+    },
+  );
+});
+
+test("resolveProxy throws a clear error when encodeJpeg is missing but a source yields pixels", async () => {
+  const sources = [{ label: "px", get: async () => ({ rgba: new Uint8Array(4 * 4 * 4), w: 4, h: 4 }) }];
+  await assert.rejects(
+    () => resolveProxy(sources, { quality: 80 }), // no encodeJpeg injected
+    (e) => {
+      assert.ok(!(e instanceof ReferenceError), "must NOT be a ReferenceError");
+      assert.match(e.message, /encodeJpeg is required/i);
+      return true;
+    },
+  );
+});
+
+test("encodeProxyJpeg works when encodeJpeg is provided (small source, no downscale)", async () => {
+  const d = fakeDeps();
+  const out = await encodeProxyJpeg(new Uint8Array(4 * 4 * 4), 4, 4, { quality: 80, encodeJpeg: d.encodeJpeg });
+  assert.equal(out.w, 4);
+  assert.equal(out.h, 4);
+  assert.equal(out.jpeg[0], 0xff);
+});

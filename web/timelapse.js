@@ -18,6 +18,8 @@
 import {
   isRawName, buildRawEncodeRequest, rawFramesCliString,
   encodeFableTimelapse, suggestTimelapseName,
+  filterSelectedAssets, buildSequentialFrames, applyLookToDecodeArgs,
+  makeTimelapseCancelToken, buildTimelapseExportRequest,
 } from './timelapse-core.js';
 import { PRESETS } from './casv-lightbox/casv-lightbox-core.js';
 
@@ -137,10 +139,11 @@ const COLL = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' }
 
 export class TimelapseStudio {
   constructor() {
-    this.items = [];       // { name, path|null, file|null }
+    this.items = [];       // { name, path|null, file|null, selected, look }
     this.lb = null;        // embedded CasvLightbox (lazy)
     this.lastOutput = null;
     this.el = {};
+    this._cancelToken = null; // active cancel token for in-progress encodes
   }
 
   mount(doc = document) {
@@ -185,7 +188,8 @@ export class TimelapseStudio {
   _addFiles(files) {
     for (const f of files) {
       if (!isRawName(f.name)) continue;
-      this.items.push({ name: f.name, path: null, file: f });
+      // All newly-added files are selected by default; look is empty (neutral).
+      this.items.push({ name: f.name, path: null, file: f, selected: true, look: {} });
     }
     this._sortItems();
     this._refresh();
@@ -196,7 +200,7 @@ export class TimelapseStudio {
       const paths = await pickNativeRawPaths();
       for (const p of paths) {
         if (!isRawName(p)) continue;
-        this.items.push({ name: basename(p), path: p, file: null });
+        this.items.push({ name: basename(p), path: p, file: null, selected: true, look: {} });
       }
       this._sortItems();
       this._refresh();
@@ -312,8 +316,12 @@ export class TimelapseStudio {
   // ── encode (Tauri sidecar) ─────────────────────────────────────────────────
   async _encode() {
     if (!isTauri()) { return this._encodeInBrowser(); }
-    const paths = this.items.map((it) => it.path).filter(Boolean);
-    if (!paths.length || paths.length !== this.items.length) {
+    // Tauri path: respect the selected scope — only selected items with paths.
+    const selectedItems = filterSelectedAssets(
+      this.items.map((it) => ({ ...it, selected: it.selected !== false })),
+    );
+    const paths = selectedItems.map((it) => it.path).filter(Boolean);
+    if (!paths.length || paths.length !== selectedItems.length) {
       this._status('Add files via the native picker so the sidecar gets absolute paths.');
       return;
     }
@@ -350,46 +358,115 @@ export class TimelapseStudio {
     }
   }
   // ── encode (in-browser, no sidecar): FableBraid lossless → download .casv ────
+  //
+  // Uses the selected-asset scope (filterSelectedAssets), sequential reads
+  // (buildSequentialFrames), a memory budget, cancellation, and per-asset
+  // look edits (applyLookToDecodeArgs) — all wired from timelapse-core.js.
   async _encodeInBrowser() {
-    const items = this.items.slice();
-    if (!items.length) { this._status('Add RAW files to encode.'); return; }
+    // Respect the selected scope: only encode selected assets.
+    const selectedItems = filterSelectedAssets(
+      this.items.map((it) => ({ ...it, selected: it.selected !== false })),
+    );
+    if (!selectedItems.length) { this._status('Add RAW files to encode (or select some).'); return; }
     const form = this._form();
     this.el.encodeGo.disabled = true;
     this.el.progressWrap.hidden = false;
-    this._progress({ stage: 'decoding', done: 0, total: items.length });
+    this._progress({ stage: 'decoding', done: 0, total: selectedItems.length });
+
+    // Create a fresh cancel token; expose cancel to the stop button (future).
+    const tok = makeTimelapseCancelToken();
+    this._cancelToken = tok;
+
     try {
       const mod = await ensureWasm();
       if (typeof mod.FableVideoEncoder !== 'function') {
         throw new Error('this web/pkg has no FableVideoEncoder — rebuild with build-parallel-wasm.ps1');
       }
-      // Gather frame bytes (in-page File or, on desktop, a filesystem path).
-      const frames = [];
-      for (const it of items) {
-        const bytes = await this._itemBytes(it);
-        if (!bytes) throw new Error(`no bytes for ${it.name}`);
-        frames.push({ bytes, name: it.name });
+
+      // Memory budget: ~80 MB per 20 MP frame; we allow 2 frames in-flight.
+      const BUDGET_BYTES = 160 * 1024 * 1024;
+
+      // Sequential decode: one frame at a time via the core generator.
+      const readBytes = (card) => this._itemBytes(card);
+      let encResult = null;
+      let encodedCount = 0;
+      const fpsNum = form.fpsNum;
+      const fpsDen = form.fpsDen;
+      const gop = form.gop;
+
+      // Collect frames sequentially (not all-at-once), applying per-asset edits.
+      // The generator yields one { assetId, name, bytes, look } at a time.
+      const frameBuf = [];
+      for await (const frame of buildSequentialFrames(selectedItems, readBytes, {
+        isCancelled: tok.isCancelled,
+        maxBytesInFlight: BUDGET_BYTES,
+      })) {
+        if (tok.isCancelled()) break;
+        // Apply per-asset look edits via the look → decode-args mapping.
+        const lookArgs = applyLookToDecodeArgs(frame.look || {});
+        // For FableBraid (lossless), we decode with the per-asset look then push
+        // to the encoder. Re-use the existing pickDecoder/decodeRawRgb path, but
+        // pass the look args so edits are baked into the lossless frame.
+        const fn = (() => {
+          switch ((frame.name.toLowerCase().match(/\.([^.]+)$/) || [])[1]) {
+            case 'orf': return mod.process_orf;
+            case 'dng': return mod.process_dng;
+            case 'cr2': return mod.process_cr2;
+            default: throw new Error('unsupported RAW: ' + frame.name);
+          }
+        })();
+        const r = fn(frame.bytes, ...lookArgs);
+        // Read width/height BEFORE freeing: the WASM getters dereference the
+        // ProcessResult pointer, so touching r.width/r.height after r.free()
+        // reads freed memory and throws. Mirror decodeRawNeutralRgb: read all
+        // fields inside the try, then free.
+        let w, h, rgb;
+        try { w = r.width; h = r.height; rgb = r.take_rgb(); } finally { r.free(); }
+        frameBuf.push({ rgb, w, h, name: frame.name });
+        encodedCount++;
+        this._progress({ stage: 'decoding', done: encodedCount, total: selectedItems.length });
       }
-      const casv = encodeFableTimelapse(
-        mod, frames,
-        { fpsNum: form.fpsNum, fpsDen: form.fpsDen, gop: form.gop },
-        (done, total) => this._progress({ stage: 'encoding', done, total }),
-      );
-      const name = suggestTimelapseName(items.map((it) => it.name));
-      this._downloadCasv(casv, name);
+
+      if (tok.isCancelled()) {
+        this._status('Encode cancelled.');
+        this.el.progressWrap.hidden = true;
+        return;
+      }
+
+      if (!frameBuf.length) throw new Error('no frames could be read');
+
+      // Encode via FableVideoEncoder — sequential push of decoded RGB frames.
+      const { w, h } = frameBuf[0];
+      let enc = new mod.FableVideoEncoder(w, h, fpsNum, fpsDen, gop);
+      try {
+        for (let i = 0; i < frameBuf.length; i++) {
+          const f = frameBuf[i];
+          enc.push_rgb8(f.rgb);
+          this._progress({ stage: 'encoding', done: i + 1, total: frameBuf.length });
+        }
+        encResult = enc.finish();
+        enc = null;
+      } finally {
+        if (enc) { try { enc.free(); } catch (_) {} }
+      }
+
+      const name = suggestTimelapseName(selectedItems.map((it) => it.name));
+      this._downloadCasv(encResult, name);
       this.lastOutput = name;
-      const mb = (casv.length / 1e6).toFixed(1);
-      this._status(`Encoded ${frames.length} frames → ${name} (${mb} MB, lossless FableBraid)`);
-      this._progress({ stage: 'done', done: frames.length, total: frames.length });
+      const mb = (encResult.length / 1e6).toFixed(1);
+      this._status(`Encoded ${frameBuf.length} frames → ${name} (${mb} MB, lossless FableBraid)`);
+      this._progress({ stage: 'done', done: frameBuf.length, total: frameBuf.length });
       // Best-effort preview in the embedded player.
       try {
         const lb = await this._ensurePlayer();
-        await lb.loadBytes(casv, name);
+        await lb.loadBytes(encResult, name);
       } catch (e) { console.warn('[timelapse] player preview failed:', e); }
     } catch (e) {
       this._status('In-browser encode failed: ' + (e?.message || e));
       this.el.progressWrap.hidden = true;
     } finally {
       this.el.encodeGo.disabled = false;
+      if (this._cancelToken === tok) this._cancelToken = null;
     }
   }
 

@@ -1,16 +1,19 @@
+// proxy-e2e.test.mjs — end-to-end test using the Node source chain.
+// embeddedPreviewSource and nodeEncodeJpeg are now in node-adapter.mjs.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import sharp from "sharp";
 import { initWasm, getRaw, decodeRaw } from "./decode.mjs";
-import { embeddedPreviewSource, rawDecodeSource } from "./sources.mjs";
-import { resolveProxy, nodeEncodeJpeg } from "./proxy.mjs";
+import { rawDecodeSource } from "./sources.mjs";
+import { embeddedPreviewSource, nodeEncodeJpeg } from "./node-adapter.mjs";
+import { resolveProxy } from "./proxy.mjs";
 
-test("CR2 → 768px q80 4:2:0 JPEG via the real source chain", async () => {
+test("CR2 → 768px q80 4:2:0 JPEG via the real Node source chain", async () => {
   await initWasm();
   const raw = getRaw();
   const path = "c:/Foo/raw-converter/tests/ADH 1248.CR2";
   const sources = [
-    embeddedPreviewSource(path, sharp),
+    embeddedPreviewSource(path),
     rawDecodeSource(path, decodeRaw, raw.rgb_to_rgba),
   ];
   const out = await resolveProxy(sources, {
