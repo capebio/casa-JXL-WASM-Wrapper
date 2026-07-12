@@ -2911,12 +2911,16 @@ function drawLightboxForCard(card) {
     }
 
     if (mode === 'jxl') {
+        // M-1 (Findings 11, 29): bind the derived-cache lookup once so LRU is promoted
+        // exactly once and there is no between-gets eviction window.
+        const _jxlAid = getCardState(card)?._assetId;
+        const _hit = _jxlAid ? jxlDerivedCache.get(_jxlAid) : getCardState(card)['_jxlDecoded'];
         if (!getCardState(card)._blobUrl) {
             // JXL not ready yet — fall back to raw.
             getCardState(card)._sourceMode = 'raw';
-        } else if ((() => { const _aid = getCardState(card)?._assetId; return _aid ? jxlDerivedCache.get(_aid) : getCardState(card)['_jxlDecoded']; })()) {
+        } else if (_hit) {
             // Cached from prefetch — instant paint (Findings 11, 29: read from DerivedCache).
-            const { rgba, w, h } = (() => { const _aid = getCardState(card)?._assetId; return (_aid ? jxlDerivedCache.get(_aid) : getCardState(card)['_jxlDecoded']); })();
+            const { rgba, w, h } = _hit;
             lightboxCanvas.width  = w;
             lightboxCanvas.height = h;
             const ctx = lightboxCanvas.getContext('2d');

@@ -832,17 +832,20 @@
     // Render thumbnails for all subjects of a parent, using its cached JXL bitmap.
     async function renderSubjectThumb(parentCard) {
         if (!parentCard?._subjects?.length) return;
-        // Need JXL pixels. Decoded once full-res into parentCard._jxlDecoded?
-        // If not yet, kick the decode and wait — we promised "wait for JXL".
-        if (!parentCard._jxlDecoded && parentCard._blobUrl
-            && typeof window.decodeFullJxlFor === 'function') {
-            await window.decodeFullJxlFor(parentCard);
+        // Need JXL pixels. Post-migration (Findings 11, 29) decodeFullJxlFor writes
+        // pixels into jxlDerivedCache (keyed by assetId) and resolves with those pixels.
+        // Always call it — it is idempotent/cached — and use the resolved value directly.
+        // Do NOT read parentCard._jxlDecoded; that property is undefined for assetId cards.
+        let jd = null;
+        if (parentCard._blobUrl && typeof window.decodeFullJxlFor === 'function') {
+            jd = await window.decodeFullJxlFor(parentCard);
             // The decode is unabortable; by the time it resolves the parent card
             // may have been torn down (lightbox exit) or its subject siblings
             // rebuilt. Bail rather than paint into stale/detached nodes.
             if (!parentCard.isConnected) return;
         }
-        const jd = parentCard._jxlDecoded;
+        // Fallback: legacy assetId-less card stores pixels in _jxlDecoded directly.
+        if (!jd) jd = parentCard._jxlDecoded ?? null;
         if (!jd) return; // JXL not available — bail silently
         const { rgba, w, h } = jd;
         // Build a temporary source canvas with the full JXL pixels.
