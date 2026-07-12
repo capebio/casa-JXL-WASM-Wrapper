@@ -510,6 +510,17 @@ body > header.adjusting-control .look-column.active {
     width: 100px;
 }
 .controls label.lr strong { color: #e7e9ec; font-weight: 600; min-width: 32px; display: inline-block; text-align: right; }
+/* Denoise controls: compact rows in the Detail column. Sub-rows (mode / ISO≥ /
+   sensitivity) are shown/hidden by main.js via the `hidden` attribute based on the
+   enabled checkbox + activation mode; [hidden] { display:none } handles the rest. */
+.controls label.lr.denoise-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+}
+.controls label.lr.denoise-row input[type="checkbox"] { accent-color: #4f8cff; }
+.controls label.lr.denoise-row select { min-width: 72px; }
 .reset-btn {
     background: #2a3038;
     color: #c8ccd0;

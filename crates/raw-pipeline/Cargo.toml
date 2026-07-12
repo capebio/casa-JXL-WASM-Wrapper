@@ -13,6 +13,8 @@ c-perceptual = []
 # image-formats: general RGB image ingestion (TIFF/EXR decoders in image_formats.rs).
 # Decoders ride the `image` crate already in deps; gate kept explicit.
 image-formats = []
+# calibrate: enables the raw_noise_calibrate CLI (pulls in no extra deps currently).
+calibrate = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +36,11 @@ half = { version = "2", optional = true }
 name = "djxl"
 path = "src/bin/djxl.rs"
 required-features = ["jxl-codec"]
+
+[[bin]]
+name = "raw_noise_calibrate"
+path = "src/bin/raw_noise_calibrate.rs"
+required-features = ["calibrate"]
 
 [[bin]]
 name = "casv_encode"

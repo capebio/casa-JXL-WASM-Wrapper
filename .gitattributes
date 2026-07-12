@@ -81,3 +81,7 @@ Thumbs.db binary
 # PGO profile + wasm are binary — never line-ending convert
 *.profdata binary
 *.wasm binary
+
+# ML model artifacts — never line-ending convert
+*.onnx binary
+*.ort binary

@@ -231,6 +231,37 @@
                         <span>texture <strong data-label="texture">0</strong></span>
                         <input type="range" data-look="texture" min="-100" max="100" step="1" value="0" />
                     </label>
+                    <label class="lr denoise-row">
+                        <span>denoise</span>
+                        <input type="checkbox" id="denoise-enabled">
+                    </label>
+                    <label class="lr denoise-row" id="denoise-activation-row">
+                        <span>mode</span>
+                        <select id="denoise-activation">
+                            <option value="auto">auto</option>
+                            <option value="iso">ISO</option>
+                            <option value="always">always</option>
+                        </select>
+                    </label>
+                    <label class="lr denoise-row" id="denoise-iso-threshold-row">
+                        <span>ISO&ge;</span>
+                        <select id="denoise-iso-threshold">
+                            <option value="200">200</option>
+                            <option value="400">400</option>
+                            <option value="800">800</option>
+                            <option value="1600" selected>1600</option>
+                            <option value="3200">3200</option>
+                            <option value="6400">6400</option>
+                        </select>
+                    </label>
+                    <label class="lr denoise-row" id="denoise-sensitivity-row">
+                        <span>sensitivity</span>
+                        <select id="denoise-sensitivity">
+                            <option value="high">high</option>
+                            <option value="normal" selected>normal</option>
+                            <option value="low">low</option>
+                        </select>
+                    </label>
                 </fieldset>
             </div>
 

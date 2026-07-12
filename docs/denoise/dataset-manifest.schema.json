@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RawDenoiseDatasetManifest",
+  "type": "object",
+  "required": ["schemaVersion", "scenes"],
+  "properties": {
+    "schemaVersion": {"type": "integer", "const": 1},
+    "scenes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "camera", "iso", "paths", "sha256"],
+        "properties": {
+          "id": {"type": "string"},
+          "camera": {"type": "string"},
+          "iso": {"type": "integer"},
+          "split": {"type": "string", "enum": ["train", "holdout"]},
+          "paths": {
+            "type": "object",
+            "properties": {
+              "clean_raw": {"type": "string"},
+              "noisy_raw": {"type": "string"},
+              "dark_frames": {"type": "array", "items": {"type": "string"}}
+            }
+          },
+          "sha256": {"type": "object"}
+        }
+      }
+    }
+  }
+}

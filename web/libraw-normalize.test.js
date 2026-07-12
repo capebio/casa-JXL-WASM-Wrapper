@@ -85,6 +85,91 @@ test('metadataToRawMosaicPayload extracts render params for Rust raw mosaic proc
   expect(payload.decoder).toBe('libraw');
 });
 
+// ─── ISO extraction tests ─────────────────────────────────────────────────────
+
+function makeMinimalMeta(extra = {}) {
+  return {
+    camera_make: 'TestMake',
+    camera_model: 'TestModel',
+    flip: 0,
+    filters: filtersFor('RGGB'),
+    cdesc: 'RGBG',
+    color_data: { black: 0, maximum: 16383, cam_mul: [2, 1, 1.5, 1], rgb_cam: [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]] },
+    ...extra,
+  };
+}
+function makeMinimalRid() {
+  return { width: 2, height: 2, raw_width: 2, raw_height: 2, left_margin: 0, top_margin: 0, data: new Uint16Array([1, 2, 3, 4]) };
+}
+
+test('iso is extracted from top-level iso_speed (ISO 200)', () => {
+  const meta = makeMinimalMeta({ iso_speed: 200 });
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.iso).toBe(200);
+});
+
+test('iso is extracted from meta.other.iso_speed when top-level is absent', () => {
+  const meta = makeMinimalMeta({ other: { iso_speed: 400 } });
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.iso).toBe(400);
+});
+
+test('iso is extracted from meta.shootinginfo.iso_speed as fallback', () => {
+  const meta = makeMinimalMeta({ shootinginfo: { iso_speed: 800 } });
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.iso).toBe(800);
+});
+
+test('iso is null when absent from all locations', () => {
+  const meta = makeMinimalMeta();
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.iso).toBeNull();
+});
+
+test('iso is null for zero iso_speed', () => {
+  const meta = makeMinimalMeta({ iso_speed: 0 });
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.iso).toBeNull();
+});
+
+test('iso is null for non-finite iso_speed', () => {
+  const meta = makeMinimalMeta({ iso_speed: NaN });
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.iso).toBeNull();
+});
+
+// ─── Per-channel black/white level tests ──────────────────────────────────────
+
+test('blackLevels is replicated from scalar black when cblack absent', () => {
+  const meta = makeMinimalMeta();
+  meta.color_data.black = 256;
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.blackLevels).toEqual([256, 256, 256, 256]);
+});
+
+test('blackLevels uses per-channel cblack when available', () => {
+  const meta = makeMinimalMeta();
+  meta.color_data.cblack = [100, 200, 300, 400];
+  meta.color_data.black = 512;
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.blackLevels).toEqual([100, 200, 300, 400]);
+});
+
+test('whiteLevels is replicated from scalar white when linear_max absent', () => {
+  const meta = makeMinimalMeta();
+  meta.color_data.maximum = 16383;
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.whiteLevels).toEqual([16383, 16383, 16383, 16383]);
+});
+
+test('whiteLevels uses linear_max per-channel when available', () => {
+  const meta = makeMinimalMeta();
+  meta.color_data.linear_max = [15000, 16000, 16000, 15500];
+  meta.color_data.maximum = 16383;
+  const payload = metadataToRawMosaicPayload(meta, makeMinimalRid());
+  expect(payload.whiteLevels).toEqual([15000, 16000, 16000, 15500]);
+});
+
 test('black is recovered from the masked margin when LibRaw reports 0 (M200/CRW case)', () => {
   // 6x6 raw: top 2 rows masked (pedestal 8), left 2 cols contaminated bright (90),
   // rest active (100). Visible crop is the inner 4x4. reported black = 0.

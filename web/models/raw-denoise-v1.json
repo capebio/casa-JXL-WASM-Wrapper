@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "modelVersion": "raw-denoise-v1",
+  "inputShape": [
+    1,
+    20,
+    320,
+    320
+  ],
+  "outputShape": [
+    1,
+    12,
+    320,
+    320
+  ],
+  "haloPixels": 32,
+  "coreSize": 256,
+  "inputChannels": {
+    "raw_rggb": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "sigma_maps": [
+      4,
+      5,
+      6,
+      7
+    ],
+    "mhc_rgb_packed": [
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ]
+  },
+  "outputChannels": {
+    "residual_rgb_packed": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11
+    ]
+  },
+  "normalization": {
+    "rawRange": [
+      -0.05,
+      1.25
+    ],
+    "residualClamp": [
+      -0.25,
+      0.25
+    ]
+  },
+  "onnxOpset": 20,
+  "sha256": "31e08aefd2bc2b9efcad1ae25ae455ac5015c88a4c15642374326e0f4bf2a972",
+  "trainingManifestHash": null,
+  "gitCommit": null,
+  "qualityMetrics": {
+    "note": "development-artifact-random-weights-no-training"
+  }
+}
