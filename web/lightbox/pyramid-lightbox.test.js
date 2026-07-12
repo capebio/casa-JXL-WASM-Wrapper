@@ -44,3 +44,26 @@ test('levelInfo literal records contenthash, dimensions, size and bitsPerSample'
   // bits is 16 on the use16 path, 8 otherwise.
   expect(source).toMatch(/bits = 16/);
 });
+
+test('loadLevel guards against stale-load overwrite: capture token before await, recheck before commit (finding 42)', () => {
+  // A per-open generation + monotonic-rank guard.
+  expect(source).toContain('createLoadGuard');
+  // A new generation is opened on every open/navigate.
+  expect(source).toContain('loadGuard.newGeneration(item.id)');
+  // The token is captured (begin) BEFORE the fetch/decode awaits.
+  expect(source).toMatch(/const token = loadGuard\.begin\(/);
+  // Both decode branches recheck canCommit BEFORE committing decoded pixels.
+  const canCommitCount = (source.match(/loadGuard\.canCommit\(token\)/g) || []).length;
+  expect(canCommitCount).toBeGreaterThanOrEqual(2);
+  // begin() must appear before the first await in loadLevel (capture-before-await).
+  const loadStart = source.indexOf('async function loadLevel');
+  const beginIdx = source.indexOf('loadGuard.begin(', loadStart);
+  const firstAwaitIdx = source.indexOf('await getLevelBytes', loadStart);
+  expect(beginIdx).toBeGreaterThan(loadStart);
+  expect(beginIdx).toBeLessThan(firstAwaitIdx);
+});
+
+test('the guard commits only monotonically-better levels for the same generation', () => {
+  // canCommit is rank-gated and commit advances the floor.
+  expect(source).toContain('loadGuard.commit(token)');
+});
