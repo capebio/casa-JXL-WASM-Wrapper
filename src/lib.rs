@@ -6038,6 +6038,165 @@ impl DecodedImage {
             _ => self.u8buf.clone(),
         }
     }
+
+    // ── Resident developed-image path (finding 58) ──────────────────────────
+    //
+    // The legacy worker path was:  decode_* → take_* (full pixels WASM→JS) →
+    // decodedToLinearRgb16 (JS) → LookRenderer.new_with_options (full RGB16
+    // JS→WASM). The methods below keep the pixels resident: the RGBA→linear
+    // RGB16-LE conversion runs inside wasm and the full-res LookRenderer is
+    // built without the buffer ever crossing the boundary. Only the produced
+    // RGB8 previews/encode buffer leave wasm, exactly as the RAW path already
+    // does via FinishedImage::take_lightbox_renderer / take_thumb_renderer.
+    //
+    // The `take_*` methods above remain as the compatibility escape hatch — not
+    // the product path — for any consumer that still needs the raw typed pixels
+    // out of wasm.
+
+    /// Borrow a `raw_pipeline::image_formats::DecodedRgba` view over the resident
+    /// buffers WITHOUT copying, so the pure-Rust resident conversion (tested for
+    /// byte-parity in `crates/raw-pipeline/tests/resident_image_pipeline.rs`) can
+    /// run against exactly these pixels. Only one of the three vecs is populated
+    /// per bit depth; the others are empty, so cloning the three `Vec`s here would
+    /// copy the live buffer — instead we move them into a temporary view and move
+    /// them back. Cheap: three `Vec` header swaps, no pixel copy.
+    fn with_rgba_view<R>(
+        &mut self,
+        f: impl FnOnce(&raw_pipeline::image_formats::DecodedRgba) -> R,
+    ) -> R {
+        let view = raw_pipeline::image_formats::DecodedRgba {
+            width: self.width,
+            height: self.height,
+            bit_depth: self.bit_depth,
+            u8: std::mem::take(&mut self.u8buf),
+            u16: std::mem::take(&mut self.u16buf),
+            f32: std::mem::take(&mut self.f32buf),
+        };
+        let r = f(&view);
+        // Move the buffers back so the handle stays usable (e.g. a later `free()`
+        // or a second resident call). No pixel copy — just restores the Vec headers.
+        self.u8buf = view.u8;
+        self.u16buf = view.u16;
+        self.f32buf = view.f32;
+        r
+    }
+
+    /// Resident RGBA → packed **linear RGB16-LE** (6 B/px, alpha dropped) — the
+    /// buffer `LookRenderer` consumes. Byte-identical to the worker's legacy
+    /// `decodedToLinearRgb16` (proven in the raw-pipeline test suite), but the
+    /// source pixels never leave wasm. Compatibility helper for any JS caller that
+    /// wants the packed bytes directly; the product path uses
+    /// [`Self::into_full_renderer`] which additionally keeps the packed bytes
+    /// resident when constructing the renderer.
+    pub fn to_linear_rgb16_le(&mut self) -> Vec<u8> {
+        self.with_rgba_view(|d| d.to_linear_rgb16_le())
+    }
+
+    /// PRODUCT PATH entry: convert the resident RGBA pixels to the packed linear
+    /// RGB16-LE full buffer ONCE, inside wasm, and hand back a [`ResidentDeveloped`]
+    /// handle that builds the full / lightbox / thumbnail `LookRenderer`s from that
+    /// resident buffer — the full pixels never cross the wasm boundary (finding 58).
+    /// Consumes the source pixels (emptied afterwards). Call a `take_*` escape hatch
+    /// first if you also need the raw typed pixels out of wasm.
+    pub fn into_resident(&mut self) -> ResidentDeveloped {
+        let full_rgb16 = self.to_linear_rgb16_le();
+        let (w, h) = (self.width, self.height);
+        // Source pixels are now redundant; drop them so peak memory is the single
+        // packed full buffer, not source + packed.
+        self.u8buf = Vec::new();
+        self.u16buf = Vec::new();
+        self.f32buf = Vec::new();
+        ResidentDeveloped {
+            full_rgb16,
+            width: w,
+            height: h,
+        }
+    }
+}
+
+/// Identity 3×3 colour matrix (row-major) used by the resident developed-image
+/// renderer — the matrix is a no-op so `LookRenderer` applies no camera→sRGB
+/// transform (the developed pixels are already display-referred). Mirrors the
+/// worker's `IDENTITY_CM`.
+const IDENTITY_COLOR_MATRIX: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+/// A developed image kept RESIDENT in wasm as a packed linear RGB16-LE full buffer
+/// (finding 58). Produced by [`DecodedImage::into_resident`]. Builds the full-res
+/// encode renderer and the downscaled lightbox / thumbnail live-edit renderers
+/// entirely inside wasm linear memory, so the full pixel buffer never round-trips
+/// out to JS (`take_*`) and back in (`LookRenderer.new_with_options`).
+///
+/// Every renderer is byte-identical to the legacy worker path: the resident
+/// RGBA→RGB16-LE conversion mirrors `decodedToLinearRgb16`, the resident downscale
+/// mirrors `downscaleRgb16LE`, and `from_packed_le` reproduces `new_with_options`
+/// for the same bytes/dims (all proven in
+/// `crates/raw-pipeline/tests/resident_image_pipeline.rs`).
+#[wasm_bindgen]
+pub struct ResidentDeveloped {
+    /// Packed linear RGB16-LE, 6 B/px, full resolution. The single resident copy.
+    full_rgb16: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+#[wasm_bindgen]
+impl ResidentDeveloped {
+    #[wasm_bindgen(getter)]
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    #[wasm_bindgen(getter)]
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Build the full-resolution encode `LookRenderer`, MOVING the resident full
+    /// buffer into it (no copy, no boundary crossing). After this call the resident
+    /// buffer is empty, so build the lightbox/thumb renderers (which downscale from
+    /// the full buffer) BEFORE calling this — matching the worker, which builds the
+    /// downscaled previews from `fullRgb16` first and constructs the full renderer
+    /// last for the transient encode.
+    pub fn take_full_renderer(&mut self) -> LookRenderer {
+        let (w, h) = (self.width, self.height);
+        LookRenderer::from_packed_le(
+            std::mem::take(&mut self.full_rgb16),
+            w,
+            h,
+            1,
+            &IDENTITY_COLOR_MATRIX,
+            false,
+            0,
+            0,
+        )
+    }
+
+    /// Build a downscaled preview `LookRenderer` (lightbox at long-edge 1800, thumb
+    /// at 360) from the resident full buffer, resident. The downscale is byte-exact
+    /// vs the worker's `downscaleRgb16LE` at the `targetDims`-derived size. Does NOT
+    /// consume the full buffer, so lightbox and thumb can both be built before
+    /// [`Self::take_full_renderer`] moves it out.
+    pub fn preview_renderer(&self, long_edge: u32) -> LookRenderer {
+        let (w, h) = (self.width, self.height);
+        let (dw, dh) =
+            raw_pipeline::image_formats::target_dims_js_parity(w, h, long_edge);
+        let packed = raw_pipeline::image_formats::downscale_linear_rgb16_le_js_parity(
+            &self.full_rgb16,
+            w as usize,
+            h as usize,
+            dw as usize,
+            dh as usize,
+        );
+        LookRenderer::from_packed_le(packed, dw, dh, 1, &IDENTITY_COLOR_MATRIX, false, 0, 0)
+    }
+
+    /// Compatibility ESCAPE HATCH (finding 58): move the packed linear RGB16-LE full
+    /// buffer out to JS. NOT the product path — the product path keeps the buffer
+    /// resident via [`Self::take_full_renderer`] / [`Self::preview_renderer`]. Kept
+    /// so a JS consumer that still needs the packed bytes (e.g. a bespoke downscale)
+    /// can obtain them without re-deriving the resident conversion.
+    pub fn take_full_rgb16_le(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.full_rgb16)
+    }
 }
 
 fn decoded_to_wasm(d: raw_pipeline::image_formats::DecodedRgba) -> DecodedImage {

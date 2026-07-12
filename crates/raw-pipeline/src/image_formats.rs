@@ -266,6 +266,184 @@ pub struct DecodedRgba {
     pub f32: Vec<f32>,
 }
 
+/// sRGB EOTF (gamma-encoded → linear) for a single normalised channel value in
+/// `[0, 1]`. Analytic, evaluated in `f64` — a *byte-exact* mirror of the worker's
+/// `srgbToLinear` (`web/worker.js`), whose `Math.pow((c+0.055)/1.055, 2.4)` is an
+/// IEEE-754 double `pow`. Used by the resident RGB16-LE conversion so the WASM
+/// path reproduces the legacy JS `decodedToLinearRgb16` bit-for-bit.
+#[inline]
+fn srgb_to_linear_f64(c: f64) -> f64 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Clamp a linear value already scaled into the u16 range to `[0, 65535]`, then
+/// truncate toward zero — the exact semantics of the worker's
+/// `clamp16(v) = (v<0?0:v>65535?65535:v)|0`. `|0` is a truncating cast, so the
+/// caller must have added the `+0.5` rounding bias BEFORE calling this (matching
+/// JS). Input/compute in `f64` for bit-parity with the JS path.
+#[inline]
+fn clamp16_trunc(v: f64) -> u16 {
+    if v < 0.0 {
+        0
+    } else if v > 65535.0 {
+        65535
+    } else {
+        // `as u16` truncates toward zero; v is in [0, 65535] here.
+        v as u16
+    }
+}
+
+impl DecodedRgba {
+    /// Convert the decoded RGBA pixels to the packed **linear RGB16-LE** buffer
+    /// (6 bytes/pixel, alpha dropped) that `LookRenderer` consumes — the same
+    /// format the RAW pipeline feeds it. This is the RESIDENT conversion: it runs
+    /// entirely inside wasm linear memory (finding 58), replacing the legacy
+    /// `take_* → JS decodedToLinearRgb16 → LookRenderer.new_with_options`
+    /// round trip that copied the full pixel buffer WASM→JS then JS→WASM.
+    ///
+    /// Per bit depth (byte-exact mirror of `web/worker.js decodedToLinearRgb16`):
+    /// - **32 (EXR, linear f32):** `clamp16(chan * 65535 + 0.5)` — no EOTF, the
+    ///   source is already linear scene-referred. HDR >1.0 clamps to 65535.
+    /// - **16 (TIFF, sRGB u16):** `srgbToLinear(u16/65535)` then the same scale
+    ///   + round + clamp. The worker's u16 path uses the ANALYTIC `srgbToLinear`
+    ///   (an f64 `Math.pow`), so the full-`f64` computation here matches it exactly.
+    /// - **8 (JPEG / 8-bit TIFF, sRGB u8):** the worker reads a precomputed 256-entry
+    ///   `Float32Array` LUT (`SRGB_TO_LINEAR_U8[i] = (f32)srgbToLinear(i/255)`), so
+    ///   the linear value is ROUNDED TO f32 before the `* 65535 + 0.5`. We mirror
+    ///   that with an explicit `as f32 as f64` round-trip so the bytes match the LUT
+    ///   path bit-for-bit (the full-f64 value would be within ≤1 u16 LSB and, for
+    ///   these 256 sRGB values, never actually differs — but the explicit f32 round
+    ///   keeps the mirror literal and robust).
+    ///
+    /// All intermediate arithmetic is `f64` to match V8's Number semantics, so the
+    /// produced bytes are identical to the JS path (verified in
+    /// `tests/resident_image_pipeline.rs`). Consuming: takes `&self` and returns a
+    /// fresh owned buffer; the source pixels are left intact so a caller can still
+    /// fall back to a `take_*` escape hatch.
+    pub fn to_linear_rgb16_le(&self) -> Vec<u8> {
+        let px = (self.width as usize).saturating_mul(self.height as usize);
+        let mut out = vec![0u8; px.saturating_mul(6)];
+        match self.bit_depth {
+            32 => {
+                for (i, chunk) in out.chunks_exact_mut(6).enumerate() {
+                    let s = i * 4;
+                    let r = clamp16_trunc(self.f32[s] as f64 * 65535.0 + 0.5);
+                    let g = clamp16_trunc(self.f32[s + 1] as f64 * 65535.0 + 0.5);
+                    let b = clamp16_trunc(self.f32[s + 2] as f64 * 65535.0 + 0.5);
+                    chunk[0..2].copy_from_slice(&r.to_le_bytes());
+                    chunk[2..4].copy_from_slice(&g.to_le_bytes());
+                    chunk[4..6].copy_from_slice(&b.to_le_bytes());
+                }
+            }
+            16 => {
+                for (i, chunk) in out.chunks_exact_mut(6).enumerate() {
+                    let s = i * 4;
+                    let r = clamp16_trunc(
+                        srgb_to_linear_f64(self.u16[s] as f64 / 65535.0) * 65535.0 + 0.5,
+                    );
+                    let g = clamp16_trunc(
+                        srgb_to_linear_f64(self.u16[s + 1] as f64 / 65535.0) * 65535.0 + 0.5,
+                    );
+                    let b = clamp16_trunc(
+                        srgb_to_linear_f64(self.u16[s + 2] as f64 / 65535.0) * 65535.0 + 0.5,
+                    );
+                    chunk[0..2].copy_from_slice(&r.to_le_bytes());
+                    chunk[2..4].copy_from_slice(&g.to_le_bytes());
+                    chunk[4..6].copy_from_slice(&b.to_le_bytes());
+                }
+            }
+            _ => {
+                // Mirror the worker's `Float32Array` sRGB→linear LUT: round the
+                // linear value to f32 (as the LUT store does) before scaling.
+                let lut8 = |v: u8| -> f64 {
+                    (srgb_to_linear_f64(v as f64 / 255.0) as f32) as f64
+                };
+                for (i, chunk) in out.chunks_exact_mut(6).enumerate() {
+                    let s = i * 4;
+                    let r = clamp16_trunc(lut8(self.u8[s]) * 65535.0 + 0.5);
+                    let g = clamp16_trunc(lut8(self.u8[s + 1]) * 65535.0 + 0.5);
+                    let b = clamp16_trunc(lut8(self.u8[s + 2]) * 65535.0 + 0.5);
+                    chunk[0..2].copy_from_slice(&r.to_le_bytes());
+                    chunk[2..4].copy_from_slice(&g.to_le_bytes());
+                    chunk[4..6].copy_from_slice(&b.to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Box-filter downscale of a packed **linear RGB16-LE** buffer (6 B/px), producing
+/// another packed RGB16-LE buffer at `dw × dh`. This is a *byte-exact* mirror of
+/// the worker's `downscaleRgb16LE` (`web/worker.js`) so the resident developed-image
+/// path can generate the lightbox / thumbnail preview buffers inside wasm — the full
+/// pixels never cross the boundary (finding 58) — while every produced byte matches
+/// the legacy JS downscale.
+///
+/// Parity-critical details (each mirrors the JS integer arithmetic, NOT the
+/// float-ratio box used by `downscale_rgb16_impl`, which rounds differently):
+/// - Source-span boundaries use INTEGER math:
+///   `sx0 = (dx*sw)/dw`, `sx1 = max(sx0+1, ((dx+1)*sw)/dw)` (and likewise for y),
+///   matching JS `Math.floor(dx*sw/dw)` on integer operands.
+/// - Channel averages truncate toward zero: `(sum/n)|0` → integer `sum/n`.
+/// - Identity when `dw==sw && dh==sh` (JS returns the source unchanged).
+pub fn downscale_linear_rgb16_le_js_parity(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dw: usize,
+    dh: usize,
+) -> Vec<u8> {
+    if dw == sw && dh == sh {
+        return src.to_vec();
+    }
+    let mut out = vec![0u8; dw * dh * 6];
+    let get = |o: usize| u16::from_le_bytes([src[o], src[o + 1]]) as u64;
+    for dy in 0..dh {
+        let sy0 = (dy * sh) / dh;
+        let sy1 = ((dy + 1) * sh / dh).max(sy0 + 1);
+        for dx in 0..dw {
+            let sx0 = (dx * sw) / dw;
+            let sx1 = ((dx + 1) * sw / dw).max(sx0 + 1);
+            let (mut rr, mut gg, mut bb, mut n) = (0u64, 0u64, 0u64, 0u64);
+            for sy in sy0..sy1 {
+                let mut so = (sy * sw + sx0) * 6;
+                for _sx in sx0..sx1 {
+                    rr += get(so);
+                    gg += get(so + 2);
+                    bb += get(so + 4);
+                    n += 1;
+                    so += 6;
+                }
+            }
+            let o = (dy * dw + dx) * 6;
+            let r = (rr / n) as u16;
+            let g = (gg / n) as u16;
+            let b = (bb / n) as u16;
+            out[o..o + 2].copy_from_slice(&r.to_le_bytes());
+            out[o + 2..o + 4].copy_from_slice(&g.to_le_bytes());
+            out[o + 4..o + 6].copy_from_slice(&b.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Long-edge clamp, aspect-preserving, no upscale — a byte-exact mirror of the
+/// worker's `targetDims` (and `src/lib.rs target_dims`). Returned as `(w, h)`.
+pub fn target_dims_js_parity(w: u32, h: u32, long_edge: u32) -> (u32, u32) {
+    if w >= h {
+        let lw = w.min(long_edge);
+        (lw, 1.max((h as u64 * lw as u64 / w as u64) as u32))
+    } else {
+        let lh = h.min(long_edge);
+        (1.max((w as u64 * lh as u64 / h as u64) as u32), lh)
+    }
+}
+
 /// Decode a general RGB(A) TIFF. 16-bit files keep 16 bits; everything else
 /// collapses to RGBA8.
 pub fn decode_tiff_bytes(bytes: &[u8]) -> Result<DecodedRgba, ImageFormatError> {

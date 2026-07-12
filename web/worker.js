@@ -386,6 +386,13 @@ function srgbToLinear(c) {
     return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
+// LEGACY / REFERENCE (finding 58): the developed-image ingest now converts and
+// downscales INSIDE wasm (DecodedImage.into_resident → ResidentDeveloped), so the
+// full pixels no longer round-trip through JS. decodedToLinearRgb16 / downscale-
+// Rgb16LE / targetDims / makeImageLiveState below are retained as the byte-exact
+// JS mirror the resident Rust path reproduces (and as a fallback if a build ever
+// ships without the resident bindings). They are NOT on the product path.
+//
 // Build full-res linear packed RGB16-LE (6 bytes/px) from a DecodedImage.
 // bit_depth: 8 → RGBA8 sRGB, 16 → RGBA16-LE sRGB, 32 → RGBA f32 linear.
 function decodedToLinearRgb16(dec) {
@@ -466,8 +473,21 @@ function downscaleRgb16LE(src, sw, sh, dw, dh) {
 
 // makeLiveState for an EXR/TIFF buffer: identity matrix, no EXIF orientation,
 // black=0. Otherwise identical shape to the RAW makeLiveState above.
+//
+// Legacy path (kept for reference / any non-resident caller): takes packed rgb16
+// bytes and marshals them across the wasm boundary via new_with_options.
 function makeImageLiveState(rgb16Bytes, w, h) {
     const renderer = LookRenderer.new_with_options(rgb16Bytes, w, h, 1, IDENTITY_CM, false, 0, 0);
+    return { renderer, nativeW: w, nativeH: h, outW: w, outH: h, orientation: 1, wbR: NaN, wbB: NaN };
+}
+
+// Resident twin of makeImageLiveState: wraps a LookRenderer built INSIDE wasm by
+// ResidentDeveloped.preview_renderer (finding 58). Dims come from the renderer's
+// own getters (native_width/height), so the packed rgb16 bytes never crossed the
+// boundary. Developed images have no EXIF orientation (always 1 → no axis swap)
+// and no camera WB (NaN), matching makeImageLiveState's returned shape exactly.
+function makeImageLiveStateFromRenderer(renderer) {
+    const w = renderer.native_width, h = renderer.native_height;
     return { renderer, nativeW: w, nativeH: h, outW: w, outH: h, orientation: 1, wbR: NaN, wbB: NaN };
 }
 
@@ -478,21 +498,26 @@ function processImageFormat(id, bytes, opts, look, route) {
     const dec = route === 'exr' ? decode_exr(bytes)
               : route === 'jpeg' ? decode_jpeg(bytes)
               : decode_tiff(bytes);
+    // Resident developed-image path (finding 58): the RGBA→linear-RGB16-LE
+    // conversion, the lightbox/thumb downscales, and every LookRenderer are built
+    // INSIDE wasm from a single resident full-res packed buffer. The full pixel
+    // buffer never round-trips out via take_* and back in via new_with_options.
+    // `resident` owns the packed full RGB16-LE until take_full_renderer() moves it
+    // into the encode renderer, so it is freed in the finally block.
+    let resident = null;
     try {
         const w = dec.width, h = dec.height;
         const bitDepth = dec.bit_depth;
-        // Full-res linear RGB16 → drives encode (full LookRenderer) + preview downscales.
-        const fullRgb16 = decodedToLinearRgb16(dec);
+        // into_resident() consumes dec's pixels into a resident packed full buffer.
+        resident = dec.into_resident();
         const pipelineMs = performance.now() - pT0;
 
-        const [lbW, lbH] = targetDims(w, h, 1800);
-        const [thW, thH] = targetDims(w, h, 360);
-        const lbRgb16   = downscaleRgb16LE(fullRgb16, w, h, lbW, lbH);
-        const thRgb16   = downscaleRgb16LE(fullRgb16, w, h, thW, thH);
-
-        // Cache live-edit renderers (same maps the RAW path + reprocess uses).
-        liveStateMap.set(id, makeImageLiveState(lbRgb16, lbW, lbH));
-        thumbStateMap.set(id, makeImageLiveState(thRgb16, thW, thH));
+        // Downscaled preview renderers, built resident from the full buffer. Byte-
+        // identical to the old decodedToLinearRgb16 + downscaleRgb16LE + makeImage-
+        // LiveState path (proven in crates/raw-pipeline/tests/resident_image_pipeline.rs).
+        // Build BOTH previews before take_full_renderer() empties the full buffer.
+        liveStateMap.set(id, makeImageLiveStateFromRenderer(resident.preview_renderer(1800)));
+        thumbStateMap.set(id, makeImageLiveStateFromRenderer(resident.preview_renderer(360)));
 
         // Minimal EXIF blob — non-RAW files carry no camera metadata here.
         const exif = { make: null, model: null, lens: null, datetime: null,
@@ -529,7 +554,10 @@ function processImageFormat(id, bytes, opts, look, route) {
         // EXR/TIFF have no EXIF rotation, but user 90° turns still compose.
         const userTurns = Math.round(((opts.userRotation || 0) % 360 + 360) % 360 / 90) % 4;
         const encodeOrientation = composeOrientation(1, userTurns);
-        const fullRenderer = LookRenderer.new_with_options(fullRgb16, w, h, 1, IDENTITY_CM, false, 0, 0);
+        // take_full_renderer() MOVES the resident full buffer into the encode
+        // renderer (no boundary crossing); build it last so the previews above
+        // could downscale from the still-resident buffer first.
+        const fullRenderer = resident.take_full_renderer();
         let fullRgb;
         try {
             fullRgb = applyLookToState({ renderer: fullRenderer, wbR: NaN, wbB: NaN }, look);
@@ -548,6 +576,10 @@ function processImageFormat(id, bytes, opts, look, route) {
         );
     } finally {
         dec.free();
+        // Free the resident handle. take_full_renderer() emptied its buffer on the
+        // success path; on an early-error path it still owns the full buffer, so
+        // free() reclaims it. free() is idempotent-safe (wasm-bindgen no-op after move).
+        if (resident) resident.free();
     }
 }
 
