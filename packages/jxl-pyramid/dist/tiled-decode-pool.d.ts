@@ -17,6 +17,41 @@ export declare enum HandleState {
     Bad = "bad",
     Terminated = "terminated"
 }
+/**
+ * Below this container size an owned whole-buffer copy per worker is cheap enough to prefer
+ * over per-tile range bookkeeping (finding 33). A JXTC container only reaches this path when
+ * SharedArrayBuffer is unavailable; small containers (thumbnails, few-tile levels) fan out as a
+ * single structured clone each, large ones switch to range transport so total transferred bytes
+ * stay bounded by the REQUESTED tiles rather than `workers * containerSize` (finding 79).
+ * 512 KiB ≈ a handful of 512² rgba8 tiles — comfortably under the point where N copies hurt.
+ */
+export declare const OWNED_WHOLE_MAX_BYTES: number;
+export type Carrier = 
+/** One SharedArrayBuffer shared by reference across all workers — zero per-worker copy. */
+{
+    kind: 'sab-view';
+}
+/** A single owned whole-container clone per worker — only chosen below OWNED_WHOLE_MAX_BYTES. */
+ | {
+    kind: 'owned-whole';
+}
+/** Only the requested tiles' byte ranges are transferred per worker (finding 79). */
+ | {
+    kind: 'range';
+};
+/**
+ * Carrier selection (pure): shared immutable SAB view where available; otherwise an owned whole
+ * buffer only for small containers; otherwise per-tile range transport so non-SAB fanout is
+ * bounded by requested tiles, not `workers * containerSize`.
+ */
+export declare function selectCarrier(input: {
+    containerBytes: Uint8Array;
+    sabAvailable: boolean;
+    requestedTileRanges: Array<{
+        offset: number;
+        length: number;
+    }>;
+}): Carrier;
 type WorkerLike = {
     addEventListener(type: "message" | "error" | "messageerror", listener: (ev: {
         data?: any;
@@ -80,6 +115,9 @@ export declare class PyramidWorkerPool {
     private readonly bytesIdByWorker;
     private readonly bytesIdBySource;
     private readonly sabByBytesId;
+    private readonly rangesByWorker;
+    private readonly headerBySource;
+    private readonly unloadWaiters;
     private nextBytesId;
     private readonly waiters;
     private visibilityDocument;
@@ -141,6 +179,31 @@ export declare class PyramidWorkerPool {
     private clearIdleTimer;
     private cleanupPendingJob;
     ensureLoaded(handles: WorkerHandle[], bytesId: number, bytes: Uint8Array, useSAB: boolean): void;
+    /**
+     * Carrier-aware load: transfer only what each worker needs to decode `requestedTiles`.
+     *  - SAB available            → one shared SAB per bytesId (delegates to ensureLoaded; no copy).
+     *  - small container          → owned whole-buffer clone per worker (delegates to ensureLoaded).
+     *  - large container, no SAB  → per-tile RANGE carrier: post only the requested tiles' bitstreams
+     *                               (finding 79) so total transferred is bounded by requested tiles,
+     *                               not `workers * containerSize`. Ranges already resident on a worker
+     *                               are not re-sent (viewport reuse).
+     */
+    ensureLoadedForTiles(handles: WorkerHandle[], bytesId: number, source: Extract<LevelSource, {
+        kind: "tiled";
+    }>, requestedTiles: ImageRegion[], useSAB: boolean): void;
+    /**
+     * Map requested viewport tiles to their absolute container byte ranges plus grid origin
+     * (`gx`,`gy`) so a range-carrier worker can address the exact tile a decode `region` targets.
+     * Deduped by tile offset (a viewport may clip several sub-rects out of one grid tile).
+     */
+    private resolveTileRanges;
+    /**
+     * Explicitly unload a bytesId from the given workers, releasing their resident bytes/ranges
+     * (finding 80). Resolves once every targeted worker acknowledges (unload-ack) or is gone.
+     */
+    unload(handles: WorkerHandle[], bytesId: number): Promise<void>;
+    /** Test-only: spawn a ready-tracked handle without going through acquire()/coreBudget. */
+    spawnForTest(): WorkerHandle;
 }
 /** Hoisted predicate (Grok4). */
 export declare function shouldUseParallel(opts: {

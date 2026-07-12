@@ -463,6 +463,15 @@ export interface PyramidPoolLike {
   release(handles: any[]): void;
   /** Load container bytes into the acquired handles once per bytesId (SAB carrier when useSAB). */
   ensureLoaded(handles: any[], bytesId: number, bytes: Uint8Array, useSAB: boolean): void;
+  /**
+   * Carrier-aware load: transfer only what each worker needs for `requestedTiles` — a shared SAB
+   * view, an owned whole clone (small containers), or per-tile RANGE payloads (large, no SAB) so
+   * non-SAB fanout is bounded by requested tiles, not workers*containerSize (findings 33, 79).
+   * Optional so duck-typed pools without it fall back to ensureLoaded.
+   */
+  ensureLoadedForTiles?(handles: any[], bytesId: number, source: any, requestedTiles: ImageRegion[], useSAB: boolean): void;
+  /** Explicitly release a bytesId from the given handles; resolves on worker ack (finding 80). */
+  unload?(handles: any[], bytesId: number): Promise<void>;
   // `| undefined` is explicit so a concrete pool whose getter returns `number | undefined`
   // (PyramidWorkerPool.requestTimeout) satisfies this under exactOptionalPropertyTypes.
   readonly requestTimeout?: number | undefined;

@@ -35,6 +35,16 @@ export function cacheNameFor(key) {
     }
     return NS_HASH + (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
 }
+/**
+ * Whether SharedArrayBuffer is usable in this environment. When it is, the memory cache is
+ * SAB-backed so an entry posted to a worker (postMessage) is never detached. When it is NOT
+ * (non-cross-origin-isolated browsers), the cache must NOT force SAB — it falls back to a plain
+ * ArrayBuffer instead of crashing (finding 33). A plain ArrayBuffer also lets OPFS persist writes
+ * skip the SAB→non-shared copy (finding 33: no extra full copy).
+ */
+function sabAvailable() {
+    return typeof SharedArrayBuffer !== 'undefined';
+}
 export class JxlCacheBrowser {
     opts;
     memoryCache;
@@ -90,7 +100,7 @@ export class JxlCacheBrowser {
         if (mem !== undefined) {
             this.persistentTracker.get(key);
             this.hitCount++;
-            return mem; // SAB: shared reference, never detaches on postMessage
+            return mem; // shared reference; SAB never detaches on postMessage (finding 33 keeps it SAB when available)
         }
         if (!this.opfsRoot) {
             this.missCount++;
@@ -135,9 +145,19 @@ export class JxlCacheBrowser {
         if (this.initPromise)
             await this.initPromise.catch(() => undefined);
         const size = buffer.byteLength;
-        const sab = new SharedArrayBuffer(size);
-        new Uint8Array(sab).set(new Uint8Array(buffer));
-        this.memoryCache.set(key, sab, size);
+        // Own the bytes so the caller can recycle their buffer. Back with SAB when available (so the
+        // entry survives postMessage without detaching); otherwise a plain ArrayBuffer — never FORCE
+        // SAB (finding 33), which would throw in a non-cross-origin-isolated environment.
+        let stored;
+        if (sabAvailable()) {
+            const sab = new SharedArrayBuffer(size);
+            new Uint8Array(sab).set(new Uint8Array(buffer));
+            stored = sab;
+        }
+        else {
+            stored = buffer.slice(0);
+        }
+        this.memoryCache.set(key, stored, size);
         if (!this.opfsRoot || size > this.persistentLimit) {
             if (this.opfsRoot) {
                 const previous = this.inflightSets.get(key) ?? Promise.resolve();
@@ -169,9 +189,10 @@ export class JxlCacheBrowser {
             catch { /* proceed */ }
             if (this._generation !== gen)
                 return;
-            // Pass a Uint8Array view of the SAB to OPFS — avoids a second copy and is safe
-            // because SAB cannot be transferred/detached, so the async write always reads valid data.
-            await this.setPersistent(key, new Uint8Array(sab));
+            // Pass a Uint8Array view of the owned buffer to OPFS. When SAB-backed this is safe because
+            // SAB cannot be transferred/detached; when a plain ArrayBuffer, OPFS writes it directly with
+            // no SAB→non-shared copy (finding 33: no extra full copy).
+            await this.setPersistent(key, new Uint8Array(stored));
         })();
         this.inflightSets.set(key, pending);
         try {
@@ -238,6 +259,19 @@ export class JxlCacheBrowser {
             hitRate: total > 0 ? this.hitCount / total : null,
         };
     }
+    /**
+     * Lightweight dashboard-facing stats snapshot.
+     * Read-only; no side effects; additive (no behavior change).
+     */
+    getStats() {
+        const total = this.hitCount + this.missCount;
+        return {
+            hits: this.hitCount,
+            misses: this.missCount,
+            totalRequests: total,
+            hitRate: total > 0 ? this.hitCount / total : null,
+        };
+    }
     async getPersistent(key) {
         if (!this.opfsRoot)
             return undefined;
@@ -255,13 +289,22 @@ export class JxlCacheBrowser {
             const raw = await file.arrayBuffer();
             if (this._generation !== gen)
                 return undefined;
-            const sab = new SharedArrayBuffer(raw.byteLength);
-            new Uint8Array(sab).set(new Uint8Array(raw));
-            this.memoryCache.set(key, sab, sab.byteLength);
-            if (entry === undefined) {
-                this.persistentTracker.set(key, { name }, sab.byteLength);
+            // Rehydrate into a SAB when available (postMessage-safe); otherwise keep the plain
+            // ArrayBuffer OPFS already gave us — no forced SAB, no extra copy (finding 33).
+            let stored;
+            if (sabAvailable()) {
+                const sab = new SharedArrayBuffer(raw.byteLength);
+                new Uint8Array(sab).set(new Uint8Array(raw));
+                stored = sab;
             }
-            return sab;
+            else {
+                stored = raw;
+            }
+            this.memoryCache.set(key, stored, stored.byteLength);
+            if (entry === undefined) {
+                this.persistentTracker.set(key, { name }, stored.byteLength);
+            }
+            return stored;
         }
         catch (e) {
             if (e instanceof DOMException && e.name === 'NotFoundError') {

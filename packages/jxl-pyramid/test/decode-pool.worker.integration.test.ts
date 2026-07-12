@@ -24,6 +24,8 @@ class ProtocolWorkerDouble {
   terminated = false;
   private readonly listeners = new Map<string, Set<(ev: { data?: any }) => void>>();
   private readonly byteStore = new Map<number, Uint8Array>();
+  // Range carrier store: bytesId -> ("gx,gy" -> standalone tile bitstream). Mirrors the real worker.
+  private readonly rangeStore = new Map<number, Map<string, Uint8Array>>();
   constructor() {
     ProtocolWorkerDouble.instances += 1;
     for (const t of ["message", "error", "messageerror"]) this.listeners.set(t, new Set());
@@ -35,18 +37,46 @@ class ProtocolWorkerDouble {
     if (this.terminated || !msg || msg.v !== 1) return;
     if (msg.type === "load") {
       this.loads += 1;
-      this.byteStore.set(msg.bytesId, msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes));
+      if (msg.ranges !== undefined) {
+        let m = this.rangeStore.get(msg.bytesId);
+        if (!m) { m = new Map(); this.rangeStore.set(msg.bytesId, m); }
+        for (const r of msg.ranges) {
+          m.set(`${r.gx},${r.gy}`, r.bytes instanceof Uint8Array ? r.bytes : new Uint8Array(r.bytes));
+        }
+      } else if (msg.sab !== undefined) {
+        this.byteStore.set(msg.bytesId, new Uint8Array(msg.sab, 0, msg.byteLength));
+      } else {
+        this.byteStore.set(msg.bytesId, msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes));
+      }
+      return;
+    }
+    if (msg.type === "unload") {
+      this.byteStore.delete(msg.bytesId);
+      this.rangeStore.delete(msg.bytesId);
+      this.emit("message", { v: 1, type: "unload-ack", bytesId: msg.bytesId });
       return;
     }
     if (msg.type === "cancel") return;
     if (msg.type === "decode") {
       this.decodes += 1;
       const { id, bytesId, region } = msg;
-      const bytes = this.byteStore.get(bytesId);
+      const whole = this.byteStore.get(bytesId);
+      const ranges = this.rangeStore.get(bytesId);
       void (async () => {
         try {
-          if (!bytes) throw new Error("no bytes for bytesId");
-          const out = await decodeTileContainerRegionRgba8(bytes, { x: region.x, y: region.y, w: region.w, h: region.h });
+          let container: Uint8Array;
+          let dx = region.x, dy = region.y;
+          if (whole) {
+            container = whole;
+          } else if (ranges) {
+            const tile = ranges.get(`${region.x},${region.y}`) ?? (ranges.size === 1 ? ranges.values().next().value : undefined);
+            if (!tile) throw new Error(`no tile bitstream for grid ${region.x},${region.y}`);
+            container = wrapSingleTile(tile, region.w, region.h);
+            dx = 0; dy = 0; // synthetic container is single-tile at origin
+          } else {
+            throw new Error("no bytes for bytesId");
+          }
+          const out = await decodeTileContainerRegionRgba8(container, { x: dx, y: dy, w: region.w, h: region.h });
           if (this.terminated) return;
           this.emit("message", { v: 1, type: "decode-reply", id, ok: true, pixels: out.pixels, w: out.width, h: out.height });
         } catch (err) {
@@ -59,6 +89,25 @@ class ProtocolWorkerDouble {
   }
   terminate() { this.terminated = true; }
   private emit(t: string, data: any) { for (const l of this.listeners.get(t) ?? []) l({ data }); }
+}
+
+/** Build a valid 1×1-tile JXTC container wrapping a single standalone tile bitstream. */
+function wrapSingleTile(tileBits: Uint8Array, w: number, h: number, bits: 8 | 16 = 8): Uint8Array {
+  const dataBase = 32 + 8;
+  const out = new Uint8Array(dataBase + tileBits.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, 0x4354584a, true);
+  view.setUint32(4, 1, true);
+  view.setUint32(8, w, true);
+  view.setUint32(12, h, true);
+  view.setUint32(16, Math.max(w, h), true);
+  view.setUint32(20, 1, true);
+  view.setUint32(24, 1, true);
+  view.setUint32(28, bits === 16 ? 2 : 0, true);
+  view.setUint32(32, dataBase, true);
+  view.setUint32(36, tileBits.byteLength, true);
+  out.set(tileBits, dataBase);
+  return out;
 }
 
 function gradient(w: number, h: number): Uint8Array {

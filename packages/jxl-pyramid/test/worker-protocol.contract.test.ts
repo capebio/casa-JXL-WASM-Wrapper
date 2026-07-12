@@ -22,6 +22,10 @@ import { validateWorkerRequest } from "../src/worker-protocol.js";
 test("validateWorkerRequest accepts every request shape the pool emits", () => {
   // load (structured-clone bytes)
   expect(() => validateWorkerRequest({ v: 1, type: "load", bytesId: 1, bytes: new Uint8Array(8) })).not.toThrow();
+  // load (per-tile range carrier — bounded fanout, finding 79)
+  expect(() => validateWorkerRequest({ v: 1, type: "load", bytesId: 1, ranges: [{ offset: 40, length: 8, gx: 0, gy: 0, bytes: new Uint8Array(8) }] })).not.toThrow();
+  // unload (explicit release, finding 80)
+  expect(() => validateWorkerRequest({ v: 1, type: "unload", bytesId: 1 })).not.toThrow();
   // decode rgba8 + rgba16
   expect(() => validateWorkerRequest({ v: 1, type: "decode", id: 3, bytesId: 1, region: { x: 0, y: 0, w: 16, h: 16 }, format: "rgba8" })).not.toThrow();
   expect(() => validateWorkerRequest({ v: 1, type: "decode", id: 4, bytesId: 1, region: { x: 8, y: 8, w: 4, h: 4 }, format: "rgba16" })).not.toThrow();
@@ -61,8 +65,14 @@ test("web worker source conforms to the v:1 reply protocol", () => {
   expect(src).toMatch(/format\s*===\s*['"]rgba16['"]/);
   expect(src).not.toMatch(/\bconst\s+use16\s*=\s*bpp\b/);
   // Load-once cache keyed by bytesId (the structured-clone amplification fix).
-  expect(src).toMatch(/byteStore/);
-  expect(src).toMatch(/\.get\(\s*bytesId\s*\)/);
+  expect(src).toMatch(/\bstore\b/);
+  expect(src).toMatch(/\bstore\.get\(\s*bytesId\s*\)/);
+  // Bounded byte carriers (Packet 2 Task 4): range carrier + explicit unload with ack,
+  // and NO .slice() of shared memory into ownership (findings 79, 80).
+  expect(src).toMatch(/msg\.ranges\s*!==\s*undefined/);
+  expect(src).toMatch(/type\s*===\s*['"]unload['"]/);
+  expect(src).toMatch(/type:\s*['"]unload-ack['"]/);
+  expect(src).not.toMatch(/msg\.sab[^\n]*\.slice\(\)/);
   // Guards the protocol version on inbound messages.
   expect(src).toMatch(/msg\.v\s*!==\s*1/);
 });

@@ -115,6 +115,43 @@ describe("JxlCacheBrowser SharedArrayBuffer memory cache", () => {
   });
 });
 
+describe("JxlCacheBrowser does not force SharedArrayBuffer (finding 33)", () => {
+  it("set/get work when SharedArrayBuffer is unavailable (no forced SAB, no crash)", async () => {
+    const saved = (globalThis as any).SharedArrayBuffer;
+    // Simulate a non-cross-origin-isolated environment: no SharedArrayBuffer.
+    delete (globalThis as any).SharedArrayBuffer;
+    try {
+      const cache = new JxlCacheBrowser({ memoryLimit: 1024 * 1024, persistentLimit: 0 });
+      await cache.init();
+
+      const data = new Uint8Array([5, 6, 7, 8]);
+      await cache.set("no-sab", data.buffer);
+
+      const result = await cache.get("no-sab");
+      assert.ok(result !== undefined, "get returns a buffer without SAB");
+      assert.ok(!(saved && result instanceof saved), "must NOT be a SharedArrayBuffer when SAB unavailable");
+      assert.deepEqual(Array.from(new Uint8Array(result as ArrayBuffer)), [5, 6, 7, 8]);
+    } finally {
+      (globalThis as any).SharedArrayBuffer = saved;
+    }
+  });
+
+  it("get returns the same buffer reference on repeated reads without SAB (no per-get copy)", async () => {
+    const saved = (globalThis as any).SharedArrayBuffer;
+    delete (globalThis as any).SharedArrayBuffer;
+    try {
+      const cache = new JxlCacheBrowser({ memoryLimit: 1024 * 1024, persistentLimit: 0 });
+      await cache.init();
+      await cache.set("k", new Uint8Array([1, 2, 3]).buffer);
+      const a = await cache.get("k");
+      const b = await cache.get("k");
+      assert.strictEqual(a, b, "same buffer reference on both gets (no extra copy)");
+    } finally {
+      (globalThis as any).SharedArrayBuffer = saved;
+    }
+  });
+});
+
 describe("JxlCacheBrowser quota sizing", () => {
   beforeEach(() => {
     delete (globalThis as { navigator?: Navigator }).navigator;

@@ -16,6 +16,20 @@
  */
 import type { ImageRegion } from "./tiling.js";
 export type { ImageRegion } from "./tiling.js";
+/**
+ * One tile's standalone JXL bitstream, addressed by its ABSOLUTE offset in the source
+ * container (matches the JXTC index-table convention) AND by its grid origin (`gx`,`gy` in image
+ * pixels) so a range-carrier worker can pick the exact tile a decode `region` refers to without
+ * ever seeing the whole container. Range carriers post ONLY the requested tiles (finding 79)
+ * instead of structured-cloning `workers * containerSize`.
+ */
+export type TileByteRange = {
+    offset: number;
+    length: number;
+    gx: number;
+    gy: number;
+    bytes: Uint8Array;
+};
 export type WorkerRequest = {
     v: 1;
     type: 'load';
@@ -29,6 +43,11 @@ export type WorkerRequest = {
     byteLength: number;
 } | {
     v: 1;
+    type: 'load';
+    bytesId: number;
+    ranges: TileByteRange[];
+} | {
+    v: 1;
     type: 'decode';
     id: number;
     bytesId: number;
@@ -39,12 +58,20 @@ export type WorkerRequest = {
     priority?: number;
 } | {
     v: 1;
+    type: 'unload';
+    bytesId: number;
+} | {
+    v: 1;
     type: 'cancel';
     id: number;
 };
 export type WorkerReply = {
     v: 1;
     type: 'ready';
+} | {
+    v: 1;
+    type: 'unload-ack';
+    bytesId: number;
 } | {
     v: 1;
     type: 'decode-reply';
