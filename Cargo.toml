@@ -10,6 +10,12 @@ crate-type = ["cdylib", "rlib"]
 # A2: enable rayon parallelism in the RAW pipeline for WASM (requires COOP/COEP, already required by libjxl MT)
 parallel-wasm = ["raw-pipeline/parallel", "dep:wasm-bindgen-rayon"]
 
+# P3-T11 (finding 21): opt-in wasm SIMD128 MHC interior demosaic kernel. Bit-exact to scalar;
+# OFF by default. Only flip on for a shipped pkg AFTER the ≥15% median browser+Node-WASM
+# flipflop perf gate passes (currently OWED — see .flipflop/tests/mhc-simd128.mjs). Forwards to
+# the raw-pipeline feature of the same name.
+mhc-simd128 = ["raw-pipeline/mhc-simd128"]
+
 # Native bench/tools: forward the BSD own-FFI JXL codec (encode + decode).
 # (Always enabled natively via the target dep below; this forwarder keeps the
 # `--features jxl-codec` invocation valid.)
