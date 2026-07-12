@@ -489,6 +489,70 @@ export function cacheStore(cache: PyramidCache | undefined, key: string | undefi
   cache.set(key, pixels.byteLength === need ? pixels : pixels.slice(0, need));
 }
 
+/**
+ * The one named tiled-decode strategy the single planner (decode-level.ts) dispatches on.
+ *
+ *   'worker-pool'        — parallel per-tile decode across the injected/owned pool
+ *                          (decodeTiledViewportPooled); handles dc-then-final + one-shot final.
+ *   'progressive-direct' — inline dc-then-final / dc-only / skip-tile / resume per-tile loop on the
+ *                          main thread (no pool); the only path that implements dc-only, skip-tile,
+ *                          and skipTiles resume.
+ *   'direct'             — single libjxl ROI decode of the whole viewport in one WASM call.
+ */
+export type TileDecodeStrategy = 'worker-pool' | 'progressive-direct' | 'direct';
+
+/**
+ * Pure pool-strategy hook: pick exactly one tiled-decode strategy from tile count, environment
+ * worker-availability, and caller options. This centralises the dispatch that was previously three
+ * overlapping booleans in decode-level.ts (finding 77) — decode-level now dispatches on the single
+ * value this returns. Kept in decode-core (the primitives/types root) so both the planner and tests
+ * consume the same decision without a cycle.
+ *
+ * Behaviour is identical to the prior inline logic:
+ *  - worker-pool requires >1 tile, a worker environment, a pool/factory, parallel !== false, and a
+ *    progressive mode the pool implements (undefined | 'dc-then-final'); never with a custom
+ *    decodeRegion, skip-tile policy, or a skipTiles resume-set (the pool fails the batch on those).
+ *  - progressive-direct covers 'dc-then-final' / 'dc-only' (and skip-tile / skipTiles, which force the
+ *    inline loop) whenever worker-pool was not selected, provided no custom decodeRegion is supplied.
+ *  - direct otherwise (single ROI decode, incl. the mock/decodeRegion path).
+ */
+export function selectTileDecodeStrategy(args: {
+  numTiles: number;
+  envCanParallel: boolean;
+  options: DecodeOptions | undefined;
+}): TileDecodeStrategy {
+  const { numTiles, envCanParallel, options } = args;
+  const progressive = options?.progressive;
+  const hasCustomDecodeRegion = !!options?.decodeRegion;
+  const wantsInlineOnly = options?.errorPolicy === 'skip-tile' || !!options?.skipTiles;
+
+  const parallelEligible =
+    !hasCustomDecodeRegion &&
+    shouldUseParallel(options, numTiles, envCanParallel) &&
+    !wantsInlineOnly;
+
+  if (parallelEligible && (progressive === 'dc-then-final' || progressive === undefined)) {
+    return 'worker-pool';
+  }
+  if ((progressive === 'dc-then-final' || progressive === 'dc-only') && !hasCustomDecodeRegion) {
+    return 'progressive-direct';
+  }
+  return 'direct';
+}
+
+/**
+ * Local mirror of tiled-decode-pool's shouldUseParallel so the strategy hook stays in decode-core
+ * (the types root) without importing tiled-decode-pool (which imports decode-core — a cycle).
+ * The concrete pool exports its own identical predicate for its internal decision.
+ */
+function shouldUseParallel(
+  opts: { parallel?: boolean; workerFactory?: unknown; pool?: unknown } | undefined,
+  numTiles: number,
+  envCanParallel: boolean,
+): boolean {
+  return (opts?.parallel !== false) && envCanParallel && numTiles > 1 && !!(opts?.workerFactory || opts?.pool);
+}
+
 export function sortCenterOut<T>(
   items: T[],
   viewport: ImageRegion,
