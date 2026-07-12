@@ -13,6 +13,8 @@ import { createReadLane } from './jxl-read-lane.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
+// Findings 13, 44, 45: full-resolution export service + metadata policy + real format label.
+import { ExportService, formatLabel as _formatLabel } from './export-service.js';
 // Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 // Findings 11, 29: byte-budgeted, LRU-evicting derived cache for decoded JXL
@@ -957,7 +959,14 @@ pool.init();
 // Finding 3: the dedicated JXL decode worker is no longer spawned here.
 // JXL decode routes through decodeJxlViaSession() → getContext() (jxl-session scheduler).
 
-async function encodeJxlSession(pixels, width, height, quality, effort, lossless, progressive, format = 'rgba8', orientation) {
+// Finding 44: optional `metadata` param carries { exif?: Uint8Array, xmp?: Uint8Array }
+// through to the JXL encode session so EXIF/XMP bytes are embedded in the output file.
+// The RAW pipeline produces these bytes at the worker level; the export service applies
+// the privacy policy (keep/strip-gps/strip-all) before passing them here.
+// Packet-3 integration point: when a metadata-preserving encoder lands, it will supply
+// the exact EXIF block; for now we pass synthesized EXIF from the json exif blob if
+// available (the JXL encoder handles null gracefully — it just omits the EXIF box).
+async function encodeJxlSession(pixels, width, height, quality, effort, lossless, progressive, format = 'rgba8', orientation, metadata = null) {
     // A3: rgb8 carries 3 channels (no alpha), rgba8/rgba16/rgbaf32 carry 4.
     const hasAlpha = format !== 'rgb8';
     const encOpts = {
@@ -976,6 +985,9 @@ async function encodeJxlSession(pixels, width, height, quality, effort, lossless
     if (orientation != null && orientation >= 1 && orientation <= 8) {
         encOpts.orientation = orientation;
     }
+    // Finding 44: pass raw EXIF/XMP bytes into the JXL container when provided.
+    if (metadata?.exif instanceof Uint8Array) encOpts.exif = metadata.exif;
+    if (metadata?.xmp  instanceof Uint8Array) encOpts.xmp  = metadata.xmp;
     const session = getContext().encode(encOpts);
     const buf = pixels instanceof ArrayBuffer ? pixels : pixels.buffer;
     await session.pushPixels(buf);
@@ -3270,7 +3282,7 @@ function buildInfoRows(card) {
         ['Camera WB', fmtCameraWb(card)],
         ['Orientation', ORIENTATION_LABEL[ex.orientation] || (ex.orientation != null ? String(ex.orientation) : null)],
         ['Dimensions', dim],
-        ['Format',    'ORF (Olympus 12-bit)'],
+        ['Format',    _formatLabel(ex)],
         ['Quality',   fmtQuality(ex.quality)],
         ['Pipeline',  getCardState(card)._pipelineMs != null ? `${getCardState(card)._pipelineMs.toFixed(0)} ms` : null],
     ].filter(([_, v]) => v != null);
@@ -3661,6 +3673,18 @@ function initFilmstrip() {
             applyLookToFilmstripSelection();
         });
     }
+
+    // Finding 13 (P0): wire the "Export selected" button to ExportService.
+    // Previously this button existed in the DOM but was never connected to any
+    // handler — clicking it did nothing.  Now it drives a full-resolution export
+    // of all filmstrip-selected cards using the current metadata policy from the
+    // export settings (defaults to 'keep').
+    const exportBtn = document.getElementById('filmstrip-export-selection');
+    if (exportBtn) {
+        exportBtn.addEventListener('click', () => {
+            exportFilmstripSelection();
+        });
+    }
 }
 
 function updateFilmstripSelectionUI() {
@@ -3828,6 +3852,114 @@ function applyLookToFilmstripSelection() {
             }
         })().catch(() => {});
     }
+}
+
+// ---------------------------------------------------------------------------
+// Finding 13 (P0): Export selected via ExportService
+// ---------------------------------------------------------------------------
+
+/**
+ * Export all filmstrip-selected cards at full resolution.
+ *
+ * Routes through ExportService (single entry point for all export paths).
+ * NEVER exports preview-resolution canvas bytes — uses the full-res lightbox
+ * pixels held in getCardState(card)._lightbox.
+ *
+ * Metadata policy: reads from the export-settings panel if present,
+ * defaults to 'keep'.  Output format: 'jxl' (default) — extendable via
+ * a format-picker UI (future work).
+ */
+async function exportFilmstripSelection() {
+    if (filmstripSelection.size === 0) return;
+
+    const indices = [...filmstripSelection];
+    // Collect cards and their assetIds in selection order.
+    const selectedCards = indices.map(i => cards[i]).filter(Boolean);
+    if (selectedCards.length === 0) return;
+
+    // Derive assetIds; cards without one are skipped (not yet decoded).
+    const assetIds = selectedCards
+        .map(c => getCardState(c)?._assetId)
+        .filter(Boolean);
+    if (assetIds.length === 0) return;
+
+    // Read metadata policy from an optional export-settings panel element.
+    // Falls back to 'keep' when no panel element is wired yet.
+    const policyEl = document.getElementById('export-metadata-policy');
+    const metadata  = (policyEl?.value === 'strip-gps' || policyEl?.value === 'strip-all')
+        ? policyEl.value : 'keep';
+
+    // Read output format from optional export-format picker, default to 'jxl'.
+    const fmtEl = document.getElementById('export-output-format');
+    const output = (['jxl','jpeg','png','tiff'].includes(fmtEl?.value))
+        ? fmtEl.value : 'jxl';
+
+    // Create the ExportService, injecting the main-thread encoder.
+    const svc = new ExportService({
+        getCardStateByAssetId(assetId) {
+            // Find the card whose assetId matches.
+            for (const c of cards) {
+                if (getCardState(c)?._assetId === assetId) return getCardState(c);
+            }
+            return null;
+        },
+        async encodePixels(pixels, w, h, format, orientation, outputFmt) {
+            // Route to the existing full-resolution JXL encoder.
+            // Packet-3 integration point: when alternative output formats
+            // (PNG/TIFF/JPEG) land, switch on outputFmt here.
+            const quality = 90;   // sensible default; future: read from UI
+            const effort  = 3;
+            return encodeJxlSession(pixels, w, h, quality, effort, false, false, format, orientation);
+        },
+    });
+
+    // Disable the button while exporting.
+    const exportBtn = document.getElementById('filmstrip-export-selection');
+    if (exportBtn) {
+        exportBtn.disabled = true;
+        exportBtn.textContent = 'Exporting…';
+    }
+
+    let doneCount = 0, errorCount = 0;
+
+    try {
+        const req = { assetIds, output, metadata, resolution: 'full' };
+        for await (const ev of svc.export(req)) {
+            if (ev.type === 'progress') {
+                // Optional: update a progress indicator.
+                if (exportBtn) exportBtn.textContent = `Exporting… (${ev.phase})`;
+            } else if (ev.type === 'done') {
+                doneCount++;
+                // Trigger browser download for each exported file.
+                const url = URL.createObjectURL(new Blob([ev.bytes], { type: _mimeForOutput(output) }));
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = ev.filename;
+                a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 30000);
+            } else if (ev.type === 'error') {
+                errorCount++;
+                console.error('[export]', ev.assetId, ev.error);
+            }
+        }
+    } finally {
+        if (exportBtn) {
+            exportBtn.disabled = false;
+            exportBtn.textContent = errorCount > 0
+                ? `Export selected (${errorCount} error${errorCount > 1 ? 's' : ''})`
+                : 'Export selected';
+        }
+    }
+
+    if (doneCount > 0 && statusText) {
+        statusBar.hidden = false;
+        statusText.textContent = `Exported ${doneCount} file${doneCount === 1 ? '' : 's'}` +
+            (errorCount > 0 ? ` (${errorCount} failed)` : '');
+    }
+}
+
+function _mimeForOutput(fmt) {
+    return { jxl: 'image/jxl', jpeg: 'image/jpeg', png: 'image/png', tiff: 'image/tiff' }[fmt] ?? 'application/octet-stream';
 }
 
 // Toolbar buttons

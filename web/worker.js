@@ -631,6 +631,22 @@ self.addEventListener('message', async (ev) => {
         const nativeRaw = rawKind === 'orf' || rawKind === 'cr2' || rawKind === 'dng';
         const decoderFn = nativeRaw ? pickRawDecoderWithFlags(bytes, opts.name || '') : null;
         let librawPayload = null;
+        // Finding 44/45: derive format label and nominal bit-depth from the raw kind so
+        // the info panel and export service show real values instead of a hardcoded string.
+        // These are the nominal sensor ADC depths for each format family; the actual pixel
+        // values after pipeline processing are always 16-bit linear.
+        const RAW_FORMAT_LABEL = {
+            orf: 'ORF', cr2: 'CR2', cr3: 'CR3', crw: 'CRW', dng: 'DNG',
+            nef: 'NEF', nrw: 'NRW', arw: 'ARW', rw2: 'RW2', rwl: 'RWL',
+            raf: 'RAF', pef: 'PEF', srw: 'SRW', x3f: 'X3F',
+        };
+        const RAW_BIT_DEPTH = {
+            orf: 12, cr2: 14, cr3: 14, crw: 12, dng: 14,
+            nef: 14, nrw: 12, arw: 14, rw2: 12, rwl: 14,
+            raf: 14, pef: 12, srw: 12, x3f: 16,
+        };
+        const rawFormatLabel = RAW_FORMAT_LABEL[rawKind] ?? rawKind.toUpperCase();
+        const rawBitDepth    = RAW_BIT_DEPTH[rawKind] ?? null;
         const lookArgs = {
             exposureEv: look.exposureEv ?? 0,
             contrast:   look.contrast   ?? 0,
@@ -745,6 +761,8 @@ self.addEventListener('message', async (ev) => {
 
         // Flat EXIF blob for the lightbox info panel. Rationals are passed as
         // {n, d}; consumer formats. Zero denominators mean "absent".
+        // Finding 44/45: include format + bitDepth so the info panel and export
+        // service can show real values (no hardcoded "ORF (Olympus 12-bit)").
         const exif = {
             make, model,
             lens: result.lens,
@@ -761,6 +779,8 @@ self.addEventListener('message', async (ev) => {
             wbR, wbB,
             wbFromCamera: result.wb_from_camera,
             width: w, height: h,
+            format:   rawFormatLabel,
+            bitDepth: rawBitDepth,
         };
 
         // Store lightbox liveState — built in-wasm from the internal packed buffer.
