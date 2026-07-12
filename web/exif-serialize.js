@@ -222,7 +222,16 @@ export function serializeExif(exif) {
     const sG = hasGps ? serializeIfd(gps, gpsOffset, dataCursor) : null;
 
     // --- assemble ---
+    // JXL/ISO-BMFF "Exif" box payload = 4-byte BIG-ENDIAN uint32 giving the
+    // offset (in bytes) from the end of this 4-byte field to the start of the
+    // TIFF header, followed by the TIFF data (ISO/IEC 18181-2). libjxl's
+    // JxlEncoderAddBox(enc, "Exif", ...) stores the buffer VERBATIM — it does
+    // NOT prepend/strip this field — so the producer owns it. We emit offset 0:
+    // the TIFF header immediately follows the 4-byte prefix. Without it a
+    // conformant reader interprets the first 4 TIFF bytes (II*\0 = 0x49492A00)
+    // as the offset → out of bounds → EXIF unreadable.
     const out = new ByteWriter();
+    out.u8(0x00); out.u8(0x00); out.u8(0x00); out.u8(0x00); // BE uint32 = 0 (TIFF starts next)
     out.u8(0x49); out.u8(0x49);          // 'II' little-endian
     out.u16(0x002A);                     // TIFF magic
     out.u32(ifd0Offset);                 // offset of IFD0
@@ -249,13 +258,23 @@ function dmsTriples(dd) {
 // Returns { hasGps, tags: Map<tagId, value>, gpsPointerPresent }.
 // ---------------------------------------------------------------------------
 /**
- * @param {Uint8Array} bytes
- * @returns {{ hasGps: boolean, gpsPointerPresent: boolean, ifd0Tags: number[], make: string|null, model: string|null }}
+ * @param {Uint8Array} bytes  JXL Exif-box payload: 4-byte BE TIFF-offset prefix + TIFF data
+ * @returns {{ hasGps: boolean, gpsPointerPresent: boolean, ifd0Tags: number[], make: string|null, model: string|null, tiffStart: number }}
  */
 export function parseExif(bytes) {
-    if (!bytes || bytes.length < 8) return { hasGps: false, gpsPointerPresent: false, ifd0Tags: [], make: null, model: null };
-    const le = bytes[0] === 0x49 && bytes[1] === 0x49;
-    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (!bytes || bytes.length < 12) return { hasGps: false, gpsPointerPresent: false, ifd0Tags: [], make: null, model: null, tiffStart: 0 };
+    const fullDv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // JXL/ISO-BMFF Exif box payload begins with a 4-byte BIG-ENDIAN uint32:
+    // the offset from the end of this field to the TIFF header. Seek to it so a
+    // reader that does NOT assume tiffStart=0 recovers the fields.
+    const tiffStart = 4 + fullDv.getUint32(0, false);
+    if (tiffStart + 8 > bytes.length) return { hasGps: false, gpsPointerPresent: false, ifd0Tags: [], make: null, model: null, tiffStart };
+
+    // TIFF-relative view: all offsets below (valOff, pointers, IFD offsets) are
+    // measured from the TIFF header, so index against this rebased view.
+    const tiff = bytes.subarray(tiffStart);
+    const le = tiff[0] === 0x49 && tiff[1] === 0x49;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset + tiffStart, bytes.byteLength - tiffStart);
     const u16 = (o) => dv.getUint16(o, le);
     const u32 = (o) => dv.getUint32(o, le);
 
@@ -273,12 +292,13 @@ export function parseExif(bytes) {
     const readAscii = (e) => {
         const byteLen = e.count;
         // All offsets here (valOff, and the pointer stored at valOff) are
-        // TIFF-relative (measured from bytes[0]).  `bytes[i]` and `dv` are both
-        // TIFF-relative too, so index `bytes` with the TIFF-relative offset.
+        // TIFF-relative (measured from the TIFF header, not from the box start).
+        // `tiff` and `dv` are both rebased to the TIFF header, so index `tiff`
+        // with the TIFF-relative offset.
         const base = byteLen <= 4 ? e.valOff : u32(e.valOff);
         let s = '';
         for (let i = 0; i < byteLen; i++) {
-            const c = bytes[base + i];
+            const c = tiff[base + i];
             if (c === 0) break;
             s += String.fromCharCode(c);
         }
@@ -295,13 +315,14 @@ export function parseExif(bytes) {
         if (e.tag === T.Model) model = readAscii(e);
     }
     // hasGps = a GPS IFD pointer exists AND points to a non-empty IFD.
+    // `gpsOff` is TIFF-relative, so bound-check against the TIFF-relative view.
     let hasGps = false;
     if (gpsPointerPresent) {
         const gpsEntry = entries.find(e => e.tag === T.GPSIFDPointer);
         const gpsOff = u32(gpsEntry.valOff);
-        if (gpsOff > 0 && gpsOff + 2 <= bytes.length) {
+        if (gpsOff > 0 && gpsOff + 2 <= tiff.length) {
             hasGps = u16(gpsOff) > 0;
         }
     }
-    return { hasGps, gpsPointerPresent, ifd0Tags, make, model };
+    return { hasGps, gpsPointerPresent, ifd0Tags, make, model, tiffStart };
 }

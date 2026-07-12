@@ -3955,6 +3955,13 @@ async function exportFilmstripSelection() {
         },
         // Decode the developed FULL-RES JXL back to full-res RGBA (never the
         // preview).  Reuses the existing full-JXL decode path.
+        //
+        // NOTE: `_jxlBytes` is intentionally UNUSED. We decode by asset id via
+        // the card's blob URL through the shared session (decodeFullJxlFor)
+        // rather than decoding the passed buffer directly — this reuses the
+        // warm decode session and its full-dims sizing. The parameter is kept
+        // to match the ExportService capability signature; do not wire it to a
+        // fresh decode without also routing sizing/session state.
         async decodeFullRes(_jxlBytes) {
             // We decode via the card's blob URL through the shared session
             // (decodeFullJxlFor), which yields { rgba, w, h } at full dims.

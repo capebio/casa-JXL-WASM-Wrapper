@@ -18,13 +18,50 @@ describe('serializeExif / parseExif', () => {
         expect(serializeExif({})).toBeNull();
     });
 
-    test('produces a valid little-endian TIFF header', () => {
+    test('begins with the 4-byte BE TIFF-offset prefix, then the TIFF header', () => {
         const b = serializeExif(base);
         expect(b).toBeInstanceOf(Uint8Array);
-        expect(b[0]).toBe(0x49); // 'I'
-        expect(b[1]).toBe(0x49); // 'I' → little-endian
-        expect(b[2]).toBe(0x2A); // magic low
-        expect(b[3]).toBe(0x00); // magic high
+        // JXL Exif box: 4-byte BIG-ENDIAN uint32 = offset from end of this field
+        // to the TIFF header. We emit 0 → TIFF starts immediately at byte 4.
+        expect(b[0]).toBe(0x00);
+        expect(b[1]).toBe(0x00);
+        expect(b[2]).toBe(0x00);
+        expect(b[3]).toBe(0x00);
+        // TIFF header lives at the prefixed offset (4), NOT at byte 0.
+        expect(b[4]).toBe(0x49); // 'I'
+        expect(b[5]).toBe(0x49); // 'I' → little-endian
+        expect(b[6]).toBe(0x2A); // magic low
+        expect(b[7]).toBe(0x00); // magic high
+    });
+
+    test('box layout: a reader that seeks to the BE offset (not tiffStart=0) recovers fields', () => {
+        const b = serializeExif(base);
+        // Independent reader: read the 4-byte BE offset, seek, then parse TIFF —
+        // does NOT assume the TIFF header is at byte 0.
+        const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+        const beOffset = dv.getUint32(0, false);        // big-endian
+        const tiffStart = 4 + beOffset;
+        expect(tiffStart).toBe(4);                       // offset 0 → TIFF at byte 4
+        expect(b[tiffStart]).toBe(0x49);                 // 'II' at the real TIFF start
+        expect(b[tiffStart + 1]).toBe(0x49);
+        // parseExif itself must honour the prefix and expose the real tiffStart.
+        const p = parseExif(b);
+        expect(p.tiffStart).toBe(tiffStart);
+        expect(p.make).toBe('Olympus');
+        expect(p.model).toBe('OM-5');
+        expect(p.hasGps).toBe(true);
+    });
+
+    test('strip-gps: no GPS after seeking to the real TIFF start', () => {
+        const b = serializeExif({ ...base, gps: null });
+        const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+        const tiffStart = 4 + dv.getUint32(0, false);
+        expect(b[tiffStart]).toBe(0x49); // real TIFF header found via the offset
+        const p = parseExif(b);
+        expect(p.gpsPointerPresent).toBe(false);
+        expect(p.hasGps).toBe(false);
+        expect(p.ifd0Tags).not.toContain(0x8825);
+        expect(p.make).toBe('Olympus'); // non-GPS fields survive
     });
 
     test('round-trips make/model as ASCII', () => {
