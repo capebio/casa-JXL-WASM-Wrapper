@@ -3493,6 +3493,10 @@ struct DngDecoded {
     iso: u32,
     /// DNG BaselineExposure (EV); folded into the render exposure. 0.0 when absent.
     baseline_exposure: f32,
+    /// Finding 51: honest WB provenance carried from the decoder (`true` only when
+    /// WB genuinely came from AsShotNeutral / MakerNote 0x4001). Replaces the
+    /// hardcoded `wb_from_camera: true` the shared output stage used to emit.
+    wb_from_camera: bool,
     datetime: String,
     gps_lat: Option<f64>,
     gps_lon: Option<f64>,
@@ -3530,19 +3534,43 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 && w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) <= MAX_PIXELS
             {
                 let phase = src.phase();
-                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, baseline_exposure, make, model) = {
+                let (
+                    black,
+                    white,
+                    wb_r,
+                    wb_b,
+                    wb_from_camera,
+                    color_matrix,
+                    orientation,
+                    iso,
+                    baseline_exposure,
+                    make,
+                    model,
+                    datetime,
+                    gps_lat,
+                    gps_lon,
+                    gps_alt,
+                ) = {
                     let m = src.meta();
                     (
                         m.black,
                         m.white,
                         m.wb_r,
                         m.wb_b,
+                        // Finding 51: carry honest provenance out of the preview carrier.
+                        m.wb_from_camera,
                         m.color_matrix,
                         m.orientation,
                         m.iso.unwrap_or(100),
                         m.baseline_exposure,
                         m.make.clone(),
                         m.model.clone(),
+                        // Finding 50: preserve datetime/GPS on the streaming preview path
+                        // (previously dropped → info panel lost them for preview-only decodes).
+                        m.datetime.clone(),
+                        m.gps_lat,
+                        m.gps_lon,
+                        m.gps_alt,
                     )
                 };
                 let (lb_w, lb_h) = target_dims(w, h, 1800);
@@ -3586,10 +3614,11 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                     model,
                     iso,
                     baseline_exposure,
-                    datetime: String::new(),
-                    gps_lat: None,
-                    gps_lon: None,
-                    gps_alt: None,
+                    wb_from_camera,
+                    datetime,
+                    gps_lat,
+                    gps_lon,
+                    gps_alt,
                     lb_packed,
                     lb_w,
                     lb_h,
@@ -3677,6 +3706,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         model: img.model,
         iso,
         baseline_exposure: img.baseline_exposure,
+        wb_from_camera: img.wb_from_camera,
         datetime: img.datetime,
         gps_lat: img.gps_lat,
         gps_lon: img.gps_lon,
@@ -3712,6 +3742,7 @@ fn process_dng_impl(
         model,
         iso,
         baseline_exposure,
+        wb_from_camera,
         datetime,
         gps_lat,
         gps_lon,
@@ -3931,7 +3962,9 @@ fn process_dng_impl(
         has_gps: gps_lat.is_some() && gps_lon.is_some(),
         quality: 0,
         wb_mode: 0xFFFF,
-        wb_from_camera: true,
+        // Finding 51: honest provenance carried from the decoder — no longer the
+        // hardcoded `true` that masked the DNG grey / CR2 2.0-1.7 fallbacks.
+        wb_from_camera,
         // DNG/CR2 stay monolithic (worker.js never sets OUT_RETAIN_RAW for them),
         // so there is never a retained raw mosaic to finish later.
         retained_raw: None,
@@ -4061,6 +4094,8 @@ struct Cr2Decoded {
     make: String,
     model: String,
     iso: u32,
+    /// Finding 51: honest WB provenance (true only when Canon MakerNote 0x4001 WB read).
+    wb_from_camera: bool,
     datetime: String,
     gps_lat: Option<f64>,
     gps_lon: Option<f64>,
@@ -4166,6 +4201,11 @@ fn process_raw_mosaic_impl(
     let mut params = pipeline::PipelineParams::default_olympus();
     params.black = black.min(u16::MAX as u32) as u16;
     params.white = white.min(u16::MAX as u32).max(params.black as u32 + 1) as u16;
+    // Finding 51: WB provenance for the generic mosaic (LibRaw) path is honest —
+    // true only when the caller supplied a valid finite positive WB (from LibRaw
+    // metadata); the 1.0 grey fallback below reports false, not a fake default.
+    let wb_from_camera =
+        wb_r.is_finite() && wb_r > 0.0 && wb_b.is_finite() && wb_b > 0.0;
     params.wb_r = if wb_r.is_finite() && wb_r > 0.0 {
         wb_r.min(8.0)
     } else {
@@ -4192,6 +4232,7 @@ fn process_raw_mosaic_impl(
             model: String::new(),
             iso: 0,
             baseline_exposure: 0.0, // generic mosaic path (LibRaw); no DNG BaselineExposure
+            wb_from_camera,
             datetime: String::new(),
             gps_lat: None,
             gps_lon: None,
@@ -4330,9 +4371,20 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     params.white = cr2.white;
     params.wb_r = cr2.wb_r;
     params.wb_b = cr2.wb_b;
-    params.color_matrix = cr2.color_matrix.into();
+    // Finding 52: resolve the CR2 colour matrix ONCE and carry it into BOTH the
+    // in-WASM tone params AND the exported color_matrix_flat. `cr2.color_matrix` is
+    // now the single resolver output (per-model or Canon-generic fallback), so the
+    // in-WASM initial render and the interactive LookRenderer (which is fed
+    // color_matrix_flat) render with the identical matrix. Previously `params`
+    // fell through to the pipeline's *Olympus* generic while color_matrix_flat used
+    // the Canon generic, so a Canon CR2's colour jumped the moment a slider moved.
+    let cr2_matrix = cr2
+        .color_matrix
+        .or_else(|| raw_pipeline::cr2::resolved_color_matrix(&cr2.make, &cr2.model))
+        .unwrap_or(CANON_CAM_TO_SRGB);
+    params.color_matrix = Some(cr2_matrix).into();
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.to_option().unwrap_or(CANON_CAM_TO_SRGB);
+        let m = cr2_matrix;
         [
             m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         ]
@@ -4361,6 +4413,7 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
         make: cr2.make,
         model: cr2.model,
         iso,
+        wb_from_camera: cr2.wb_from_camera,
         datetime: cr2.datetime,
         gps_lat: cr2.gps_lat,
         gps_lon: cr2.gps_lon,
@@ -4383,6 +4436,7 @@ impl From<Cr2Decoded> for DngDecoded {
             model: c.model,
             iso: c.iso,
             baseline_exposure: 0.0, // CR2 (Canon) has no DNG BaselineExposure tag
+            wb_from_camera: c.wb_from_camera,
             datetime: c.datetime,
             gps_lat: c.gps_lat,
             gps_lon: c.gps_lon,

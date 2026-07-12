@@ -402,6 +402,45 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
     Some(crate::dng::mul3x3(crate::dng::XYZ_D50_TO_SRGB, cam_to_xyz))
 }
 
+/// Generic Canon EOS camera→sRGB matrix (dcraw/LibRaw coefficients).
+///
+/// Finding 52: this is the ONE Canon fallback both preview and final tone must use.
+/// Previously the in-WASM initial render fell through to the pipeline's *Olympus*
+/// generic (`CAM_TO_SRGB`) while the interactive `LookRenderer` (fed the exported
+/// `color_matrix_flat`) used this Canon matrix — so the moment a slider moved, a
+/// Canon CR2's colour jumped (mean per-channel 6–33/255, up to 210 max on the real
+/// corpus). Keeping the value identical to `src/lib.rs::CANON_CAM_TO_SRGB` so the
+/// resolved matrix is byte-identical on both sides of the FFI boundary.
+pub const CANON_CAM_TO_SRGB: [[f32; 3]; 3] = [
+    [0.4592, 0.3810, 0.1595],
+    [0.1638, 0.7718, 0.0644],
+    [0.0388, 0.0791, 0.8824],
+];
+
+/// The single CR2 camera→sRGB matrix resolution point (finding 52).
+///
+/// Precedence: per-model matrix (`canon_color_matrix`, currently disabled pending
+/// the WB-first neutral-correction fix) → Canon-generic fallback → `None` for a
+/// non-Canon body (leaving the caller's generic pipeline fallback in place).
+///
+/// Because it is a pure function of make/model, every caller — the batch decoder,
+/// the streaming row-source, and the WASM tone/preview paths in `src/lib.rs` — that
+/// routes its matrix through here is GUARANTEED to render preview and final with the
+/// identical matrix. A Canon body therefore never resolves to `None`, which is what
+/// let preview and final diverge before.
+pub fn resolved_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
+    // Alloc-free ASCII case-insensitive "canon" search.
+    let is_canon = make
+        .as_bytes()
+        .windows(5)
+        .any(|w| w.eq_ignore_ascii_case(b"canon"));
+    if !is_canon {
+        return None;
+    }
+    // Per-model matrix wins when available; otherwise the Canon generic fallback.
+    Some(canon_color_matrix(make, model).unwrap_or(CANON_CAM_TO_SRGB))
+}
+
 fn canon_default_black_white(precision: u8, model: &str) -> (u16, u16) {
     match precision {
         14 if model.eq_ignore_ascii_case("Canon EOS M5") => (512u16, 15300u16),
@@ -1475,7 +1514,10 @@ fn decode_impl(
             wb_b,
             wb_from_camera,
             iso,
-            color_matrix: canon_color_matrix(&make, &model),
+            // Finding 52: resolve the CR2 matrix ONCE (per-model or Canon-generic
+            // fallback) so the batch/final path and the streaming/preview path — and
+            // the WASM tone path that consumes this — all render with the same matrix.
+            color_matrix: resolved_color_matrix(&make, &model),
             make,
             model,
             orientation,
@@ -1528,6 +1570,9 @@ pub struct Cr2RowSource {
     pub wb_r: f32,
     pub wb_g: f32,
     pub wb_b: f32,
+    /// `true` only when WB came from Canon MakerNote 0x4001; `false` = the 2.0/1.7
+    /// fallback fired. Mirrors `Cr2Image.wb_from_camera` (finding 51).
+    pub wb_from_camera: bool,
     pub iso: Option<u32>,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub make: String,
@@ -1655,6 +1700,8 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
     // MakerNote: WB + SensorInfo
     let mut wb_r: f32 = 2.0;
     let mut wb_b: f32 = 1.7;
+    // Finding 51: honest provenance — true only when WB came from MakerNote 0x4001.
+    let mut wb_from_camera = false;
     let mut black_from_colordata: Option<u16> = None;
     let mut sensor_info: Option<SensorInfo> = None;
 
@@ -1668,6 +1715,7 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
                     if let Some((r, b)) = extract_wb_from_raw(data, p, cnt, le, dtype) {
                         wb_r = r;
                         wb_b = b;
+                        wb_from_camera = true;
                     }
                     black_from_colordata = extract_black_from_raw(data, p, cnt, le, dtype);
                 }
@@ -1894,8 +1942,10 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
         wb_r,
         wb_g: 1.0,
         wb_b,
+        wb_from_camera,
         iso,
-        color_matrix: canon_color_matrix(&make, &model),
+        // Finding 52: same single resolver as the batch path (see decode return).
+        color_matrix: resolved_color_matrix(&make, &model),
         make,
         model,
         orientation,
@@ -2416,6 +2466,25 @@ mod tests {
             );
         }
         assert!(canon_color_matrix("OM Digital Solutions", "OM-5").is_none());
+    }
+
+    #[test]
+    fn resolved_color_matrix_is_canon_generic_fallback() {
+        // Finding 52: while the per-model table is disabled, every Canon body must
+        // still resolve to the CONCRETE Canon-generic matrix (never None), so preview
+        // and final consume the same matrix instead of diverging (Olympus vs Canon).
+        for model in ["Canon EOS 550D", "Canon EOS M5", "Canon EOS 9999X"] {
+            assert_eq!(
+                resolved_color_matrix("Canon", model),
+                Some(CANON_CAM_TO_SRGB),
+                "Canon body {model} must resolve to the Canon generic, not None"
+            );
+        }
+        // Case-insensitive make match.
+        assert_eq!(resolved_color_matrix("CANON", "x"), Some(CANON_CAM_TO_SRGB));
+        // Non-Canon → None (caller keeps its generic pipeline fallback).
+        assert_eq!(resolved_color_matrix("Nikon", "D850"), None);
+        assert_eq!(resolved_color_matrix("OM Digital Solutions", "OM-5"), None);
     }
 
     #[test]
