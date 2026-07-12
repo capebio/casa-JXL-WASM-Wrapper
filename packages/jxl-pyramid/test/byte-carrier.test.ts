@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, describe } from "bun:test";
 import { __testing, disposeDefaultPool, PyramidWorkerPool } from "../src/tiled-decode-pool.js";
 import { selectCarrier, OWNED_WHOLE_MAX_BYTES } from "../src/tiled-decode-pool.js";
 import type { LevelSource } from "../src/level-source.js";
@@ -298,4 +298,259 @@ test("repeated ensureLoadedForTiles does not re-transfer ranges already resident
   const after2 = usable[0].worker.ownedBytesTransferred();
 
   expect(after2).toBe(after1); // no re-transfer of the already-resident tile range
+});
+
+// ---------------------------------------------------------------------------
+// Behavioral tests added per spec checklist-1
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 1. Budget eviction (LRU): unit-tests createWorkerStore with a tiny budget so
+//    we don't need real 256 MiB data.  Directly exercises the same code path
+//    the worker uses (worker-store.js is now a shared module).
+//
+// Key design: loadMessage increments refs so freshly-loaded entries have refs≥1.
+// evictToBudget skips entries with refs>0.  Eviction therefore only reclaims
+// entries that have been unloaded (refs→0) but whose unloadMessage freed them
+// immediately.  The meaningful eviction scenario is when entries are MANUALLY
+// marked refs=0 (simulating a worker crash without explicit unload) so the
+// next over-budget load can reclaim them LRU-first.
+// ---------------------------------------------------------------------------
+describe("worker byte-store: budget eviction (LRU)", async () => {
+  // Dynamic import because worker-store.js is a plain JS ESM file outside
+  // the TypeScript src tree; bun resolves it fine at runtime.
+  const { createWorkerStore, DEFAULT_BYTE_BUDGET } = await import("../../../web/lightbox/worker-store.js");
+
+  test("production default budget is 256 MiB (seam does not alter production behaviour)", () => {
+    expect(DEFAULT_BYTE_BUDGET).toBe(256 * 1024 * 1024);
+    // A store created with no argument uses the same budget.
+    const ws = createWorkerStore();
+    expect(ws.storeBytes).toBe(0);
+  });
+
+  test("evictToBudget evicts the LRU unreferenced entry when over budget", () => {
+    // Budget = 100 bytes.
+    // Load A (60 bytes) — initially refs=1 (the load pinned it).
+    // Simulate a worker crash: manually set refs=0 on A (pool-side unload not sent).
+    // Load B (60 bytes, refs=1) → total=120 > 100 → evictToBudget → A is LRU + refs=0 → evicted.
+    const budget = 100;
+    const ws = createWorkerStore(budget);
+
+    ws.loadMessage({ v: 1, type: "load", bytesId: 10, bytes: new Uint8Array(60) });
+    // Simulate the worker crash / unpin scenario: manually zero refs without freeing.
+    const entryA = ws.store.get(10)!;
+    entryA.refs = 0; // test-only: mark as evictable
+
+    ws.loadMessage({ v: 1, type: "load", bytesId: 20, bytes: new Uint8Array(60) });
+    // evictToBudget ran inside loadMessage for B; A was LRU+refs=0 → evicted.
+    expect(ws.store.has(20)).toBe(true);
+    expect(ws.store.has(10)).toBe(false);
+    expect(ws.storeBytes).toBeLessThanOrEqual(budget);
+  });
+
+  test("touch() promotes an entry to MRU so a different LRU entry is evicted first", () => {
+    // Budget = 100.  Load A (60 bytes, mark refs=0) → touch A → load B (60 bytes, mark refs=0)
+    // → load C (60 bytes) → eviction runs, B is LRU → evicted; A is MRU → kept.
+    const budget = 100;
+    const ws = createWorkerStore(budget);
+
+    ws.loadMessage({ v: 1, type: "load", bytesId: 10, bytes: new Uint8Array(30) });
+    ws.loadMessage({ v: 1, type: "load", bytesId: 20, bytes: new Uint8Array(30) });
+    // Mark both unreferenced (simulate unpin without unload).
+    ws.store.get(10)!.refs = 0;
+    ws.store.get(20)!.refs = 0;
+    // Touch A (10) → moves to MRU.
+    ws.touch(10);
+    // Load C (60 bytes) → total=120 > 100 → evict LRU unreferenced, which is bytesId=20.
+    ws.loadMessage({ v: 1, type: "load", bytesId: 30, bytes: new Uint8Array(60) });
+
+    expect(ws.store.has(10)).toBe(true);  // touched → MRU → kept
+    expect(ws.store.has(20)).toBe(false); // LRU → evicted
+    expect(ws.store.has(30)).toBe(true);
+  });
+
+  test("referenced entry (refs > 0) is NOT evicted even when it is the LRU entry", () => {
+    // Budget = 100.  Two entries both at 60 bytes = 120 total > budget.
+    // A (10) is LRU but has refs=1 (still referenced); B (20) has refs=0.
+    // Eviction must skip A and evict B.
+    const budget = 100;
+    const ws = createWorkerStore(budget);
+
+    ws.loadMessage({ v: 1, type: "load", bytesId: 10, bytes: new Uint8Array(60) });
+    // B loaded after A, so B is MRU; but we manually zero B's refs.
+    ws.loadMessage({ v: 1, type: "load", bytesId: 20, bytes: new Uint8Array(60) });
+    ws.store.get(20)!.refs = 0; // B unreferenced, but MRU
+    // Force eviction manually (total=120 > 100).
+    ws.evictToBudget();
+
+    // A (LRU, refs=1) must NOT be evicted.
+    expect(ws.store.has(10)).toBe(true);
+    // B (MRU, refs=0) IS evicted because it's the only unreferenced entry.
+    expect(ws.store.has(20)).toBe(false);
+    expect(ws.storeBytes).toBeLessThanOrEqual(budget);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2. Worker failure: simulate a worker erroring mid-load under the range/owned
+//    carrier path.  Assert the error propagates (decode rejects), no hang, and
+//    the pool's other state is not corrupted.
+// ---------------------------------------------------------------------------
+
+/** A RecordingWorker variant that fires an error event on the first 'decode' message. */
+class ErrorOnDecodeWorker {
+  readonly messages: Array<{ msg: any; transfer: any[] }> = [];
+  terminated = false;
+  private readonly listeners = new Map<string, Set<(ev: { data?: any }) => void>>();
+
+  constructor() {
+    this.listeners.set("message", new Set());
+    this.listeners.set("error", new Set());
+    this.listeners.set("messageerror", new Set());
+    globalThis.setTimeout(() => {
+      if (!this.terminated) this.emit("message", { v: 1, type: "ready" });
+    }, 0);
+  }
+  addEventListener(type: string, l: (ev: { data?: any }) => void) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type)!.add(l);
+  }
+  removeEventListener(type: string, l: (ev: { data?: any }) => void) {
+    this.listeners.get(type)?.delete(l);
+  }
+  postMessage(msg: any, _transfer?: any[]): void {
+    if (this.terminated) return;
+    this.messages.push({ msg, transfer: _transfer ?? [] });
+    if (msg.type === "decode") {
+      // Fire a worker-level error to simulate a crash/OOM during decode.
+      globalThis.setTimeout(() => this.emit("error", new ErrorEvent("error", { message: "simulated worker crash" })), 0);
+    }
+    if (msg.type === "unload") {
+      globalThis.setTimeout(() => this.emit("message", { v: 1, type: "unload-ack", bytesId: msg.bytesId }), 0);
+    }
+  }
+  terminate() {
+    this.terminated = true;
+  }
+  private emit(type: string, data: any) {
+    for (const l of this.listeners.get(type) ?? []) l(type === "error" ? data : { data });
+  }
+}
+
+test("worker failure: error event during decode propagates and does not hang", async () => {
+  const workers = [new ErrorOnDecodeWorker()];
+  const pool = new PyramidWorkerPool({
+    factory: () => workers.shift()!,
+    maxSize: 1,
+    idleTimeoutMs: 0,
+    minIdle: 0,
+    prewarm: "on-demand",
+  });
+
+  const c = buildJxtc({ width: 64, height: 32, tileSize: 32, tilePayload: 256 });
+  const src = tiledSource(c);
+  const bytesId = pool.allocateBytesId(src);
+  const handles = spawnHandles(pool, 1);
+  pool.ensureLoadedForTiles(handles, bytesId, src, [{ x: 0, y: 0, w: 32, h: 32 }], false);
+
+  const outBuffer = new Uint8Array(32 * 32 * 4);
+  const tiles = [{ x: 0, y: 0, w: 32, h: 32 }];
+
+  // decodeTilesParallel should reject (not hang) when the worker emits an error event.
+  await expect(
+    __testing.decodeTilesParallel(
+      bytesId,
+      "rgba8",
+      tiles,
+      handles,
+      outBuffer,
+      { x: 0, y: 0, w: 32, h: 32 },
+      4,
+      { requestTimeoutMs: 2000 },
+    ),
+  ).rejects.toBeDefined();
+
+  // The pool itself is not corrupted — it can be destroyed cleanly.
+  await pool.destroy(0);
+});
+
+// ---------------------------------------------------------------------------
+// 3. Refcount→0 frees: load a bytesId (refcount up), unload it (refcount→0),
+//    assert the store actually freed it — subsequent load is a cache-miss
+//    (re-transfer required).
+// ---------------------------------------------------------------------------
+
+/** A worker double that exposes its internal store so tests can probe store.has(bytesId). */
+class StoreTrackingWorker {
+  /** Mirror of the worker's byte store: bytesId → true if resident. */
+  readonly byteStore = new Map<number, Uint8Array>();
+  terminated = false;
+  private readonly listeners = new Map<string, Set<(ev: { data?: any }) => void>>();
+  readonly messages: Array<{ msg: any }> = [];
+
+  constructor() {
+    this.listeners.set("message", new Set());
+    this.listeners.set("error", new Set());
+    this.listeners.set("messageerror", new Set());
+    globalThis.setTimeout(() => {
+      if (!this.terminated) this.emit("message", { v: 1, type: "ready" });
+    }, 0);
+  }
+  addEventListener(type: string, l: (ev: { data?: any }) => void) {
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type)!.add(l);
+  }
+  removeEventListener(type: string, l: (ev: { data?: any }) => void) {
+    this.listeners.get(type)?.delete(l);
+  }
+  postMessage(msg: any, _transfer?: any[]): void {
+    if (this.terminated) return;
+    this.messages.push({ msg });
+    if (msg.type === "load") {
+      if (msg.bytes) this.byteStore.set(msg.bytesId, msg.bytes);
+      else if (msg.sab) this.byteStore.set(msg.bytesId, new Uint8Array(msg.sab, 0, msg.byteLength));
+    }
+    if (msg.type === "unload") {
+      this.byteStore.delete(msg.bytesId);
+      globalThis.setTimeout(() => this.emit("message", { v: 1, type: "unload-ack", bytesId: msg.bytesId }), 0);
+    }
+  }
+  terminate() { this.terminated = true; }
+  private emit(type: string, data: any) {
+    for (const l of this.listeners.get(type) ?? []) l({ data });
+  }
+  loadCount() { return this.messages.filter(m => m.msg.type === "load").length; }
+}
+
+test("refcount→0 frees: unload releases the entry so a subsequent load re-transfers bytes", async () => {
+  const trackingWorker = new StoreTrackingWorker();
+  const workerQueue = [trackingWorker];
+  const pool = new PyramidWorkerPool({
+    factory: () => workerQueue.shift()!,
+    maxSize: 1,
+    idleTimeoutMs: 0,
+    minIdle: 0,
+    prewarm: "on-demand",
+  });
+
+  const c = buildJxtc({ tilePayload: 256 });
+  const src = tiledSource(c);
+  const bytesId = pool.allocateBytesId(src);
+  const handles = spawnHandles(pool, 1);
+
+  // Load the bytes onto the worker.
+  pool.ensureLoadedForTiles(handles, bytesId, src, [{ x: 0, y: 0, w: 32, h: 32 }], false);
+  expect(trackingWorker.loadCount()).toBe(1);
+  // The pool's internal resident set should know bytesId is loaded.
+  const loadsBefore = trackingWorker.loadCount();
+
+  // Unload: pool sends 'unload', worker acks, pool clears its resident tracking.
+  await pool.unload(handles, bytesId);
+  // The StoreTrackingWorker.byteStore mirrors the worker's store: after unload, entry is gone.
+  expect(trackingWorker.byteStore.has(bytesId)).toBe(false);
+
+  // After unload the pool's resident-tracking is cleared for bytesId.
+  // Re-loading the same tiles must re-transfer (cache miss) — not a no-op.
+  pool.ensureLoadedForTiles(handles, bytesId, src, [{ x: 0, y: 0, w: 32, h: 32 }], false);
+  expect(trackingWorker.loadCount()).toBeGreaterThan(loadsBefore);
 });

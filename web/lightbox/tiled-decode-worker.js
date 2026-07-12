@@ -19,96 +19,33 @@
 // eagerly. SAB-backed loads are held BY REFERENCE (no .slice() into ownership — finding 80).
 
 import { decodeTileContainerRegionRgba8, decodeTileContainerRegionRgba16, preloadJxlModule } from '../../packages/jxl-wasm/dist/index.js';
+import { createWorkerStore } from './worker-store.js';
 
 try { preloadJxlModule(); } catch { /* optional warm-up */ }
 
 const JXTC_MAGIC = 0x4354584a; // 'JXTC' little-endian
 
-/** Retained-byte budget for this worker's store. LRU-evicted above this (finding 80). */
-const BYTE_BUDGET = 256 * 1024 * 1024; // 256 MiB
-
-/**
- * @typedef {Object} StoreEntry
- * @property {'whole'|'sab'|'ranges'} kind
- * @property {Uint8Array} [whole]                          resolved container bytes (whole/sab)
- * @property {Map<string, Uint8Array>} [ranges]            "gx,gy" -> standalone tile bitstream
- * @property {Set<number>} [offsets]                       resident tile offsets (dedup on reload)
- * @property {number} bytes                                bytes counted toward the budget
- * @property {number} refs                                 outstanding load references (refcount)
- */
-
-/** @type {Map<number, StoreEntry>} bytesId -> entry (insertion order = LRU recency) */
-const store = new Map();
-let storeBytes = 0;
+// Store with the production 256 MiB budget. Logic lives in worker-store.js so tests
+// can exercise eviction with a small budget without real large allocations.
+const _ws = createWorkerStore();
+const store = _ws.store; // read-only ref used by decode path to look up entries
+function touch(bytesId) { _ws.touch(bytesId); }
 
 self.postMessage({ v: 1, type: 'ready' });
-
-/** Mark an entry most-recently-used (Map preserves insertion order → reinsert to move to end). */
-function touch(bytesId) {
-  const e = store.get(bytesId);
-  if (e) { store.delete(bytesId); store.set(bytesId, e); }
-}
-
-function dropEntry(bytesId) {
-  const e = store.get(bytesId);
-  if (!e) return;
-  storeBytes -= e.bytes;
-  store.delete(bytesId);
-}
-
-/** Evict LRU entries with no outstanding refs until under budget. */
-function evictToBudget() {
-  if (storeBytes <= BYTE_BUDGET) return;
-  for (const [id, e] of store) {
-    if (storeBytes <= BYTE_BUDGET) break;
-    if (e.refs > 0) continue; // never evict a referenced entry
-    dropEntry(id);
-  }
-}
 
 self.onmessage = async (ev) => {
   const msg = ev.data;
   if (!msg || msg.v !== 1) return;
 
   if (msg.type === 'load') {
-    if (msg.sab !== undefined) {
-      // Hold a zero-copy VIEW over the SharedArrayBuffer — no .slice() into ownership
-      // (finding 80). The SAB is immutable for our purposes; the container writer never
-      // mutates it after load, so a live view is safe and costs no per-worker copy.
-      const view = new Uint8Array(msg.sab, 0, msg.byteLength);
-      upsertWhole(msg.bytesId, 'sab', view, msg.byteLength);
-    } else if (msg.ranges !== undefined) {
-      // Range carrier: merge the transferred tile bitstreams into the per-tile store, keyed by
-      // grid origin so a decode `region` (grid-aligned) addresses the exact tile.
-      let entry = store.get(msg.bytesId);
-      if (!entry || entry.kind !== 'ranges') {
-        entry = { kind: 'ranges', ranges: new Map(), offsets: new Set(), bytes: 0, refs: 0 };
-        store.set(msg.bytesId, entry);
-      }
-      for (const r of msg.ranges) {
-        if (entry.offsets.has(r.offset)) continue;
-        const b = r.bytes instanceof Uint8Array ? r.bytes : new Uint8Array(r.bytes);
-        entry.ranges.set(`${r.gx},${r.gy}`, b);
-        entry.offsets.add(r.offset);
-        entry.bytes += b.byteLength;
-        storeBytes += b.byteLength;
-      }
-      entry.refs += 1;
-      touch(msg.bytesId);
-      evictToBudget();
-    } else {
-      const b = msg.bytes instanceof Uint8Array ? msg.bytes : new Uint8Array(msg.bytes);
-      upsertWhole(msg.bytesId, 'whole', b, b.byteLength);
-    }
+    // Delegates to worker-store.js (SAB zero-copy, range carrier, whole-buffer — findings 79, 80).
+    _ws.loadMessage(msg);
     return; // no reply for load
   }
 
   if (msg.type === 'unload') {
-    const e = store.get(msg.bytesId);
-    if (e) {
-      e.refs -= 1;
-      if (e.refs <= 0) dropEntry(msg.bytesId);
-    }
+    // Delegates to worker-store.js; decrements refcount, frees when → 0.
+    _ws.unloadMessage(msg.bytesId);
     self.postMessage({ v: 1, type: 'unload-ack', bytesId: msg.bytesId });
     return;
   }
@@ -165,16 +102,6 @@ self.onmessage = async (ev) => {
     return;
   }
 };
-
-function upsertWhole(bytesId, kind, view, byteLen) {
-  const prev = store.get(bytesId);
-  if (prev) storeBytes -= prev.bytes;
-  const entry = { kind, whole: view, bytes: byteLen, refs: (prev?.refs ?? 0) + 1 };
-  store.set(bytesId, entry);
-  storeBytes += byteLen;
-  touch(bytesId);
-  evictToBudget();
-}
 
 /** Choose the stored tile bitstream for a grid-aligned decode region by its grid origin. */
 function pickTileBitstream(entry, region) {

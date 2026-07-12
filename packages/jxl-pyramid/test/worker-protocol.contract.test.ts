@@ -50,6 +50,8 @@ test("validateWorkerRequest rejects malformed / legacy shapes", () => {
 
 test("web worker source conforms to the v:1 reply protocol", () => {
   const src = readFileSync(new URL("../../../web/lightbox/tiled-decode-worker.js", import.meta.url), "utf8");
+  // worker-store.js holds the store logic (range carrier + LRU eviction) — check it together.
+  const storeSrc = readFileSync(new URL("../../../web/lightbox/worker-store.js", import.meta.url), "utf8");
 
   // Announces readiness with the versioned ready message (pool's whenReady).
   expect(src).toMatch(/postMessage\(\s*\{\s*v:\s*1,\s*type:\s*['"]ready['"]/);
@@ -65,14 +67,16 @@ test("web worker source conforms to the v:1 reply protocol", () => {
   expect(src).toMatch(/format\s*===\s*['"]rgba16['"]/);
   expect(src).not.toMatch(/\bconst\s+use16\s*=\s*bpp\b/);
   // Load-once cache keyed by bytesId (the structured-clone amplification fix).
+  // Range-carrier / LRU logic is in worker-store.js (imported by the worker).
   expect(src).toMatch(/\bstore\b/);
   expect(src).toMatch(/\bstore\.get\(\s*bytesId\s*\)/);
-  // Bounded byte carriers (Packet 2 Task 4): range carrier + explicit unload with ack,
-  // and NO .slice() of shared memory into ownership (findings 79, 80).
-  expect(src).toMatch(/msg\.ranges\s*!==\s*undefined/);
+  // Bounded byte carriers (Packet 2 Task 4): range carrier lives in worker-store.js,
+  // unload + ack remain in the worker itself. No .slice() of shared memory (findings 79, 80).
+  expect(storeSrc).toMatch(/msg\.ranges\s*!==\s*undefined/);
   expect(src).toMatch(/type\s*===\s*['"]unload['"]/);
   expect(src).toMatch(/type:\s*['"]unload-ack['"]/);
   expect(src).not.toMatch(/msg\.sab[^\n]*\.slice\(\)/);
+  expect(storeSrc).not.toMatch(/msg\.sab[^\n]*\.slice\(\)/);
   // Guards the protocol version on inbound messages.
   expect(src).toMatch(/msg\.v\s*!==\s*1/);
 });
