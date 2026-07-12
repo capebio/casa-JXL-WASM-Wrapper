@@ -220,6 +220,11 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
 }
 
 /// Preview-path metadata (no raw). Mirrors the fields `decode_bytes_inner` derives.
+///
+/// Finding 50/51: this is the streaming-preview arm of the ONE metadata carrier.
+/// It must preserve the SAME datetime/GPS/wb-provenance the full decode (`DngImage`)
+/// carries — the streaming preview path used to drop them, so the info panel lost
+/// datetime/GPS and `wb_from_camera` was faked to `true` regardless of provenance.
 pub struct DngMeta {
     pub width: usize,
     pub height: usize,
@@ -228,6 +233,9 @@ pub struct DngMeta {
     pub white: u16,
     pub wb_r: f32,
     pub wb_b: f32,
+    /// `true` only when WB genuinely came from AsShotNeutral (or the derived
+    /// AsShotWhiteXY). `false` = the 1.0/1.0 grey fallback fired. Not a fake default.
+    pub wb_from_camera: bool,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub iso: Option<u32>,
     pub baseline_exposure: f32,
@@ -236,6 +244,12 @@ pub struct DngMeta {
     pub model: String,
     /// Per-CFA-plane noise metadata (black/white levels, embedded NoiseProfile, etc.).
     pub noise_metadata: RawNoiseMetadata,
+    /// EXIF DateTimeOriginal (or DateTime), "YYYY:MM:DD HH:MM:SS", empty if absent.
+    pub datetime: String,
+    /// Decimal GPS (None when the file has no GPS IFD or it is out of range).
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
+    pub gps_alt: Option<f64>,
 }
 
 /// Build `DngMeta` from a parsed IFD + walk state. The expressions match
@@ -260,6 +274,8 @@ fn dng_meta(
         white: raw.white_level.unwrap_or(16383),
         wb_r: wb_g_neutral / wb_r_neutral.max(1e-6),
         wb_b: wb_g_neutral / wb_b_neutral.max(1e-6),
+        // Finding 51: honest provenance — mirrors DngImage (AsShotNeutral presence).
+        wb_from_camera: state.as_shot_neutral.is_some(),
         color_matrix: choose_camera_to_srgb_matrix(
             state.forward_matrix_1,
             state.forward_matrix_2,
@@ -272,6 +288,11 @@ fn dng_meta(
         make: state.make.clone(),
         model: state.model.clone(),
         noise_metadata,
+        // Finding 50: preserve the datetime/GPS the walk already parsed into state.exif.
+        datetime: state.exif.datetime.clone(),
+        gps_lat: state.exif.gps_lat,
+        gps_lon: state.exif.gps_lon,
+        gps_alt: state.exif.gps_alt,
     }
 }
 

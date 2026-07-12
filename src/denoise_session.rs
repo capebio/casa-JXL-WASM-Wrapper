@@ -338,6 +338,8 @@ pub(crate) struct DngShell {
     gps_lon: Option<f64>,
     gps_alt: Option<f64>,
     noise_metadata: RawNoiseMetadata,
+    baseline_exposure: f32,
+    wb_from_camera: bool,
 }
 
 impl DngShell {
@@ -368,6 +370,8 @@ impl DngShell {
             gps_lon: d.gps_lon,
             gps_alt: d.gps_alt,
             noise_metadata: d.noise_metadata.clone(),
+            baseline_exposure: d.baseline_exposure,
+            wb_from_camera: d.wb_from_camera,
         };
         (
             shell,
@@ -410,6 +414,8 @@ impl DngShell {
             raw_mosaic: Vec::new(),
             cfa_index: core.cfa_index,
             noise_metadata: self.noise_metadata.clone(),
+            baseline_exposure: self.baseline_exposure,
+            wb_from_camera: self.wb_from_camera,
         }
     }
 }

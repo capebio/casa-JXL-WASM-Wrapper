@@ -833,6 +833,14 @@ self.addEventListener('message', async (ev) => {
         //   canSplit = nativeRaw && interactive && rawKind === 'orf' && !denoise.enabled
         const denoise = opts.denoise || { enabled: false };
         const canSplit = nativeRaw && interactive && rawKind === 'orf' && !denoise.enabled;
+        // Finding 52 (colour truth): for CR2 the in-WASM lb/thumb/final renders and the
+        // interactive LookRenderer now consume ONE resolved camera→sRGB matrix. The
+        // matrix is resolved once in the decoder (cr2::resolved_color_matrix) and lib.rs
+        // uses that SAME matrix for both `params.color_matrix` (the in-WASM tone) and the
+        // exported color_matrix_flat (read below as result.color_matrix_used() → the
+        // LookRenderer). Do NOT reintroduce a separate preview matrix here: previously the
+        // in-WASM initial render used the Olympus generic while the LookRenderer used the
+        // Canon generic, so a Canon CR2's colour jumped the instant a slider moved.
 
         const pT0 = performance.now();
         // OUT_NO_ORIENT: skip apply_orientation on the full RGB8 — JXL records
