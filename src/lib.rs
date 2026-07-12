@@ -2191,6 +2191,7 @@ pub fn process_orf_with_options(
             make: decoded.info.make,
             model: decoded.info.model,
             iso: decoded.info.iso.unwrap_or(0),
+            baseline_exposure: 0.0, // ORF has no DNG BaselineExposure tag
             datetime: decoded.info.datetime,
             gps_lat: decoded.info.gps_lat,
             gps_lon: decoded.info.gps_lon,
@@ -4677,6 +4678,7 @@ pub fn process_raw_mosaic_with_options(
             make: String::new(),
             model: String::new(),
             iso,
+            baseline_exposure: 0.0, // generic/LibRaw mosaic path; no DNG BaselineExposure
             datetime: String::new(),
             gps_lat: None,
             gps_lon: None,
@@ -5026,6 +5028,7 @@ pub fn create_orf_denoise_session(
         make: decoded.info.make,
         model: decoded.info.model,
         iso: decoded.info.iso.unwrap_or(0),
+        baseline_exposure: 0.0, // ORF has no DNG BaselineExposure tag
         datetime: decoded.info.datetime,
         gps_lat: decoded.info.gps_lat,
         gps_lon: decoded.info.gps_lon,
@@ -5126,6 +5129,7 @@ pub fn create_raw_mosaic_denoise_session(
         make: String::new(),
         model: String::new(),
         iso,
+        baseline_exposure: 0.0, // generic/LibRaw mosaic path; no DNG BaselineExposure
         datetime: String::new(),
         gps_lat: None,
         gps_lon: None,
