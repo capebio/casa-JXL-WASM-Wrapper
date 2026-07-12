@@ -19,20 +19,15 @@ import { acceptExtensions, isPipelineInput as _isPipelineInputByName } from './f
 import { makeIntakeMode, selectCardsForDevelop, buildDevelopTask } from './proxy-develop.js';
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
-// Findings 13, 44, 45: full-resolution export service + metadata policy + real format label.
-// The service sources the FULL-RES DEVELOPED OUTPUT (never the 1800px preview),
-// gates formats (jxl/png real; jpeg/tiff packet-3), and threads serialised EXIF
-// (metadata policy) into the encoder.
-import { ExportService, formatLabel as _formatLabel, isFormatEncodable as _isFormatEncodable } from './export-service.js';
-// I-B: real PNG encoder (honest bytes for the PNG export option).
-import { encodePng as _encodePng } from './png-encode.js';
 // Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 // Findings 11, 29: byte-budgeted, LRU-evicting derived cache for decoded JXL
 // RGBA buffers. Replaces per-card _jxlDecoded (unbounded WeakMap) with a single
 // governed cache; invalidated on generation change and explicit card delete.
 import { createDerivedCache } from './jxl-derived-cache.js';
-import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
+// Finding 47 (P4 T8): lazy-load helper — optional heavy modules are imported
+// dynamically on first use, not at page parse time.
+import { makeLazyModule } from './lazy-module.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
 // `estimateDecodePeak` + `OUT_BATCH_DEFAULT` back the hard decode-admission gate
@@ -50,11 +45,55 @@ import {
 // the H29 develop-channel fns (apply_look_stream / jxl_progressive_pass) are
 // absent until the Rust H29 work is built, so the channel path stays gated.
 import * as rawWasm from './pkg/raw_converter_wasm.js';
-import {
-    applyLens, estimateSceneWhiteLms,
-    normalizedLabBuffer, selectByColour, unionMask, maskBorder, maskCoverage,
-    probe as probeColour,
-} from './perceptual-color.mjs';
+
+// ---------------------------------------------------------------------------
+// Finding 47 (P4 T8): lazy-loaded optional modules.
+//
+// Each heavy/optional module is imported dynamically on first use (at the
+// existing command boundary) so parse + eval cost is deferred past first paint.
+// One-time memoised via makeLazyModule — concurrent callers share the same
+// promise; failures are not memoised (transient errors are retryable).
+//
+// formatLabel (from export-service.js) is a tiny pure function inlined here
+// so the info panel (shown whenever the lightbox opens) does not force a load
+// of the full export-service module.
+// ---------------------------------------------------------------------------
+
+/**
+ * Lazy: perceptual-color.mjs — Perceptual Lens + Colour Selector maths.
+ * Loaded on first P-key press / lens-toggle click.
+ */
+const lazyPerceptual = makeLazyModule(() => import('./perceptual-color.mjs'));
+
+/**
+ * Lazy: tauri-parity-lightbox.js — M2/HDR FilterEngine lightbox.
+ * Loaded + constructed on first lightbox open.
+ */
+const lazyTauriParity = makeLazyModule(() => import('./tauri-parity-lightbox.js'));
+
+/**
+ * Lazy: export-service.js + png-encode.js — full-res export pipeline.
+ * Co-loaded on first "Export selected" click.
+ */
+const lazyExport = makeLazyModule(async () => {
+    const [exportMod, pngMod] = await Promise.all([
+        import('./export-service.js'),
+        import('./png-encode.js'),
+    ]);
+    return { ...exportMod, encodePng: pngMod.encodePng };
+});
+
+// ---------------------------------------------------------------------------
+// formatLabel — inlined from export-service.js (finding 45) so the info panel
+// does not force an export-service module load on every lightbox open.
+// Keep in sync with export-service.js:formatLabel.
+// ---------------------------------------------------------------------------
+function _formatLabel(exif) {
+    if (!exif || !exif.format) return 'Unknown';
+    const { format, bitDepth } = exif;
+    if (bitDepth && bitDepth > 0) return `${format} (${bitDepth}-bit)`;
+    return format;
+}
 
 // On-page console: mirror console.* (and relayed worker logs) into a panel so
 // debugging doesn't require DevTools. Panel + toggle live in index.html.
@@ -2624,6 +2663,33 @@ if (IS_TAURI) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Finding 47 (P4 T8): idle-prefetch — warm lazy modules AFTER the core
+// interaction pipeline is ready and the browser is idle.
+//
+// Policy: prefetch only under ResourceTiming / connection hints that indicate
+// the browser is on a good connection (or falls back to a conservative 2s
+// setTimeout when requestIdleCallback is not available). Does NOT prefetch
+// everything eagerly — only modules that the user is "likely" to need within
+// a session (all three optional feature groups are touched by most users who
+// open a file). The prefetch is advisory: each lazily imported module is a
+// no-op if it was already loaded by an earlier user action.
+// ---------------------------------------------------------------------------
+{
+    function prefetchLazyModules() {
+        // Fire-and-forget: errors don't matter (they will retry on demand).
+        lazyPerceptual().catch(() => {});
+        lazyTauriParity().catch(() => {});
+        lazyExport().catch(() => {});
+    }
+
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(prefetchLazyModules, { timeout: 4000 });
+    } else {
+        setTimeout(prefetchLazyModules, 2000);
+    }
+}
+
 // Finding 10 (P4 T5): wire intake mode checkbox + "Develop Selected" button.
 {
     const proxyToggle = document.getElementById('proxy-intake-toggle');
@@ -2797,10 +2863,15 @@ function captureCleanAndApplyLens(imageData) {
     applyPerceptualLens();
 }
 
-function applyPerceptualLens() {
+// Finding 47 (P4 T8): perceptual-color.mjs is loaded lazily on first lens activation.
+// All four functions below are async; callers that are synchronous fire-and-forget
+// (captureCleanAndApplyLens, event handlers) — the await is internal.
+
+async function applyPerceptualLens() {
     if (!lightboxCanvas.width) return;
     const ctx = lightboxCanvas.getContext('2d');
     if (perceptualLens.active && cleanSnapshot) {
+        const { applyLens } = await lazyPerceptual();
         const out = applyLens(
             cleanSnapshot.data, lightboxCanvas.width, lightboxCanvas.height,
             { strength: perceptualLens.strength, lightness: perceptualLens.lightness },
@@ -2809,11 +2880,12 @@ function applyPerceptualLens() {
     } else if (!perceptualLens.active && cleanSnapshot) {
         ctx.putImageData(cleanSnapshot, 0, 0);
     }
-    refreshSelectionOverlay();
+    await refreshSelectionOverlay();
 }
 
-function ensureLabBuf() {
+async function ensureLabBuf() {
     if (!cleanSnapshot || !lightboxCanvas.width) return;
+    const { estimateSceneWhiteLms, normalizedLabBuffer } = await lazyPerceptual();
     const sceneWhite = estimateSceneWhiteLms(
         cleanSnapshot.data, lightboxCanvas.width, lightboxCanvas.height,
     );
@@ -2822,7 +2894,7 @@ function ensureLabBuf() {
     );
 }
 
-function refreshSelectionOverlay() {
+async function refreshSelectionOverlay() {
     if (!plOverlayCanvas) return;
     plOverlayCanvas.width = lightboxCanvas.width;
     plOverlayCanvas.height = lightboxCanvas.height;
@@ -2834,6 +2906,7 @@ function refreshSelectionOverlay() {
     const ctx = plOverlayCanvas.getContext('2d');
     ctx.clearRect(0, 0, plOverlayCanvas.width, plOverlayCanvas.height);
     if (!colourSelect.mask || !colourSelect.seeds.length) return;
+    const { maskBorder, maskCoverage } = await lazyPerceptual();
     const border  = maskBorder(colourSelect.mask, plOverlayCanvas.width, plOverlayCanvas.height);
     const imgData = ctx.createImageData(plOverlayCanvas.width, plOverlayCanvas.height);
     for (let i = 0; i < colourSelect.mask.length; i++) {
@@ -2856,8 +2929,8 @@ function refreshSelectionOverlay() {
     if (readout) readout.textContent = `${(cov.fraction * 100).toFixed(1)}% selected`;
 }
 
-function handleLensClick(e) {
-    ensureLabBuf();
+async function handleLensClick(e) {
+    await ensureLabBuf();
     if (!colourSelect.labBuf) return;
     const rect = lightboxCanvas.getBoundingClientRect();
     const scaleX = lightboxCanvas.width / rect.width;
@@ -2866,6 +2939,7 @@ function handleLensClick(e) {
     const cy = Math.round((e.clientY - rect.top) * scaleY);
     const w = lightboxCanvas.width, h = lightboxCanvas.height;
     if (cx < 0 || cy < 0 || cx >= w || cy >= h) return;
+    const { probe: probeColour, selectByColour, unionMask } = await lazyPerceptual();
     const p = probeColour(colourSelect.labBuf, w, h, cx, cy, 3);
     const readout = document.getElementById('pl-probe-readout');
     if (readout) readout.textContent = `H:${p.hueDeg.toFixed(0)}° S:${p.dampedSaturation.toFixed(1)} L:${p.lightness.toFixed(0)}`;
@@ -2879,7 +2953,7 @@ function handleLensClick(e) {
         colourSelect.mask = newMask;
         colourSelect.seeds = [seedLab];
     }
-    refreshSelectionOverlay();
+    await refreshSelectionOverlay();
 }
 
 function applyLbTransform() {
@@ -3974,6 +4048,20 @@ async function exportFilmstripSelection() {
     const output = (['jxl','jpeg','png','tiff'].includes(fmtEl?.value))
         ? fmtEl.value : 'jxl';
 
+    // Finding 47 (P4 T8): load export-service + png-encode lazily on first click.
+    let exportMods;
+    try {
+        exportMods = await lazyExport();
+    } catch (err) {
+        console.error('[export] failed to load export modules:', err);
+        if (statusText) {
+            statusBar.hidden = false;
+            statusText.textContent = 'Export unavailable — module load failed.';
+        }
+        return;
+    }
+    const { ExportService, isFormatEncodable: _isFormatEncodable, encodePng: _encodePng } = exportMods;
+
     // I-B: guard at the entry point too (defence in depth — the UI disables
     // gated options, and the service rejects them per-asset).  Fail fast with a
     // single status message rather than emitting N identical per-asset errors.
@@ -4506,9 +4594,10 @@ document.addEventListener('keydown', (e) => {
         scheduleLensApply();
     });
 
-    toleranceEl?.addEventListener('input', () => {
+    toleranceEl?.addEventListener('input', async () => {
         colourSelect.tolerance = parseInt(toleranceEl.value, 10);
         if (colourSelect.seeds.length && colourSelect.labBuf) {
+            const { selectByColour, unionMask } = await lazyPerceptual();
             const w = lightboxCanvas.width, h = lightboxCanvas.height;
             let mask = null;
             for (const seed of colourSelect.seeds) {
@@ -4516,7 +4605,7 @@ document.addEventListener('keydown', (e) => {
                 mask = mask ? unionMask(mask, m) : m;
             }
             colourSelect.mask = mask;
-            refreshSelectionOverlay();
+            await refreshSelectionOverlay();
         }
     });
 
@@ -4923,1224 +5012,133 @@ async function startBatchTauri(paths) {
     );
 }
 
-// ─── Benchmark harness ─────────────────────────────────────────────────────
-// Runs the same set of files through several configs sequentially so the
-// user can A/B perf knobs on their machine.  No UI rendering — pure perf.
-// c = max files in flight (Rust file-semaphore size)
-// t = encoder threads per file (libjxl ThreadsRunner)
-// e = JXL effort (1 = lightning … 7 = squirrel)
-// peak threads during encode ≈ c × t.  12-core dev box → c × t = 12 saturates.
+// ─── Finding 47 (P4 T8): benchmark harness + pixel-peep dev tools ──────────
+// These ~1200 lines are IS_TAURI-gated dev tools that a browser user never
+// invokes.  They are extracted to web/tools/benchmark.js and
+// web/tools/pixel-peep.js and loaded lazily on first button click so they are
+// NOT in main.js's static parse graph.
 //
-// 2-config 200-file probe.  Topology axis exhausted (c=3 t=4 wins at 3/6/20
-// file scales).  Effort axis barely tested.  Two configs at champ topology
-// vary only effort: e=3 Falcon vs e=2 Thunder.  Hypothesis: Thunder is either
-// faster with similar size (free win) or a Lightning-style trap (bloated
-// output cancels speed gain).
-const BENCH_CONFIGS = [
-    { label: 'c=3 t=4 e=3  Falcon (champ)',  concurrency: 3, encoder_threads: 4, effort: 3 },
-    { label: 'c=3 t=4 e=2  Thunder (probe)', concurrency: 3, encoder_threads: 4, effort: 2 },
-];
+// Proxy stubs (pixelPeepActive, exitPixelPeep, etc.) keep the event handlers
+// at lines ~3051/4393-4479 working before the first lazy init completes.
+// ---------------------------------------------------------------------------
 
-function _pct(arr, p) {
-    if (!arr.length) return 0;
-    const s = arr.slice().sort((a, b) => a - b);
-    const i = Math.min(s.length - 1, Math.floor(s.length * p));
-    return s[i];
-}
-function _stats(arr) {
-    if (!arr.length) return { avg: 0, p50: 0, p95: 0, min: 0, max: 0 };
-    return {
-        avg: arr.reduce((s, x) => s + x, 0) / arr.length,
-        p50: _pct(arr, 0.5),
-        p95: _pct(arr, 0.95),
-        min: arr.reduce((m, x) => Math.min(m, x), Infinity),
-        max: arr.reduce((m, x) => Math.max(m, x), -Infinity),
-    };
-}
+// Lazy: web/tools/benchmark.js — A/B harness + JXL decoder bench.
+// Loaded on first click of any benchmark button.
+const lazyBenchmark = makeLazyModule(() => import('./tools/benchmark.js'));
 
-async function runOneConfig(paths, cfg, opts) {
-    await invoke('set_concurrency', { n: cfg.concurrency });
-    // Pre-size + write-by-index so completion-race doesn't shuffle drift order.
-    const perFile = new Array(paths.length);
-    const t0 = performance.now();
-    await Promise.allSettled(paths.map(async (path, idx) => {
-        const tStart = performance.now();
-        try {
-            const result = await invoke('process_file', {
-                path,
-                options: {
-                    quality: opts.quality,
-                    effort: cfg.effort,
-                    lossless: opts.lossless,
-                    look: lookToSnake(opts.look),
-                    user_rotation: 0,
-                    wb_r: null,
-                    wb_b: null,
-                    encoder_threads: cfg.encoder_threads,
-                },
-            });
-            const tEnd = performance.now();
-            const t = result?.timings || {};
-            perFile[idx] = {
-                path,
-                wall_ms:    tEnd - tStart,
-                start_ms:   tStart - t0,
-                end_ms:     tEnd - t0,
-                dec_ms:     t.decompress_ms || 0,
-                dem_ms:     t.demosaic_ms   || 0,
-                tone_ms:    t.tone_ms       || 0,
-                enc_ms:     t.encode_ms     || 0,
-                qwait_ms:   result?.queue_wait_ms || 0,
-                jxl_bytes:  result?.jxl?.length || 0,
-            };
-        } catch (err) {
-            perFile[idx] = { error: String(err), path };
-        }
-    }));
-    const wallMs = performance.now() - t0;
-    return { cfg, wallMs, perFile };
-}
-
-function reportConfig(r) {
-    const n = r.perFile.length;
-    const ok = r.perFile.filter(p => !p.error);
-    const errs = n - ok.length;
-    const amortMs = r.wallMs / n;
-    const tput = n / (r.wallMs / 1000);
-    pushStat(
-        `[bench] ${r.cfg.label}  total ${(r.wallMs / 1000).toFixed(2)}s  ` +
-        `amort ${amortMs.toFixed(0)} ms/f  tput ${tput.toFixed(2)} f/s` +
-        (errs ? `  ERRORS ${errs}` : '')
-    );
-    if (!ok.length) return;
-
-    const dec   = _stats(ok.map(p => p.dec_ms));
-    const dem   = _stats(ok.map(p => p.dem_ms));
-    const tone  = _stats(ok.map(p => p.tone_ms));
-    const enc   = _stats(ok.map(p => p.enc_ms));
-    const qwait = _stats(ok.map(p => p.qwait_ms));
-    const wall  = _stats(ok.map(p => p.wall_ms));
-    const sizes = _stats(ok.map(p => p.jxl_bytes / 1024));
-
-    pushStat(`[bench]   dec   avg ${dec.avg.toFixed(0)}  p50 ${dec.p50}  p95 ${dec.p95}  max ${dec.max} ms`);
-    pushStat(`[bench]   dem   avg ${dem.avg.toFixed(0)}  p50 ${dem.p50}  p95 ${dem.p95}  max ${dem.max} ms`);
-    pushStat(`[bench]   tone  avg ${tone.avg.toFixed(0)}  p50 ${tone.p50}  p95 ${tone.p95}  max ${tone.max} ms`);
-    pushStat(`[bench]   enc   avg ${enc.avg.toFixed(0)}  p50 ${enc.p50}  p95 ${enc.p95}  max ${enc.max} ms`);
-    pushStat(`[bench]   qwait avg ${qwait.avg.toFixed(0)}  p50 ${qwait.p50}  p95 ${qwait.p95}  max ${qwait.max} ms  (priority promotion effect under C/D)`);
-    pushStat(`[bench]   wall  avg ${wall.avg.toFixed(0)}  p50 ${wall.p50.toFixed(0)}  p95 ${wall.p95.toFixed(0)}  max ${wall.max.toFixed(0)} ms`);
-    pushStat(`[bench]   size  avg ${sizes.avg.toFixed(0)}  p50 ${sizes.p50.toFixed(0)}  p95 ${sizes.p95.toFixed(0)}  min ${sizes.min.toFixed(0)}  max ${sizes.max.toFixed(0)} KB  total ${(sizes.avg * ok.length / 1024).toFixed(1)} MB`);
-
-    // Drift: split by dispatch index, compare first vs last half stage averages
-    const half = Math.floor(ok.length / 2);
-    const firstHalf = ok.slice(0, half);
-    const lastHalf  = ok.slice(ok.length - half);
-    const avg = (arr, k) => arr.reduce((s, p) => s + p[k], 0) / arr.length;
-    const driftAmort  = (avg(lastHalf, 'wall_ms') - avg(firstHalf, 'wall_ms'));
-    const driftDec    = (avg(lastHalf, 'dec_ms')  - avg(firstHalf, 'dec_ms'));
-    const driftEnc    = (avg(lastHalf, 'enc_ms')  - avg(firstHalf, 'enc_ms'));
-    const pct = (delta, base) => base > 0 ? `${delta >= 0 ? '+' : ''}${(100 * delta / base).toFixed(1)}%` : 'n/a';
-    pushStat(
-        `[bench]   drift  wall ${avg(firstHalf, 'wall_ms').toFixed(0)}→${avg(lastHalf, 'wall_ms').toFixed(0)} ms (${pct(driftAmort, avg(firstHalf, 'wall_ms'))})  ` +
-        `dec ${pct(driftDec, avg(firstHalf, 'dec_ms'))}  enc ${pct(driftEnc, avg(firstHalf, 'enc_ms'))}`
-    );
-
-    // Top 3 slowest by wall_ms
-    const fname = (p) => (p.split(/[\\/]/).pop() || p);
-    const slowest = ok.slice().sort((a, b) => b.wall_ms - a.wall_ms).slice(0, 3);
-    pushStat('[bench]   slowest 3:');
-    for (const p of slowest) {
-        pushStat(`[bench]     ${fname(p.path)}  wall ${p.wall_ms.toFixed(0)} ms  dec ${p.dec_ms} dem ${p.dem_ms} tone ${p.tone_ms} enc ${p.enc_ms} qwait ${p.qwait_ms}  ${(p.jxl_bytes/1024).toFixed(0)} KB`);
-    }
-    pushStat('');
-}
-
-async function runBenchmark() {
-    if (!IS_TAURI) {
-        pushStat('[bench] tauri-only — benchmark needs the native pipeline');
-        return;
-    }
-    let paths;
-    try {
-        paths = await invoke('pick_files');
-    } catch (err) {
-        pushStat(`[bench] pick_files failed: ${err}`);
-        return;
-    }
-    if (!paths?.length) { pushStat('[bench] cancelled — no files'); return; }
-    const opts = currentOptions();
-    pushStat(`[bench] ${paths.length} files × ${BENCH_CONFIGS.length} configs starting…`);
-
-    const rows = [];
-    for (let i = 0; i < BENCH_CONFIGS.length; i++) {
-        const cfg = BENCH_CONFIGS[i];
-        updateStat('bench:status', `[bench] running ${i + 1}/${BENCH_CONFIGS.length}  ${cfg.label}…`);
-        const r = await runOneConfig(paths, cfg, opts);
-        rows.push(r);
-        reportConfig(r);
-    }
-
-    // A/B Pareto comparison (only meaningful for 2 configs).
-    if (rows.length === 2) {
-        pushStat('[bench] === A vs B Pareto ===');
-        const a = rows[0], b = rows[1];
-        const okA = a.perFile.filter(p => !p.error);
-        const okB = b.perFile.filter(p => !p.error);
-        const tputA = a.perFile.length / (a.wallMs / 1000);
-        const tputB = b.perFile.length / (b.wallMs / 1000);
-        const avgSizeA = okA.reduce((s, p) => s + p.jxl_bytes, 0) / okA.length / 1024;
-        const avgSizeB = okB.reduce((s, p) => s + p.jxl_bytes, 0) / okB.length / 1024;
-        const totalA = okA.reduce((s, p) => s + p.jxl_bytes, 0) / 1024 / 1024;
-        const totalB = okB.reduce((s, p) => s + p.jxl_bytes, 0) / 1024 / 1024;
-        const speedDelta = 100 * (tputB - tputA) / tputA;
-        const sizeDelta  = 100 * (avgSizeB - avgSizeA) / avgSizeA;
-        pushStat(`[bench]   A: ${a.cfg.label}`);
-        pushStat(`[bench]   B: ${b.cfg.label}`);
-        pushStat(`[bench]   speed  A ${tputA.toFixed(2)} f/s  →  B ${tputB.toFixed(2)} f/s  (${speedDelta >= 0 ? '+' : ''}${speedDelta.toFixed(1)}%)`);
-        pushStat(`[bench]   size   A ${avgSizeA.toFixed(0)} KB/f → B ${avgSizeB.toFixed(0)} KB/f  (${sizeDelta >= 0 ? '+' : ''}${sizeDelta.toFixed(1)}%)`);
-        pushStat(`[bench]   total  A ${totalA.toFixed(1)} MB    → B ${totalB.toFixed(1)} MB`);
-        let verdict;
-        if (speedDelta > 0 && sizeDelta <= 2) verdict = 'B WINS — faster, no size cost (replace default)';
-        else if (speedDelta > 0 && sizeDelta < speedDelta) verdict = 'B Pareto-wins on speed (gains > size cost)';
-        else if (speedDelta > 0)                          verdict = 'TRAP — B faster but size cost ≥ speed gain (Lightning-style)';
-        else if (Math.abs(speedDelta) < 2)                verdict = 'TIE — keep A (smaller)';
-        else                                              verdict = 'A holds — B slower';
-        pushStat(`[bench]   ⇒ ${verdict}`);
-    }
-
-    updateStat('bench:status', `[bench] done — ${rows.length} configs, ${paths.length} files each`);
-
-    // Restore the default concurrency for normal operation.
-    await invoke('set_concurrency', { n: 3 });
-}
-
-// Wire the button at module init.
-const benchBtn = document.getElementById('run-benchmark');
-if (benchBtn) {
-    benchBtn.addEventListener('click', () => {
-        benchBtn.disabled = true;
-        runBenchmark().catch(e => pushStat(`[bench] ${e?.message || e}`))
-                      .finally(() => { benchBtn.disabled = false; });
-    });
-}
-
-// Effort sweep: e=1..9 at fixed c=3 t=4.  Reports per-file output size so we
-// can read the speed/size Pareto.  Same files run 9 times; quality + lossless
-// come from current UI settings (same as Benchmark).
-async function runEffortSweep() {
-    if (!IS_TAURI) {
-        pushStat('[sweep] tauri-only — needs the native pipeline');
-        return;
-    }
-    let paths;
-    try { paths = await invoke('pick_files'); }
-    catch (err) { pushStat(`[sweep] pick_files failed: ${err}`); return; }
-    if (!paths?.length) { pushStat('[sweep] cancelled — no files'); return; }
-    const opts = currentOptions();
-    const fname = (p) => (p.split(/[\\/]/).pop() || p);
-
-    pushStat(`[sweep] ${paths.length} files × 9 efforts (c=3 t=4, q=${opts.quality}, lossless=${opts.lossless})`);
-    pushStat('[sweep] effort key: 1 Lightning · 2 Thunder · 3 Falcon · 4 Cheetah · 5 Hare · 6 Wombat · 7 Squirrel · 8 Kitten · 9 Tortoise');
-
-    const rows = [];
-    for (let e = 1; e <= 9; e++) {
-        const cfg = { label: `c=3 t=4 e=${e}`, concurrency: 3, encoder_threads: 4, effort: e };
-        updateStat('bench:status', `[sweep] running e=${e}…`);
-        const r = await runOneConfig(paths, cfg, opts);
-        rows.push({ effort: e, ...r });
-        const ok = r.perFile.filter(p => !p.error);
-        const totalKB = ok.reduce((s, p) => s + p.jxl_bytes, 0) / 1024;
-        const avgKB   = ok.length ? totalKB / ok.length : 0;
-        const avgEnc  = ok.length ? ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length : 0;
-        const sizesStr = r.perFile.map((p, i) =>
-            p.error ? `${fname(paths[i])}=ERR` : `${fname(paths[i])}=${(p.jxl_bytes/1024).toFixed(0)}KB`
-        ).join(' · ');
-        pushStat(
-            `[sweep] e=${e}  ` +
-            `wall ${(r.wallMs/1000).toFixed(2)}s  ` +
-            `enc ${avgEnc.toFixed(0)} ms/file  ` +
-            `avg ${avgKB.toFixed(0)} KB  ` +
-            `total ${totalKB.toFixed(0)} KB`
-        );
-        pushStat(`[sweep]   sizes: ${sizesStr}`);
-    }
-
-    pushStat('');
-    pushStat('[sweep] === effort vs size table ===');
-    pushStat('[sweep]  e   wall_s   enc_ms   avg_KB   total_KB');
-    for (const r of rows) {
-        const ok = r.perFile.filter(p => !p.error);
-        const totalKB = ok.reduce((s, p) => s + p.jxl_bytes, 0) / 1024;
-        const avgKB   = ok.length ? totalKB / ok.length : 0;
-        const avgEnc  = ok.length ? ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length : 0;
-        pushStat(
-            `[sweep]  ${r.effort}` +
-            `   ${(r.wallMs/1000).toFixed(2).padStart(6)}` +
-            `   ${avgEnc.toFixed(0).padStart(6)}` +
-            `   ${avgKB.toFixed(0).padStart(6)}` +
-            `   ${totalKB.toFixed(0).padStart(8)}`
-        );
-    }
-    updateStat('bench:status', `[sweep] done — 9 efforts × ${paths.length} files`);
-    await invoke('set_concurrency', { n: 3 });
-}
-
-const sweepBtn = document.getElementById('run-effort-sweep');
-if (sweepBtn) {
-    sweepBtn.addEventListener('click', () => {
-        sweepBtn.disabled = true;
-        runEffortSweep().catch(e => pushStat(`[sweep] ${e?.message || e}`))
-                        .finally(() => { sweepBtn.disabled = false; });
-    });
-}
-
-// Variance × effort bench: picks 5 size-spread files from the user's
-// pick, sweeps effort 3/6/7/8/9, reports size matrix + upload-quota
-// economics.  Targets chosen from prior 20-file run to span ~6× output
-// size range (Falcon column values: 973 → 5575 KB).
-//
-// Match by filename prefix so '.ORF' / ' - Copy.ORF' suffix variants
-// resolve to the same logical target.
-const VARIANCE_TARGETS = [
-    'P1110187',  // ~973 KB Falcon — smooth scene, low entropy
-    'P1100086',  // ~1866 KB
-    'P1110179',  // ~3182 KB
-    'P1100149',  // ~4788 KB
-    'P1110202',  // ~5575 KB — high entropy
-];
-const VARIANCE_EFFORTS = [3, 6, 7, 8, 9];
-const VARIANCE_TOPOLOGY = { concurrency: 3, encoder_threads: 4 };
-// Starlink-ish assumptions for upload-time economics.  Edit as needed.
-const QUOTA_GB = 50;
-const UPLOAD_MBPS = 25;  // typical Starlink upload, MB-per-sec ≈ Mbps/8
-
-async function runVarianceBench() {
-    if (!IS_TAURI) { pushStat('[var] tauri-only'); return; }
-    let allPaths;
-    try { allPaths = await invoke('pick_files'); }
-    catch (err) { pushStat(`[var] pick_files failed: ${err}`); return; }
-    if (!allPaths?.length) { pushStat('[var] cancelled'); return; }
-
-    const fname = (p) => (p.split(/[\\/]/).pop() || p);
-    const baseUC = (p) => fname(p).replace(/\.[Oo][Rr][Ff]$/, '').toUpperCase();
-    const selected = [];
-    const missing = [];
-    for (const target of VARIANCE_TARGETS) {
-        const tu = target.toUpperCase();
-        const hit = allPaths.find(p => baseUC(p).startsWith(tu));
-        if (hit) selected.push({ target, path: hit });
-        else missing.push(target);
-    }
-    if (missing.length) pushStat(`[var] missing: ${missing.join(', ')}`);
-    if (!selected.length) { pushStat('[var] no targets found in selection'); return; }
-
-    const opts = currentOptions();
-    pushStat(`[var] ${selected.length} files × ${VARIANCE_EFFORTS.length} efforts  c=${VARIANCE_TOPOLOGY.concurrency} t=${VARIANCE_TOPOLOGY.encoder_threads} q=${opts.quality} lossless=${opts.lossless}`);
-    pushStat(`[var] targets: ${selected.map(s => fname(s.path)).join(', ')}`);
-    pushStat('[var] effort key: 3 Falcon · 5 Hare · 6 Wombat · 7 Squirrel · 8 Kitten · 9 Tortoise');
-
-    const paths = selected.map(s => s.path);
-    // matrix[effortIndex] = { e, perFile: [{path, enc_ms, jxl_bytes, ...}], wallMs }
-    const matrix = [];
-    for (let i = 0; i < VARIANCE_EFFORTS.length; i++) {
-        const e = VARIANCE_EFFORTS[i];
-        const cfg = { label: `e=${e}`, concurrency: VARIANCE_TOPOLOGY.concurrency, encoder_threads: VARIANCE_TOPOLOGY.encoder_threads, effort: e };
-        updateStat('bench:status', `[var] ${i+1}/${VARIANCE_EFFORTS.length}  effort ${e}…`);
-        const r = await runOneConfig(paths, cfg, opts);
-        matrix.push({ effort: e, ...r });
-        const ok = r.perFile.filter(p => !p.error);
-        const totalKB = ok.reduce((s, p) => s + p.jxl_bytes, 0) / 1024;
-        const avgKB   = ok.length ? totalKB / ok.length : 0;
-        const avgEnc  = ok.length ? ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length : 0;
-        pushStat(`[var] e=${e}  wall ${(r.wallMs/1000).toFixed(2)}s  enc ${avgEnc.toFixed(0)} ms/f  avg ${avgKB.toFixed(0)} KB  total ${totalKB.toFixed(0)} KB`);
-    }
-
-    // === size matrix: rows = files, columns = effort ===
-    pushStat('');
-    pushStat('[var] === size matrix (KB per file) ===');
-    const header = 'file              ' + VARIANCE_EFFORTS.map(e => `   e=${e}`).join('  ');
-    pushStat('[var] ' + header);
-    for (let f = 0; f < paths.length; f++) {
-        const row = VARIANCE_EFFORTS.map((_, ei) => {
-            const p = matrix[ei].perFile[f];
-            return p && !p.error ? (p.jxl_bytes/1024).toFixed(0).padStart(6) : '   ERR';
-        }).join('  ');
-        pushStat(`[var] ${fname(paths[f]).padEnd(18)}${row}`);
-    }
-
-    // === aggregate Pareto + quota economics ===
-    pushStat('');
-    pushStat('[var] === effort vs size + upload economics ===');
-    pushStat(`[var]  quota = ${QUOTA_GB} GB/mo  upload = ${UPLOAD_MBPS} Mbps (${(UPLOAD_MBPS/8).toFixed(1)} MB/s)`);
-    pushStat('[var]  e   avgKB   enc_s   vs_e3_size   vs_e3_enc   files/quota   upload_s   total_s');
-    const baseE3 = matrix[0];
-    const baseOk = baseE3.perFile.filter(p => !p.error);
-    const baseAvgKB = baseOk.reduce((s, p) => s + p.jxl_bytes, 0) / baseOk.length / 1024;
-    const baseAvgEnc = baseOk.reduce((s, p) => s + p.enc_ms, 0) / baseOk.length / 1000;
-    const uploadMBps = UPLOAD_MBPS / 8;
-    for (const r of matrix) {
-        const ok = r.perFile.filter(p => !p.error);
-        const avgKB  = ok.reduce((s, p) => s + p.jxl_bytes, 0) / ok.length / 1024;
-        const avgEnc = ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length / 1000;
-        const sizeDelta = 100 * (avgKB  - baseAvgKB)  / baseAvgKB;
-        const encDelta  = 100 * (avgEnc - baseAvgEnc) / baseAvgEnc;
-        const filesPerQuota = (QUOTA_GB * 1024 * 1024) / avgKB;
-        const uploadS = (avgKB / 1024) / uploadMBps;   // KB → MB → s
-        const totalS  = avgEnc + uploadS;
-        const sdStr = (sizeDelta >= 0 ? '+' : '') + sizeDelta.toFixed(1) + '%';
-        const edStr = (encDelta  >= 0 ? '+' : '') + encDelta.toFixed(1)  + '%';
-        pushStat(
-            `[var]  ${r.effort}` +
-            `  ${avgKB.toFixed(0).padStart(6)}` +
-            `  ${avgEnc.toFixed(2).padStart(6)}` +
-            `  ${sdStr.padStart(11)}` +
-            `  ${edStr.padStart(10)}` +
-            `  ${filesPerQuota.toFixed(0).padStart(12)}` +
-            `  ${uploadS.toFixed(2).padStart(8)}` +
-            `  ${totalS.toFixed(2).padStart(8)}`
-        );
-    }
-
-    // === verdict: pick the effort that minimises total time-to-upload ===
-    pushStat('');
-    let bestTotal = { effort: 0, totalS: Infinity };
-    let bestSize  = { effort: 0, avgKB: Infinity };
-    let bestQuota = { effort: 0, files: 0 };
-    for (const r of matrix) {
-        const ok = r.perFile.filter(p => !p.error);
-        const avgKB  = ok.reduce((s, p) => s + p.jxl_bytes, 0) / ok.length / 1024;
-        const avgEnc = ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length / 1000;
-        const totalS = avgEnc + (avgKB / 1024) / uploadMBps;
-        const files  = (QUOTA_GB * 1024 * 1024) / avgKB;
-        if (totalS < bestTotal.totalS) bestTotal = { effort: r.effort, totalS };
-        if (avgKB  < bestSize.avgKB)   bestSize  = { effort: r.effort, avgKB };
-        if (files  > bestQuota.files)  bestQuota = { effort: r.effort, files };
-    }
-    pushStat(`[var] BEST encode+upload total time:  e=${bestTotal.effort}  (${bestTotal.totalS.toFixed(2)} s/file)`);
-    pushStat(`[var] BEST output size:               e=${bestSize.effort}  (${bestSize.avgKB.toFixed(0)} KB/file)`);
-    pushStat(`[var] BEST files per ${QUOTA_GB} GB quota:        e=${bestQuota.effort}  (${bestQuota.files.toFixed(0)} files)`);
-    updateStat('bench:status', `[var] done`);
-    await invoke('set_concurrency', { n: 3 });
-}
-
-const varBtn = document.getElementById('run-variance-bench');
-if (varBtn) {
-    varBtn.addEventListener('click', () => {
-        varBtn.disabled = true;
-        runVarianceBench().catch(e => pushStat(`[var] ${e?.message || e}`))
-                          .finally(() => { varBtn.disabled = false; });
-    });
-}
-
-// Quality sweep: q=80/85/90/95 at fixed c=3 t=4 e=3 Falcon on 10 files
-// sampled with even spread across the picked folder.  Anchor size deltas at
-// q=90 (current production default).  Headline metric = files-per-50GB-quota.
-const QUALITY_VALUES = [80, 85, 90, 95];
-const QUALITY_TOPOLOGY = { concurrency: 3, encoder_threads: 4, effort: 3 };
-const QUALITY_SAMPLE_N = 10;
-
-async function runQualitySweep() {
-    if (!IS_TAURI) { pushStat('[q] tauri-only'); return; }
-    let allPaths;
-    try { allPaths = await invoke('pick_files'); }
-    catch (err) { pushStat(`[q] pick_files failed: ${err}`); return; }
-    if (!allPaths?.length) { pushStat('[q] cancelled'); return; }
-
-    const fname = (p) => (p.split(/[\\/]/).pop() || p);
-    const n = allPaths.length;
-    // Even-spread sampling: pick floor(i * n / N) for i in 0..N.  Avoids
-    // clustering that random sampling can produce.
-    const paths = [];
-    if (n <= QUALITY_SAMPLE_N) {
-        paths.push(...allPaths);
-    } else {
-        for (let i = 0; i < QUALITY_SAMPLE_N; i++) {
-            paths.push(allPaths[Math.floor(i * n / QUALITY_SAMPLE_N)]);
-        }
-    }
-
-    const baseOpts = currentOptions();
-    pushStat(`[q] picked ${n} files, sampling ${paths.length} with even spread`);
-    pushStat(`[q] sweep q=${QUALITY_VALUES.join('/')} at c=${QUALITY_TOPOLOGY.concurrency} t=${QUALITY_TOPOLOGY.encoder_threads} e=${QUALITY_TOPOLOGY.effort} Falcon  lossless=${baseOpts.lossless}`);
-    pushStat('[q] chosen files:');
-    for (let i = 0; i < paths.length; i++) {
-        pushStat(`[q]   ${String(i+1).padStart(2)}. ${fname(paths[i])}`);
-    }
-
-    // matrix[qIndex] = { quality, perFile, wallMs, cfg }
-    const matrix = [];
-    for (let i = 0; i < QUALITY_VALUES.length; i++) {
-        const q = QUALITY_VALUES[i];
-        const cfg = { label: `q=${q}`, ...QUALITY_TOPOLOGY };
-        const opts = { ...baseOpts, quality: q };
-        updateStat('bench:status', `[q] ${i+1}/${QUALITY_VALUES.length}  q=${q}…`);
-        const r = await runOneConfig(paths, cfg, opts);
-        matrix.push({ quality: q, ...r });
-        const ok = r.perFile.filter(p => !p.error);
-        const totalKB = ok.reduce((s, p) => s + p.jxl_bytes, 0) / 1024;
-        const avgKB   = ok.length ? totalKB / ok.length : 0;
-        const avgEnc  = ok.length ? ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length : 0;
-        pushStat(`[q] q=${q}  wall ${(r.wallMs/1000).toFixed(2)}s  enc ${avgEnc.toFixed(0)} ms/f  avg ${avgKB.toFixed(0)} KB  total ${totalKB.toFixed(0)} KB`);
-    }
-
-    // === size matrix: rows = files, columns = quality ===
-    pushStat('');
-    pushStat('[q] === size matrix (KB per file) ===');
-    const header = 'file                  ' + QUALITY_VALUES.map(q => `  q=${q}`).join('  ');
-    pushStat('[q] ' + header);
-    for (let f = 0; f < paths.length; f++) {
-        const row = QUALITY_VALUES.map((_, qi) => {
-            const p = matrix[qi].perFile[f];
-            return p && !p.error ? (p.jxl_bytes/1024).toFixed(0).padStart(5) : '  ERR';
-        }).join('  ');
-        pushStat(`[q] ${fname(paths[f]).padEnd(22)}${row}`);
-    }
-
-    // === aggregate Pareto + quota economics, anchored at q=90 ===
-    pushStat('');
-    pushStat('[q] === quality vs size + upload economics ===');
-    pushStat(`[q]  quota = ${QUOTA_GB} GB/mo  upload = ${UPLOAD_MBPS} Mbps (${(UPLOAD_MBPS/8).toFixed(1)} MB/s)  anchor = q=90`);
-    pushStat('[q]  q    avgKB   p50KB   p95KB   enc_ms   vs_q90_size   files/quota   upload_s   total_s');
-    const baseIdx = QUALITY_VALUES.indexOf(90);
-    const baseRow = matrix[baseIdx];
-    const baseOk = baseRow.perFile.filter(p => !p.error);
-    const baseAvgKB = baseOk.reduce((s, p) => s + p.jxl_bytes, 0) / baseOk.length / 1024;
-    const uploadMBps = UPLOAD_MBPS / 8;
-    for (const r of matrix) {
-        const ok = r.perFile.filter(p => !p.error);
-        const sizesKB = ok.map(p => p.jxl_bytes / 1024);
-        const sStats  = _stats(sizesKB);
-        const avgKB   = sStats.avg;
-        const avgEnc  = ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length;
-        const sizeDelta = 100 * (avgKB - baseAvgKB) / baseAvgKB;
-        const filesPerQuota = (QUOTA_GB * 1024 * 1024) / avgKB;
-        const uploadS = (avgKB / 1024) / uploadMBps;
-        const totalS  = (avgEnc / 1000) + uploadS;
-        const sdStr = (sizeDelta >= 0 ? '+' : '') + sizeDelta.toFixed(1) + '%';
-        pushStat(
-            `[q]  ${r.quality}` +
-            `  ${avgKB.toFixed(0).padStart(6)}` +
-            `  ${sStats.p50.toFixed(0).padStart(6)}` +
-            `  ${sStats.p95.toFixed(0).padStart(6)}` +
-            `  ${avgEnc.toFixed(0).padStart(7)}` +
-            `  ${sdStr.padStart(12)}` +
-            `  ${filesPerQuota.toFixed(0).padStart(12)}` +
-            `  ${uploadS.toFixed(2).padStart(8)}` +
-            `  ${totalS.toFixed(2).padStart(8)}`
-        );
-    }
-
-    // === verdicts ===
-    pushStat('');
-    let bestTotal = { quality: 0, totalS: Infinity };
-    let bestSize  = { quality: 0, avgKB: Infinity };
-    let bestQuota = { quality: 0, files: 0 };
-    for (const r of matrix) {
-        const ok = r.perFile.filter(p => !p.error);
-        const avgKB  = ok.reduce((s, p) => s + p.jxl_bytes, 0) / ok.length / 1024;
-        const avgEnc = ok.reduce((s, p) => s + p.enc_ms, 0) / ok.length / 1000;
-        const totalS = avgEnc + (avgKB / 1024) / uploadMBps;
-        const files  = (QUOTA_GB * 1024 * 1024) / avgKB;
-        if (totalS < bestTotal.totalS) bestTotal = { quality: r.quality, totalS };
-        if (avgKB  < bestSize.avgKB)   bestSize  = { quality: r.quality, avgKB };
-        if (files  > bestQuota.files)  bestQuota = { quality: r.quality, files };
-    }
-    pushStat(`[q] BEST encode+upload total time:  q=${bestTotal.quality}  (${bestTotal.totalS.toFixed(2)} s/file)`);
-    pushStat(`[q] BEST output size:               q=${bestSize.quality}  (${bestSize.avgKB.toFixed(0)} KB/file)`);
-    pushStat(`[q] BEST files per ${QUOTA_GB} GB quota:        q=${bestQuota.quality}  (${bestQuota.files.toFixed(0)} files)`);
-    updateStat('bench:status', `[q] done`);
-    await invoke('set_concurrency', { n: 3 });
-}
-
-const qBtn = document.getElementById('run-quality-sweep');
-if (qBtn) {
-    qBtn.addEventListener('click', () => {
-        qBtn.disabled = true;
-        runQualitySweep().catch(e => pushStat(`[q] ${e?.message || e}`))
-                         .finally(() => { qBtn.disabled = false; });
-    });
-}
-
-// ============================================================================
-// Pixel-peep quality compare mode
-// ----------------------------------------------------------------------------
-// Pick N photos.  Queue encodes globally in priority order — q=80 for every
-// photo first (so all show up viewable fastest), then q=75/85, then 70/90/95.
-// Each photo: decode all available qualities; paint the current peepQuality
-// or fallback to nearest-decoded quality so something is always on screen.
-// Lightbox opens at 100% pixels (no fit-to-screen).  Up/Down cycle quality;
-// Left/Right switch photo preserving zoom+pan (tripod compare).  Esc exits.
-// ============================================================================
-// Full ladder: q=50..95 in steps of 5, then lossless JXL (bit-exact for RGB,
-// i.e. visually identical to uncompressed source — just much smaller bytes).
-const PEEP_QUALITIES = [50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 'lossless'];
-// Encode order: sweet-spot + anchors first so the most informative variants
-// are viewable early.  Tauri semaphore drains the rest in submission order.
-const PEEP_PRIORITY  = [80, 95, 'lossless', 70, 90, 60, 85, 50, 75, 65, 55];
-const PEEP_INITIAL_Q = 80;
-const fmtPeepQ = (q) => typeof q === 'number' ? `q=${q}` : q;
-const PEEP_EFFORT = 3;
-const PEEP_ENCODER_THREADS = 4;
-const PEEP_CONCURRENCY = 3;
-
+// Proxy state: event handlers registered before the lazy module loads read
+// these.  They delegate to the handle once the module is alive.
+// pixelPeepActive is kept in sync via the onActiveChange callback passed to initPixelPeep.
+let _peepHandle = null;
 let pixelPeepActive = false;
-let peepPaths = [];
-let peepIdx = 0;
-let peepQuality = PEEP_INITIAL_Q;
-// peepCache: Map<photoIdx, { jxlBytes:{q:Uint8Array}, decoded:{q:{rgba,w,h}}, encodeMs:{q:number}, sizeBytes:{q:number}, doneCount:number }>
-const peepCache = new Map();
 
-// Bounded LRU over decoded full-res RGBA variants. Without this, the peep cache
-// accumulates one RGBA buffer per (photo × quality) it ever decodes — N photos
-// × up to 11 qualities, each potentially tens of MB — and never frees them, so
-// a long peep session over a folder grows memory without bound. We keep the
-// small jxlBytes/sizeBytes/encodeMs metadata (cheap) but cap the count of heavy
-// decoded RGBA buffers, evicting the least-recently-used. Cap ≈ 2 full quality
-// ladders so the current photo plus a neighbour stay hot; evicted variants are
-// transparently re-decoded from the retained jxlBytes on demand.
-const PEEP_DECODED_LRU_MAX = 24;
-const peepLruKey = (idx, q) => `${idx}:${q}`;
-// S3: govern the decoded-RGBA LRU through AssetStore instead of a bespoke Map.
-// One "unit" per decoded variant (size = 1) + a 24-unit budget reproduces the
-// exact count-capped, insertion-ordered LRU (oldest = victim; touch = promote);
-// the onEvict hook frees the evicted RGBA from its owning peepCache entry so it
-// can be GC'd (transparently re-decoded from the retained jxlBytes on demand).
-// Switching `maxBytes` to a real byte budget later is a one-line change.
-const peepDecodedStore = new AssetStore({
-    name: 'peep-decoded',
-    maxBytes: PEEP_DECODED_LRU_MAX,
-    onEvict: (key) => {
-        const sep = key.lastIndexOf(':');
-        const oIdx = Number(key.slice(0, sep));
-        const oQ = key.slice(sep + 1);
-        // PEEP_QUALITIES are numbers except 'lossless'; restore the number type
-        // so the delete hits the same key the decoded variant was stored under.
-        const qKey = oQ === 'lossless' ? oQ : Number(oQ);
-        const oEntry = peepCache.get(oIdx);
-        if (oEntry?.decoded) delete oEntry.decoded[qKey];
-    },
+// Lazy: web/tools/pixel-peep.js — quality compare mode.
+// Loaded on first "Pixel Peep" button click; initialised once with all deps.
+const lazyPixelPeep = makeLazyModule(async () => {
+    const { initPixelPeep } = await import('./tools/pixel-peep.js');
+    const handle = initPixelPeep({
+        invoke,
+        IS_TAURI,
+        pushStat,
+        currentOptions,
+        lookToSnake,
+        lightbox,
+        lightboxCanvas,
+        lbSourceBanner,
+        lbToggleJpegBtn,
+        lbLoadingBadge,
+        lbPreviewBadge,
+        getLightboxIndex: () => lightboxIndex,
+        clearLightboxIndex: () => { lightboxIndex = -1; },
+        cards,
+        getLbZoom: () => lbZoom,
+        resetLbViewport: () => { lbZoom = 1.0; lbPanX = 0; lbPanY = 0; lbRotation = 0; applyLbTransform(); },
+        applyLbTransform,
+        captureCleanAndApplyLens,
+        decodeJxlViaSession,
+        AssetStore,
+        // Keep main.js's pixelPeepActive proxy in sync whenever the module changes state.
+        onActiveChange: (active) => { pixelPeepActive = active; },
+    });
+    _peepHandle = handle;
+    return handle;
 });
 
-// Record a freshly-decoded variant as most-recently-used; the store evicts the
-// LRU victim past the cap (freeing it via onEvict above).
-function peepLruRecord(idx, q) {
-    peepDecodedStore.set(peepLruKey(idx, q), true, 1);
-}
+function exitPixelPeep()       { _peepHandle?.exitPixelPeep(); }
+function peepNavPhoto(delta)    { _peepHandle?.peepNavPhoto(delta); }
+function peepCycleQuality(delta){ _peepHandle?.peepCycleQuality(delta); }
+function updatePeepBadges()     { _peepHandle?.updatePeepBadges(); }
 
-// Mark an already-decoded variant as recently used (e.g. on paint/nav) without
-// inserting one that was never decoded (get() promotes if present, else no-op).
-function peepLruTouch(idx, q) {
-    peepDecodedStore.get(peepLruKey(idx, q));
-}
-
-async function runPixelPeep() {
-    if (!IS_TAURI) { pushStat('[peep] tauri-only'); return; }
-    let paths;
-    try { paths = await invoke('pick_files'); }
-    catch (err) { pushStat(`[peep] pick_files failed: ${err}`); return; }
-    if (!paths?.length) { pushStat('[peep] cancelled'); return; }
-
-    pixelPeepActive = true;
-    peepPaths = paths;
-    peepIdx = 0;
-    peepQuality = PEEP_INITIAL_Q;
-    peepCache.clear();
-    peepDecodedStore.clear();
-    // Seed cache entries so .then() callbacks can locate their photo idx.
-    for (let i = 0; i < paths.length; i++) {
-        peepCache.set(i, { jxlBytes: {}, decoded: {}, encodeMs: {}, sizeBytes: {}, doneCount: 0 });
+// Wire benchmark buttons: on first click, lazy-load the module and call
+// initBenchmark.  The module wires all buttons internally on init.
+// Each button fires the lazy load exactly once (makeLazyModule memoises).
+(function wireBenchmarkButtons() {
+    const BENCH_BTN_IDS = [
+        'run-benchmark', 'run-effort-sweep', 'run-variance-bench', 'run-quality-sweep',
+        'run-jxl-bench', 'run-jxl-sweep', 'run-jxl-stress', 'run-jxl-thumb', 'run-jxl-disk',
+    ];
+    for (const id of BENCH_BTN_IDS) {
+        const btn = document.getElementById(id);
+        if (!btn) continue;
+        btn.addEventListener('click', async function onFirstClick() {
+            // Remove this one-shot handler; the module will wire its own permanent handler.
+            btn.removeEventListener('click', onFirstClick);
+            try {
+                const { initBenchmark } = await lazyBenchmark();
+                initBenchmark({ invoke, listen, IS_TAURI, pushStat, updateStat, currentOptions, lookToSnake });
+                // Re-dispatch so the now-wired permanent handler fires.
+                btn.click();
+            } catch (e) {
+                pushStat(`[bench-init] failed to load benchmark module: ${e?.message || e}`);
+            }
+        }, { once: false });
     }
+})();
 
-    await invoke('set_concurrency', { n: PEEP_CONCURRENCY });
-    pushStat(`[peep] ${paths.length} photos  ladder=${PEEP_QUALITIES.join('/')}  e=${PEEP_EFFORT} Falcon`);
-    pushStat(`[peep] queue order: ${PEEP_PRIORITY.join(' → ')}  (all photos per step)`);
-    pushStat(`[peep] note: 'raw' aliases 'lossless' decode (lossless JXL is bit-exact); size shown as uncompressed RGB bytes`);
-    pushStat('[peep] keys: ↑/↓ quality · ←/→ photo · Esc exit · wheel zoom · drag pan');
-
-    openPeepLightbox();
-    queuePeepEncodes();
-}
-
-function openPeepLightbox() {
-    // Fresh canvas — pixel-peep starts blank until first decode arrives.
-    lightboxCanvas.width = 1;
-    lightboxCanvas.height = 1;
-    lbZoom = 1.0;   // 100% pixels, NOT fit-to-screen
-    lbPanX = 0;
-    lbPanY = 0;
-    lbRotation = 0;
-    applyLbTransform();
-    lbPreviewBadge.hidden = true;
-    lbLoadingBadge.hidden = false;
-    lightbox.hidden = false;
-    lightbox.classList.add('peep-mode');
-    // Clear stale lightbox state from any prior normal-mode open.
-    lightboxIndex = -1;
-    if (lightboxInfo) lightboxInfo.innerHTML = '';
-    // Source indicators repurposed: show current peep quality, not RAW/JXL/JPEG.
-    if (lbSourceBanner) {
-        lbSourceBanner.hidden = false;
-        lbSourceBanner.setAttribute('data-source', 'peep');
-        lbSourceBanner.textContent = fmtPeepQ(peepQuality);
-    }
-    if (lbToggleJpegBtn) {
-        lbToggleJpegBtn.disabled = true;
-    }
-    updatePeepBadges();
-    pushStat(`[peep] open: lightbox.hidden=${lightbox.hidden} canvas=${lightboxCanvas.width}x${lightboxCanvas.height} zoom=${lbZoom}`);
-}
-
-function _fmtMB(bytes) {
-    if (bytes == null) return '—';
-    const mb = bytes / (1024 * 1024);
-    return mb >= 10 ? `${mb.toFixed(1)} MB` : `${mb.toFixed(2)} MB`;
-}
-
-// Persistent HUD: current quality + compressed JXL bytes + uncompressed RGB
-// bytes (raw reference) + zoom %.  Replaces the old centred fade label.
-function updatePeepBadges() {
-    if (!lbSourceBanner) return;
-    const entry = peepCache.get(peepIdx);
-    const compBytes = entry?.sizeBytes?.[peepQuality];
-    // Raw RGB bytes from any decoded variant for this photo — dims are the
-    // same for every quality.
-    let rawBytes = null;
-    if (entry?.decoded) {
-        for (const k in entry.decoded) {
-            const d = entry.decoded[k];
-            if (d?.w && d?.h) { rawBytes = d.w * d.h * 3; break; }
-        }
-    }
-    const compStr = compBytes != null ? _fmtMB(compBytes) : 'loading';
-    const rawStr  = rawBytes  != null ? _fmtMB(rawBytes)  : '—';
-    const zoomStr = `${Math.round(lbZoom * 100)}%`;
-    const photoStr = peepPaths.length > 1 ? `  ${peepIdx + 1}/${peepPaths.length}` : '';
-    lbSourceBanner.textContent =
-        `${fmtPeepQ(peepQuality)}   ${compStr} / raw ${rawStr}   ${zoomStr}${photoStr}`;
-    if (lbToggleJpegBtn) lbToggleJpegBtn.textContent = fmtPeepQ(peepQuality);
-}
-
-// Fire all N×6 encodes in priority order.  Tauri's set_concurrency semaphore
-// queues excess work — order of submission decides what completes first.
-function queuePeepEncodes() {
-    for (const q of PEEP_PRIORITY) {
-        for (let idx = 0; idx < peepPaths.length; idx++) {
-            kickPeepEncode(idx, q);
-        }
-    }
-}
-
-function kickPeepEncode(idx, q) {
-    const path = peepPaths[idx];
-    const baseOpts = currentOptions();
-    const isLossless = q === 'lossless';
-    const t0 = performance.now();
-    invoke('process_file', {
-        path,
-        options: {
-            // Tauri side accepts quality even when lossless=true; libjxl ignores it.
-            quality: isLossless ? 100 : q,
-            effort: PEEP_EFFORT,
-            lossless: isLossless,
-            look: lookToSnake(baseOpts.look),
-            user_rotation: 0,
-            wb_r: null,
-            wb_b: null,
-            encoder_threads: PEEP_ENCODER_THREADS,
-        },
-    }).then((result) => {
-        if (!pixelPeepActive || !peepCache.has(idx)) return;
-        const e = peepCache.get(idx);
-        const bytes = new Uint8Array(result.jxl);
-        e.jxlBytes[q] = bytes;
-        e.encodeMs[q] = performance.now() - t0;
-        e.sizeBytes[q] = bytes.byteLength;
-        e.doneCount++;
-        pushStat(`[peep]   photo ${idx+1} ${fmtPeepQ(q)} ready  ${(e.encodeMs[q]/1000).toFixed(2)}s  ${(bytes.byteLength/1024).toFixed(0)} KB`);
-        decodePeepQuality(idx, q);
-        if (idx === peepIdx) updatePeepBadges();
-    }).catch((err) => {
-        if (!peepCache.has(idx)) return;
-        const e = peepCache.get(idx);
-        e.encodeMs[q] = -1;
-        e.doneCount++;
-        pushStat(`[peep]   photo ${idx+1} ${fmtPeepQ(q)} FAILED: ${err}`);
-    });
-}
-
-function decodePeepQuality(idx, q) {
-    const entry = peepCache.get(idx);
-    if (!entry || !entry.jxlBytes[q] || entry.decoded[q]) return;
-    const blob = new Blob([entry.jxlBytes[q]], { type: 'image/jxl' });
-    const url = URL.createObjectURL(blob);
-    decodeJxlViaSession(url, (msg) => {
-        URL.revokeObjectURL(url);
-        if (!pixelPeepActive) return;
-        if (!peepCache.has(idx)) return;
-        if (msg.type === 'decode_error') {
-            pushStat(`[peep]   photo ${idx+1} q=${q} decode error: ${msg.error}`);
-            return;
-        }
-        const e = peepCache.get(idx);
-        e.decoded[q] = { rgba: msg.rgba, w: msg.w, h: msg.h };
-        peepLruRecord(idx, q);
-        pushStat(`[peep]   photo ${idx+1} ${fmtPeepQ(q)} decoded  ${msg.w}×${msg.h}`);
-        if (idx === peepIdx) { paintPeepCurrent(); updatePeepBadges(); }
-    });
-}
-
-// Walk outward from peepQuality to find the nearest decoded variant.
-function pickNearestDecoded(entry, want) {
-    if (entry.decoded[want]) return { dec: entry.decoded[want], q: want, fallback: false };
-    const idx = PEEP_QUALITIES.indexOf(want);
-    for (let d = 1; d < PEEP_QUALITIES.length; d++) {
-        const lo = idx - d, hi = idx + d;
-        if (hi < PEEP_QUALITIES.length) {
-            const q = PEEP_QUALITIES[hi];
-            if (entry.decoded[q]) return { dec: entry.decoded[q], q, fallback: true };
-        }
-        if (lo >= 0) {
-            const q = PEEP_QUALITIES[lo];
-            if (entry.decoded[q]) return { dec: entry.decoded[q], q, fallback: true };
-        }
-    }
-    return null;
-}
-
-function paintPeepCurrent() {
-    const entry = peepCache.get(peepIdx);
-    if (!entry) { lbLoadingBadge.hidden = false; return; }
-    const pick = pickNearestDecoded(entry, peepQuality);
-    if (!pick) {
-        if (entry.jxlBytes[peepQuality]) decodePeepQuality(peepIdx, peepQuality);
-        lbLoadingBadge.hidden = false;
-        return;
-    }
-    const { dec, q: paintedQ, fallback } = pick;
-    // Painting this variant makes it most-recently-used so navigation back and
-    // forth across photos doesn't evict what's currently on screen.
-    peepLruTouch(peepIdx, paintedQ);
-    try {
-        lightboxCanvas.width = dec.w;
-        lightboxCanvas.height = dec.h;
-        const ctx = lightboxCanvas.getContext('2d');
-        // Force fresh ImageData even if rgba is plain Uint8Array (not Clamped).
-        const rgba = dec.rgba instanceof Uint8ClampedArray
-            ? dec.rgba
-            : new Uint8ClampedArray(dec.rgba.buffer, dec.rgba.byteOffset, dec.rgba.byteLength);
-        ctx.putImageData(new ImageData(rgba, dec.w, dec.h), 0, 0);
-        if (lightboxCanvas.width > 0) {
-            captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
-        }
-        pushStat(`[peep] painted photo ${peepIdx+1} ${fmtPeepQ(paintedQ)}  ${dec.w}×${dec.h}`);
-    } catch (err) {
-        pushStat(`[peep] PAINT FAILED photo ${peepIdx+1} ${fmtPeepQ(paintedQ)}: ${err?.message || err}`);
-        console.error('paintPeepCurrent error', err, dec);
-        return;
-    }
-    lbLoadingBadge.hidden = !fallback;
-    applyLbTransform();
-    updatePeepBadges();
-}
-
-function peepNavPhoto(delta) {
-    const n = peepPaths.length;
-    if (n <= 1) return;
-    peepIdx = (peepIdx + delta + n) % n;
-    paintPeepCurrent();
-    updatePeepBadges();
-}
-
-function peepCycleQuality(delta) {
-    const i = PEEP_QUALITIES.indexOf(peepQuality);
-    const ni = (i + delta + PEEP_QUALITIES.length) % PEEP_QUALITIES.length;
-    peepQuality = PEEP_QUALITIES[ni];
-    const entry = peepCache.get(peepIdx);
-    if (entry && !entry.decoded[peepQuality] && entry.jxlBytes[peepQuality]) {
-        decodePeepQuality(peepIdx, peepQuality);
-    }
-    paintPeepCurrent();
-    updatePeepBadges();
-}
-
-function exitPixelPeep() {
-    pixelPeepActive = false;
-    peepCache.clear();
-    peepDecodedStore.clear();
-    peepPaths = [];
-    lightbox.hidden = true;
-    lightbox.classList.remove('peep-mode');
-    lbLoadingBadge.hidden = true;
-    pushStat('[peep] exited');
-}
-
-const peepBtn = document.getElementById('run-pixel-peep');
-if (peepBtn) {
-    peepBtn.addEventListener('click', () => {
+// Wire the pixel-peep button: on first click, lazy-load + init the module.
+// After init the module's own button handler takes over.
+(function wirePixelPeepButton() {
+    const peepBtn = document.getElementById('run-pixel-peep');
+    if (!peepBtn) return;
+    peepBtn.addEventListener('click', async function onFirstClick() {
+        peepBtn.removeEventListener('click', onFirstClick);
         peepBtn.disabled = true;
-        runPixelPeep().catch(e => pushStat(`[peep] ${e?.message || e}`))
-                      .finally(() => { peepBtn.disabled = false; });
-    });
-}
-
-// Measure canvas paint cost (putImageData) at each unique W×H in the bench
-// rows. Paint cost depends only on dimensions, not on which decoder produced
-// the buffer — so a synthetic RGBA of the right size gives an accurate paint
-// timing without round-tripping the real decoded pixels through IPC (which
-// would dominate the measurement with JSON-array encoding overhead).
-function measurePaintTimings(rows) {
-    const canvas = document.createElement('canvas');
-    canvas.style.position = 'fixed';
-    canvas.style.left = '-99999px';
-    canvas.style.top = '0';
-    document.body.appendChild(canvas);
-    const ctx = canvas.getContext('2d');
-    const cache = new Map();
-    const ITERS = 3;
-    for (const r of rows) {
-        if (!r.width || !r.height) { r.paint_ms = 0; continue; }
-        const key = `${r.width}x${r.height}`;
-        if (cache.has(key)) { r.paint_ms = cache.get(key); continue; }
-        canvas.width = r.width;
-        canvas.height = r.height;
-        const rgba = new Uint8ClampedArray(r.width * r.height * 4);
-        // Mid-grey opaque; avoids any all-zero fast-path the browser might take.
-        for (let i = 0; i < rgba.length; i += 4) {
-            rgba[i] = 128; rgba[i+1] = 128; rgba[i+2] = 128; rgba[i+3] = 255;
+        try {
+            await lazyPixelPeep();
+            // pixelPeepActive is now wired; re-dispatch so the module's handler fires.
+            peepBtn.disabled = false;
+            peepBtn.click();
+        } catch (e) {
+            pushStat(`[peep-init] failed to load pixel-peep module: ${e?.message || e}`);
+            peepBtn.disabled = false;
         }
-        const imgData = new ImageData(rgba, r.width, r.height);
-        // Warm up — first putImageData on a fresh canvas size pays extra cost.
-        ctx.putImageData(imgData, 0, 0);
-        const t0 = performance.now();
-        for (let i = 0; i < ITERS; i++) ctx.putImageData(imgData, 0, 0);
-        const ms = (performance.now() - t0) / ITERS;
-        cache.set(key, ms);
-        r.paint_ms = ms;
-    }
-    canvas.remove();
+    }, { once: false });
+})();
+
+// Prefetch the benchmark + pixel-peep modules after the page is idle so that
+// when a dev clicks a button the module is already resident.  Gated behind an
+// idleness check (requestIdleCallback) to avoid contending with first-paint.
+if (typeof requestIdleCallback === 'function') {
+    requestIdleCallback(() => {
+        lazyBenchmark().catch(() => {});
+        lazyPixelPeep().catch(() => {});
+    }, { timeout: 5000 });
 }
 
-// JXL decoder bench — encodes a chosen ORF then decodes it with jpegxl-rs
-// (libjxl, current encoder) and jxl-oxide (pure-Rust) at a ladder of sizes
-// and regions, printing the timing matrix to the stats panel.
-const _benchPad = (s, n) => String(s).padEnd(n, ' ');
-const _benchPadN = (s, n) => String(s).padStart(n, ' ');
-const _benchFmtMs1 = (ms) => `${(ms || 0).toFixed(1)}ms`;
-
-function printBenchResult(label, result) {
-    pushStat(`[${label}] file ${result.source_path}`);
-    pushStat(`[${label}] full ${result.full_width}×${result.full_height}  jxl ${(result.encoded_bytes/1024).toFixed(0)} KB  encode ${result.encode_ms} ms`);
-    measurePaintTimings(result.rows);
-    pushStat(`[${label}] ${_benchPad('library', 11)} ${_benchPad('operation', 22)} ${_benchPadN('w', 5)}×${_benchPadN('h', 5)} ${_benchPadN('decode', 9)} ${_benchPadN('post', 8)} ${_benchPadN('paint', 9)} ${_benchPadN('total', 9)}  note`);
-    for (const r of result.rows) {
-        const totalWithPaint = (r.decode_ms || 0) + (r.resize_ms || 0) + (r.paint_ms || 0);
-        pushStat(
-            `[${label}] ${_benchPad(r.library, 11)} ${_benchPad(r.operation, 22)} ${_benchPadN(r.width, 5)}×${_benchPadN(r.height, 5)} ` +
-            `${_benchPadN(r.decode_ms + 'ms', 9)} ${_benchPadN(r.resize_ms + 'ms', 8)} ${_benchPadN(_benchFmtMs1(r.paint_ms), 9)} ` +
-            `${_benchPadN(totalWithPaint.toFixed(1) + 'ms', 9)}  ${r.note}`,
-        );
-    }
-}
-
-async function runJxlDecodeBench() {
-    if (!IS_TAURI) {
-        pushStat('[jxl-bench] Tauri-only — run inside the desktop app');
-        return;
-    }
-    const defaultPath = 'C:\\995\\2026-01-09 Birthday at Cederberg\\P1100080.ORF';
-    const path = prompt('JXL bench — ORF path to encode + decode:', defaultPath) || defaultPath;
-    pushStat(`[jxl-bench] starting on ${path}`);
-    const t0 = performance.now();
-    let result;
-    try {
-        result = await invoke('bench_jxl_decode', { path });
-    } catch (e) {
-        pushStat(`[jxl-bench] FAILED: ${e?.message || e}`);
-        return;
-    }
-    const wallMs = (performance.now() - t0).toFixed(0);
-    pushStat(`[jxl-bench] wall ${wallMs} ms`);
-    printBenchResult('jxl-bench', result);
-    pushStat('[jxl-bench] done');
-}
-
-async function runJxlSweep() {
-    if (!IS_TAURI) {
-        pushStat('[jxl-sweep] Tauri-only — run inside the desktop app');
-        return;
-    }
-    const defaultFolder = 'C:\\995\\2026-01-09 Birthday at Cederberg';
-    const folder = prompt('JXL sweep — folder of ORFs:', defaultFolder) || defaultFolder;
-    pushStat(`[jxl-sweep] starting on folder ${folder}`);
-    const t0 = performance.now();
-    const unlisten = await listen('bench_progress', ({ payload }) => {
-        if (payload?.stage === 'sweep') pushStat(`[jxl-sweep] ${payload.msg}`);
-    });
-    let sweep;
-    try {
-        sweep = await invoke('bench_jxl_sweep', { folder });
-    } catch (e) {
-        pushStat(`[jxl-sweep] FAILED: ${e?.message || e}`);
-        unlisten();
-        return;
-    }
-    unlisten();
-    const wallMs = (performance.now() - t0).toFixed(0);
-    pushStat(`[jxl-sweep] ${sweep.per_image.length} images  wall ${wallMs} ms`);
-    sweep.picks.forEach((p, i) => pushStat(`[jxl-sweep] pick ${i + 1}/${sweep.picks.length}  ${p}`));
-    sweep.per_image.forEach((res, i) => {
-        pushStat(`[jxl-sweep] ─── image ${i + 1}/${sweep.per_image.length} ───`);
-        printBenchResult('jxl-sweep', res);
-    });
-    pushStat('[jxl-sweep] done');
-}
-
-async function runJxlStress() {
-    if (!IS_TAURI) {
-        pushStat('[jxl-stress] Tauri-only — run inside the desktop app');
-        return;
-    }
-    const defaultFolder = 'C:\\995\\2026-01-09 Birthday at Cederberg';
-    const folder = prompt('JXL stress — folder of ORFs:', defaultFolder) || defaultFolder;
-    const sizes = [180, 480, 1080];
-    const repeats = 3;
-    pushStat(`[jxl-stress] starting on folder ${folder}  sizes ${sizes.join('/')}  repeats ${repeats}`);
-    const t0 = performance.now();
-    const unlisten = await listen('bench_progress', ({ payload }) => {
-        if (payload?.stage === 'stress') pushStat(`[jxl-stress] ${payload.msg}`);
-    });
-    let stress;
-    try {
-        stress = await invoke('bench_jxl_stress', { folder, sizes, repeats });
-    } catch (e) {
-        pushStat(`[jxl-stress] FAILED: ${e?.message || e}`);
-        unlisten();
-        return;
-    }
-    unlisten();
-    const wallMs = (performance.now() - t0).toFixed(0);
-    pushStat(`[jxl-stress] picks=${stress.picks.length} sizes=${stress.sizes.length} repeats=${stress.repeats}  wall ${wallMs} ms`);
-    stress.picks.forEach((p, i) => {
-        const enc = stress.encode_ms_per_image[i];
-        const sz = (stress.encoded_bytes_per_image[i] / 1024).toFixed(0);
-        pushStat(`[jxl-stress] pick ${i + 1}  enc ${enc} ms  ${sz} KB  ${p}`);
-    });
-
-    pushStat(`[jxl-stress] ${_benchPad('image', 32)} ${_benchPad('lib', 11)} ${_benchPadN('size', 5)} ${_benchPadN('min', 8)} ${_benchPadN('mean', 8)} ${_benchPadN('p50', 8)} ${_benchPadN('p95', 8)} ${_benchPadN('max', 8)} ${_benchPadN('rs-mean', 9)} ${_benchPadN('total', 9)}`);
-    const fmt = (v) => `${(v || 0).toFixed(1)}ms`;
-    for (const r of stress.rows) {
-        const name = r.source_path.split(/[\\/]/).pop();
-        pushStat(
-            `[jxl-stress] ${_benchPad(name, 32)} ${_benchPad(r.library, 11)} ${_benchPadN(r.target_long_edge, 5)} ` +
-            `${_benchPadN(fmt(r.decode_min_ms), 8)} ${_benchPadN(fmt(r.decode_mean_ms), 8)} ${_benchPadN(fmt(r.decode_p50_ms), 8)} ` +
-            `${_benchPadN(fmt(r.decode_p95_ms), 8)} ${_benchPadN(fmt(r.decode_max_ms), 8)} ` +
-            `${_benchPadN(fmt(r.resize_mean_ms), 9)} ${_benchPadN(fmt(r.total_mean_ms), 9)}`,
-        );
-    }
-
-    // Library × size aggregate across all picks (decode mean).
-    const agg = new Map();
-    for (const r of stress.rows) {
-        const k = `${r.library}|${r.target_long_edge}`;
-        if (!agg.has(k)) agg.set(k, { lib: r.library, size: r.target_long_edge, n: 0, decode: 0, resize: 0 });
-        const a = agg.get(k);
-        a.n += 1;
-        a.decode += r.decode_mean_ms;
-        a.resize += r.resize_mean_ms;
-    }
-    pushStat(`[jxl-stress] ─── aggregate (mean across ${stress.picks.length} images) ───`);
-    for (const a of [...agg.values()].sort((x, y) => x.size - y.size || x.lib.localeCompare(y.lib))) {
-        const d = a.decode / a.n;
-        const rs = a.resize / a.n;
-        pushStat(`[jxl-stress] ${_benchPad(a.lib, 11)} size ${_benchPadN(a.size, 5)}  decode ${fmt(d)}  resize ${fmt(rs)}  total ${fmt(d + rs)}`);
-    }
-    pushStat('[jxl-stress] done');
-}
-
-const jxlBenchBtn = document.getElementById('run-jxl-bench');
-if (jxlBenchBtn) {
-    jxlBenchBtn.addEventListener('click', () => {
-        jxlBenchBtn.disabled = true;
-        runJxlDecodeBench().catch(e => pushStat(`[jxl-bench] ${e?.message || e}`))
-                           .finally(() => { jxlBenchBtn.disabled = false; });
-    });
-}
-
-const jxlSweepBtn = document.getElementById('run-jxl-sweep');
-if (jxlSweepBtn) {
-    jxlSweepBtn.addEventListener('click', () => {
-        jxlSweepBtn.disabled = true;
-        runJxlSweep().catch(e => pushStat(`[jxl-sweep] ${e?.message || e}`))
-                     .finally(() => { jxlSweepBtn.disabled = false; });
-    });
-}
-
-const jxlStressBtn = document.getElementById('run-jxl-stress');
-if (jxlStressBtn) {
-    jxlStressBtn.addEventListener('click', () => {
-        jxlStressBtn.disabled = true;
-        runJxlStress().catch(e => pushStat(`[jxl-stress] ${e?.message || e}`))
-                      .finally(() => { jxlStressBtn.disabled = false; });
-    });
-}
-
-async function runJxlThumb() {
-    if (!IS_TAURI) {
-        pushStat('[jxl-thumb] Tauri-only — run inside the desktop app');
-        return;
-    }
-    const defaultFolder = 'C:\\995\\2026-01-09 Birthday at Cederberg';
-    const folder = prompt('JXL thumb bench — folder of ORFs:', defaultFolder) || defaultFolder;
-    const quality = 95;
-    const defaultOut = `C:\\foo\\raw-converter-tauri\\bench-output\\thumbs_q${quality}`;
-    const outputDir = prompt('Output directory for thumb JXLs:', defaultOut) || defaultOut;
-    const sizes = [150, 300, 640, 1080, 1920];
-    const gallerySizes = [150, 300];
-    const galleryCount = 100;
-    const repeats = 3;
-    const effort = 3;
-    pushStat(`[jxl-thumb] starting  folder=${folder}  out=${outputDir}  sizes=${sizes.join('/')}  gallery=${gallerySizes.join('/')} ×${galleryCount}  reps=${repeats}  q=${quality}  e=${effort}`);
-    const t0 = performance.now();
-    const unlisten = await listen('bench_progress', ({ payload }) => {
-        if (payload?.stage === 'thumb') pushStat(`[jxl-thumb] ${payload.msg}`);
-    });
-    let result;
-    try {
-        result = await invoke('bench_jxl_thumb', {
-            folder,
-            outputDir,
-            sizes,
-            gallerySizes,
-            galleryCount,
-            repeats,
-            quality,
-            effort,
-        });
-    } catch (e) {
-        pushStat(`[jxl-thumb] FAILED: ${e?.message || e}`);
-        unlisten();
-        return;
-    }
-    unlisten();
-    const wallMs = (performance.now() - t0).toFixed(0);
-    pushStat(`[jxl-thumb] picks=${result.picks.length} sizes=${result.sizes.length}  wall ${wallMs} ms`);
-
-    // Per-image per-size table.
-    pushStat(`[jxl-thumb] ${_benchPad('image', 24)} ${_benchPadN('size', 5)} ${_benchPadN('wxh', 11)} ${_benchPadN('bytes', 8)} ${_benchPadN('enc', 7)} ${_benchPadN('libjxl', 9)} ${_benchPadN('oxide', 9)}`);
-    for (const r of result.size_rows) {
-        const name = r.source_path.split(/[\\/]/).pop();
-        const dim = `${r.width}×${r.height}`;
-        const kb = `${(r.encoded_bytes/1024).toFixed(1)}KB`;
-        pushStat(
-            `[jxl-thumb] ${_benchPad(name, 24)} ${_benchPadN(r.long_edge, 5)} ${_benchPadN(dim, 11)} ${_benchPadN(kb, 8)} ` +
-            `${_benchPadN(r.encode_ms + 'ms', 7)} ${_benchPadN(r.libjxl_decode_mean_ms.toFixed(0) + 'ms', 9)} ${_benchPadN(r.oxide_decode_mean_ms.toFixed(0) + 'ms', 9)}`
-        );
-    }
-
-    // Aggregate per size (mean across images).
-    const sizeAgg = new Map();
-    for (const r of result.size_rows) {
-        const a = sizeAgg.get(r.long_edge) || { n: 0, bytes: 0, enc: 0, libjxl: 0, oxide: 0 };
-        a.n += 1;
-        a.bytes += r.encoded_bytes;
-        a.enc += r.encode_ms;
-        a.libjxl += r.libjxl_decode_mean_ms;
-        a.oxide += r.oxide_decode_mean_ms;
-        sizeAgg.set(r.long_edge, a);
-    }
-    pushStat(`[jxl-thumb] ─── per-size mean (across ${result.picks.length} images) ───`);
-    for (const [size, a] of [...sizeAgg.entries()].sort((x, y) => x[0] - y[0])) {
-        const kb = (a.bytes / a.n / 1024).toFixed(1);
-        pushStat(`[jxl-thumb] size ${_benchPadN(size, 4)}  ${_benchPadN(kb + 'KB', 9)}  enc ${(a.enc/a.n).toFixed(0)}ms  libjxl ${(a.libjxl/a.n).toFixed(0)}ms  oxide ${(a.oxide/a.n).toFixed(0)}ms`);
-    }
-
-    // DC probe.
-    pushStat(`[jxl-thumb] ─── DC-only probe (libjxl progressive flush) ───`);
-    pushStat(`[jxl-thumb] ${_benchPad('image', 24)} ${_benchPadN('full-dec', 10)} ${_benchPadN('dc-dec', 10)} ${_benchPadN('speedup', 9)} note`);
-    for (const r of result.dc_rows) {
-        const name = r.source_path.split(/[\\/]/).pop();
-        const full = `${r.libjxl_full_decode_ms}ms`;
-        if (r.libjxl_dc_decode_ms != null) {
-            const dc = `${r.libjxl_dc_decode_ms}ms`;
-            const sp = (r.libjxl_full_decode_ms / Math.max(r.libjxl_dc_decode_ms, 1)).toFixed(1) + '×';
-            pushStat(`[jxl-thumb] ${_benchPad(name, 24)} ${_benchPadN(full, 10)} ${_benchPadN(dc, 10)} ${_benchPadN(sp, 9)} ok`);
-        } else {
-            pushStat(`[jxl-thumb] ${_benchPad(name, 24)} ${_benchPadN(full, 10)} ${_benchPadN('—', 10)} ${_benchPadN('—', 9)} ${r.libjxl_dc_error || 'no DC stage'}`);
-        }
-    }
-
-    // Gallery simulation.
-    pushStat(`[jxl-thumb] ─── gallery simulation (${galleryCount} decodes, ${result.gallery_rows[0]?.unique_thumbs || 0} unique cycled) ───`);
-    pushStat(`[jxl-thumb] ${_benchPadN('size', 5)} ${_benchPad('library', 11)} ${_benchPadN('total', 9)} ${_benchPadN('mean/dec', 11)}`);
-    for (const r of result.gallery_rows) {
-        pushStat(`[jxl-thumb] ${_benchPadN(r.long_edge, 5)} ${_benchPad(r.library, 11)} ${_benchPadN(r.total_ms + 'ms', 9)} ${_benchPadN(r.mean_per_decode_ms.toFixed(1) + 'ms', 11)}`);
-    }
-    pushStat('[jxl-thumb] done');
-}
-
-const jxlThumbBtn = document.getElementById('run-jxl-thumb');
-if (jxlThumbBtn) {
-    jxlThumbBtn.addEventListener('click', () => {
-        jxlThumbBtn.disabled = true;
-        runJxlThumb().catch(e => pushStat(`[jxl-thumb] ${e?.message || e}`))
-                     .finally(() => { jxlThumbBtn.disabled = false; });
-    });
-}
-
-async function runJxlDisk() {
-    if (!IS_TAURI) {
-        pushStat('[jxl-disk] Tauri-only — run inside the desktop app');
-        return;
-    }
-    const folder = prompt('JXL disk arch bench — source ORF folder:', 'C:\\995\\2026-01-09 Birthday at Cederberg') || 'C:\\995\\2026-01-09 Birthday at Cederberg';
-    const workDir = prompt('Working directory for sidecar + bundle:', 'C:\\foo\\raw-converter-tauri\\bench-output\\disk') || 'C:\\foo\\raw-converter-tauri\\bench-output\\disk';
-    const flushFile = prompt('Flush file path (will be created if absent):', 'C:\\foo\\raw-converter-tauri\\bench-output\\flush.bin') || 'C:\\foo\\raw-converter-tauri\\bench-output\\flush.bin';
-    const flushGbStr = prompt('Flush file size in GB (set ≥ system RAM for reliable cold reads):', '20') || '20';
-    const flushSizeGb = parseInt(flushGbStr, 10) || 20;
-    const nStr = prompt('Number of test files (≤ folder size):', '50') || '50';
-    const nFiles = parseInt(nStr, 10) || 50;
-
-    pushStat(`[jxl-disk] starting  folder=${folder}  work=${workDir}  flush=${flushFile} (${flushSizeGb} GB)  n=${nFiles}`);
-    const t0 = performance.now();
-    const unlisten = await listen('bench_progress', ({ payload }) => {
-        if (payload?.stage === 'disk') pushStat(`[jxl-disk] ${payload.msg}`);
-    });
-    let result;
-    try {
-        result = await invoke('bench_jxl_disk', {
-            folder,
-            workDir,
-            flushFile,
-            flushSizeGb,
-            nFiles,
-        });
-    } catch (e) {
-        pushStat(`[jxl-disk] FAILED: ${e?.message || e}`);
-        unlisten();
-        return;
-    }
-    unlisten();
-    const wallMs = (performance.now() - t0).toFixed(0);
-    pushStat(`[jxl-disk] setup ${result.setup_ms} ms  wall ${wallMs} ms`);
-    pushStat(`[jxl-disk] ${_benchPad('arch', 18)} ${_benchPad('operation', 14)} ${_benchPadN('n', 4)} ${_benchPadN('read', 9)} ${_benchPadN('decode', 9)} ${_benchPadN('total', 9)} ${_benchPadN('mean/ea', 9)} ${_benchPadN('MB', 8)}`);
-    for (const r of result.rows) {
-        pushStat(
-            `[jxl-disk] ${_benchPad(r.architecture, 18)} ${_benchPad(r.operation, 14)} ${_benchPadN(r.n_files, 4)} ` +
-            `${_benchPadN(r.read_total_ms + 'ms', 9)} ${_benchPadN(r.decode_total_ms + 'ms', 9)} ${_benchPadN(r.total_ms + 'ms', 9)} ` +
-            `${_benchPadN(r.mean_per_file_ms.toFixed(1) + 'ms', 9)} ${_benchPadN((r.bytes_read / 1024 / 1024).toFixed(1), 8)}`
-        );
-    }
-    pushStat('[jxl-disk] done');
-}
-
-const jxlDiskBtn = document.getElementById('run-jxl-disk');
-if (jxlDiskBtn) {
-    jxlDiskBtn.addEventListener('click', () => {
-        jxlDiskBtn.disabled = true;
-        runJxlDisk().catch(e => pushStat(`[jxl-disk] ${e?.message || e}`))
-                    .finally(() => { jxlDiskBtn.disabled = false; });
-    });
-}
-
+// ---------------------------------------------------------------------------
+// Sentinel: BENCH_CONFIGS was the first top-level declaration of the benchmark
+// harness.  Anything below this comment that used to be part of the benchmark
+// harness or pixel-peep has been moved to web/tools/benchmark.js or
+// web/tools/pixel-peep.js respectively.
+// ---------------------------------------------------------------------------
+// (previously: BENCH_CONFIGS through runQualitySweep + button wiring,
+//  then pixel-peep section, then measurePaintTimings + JXL bench functions —
+//  all removed from the static graph, now in the tool modules above)
+// ---------------------------------------------------------------------------
+//
+// The next section is: Tauri live-look: invoked from triggerLiveUpdate
+//
+// ─── end of finding 47 (P4 T8) extraction ───────────────────────────────────
 // Tauri live-look: invoked from triggerLiveUpdate when IS_TAURI
 let tauriLiveInFlight = false;
 let tauriLivePending = null;
@@ -6301,41 +5299,56 @@ function lightboxViewportRegion(imgW, imgH) {
     return { x, y, w: visW, h: visH };
 }
 
-const tauriParityLb = createTauriParityLightbox({
-    rootEl: lightbox,
-    canvas: lightboxCanvas,
-    histCanvas: lightbox.querySelector('[data-m2-hist]'),
-    // Bench has no Tauri bridge: pass the real invoke when present, else null.
-    invoke: (typeof invoke === 'function') ? invoke : null,
-    getActiveCard: () => (lightboxIndex >= 0 ? cards[lightboxIndex] : null) || null,
-    // When the M2 FilterEngine has no cached baseline (bench single-image), ask
-    // the develop channel / live pipeline to re-render the current frame.
-    onRepaintRequest: () => {
-        const adj = tauriParityLb?.state?.adjustments;
-        if (adj && runH29DevelopChannel(adj)) return;
-        scheduleLiveUpdate();
-    },
-    pyramidClient: null,
-    getViewportRegion: lightboxViewportRegion,
-    getZoom: () => lbZoom,
+// Finding 47 (P4 T8): tauri-parity-lightbox.js is loaded lazily on first lightbox
+// open (first call to feedTauriParityBaseline, which fires when a frame paints).
+// tauriParityLb is null until the lazy init completes; all callers already
+// use optional chaining (tauriParityLb?.…) so null is safe before init.
+
+let tauriParityLb = null;
+
+// Lazy init: load the module and construct the lightbox instance once.
+const _initTauriParityLb = makeLazyModule(async () => {
+    const { createTauriParityLightbox } = await lazyTauriParity();
+    const lb = createTauriParityLightbox({
+        rootEl: lightbox,
+        canvas: lightboxCanvas,
+        histCanvas: lightbox.querySelector('[data-m2-hist]'),
+        // Bench has no Tauri bridge: pass the real invoke when present, else null.
+        invoke: (typeof invoke === 'function') ? invoke : null,
+        getActiveCard: () => (lightboxIndex >= 0 ? cards[lightboxIndex] : null) || null,
+        // When the M2 FilterEngine has no cached baseline (bench single-image), ask
+        // the develop channel / live pipeline to re-render the current frame.
+        onRepaintRequest: () => {
+            const adj = tauriParityLb?.state?.adjustments;
+            if (adj && runH29DevelopChannel(adj)) return;
+            scheduleLiveUpdate();
+        },
+        pyramidClient: null,
+        getViewportRegion: lightboxViewportRegion,
+        getZoom: () => lbZoom,
+    });
+    tauriParityLb = lb;
+    window.tauriParityLb = lb;
+    return lb;
 });
-window.tauriParityLb = tauriParityLb;
 
 // Feed the M2 FilterEngine a clean 8-bit baseline whenever a fresh frame lands
 // on the lightbox canvas, so its sliders have pixels to transform.
-function feedTauriParityBaseline(snapshot) {
-    if (!tauriParityLb || lightboxIndex < 0) return;
+// Fire-and-forget: lazy loads tauri-parity-lightbox.js on first call.
+async function feedTauriParityBaseline(snapshot) {
+    if (lightboxIndex < 0) return;
     const card = cards[lightboxIndex];
     if (!card) return;
     try {
+        const lb = await _initTauriParityLb();
         let img = snapshot;
         if (!img) {
             if (!lightboxCanvas.width || !lightboxCanvas.height) return;
             const ctx = lightboxCanvas.getContext('2d');
             img = ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height);
         }
-        tauriParityLb.onBaseFramePainted(card, img.data, img.width, img.height);
-    } catch { /* cross-tainted canvas or 0-size: skip baseline feed */ }
+        lb.onBaseFramePainted(card, img.data, img.width, img.height);
+    } catch { /* cross-tainted canvas, 0-size, or failed import: skip baseline feed */ }
 }
 window.feedTauriParityBaseline = feedTauriParityBaseline;
 
