@@ -13,6 +13,8 @@ import { createReadLane } from './jxl-read-lane.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
+// Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
+import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
@@ -656,18 +658,21 @@ const jxlFirstProgressCacheSeen = new Set();
 // during refinement. The policy may change in the future; the per-request flag exists so the
 // difference remains measurable and controllable. Do not remove the three-policy wiring without
 // updating the P3.1 lightbox progressive decoder design notes.
-function applyJxlDecodeCachePolicy(card, decodeId, pixels, w, h, isFinal, policy) {
-    if (!card || !pixels || !w || !h || policy === 'never') return;
-    if (policy === 'onFirstProgress') {
-        if (jxlFirstProgressCacheSeen.has(decodeId)) return;
-        jxlFirstProgressCacheSeen.add(decodeId);
-        getCardState(card)._jxlProgressCacheDecodeId = decodeId;
-        getCardState(card)._jxlDecoded = { rgba: pixels, w, h };
-        return;
-    }
-    if (policy === 'onFinal' && isFinal) {
-        getCardState(card)._jxlDecoded = { rgba: pixels, w, h };
-    }
+// Finding 48: `tag` is the per-listener result-tag captured at dispatch. The
+// cache commit is gated on assetStateStore.isStale(tag, state) BEFORE the write
+// (inside commitJxlDecodeCache), so a decode that finishes after a reprocess
+// (generation bump) can no longer poison the card cache with stale pixels. The
+// isStale guard inside each decode callback only protects the canvas paint — the
+// cache write must be guarded here, at the point of write.
+function applyJxlDecodeCachePolicy(card, decodeId, pixels, w, h, isFinal, policy, tag) {
+    if (!card) return;
+    commitJxlDecodeCache({
+        target: getCardState(card),
+        tag: tag ?? null,
+        store: assetStateStore,
+        seen: jxlFirstProgressCacheSeen,
+        decodeId, pixels, w, h, isFinal, policy,
+    });
 }
 
 class WorkerPool {
@@ -1036,7 +1041,9 @@ function decodeJxlViaSession(url, callback, priority = 'normal', options = {}) {
             if (msg.type === 'jxl_progress' || msg.type === 'jxl_decoded') {
                 const ct = listener.options?.cacheTarget;
                 if (!(ct && ct.isConnected === false)) {
-                    applyJxlDecodeCachePolicy(ct, msg.decodeId, msg.rgba, msg.w, msg.h, isFinal, listener.options?.cachePolicy ?? 'never');
+                    // Finding 48: pass this listener's result-tag so the cache
+                    // commit is gated on staleness BEFORE the write, not after.
+                    applyJxlDecodeCachePolicy(ct, msg.decodeId, msg.rgba, msg.w, msg.h, isFinal, listener.options?.cachePolicy ?? 'never', listener.options?.cacheTag ?? null);
                 }
             }
             try { listener.cb(msg); } catch {}
@@ -2030,7 +2037,9 @@ function startConvert(file, existingCard) {
     // Finding 40: pass the assetId explicitly so applySidecarEdit targets THIS card.
     if (typeof loadSidecar === 'function' && file.name) {
         const _assetIdForSidecar = getCardState(card)._assetId;
-        loadSidecar(file.name).then(s => {
+        // Finding 46: pass the stable assetId so loadSidecar reads the same
+        // stable-id key that saveSidecar writes (basename fallback is secondary).
+        loadSidecar(file.name, _assetIdForSidecar).then(s => {
             if (!s) return;
             if (typeof updateSidecarDot === 'function') updateSidecarDot(file.name, true);
             // Route through assetStateStore to keep edit state isolated.
@@ -2634,7 +2643,7 @@ function repaintThumbFromJxl(card) {
             card.classList.remove('embedded-thumb');
             setThumbSource(card, 'jxl');
         }).catch(e => console.warn('JXL thumb bitmap failed:', e));
-    }, 'low', cacheOpts);
+    }, 'low', { ...cacheOpts, cacheTag: _thumbDecodeTag });
 }
 
 // ---------------------------------------------------------------------------
@@ -2937,6 +2946,7 @@ function drawLightboxForCard(card) {
                 cachePolicy: 'onFirstProgress',
                 progressiveDetail: 'lastPasses',
                 cacheTarget: card,
+                cacheTag: _lbDecodeTag, // Finding 48: gate cache write on generation
                 guard: () => lightboxIndex >= 0 && cards[lightboxIndex] === card,
             });
             return;
@@ -3281,6 +3291,7 @@ function prefetchJxl(card, priority = 'normal') {
         cachePolicy: 'onFinal',
         progressiveDetail: 'lastPasses',
         cacheTarget: card,
+        cacheTag: _prefetchTag, // Finding 48: gate cache write on generation
     });
 }
 function prefetchAroundCurrent() {
@@ -3381,7 +3392,9 @@ function openLightbox(card) {
     // Auto-load sidecar if present
     if (typeof loadSidecar === 'function' && (getCardState(card)._tauriPath || getCardState(card)._file?.name)) {
         const sidecarPath = getCardState(card)._tauriPath || getCardState(card)._file?.name;
-        loadSidecar(sidecarPath).then(sidecar => {
+        // Finding 46: pass the stable assetId so the browser localStorage lookup
+        // reads the same stable-id key saveSidecar writes (Tauri keys on path).
+        loadSidecar(sidecarPath, getCardState(card)._assetId).then(sidecar => {
             if (sidecar && typeof applySidecar === 'function') applySidecar(sidecar);
             // After sidecar applied, sync sibling cards in the grid and queue
             // JXL-based thumbnail rendering once the JXL is ready.
@@ -3738,16 +3751,32 @@ function applyLookToFilmstripSelection() {
         scheduleGalleryLiveUpdate();
     }
 
-    // On Tauri we also want sidecars written for the selected files
+    // On Tauri we also want sidecars written for the selected files.
+    // Finding 40: pass the ITERATED card `c` so buildSidecarData serializes THAT
+    //   card's per-asset state via the store — not the ambient lightboxCard(),
+    //   which would serialize the same card N times across the batch.
+    // Finding 46: AWAIT each write and collect failures so a failed durable write
+    //   is surfaced to the user instead of being swallowed by .catch(()=>{}).
     if (window.IS_TAURI) {
-        indices.forEach(i => {
-            const c = cards[i];
-            const fname = getCardState(c)?._tauriPath || getCardState(c)?._file?.name;
-            if (fname && typeof window.saveSidecar === 'function') {
-                // saveSidecar reads current global look + the card's crop/subjects
-                window.saveSidecar(fname).catch(() => {});
+        (async () => {
+            const failures = [];
+            for (const i of indices) {
+                const c = cards[i];
+                const fname = getCardState(c)?._tauriPath || getCardState(c)?._file?.name;
+                if (fname && typeof window.saveSidecar === 'function') {
+                    try {
+                        await window.saveSidecar(fname, c);
+                    } catch (err) {
+                        console.error('batch sidecar save failed for', fname, err);
+                        failures.push(fname);
+                    }
+                }
             }
-        });
+            if (failures.length && statusText) {
+                statusBar.hidden = false;
+                statusText.textContent = `save failed: ${failures.length} file${failures.length === 1 ? '' : 's'}`;
+            }
+        })();
     }
 }
 
@@ -3984,7 +4013,17 @@ document.addEventListener('keydown', (e) => {
         if (!lightbox.hidden) {
             const card = cards[lightboxIndex];
             const sidecarPath = getCardState(card)?._tauriPath || getCardState(card)?._file?.name;
-            if (sidecarPath && typeof saveSidecar === 'function') saveSidecar(sidecarPath);
+            // Finding 40/46: pass the target card explicitly (correct per-card state)
+            // and surface the write error instead of leaving an uncaught rejection.
+            if (sidecarPath && typeof saveSidecar === 'function') {
+                saveSidecar(sidecarPath, card).catch(err => {
+                    console.error('sidecar save failed for', sidecarPath, err);
+                    if (statusText) {
+                        statusBar.hidden = false;
+                        statusText.textContent = 'save failed';
+                    }
+                });
+            }
         }
         return;
     }
