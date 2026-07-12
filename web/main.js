@@ -15,6 +15,10 @@ import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.j
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
 // Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
+// Findings 11, 29: byte-budgeted, LRU-evicting derived cache for decoded JXL
+// RGBA buffers. Replaces per-card _jxlDecoded (unbounded WeakMap) with a single
+// governed cache; invalidated on generation change and explicit card delete.
+import { createDerivedCache } from './jxl-derived-cache.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
 // of it (one governed budget + one eviction policy), replacing the bespoke Map.
@@ -440,24 +444,28 @@ window.lightboxRefreshDraw = () => {
 };
 window.allCards = () => cards;
 
-// Decode the parent's full-resolution JXL into getCardState(card)._jxlDecoded if not already
+// Decode the parent's full-resolution JXL into the jxlDerivedCache if not already
 // cached. Used by crop.js to render focal-subject thumbnails from the JXL
 // roundtrip. Returns a promise that resolves when the buffer is in place.
 window.decodeFullJxlFor = function decodeFullJxlFor(card) {
     return new Promise((resolve) => {
         if (!getCardState(card)?._blobUrl) { resolve(null); return; }
-        if (getCardState(card)._jxlDecoded) { resolve(getCardState(card)._jxlDecoded); return; }
+        // Findings 11, 29: check the governed DerivedCache first.
+        const _fullAssetId = getCardState(card)?._assetId;
+        const _cached = _fullAssetId ? jxlDerivedCache.get(_fullAssetId) : getCardState(card)['_jxlDecoded'];
+        if (_cached) { resolve(_cached); return; }
         // Finding 48: stamp the generation tag at dispatch so a stale result
-        // from a prior reprocess cannot commit to _jxlDecoded via the cache path.
+        // from a prior reprocess cannot commit to the cache.
         // Keep null for a genuinely id-less card (backward compatible).
         const _fullTag = (() => {
-            const id = getCardState(card)?._assetId;
-            return id ? assetStateStore.makeResultTag(id) : null;
+            return _fullAssetId ? assetStateStore.makeResultTag(_fullAssetId) : null;
         })();
         decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
             if (msg.type === 'decode_error') { resolve(null); return; }
             if (msg.type !== 'jxl_decoded' && msg.isFinal !== true) return;
-            resolve(getCardState(card)._jxlDecoded ?? { rgba: msg.rgba, w: msg.w, h: msg.h });
+            // Findings 11, 29: read from DerivedCache (populated by applyJxlDecodeCachePolicy).
+            const _hit = _fullAssetId ? jxlDerivedCache.get(_fullAssetId) : getCardState(card)['_jxlDecoded'];
+            resolve(_hit ?? { rgba: msg.rgba, w: msg.w, h: msg.h });
         }, 'low', {
             progressive: true,
             cachePolicy: 'onFinal',
@@ -678,6 +686,8 @@ function applyJxlDecodeCachePolicy(card, decodeId, pixels, w, h, isFinal, policy
         target: getCardState(card),
         tag: tag ?? null,
         store: assetStateStore,
+        // Findings 11, 29: route the write through the governed DerivedCache.
+        derivedCache: jxlDerivedCache,
         seen: jxlFirstProgressCacheSeen,
         decodeId, pixels, w, h, isFinal, policy,
     });
@@ -1360,6 +1370,10 @@ function removeCard(card) {
     }
     if (getCardState(card)._tauriPath != null) cardByFilename.delete(getCardState(card)._tauriPath);
     if (getCardState(card)._blobUrl) { try { URL.revokeObjectURL(getCardState(card)._blobUrl); } catch {} getCardState(card)._blobUrl = null; }
+    // Findings 11, 29: evict the derived JXL decode cache entry for this card so
+    // its ~80 MB RGBA buffer is freed immediately on delete, not on next GC cycle.
+    const _removeAssetId = getCardState(card)._assetId;
+    if (_removeAssetId) jxlDerivedCache.delete(_removeAssetId);
     // Close per-card ImageBitmaps so their GPU-backed store is freed eagerly
     // rather than waiting on GC of the detached node — mirrors the explicit
     // .close() the thumb/lightbox paths already do when replacing a bitmap.
@@ -1396,6 +1410,17 @@ const seenFiles = new Set(); // "name|size|lastModified" — prevents duplicate-
 const RAW_DECODE_BUDGET_BYTES = Math.round(1.8 * 1024 * 1024 * 1024); // ~1.8 GiB of the 2 GiB WASM ceiling
 const RAW_DECODE_SAFETY_MULT = 1.7;
 const rawDecodeGovernor = new AssetStore({ name: 'raw-decode', maxBytes: RAW_DECODE_BUDGET_BYTES });
+
+// Findings 11, 29: governed LRU cache for decoded JXL full-res RGBA buffers.
+// Budget = 3 × 24 MP RGBA8 = 3 × 24_000_000 × 4 ≈ 288 MB. Keeps the 2–3 most
+// recently viewed/prefetched cards in memory; older entries are evicted
+// automatically. Callers must use jxlDerivedCache.get/set/invalidate — not
+// _jxlDecoded directly — so the byte budget and LRU are always enforced.
+const JXL_DERIVED_CACHE_BYTES = 3 * 24_000_000 * 4; // ~288 MB
+const jxlDerivedCache = createDerivedCache({
+    name: 'jxl-derived',
+    maxBytes: JXL_DERIVED_CACHE_BYTES,
+});
 
 // Finding 39: byte-admission lane for file reads. A full file.arrayBuffer()
 // read MUST NOT start before a slot is available so pending tasks never hold
@@ -2259,7 +2284,8 @@ function startConvert(file, existingCard) {
                     if (getCardState(card)._blobUrl) URL.revokeObjectURL(getCardState(card)._blobUrl);
                     const url = URL.createObjectURL(blob);
                     getCardState(card)._blobUrl = url;
-                    getCardState(card)._jxlDecoded = null;  // cache stale once bytes change
+                    // Findings 11, 29: invalidate the derived cache (bytes changed).
+                    { const _aid = getCardState(card)._assetId; if (_aid) jxlDerivedCache.invalidate(_aid); else getCardState(card)['_jxlDecoded'] = null; }
                     card.querySelector('.size').textContent =
                         `${(msg.jxl.byteLength / 1024).toFixed(0)} KB`;
                     const totalMs = getCardState(card)._pipelineMs + msg.jxlMs;
@@ -2622,13 +2648,17 @@ function repaintThumbFromJxl(card) {
         const canvas = card.querySelector('canvas');
         if (!canvas) return;
         const { rgba, w, h } = msg;
+        // Finding 43: decoded at downsample:4 so w/h are already ≤ 1/4 of the
+        // master. We still clamp to 360px long-edge for exact grid sizing, but the
+        // createImageBitmap resize covers only a small remaining scale (e.g. 1000px
+        // → 360px) rather than the full 6000px → 360px of a master decode.
         const LONG_EDGE = 360;
         const long = Math.max(w, h);
         const targetW = long > LONG_EDGE ? Math.max(1, Math.round(w * LONG_EDGE / long)) : w;
         const targetH = long > LONG_EDGE ? Math.max(1, Math.round(h * LONG_EDGE / long)) : h;
         // Build the source ImageBitmap then high-quality draw into the thumb.
         // Cache the downsampled bitmap so rotation can repaint without
-        // re-decoding the full JXL.
+        // re-decoding the JXL.
         createImageBitmap(new ImageData(rgba, w, h), {
             resizeWidth: targetW, resizeHeight: targetH, resizeQuality: 'high',
         }).then(bmp => {
@@ -2651,7 +2681,12 @@ function repaintThumbFromJxl(card) {
             card.classList.remove('embedded-thumb');
             setThumbSource(card, 'jxl');
         }).catch(e => console.warn('JXL thumb bitmap failed:', e));
-    }, 'low', { ...cacheOpts, cacheTag: _thumbDecodeTag });
+    // Finding 43: pass downsample:4 so the decoder produces ~W/4 × H/4 pixels
+    // (1/16th of a 24 MP frame) rather than the full master. The thumb target is
+    // 360px long-edge, so a 4× downsample of a 6000px frame gives ~1500px —
+    // a small createImageBitmap rescale finishes what the decoder started, while
+    // the decode itself costs ~4× less RGBA memory and ~4–8× less decode time.
+    }, 'low', { ...cacheOpts, cacheTag: _thumbDecodeTag, downsample: 4 });
 }
 
 // ---------------------------------------------------------------------------
@@ -2876,12 +2911,16 @@ function drawLightboxForCard(card) {
     }
 
     if (mode === 'jxl') {
+        // M-1 (Findings 11, 29): bind the derived-cache lookup once so LRU is promoted
+        // exactly once and there is no between-gets eviction window.
+        const _jxlAid = getCardState(card)?._assetId;
+        const _hit = _jxlAid ? jxlDerivedCache.get(_jxlAid) : getCardState(card)['_jxlDecoded'];
         if (!getCardState(card)._blobUrl) {
             // JXL not ready yet — fall back to raw.
             getCardState(card)._sourceMode = 'raw';
-        } else if (getCardState(card)._jxlDecoded) {
-            // Cached from prefetch — instant paint.
-            const { rgba, w, h } = getCardState(card)._jxlDecoded;
+        } else if (_hit) {
+            // Cached from prefetch — instant paint (Findings 11, 29: read from DerivedCache).
+            const { rgba, w, h } = _hit;
             lightboxCanvas.width  = w;
             lightboxCanvas.height = h;
             const ctx = lightboxCanvas.getContext('2d');
@@ -3272,11 +3311,14 @@ function renderInfoPanel(card) {
 }
 
 // Background JXL prefetch — keeps RAW on display but stashes decoded JXL
-// pixels in getCardState(card)._jxlDecoded so manual toggle / zoom is instant.
+// pixels in the jxlDerivedCache so manual toggle / zoom is instant.
+// (Findings 11, 29: no longer stored in per-card _jxlDecoded.)
 const PREFETCH_NEIGHBORS = 2;
 function prefetchJxl(card, priority = 'normal') {
     if (!card || !getCardState(card)._blobUrl) return;
-    if (getCardState(card)._jxlDecoded) return;
+    // Findings 11, 29: check the governed DerivedCache.
+    const _prefetchAssetId0 = getCardState(card)?._assetId;
+    if (_prefetchAssetId0 ? jxlDerivedCache.get(_prefetchAssetId0) : getCardState(card)['_jxlDecoded']) return;
     if (getCardState(card)._jxlPrefetching) return;
     getCardState(card)._jxlPrefetching = true;
     // Finding 48: stamp the result tag at dispatch time so the callback can
@@ -4407,7 +4449,8 @@ function onFileDoneTauri(path, result) {
         const blob = new Blob([jxlBytes], { type: 'image/jxl' });
         if (getCardState(card)._blobUrl) URL.revokeObjectURL(getCardState(card)._blobUrl);
         getCardState(card)._blobUrl = URL.createObjectURL(blob);
-        getCardState(card)._jxlDecoded = null;
+        // Findings 11, 29: invalidate the derived cache (Tauri JXL bytes changed).
+        { const _taid = getCardState(card)._assetId; if (_taid) jxlDerivedCache.invalidate(_taid); else getCardState(card)['_jxlDecoded'] = null; }
         const dlBtn = card.querySelector('.thumb-dl-btn');
         if (dlBtn) dlBtn.hidden = false;
         refreshThumbToggleButton(card);

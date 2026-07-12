@@ -19,9 +19,11 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 import { createAssetStateStore } from './asset-state-store.js';
+import { createDerivedCache } from './jxl-derived-cache.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const mainSrc = readFileSync(join(__dirname, 'main.js'), 'utf8');
+const cropSrc = readFileSync(join(__dirname, 'crop.js'), 'utf8');
 
 describe('commitJxlDecodeCache: stale-gate BEFORE cache write (Finding 48)', () => {
     let store;
@@ -162,8 +164,8 @@ describe('main.js source-text: decodeFullJxlFor passes cacheTag (Finding 48)', (
         // appears within that span.
         const fnStart = mainSrc.indexOf('window.decodeFullJxlFor = function decodeFullJxlFor');
         expect(fnStart).toBeGreaterThan(-1);
-        // The function ends with "};" — grab up to 1200 chars from the definition.
-        const fnBody = mainSrc.slice(fnStart, fnStart + 1200);
+        // The function ends with "};" — grab up to 2000 chars from the definition.
+        const fnBody = mainSrc.slice(fnStart, fnStart + 2000);
         expect(fnBody).toContain('cacheTag');
     });
 
@@ -171,7 +173,125 @@ describe('main.js source-text: decodeFullJxlFor passes cacheTag (Finding 48)', (
         // The tag must be a fresh result-tag, not a hardcoded value.
         const fnStart = mainSrc.indexOf('window.decodeFullJxlFor = function decodeFullJxlFor');
         expect(fnStart).toBeGreaterThan(-1);
-        const fnBody = mainSrc.slice(fnStart, fnStart + 1200);
+        const fnBody = mainSrc.slice(fnStart, fnStart + 2000);
         expect(fnBody).toContain('makeResultTag');
     });
 });
+
+// ---------------------------------------------------------------------------
+// M-3: derived-cache read-path (Finding I-1)
+//
+// Post-migration, decodeFullJxlFor resolves with the pixels stored in
+// jxlDerivedCache (keyed by assetId). The bug was that crop.js read
+// parentCard._jxlDecoded directly, which is undefined for assetId cards
+// because the write now goes to jxlDerivedCache, not to the DOM element
+// property. This section verifies:
+//   1. (Behavioral) commitJxlDecodeCache writes to derivedCache and the
+//      written value is readable back via derivedCache.get(assetId).
+//   2. (Behavioral) a miss on an unknown assetId returns undefined.
+//   3. (Behavioral) after invalidation the entry is no longer readable.
+//   4. (Source assertion) crop.js does NOT read parentCard._jxlDecoded
+//      as the final pixel source; it uses the return value of decodeFullJxlFor.
+// ---------------------------------------------------------------------------
+
+describe('M-3: derived-cache write→read round-trip (I-1 regression guard)', () => {
+    test('commitJxlDecodeCache with derivedCache writes pixels; get() returns them', () => {
+        const store = createAssetStateStore();
+        const derivedCache = createDerivedCache({ maxBytes: 10 * 1024 * 1024 });
+        const assetId = 'card-subject-001';
+        store.getOrCreate(assetId);
+        const tag = store.makeResultTag(assetId);
+        const pixels = new Uint8ClampedArray([10, 20, 30, 255, 40, 50, 60, 255]);
+        const target = {};
+
+        commitJxlDecodeCache({
+            target, tag, store, derivedCache,
+            seen: new Set(),
+            decodeId: 42, pixels, w: 2, h: 1, isFinal: true, policy: 'onFinal',
+        });
+
+        // The value must be readable from the derived cache, NOT from target._jxlDecoded.
+        const hit = derivedCache.get(assetId);
+        expect(hit).not.toBeUndefined();
+        expect(hit.rgba).toBe(pixels);
+        expect(hit.w).toBe(2);
+        expect(hit.h).toBe(1);
+        // target._jxlDecoded must NOT be set (that would be the old legacy path).
+        expect(target._jxlDecoded).toBeUndefined();
+    });
+
+    test('derived-cache miss returns undefined for an assetId that was never written', () => {
+        const derivedCache = createDerivedCache({ maxBytes: 10 * 1024 * 1024 });
+        expect(derivedCache.get('never-written-asset')).toBeUndefined();
+    });
+
+    test('after invalidation, derived-cache read returns undefined (stale-invalidation path)', () => {
+        const store = createAssetStateStore();
+        const derivedCache = createDerivedCache({ maxBytes: 10 * 1024 * 1024 });
+        const assetId = 'card-invalidate-me';
+        store.getOrCreate(assetId);
+        const tag = store.makeResultTag(assetId);
+        const pixels = new Uint8ClampedArray([1, 2, 3, 4]);
+        const target = {};
+
+        commitJxlDecodeCache({
+            target, tag, store, derivedCache,
+            seen: new Set(),
+            decodeId: 1, pixels, w: 1, h: 1, isFinal: true, policy: 'onFinal',
+        });
+        expect(derivedCache.get(assetId)).not.toBeUndefined();
+
+        // Simulate reprocess / card delete → invalidate.
+        derivedCache.invalidate(assetId);
+        expect(derivedCache.get(assetId)).toBeUndefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// M-3: crop.js source-text assertion — uses decodeFullJxlFor return value
+// (not a bare parentCard._jxlDecoded read) as the final pixel source.
+// ---------------------------------------------------------------------------
+
+describe('crop.js source-text: renderSubjectThumb reads pixels from decodeFullJxlFor return (I-1)', () => {
+    // Extract the renderSubjectThumb function body from crop.js source.
+    function renderSubjectThumbBody() {
+        const fnStart = cropSrc.indexOf('async function renderSubjectThumb(');
+        if (fnStart < 0) return '';
+        // The function is ~60 lines; 3000 chars covers it safely.
+        return cropSrc.slice(fnStart, fnStart + 3000);
+    }
+
+    test('renderSubjectThumb exists in crop.js', () => {
+        expect(cropSrc.indexOf('async function renderSubjectThumb(')).toBeGreaterThan(-1);
+    });
+
+    test('renderSubjectThumb calls decodeFullJxlFor and captures its return value', () => {
+        const fnBody = renderSubjectThumbBody();
+        // Must call window.decodeFullJxlFor (or decodeFullJxlFor) with await.
+        expect(fnBody).toContain('decodeFullJxlFor');
+        expect(fnBody).toContain('await');
+        // The return value must be captured (assigned to a variable), not discarded.
+        // Pattern: jd = await window.decodeFullJxlFor OR const jd = await decodeFullJxlFor
+        const capturesReturn = /\w+\s*=\s*await\s+(window\.)?decodeFullJxlFor/.test(fnBody);
+        expect(capturesReturn).toBe(true);
+    });
+
+    test('renderSubjectThumb does NOT use parentCard._jxlDecoded as the primary (assetId-path) pixel source', () => {
+        // The bug: const jd = parentCard._jxlDecoded; was undefined for assetId cards.
+        // After the fix, pixels come from decodeFullJxlFor's return, with _jxlDecoded
+        // only as a legacy fallback for assetId-less cards. There must be no path that
+        // reads _jxlDecoded BEFORE (or instead of) calling decodeFullJxlFor.
+        const fnBody = renderSubjectThumbBody();
+        // decodeFullJxlFor must appear before any read of _jxlDecoded in the function body.
+        const dfIdx = fnBody.indexOf('decodeFullJxlFor');
+        const legacyIdx = fnBody.indexOf('_jxlDecoded');
+        // decodeFullJxlFor must exist in the body.
+        expect(dfIdx).toBeGreaterThan(-1);
+        // If _jxlDecoded appears at all, it must come AFTER the decodeFullJxlFor call
+        // (only as a fallback, not as the primary read path).
+        if (legacyIdx >= 0) {
+            expect(legacyIdx).toBeGreaterThan(dfIdx);
+        }
+    });
+});
+
