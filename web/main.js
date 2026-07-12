@@ -1,4 +1,4 @@
-﻿// Main thread.  Builds a Worker pool, dispatches each ORF to a free worker,
+// Main thread.  Builds a Worker pool, dispatches each ORF to a free worker,
 // streams events back (thumb → lightbox-preview → JXL bytes), and renders
 // thumbnails + a clickable lightbox grid.
 //
