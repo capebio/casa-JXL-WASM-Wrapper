@@ -80,6 +80,13 @@ async function loadWasm() {
        decode_exr, decode_tiff, decode_jpeg } = rawWasm);
 }
 
+// P3-T8 (finding 34): does the loaded wasm expose the DNG deferred-finish binding?
+// An older shipped web/pkg predates it, so the DNG/CR2 split falls back to the
+// monolithic path (feature-detected, never assumed present).
+function dngDeferredFinishAvailable() {
+    return typeof rawWasm?.ProcessResult?.prototype?.finish_dng_full_rgb8 === 'function';
+}
+
 // Route a RAW buffer to its WASM decoder via the SINGLE-SOURCE sniffer in
 // format-detect.js (detectRawKind) — the worker no longer re-implements its own
 // magic table. Olympus ORF / Canon CR2 / Adobe-DNG-family TIFF map to their
@@ -832,7 +839,23 @@ self.addEventListener('message', async (ev) => {
         // DISABLES the split. Exact gate per spec:
         //   canSplit = nativeRaw && interactive && rawKind === 'orf' && !denoise.enabled
         const denoise = opts.denoise || { enabled: false };
-        const canSplit = nativeRaw && interactive && rawKind === 'orf' && !denoise.enabled;
+        // ORF split: cheap superpixel previews in phase 1, full MHC demosaic once in
+        // phase 2 from the retained mosaic (finish_full_rgb8).
+        const orfSplit = nativeRaw && interactive && rawKind === 'orf' && !denoise.enabled;
+        // P3-T8 (finding 34) — DNG/CR2 deferred finish: phase 1 does the FULL container
+        // decode + eager demosaic (needed for its previews, which downscale from the
+        // full-res MHC — the SAME source the monolithic path uses, so preview bytes are
+        // identical) and RETAINS the raw mosaic; phase 2's finish_dng_full_rgb8 re-runs
+        // demosaic+tone from that mosaic with NO second container decode. This makes the
+        // container decode-once contract explicit. Gated on the new binding being present
+        // so an older shipped web/pkg simply stays monolithic (feature-detected).
+        const dngSplit =
+            nativeRaw &&
+            interactive &&
+            (rawKind === 'dng' || rawKind === 'cr2') &&
+            !denoise.enabled &&
+            dngDeferredFinishAvailable();
+        const canSplit = orfSplit || dngSplit;
         // Finding 52 (colour truth): for CR2 the in-WASM lb/thumb/final renders and the
         // interactive LookRenderer now consume ONE resolved camera→sRGB matrix. The
         // matrix is resolved once in the decoder (cr2::resolved_color_matrix) and lib.rs
@@ -1011,16 +1034,24 @@ self.addEventListener('message', async (ev) => {
         if (canSplit) {
             const p2T0 = performance.now();
             try {
-                // Same 14 look args, same order, as process_orf_with_flags / phase 1.
-                result.finish_full_rgb8(
+                // Same 14 look args, same order, as the phase-1 decoder. ORF finishes
+                // via finish_full_rgb8 (RGGB demosaic); DNG/CR2 via finish_dng_full_rgb8
+                // (CFA-phase demosaic + BaselineExposure fold). Both reuse the retained
+                // mosaic — NO second container decode.
+                const finishArgs = [
                     OUT_FULL_RGB8 | OUT_NO_ORIENT,
                     lookArgs.exposureEv, lookArgs.contrast, lookArgs.highlights, lookArgs.shadows,
                     lookArgs.whites, lookArgs.blacks, lookArgs.saturation, lookArgs.vibrance,
                     lookArgs.temp, lookArgs.tint, lookArgs.wbR, lookArgs.wbB,
                     lookArgs.texture, lookArgs.clarity,
-                );
+                ];
+                if (dngSplit) {
+                    result.finish_dng_full_rgb8(...finishArgs);
+                } else {
+                    result.finish_full_rgb8(...finishArgs);
+                }
                 const p2Ms = performance.now() - p2T0;
-                encW = result.width;   // full sensor dims, set by finish_full_rgb8
+                encW = result.width;   // full sensor dims, set by the finish
                 encH = result.height;
                 // Honest single-decompress cost: decompress ran ONCE (phase 1); the
                 // finish contributes demosaic+tonemap only (its orient is skipped by

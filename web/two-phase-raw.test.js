@@ -207,3 +207,43 @@ batchTest('mode 3: retain-raw + finish_full_rgb8 == monolithic full, single deco
     expect(() => noRetain.finish_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0)).toThrow();
     noRetain.free();
 }, 300_000);
+
+// P3-T8 (finding 34): deferred DNG finish. The DNG twin of the mode-3 ORF test.
+// Phase-1 retains the container-decoded raw mosaic + CFA phase + BaselineExposure;
+// finish_dng_full_rgb8 produces the full-res RGB8 FROM it with NO second container
+// decode (dng::decode_bytes runs once). The full RGB8 must be byte-identical to the
+// monolithic decode (finish_dng_from_raw is the single shared demosaic+tone source),
+// and the container decode/decompress must run exactly once.
+//
+// Env note: this exercises the NEW bindings (finish_dng_full_rgb8 + the DNG retain
+// branch). When the shipped web/pkg predates them, the real-WASM path env-BLOCKS;
+// the decode-count + byte-parity invariant is proven Rust-side in
+// crates/raw-pipeline/tests/dng_deferred_finish.rs. Rebuild web/pkg to run this.
+dngTest('mode 3 (DNG): retain-raw + finish_dng_full_rgb8 == monolithic full, single decode', async () => {
+    await ensureRaw();
+    if (typeof rawWasm.ProcessResult?.prototype?.finish_dng_full_rgb8 !== 'function') {
+        console.log('  SKIP (OWED): shipped web/pkg predates finish_dng_full_rgb8 — proven Rust-side (dng_deferred_finish.rs)');
+        return;
+    }
+    const bytes = new Uint8Array(readFileSync(DNG_FIXTURE));
+    // Reference: monolithic full decode (one container decode, one demosaic+tone).
+    const ref = processNeutral(rawWasm.process_dng_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+    const refSha = sha(ref.take_rgb()); ref.free();
+
+    // Mode 3: phase-1 previews + retain raw, then finish full-res from the retained mosaic.
+    const r = processNeutral(rawWasm.process_dng_with_flags, bytes, OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW);
+    const phase1Decompress = r.decompress_ms;
+    r.finish_dng_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+    const modeSha = sha(r.take_rgb());
+    const afterDecompress = r.decompress_ms;
+    r.free();
+    console.log(`  mode3 DNG decompress_ms: phase1=${phase1Decompress} afterFinish=${afterDecompress} (finish adds 0)`);
+    expect(modeSha).toBe(refSha);                    // byte-identical full output
+    expect(phase1Decompress).toBeGreaterThan(0);     // phase-1 did the (only) container decode
+    expect(afterDecompress).toBe(phase1Decompress);  // finish added NO decode
+
+    // Contract: DNG finish without a retained raw must throw.
+    const noRetain = processNeutral(rawWasm.process_dng_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+    expect(() => noRetain.finish_dng_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0)).toThrow();
+    noRetain.free();
+}, 300_000);
