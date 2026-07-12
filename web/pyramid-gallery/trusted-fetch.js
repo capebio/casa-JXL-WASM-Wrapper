@@ -110,6 +110,14 @@ function assertContained(rootUrl, candidate, stage) {
  * @param {AbortSignal} [opts.signal]         Caller abort signal.
  * @param {typeof fetch} [opts.fetchImpl]     Injected fetch (defaults to global fetch).
  * @param {SubtleCrypto} [opts.subtle]        Injected SubtleCrypto (defaults to crypto.subtle).
+ * @param {{ start: number, endExclusive: number }} [opts.range]
+ *        Half-open byte window `[start, endExclusive)` (Task 6). When present, an HTTP
+ *        `Range: bytes=start-(endExclusive-1)` is sent; a `206` is accepted (its `Content-Range`
+ *        start is validated against `start`) and only that slice is returned. A `200` fallback
+ *        (server ignored Range) is tolerated: the requested window is sliced from the full body
+ *        so the delivered bytes are always exactly the range. `expectedBytes` becomes the window
+ *        length (`endExclusive - start`) automatically; a caller-supplied `sha256` then verifies
+ *        the RANGE bytes. Range fetches are `exactBytes` for a 206 (the slice must be complete).
  * @returns {Promise<ArrayBuffer>}            The verified body bytes.
  */
 export async function fetchVerifiedAsset({
@@ -121,11 +129,27 @@ export async function fetchVerifiedAsset({
   signal,
   fetchImpl,
   subtle,
+  range,
 }) {
   const doFetch = fetchImpl ?? (typeof fetch !== "undefined" ? fetch : undefined);
   if (!doFetch) fail("no fetch implementation available", "no-fetch");
   const digestImpl =
     subtle ?? (typeof crypto !== "undefined" ? crypto.subtle : undefined);
+
+  // Range window (Task 6): validate + derive the exact expected length from the window so the cap
+  // and truncation checks below apply to the SLICE, not the whole resource.
+  let rangeStart = 0;
+  let rangeLen = 0;
+  const hasRange = range != null;
+  if (hasRange) {
+    rangeStart = range.start;
+    const end = range.endExclusive;
+    if (!Number.isInteger(rangeStart) || rangeStart < 0 || !Number.isInteger(end) || end <= rangeStart) {
+      fail(`range must satisfy 0 <= start < endExclusive (got ${rangeStart}..${end})`, "bad-range");
+    }
+    rangeLen = end - rangeStart;
+    expectedBytes = rangeLen; // the window length is the precise cap for a ranged fetch.
+  }
 
   // Argument bounds: expectedBytes is the hard cap; a non-finite / non-positive cap is meaningless
   // and would let an unbounded body through, so reject it before touching the network.
@@ -136,7 +160,16 @@ export async function fetchVerifiedAsset({
   const rootUrl = root instanceof URL ? root : new URL(String(root));
   const target = resolveContained(rootUrl, relativePath);
 
-  const res = await doFetch(target.href, { signal, redirect: "error", cache: "no-store" });
+  // Signal is honored before touching the network too (some fetch impls only observe it mid-body).
+  if (signal?.aborted) {
+    throw new DOMException("Aborted", "AbortError");
+  }
+
+  const fetchInit = { signal, redirect: "error", cache: "no-store" };
+  if (hasRange) {
+    fetchInit.headers = { Range: `bytes=${rangeStart}-${rangeStart + rangeLen - 1}` };
+  }
+  const res = await doFetch(target.href, fetchInit);
   if (!res || !res.ok) {
     fail(`fetch ${target.href} failed: ${res ? res.status : "no response"}`, "http");
   }
@@ -157,6 +190,44 @@ export async function fetchVerifiedAsset({
     // A redirect that stayed in-subtree is still allowed (url check passed); this only fires when
     // the impl reports a redirect AND the url check somehow did not run (no res.url).
     if (!res.url) fail("response redirected but exposes no final URL to verify", "redirect");
+  }
+
+  // Ranged fetch that fell back to a full body (server ignored Range → 200): read the whole body
+  // (still capped generously to prevent an unbounded DoS) and slice the requested window so the
+  // delivered bytes are ALWAYS exactly the range, regardless of server Range support (Task 6).
+  if (hasRange && res.status === 200) {
+    // The full resource may legitimately exceed the window; cap at a large ceiling so we cannot
+    // buffer unbounded bytes but can still reach the requested window.
+    const FULL_FALLBACK_CAP = 512 * 1024 * 1024; // matches LEVEL_MAX_BYTES ceiling in image-store.
+    const declaredFull = Number(res.headers?.get?.("content-length"));
+    if (Number.isFinite(declaredFull) && declaredFull > FULL_FALLBACK_CAP) {
+      fail(`Content-Length ${declaredFull} exceeds fallback cap ${FULL_FALLBACK_CAP}`, "oversize-header");
+    }
+    const full = await readCapped(res, FULL_FALLBACK_CAP);
+    if (full.length < rangeStart + rangeLen) {
+      fail(`resource length ${full.length} shorter than requested window end ${rangeStart + rangeLen}`, "truncated");
+    }
+    const body = full.subarray(rangeStart, rangeStart + rangeLen);
+    if (sha256 != null) {
+      if (!digestImpl) fail("no SubtleCrypto available to verify sha256", "no-subtle");
+      const actual = await sha256HexOf(digestImpl, body);
+      if (actual.toLowerCase() !== String(sha256).toLowerCase()) {
+        fail(`sha256 mismatch: expected ${sha256}, got ${actual}`, "sha-mismatch");
+      }
+    }
+    return body.slice().buffer;
+  }
+
+  // For a 206, validate the Content-Range start matches the requested window (defends against a
+  // proxy that shifts/normalizes the range and would otherwise silently return the wrong bytes).
+  if (hasRange && res.status === 206) {
+    const cr = res.headers?.get?.("content-range");
+    const m = cr == null ? null : /^bytes\s+(\d+)-/.exec(cr);
+    if (m == null || Number(m[1]) !== rangeStart) {
+      fail(`Content-Range start mismatch (wanted ${rangeStart}, got ${cr ?? "none"})`, "range-mismatch");
+    }
+    // A 206 slice must be complete (exact length), so force exactBytes below.
+    exactBytes = true;
   }
 
   // Byte cap BEFORE streaming: a declared Content-Length larger than the cap is rejected without
