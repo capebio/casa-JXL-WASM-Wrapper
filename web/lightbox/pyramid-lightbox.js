@@ -738,6 +738,13 @@ export function createPyramidLightbox(deps) {
     // captured under a prior generation will be rejected at its commit point, so a
     // late old-image load cannot overwrite the newly-opened image.
     loadGuard.newGeneration(item.id);
+    // finding 42 (M-1): capture THIS open's generation BEFORE the manifest await
+    // below. On resume we re-check canCommit(openToken) before the synchronous
+    // LRU-seed / blank-buffer writes, so a rapid second open()/navigate() that
+    // ran during our await cannot have its view clobbered by our stale seed. Rank
+    // -Infinity keeps the seed at the monotonic floor: it commits only when it is
+    // the FIRST paint of a still-current generation, never over a real level.
+    const openToken = loadGuard.begin({ itemId: item.id, contenthash: 'open-seed', rank: -Infinity });
 
     eng = createFilterEngine(LightboxPreset.NONE);
     for (const k of ADJUSTMENT_PARAMS) adjustments[k] = 0;
@@ -778,8 +785,14 @@ export function createPyramidLightbox(deps) {
 
     let seeded = false;
 
+    // finding 42 (M-1): if a newer open()/navigate() bumped the generation during
+    // the manifest await, this open is stale — skip the synchronous seed writes so
+    // they cannot clobber the current image's view. loadLevel() below has its own
+    // per-load guard, so only the seed / blank-fallback writes are gated here.
+    const seedIsCurrent = loadGuard.canCommit(openToken);
+
     // LRU first (8-bit decoded levels only).
-    if (init && !init.tiled && !is16bitMode) {
+    if (seedIsCurrent && init && !init.tiled && !is16bitMode) {
       const hit = lruGet(init.contenthash);
       if (hit) {
         levelPixels = new Uint8ClampedArray(hit.pixels);
@@ -796,7 +809,7 @@ export function createPyramidLightbox(deps) {
 
     if (init && !seeded) {
       await loadLevel(init);
-    } else if (!seeded) {
+    } else if (!seeded && seedIsCurrent) {
       levelPixels = new Uint8ClampedArray(VIEW_W * VIEW_H * 4);
       levelInfo = {w: VIEW_W, h: VIEW_H, size: Math.max(VIEW_W, VIEW_H), contenthash: 'fallback', bitsPerSample: 8};
       offscreen = document.createElement('canvas');

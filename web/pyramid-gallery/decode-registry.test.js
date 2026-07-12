@@ -99,3 +99,35 @@ test('an explicit release() (no signal) contributes to the refcount too', async 
   b.release();
   expect(d.state.aborted).toBe(true);  // now cancelled
 });
+
+test('re-decode within the SAME synchronous tick as cancel starts a FRESH decode, not a re-attach to the cancelled shared (finding I-1)', () => {
+  // Regression: when the last lease releases, cancelIfIdle() aborts the shared
+  // decode SYNCHRONOUSLY, but the registry entry was formerly evicted only ASYNC
+  // (p.then(evict, evict)). In that synchronous window `inflight.has(key)` is
+  // still true, so a re-decode(key) re-attached to the already-cancelled shared —
+  // no fresh decode started and the new lease rejected with AbortError.
+  //
+  // Reachable under fast-scroll re-intersect: a cell leaves then re-intersects in
+  // the same IntersectionObserver callback batch (release -> re-acquire) BEFORE
+  // any microtask/await runs the async eviction.
+  const reg = createInflightDecodes();
+  const d = makeDecode();
+
+  // First decode + immediate last-lease release => synchronous cancel.
+  const first = reg.decode('k', d.start);
+  first.release();               // last lease out -> shared aborts synchronously
+  expect(d.state.aborted).toBe(true);
+  expect(d.state.started).toBe(1);
+
+  // WITHIN the same synchronous tick (no await/microtask yet), re-decode the key.
+  const d2 = makeDecode();
+  const second = reg.decode('k', d2.start);
+
+  // A FRESH decode must have started (the cancelled shared was evicted at cancel).
+  expect(d2.state.started).toBe(1);
+  // And the new lease must NOT be attached to the aborted shared.
+  expect(d2.state.aborted).toBe(false);
+  expect(reg.size()).toBe(1);
+  d2.finish('fresh');
+  return expect(second.promise).resolves.toBe('fresh');
+});

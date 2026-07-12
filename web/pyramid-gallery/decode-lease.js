@@ -32,9 +32,15 @@
  *   Runs the underlying decode. Called exactly once, lazily, on the first
  *   `acquire()`. Receives the shared AbortSignal; it must abort the decode when
  *   that signal fires (which only happens once ALL leases are released).
- * @returns {{ acquire: (signal?: AbortSignal | null) => DecodeLease<T>, readonly leaseCount: number }}
+ * @param {{ onCancel?: () => void }} [opts]
+ *   `onCancel` is invoked SYNCHRONOUSLY at the instant the shared decode is
+ *   cancelled at refcount zero (inside `cancelIfIdle`, before the abort listener
+ *   settles the promise). A registry uses it to evict its entry immediately so a
+ *   re-`acquire()` in the same synchronous tick starts fresh instead of joining
+ *   the already-cancelled decode (finding I-1). Fires at most once.
+ * @returns {{ acquire: (signal?: AbortSignal | null) => DecodeLease<T>, readonly leaseCount: number, readonly cancelled: boolean }}
  */
-export function createSharedDecode(start) {
+export function createSharedDecode(start, { onCancel } = {}) {
   const sharedController = new AbortController();
   let count = 0;
   let started = false;
@@ -64,11 +70,19 @@ export function createSharedDecode(start) {
   function cancelIfIdle() {
     if (count <= 0 && !cancelled) {
       cancelled = true;
+      // Evict-on-cancel hook FIRST (finding I-1): drop the registry entry
+      // synchronously, before aborting, so a re-acquire in this same tick cannot
+      // rejoin the about-to-be-cancelled shared. onCancel must not throw.
+      onCancel?.();
       sharedController.abort();
     }
   }
 
   /**
+   * The caller MUST always call `release()` on the returned lease — including on
+   * success, in a `finally`. If a lease is never released, its refcount is never
+   * returned, so the shared decode never cancels and (when a `signal` was passed)
+   * its `abort` listener leaks.
    * @param {AbortSignal | null} [signal]
    * @returns {DecodeLease<T>}
    */
@@ -113,6 +127,9 @@ export function createSharedDecode(start) {
     get leaseCount() {
       return count;
     },
+    get cancelled() {
+      return cancelled;
+    },
   };
 }
 
@@ -136,6 +153,9 @@ export function createInflightDecodes() {
   const inflight = new Map();
 
   /**
+   * The caller MUST always call `release()` on the returned lease — including on
+   * success, in a `finally`. A lease that is never released keeps the shared
+   * decode from cancelling and leaks its `signal` abort listener.
    * @param {string} key
    * @param {(sharedSignal: AbortSignal) => Promise<T>} start
    * @param {AbortSignal | null} [signal]
@@ -143,7 +163,17 @@ export function createInflightDecodes() {
    */
   function decode(key, start, signal = null) {
     let shared = inflight.get(key);
+    // Defensive (finding I-1): never rejoin a shared that has already been
+    // cancelled at refcount zero. The onCancel hook below normally evicts it
+    // synchronously, but this guard also covers any path that leaves a cancelled
+    // shared mapped — drop it and fall through to a fresh decode.
+    if (shared && shared.cancelled) {
+      inflight.delete(key);
+      shared = undefined;
+    }
     if (!shared) {
+      // `evict` only removes THIS entry (identity-checked) so it can never delete
+      // a fresher decode that replaced it under the same key. Idempotent.
       const evict = () => { if (inflight.get(key) === shared) inflight.delete(key); };
       shared = createSharedDecode((sharedSignal) => {
         // Call the real decode SYNCHRONOUSLY (its abort listener must be wired
@@ -159,6 +189,12 @@ export function createInflightDecodes() {
         }
         p.then(evict, evict);
         return p;
+      }, {
+        // Cancel-at-zero evicts the entry SYNCHRONOUSLY (finding I-1), before the
+        // async settle path runs, so a re-decode(key) in the same tick starts
+        // fresh instead of attaching to the just-cancelled shared. `evict` is
+        // identity-checked and idempotent, so a later async settle is a no-op.
+        onCancel: () => evict(),
       });
       inflight.set(key, shared);
     }

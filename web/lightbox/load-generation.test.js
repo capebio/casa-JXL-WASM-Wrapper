@@ -88,3 +88,39 @@ test('newGeneration resets the committed rank so the next image can paint from s
   const b = guard.begin({ itemId: 'B', contenthash: 'b', rank: 40 });
   expect(guard.canCommit(b)).toBe(true);
 });
+
+test('open() seed race (M-1): a stale open cannot write its seed after a newer open ran during the manifest await', () => {
+  // Reproduces the open()-seed hazard: open() bumps the generation and captures a
+  // token (rank -Infinity, the seed floor) BEFORE awaiting getManifest; a rapid
+  // second open()/navigate() opens a fresher generation during that await; the
+  // first open resumes and must NOT commit its (now stale) LRU-seed / blank-buffer.
+  const guard = createLoadGuard();
+
+  // open(A): bump generation, capture the seed token before the manifest await.
+  guard.newGeneration('A');
+  const openTokenA = guard.begin({ itemId: 'A', contenthash: 'open-seed', rank: -Infinity });
+
+  // During A's await, the user navigates: open(B) bumps to a fresher generation.
+  guard.newGeneration('B');
+  const openTokenB = guard.begin({ itemId: 'B', contenthash: 'open-seed', rank: -Infinity });
+
+  // A resumes: its seed writes are gated on canCommit(openTokenA) -> must be false
+  // (stale generation), so the stale seed is skipped and B's view is preserved.
+  expect(guard.canCommit(openTokenA)).toBe(false);
+  // B's own seed is current and may commit (first paint of the live generation).
+  expect(guard.canCommit(openTokenB)).toBe(true);
+});
+
+test('open() seed token (rank -Infinity) commits as the first paint of a current generation but never over a real level', () => {
+  const guard = createLoadGuard();
+  guard.newGeneration('A');
+  // Fresh generation, nothing committed: the -Infinity seed floor is allowed.
+  const seed = guard.begin({ itemId: 'A', contenthash: 'open-seed', rank: -Infinity });
+  expect(guard.canCommit(seed)).toBe(true);
+
+  // Once a real level commits, a late seed recheck must not clobber it.
+  const real = guard.begin({ itemId: 'A', contenthash: 'lvl', rank: 100 });
+  guard.commit(real);
+  const lateSeed = guard.begin({ itemId: 'A', contenthash: 'open-seed', rank: -Infinity });
+  expect(guard.canCommit(lateSeed)).toBe(false);
+});
