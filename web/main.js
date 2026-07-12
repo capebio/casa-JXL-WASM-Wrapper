@@ -14,7 +14,12 @@ import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.j
 // Finding 40/41/46/48: per-asset edit/crop/persistence/generation state store.
 import { createAssetStateStore, makeAssetId, normalizeCrop as _normalizeCrop } from './asset-state-store.js';
 // Findings 13, 44, 45: full-resolution export service + metadata policy + real format label.
-import { ExportService, formatLabel as _formatLabel } from './export-service.js';
+// The service sources the FULL-RES DEVELOPED OUTPUT (never the 1800px preview),
+// gates formats (jxl/png real; jpeg/tiff packet-3), and threads serialised EXIF
+// (metadata policy) into the encoder.
+import { ExportService, formatLabel as _formatLabel, isFormatEncodable as _isFormatEncodable } from './export-service.js';
+// I-B: real PNG encoder (honest bytes for the PNG export option).
+import { encodePng as _encodePng } from './png-encode.js';
 // Finding 48: gated JXL decode cache-write commit (stale-tag guard BEFORE write).
 import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 // Findings 11, 29: byte-budgeted, LRU-evicting derived cache for decoded JXL
@@ -3859,15 +3864,18 @@ function applyLookToFilmstripSelection() {
 // ---------------------------------------------------------------------------
 
 /**
- * Export all filmstrip-selected cards at full resolution.
+ * Export all filmstrip-selected cards at FULL RESOLUTION.
  *
  * Routes through ExportService (single entry point for all export paths).
- * NEVER exports preview-resolution canvas bytes — uses the full-res lightbox
- * pixels held in getCardState(card)._lightbox.
  *
- * Metadata policy: reads from the export-settings panel if present,
- * defaults to 'keep'.  Output format: 'jxl' (default) — extendable via
- * a format-picker UI (future work).
+ * I-A: full resolution is sourced from the DEVELOPED FULL-RES OUTPUT — the
+ *   full-res developed JXL (`_blobUrl`, dims from `_exif.width/height`) — NEVER
+ *   the 1800px `_lightbox` preview.  JXL/keep passes the developed bytes through
+ *   unchanged.  Other outputs decode the full-res developed JXL and re-encode.
+ * I-B: only formats that genuinely encode are offered (jxl/png real; jpeg/tiff
+ *   gated).  PNG produces honest PNG bytes from the full-res RGBA.
+ * I-C: the metadata privacy policy is serialised to EXIF bytes and threaded into
+ *   the encoder (GPS absent under strip-gps/strip-all).
  */
 async function exportFilmstripSelection() {
     if (filmstripSelection.size === 0) return;
@@ -3894,22 +3902,79 @@ async function exportFilmstripSelection() {
     const output = (['jxl','jpeg','png','tiff'].includes(fmtEl?.value))
         ? fmtEl.value : 'jxl';
 
-    // Create the ExportService, injecting the main-thread encoder.
+    // I-B: guard at the entry point too (defence in depth — the UI disables
+    // gated options, and the service rejects them per-asset).  Fail fast with a
+    // single status message rather than emitting N identical per-asset errors.
+    if (!_isFormatEncodable(output)) {
+        if (statusText) {
+            statusBar.hidden = false;
+            statusText.textContent = `${output.toUpperCase()} export is not available yet (packet-3).`;
+        }
+        return;
+    }
+
+    const cardForAsset = (assetId) => cards.find(c => getCardState(c)?._assetId === assetId) ?? null;
+    // Tracks which asset the service is currently processing, so decodeFullRes
+    // can find the right card (the service passes bytes, not the assetId).  Set
+    // on each 'preparing' progress event below (the service is strictly serial).
+    let _currentExportAssetId = null;
+
+    // Create the ExportService, injecting the developed-output source + encoders.
     const svc = new ExportService({
         getCardStateByAssetId(assetId) {
-            // Find the card whose assetId matches.
-            for (const c of cards) {
-                if (getCardState(c)?._assetId === assetId) return getCardState(c);
-            }
-            return null;
+            const c = cardForAsset(assetId);
+            return c ? getCardState(c) : null;
         },
-        async encodePixels(pixels, w, h, format, orientation, outputFmt) {
-            // Route to the existing full-resolution JXL encoder.
-            // Packet-3 integration point: when alternative output formats
-            // (PNG/TIFF/JPEG) land, switch on outputFmt here.
-            const quality = 90;   // sensible default; future: read from UI
-            const effort  = 3;
-            return encodeJxlSession(pixels, w, h, quality, effort, false, false, format, orientation);
+        // I-A: the developed FULL-RES output.  `_blobUrl` is the full-res
+        // developed JXL blob; fetch its bytes lazily.  Dims come from the sensor
+        // dims patched onto _exif at DONE (msg.w/msg.h), never the preview.
+        async getDevelopedOutput(state) {
+            const url = state?._blobUrl;
+            const w = state?._exif?.width, h = state?._exif?.height;
+            if (!url || !w || !h) return null;
+            const resp = await fetch(url);
+            const jxlBytes = new Uint8Array(await resp.arrayBuffer());
+            return { jxlBytes, w, h };
+        },
+        // I-A: if the developed full-res JXL is not present yet, trigger the
+        // existing full-res convert flow and await it.
+        async ensureDeveloped(assetId) {
+            const c = cardForAsset(assetId);
+            if (!c) return;
+            if (getCardState(c)?._blobUrl) return;          // already developed
+            await new Promise((resolve) => {
+                const t0 = Date.now();
+                const poll = () => {
+                    if (getCardState(c)?._blobUrl || Date.now() - t0 > 60000) return resolve();
+                    setTimeout(poll, 150);
+                };
+                // Kick a full-res reprocess if one is not already in flight.
+                try { if (typeof startConvert === 'function') startConvert(getCardState(c)._file, c); } catch {}
+                poll();
+            });
+        },
+        // Decode the developed FULL-RES JXL back to full-res RGBA (never the
+        // preview).  Reuses the existing full-JXL decode path.
+        async decodeFullRes(_jxlBytes) {
+            // We decode via the card's blob URL through the shared session
+            // (decodeFullJxlFor), which yields { rgba, w, h } at full dims.
+            const c = cardForAsset(_currentExportAssetId);
+            if (!c) throw new Error('card not found for full-res decode');
+            const dec = await window.decodeFullJxlFor(c);
+            if (!dec || !dec.rgba) throw new Error('full-res JXL decode failed');
+            return { pixels: dec.rgba, w: dec.w, h: dec.h, format: 'rgba8' };
+        },
+        // Re-encode full-res pixels to the requested format, embedding the
+        // policy-serialised metadata bytes (I-C).
+        async encodePixels(pixels, w, h, format, orientation, outputFmt, metadataBytes) {
+            if (outputFmt === 'png') {
+                // I-B: honest PNG bytes.  (PNG carries no EXIF here; the privacy
+                // policy is still honoured because no metadata is embedded.)
+                return _encodePng(pixels, w, h, format === 'rgb8' ? 'rgb8' : 'rgba8');
+            }
+            // jxl re-encode with serialised EXIF/XMP (I-C).
+            const quality = 90, effort = 3;
+            return encodeJxlSession(pixels, w, h, quality, effort, false, false, format, orientation, metadataBytes);
         },
     });
 
@@ -3926,7 +3991,8 @@ async function exportFilmstripSelection() {
         const req = { assetIds, output, metadata, resolution: 'full' };
         for await (const ev of svc.export(req)) {
             if (ev.type === 'progress') {
-                // Optional: update a progress indicator.
+                // Track the in-flight asset so decodeFullRes finds the right card.
+                _currentExportAssetId = ev.assetId;
                 if (exportBtn) exportBtn.textContent = `Exporting… (${ev.phase})`;
             } else if (ev.type === 'done') {
                 doneCount++;
