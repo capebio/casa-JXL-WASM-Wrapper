@@ -141,6 +141,18 @@ fn deferred_finish_decodes_container_once_and_is_byte_identical() {
         "phase-1 preview must decode the container exactly once"
     );
     let retained = RetainedDng::from_decoded(preview);
+    // Retained working set held between preview and final: the raw Bayer mosaic
+    // (u16/sample) + the small metadata carrier. This is the memory cost of the
+    // deferred finish (the browser flipflopMem figure is OWED — env-blocked).
+    let retained_bytes = retained.raw.len() * std::mem::size_of::<u16>();
+    eprintln!(
+        "retained: {}x{} mosaic = {} bytes ({:.1} MiB); container decodes = {}",
+        retained.width,
+        retained.height,
+        retained_bytes,
+        retained_bytes as f64 / (1024.0 * 1024.0),
+        dng::decode_count(),
+    );
     let final_rgb16 = retained.finish_rgb16();
     assert_eq!(
         dng::decode_count(),
