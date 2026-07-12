@@ -6,8 +6,10 @@
 // encoder per worker, single-threaded inside.  Pool size scales with
 // `navigator.hardwareConcurrency` so a batch saturates all cores.
 
-import { getContext } from './jxl-browser-context.js';
+import { getContext, setCalibrationPoolSize } from './jxl-browser-context.js';
 import { WorkerMsg } from './worker-message-types.js';
+import { buildCalibrationMessage, calibrationToPoolSize } from './jxl-calibration-propagation.js';
+import { createReadLane } from './jxl-read-lane.js';
 import { RAW_ACCEPT, isRawFilename, stripRawExtension } from './raw-extensions.js';
 import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 // S3: the memory-governed asset store. peepCache's decoded-RGBA LRU is a client
@@ -84,11 +86,17 @@ const POOL_SIZE = (globalThis.__rawCalibration && globalThis.__rawCalibration.wo
     ? Math.max(1, globalThis.__rawCalibration.workers)
     : Math.min(navigator.hardwareConcurrency || 4, 12);
 
+// Finding 9: feed calibrated pool size to the shared JxlContext BEFORE first use.
+// calibrationToPoolSize extracts workers from the profile; setCalibrationPoolSize
+// forwards it to createBrowserContext so the jxl-session scheduler honours the
+// measured worker count rather than its own HC-based default.
+setCalibrationPoolSize(calibrationToPoolSize(globalThis.__rawCalibration ? { selections: globalThis.__rawCalibration } : null));
+
 // Assessment switch (default OFF = blob/O1 behaviour unchanged). Add
 // `?alphaProgressive=1` to the page URL to let alpha/extra-channel VarDCT
 // images emit intermediate progressive paints, so the win (or lack of it) can
 // be measured on real images. Requires the fork (0.12) decode WASM; the stock
-// 0.11.2 module ignores it. See web/jxl-decode-worker.js plumbing.
+// 0.11.2 module ignores it. Forwarded to the jxl-session decode options.
 const ALPHA_PROGRESSIVE = (() => {
     try {
         return new URLSearchParams(globalThis.location?.search ?? '')
@@ -435,7 +443,7 @@ window.decodeFullJxlFor = function decodeFullJxlFor(card) {
     return new Promise((resolve) => {
         if (!getCardState(card)?._blobUrl) { resolve(null); return; }
         if (getCardState(card)._jxlDecoded) { resolve(getCardState(card)._jxlDecoded); return; }
-        pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
+        decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
             if (msg.type === 'decode_error') { resolve(null); return; }
             if (msg.type !== 'jxl_decoded' && msg.isFinal !== true) return;
             resolve(getCardState(card)._jxlDecoded ?? { rgba: msg.rgba, w: msg.w, h: msg.h });
@@ -669,81 +677,9 @@ class WorkerPool {
         this.tasks = new Map(); // id -> handlers
         this.nextId = 1;
         this.workerForTask = new Map(); // taskId -> worker (populated on _releaseWorker)
-        this._jxlDecodeCallbacks = new Map(); // decodeId -> { url, listeners: [{ cb, options }] }
-        this._jxlNextDecodeId    = 1;
-        this._jxlDecodeQueue = [];           // { decodeId, url, priority, options }
-        this._jxlDecodeBusy  = false;
-        this._jxlPendingByUrl = new Map();   // url -> decodeId (dedupe)
-    }
-
-    _jxlPriorityRank(p) { return p === 'high' ? 0 : p === 'low' ? 2 : 1; }
-    _sortJxlQueue() {
-        const rank = this._jxlPriorityRank.bind(this);
-        this._jxlDecodeQueue.sort((a, b) => rank(a.priority) - rank(b.priority));
-    }
-    _pumpJxlQueue() {
-        if (this._jxlDecodeBusy) return;
-        const next = this._jxlDecodeQueue.shift();
-        if (!next) return;
-        this._jxlDecodeBusy = true;
-        this._jxlDecodeWorker.postMessage({
-            type: 'decode_jxl', decodeId: next.decodeId, url: next.url,
-            progressive: next.options?.progressive === true,
-            cachePolicy: next.options?.cachePolicy,
-            progressiveDetail: next.options?.progressiveDetail,
-            previewFirst: next.options?.previewFirst === true,
-            allowAlphaProgressive: next.options?.allowAlphaProgressive ?? ALPHA_PROGRESSIVE,
-            region: next.options?.region ?? null,
-            downsample: next.options?.downsample ?? null,
-            frameIndex: next.options?.frameIndex ?? null,
-            jpegReconstructionAvailable: next.options?.jpegReconstructionAvailable === true,
-        });
-    }
-    _onJxlDecodeResponse(data) {
-        const isFinal = data.type === 'jxl_decoded' || data.isFinal === true;
-        const isTerminal = data.type === 'jxl_decoded' || data.type === 'decode_error';
-        const entry = this._jxlDecodeCallbacks.get(data.decodeId);
-        if (entry) {
-            for (const listener of entry.listeners) {
-                if (typeof listener.options?.guard === 'function' && !listener.options.guard()) continue;
-                // See the policy note above: cache writes stay centralized here.
-                if (data.type === 'jxl_progress' || data.type === 'jxl_decoded') {
-                    const ct = listener.options?.cacheTarget;
-                    // Skip caching into a card removed mid-decode (detached node):
-                    // its _jxlDecoded write would be orphaned onto a dead element.
-                    // Not every listener passes a removal `guard` above, so gate
-                    // centrally on isConnected. The in-flight decode still runs to
-                    // completion (best-effort; push() has no mid-decode cancel) —
-                    // we just don't stash pixels on a card that's gone.
-                    if (!(ct && ct.isConnected === false)) {
-                        applyJxlDecodeCachePolicy(
-                            ct,
-                            data.decodeId,
-                            data.rgba,
-                            data.w,
-                            data.h,
-                            isFinal,
-                            listener.options?.cachePolicy ?? 'never',
-                        );
-                    }
-                }
-                listener.cb(data);
-            }
-            if (isTerminal) {
-                this._jxlDecodeCallbacks.delete(data.decodeId);
-                this._jxlPendingByUrl.delete(entry.url);
-                jxlFirstProgressCacheSeen.delete(data.decodeId);
-            }
-        }
-        // Release the single decode slot only on a true terminal message.
-        // header / preview / recon_jpeg / progress are mid-decode signals — they
-        // must NOT free the slot, or the next queued decode is dispatched to the
-        // same worker while this one is still running (overlapping decodes,
-        // out-of-order frames, unbounded WASM decoder instances).
-        if (isTerminal) {
-            this._jxlDecodeBusy = false;
-            this._pumpJxlQueue();
-        }
+        // Finding 3: _jxl* private queue/state removed. JXL decodes now route
+        // through decodeJxlViaSession() which uses getContext() (the shared
+        // jxl-session scheduler) for priority ordering, dedupe, and cancellation.
     }
 
     init() {
@@ -766,6 +702,13 @@ class WorkerPool {
         const w = new Worker(new URL('./worker.js', import.meta.url), {
             type: 'module',
         });
+        // Finding 9: post calibrated thread count BEFORE any other message so
+        // ensureWasm → initThreadPool uses the right per-worker thread budget.
+        // globalThis.__rawCalibration is set synchronously at startup from the
+        // persisted profile; absent = no-op (worker falls back to HC default).
+        if (globalThis.__rawCalibration) {
+            w.postMessage(buildCalibrationMessage({ selections: globalThis.__rawCalibration }));
+        }
         w.addEventListener('message', (ev) => this._onMessage(w, ev));
         w.addEventListener('error', (ev) => {
             console.error('worker error:', ev);
@@ -922,61 +865,10 @@ class WorkerPool {
     setLiveHandler(fn) { this._liveHandler = fn; }
     setThumbLiveHandler(fn) { this._thumbLiveHandler = fn; }
 
-    setJxlDecodeWorker(w) {
-        this._jxlDecodeWorker = w;
-        w.addEventListener('message', ({ data }) => this._onJxlDecodeResponse(data));
-        w.addEventListener('error', (ev) => {
-            console.error('jxl-decode-worker error:', ev.message);
-            // A worker crash otherwise wedges the queue forever: `_jxlDecodeBusy`
-            // never clears and pending callbacks never resolve (loaders spin).
-            // Fail every in-flight decode and resume the pump so the UI recovers.
-            const reason = ev.message || 'decode worker crashed';
-            for (const [decodeId, entry] of this._jxlDecodeCallbacks) {
-                for (const listener of entry.listeners) {
-                    try { listener.cb({ type: 'decode_error', decodeId, error: reason }); } catch {}
-                }
-                this._jxlPendingByUrl.delete(entry.url);
-                jxlFirstProgressCacheSeen.delete(decodeId);
-            }
-            this._jxlDecodeCallbacks.clear();
-            this._jxlDecodeBusy = false;
-            this._pumpJxlQueue();
-        });
-        w.postMessage({ type: 'preload' });
-    }
-
-    /**
-     * @param {string} url
-     * @param {(msg: any) => void} callback
-     * @param {'high'|'normal'|'low'} [priority='normal']
-     * @param {{progressive?: boolean, cachePolicy?: 'onFirstProgress'|'onFinal'|'never', progressiveDetail?: string, cacheTarget?: any, guard?: () => boolean}} [options]
-     */
-    decodeJxl(url, callback, priority = 'normal', options = {}) {
-        // Dedupe — if same URL already pending, chain callback + promote priority.
-        const existingId = this._jxlPendingByUrl.get(url);
-        if (existingId != null) {
-            const entry = this._jxlDecodeCallbacks.get(existingId);
-            if (entry) {
-                entry.listeners.push({ cb: callback, options: { ...options } });
-            }
-            // Promote priority if higher
-            const newRank = this._jxlPriorityRank(priority);
-            for (const q of this._jxlDecodeQueue) {
-                if (q.decodeId === existingId) {
-                    if (newRank < this._jxlPriorityRank(q.priority)) q.priority = priority;
-                    break;
-                }
-            }
-            this._sortJxlQueue();
-            return;
-        }
-        const decodeId = this._jxlNextDecodeId++;
-        this._jxlDecodeCallbacks.set(decodeId, { url, listeners: [{ cb: callback, options: { ...options } }] });
-        this._jxlPendingByUrl.set(url, decodeId);
-        this._jxlDecodeQueue.push({ decodeId, url, priority, options: { ...options } });
-        this._sortJxlQueue();
-        this._pumpJxlQueue();
-    }
+    // Finding 3: the private JXL queue methods removed.
+    // JXL decode now goes through decodeJxlViaSession() (module level) which
+    // uses getContext() (the shared jxl-session scheduler) for priority ordering,
+    // dedupe, and concurrent execution. The dedicated decode worker is no longer spawned.
 
     reprocessLive(taskId, look) {
         // TTFP-4: workerForTask is populated at ENCODE_REQUEST (worker
@@ -1037,8 +929,8 @@ class WorkerPool {
 
 const pool = new WorkerPool(POOL_SIZE);
 pool.init();
-
-pool.setJxlDecodeWorker(new Worker(new URL('./jxl-decode-worker.js', import.meta.url), { type: 'module' }));
+// Finding 3: the dedicated JXL decode worker is no longer spawned here.
+// JXL decode routes through decodeJxlViaSession() → getContext() (jxl-session scheduler).
 
 async function encodeJxlSession(pixels, width, height, quality, effort, lossless, progressive, format = 'rgba8', orientation) {
     // A3: rgb8 carries 3 channels (no alpha), rgba8/rgba16/rgbaf32 carry 4.
@@ -1072,6 +964,172 @@ async function encodeJxlSession(pixels, width, height, quality, effort, lossless
     let off = 0;
     for (const p of parts) { out.set(p, off); off += p.byteLength; }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// JXL decode via shared jxl-session scheduler (finding 3)
+//
+// Replaces the private _jxl* queue in WorkerPool with the jxl-session scheduler
+// for JXL decodes. The jxl-session handles priority ordering, concurrent execution,
+// and backpressure. We maintain URL-level dedupe here so a blob URL requested
+// multiple times fans out to one decode session.
+//
+// Protocol bridge: jxl-session decode events → legacy callback message format.
+//   decode_header → { type: 'jxl_header', decodeId, w, h }
+//   'dc'/'pass' frame → { type: 'jxl_progress', decodeId, rgba, w, h, isFinal: false, ... }
+//   'final' frame → { type: 'jxl_progress', isFinal: true } + { type: 'jxl_decoded', ... }
+//   error → { type: 'decode_error', decodeId, error }
+// ---------------------------------------------------------------------------
+
+// URL → { session, listeners: [{ cb, options }], abortCtrl } (dedup map)
+const _jxlDecodeByUrl = new Map();
+let _jxlNextDecodeId = 1;
+
+/**
+ * Priority mapping: the old queue used 'high'|'normal'|'low'; jxl-session uses
+ * 'visible'|'near'|'background'. Map: high→visible, normal→near, low→background.
+ */
+function _mapJxlPriority(p) {
+    if (p === 'high') return 'visible';
+    if (p === 'low') return 'background';
+    return 'near';
+}
+
+/**
+ * Decode a JXL file from a blob URL, routing through the shared jxl-session scheduler.
+ * Implements the same external API as the removed decodeJxlViaSession():
+ *   decodeJxlViaSession(url, callback, priority?, options?)
+ *
+ * Dedupe: if the same URL is already being decoded, adds the callback as a fan-out
+ * listener. Multiple callers share one decode session's output.
+ *
+ * @param {string} url
+ * @param {(msg: any) => void} callback
+ * @param {'high'|'normal'|'low'} [priority='normal']
+ * @param {object} [options]
+ */
+function decodeJxlViaSession(url, callback, priority = 'normal', options = {}) {
+    const decodeId = _jxlNextDecodeId++;
+
+    // Dedupe: fan out to an existing in-flight decode for this URL.
+    const existing = _jxlDecodeByUrl.get(url);
+    if (existing) {
+        existing.listeners.push({ cb: callback, options: { ...options } });
+        return;
+    }
+
+    const listeners = [{ cb: callback, options: { ...options } }];
+    const abortCtrl = new AbortController();
+    _jxlDecodeByUrl.set(url, { listeners, abortCtrl, decodeId });
+
+    const sessionPriority = _mapJxlPriority(priority);
+
+    // Broadcast one message to all current listeners for this URL.
+    function broadcast(msg) {
+        const entry = _jxlDecodeByUrl.get(url);
+        if (!entry) return;
+        for (const listener of entry.listeners) {
+            if (typeof listener.options?.guard === 'function' && !listener.options.guard()) continue;
+            const isFinal = msg.type === 'jxl_decoded' || msg.isFinal === true;
+            if (msg.type === 'jxl_progress' || msg.type === 'jxl_decoded') {
+                const ct = listener.options?.cacheTarget;
+                if (!(ct && ct.isConnected === false)) {
+                    applyJxlDecodeCachePolicy(ct, msg.decodeId, msg.rgba, msg.w, msg.h, isFinal, listener.options?.cachePolicy ?? 'never');
+                }
+            }
+            try { listener.cb(msg); } catch {}
+        }
+    }
+
+    function cleanup() {
+        _jxlDecodeByUrl.delete(url);
+        jxlFirstProgressCacheSeen.delete(decodeId);
+    }
+
+    // Async decode pipeline: fetch bytes → create session → push → iterate frames.
+    (async () => {
+        let buf;
+        try {
+            const resp = await fetch(url, { signal: abortCtrl.signal });
+            buf = await resp.arrayBuffer();
+        } catch (err) {
+            if (!abortCtrl.signal.aborted) {
+                broadcast({ type: 'decode_error', decodeId, error: String(err?.message ?? err) });
+            }
+            cleanup();
+            return;
+        }
+
+        // I-2: the try block starts here — BEFORE getContext().decode() — so a
+        // synchronous throw from getContext() (context-creation failure) runs
+        // cleanup() via the finally and evicts the _jxlDecodeByUrl entry.
+        // A dangling entry would cause a subsequent same-URL decode to fan out
+        // to a dead session that never emits.
+        let session;
+        try {
+            session = getContext().decode({
+                format: 'rgba8',
+                priority: sessionPriority,
+                signal: abortCtrl.signal,
+                emitEveryPass: options?.progressive !== false,
+                progressiveDetail: options?.progressiveDetail ?? 'lastPasses',
+                region: options?.region ?? null,
+                downsample: options?.downsample ?? 1,
+                frameIndex: options?.frameIndex ?? 0,
+                preserveIcc: true,
+                preserveMetadata: true,
+            });
+
+            // Consume frames as they arrive, bridging to the legacy message format.
+            const framesPromise = (async () => {
+                for await (const frame of session.frames()) {
+                    const w = frame.info?.width ?? 0;
+                    const h = frame.info?.height ?? 0;
+                    // Normalise pixels to Uint8ClampedArray for ImageData compatibility.
+                    let rgba;
+                    if (frame.pixels instanceof Uint8ClampedArray
+                        && frame.pixels.byteOffset === 0
+                        && frame.pixels.byteLength === frame.pixels.buffer.byteLength) {
+                        rgba = frame.pixels;
+                    } else if (frame.pixels instanceof Uint8Array
+                        && frame.pixels.byteOffset === 0
+                        && frame.pixels.byteLength === frame.pixels.buffer.byteLength) {
+                        rgba = new Uint8ClampedArray(frame.pixels.buffer);
+                    } else {
+                        rgba = new Uint8ClampedArray(
+                            frame.pixels instanceof ArrayBuffer ? frame.pixels : frame.pixels,
+                        );
+                    }
+                    const isFinal = frame.stage === 'final';
+                    if (isFinal) {
+                        // Emit jxl_progress with isFinal:true first (same pattern as jxl-decode-worker).
+                        const copy = new Uint8ClampedArray(rgba);
+                        broadcast({ type: 'jxl_progress', decodeId, rgba, w, h, isFinal: true,
+                                     stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
+                        broadcast({ type: 'jxl_decoded',  decodeId, rgba: copy, w, h, isFinal: true,
+                                     stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
+                    } else {
+                        broadcast({ type: 'jxl_progress', decodeId, rgba, w, h, isFinal: false,
+                                     stage: frame.stage, frameIndex: frame.frameIndex ?? 0 });
+                    }
+                }
+            })();
+
+            await session.push(buf);
+            await session.close();
+            await framesPromise;
+        } catch (err) {
+            if (!abortCtrl.signal.aborted) {
+                broadcast({ type: 'decode_error', decodeId, error: String(err?.message ?? err) });
+            }
+            // I-2: if push()/close() threw (not from a worker-terminal message),
+            // cancel the session best-effort so the scheduler slot is released
+            // and the dangling framesPromise stream ends.
+            try { session?.cancel(); } catch {}
+        } finally {
+            cleanup();
+        }
+    })();
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +1308,16 @@ const cards = []; // ordered list of card elements for lightbox prev/next
 // route through here rather than dropping the element directly.
 function removeCard(card) {
     if (!card) return;
+    // I-1: release the read-lane byte reservation for this card if it is still
+    // held. This fires when the worker cancelled the task (emits neither DONE
+    // nor ERROR), preventing activeBytes from leaking permanently.
+    // _laneRelease is nulled by onDone/onError/arrayBuffer-catch before they
+    // call lane_release(), so the release() here only fires on the cancel path.
+    if (getCardState(card)._laneRelease) { try { getCardState(card)._laneRelease(); } catch {} getCardState(card)._laneRelease = null; }
+    // M-3: abort any still-queued or in-flight read so the AbortSignal wired
+    // into readLane.admit() cancels the queued waiter, and the fetch/session
+    // signal fires for an in-progress request.
+    if (getCardState(card)._readAbortCtrl) { try { getCardState(card)._readAbortCtrl.abort(); } catch {} getCardState(card)._readAbortCtrl = null; }
     if (getCardState(card)._taskId != null) {
         pool.cancelTask(getCardState(card)._taskId);
         try { pool.releaseState(getCardState(card)._taskId); } catch {}
@@ -1293,6 +1361,16 @@ const seenFiles = new Set(); // "name|size|lastModified" — prevents duplicate-
 const RAW_DECODE_BUDGET_BYTES = Math.round(1.8 * 1024 * 1024 * 1024); // ~1.8 GiB of the 2 GiB WASM ceiling
 const RAW_DECODE_SAFETY_MULT = 1.7;
 const rawDecodeGovernor = new AssetStore({ name: 'raw-decode', maxBytes: RAW_DECODE_BUDGET_BYTES });
+
+// Finding 39: byte-admission lane for file reads. A full file.arrayBuffer()
+// read MUST NOT start before a slot is available so pending tasks never hold
+// complete file bytes in memory while waiting for a worker slot. The lane
+// gates on an in-memory byte budget; the read starts only after admission
+// resolves, and the slot is released when the submitted task completes (done
+// or error). Capacity = half the raw-decode budget (reads are transient; the
+// WASM decode stage is the true peak, governed separately by rawDecodeGovernor).
+const READ_LANE_CAPACITY_BYTES = Math.round(RAW_DECODE_BUDGET_BYTES / 2);
+const readLane = createReadLane({ capacityBytes: READ_LANE_CAPACITY_BYTES });
 
 function fileKey(f) { return `${f.name}|${f.size}|${f.lastModified}`; }
 
@@ -2017,6 +2095,21 @@ function startConvert(file, existingCard) {
     // unless proxyViewMode is on — then Phase A completes the card from the embedded JPEG,
     // or falls back to dispatchRaw() when there is no usable preview.
     function dispatchRaw() {
+    // Finding 39: admit the read lane BEFORE calling file.arrayBuffer() so the
+    // full file bytes are never loaded into memory until there is capacity. The
+    // release() is called on task done/error or on read error, so bytes are never
+    // orphaned in-memory while a card is waiting for a worker slot.
+    //
+    // I-1/M-1/M-3: create a per-card AbortController so removeCard() can (a)
+    // cancel a still-queued admission and (b) abort an in-flight fetch/session.
+    // The controller is stored on card state so removeCard() can reach it.
+    const _readAbortCtrl = new AbortController();
+    getCardState(card)._readAbortCtrl = _readAbortCtrl;
+    const _readPriority = getCardState(card)._pendingPriority || 'normal';
+    readLane.admit(file.size || 0, _readAbortCtrl.signal, _readPriority).then(lane_release => {
+    // I-1: store lane_release on card state so removeCard() can call it even
+    // when the worker cancels the task without emitting DONE or ERROR.
+    getCardState(card)._laneRelease = lane_release;
     file.arrayBuffer()
         .then((buf) => {
             const bytes = new Uint8Array(buf);
@@ -2034,7 +2127,7 @@ function startConvert(file, existingCard) {
             // first-paint-optimized split. opts survives postMessage (pool.submit
             // forwards `options` verbatim to the worker), so a future batch/
             // scheduler entry only needs to set opts.batch = true to opt in.
-            const initialPriority = getCardState(card)._pendingPriority || 'normal';
+            const initialPriority = getCardState(card)._pendingPriority || _readPriority;
             getCardState(card)._pendingPriority = null;
             const taskId = pool.submit(bytes, opts, {
                 onThumb(msg) {
@@ -2090,6 +2183,7 @@ function startConvert(file, existingCard) {
                     }
                 },
                 onDone(msg) {
+                    getCardState(card)._laneRelease = null; lane_release(); // finding 39: release byte slot — task is complete
                     card.classList.remove('encoding');
                     // TTFP-4 (two-phase RAW split): THUMB carried phase-1-only
                     // timings and exif with width/height 0 (lib.rs previews-only
@@ -2156,6 +2250,7 @@ function startConvert(file, existingCard) {
                     }
                 },
                 onError(msg) {
+                    getCardState(card)._laneRelease = null; lane_release(); // finding 39: release byte slot on task error
                     card.classList.remove('busy', 'encoding');
                     card.classList.add('error');
                     card.dataset.error = msg.error;
@@ -2169,11 +2264,19 @@ function startConvert(file, existingCard) {
             cardByTaskId.set(taskId, card);
         })
         .catch((e) => {
+            getCardState(card)._laneRelease = null; lane_release(); // finding 39: release byte slot on read error
             card.classList.add('error');
             card.dataset.error = e.message || String(e);
             totalDone++;
             refreshStatus();
         });
+    }).catch((e) => {
+        // admit() itself failed (AbortError or lane destroyed) — surface as error
+        card.classList.add('error');
+        card.dataset.error = e.message || String(e);
+        totalDone++;
+        refreshStatus();
+    });
     } // end dispatchRaw
     if (!proxyViewMode) dispatchRaw();
 }
@@ -2441,7 +2544,7 @@ function repaintThumbFromJxl(card) {
             }
         }
     }
-    pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
+    decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
         if (msg.type === 'decode_error') {
             console.warn('JXL thumb decode error:', msg.error);
             return;
@@ -2729,7 +2832,7 @@ function drawLightboxForCard(card) {
             // Decode in flight — keep whatever pixels are on screen, show loader.
             lbLoadingBadge.hidden = false;
             updateToggleButtonState(card);
-            pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
+            decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
                 if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
                 if (msg.type === 'decode_error') {
                     console.warn('JXL decode error:', msg.error);
@@ -3088,7 +3191,7 @@ function prefetchJxl(card, priority = 'normal') {
     if (getCardState(card)._jxlDecoded) return;
     if (getCardState(card)._jxlPrefetching) return;
     getCardState(card)._jxlPrefetching = true;
-    pool.decodeJxl(getCardState(card)._blobUrl, (msg) => {
+    decodeJxlViaSession(getCardState(card)._blobUrl, (msg) => {
         if (msg.type === 'decode_error' || msg.type === 'jxl_decoded' || msg.isFinal === true) {
             getCardState(card)._jxlPrefetching = false;
         }
@@ -5121,7 +5224,7 @@ function decodePeepQuality(idx, q) {
     if (!entry || !entry.jxlBytes[q] || entry.decoded[q]) return;
     const blob = new Blob([entry.jxlBytes[q]], { type: 'image/jxl' });
     const url = URL.createObjectURL(blob);
-    pool.decodeJxl(url, (msg) => {
+    decodeJxlViaSession(url, (msg) => {
         URL.revokeObjectURL(url);
         if (!pixelPeepActive) return;
         if (!peepCache.has(idx)) return;
@@ -5798,14 +5901,16 @@ if (new URLSearchParams(location.search).has('debug')) {
   // main.js uses its own internal WorkerPool (not the jxl-scheduler package).
   // Wrap it with a getStats() shim so the dashboard's Worker Pool + Scheduler
   // panels show live data from this page's actual worker pool.
+  // Finding 3: jxl-session scheduler metrics replace the removed _jxl* queue fields.
+  // The shared jxl-session context exposes scheduler metrics via getContext().
   const _schedulerAdapter = {
     getStats() {
       return {
         activeWorkers: pool.workers.length - pool.free.length,
         idleWorkers: pool.free.length,
-        queueDepth: pool.queue.length + pool._jxlDecodeQueue.length,
-        dedupeSize: pool._jxlPendingByUrl.size,
-        draining: pool._jxlDecodeBusy,
+        queueDepth: pool.queue.length + _jxlDecodeByUrl.size,
+        dedupeSize: _jxlDecodeByUrl.size,
+        draining: false, // concurrent with jxl-session — no single-lane busy flag
       };
     },
   };

@@ -483,6 +483,17 @@ function applyLookToState(state, look) {
 }
 
 self.addEventListener('message', async (ev) => {
+    // --- calibration hint from main thread (finding 9): sets the rayon thread pool
+    //     size for this worker. Must arrive BEFORE PRELOAD so initThreadPool picks it up.
+    //     Payload: { type: 'set_calibration', threadsPerWorker: number }
+    if (ev.data.type === 'set_calibration') {
+        const t = ev.data.threadsPerWorker;
+        if (typeof t === 'number' && t >= 1) {
+            self.__calibratedThreads = Math.max(1, Math.round(t));
+        }
+        return;
+    }
+
     // --- prewarm: run ensureWasm before the first file task (TTFP-1) ---
     // Fire-and-forget: on failure ensureWasm resets wasmReady=null, so the
     // first real task simply retries the load — prewarm failure self-heals.
