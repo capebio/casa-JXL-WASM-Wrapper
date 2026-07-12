@@ -416,9 +416,13 @@ export class TimelapseStudio {
           }
         })();
         const r = fn(frame.bytes, ...lookArgs);
-        let rgb;
-        try { rgb = r.take_rgb(); } finally { r.free(); }
-        frameBuf.push({ rgb, w: r ? r.width : 0, h: r ? r.height : 0, name: frame.name });
+        // Read width/height BEFORE freeing: the WASM getters dereference the
+        // ProcessResult pointer, so touching r.width/r.height after r.free()
+        // reads freed memory and throws. Mirror decodeRawNeutralRgb: read all
+        // fields inside the try, then free.
+        let w, h, rgb;
+        try { w = r.width; h = r.height; rgb = r.take_rgb(); } finally { r.free(); }
+        frameBuf.push({ rgb, w, h, name: frame.name });
         encodedCount++;
         this._progress({ stage: 'decoding', done: encodedCount, total: selectedItems.length });
       }

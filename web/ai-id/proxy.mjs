@@ -18,7 +18,15 @@ export async function encodeProxyJpeg(rgba, w, h, opts = {}) {
   const maxEdge = opts.maxEdge ?? DEFAULT_MAX_EDGE;
   const quality = opts.quality ?? DEFAULT_QUALITY;
   const downscaleRgba = opts.downscaleRgba;
-  const encodeJpeg = opts.encodeJpeg ?? nodeEncodeJpeg;
+  // encodeJpeg is REQUIRED and injected by the caller: browser callers pass a
+  // canvas/OffscreenCanvas encoder (browser-adapter.js); Node callers pass
+  // node-adapter.nodeEncodeJpeg. This module stays free of Node/sharp/DOM.
+  const encodeJpeg = opts.encodeJpeg;
+  if (typeof encodeJpeg !== "function") {
+    throw new Error(
+      "proxy: encodeJpeg is required (browser: canvas/OffscreenCanvas; node: node-adapter.nodeEncodeJpeg)",
+    );
+  }
   const t = targetDims(w, h, maxEdge);
   let ow = w, oh = h, buf = rgba;
   if (t) {

@@ -161,22 +161,26 @@ export function filterSelectedAssets(cards) {
 }
 
 /**
- * Map a look-params object from the per-asset edit store to the 15-element
- * positional array that the WASM decoders (process_orf / process_dng / process_cr2)
- * accept. The ordering mirrors `src/lib.rs` (same as worker.js RAW_NEUTRAL).
+ * Map a look-params object from the per-asset edit store to the **14-element**
+ * positional f32 array that the WASM RAW decoders (`process_orf` /
+ * `process_dng` / `process_cr2`) accept, in `src/lib.rs` order (identical to
+ * `web/worker.js` RAW_NEUTRAL and to the neutral call in `decodeRawNeutralRgb`):
  *
- * Slots: [brightness, contrast, saturation, hue, sharpness, denoise,
- *          shadows, highlights, blacks, whites, vibrance, wbR, wbG, wbB, tint]
+ *   0 exposure_ev  1 contrast   2 highlights  3 shadows  4 whites   5 blacks
+ *   6 saturation   7 vibrance   8 temp        9 tint     10 wb_r    11 wb_b
+ *   12 texture     13 clarity
  *
- * WB (indices 11, 12) default to NaN = use each file's embedded camera WB — the
- * right default for a locked time-lapse where WB is consistent across the run.
+ * Look-edit field names mirror `panels.js` LOOK_PARAMS (`exposureEv`, not
+ * `exposure`). WB overrides (slots 10, 11) default to NaN = use each file's
+ * embedded camera white balance — the right default for a locked time-lapse
+ * where WB is consistent across the run. Fields with no decoder slot (there is no
+ * `hue`/`sharpness`/`denoise`/`wbG` decoder param) are ignored.
  *
- * @param {{ exposure?: number, contrast?: number, saturation?: number,
- *            hue?: number, sharpness?: number, denoise?: number,
- *            shadows?: number, highlights?: number, blacks?: number,
- *            whites?: number, vibrance?: number,
- *            wbR?: number, wbG?: number, wbB?: number, tint?: number }} look
- * @returns {number[]} 15-element array
+ * @param {{ exposureEv?: number, contrast?: number, highlights?: number,
+ *            shadows?: number, whites?: number, blacks?: number,
+ *            saturation?: number, vibrance?: number, temp?: number, tint?: number,
+ *            wbR?: number, wbB?: number, texture?: number, clarity?: number }} look
+ * @returns {number[]} 14-element positional array
  */
 export function applyLookToDecodeArgs(look = {}) {
   const g = (k, dflt) => {
@@ -184,21 +188,20 @@ export function applyLookToDecodeArgs(look = {}) {
     return (v !== undefined && v !== null && typeof v === 'number') ? v : dflt;
   };
   return [
-    g('exposure',    0),   // 0  brightness
+    g('exposureEv',  0),   // 0  exposure_ev
     g('contrast',    0),   // 1  contrast
-    g('saturation',  0),   // 2  saturation
-    g('hue',         0),   // 3  hue
-    g('sharpness',   0),   // 4  sharpness
-    g('denoise',     0),   // 5  denoise
-    g('shadows',     0),   // 6  shadows
-    g('highlights',  0),   // 7  highlights
-    g('blacks',      0),   // 8  blacks
-    g('whites',      0),   // 9  whites
-    g('vibrance',    0),   // 10 vibrance
-    g('wbR',         NaN), // 11 wbR  (NaN → camera WB)
-    g('wbG',         NaN), // 12 wbG  (NaN → camera WB)  [historically called wbB in slot 12]
-    g('wbB',         0),   // 13 tint/wbB — kept as zero in neutral path
-    g('tint',        0),   // 14 tint
+    g('highlights',  0),   // 2  highlights
+    g('shadows',     0),   // 3  shadows
+    g('whites',      0),   // 4  whites
+    g('blacks',      0),   // 5  blacks
+    g('saturation',  0),   // 6  saturation
+    g('vibrance',    0),   // 7  vibrance
+    g('temp',        0),   // 8  temp
+    g('tint',        0),   // 9  tint
+    g('wbR',         NaN), // 10 wb_r_override (NaN → camera WB)
+    g('wbB',         NaN), // 11 wb_b_override (NaN → camera WB)
+    g('texture',     0),   // 12 texture
+    g('clarity',     0),   // 13 clarity
   ];
 }
 
@@ -219,36 +222,27 @@ export function makeTimelapseCancelToken() {
  * time, honouring the memory budget and cancel token.
  *
  * - Reads cards sequentially (never starts the next read until the current frame
- *   has been consumed by the caller), so peak memory = one frame at a time.
- * - `maxBytesInFlight`: if provided, checks outstanding bytes before each read.
- *   Because we yield before moving on, the natural sequential behaviour already
- *   satisfies most budgets; this gate only fires if a very small budget is given.
+ *   has been consumed by the caller), so peak memory is one frame at a time and a
+ *   byte budget is intrinsically satisfied — no gate needed. `maxBytesInFlight`
+ *   is accepted for call-site compatibility but is deliberately NOT used to drop
+ *   frames: dropping a valid frame would silently corrupt the time-lapse.
  * - Skips cards where `readBytes` returns null or undefined (Tauri fs unavailable,
  *   no file attached, etc.).
  *
  * @param {Array<{ assetId: string, name: string }>} cards
  * @param {(card: object) => Promise<Uint8Array|null>} readBytes
- * @param {{ isCancelled: () => boolean, maxBytesInFlight?: number }} opts
+ * @param {{ isCancelled?: () => boolean, maxBytesInFlight?: number }} opts
  */
 export async function* buildSequentialFrames(cards, readBytes, {
   isCancelled = () => false,
-  maxBytesInFlight = Infinity,
 } = {}) {
-  let outstandingBytes = 0;
   for (const card of cards) {
     if (isCancelled()) return;
-    // Budget gate: wait until outstanding drops below budget before reading.
-    // In practice the sequential nature means outstanding is 0 here (the caller
-    // consumed the previous frame); this guard is a safety net for very small budgets.
-    if (outstandingBytes >= maxBytesInFlight) continue;
-
+    // Strictly sequential: we do not start the next read until the caller has
+    // consumed (yielded) the current frame, so only one frame is ever in flight.
     const bytes = await readBytes(card);
     if (!bytes) continue;
-
-    outstandingBytes += bytes.length;
     yield { assetId: card.assetId, name: card.name, bytes, look: card.look ?? {} };
-    // The caller has consumed (or handed off) the frame; subtract from budget.
-    outstandingBytes -= bytes.length;
   }
 }
 

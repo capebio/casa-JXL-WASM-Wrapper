@@ -13,7 +13,19 @@ import {
   applyLookToDecodeArgs,
   makeTimelapseCancelToken,
   buildTimelapseExportRequest,
+  decodeRawNeutralRgb,
 } from './timelapse-core.js';
+
+// The REAL WASM RAW decoder ABI (ground truth: src/lib.rs process_orf /
+// process_dng / process_cr2; mirrored by web/worker.js RAW_NEUTRAL and by
+// decodeRawNeutralRgb here). 14 positional f32 args, in THIS exact order:
+//
+//   0 exposure_ev  1 contrast   2 highlights  3 shadows  4 whites   5 blacks
+//   6 saturation   7 vibrance   8 temp        9 tint     10 wb_r    11 wb_b
+//   12 texture     13 clarity
+//
+// WB overrides default to NaN = use each file's embedded camera white balance.
+const NEUTRAL_ARGS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -53,29 +65,68 @@ test('filterSelectedAssets preserves capture order (sort by name)', () => {
   assert.deepEqual(names, ['P002.ORF', 'P005.DNG', 'P010.ORF']);
 });
 
-// ── applyLookToDecodeArgs ─────────────────────────────────────────────────────
+// ── applyLookToDecodeArgs (BUG 1: real 14-slot decoder ABI) ───────────────────
 
-test('applyLookToDecodeArgs returns 15-element array matching the positional WASM ABI', () => {
-  const args = applyLookToDecodeArgs({});
-  assert.equal(args.length, 15);
+test('applyLookToDecodeArgs emits EXACTLY 14 slots (the real decoder arity)', () => {
+  // src/lib.rs process_orf/dng/cr2 take 14 positional f32 args — not 15.
+  assert.equal(applyLookToDecodeArgs({}).length, 14);
 });
 
-test('applyLookToDecodeArgs maps exposure, contrast, saturation from look', () => {
-  const args = applyLookToDecodeArgs({ exposure: 1.0, contrast: 0.5, saturation: -0.3 });
-  // Positional order: brightness, contrast, saturation, hue, sharpness, denoise,
-  //   shadows, highlights, blacks, whites, vibrance, wbR, wbG, wbB, tint
-  // The exact slot for exposure is index 0 (brightness param)
-  assert.ok(args.every((v) => typeof v === 'number'), 'all elements must be numbers');
-  // With no look, WB fields (indices 11, 12) are NaN (use camera WB)
-  const neutral = applyLookToDecodeArgs({});
-  assert.ok(Number.isNaN(neutral[11]), 'wbR defaults to NaN (camera WB)');
-  assert.ok(Number.isNaN(neutral[12]), 'wbG defaults to NaN (camera WB)');
+test('applyLookToDecodeArgs neutral look == the neutral decode args', () => {
+  assert.deepEqual(applyLookToDecodeArgs({}), NEUTRAL_ARGS);
+  assert.deepEqual(applyLookToDecodeArgs(), NEUTRAL_ARGS);
 });
 
-test('applyLookToDecodeArgs WB fields set when look provides them', () => {
-  const args = applyLookToDecodeArgs({ wbR: 1.5, wbG: 1.0 });
-  assert.equal(args[11], 1.5);
-  assert.equal(args[12], 1.0);
+test('applyLookToDecodeArgs mirrors decodeRawNeutralRgb positional args (RAW_NEUTRAL semantics)', () => {
+  // Capture the exact args decodeRawNeutralRgb feeds the decoder, then assert the
+  // neutral look mapping reproduces them slot-for-slot — the real ABI, checked
+  // end-to-end against the one place that already gets it right.
+  const captured = [];
+  const fakeMod = {
+    process_orf: (_bytes, ...rest) => {
+      captured.push(...rest);
+      return { take_rgb: () => new Uint8Array(0), width: 1, height: 1, free() {} };
+    },
+  };
+  decodeRawNeutralRgb(fakeMod, new Uint8Array(0), 'x.orf');
+  assert.equal(captured.length, 14, 'decoder called with 14 look args');
+  assert.deepEqual(captured, NEUTRAL_ARGS);
+  assert.deepEqual(applyLookToDecodeArgs({}), captured);
+});
+
+test('applyLookToDecodeArgs lands each look-edit field in its CORRECT decoder slot', () => {
+  // Distinct value per slot so any transposition is caught. Field names mirror
+  // panels.js LOOK_PARAMS (exposureEv, not "exposure").
+  const look = {
+    exposureEv: 1, contrast: 2, highlights: 3, shadows: 4, whites: 5, blacks: 6,
+    saturation: 7, vibrance: 8, temp: 9, tint: 10, wbR: 11, wbB: 12,
+    texture: 13, clarity: 14,
+  };
+  assert.deepEqual(
+    applyLookToDecodeArgs(look),
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+  );
+});
+
+test('applyLookToDecodeArgs: WB overrides live in slots 10/11, not 2/3', () => {
+  const args = applyLookToDecodeArgs({ wbR: 1.9, wbB: 2.3 });
+  assert.equal(args[10], 1.9, 'wb_r_override slot');
+  assert.equal(args[11], 2.3, 'wb_b_override slot');
+  assert.equal(args[2], 0, 'highlights slot untouched by WB');
+  assert.equal(args[3], 0, 'shadows slot untouched by WB');
+});
+
+test('applyLookToDecodeArgs: WB defaults to NaN (camera metadata) in the override slots', () => {
+  const args = applyLookToDecodeArgs({ exposureEv: 0.5 });
+  assert.ok(Number.isNaN(args[10]), 'wb_r default NaN');
+  assert.ok(Number.isNaN(args[11]), 'wb_b default NaN');
+  assert.equal(args[0], 0.5);
+});
+
+test('applyLookToDecodeArgs ignores non-numeric and unknown (invented) fields', () => {
+  // '3' is a string → default; hue/sharpness/denoise/wbG are not decoder params.
+  const args = applyLookToDecodeArgs({ exposureEv: '3', hue: 5, sharpness: 9, denoise: 1, wbG: 2 });
+  assert.deepEqual(args, NEUTRAL_ARGS);
 });
 
 // ── makeTimelapseCancelToken ─────────────────────────────────────────────────
@@ -163,6 +214,24 @@ test('buildSequentialFrames respects maxBytesInFlight memory budget', async () =
     concurrentBytesHistory.every((b) => b <= 1500),
     `outstanding bytes exceeded budget: ${JSON.stringify(concurrentBytesHistory)}`,
   );
+});
+
+test('buildSequentialFrames does NOT silently drop a frame larger than the budget', async () => {
+  // Reads are sequential (outstanding == 0 at the loop top), so a per-frame
+  // budget must never cause a valid frame to be dropped. A frame bigger than
+  // maxBytesInFlight must STILL be yielded, not skipped with `continue`.
+  const cards = [
+    { assetId: 'small', name: 's.orf' },
+    { assetId: 'big',   name: 'b.orf' },
+    { assetId: 'small2', name: 't.orf' },
+  ];
+  const readBytes = async (c) => new Uint8Array(c.assetId === 'big' ? 1000 : 10);
+  const results = [];
+  for await (const frame of buildSequentialFrames(cards, readBytes, { maxBytesInFlight: 100 })) {
+    results.push(frame.assetId);
+  }
+  assert.deepEqual(results, ['small', 'big', 'small2'],
+    'the over-budget frame must be yielded, and later frames must not be lost');
 });
 
 test('buildSequentialFrames skips cards where readBytes returns null/undefined', async () => {
