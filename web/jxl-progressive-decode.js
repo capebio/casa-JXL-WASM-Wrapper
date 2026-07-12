@@ -16,6 +16,13 @@ export function createProgressiveDecodeRequest({
     format = 'rgba8',
     region = null,
     downsample = 1,
+    // Task 6 (finding 2): an OPTIONAL descriptor recording which resolved LOD this request
+    // represents (e.g. { kind: 'progressive-prefix', byteEnd }). It is purely informational —
+    // surfaced on the returned request for telemetry / cache keys — and is NOT sent to the worker,
+    // so the decode_start message (and the opportunistic-flush / chunk-feeding contract) is
+    // unchanged. The progressive-prefix bytes are fed through the EXISTING push(), reusing this
+    // request's queue rather than recreating it.
+    lod = null,
 } = {}) {
     if (!worker) {
         throw new TypeError('createProgressiveDecodeRequest requires a worker');
@@ -150,6 +157,9 @@ export function createProgressiveDecodeRequest({
         done,
         get lastInfo() { return lastInfo; },
         get currentStage() { return currentStage; },
+        // The resolved LOD this request represents (or null). Informational only — see the `lod`
+        // param note above; it never enters a worker message.
+        get lod() { return lod; },
         start() {
             if (started) return;
             started = true;

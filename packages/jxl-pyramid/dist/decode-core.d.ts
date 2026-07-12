@@ -185,10 +185,21 @@ export interface PyramidPoolLike {
         maxWaitMs?: number;
     }): Promise<any[]>;
     release(handles: any[]): void;
-    readonly requestTimeout?: number;
+    /** Load container bytes into the acquired handles once per bytesId (SAB carrier when useSAB). */
+    ensureLoaded(handles: any[], bytesId: number, bytes: Uint8Array, useSAB: boolean): void;
+    /**
+     * Carrier-aware load: transfer only what each worker needs for `requestedTiles` — a shared SAB
+     * view, an owned whole clone (small containers), or per-tile RANGE payloads (large, no SAB) so
+     * non-SAB fanout is bounded by requested tiles, not workers*containerSize (findings 33, 79).
+     * Optional so duck-typed pools without it fall back to ensureLoaded.
+     */
+    ensureLoadedForTiles?(handles: any[], bytesId: number, source: any, requestedTiles: ImageRegion[], useSAB: boolean): void;
+    /** Explicitly release a bytesId from the given handles; resolves on worker ack (finding 80). */
+    unload?(handles: any[], bytesId: number): Promise<void>;
+    readonly requestTimeout?: number | undefined;
     destroy?(graceMs?: number): Promise<void> | void;
-    readonly destroyed?: boolean;
-    readonly poolState?: string;
+    readonly destroyed?: boolean | undefined;
+    readonly poolState?: string | undefined;
     prewarm?(count: number): void;
 }
 /** Init/options bag passed to jxl-wasm createDecoder (local name for cast sites; structural). */
@@ -200,5 +211,36 @@ export interface DecoderInit {
     preserveMetadata: boolean;
 }
 export declare function cacheStore(cache: PyramidCache | undefined, key: string | undefined, pixels: Uint8Array, need: number): void;
+/**
+ * The one named tiled-decode strategy the single planner (decode-level.ts) dispatches on.
+ *
+ *   'worker-pool'        — parallel per-tile decode across the injected/owned pool
+ *                          (decodeTiledViewportPooled); handles dc-then-final + one-shot final.
+ *   'progressive-direct' — inline dc-then-final / dc-only / skip-tile / resume per-tile loop on the
+ *                          main thread (no pool); the only path that implements dc-only, skip-tile,
+ *                          and skipTiles resume.
+ *   'direct'             — single libjxl ROI decode of the whole viewport in one WASM call.
+ */
+export type TileDecodeStrategy = 'worker-pool' | 'progressive-direct' | 'direct';
+/**
+ * Pure pool-strategy hook: pick exactly one tiled-decode strategy from tile count, environment
+ * worker-availability, and caller options. This centralises the dispatch that was previously three
+ * overlapping booleans in decode-level.ts (finding 77) — decode-level now dispatches on the single
+ * value this returns. Kept in decode-core (the primitives/types root) so both the planner and tests
+ * consume the same decision without a cycle.
+ *
+ * Behaviour is identical to the prior inline logic:
+ *  - worker-pool requires >1 tile, a worker environment, a pool/factory, parallel !== false, and a
+ *    progressive mode the pool implements (undefined | 'dc-then-final'); never with a custom
+ *    decodeRegion, skip-tile policy, or a skipTiles resume-set (the pool fails the batch on those).
+ *  - progressive-direct covers 'dc-then-final' / 'dc-only' (and skip-tile / skipTiles, which force the
+ *    inline loop) whenever worker-pool was not selected, provided no custom decodeRegion is supplied.
+ *  - direct otherwise (single ROI decode, incl. the mock/decodeRegion path).
+ */
+export declare function selectTileDecodeStrategy(args: {
+    numTiles: number;
+    envCanParallel: boolean;
+    options: DecodeOptions | undefined;
+}): TileDecodeStrategy;
 export declare function sortCenterOut<T>(items: T[], viewport: ImageRegion, getRect: (item: T) => ImageRegion): T[];
 //# sourceMappingURL=decode-core.d.ts.map

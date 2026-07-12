@@ -6,6 +6,7 @@ import init, {
   process_cr2,
 } from "../../../pkg/raw_converter_wasm.js";
 import type { DecodedMaster, RawBackend, RawFormat } from "./backends.js";
+import { throwIfAborted } from "./abort.js";
 
 let initialized = false;
 let initPromise: Promise<void> | null = null;
@@ -29,8 +30,12 @@ const ZERO_LOOK = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Number.NaN, Number.NaN, 0, 0] a
 
 export function createRawBackend(): RawBackend {
   return {
-    async decode(bytes: Uint8Array, format: RawFormat): Promise<DecodedMaster> {
+    async decode(bytes: Uint8Array, format: RawFormat, signal?: AbortSignal): Promise<DecodedMaster> {
+      // finding 67: the native WASM decode is synchronous+uninterruptible, so honour the deadline at
+      // the boundaries around it — before starting, and after the decode/before the hot JS expand loop.
+      throwIfAborted(signal, "decode");
       await ensureWasm();
+      throwIfAborted(signal, "decode");
       let res: any;
       if (format === "orf") {
         res = process_orf(bytes, ...ZERO_LOOK);
@@ -42,6 +47,7 @@ export function createRawBackend(): RawBackend {
         throw new Error(`native raw decode unsupported format: ${format}`);
       }
       try {
+        throwIfAborted(signal, "decode"); // deadline may have fired during the (blocking) native decode
         // Prefer take_rgba (RGB->RGBA inside WASM). Falls back to rgb+convert if needed.
         // The rgb fallback runs a hot per-pixel JS expand loop (lens6) on every pixel of the master.
         // This is the slow path for large RAW ingest into the JXL pyramid; take_rgba (WASM-side) is strongly preferred.

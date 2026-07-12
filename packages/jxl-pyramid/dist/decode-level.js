@@ -1,9 +1,9 @@
 import { createDecoder } from "@casabio/jxl-wasm";
 import { extractTileBitstream, canUseParallelTileWorkers } from "./tiling.js";
-import { WHOLE_DECODE_OPTS, stitch, PyramidError, stitchCropped, assertFiniteRegion, snapRegionToIntegers, formatFromBits, bppOfFormat, viewportCacheKey, tileIdOf, tileKey, tileKeyPacked, validateDecodedOutput, raceWithAbort, ensureIccProfile, buffersInFlight, cacheStore, clampRegion, } from "./decode-core.js";
+import { WHOLE_DECODE_OPTS, stitch, PyramidError, stitchCropped, assertFiniteRegion, snapRegionToIntegers, formatFromBits, bppOfFormat, viewportCacheKey, tileIdOf, tileKey, tileKeyPacked, validateDecodedOutput, raceWithAbort, ensureIccProfile, buffersInFlight, cacheStore, clampRegion, selectTileDecodeStrategy, } from "./decode-core.js";
 import { prepareDecodePlan } from "./plan.js";
 import { getLevelId, makeTileCacheKey } from "./cache.js";
-import { shouldUseParallel, decodeTiledViewportPooled } from "./tiled-decode-pool.js";
+import { decodeTiledViewportPooled } from "./tiled-decode-pool.js";
 export { PyramidError, formatFromBits, bppOfFormat, viewportCacheKey, tileIdOf, tileKey, tileKeyPacked } from "./decode-core.js";
 function stitchTileIntoViewport(outBuffer, viewport, tile, decodedPixels, source, bpp) {
     const tileSize = source.tileSize;
@@ -69,13 +69,17 @@ export async function decodeTiledViewport(source, region, options) {
     const vp = plan.viewport;
     const bpp = plan.bpp;
     const need = vp.w * vp.h * bpp;
-    // Hoist delegation decision ABOVE outBuffer registration (P1-A fix)
-    const canParallel = canUseParallelTileWorkers();
+    // ONE named strategy decision drives dispatch (finding 77): the single planner picks
+    // worker-pool / progressive-direct / direct up front, above outBuffer registration (P1-A fix),
+    // instead of re-deriving overlapping booleans. The 'worker-pool' strategy is the injected pool
+    // primitive; the other two run on this thread below.
     const progressive = options?.progressive;
-    const parallelEligible = !options?.decodeRegion
-        && shouldUseParallel(options, plan.tiles.length, canParallel)
-        && options?.errorPolicy !== 'skip-tile' && !options?.skipTiles;
-    if (parallelEligible && (progressive === 'dc-then-final' || progressive === undefined)) {
+    const strategy = selectTileDecodeStrategy({
+        numTiles: plan.tiles.length,
+        envCanParallel: canUseParallelTileWorkers(),
+        options,
+    });
+    if (strategy === 'worker-pool') {
         return decodeTiledViewportPooled(source, snappedRegion, options);
     }
     // Cache + outBuffer + onTile for direct (non-pooled) path.
@@ -121,8 +125,9 @@ export async function decodeTiledViewport(source, region, options) {
         let target;
         // Progressive DC-then-final (F1 + L3-1): Phase 1 all DC, Phase 2 all final.
         // Delivers onTile twice per tile (DC first for full coarse paint, then final). Stream-stitch friendly.
-        // Only when no custom decodeRegion (tests use mocks for the one-shot path).
-        if ((progressive === 'dc-then-final' || progressive === 'dc-only') && !options?.decodeRegion) {
+        // Selected as 'progressive-direct' by the single strategy decision (dc-then-final / dc-only /
+        // skip-tile / resume, without a custom decodeRegion).
+        if (strategy === 'progressive-direct') {
             target = outBuf ? outBuf : new Uint8Array(need);
             let completed = 0;
             const tilesX = Math.ceil(source.width / source.tileSize);

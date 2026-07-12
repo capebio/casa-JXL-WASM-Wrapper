@@ -210,13 +210,25 @@ export function pickByteEndForQuality(
   return undefined;
 }
 
-/** Information about the smallest level (L0 seed) inlined in the gallery index. */
+/** Information about the smallest level (L0 seed) inlined in the gallery index.
+ *  finding 81: the seed declares its PRECISION (bitsPerSample) and TRANSPORT (tiled + optional
+ *  TilingDescriptor) so a seed decoder chooses a VALID decode path instead of assuming a whole
+ *  8-bit RGBA bitstream. All three are optional + additive: a bare { contenthash, w, h } seed IS a
+ *  monolithic 8-bit level (the default path), so pre-finding-81 indexes decode unchanged. A tiled L0
+ *  is permitted ONLY when it declares `tiled` (and, when present, `tiling`) so the decoder can route
+ *  to the tile-container path. */
 export interface LevelZeroSeed {
   contenthash: string;
   w: number;
   h: number;
   /** Total compressed bytes for the level; used for prefetch sizing and progress reporting. */
   bytes?: number;
+  /** Seed pixel precision; absent ⇒ 8-bit (monolithic-RGBA8 default). */
+  bitsPerSample?: BitsPerSample;
+  /** Whether the seed is a JXTC tile container; absent/false ⇒ a whole-frame bitstream. */
+  tiled?: boolean;
+  /** Present only when tiled: lets the seed decoder address tiles without decoding the container. */
+  tiling?: TilingDescriptor;
 }
 
 /** A single image entry within `index.json`. */

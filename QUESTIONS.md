@@ -1833,6 +1833,11 @@ deferred as design questions rather than unilateral edits.
   vs legacy 2026-06-08). NOTE: the modular gallery's HTML is NOT linked from index.html — the home
   nav still points at the legacy top-level page. Full migration + colour-parity risk written up in
   `.epiccodereview/20260622T113415Z/sections/002/adr_draft/consolidate-filter-engines.md`.
+- RESOLVED 2026-07-12 (Packet 2, Task 7, finding 74): the legacy fork `web/pyramid-gallery.js` is
+  DELETED and `web/pyramid-gallery.html` is now a pure redirect (query+hash preserved) to the
+  modular `web/pyramid-gallery/pyramid-gallery.html`. index.html links only the modular page. The
+  `lightbox/filter-engine.js` engine (via `lightbox/pyramid-lightbox.js`) is the single canonical
+  look/colour path; the `pyramid-filter-engine.js` fork is no longer reachable from any live page.
 
 ### QUESTION (ADR/perf): renderLightboxAdjusted re-filters full image + allocs temp canvas per frame
 - `web/pyramid-gallery.js:409-440` (`renderLightboxAdjusted`) re-runs the full-image filter and
@@ -1842,6 +1847,8 @@ deferred as design questions rather than unilateral edits.
   paint/alloc — must be measured with **flipflopdom** (browser harness), not Node.
 - Decision needed: cache the adjusted full-res canvas; re-filter only on look change; pan/zoom
   re-draw from cache. Validate the win with flipflopdom before applying.
+- RESOLVED 2026-07-12 (Packet 2, Task 7): MOOT — `web/pyramid-gallery.js` (and its per-frame
+  `renderLightboxAdjusted`) is DELETED. The modular `lightbox/pyramid-lightbox.js` owns rendering.
 
 ## EpicCodeReview 20260622T113415Z — section 002 (web/worker.js) deferrals
 

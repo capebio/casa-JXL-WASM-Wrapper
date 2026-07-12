@@ -296,7 +296,14 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
   const height = requireNumber(o["height"], "manifest.height");
   const aspect = requireNumber(o["aspect"], "manifest.aspect");
 
+  // finding 73: the reader is a trust boundary for untrusted network manifests. Bound the top-level
+  // dimensions/aspect (requireNumber already rejects NaN/Infinity) so a hostile manifest cannot drive
+  // downstream allocation/tiling/aspect math off a cliff. Matches the per-level w/h caps below.
+  if (width <= 0) fail("manifest.width", `width must be positive, got ${width}`);
+  if (width > MAX_DIMENSION) fail("manifest.width", `width exceeds maximum ${MAX_DIMENSION}, got ${width}`);
   if (height <= 0) fail("manifest.height", `height must be positive, got ${height}`);
+  if (height > MAX_DIMENSION) fail("manifest.height", `height exceeds maximum ${MAX_DIMENSION}, got ${height}`);
+  if (!(aspect > 0)) fail("manifest.aspect", `aspect must be positive, got ${aspect}`);
   if (Math.abs(aspect - width / height) > 1e-3) {
     fail("manifest.aspect", `aspect ${aspect} inconsistent with width/height ratio ${width}/${height} = ${(width / height).toFixed(6)}`);
   }
@@ -364,6 +371,24 @@ function validateLevelZeroSeed(v: unknown, path: string): LevelZeroSeed {
     if (bytes > MAX_BYTES) fail(`${path}.bytes`, `bytes exceeds maximum ${MAX_BYTES}, got ${bytes}`);
     result.bytes = bytes;
   }
+  // finding 81: the seed declares PRECISION (bitsPerSample) and TRANSPORT (tiled + tiling) so a seed
+  // decoder chooses a valid path. Validate them at the trust boundary and preserve them; a bare seed
+  // (none present) stays a monolithic 8-bit level — the default. A tiled seed MUST carry a tiling
+  // descriptor (otherwise the seed decoder can't address tiles): reject a tiled seed without one.
+  if (o["bitsPerSample"] !== undefined) {
+    const bits = requireNumber(o["bitsPerSample"], `${path}.bitsPerSample`);
+    if (bits !== 8 && bits !== 16) fail(`${path}.bitsPerSample`, `expected 8 or 16, got ${bits}`);
+    result.bitsPerSample = bits as 8 | 16;
+  }
+  const tiled = o["tiled"] === undefined ? undefined : requireBoolean(o["tiled"], `${path}.tiled`);
+  if (tiled) {
+    result.tiled = true;
+    if (o["tiling"] == null) fail(`${path}.tiling`, "required when a tiled L0 seed is declared");
+    const t = requireObject(o["tiling"], `${path}.tiling`);
+    result.tiling = validateTilingDescriptor(t, `${path}.tiling`, w, h);
+  } else if (tiled === false) {
+    result.tiled = false;
+  }
   return result;
 }
 
@@ -371,6 +396,10 @@ function validateGalleryIndexEntry(v: unknown, path: string): GalleryIndexEntry 
   const o = requireObject(v, path);
   const imageId = requireString(o["imageId"], `${path}.imageId`);
   const aspect = requireNumber(o["aspect"], `${path}.aspect`);
+  // finding 73: index entries also cross the trust boundary — a non-finite/non-positive aspect drives
+  // the gallery's CSS layout (--aspect) into NaN/negative territory. requireNumber caught NaN/Infinity;
+  // reject non-positive here too.
+  if (!(aspect > 0)) fail(`${path}.aspect`, `aspect must be positive, got ${aspect}`);
   const l0 = validateLevelZeroSeed(o["l0"], `${path}.l0`);
   const result: GalleryIndexEntry = { imageId, aspect, l0 };
   if (o["thumbhash"] !== undefined) result.thumbhash = requireString(o["thumbhash"], `${path}.thumbhash`);

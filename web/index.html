@@ -53,8 +53,7 @@
             <a class="home-bar-link" href="./jxl-progressive-paint.html">Progressive paint</a>
             <a class="home-bar-link" href="./jxl-single-progressive.html">Single progressive</a>
             <a class="home-bar-link" href="./jxl-progressive-gallery.html">Progressive gallery</a>
-            <a class="home-bar-link" href="./pyramid-gallery.html">Pyramid gallery (M1 grid)</a>
-            <a class="home-bar-link" href="./pyramid-gallery/pyramid-gallery.html">Pyramid gallery (modular — tiled-pool grid + lightbox, in-browser verified; 16-bit HDR pending WASM rebuild)</a>
+            <a class="home-bar-link" href="./pyramid-gallery/pyramid-gallery.html">Pyramid gallery (modular runtime; tiled-pool grid + lightbox)</a>
             <a class="home-bar-link" href="./jxl-crop-benchmark.html">Crop benchmark</a>
             <a class="home-bar-link" href="./jxl-preset-benchmark.html">Preset benchmark</a>
             <a class="home-bar-link" href="./jxl-encode-space.html">Encode Space</a>
@@ -563,7 +562,22 @@
                 <button id="filmstrip-apply-selection" class="lb-btn" type="button">
                     Apply look to <span id="filmstrip-selection-count">0</span> selected
                 </button>
-                <button id="filmstrip-export-selection" class="lb-btn ghost" type="button" title="Export selected with current look + their crops (future)">
+                <!-- Finding 13: Export selected — wired to ExportService (full-res, not preview bytes) -->
+                <!-- I-B: only formats that genuinely encode are enabled. JPEG/TIFF
+                     re-encoders are packet-3 scope; disabled so we never write a
+                     file whose bytes don't match its extension. -->
+                <select id="export-output-format" class="lb-select" title="Export format" style="font-size:12px;padding:1px 4px">
+                    <option value="jxl" selected>JXL</option>
+                    <option value="png">PNG</option>
+                    <option value="jpeg" disabled>JPEG (packet-3)</option>
+                    <option value="tiff" disabled>TIFF (packet-3)</option>
+                </select>
+                <select id="export-metadata-policy" class="lb-select" title="Metadata privacy policy" style="font-size:12px;padding:1px 4px">
+                    <option value="keep" selected>Keep metadata</option>
+                    <option value="strip-gps">Strip GPS</option>
+                    <option value="strip-all">Strip all</option>
+                </select>
+                <button id="filmstrip-export-selection" class="lb-btn ghost" type="button" title="Export selected at full resolution with chosen format and metadata policy">
                     Export selected
                 </button>
             </div>

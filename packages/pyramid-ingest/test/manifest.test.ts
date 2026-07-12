@@ -11,6 +11,7 @@ import {
   parseManifest,
   CURRENT_MANIFEST_SCHEMA,
   manifestToJson,
+  indexEntrySchema,
 } from "../src/schema";
 
 // M-3: the dead binary WRITE API (manifestToBinary / indexToBinary) is removed — the canonical
@@ -116,7 +117,111 @@ test("buildManifest flags proxy and buildIndexEntry inlines L0", () => {
 
   const idx = buildIndexEntry(proxy);
   expect(idx.imageId).toBe("a".repeat(16));
+  // finding 81: a monolithic 8-bit L0 defaults to the bare seed (no tiled/bitsPerSample) so a seed
+  // decoder treats it as a whole RGBA8 bitstream — the documented default path.
   expect(idx.l0).toEqual({ contenthash: "b".repeat(16), w: 512, h: 384 });
+});
+
+// finding 81: the L0 index seed must declare precision (bitsPerSample) and transport (tiled +
+// tiling descriptor) when they differ from the monolithic-RGBA8 default, so a seed decoder chooses
+// a VALID decode path instead of assuming a whole 8-bit bitstream. L0 is the SMALLEST level after
+// the ascending sort in buildManifest.
+test("finding 81: a tiled L0 seed declares tiled + tiling descriptor so the seed decoder routes to the tile path", () => {
+  const tiledSmall: LevelEntry = {
+    size: 256, w: 256, h: 192, bytes: 9, bitsPerSample: 8, contenthash: "c".repeat(16),
+    tiled: true, tiling: { container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" },
+  } as any;
+  const bigger: LevelEntry = { size: "full", w: 4000, h: 3000, bytes: 20, bitsPerSample: 8, contenthash: "d".repeat(16), tiled: false };
+  const m = buildManifest({
+    imageId: "a".repeat(16), master: { name: "x.orf", format: "orf", mtimeMs: 1 },
+    orientation: "baked", width: 4000, height: 3000, levels: [bigger, tiledSmall],
+  });
+  const idx = buildIndexEntry(m);
+  expect(idx.l0.contenthash).toBe("c".repeat(16)); // smallest level is L0
+  expect(idx.l0.tiled).toBe(true);
+  expect(idx.l0.bitsPerSample).toBe(8);
+  // the seed carries the tiling descriptor so the seed decoder can address tiles without decoding
+  expect((idx.l0 as any).tiling).toEqual({ container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" });
+});
+
+test("finding 81: a 16-bit L0 seed declares bitsPerSample:16 so the seed decoder picks the 16-bit path", () => {
+  const wide16: LevelEntry = {
+    size: 512, w: 512, h: 384, bytes: 12, bitsPerSample: 16, contenthash: "e".repeat(16), tiled: false,
+  };
+  const bigger: LevelEntry = { size: "full", w: 4000, h: 3000, bytes: 30, bitsPerSample: 16, contenthash: "f".repeat(16), tiled: false };
+  const m = buildManifest({
+    imageId: "a".repeat(16), master: { name: "x.dng", format: "dng", mtimeMs: 1 },
+    orientation: "baked", width: 4000, height: 3000, levels: [bigger, wide16],
+  });
+  const idx = buildIndexEntry(m);
+  expect(idx.l0.contenthash).toBe("e".repeat(16));
+  expect(idx.l0.bitsPerSample).toBe(16);
+  expect(idx.l0.tiled).toBeUndefined(); // untiled 16-bit: no transport descriptor, but precision is explicit
+});
+
+test("finding 81: the index schema validates an L0 seed carrying tiled + bitsPerSample + tiling", () => {
+  const entry = indexEntrySchema.parse({
+    imageId: "a".repeat(16),
+    aspect: 1.3333,
+    l0: {
+      contenthash: "c".repeat(16), w: 256, h: 192,
+      tiled: true, bitsPerSample: 8,
+      tiling: { container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" },
+    },
+  });
+  expect((entry.l0 as any).tiled).toBe(true);
+  expect((entry.l0 as any).tiling.tileSize).toBe(256);
+});
+
+// finding 76 (Task 7): the gallery index entry carries the shared reader's OPTIONAL `thumbhash` and
+// `group` fields. buildIndexEntry forwards them from the manifest's EXISTING `metadata` dict (no new
+// manifest dialect) so a produced index.json activates the placeholder + grouping the gallery reads.
+test("finding 76: buildIndexEntry forwards thumbhash + group from manifest.metadata", () => {
+  const level: LevelEntry = { size: 512, w: 512, h: 384, bytes: 3, bitsPerSample: 8, contenthash: "b".repeat(16), tiled: false };
+  const m = buildManifest({
+    imageId: "a".repeat(16), master: { name: "x.jpg", format: "jpg", mtimeMs: 1 },
+    orientation: "source", width: 4000, height: 3000, levels: [level],
+  });
+  (m as any).metadata = { thumbhash: "3OcRJYB4d3h/iIeHeEh3eIhw+j3A", group: "specimen-42", make: "Canon" };
+  const idx = buildIndexEntry(m);
+  expect(idx.thumbhash).toBe("3OcRJYB4d3h/iIeHeEh3eIhw+j3A");
+  expect(idx.group).toBe("specimen-42");
+});
+
+test("finding 76: buildIndexEntry omits thumbhash/group when the manifest carries no metadata", () => {
+  const level: LevelEntry = { size: 512, w: 512, h: 384, bytes: 3, bitsPerSample: 8, contenthash: "b".repeat(16), tiled: false };
+  const m = buildManifest({
+    imageId: "a".repeat(16), master: { name: "x.jpg", format: "jpg", mtimeMs: 1 },
+    orientation: "source", width: 4000, height: 3000, levels: [level],
+  });
+  const idx = buildIndexEntry(m);
+  expect("thumbhash" in idx).toBe(false);
+  expect("group" in idx).toBe(false);
+});
+
+// finding 76: the ingest index schema mirrors the shared jxl-pyramid reader — index entries accept
+// optional `thumbhash`/`group`, and the index accepts an optional `next` pagination cursor. This is
+// the SAME contract the browser reader already validates (not a new dialect).
+test("finding 76: indexEntrySchema accepts optional thumbhash + group", () => {
+  const entry = indexEntrySchema.parse({
+    imageId: "a".repeat(16),
+    aspect: 1.3333,
+    l0: { contenthash: "c".repeat(16), w: 256, h: 192 },
+    thumbhash: "3OcRJYB4d3h/iIeHeEh3eIhw+j3A",
+    group: "specimen-42",
+  });
+  expect(entry.thumbhash).toBe("3OcRJYB4d3h/iIeHeEh3eIhw+j3A");
+  expect(entry.group).toBe("specimen-42");
+});
+
+test("finding 76: galleryIndexSchema accepts an optional next pagination cursor", async () => {
+  const { galleryIndexSchema } = await import("../src/schema");
+  const idx = galleryIndexSchema.parse({
+    schema: 1,
+    images: [{ imageId: "a".repeat(16), aspect: 1.3333, l0: { contenthash: "c".repeat(16), w: 256, h: 192 } }],
+    next: "index-002.json",
+  });
+  expect(idx.next).toBe("index-002.json");
 });
 
 test("isUpToDate requires matching mtime and proxy flag alignment (non-proxy or proxy)", () => {
@@ -135,6 +240,43 @@ test("isUpToDate requires matching mtime and proxy flag alignment (non-proxy or 
   const pxy = { ...base, proxy: true as const };
   expect(isUpToDate(pxy, 1000, true)).toBe(true);
   expect(isUpToDate(pxy, 1000, false)).toBe(false);
+});
+
+describe("isSourceFresh (finding 66): fingerprint-aware freshness, mtime alone never certifies", () => {
+  function mk(fingerprint?: { byteLength: number; quickHash: string; contentHash?: string }) {
+    return buildManifest({
+      imageId: "d".repeat(16), master: { name: "x.orf", format: "orf", mtimeMs: 1000, fingerprint },
+      orientation: "baked", width: 10, height: 10,
+      levels: [{ size: "full", w: 10, h: 10, bytes: 1, bitsPerSample: 8, contenthash: "e".repeat(16), tiled: false }],
+    });
+  }
+
+  test("replaced bytes with PRESERVED mtime is STALE when a fingerprint is recorded", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const m = mk({ byteLength: 100, quickHash: "a".repeat(16) });
+    // same mtime + same size, but quickHash differs (content replaced in place) -> not fresh
+    expect(isSourceFresh(m, { byteLength: 100, mtimeMs: 1000, quickHash: "b".repeat(16) }, false)).toBe(false);
+  });
+
+  test("unchanged content with bumped mtime is FRESH when a fingerprint is recorded", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const m = mk({ byteLength: 100, quickHash: "a".repeat(16) });
+    expect(isSourceFresh(m, { byteLength: 100, mtimeMs: 9999, quickHash: "a".repeat(16) }, false)).toBe(true);
+  });
+
+  test("falls back to mtime-only freshness for legacy manifests with no fingerprint", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const legacy = mk(undefined); // no fingerprint recorded (v1..pre-task5 manifest)
+    expect(isSourceFresh(legacy, { byteLength: 100, mtimeMs: 1000, quickHash: "z".repeat(16) }, false)).toBe(true);
+    expect(isSourceFresh(legacy, { byteLength: 100, mtimeMs: 2000, quickHash: "z".repeat(16) }, false)).toBe(false);
+  });
+
+  test("proxy flag mismatch is never fresh, regardless of fingerprint match", async () => {
+    const { isSourceFresh } = await import("../src/manifest");
+    const m = mk({ byteLength: 100, quickHash: "a".repeat(16) });
+    // caller wants a proxy manifest but this is a non-proxy manifest -> stale
+    expect(isSourceFresh(m, { byteLength: 100, mtimeMs: 1000, quickHash: "a".repeat(16) }, true)).toBe(false);
+  });
 });
 
 test("buildManifest produces producedBy and manifestSchemaV1 roundtrips it", () => {

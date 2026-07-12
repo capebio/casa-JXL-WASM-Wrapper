@@ -1,4 +1,5 @@
 import * as JxlWasmNS from "@casabio/jxl-wasm";
+import { throwIfAborted } from "./abort.js";
 const JW: any = JxlWasmNS;
 
 export type MasterFormat = "orf" | "dng" | "cr2" | "jpg";
@@ -52,6 +53,11 @@ export interface PyramidLevelBytes {
   qualityCurve?: QualityCurvePoint[];
   /** unlocked instrumentation (via O/runlog from WU-6+phase2): pixel bytes of the level buffer passed to encoder (downscale output size = JS/WASM materialization + staging copy size per level for current batch JXTC path). */
   stagedBytes?: number;
+  /** finding 71: TRANSIENT tight RGBA8 reference pixels the ladder fed to the encoder for this level.
+   *  Held only when --profile-convergence is on so profiling reuses them (skips the reference decode);
+   *  cleared after profiling and NEVER persisted (toEntry ignores it). 16-bit big levels omit it (the
+   *  8-bit profiler cannot consume a 16-bit reference) and fall back to a decoded reference. */
+  refPixels?: Uint8Array;
 }
 
 export interface TileContainerEncodeOptions {
@@ -67,29 +73,51 @@ export interface PyramidEncodeOptions {
 }
 
 export interface RawBackend {
-  decode(bytes: Uint8Array, format: RawFormat): Promise<DecodedMaster>;
+  // finding 67 (Task 6): optional combined per-image signal (caller cancel + deadline). A backend that
+  // can decode incrementally should abort mid-decode when it fires; backends that ignore it still get
+  // stopped at the stage boundaries in ingest.ts (throwIfAborted before/after decode).
+  decode(bytes: Uint8Array, format: RawFormat, signal?: AbortSignal): Promise<DecodedMaster>;
 }
 
 export interface JxlBackend {
+  // finding 67 (Task 6): the trailing optional `signal` is the combined per-image signal (caller
+  // cancel + deadline). Encode/downscale are the heaviest stages; a backend that can check it should
+  // stop early. Backends that ignore it are still bounded by the throwIfAborted stage checkpoints in
+  // ingest.ts (before ladder build and before publish).
   encodePyramid(
     rgba: Uint8Array,
     width: number,
     height: number,
     opts: PyramidEncodeOptions,
+    signal?: AbortSignal,
   ): Promise<PyramidLevelBytes[]>;
   encodeTileContainer(
     rgba: Uint8Array,
     width: number,
     height: number,
     opts: TileContainerEncodeOptions,
+    signal?: AbortSignal,
   ): Promise<Uint8Array>;
-  /** 16-bit JXTC path (available after JXTC-16 WASM rebuild; v1 tiled top uses 8-bit). */
+  /** 16-bit JXTC path (available after JXTC-16 WASM rebuild; v1 tiled top uses 8-bit). Optional:
+   *  when absent (16-bit tile build not present) the ladder falls back to a monolithic 16-bit encode
+   *  via `encodeRgba16` rather than failing — finding 70. */
   encodeTileContainer16?(
     rgba16: Uint8Array,
     width: number,
     height: number,
     opts: TileContainerEncodeOptions,
+    signal?: AbortSignal,
   ): Promise<Uint8Array>;
+  /** Monolithic (whole-frame) 16-bit encode. Used for RGB16 big levels when the tiling policy is
+   *  "never" (or "adaptive" for a non-massive level), and as the mandatory fallback when the 16-bit
+   *  tile encoder is unavailable under a tiling policy (finding 70). */
+  encodeRgba16?(
+    rgba16: Uint8Array,
+    width: number,
+    height: number,
+    opts: { distance: number; effort: number },
+    signal?: AbortSignal,
+  ): Promise<{ data: Uint8Array; width: number; height: number }>;
   /** Downscale helpers for per-level tiled encoding (Phase 3 all-levels JXTC). */
   downscaleRgba8(
     rgba: Uint8Array,
@@ -97,6 +125,7 @@ export interface JxlBackend {
     srcH: number,
     dstW: number,
     dstH: number,
+    signal?: AbortSignal,
   ): Promise<Uint8Array>;
   downscaleRgba16?(
     rgba16: Uint16Array | Uint8Array,
@@ -107,10 +136,13 @@ export interface JxlBackend {
   ): Promise<Uint16Array | Uint8Array>;
   transcodeJpeg(jpeg: Uint8Array): Promise<Uint8Array>;
   decodeToRgba8(jxl: Uint8Array): Promise<{ rgba: Uint8Array; width: number; height: number }>;
-  /** incremental progressive decode + SSIM (or butter) to find first visual saturation byte offset for the level's own final. returns undef if single-pass or below threshold or small level. */
-  profileConvergence?(jxl: Uint8Array, w?: number, h?: number): Promise<number | undefined>;
-  /** full-curve variant of profileConvergence: per-pass ssim/butteraugli vs the level's own final + derived convergedByteEnd. Measured once at encode; clients read the curve from the manifest. */
-  profileConvergenceCurve?(jxl: Uint8Array, w?: number, h?: number): Promise<ConvergenceProfile | undefined>;
+  /** incremental progressive decode + SSIM (or butter) to find first visual saturation byte offset for the level's own final. returns undef if single-pass or below threshold or small level.
+   *  finding 71: `refPixels` (tight RGBA8 for w×h) lets the caller SUPPLY the reference the ladder
+   *  already produced, so the profiler skips its own reference decode (each reference decodes once). */
+  profileConvergence?(jxl: Uint8Array, w?: number, h?: number, refPixels?: Uint8Array): Promise<number | undefined>;
+  /** full-curve variant of profileConvergence: per-pass ssim/butteraugli vs the level's own final + derived convergedByteEnd. Measured once at encode; clients read the curve from the manifest.
+   *  finding 71: `refPixels` reuses the ladder's already-generated reference (skips the reference decode). */
+  profileConvergenceCurve?(jxl: Uint8Array, w?: number, h?: number, refPixels?: Uint8Array): Promise<ConvergenceProfile | undefined>;
 }
 
 export interface Telemetry {
@@ -127,7 +159,8 @@ export interface Clock {
 export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
   const tel = telemetry;
   return {
-    async encodePyramid(rgba, width, height, opts) {
+    async encodePyramid(rgba, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
       const sidecarSizes = opts.sidecars.map((s) => s.size);
       const sidecarDistances = opts.sidecars.map((s) => s.distance);
       const enc = JW.encodeRgba8Pyramid;
@@ -142,7 +175,8 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return levels.map((l: { data: Uint8Array; width: number; height: number }) => ({ data: l.data, width: l.width, height: l.height }));
     },
 
-    async encodeTileContainer(rgba, width, height, opts) {
+    async encodeTileContainer(rgba, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67: WASM encode is synchronous+uninterruptible; gate at entry
       const t0 = Date.now();
       const enc = JW.encodeTileContainerRgba8;
       const data = await enc(rgba, width, height, {
@@ -156,7 +190,8 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return data;
     },
 
-    async encodeTileContainer16(rgba16, width, height, opts) {
+    async encodeTileContainer16(rgba16, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
       const t0 = Date.now();
       const enc = JW.encodeTileContainerRgba16;
       if (typeof enc !== "function") throw new Error("encodeTileContainerRgba16 missing on jxl-wasm module (16-bit JXTC build required)"); // BK-4
@@ -171,7 +206,23 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return data;
     },
 
-    async downscaleRgba8(rgba, srcW, srcH, dstW, dstH) {
+    async encodeRgba16(rgba16, width, height, opts, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
+      const t0 = Date.now();
+      const enc = JW.encodeRgba16;
+      if (typeof enc !== "function") throw new Error("encodeRgba16 missing on jxl-wasm module (multi-format bridge required)");
+      const out = await enc(rgba16, width, height, {
+        distance: opts.distance,
+        effort: opts.effort,
+        hasAlpha: false,
+      });
+      const ms = Date.now() - t0;
+      tel?.stage?.("encode-rgba16", { w: width, h: height, inputBytes: (rgba16 as any).byteLength, ms });
+      return { data: out.data, width: out.width, height: out.height };
+    },
+
+    async downscaleRgba8(rgba, srcW, srcH, dstW, dstH, signal) {
+      throwIfAborted(signal, "encode"); // finding 67
       const t0 = Date.now();
       const ds = JW.downscaleRgba8;
       if (typeof ds !== "function") throw new Error("downscaleRgba8 missing on jxl-wasm module");
@@ -202,20 +253,20 @@ export function createJxlBackend(telemetry?: Telemetry): JxlBackend {
       return { rgba: ref.pixels, width: ref.w, height: ref.h };
     },
 
-    async profileConvergence(jxl, w, h) {
+    async profileConvergence(jxl, w, h, refPixels) {
       const t0 = Date.now();
-      const prof = await measureConvergenceProfile(jxl, w, h);
+      const prof = await measureConvergenceProfile(jxl, w, h, refPixels);
       const ms = Date.now() - t0;
-      tel?.stage?.("profile-convergence", { w, h, kind: "cutoff", ms, converged: !!prof?.convergedByteEnd });
+      tel?.stage?.("profile-convergence", { w, h, kind: "cutoff", ms, reusedRef: refPixels != null, converged: !!prof?.convergedByteEnd });
       return prof?.convergedByteEnd;
     },
 
-    async profileConvergenceCurve(jxl, w, h) {
+    async profileConvergenceCurve(jxl, w, h, refPixels) {
       const t0 = Date.now();
-      const prof = await measureConvergenceProfile(jxl, w, h);
+      const prof = await measureConvergenceProfile(jxl, w, h, refPixels);
       const ms = Date.now() - t0;
       const curveLen = prof?.curve?.length ?? 0;
-      tel?.stage?.("profile-convergence", { w, h, kind: "curve", ms, curveLen, converged: !!prof?.convergedByteEnd });
+      tel?.stage?.("profile-convergence", { w, h, kind: "curve", ms, reusedRef: refPixels != null, curveLen, converged: !!prof?.convergedByteEnd });
       return prof;
     },
   };
@@ -286,13 +337,26 @@ async function measureConvergenceProfile(
   jxl: Uint8Array,
   w?: number,
   h?: number,
+  refPixels?: Uint8Array,
 ): Promise<ConvergenceProfile | undefined> {
-  // 1. final ref (no progress events)
-  const ref = await decodeFinal(jxl);
-  if (!ref) return undefined;
-  let finalPixels = ref.pixels;
-  let useW = ref.w || (w ?? 0);
-  let useH = ref.h || (h ?? 0);
+  // 1. final ref. finding 71: reuse the ladder's already-generated reference pixels when supplied
+  // (the RGBA8 buffer the ladder fed to the encoder) so the reference is decoded exactly ONCE across
+  // the whole ingest instead of a redundant full decode per level. Only fall back to a fresh
+  // decodeFinal when no reference is supplied or its size does not match the declared w/h.
+  let finalPixels: Uint8Array;
+  let useW: number;
+  let useH: number;
+  if (refPixels && w && h && refPixels.length === w * h * 4) {
+    finalPixels = refPixels;
+    useW = w;
+    useH = h;
+  } else {
+    const ref = await decodeFinal(jxl);
+    if (!ref) return undefined;
+    finalPixels = ref.pixels;
+    useW = ref.w || (w ?? 0);
+    useH = ref.h || (h ?? 0);
+  }
   if (!finalPixels || Math.max(useW, useH) < 1024) return undefined;
 
   // SSIM engine: prefer the WASM kernel (_jxl_wasm_ssim_compare) — measured 95-97% faster than

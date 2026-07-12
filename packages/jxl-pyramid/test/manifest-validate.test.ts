@@ -102,6 +102,125 @@ describe("aspect ratio", () => {
   });
 });
 
+// ── Finite / bounded top-level dimensions (finding 73) ───────────────────────
+// The reader is a trust boundary for untrusted network manifests. Non-finite,
+// negative, or absurdly-large top-level width/height/aspect must be rejected so a
+// hostile manifest cannot drive downstream allocation/tiling math off a cliff.
+
+describe("finite/bounded top-level dimensions", () => {
+  test("NaN width throws", () => {
+    expectValidationError(() => parsePyramidManifest(baseManifest({ width: NaN })), "width");
+  });
+
+  test("Infinity width throws", () => {
+    expectValidationError(() => parsePyramidManifest(baseManifest({ width: Infinity })), "width");
+  });
+
+  test("negative width throws", () => {
+    // aspect kept negative so the aspect/ratio check does not fire first; width positivity must catch it.
+    expectValidationError(() => parsePyramidManifest(baseManifest({ width: -100, aspect: -100 / 3456 })), "width");
+  });
+
+  test("negative height throws", () => {
+    expectValidationError(() => parsePyramidManifest(baseManifest({ height: -100, aspect: 4608 / -100 })), "height");
+  });
+
+  test("absurdly-large width (beyond MAX_DIMENSION) throws", () => {
+    expectValidationError(() => parsePyramidManifest(baseManifest({ width: 1e12, height: 1e12, aspect: 1 })), "width");
+  });
+
+  test("absurdly-large height (beyond MAX_DIMENSION) throws", () => {
+    // width kept in-range so the height cap is what fires; aspect kept consistent.
+    expectValidationError(() => parsePyramidManifest(baseManifest({ width: 4608, height: 1e12, aspect: 4608 / 1e12 })), "height");
+  });
+
+  test("non-positive aspect throws", () => {
+    expectValidationError(() => parsePyramidManifest(baseManifest({ aspect: 0 })), "aspect");
+  });
+
+  test("NaN aspect throws", () => {
+    expectValidationError(() => parsePyramidManifest(baseManifest({ aspect: NaN })), "aspect");
+  });
+});
+
+// ── Index entry aspect bounds (finding 73) ───────────────────────────────────
+
+describe("index entry finite/bounded aspect", () => {
+  function baseIndex(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      schema: 1,
+      images: [{ imageId: "img-001", aspect: 1.333, l0: { contenthash: "abc", w: 256, h: 192 } }],
+      ...overrides,
+    };
+  }
+
+  test("NaN entry aspect throws", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: NaN, l0: { contenthash: "abc", w: 1, h: 1 } }],
+    })), "aspect");
+  });
+
+  test("non-positive entry aspect throws", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 0, l0: { contenthash: "abc", w: 1, h: 1 } }],
+    })), "aspect");
+  });
+
+  test("absurdly-large l0.w throws", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1, l0: { contenthash: "abc", w: 1e12, h: 1 } }],
+    })), "w");
+  });
+
+  // ── finding 81: the L0 seed declares precision + transport so the seed decoder chooses a valid path.
+  test("finding 81: a bare L0 seed stays monolithic 8-bit (no tiled/bitsPerSample carried)", () => {
+    const idx = parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192 } }],
+    }));
+    const seed = idx.images[0]!.l0;
+    expect(seed.tiled).toBeUndefined();
+    expect(seed.bitsPerSample).toBeUndefined();
+    expect(seed.tiling).toBeUndefined();
+  });
+
+  test("finding 81: a tiled L0 seed preserves tiled + tiling so the seed decoder routes to the tile path", () => {
+    const idx = parseGalleryIndex(baseIndex({
+      images: [{
+        imageId: "x", aspect: 1.333,
+        l0: {
+          contenthash: "abc123", w: 256, h: 192, bitsPerSample: 8, tiled: true,
+          tiling: { container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" },
+        },
+      }],
+    }));
+    const seed = idx.images[0]!.l0;
+    expect(seed.tiled).toBe(true);
+    expect(seed.bitsPerSample).toBe(8);
+    expect(seed.tiling).toEqual({ container: "jxtc", version: 1, tileSize: 256, bitsPerSample: 8, offsetBase: "file" });
+  });
+
+  test("finding 81: a 16-bit L0 seed preserves bitsPerSample:16", () => {
+    const idx = parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192, bitsPerSample: 16 } }],
+    }));
+    const seed = idx.images[0]!.l0;
+    expect(seed.bitsPerSample).toBe(16);
+    expect(seed.tiled).toBeUndefined();
+  });
+
+  test("finding 81: a tiled L0 seed WITHOUT a tiling descriptor is rejected at the trust boundary", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192, tiled: true } }],
+    })), "tiling");
+  });
+
+  test("finding 81: an invalid l0.bitsPerSample is rejected", () => {
+    expectValidationError(() => parseGalleryIndex(baseIndex({
+      images: [{ imageId: "x", aspect: 1.333, l0: { contenthash: "abc123", w: 256, h: 192, bitsPerSample: 12 } }],
+    })), "bitsPerSample");
+  });
+});
+
 // ── Level ordering ───────────────────────────────────────────────────────────
 
 describe("level ordering", () => {

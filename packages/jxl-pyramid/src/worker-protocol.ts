@@ -19,14 +19,26 @@ import type { ImageRegion } from "./tiling.js";
 
 export type { ImageRegion } from "./tiling.js";
 
+/**
+ * One tile's standalone JXL bitstream, addressed by its ABSOLUTE offset in the source
+ * container (matches the JXTC index-table convention) AND by its grid origin (`gx`,`gy` in image
+ * pixels) so a range-carrier worker can pick the exact tile a decode `region` refers to without
+ * ever seeing the whole container. Range carriers post ONLY the requested tiles (finding 79)
+ * instead of structured-cloning `workers * containerSize`.
+ */
+export type TileByteRange = { offset: number; length: number; gx: number; gy: number; bytes: Uint8Array };
+
 export type WorkerRequest =
   | { v: 1; type: 'load'; bytesId: number; bytes: Uint8Array }
   | { v: 1; type: 'load'; bytesId: number; sab: SharedArrayBuffer; byteLength: number }
+  | { v: 1; type: 'load'; bytesId: number; ranges: TileByteRange[] }
   | { v: 1; type: 'decode'; id: number; bytesId: number; region: ImageRegion; format: 'rgba8' | 'rgba16'; deadlineMs?: number; progressiveStage?: 'dc' | 'final'; priority?: number }
+  | { v: 1; type: 'unload'; bytesId: number }
   | { v: 1; type: 'cancel'; id: number };
 
 export type WorkerReply =
   | { v: 1; type: 'ready' }
+  | { v: 1; type: 'unload-ack'; bytesId: number }
   | { v: 1; type: 'decode-reply'; id: number; ok: true; pixels: Uint8Array; w: number; h: number }
   | { v: 1; type: 'decode-reply'; id: number; ok: false; error: { code: WorkerErrorCode; message: string; stack?: string } };
 
@@ -47,9 +59,19 @@ export function validateWorkerRequest(req: unknown): void {
         throw new Error('[pyramid] WorkerRequest load: sab is not a SharedArrayBuffer');
       if (typeof r.byteLength !== 'number' || r.byteLength <= 0)
         throw new Error('[pyramid] WorkerRequest load: byteLength must be positive number');
+    } else if (r.ranges !== undefined) {
+      if (!Array.isArray(r.ranges) || r.ranges.length === 0)
+        throw new Error('[pyramid] WorkerRequest load: ranges must be a non-empty array');
+      for (const range of r.ranges) {
+        if (!range || typeof range.offset !== 'number' || typeof range.length !== 'number' ||
+            typeof range.gx !== 'number' || typeof range.gy !== 'number' || !(range.bytes instanceof Uint8Array))
+          throw new Error('[pyramid] WorkerRequest load: each range needs numeric offset,length,gx,gy + Uint8Array bytes');
+      }
     } else if (!(r.bytes instanceof Uint8Array)) {
       throw new Error('[pyramid] WorkerRequest load: bytes must be a Uint8Array');
     }
+  } else if (r.type === 'unload') {
+    if (typeof r.bytesId !== 'number') throw new Error('[pyramid] WorkerRequest unload: bytesId not a number');
   } else if (r.type === 'decode') {
     if (typeof r.id !== 'number') throw new Error('[pyramid] WorkerRequest decode: id not a number');
     if (typeof r.bytesId !== 'number') throw new Error('[pyramid] WorkerRequest decode: bytesId not a number');

@@ -68,6 +68,74 @@ test("buildRawLadder attaches qualityCurve + convergedByteEnd from profileConver
   }
 });
 
+// ── finding 71: bound convergence profiling + reuse reference decodes ─────────────────────────────
+
+test("finding 71: profiling reuses the level's reference pixels (refPixels passed, no separate decode)", async () => {
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+  const refCalls: Array<{ w?: number; h?: number; hasRef: boolean; refLen: number }> = [];
+  const jxl: JxlBackend = {
+    ...makeTestJxlBackend(),
+    async profileConvergenceCurve(_jxl: Uint8Array, w?: number, h?: number, refPixels?: Uint8Array) {
+      refCalls.push({ w, h, hasRef: refPixels != null, refLen: refPixels?.length ?? 0 });
+      return { curve: [{ bytes: 2, ssim: 0.999 }], convergedByteEnd: 2 };
+    },
+  };
+  const W = 2048, H = 1536;
+  const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
+  await buildRawLadder(jxl, decoded, true, "tile-all");
+  // Only levels >= 1024 are profiled; each MUST receive the pre-encode reference pixels so the
+  // profiler skips its own reference re-decode (finding 71 — reuse existing reference decodes).
+  expect(refCalls.length).toBeGreaterThan(0);
+  for (const c of refCalls) {
+    expect(c.hasRef).toBe(true);
+    expect(c.refLen).toBe(c.w! * c.h! * 4); // tight RGBA8 reference for that level
+  }
+});
+
+test("finding 71: profiling is bounded by the memory budget (byte-weighted semaphore limits concurrency)", async () => {
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+  let live = 0, peakLive = 0;
+  const jxl: JxlBackend = {
+    ...makeTestJxlBackend(),
+    async profileConvergenceCurve(_jxl: Uint8Array, _w?: number, _h?: number, _ref?: Uint8Array) {
+      live++;
+      peakLive = Math.max(peakLive, live);
+      await new Promise((r) => setTimeout(r, 25));
+      live--;
+      return { curve: [{ bytes: 2, ssim: 0.999 }], convergedByteEnd: 2 };
+    },
+  };
+  const W = 4096, H = 3072; // several levels >= 1024 (1024/2048/4096) → multiple profiling tasks
+  const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
+  // Budget only large enough for a single 1024-wide reference (1024*768*4 ≈ 3.1MB); the 2048/4096
+  // references are far larger, so they cannot run concurrently with each other.
+  await buildRawLadder(jxl, decoded, true, "tile-all", undefined, { profileMemBudgetBytes: 1024 * 768 * 4 });
+  expect(peakLive).toBe(1); // budget forces the large references to profile one at a time
+});
+
+test("finding 71: without a budget cap, profiling of independent levels runs concurrently", async () => {
+  const module = await loadScalarModule();
+  setJxlModuleFactoryForTesting(scalarFactory(module));
+  let live = 0, peakLive = 0;
+  const jxl: JxlBackend = {
+    ...makeTestJxlBackend(),
+    async profileConvergenceCurve() {
+      live++;
+      peakLive = Math.max(peakLive, live);
+      await new Promise((r) => setTimeout(r, 25));
+      live--;
+      return { curve: [{ bytes: 2, ssim: 0.999 }], convergedByteEnd: 2 };
+    },
+  };
+  const W = 4096, H = 3072;
+  const decoded: DecodedMaster = { rgba: gradientRgba(W, H), width: W, height: H, orientation: "baked" };
+  // Generous budget: independent levels profile in parallel (>1 concurrent).
+  await buildRawLadder(jxl, decoded, true, "tile-all", undefined, { profileMemBudgetBytes: 1 << 30 });
+  expect(peakLive).toBeGreaterThan(1);
+});
+
 test("buildJpgLadder produces all levels (incl full) as tiled JXTC (no transcode substitution)", async () => {
   const transcodeBytes = new Uint8Array([0xff, 0x0a, 0x42, 0x13]);
   const fake: JxlBackend = {
@@ -191,6 +259,111 @@ test("I-1: buildRawLadder rgb16 grid tile-all threads tileSize=256 into the pers
     expect(entry.tiling.tileSize).toBe(256);
     expect(entry.tiling.version).toBe(1);
   }
+});
+
+// ── finding 70: RGB16 tiling policy (never | adaptive | tile-all/always) ─────────────────────────
+// The rgb16 branch previously ALWAYS tiled (grid via encodeTileContainer, big via
+// encodeTileContainer16) and THREW when encodeTileContainer16 was absent — ignoring the batch
+// tiling policy and making the 16-bit tile encoder mandatory. The policy must be honored and a
+// missing 16-bit tile encoder must fall back to a monolithic 16-bit encode (encodeRgba16), not throw.
+
+function make16Backend(overrides: Partial<JxlBackend> = {}): JxlBackend {
+  return {
+    async encodeTileContainer(_r, w, h) { return new Uint8Array([0xc0, w & 0xff, (w >> 8) & 0xff, h & 0xff]); },
+    async encodeTileContainer16(_r, w, h) { return new Uint8Array([0x4a, 0x58, 0x54, 0x43, w & 0xff, (w >> 8) & 0xff, h & 0xff]); },
+    async encodeRgba16(_r, w, h) { return { data: new Uint8Array([0xe0, w & 0xff, (w >> 8) & 0xff, h & 0xff]), width: w, height: h }; },
+    async encodePyramid(_r, w, h, opts) {
+      const out: any[] = [];
+      for (const sc of (opts.sidecars ?? [])) out.push({ data: new Uint8Array([0xf0, sc.size & 0xff]), width: sc.size, height: sc.size });
+      out.push({ data: new Uint8Array([0xf1, w & 0xff]), width: w, height: h });
+      return out;
+    },
+    async downscaleRgba8(_r, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
+    async downscaleRgba16(_r, _sw, _sh, dw, dh) { return new Uint16Array(dw * dh * 4); },
+    ...overrides,
+  } as JxlBackend;
+}
+
+test("finding 70: RGB16 'never' policy emits monolithic 16-bit big levels (no tiled big levels, encodeRgba16 used)", async () => {
+  const enc16Calls: Array<{ w: number; h: number }> = [];
+  const monoCalls: Array<{ w: number; h: number }> = [];
+  const fake = make16Backend({
+    async encodeTileContainer16(_r, w, h) { enc16Calls.push({ w, h }); return new Uint8Array([0x4a, 0x58, 0x54, 0x43]); },
+    async encodeRgba16(_r, w, h) { monoCalls.push({ w, h }); return { data: new Uint8Array([0xe0, w & 0xff]), width: w, height: h }; },
+  });
+  const rgb16 = new Uint8Array(3000 * 2000 * 6);
+  const decoded: DecodedMaster = { rgba: gradientRgba(3000, 2000), rgb16, width: 3000, height: 2000, orientation: "baked" };
+  const ladder = await buildRawLadder(fake, decoded, false, "never");
+  const big = ladder.levels.filter((l) => Math.max(l.width, l.height) >= 2048);
+  expect(big.length).toBeGreaterThan(0);
+  for (const lvl of big) {
+    expect(lvl.bitsPerSample).toBe(16);
+    expect(lvl.tiled).toBe(false); // never => monolithic
+  }
+  expect(enc16Calls.length).toBe(0); // no 16-bit tile encode under 'never'
+  expect(monoCalls.length).toBe(big.length); // one monolithic 16-bit encode per big level
+});
+
+test("finding 70: RGB16 missing 16-bit tile encoder under tile-all falls back to monolithic 16-bit (does NOT throw)", async () => {
+  const monoCalls: Array<{ w: number; h: number }> = [];
+  const fake = make16Backend({
+    encodeTileContainer16: undefined, // 16-bit JXTC build absent
+    async encodeRgba16(_r, w, h) { monoCalls.push({ w, h }); return { data: new Uint8Array([0xe0, w & 0xff]), width: w, height: h }; },
+  });
+  const rgb16 = new Uint8Array(3000 * 2000 * 6);
+  const decoded: DecodedMaster = { rgba: gradientRgba(3000, 2000), rgb16, width: 3000, height: 2000, orientation: "baked" };
+  const ladder = await buildRawLadder(fake, decoded, false, "tile-all");
+  const big = ladder.levels.filter((l) => Math.max(l.width, l.height) >= 2048);
+  expect(big.length).toBeGreaterThan(0);
+  for (const lvl of big) {
+    expect(lvl.bitsPerSample).toBe(16);
+    expect(lvl.tiled).toBe(false); // fell back to monolithic — NOT tiled
+  }
+  expect(monoCalls.length).toBe(big.length);
+});
+
+test("finding 70: RGB16 tile-all with a 16-bit tile encoder tiles the big levels (bitsPerSample:16 descriptor)", async () => {
+  const enc16Calls: Array<{ w: number; h: number }> = [];
+  const fake = make16Backend({
+    async encodeTileContainer16(_r, w, h) { enc16Calls.push({ w, h }); return new Uint8Array([0x4a, 0x58, 0x54, 0x43, w & 0xff]); },
+  });
+  const rgb16 = new Uint8Array(3000 * 2000 * 6);
+  const decoded: DecodedMaster = { rgba: gradientRgba(3000, 2000), rgb16, width: 3000, height: 2000, orientation: "baked" };
+  const ladder = await buildRawLadder(fake, decoded, false, "tile-all");
+  const big = ladder.levels.filter((l) => Math.max(l.width, l.height) >= 2048);
+  expect(big.length).toBeGreaterThan(0);
+  for (const lvl of big) {
+    expect(lvl.bitsPerSample).toBe(16);
+    expect(lvl.tiled).toBe(true);
+    const entry = toEntry(lvl, decoded.width, decoded.height) as any;
+    expect(entry.tiling.bitsPerSample).toBe(16); // 16-bit tiling descriptor
+    expect(entry.tiling.tileSize).toBe(256);
+  }
+  expect(enc16Calls.length).toBe(big.length);
+});
+
+test("finding 70: RGB16 adaptive tiles only a massive full big level; smaller big sidecars stay monolithic 16-bit", async () => {
+  // master 9000 long-edge (massive: > 8000). adaptive => tile the massive full level only.
+  const enc16Calls: Array<{ w: number; h: number }> = [];
+  const monoCalls: Array<{ w: number; h: number }> = [];
+  const fake = make16Backend({
+    async encodeTileContainer16(_r, w, h) { enc16Calls.push({ w, h }); return new Uint8Array([0x4a, 0x58, 0x54, 0x43]); },
+    async encodeRgba16(_r, w, h) { monoCalls.push({ w, h }); return { data: new Uint8Array([0xe0, w & 0xff]), width: w, height: h }; },
+  });
+  const rgb16 = new Uint8Array(9000 * 4000 * 6);
+  const decoded: DecodedMaster = { rgba: gradientRgba(9000, 4000), rgb16, width: 9000, height: 4000, orientation: "baked" };
+  const ladder = await buildRawLadder(fake, decoded, false, "adaptive");
+  const big = ladder.levels.filter((l) => Math.max(l.width, l.height) >= 2048);
+  const full = big.find((l) => l.width === 9000);
+  expect(full).toBeDefined();
+  expect(full!.tiled).toBe(true); // massive full is tiled under adaptive
+  // every non-full big sidecar stays monolithic 16-bit
+  for (const lvl of big) {
+    if (lvl.width === 9000) continue;
+    expect(lvl.tiled).toBe(false);
+    expect(lvl.bitsPerSample).toBe(16);
+  }
+  expect(enc16Calls.length).toBe(1); // exactly the full level
 });
 
 test("I-1: buildJpgLadder tile-all full JXTC level threads tileSize=256 into the persisted TilingDescriptor", async () => {

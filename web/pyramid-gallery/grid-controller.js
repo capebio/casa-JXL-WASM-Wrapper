@@ -1,10 +1,22 @@
-import { chooseLevelForTarget, shouldUpgrade } from '../../packages/jxl-pyramid/dist/choose-level.js';
+import { shouldUpgrade } from '../../packages/jxl-pyramid/dist/choose-level.js';
+// finding 26: ONE resolver across consumers. The grid no longer calls chooseLevelForTarget
+// directly — it routes demand through resolveLod, which owns the (shared) level selection and
+// tells us the delivery kind. The grid's targets stay <=2048 whole, so the resolution axis is the
+// one it exercises; the resolver's region/quality axes are used by the lightbox.
+import { resolveLod } from '../../packages/jxl-pyramid/dist/lod-resolver.js';
+import { createLevelSource } from '../../packages/jxl-pyramid/dist/level-source.js';
 import { decodePyramidLevel } from './pyramid-decode.js';
 import { createImageStore } from './image-store.js'; // S2; passed in or fallback
+import { createInflightDecodes } from './decode-lease.js';
 
 const PREFETCH_RING = 1;
 
-/** @typedef {{ contenthash: string; w: number; h: number }} IndexL0 */
+/**
+ * finding 81: the L0 seed declares precision (bitsPerSample) and transport (tiled + tiling) so this
+ * controller decodes it through a VALID path. A bare seed (no tiled/bitsPerSample) is a monolithic
+ * 8-bit level — the default. A tiled seed is decoded through the tile-container path with a region.
+ * @typedef {{ contenthash: string; w: number; h: number; bytes?: number; bitsPerSample?: 8|16; tiled?: boolean; tiling?: object }} IndexL0
+ */
 /** @typedef {{ imageId: string; aspect: number; l0: IndexL0 }} IndexEntry */
 
 /**
@@ -13,6 +25,7 @@ const PREFETCH_RING = 1;
  * @param {import('@casabio/jxl-cache').JxlCacheBrowser} [opts.cache]
  * @param {URL} [opts.galleryBase]
  * @param {object} [opts.imageStore] // preferred; from createImageStore S1
+ * @param {import('@casabio/jxl-pyramid').PyramidRuntime} [opts.runtime] // Packet 2 Task 1: single owned decode runtime (engine of record); Task 3 routes decode through it
  * @param {number} opts.tileSizePx
  * @param {number} [opts.devicePixelRatio]
  * @param {Map<string, IndexEntry>} [opts.indexByImageId]
@@ -23,72 +36,91 @@ export function createGridController({
   cache,
   galleryBase,
   imageStore,
+  runtime,
   tileSizePx,
   devicePixelRatio,
   indexByImageId,
   onTilePainted,
 }) {
   const store = imageStore || (cache && galleryBase ? createImageStore({ cache, galleryBase }) : null);
+  // Packet 2 Task 3: the single decode runtime handed down by the gallery bootstrap is the ONE
+  // orchestration surface that owns the tiled worker pool. Tiled levels decode through
+  // runtime.decodeLevel (no per-call pool, no drifted options); whole levels stay on the shared
+  // scheduler/session path via decodePyramidLevel.
   const dpr = devicePixelRatio ?? 1;
   const paintedRank = new Map();
-  const inflight = new Map();
+  // Ref-counted shared-decode ownership (findings 49, 76). Callers that share a
+  // job key dedupe onto one underlying decode; the decode is cancelled only when
+  // EVERY caller — including a caller WITHOUT an AbortSignal — has released its
+  // lease. A no-signal caller is therefore never invisible.
+  const inflight = createInflightDecodes();
   // S2: manifests map + fetchManifest/fetchLevelBytes replaced by imageStore (S1)
 
   function targetLongEdge() {
     return Math.ceil(tileSizePx * dpr);
   }
 
-  async function decodeForLevel(imageId, level, priority, signal) {
-    const jobKey = `${imageId}:${level.contenthash}`;
+  // Capabilities for the resolver. The grid decodes whole levels (targets <=2048), so it does not
+  // request Range delivery here — it reports rangeRequests:false so the resolver always yields a
+  // whole-level for the grid. (The lightbox, which owns zoom/ROI, is the range-capable consumer.)
+  function gridCapabilities() {
+    return {
+      workers: runtime?.capabilities?.workers ?? true,
+      sharedMemory: runtime?.capabilities?.sharedMemory ?? false,
+      rangeRequests: false,
+      rgba16: runtime?.capabilities?.rgba16 ?? false,
+    };
+  }
 
-    // Ref-counted cancellation: dedup joiners share one underlying decode, but
-    // the shared decode is only aborted once EVERY joiner has aborted. The
-    // shared controller's signal is what drives the decode.
-    let job = inflight.get(jobKey);
-    if (!job) {
-      const shared = new AbortController();
-      job = { shared, joiners: 0, promise: null };
-      job.promise = (async () => {
-        if (!store) throw new Error('grid-controller requires imageStore (or cache+galleryBase)');
-        const bytes = await store.getLevelBytes(level.contenthash);
-        const isTiled = level.tiled === true;
-        return decodePyramidLevel(ctx, bytes, {
-          contenthash: level.contenthash,
-          priority,
-          signal: shared.signal,
-          tiled: isTiled,
-          // Supply full region for tiled so decodeTiledPooled can parallel all tiles (grid targets stay <=2048 whole, but protects if large tileSize or full picked).
-          region: isTiled ? { x: 0, y: 0, w: level.w, h: level.h } : undefined,
-        });
-      })().finally(() => inflight.delete(jobKey));
-      inflight.set(jobKey, job);
-    }
-
-    // Register this caller as a joiner so its abort only contributes to, but
-    // does not unilaterally trigger, cancellation of the shared decode.
-    if (signal) {
-      if (signal.aborted) {
-        job.shared.abort();
-      } else {
-        job.joiners += 1;
-        let counted = true;
-        const onAbort = () => {
-          if (!counted) return;
-          counted = false;
-          job.joiners -= 1;
-          if (job.joiners <= 0) job.shared.abort();
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-        // Stop tracking once the decode settles so a late abort from this
-        // joiner cannot over-decrement / abort an already-finished job.
-        job.promise.catch(() => {}).finally(() => {
-          counted = false;
-          signal.removeEventListener('abort', onAbort);
-        });
+  // Runs the actual decode under the shared signal handed down by the lease
+  // registry. The shared signal aborts only once all leases for this job key
+  // are released — so this decode observes cancellation, but never a premature
+  // one driven by a single joiner.
+  function startDecode(imageId, level, priority, sharedSignal) {
+    return (async () => {
+      if (!store) throw new Error('grid-controller requires imageStore (or cache+galleryBase)');
+      // Pass the level's declared byte size so the trusted boundary caps the fetch precisely
+      // (finding 73). `level.bytes` comes from the validated manifest; undefined for a bare l0
+      // seed falls back to the store's generous ceiling.
+      const bytes = await store.getLevelBytes(level.contenthash, { expectedBytes: level.bytes });
+      // finding 81: honor the level's DECLARED transport + precision. A level (or L0 seed) is
+      // decoded as tiled only when it explicitly declares `tiled` — an L0 seed without it defaults
+      // to a monolithic whole-frame decode (never assumed tiled). Precision follows bitsPerSample.
+      const isTiled = level.tiled === true;
+      if (isTiled && runtime) {
+        // finding 77/78: tiled decode goes through the ONE injected runtime. It owns the pool
+        // (no per-call pool creation) and accepts only the declared demand keys — the runtime
+        // derives format from the JXTC header, so no `format`/`priority`/`sourceKey` drift here.
+        const source = createLevelSource({ w: level.w, h: level.h, tiled: true, bitsPerSample: level.bitsPerSample }, bytes);
+        // Full-region decode so the pool can fan every tile out in parallel (grid targets stay
+        // <=2048 whole, but this protects if a large tileSize or the full level is picked).
+        const region = { x: 0, y: 0, w: level.w, h: level.h };
+        return runtime.decodeLevel(source, region, { quality: 'final', signal: sharedSignal });
       }
-    }
+      // Whole-frame levels use the shared scheduler/session path (dedupe/priority/backpressure).
+      const format = level.bitsPerSample === 16 ? 'rgba16' : 'rgba8';
+      return decodePyramidLevel(ctx, bytes, {
+        contenthash: level.contenthash,
+        priority,
+        signal: sharedSignal,
+        tiled: false,
+        format,
+      });
+    })();
+  }
 
-    return job.promise;
+  /**
+   * Acquire a lease on the (possibly shared) decode for this level. EVERY caller
+   * — with or without a signal — owns exactly one lease and must release() it in
+   * a `finally`. Returns `{ promise, release }`.
+   */
+  function decodeForLevel(imageId, level, priority, signal) {
+    const jobKey = `${imageId}:${level.contenthash}`;
+    return inflight.decode(
+      jobKey,
+      (sharedSignal) => startDecode(imageId, level, priority, sharedSignal),
+      signal,
+    );
   }
 
   function paintCanvas(cellEl, decoded) {
@@ -125,17 +157,26 @@ export function createGridController({
     const current = paintedRank.get(rankKey) ?? null;
     if (!shouldUpgrade(current, level)) return false;
 
-    const decoded = await decodeForLevel(imageId, level, priority, signal);
-    // Don't advance painted state on abort: leave paintedRank untouched.
-    if (signal?.aborted) return false;
-    // Re-check against the (possibly advanced) rank after the await so a late
-    // lower-level decode cannot overpaint a higher level painted meanwhile.
-    if (!shouldUpgrade(paintedRank.get(rankKey) ?? null, level)) return false;
+    // Own exactly one lease on the shared decode and release it once (finding 49).
+    // Releasing in `finally` guarantees the underlying decode is not kept alive by
+    // this caller past its own interest, while a concurrent no-signal/other-signal
+    // caller still holds it.
+    const lease = decodeForLevel(imageId, level, priority, signal);
+    try {
+      const decoded = await lease.promise;
+      // Don't advance painted state on abort: leave paintedRank untouched.
+      if (signal?.aborted) return false;
+      // Re-check against the (possibly advanced) rank after the await so a late
+      // lower-level decode cannot overpaint a higher level painted meanwhile.
+      if (!shouldUpgrade(paintedRank.get(rankKey) ?? null, level)) return false;
 
-    paintCanvas(cellEl, decoded);
-    paintedRank.set(rankKey, level);
-    onTilePainted?.(cellEl, imageId, level, decoded);
-    return true;
+      paintCanvas(cellEl, decoded);
+      paintedRank.set(rankKey, level);
+      onTilePainted?.(cellEl, imageId, level, decoded);
+      return true;
+    } finally {
+      lease.release();
+    }
   }
 
   async function paintCell(cellEl, imageId, { priority = 'visible', signal = null } = {}) {
@@ -147,8 +188,11 @@ export function createGridController({
 
     if (!store) throw new Error('grid-controller requires imageStore (or cache+galleryBase)');
     const manifest = await store.getManifest(imageId);
-    const target = targetLongEdge();
-    const level = chooseLevelForTarget(manifest.levels, target);
+    // finding 26: route selection through the ONE resolver. For the grid this yields a whole-level
+    // (rangeRequests:false), and its `.level` is the same level the shared chooseLevelForTarget
+    // would pick — the resolver simply owns that selection now.
+    const resolution = resolveLod(manifest, { targetLongEdge: targetLongEdge(), dpr }, gridCapabilities());
+    const level = resolution?.level;
     if (!level) return;
 
     await paintLevel(cellEl, imageId, level, { priority, signal });

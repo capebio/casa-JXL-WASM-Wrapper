@@ -1,4 +1,4 @@
-import { canUseParallelTileWorkers, canShareContainerBytes, parseJxtcHeader, } from "./tiling.js";
+import { canUseParallelTileWorkers, canShareContainerBytes, parseJxtcHeader, extractTileBitstream, } from "./tiling.js";
 import { stitch, PyramidError, viewportCacheKey, bppOfFormat, ensureIccProfile, validateDecodedOutput, tileKey, tileIdOf, buffersInFlight, raceWithAbort, cacheStore, assertFiniteRegion, snapRegionToIntegers, stitchCropped, } from "./decode-core.js";
 import { getLevelId, makeTileCacheKey } from "./cache.js";
 import { prepareDecodePlan } from "./plan.js";
@@ -21,6 +21,27 @@ export var HandleState;
     HandleState["Terminated"] = "terminated";
 })(HandleState || (HandleState = {}));
 const DEV = typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production';
+/**
+ * Below this container size an owned whole-buffer copy per worker is cheap enough to prefer
+ * over per-tile range bookkeeping (finding 33). A JXTC container only reaches this path when
+ * SharedArrayBuffer is unavailable; small containers (thumbnails, few-tile levels) fan out as a
+ * single structured clone each, large ones switch to range transport so total transferred bytes
+ * stay bounded by the REQUESTED tiles rather than `workers * containerSize` (finding 79).
+ * 512 KiB ≈ a handful of 512² rgba8 tiles — comfortably under the point where N copies hurt.
+ */
+export const OWNED_WHOLE_MAX_BYTES = 512 * 1024;
+/**
+ * Carrier selection (pure): shared immutable SAB view where available; otherwise an owned whole
+ * buffer only for small containers; otherwise per-tile range transport so non-SAB fanout is
+ * bounded by requested tiles, not `workers * containerSize`.
+ */
+export function selectCarrier(input) {
+    if (input.sabAvailable)
+        return { kind: 'sab-view' };
+    if (input.containerBytes.byteLength <= OWNED_WHOLE_MAX_BYTES)
+        return { kind: 'owned-whole' };
+    return { kind: 'range' };
+}
 // Grok3 #16 single transition fn with table. Invalid throws in dev.
 const ALLOWED_TRANSITIONS = {
     [HandleState.WarmFloor]: { [HandleState.Active]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },
@@ -179,6 +200,13 @@ export class PyramidWorkerPool {
     bytesIdByWorker = new WeakMap();
     bytesIdBySource = new WeakMap();
     sabByBytesId = new Map();
+    // Which tile ranges (keyed by absolute offset) each worker already holds for a bytesId, so a
+    // range carrier never re-transfers a resident tile on viewport reuse. Map<bytesId, Set<offset>>.
+    rangesByWorker = new WeakMap();
+    // Parsed JXTC header per source (for range extraction). Weakly held with the source.
+    headerBySource = new WeakMap();
+    // Pending unload acks: bytesId -> resolvers awaiting the worker's unload-ack.
+    unloadWaiters = new WeakMap();
     // instance-scoped (not module) per Grok2/3
     nextBytesId = 0;
     // waiter queue for over-cap (Grok3 #26-29)
@@ -572,6 +600,15 @@ export class PyramidWorkerPool {
                 }
                 return;
             }
+            if (reply.type === 'unload-ack') {
+                const waiters = this.unloadWaiters.get(h.worker);
+                const resolve = waiters?.get(reply.bytesId);
+                if (resolve) {
+                    waiters.delete(reply.bytesId);
+                    resolve();
+                }
+                return;
+            }
             if (reply.type !== 'decode-reply')
                 return;
             const job = h.pending.get(reply.id);
@@ -703,10 +740,138 @@ export class PyramidWorkerPool {
             }
         }
     }
+    /**
+     * Carrier-aware load: transfer only what each worker needs to decode `requestedTiles`.
+     *  - SAB available            → one shared SAB per bytesId (delegates to ensureLoaded; no copy).
+     *  - small container          → owned whole-buffer clone per worker (delegates to ensureLoaded).
+     *  - large container, no SAB  → per-tile RANGE carrier: post only the requested tiles' bitstreams
+     *                               (finding 79) so total transferred is bounded by requested tiles,
+     *                               not `workers * containerSize`. Ranges already resident on a worker
+     *                               are not re-sent (viewport reuse).
+     */
+    ensureLoadedForTiles(handles, bytesId, source, requestedTiles, useSAB) {
+        const bytes = source.bytes;
+        const sabAvailable = useSAB && typeof SharedArrayBuffer !== 'undefined';
+        // Decide the carrier from container size + SAB availability FIRST. Only the range carrier
+        // needs the tile index table parsed/extracted — the SAB and owned-whole paths must not (a
+        // header-only synthetic container has no index table). This keeps carrier selection cheap and
+        // side-effect-free for the common small/SAB cases.
+        const carrier = selectCarrier({ containerBytes: bytes, sabAvailable, requestedTileRanges: [] });
+        if (carrier.kind === 'sab-view' || carrier.kind === 'owned-whole') {
+            // Both are a single load message per worker (shared SAB, or one owned clone). Reuse the
+            // proven ensureLoaded path — useSAB=false there posts an owned whole buffer.
+            this.ensureLoaded(handles, bytesId, bytes, carrier.kind === 'sab-view');
+            return;
+        }
+        // Range carrier: resolve requested tiles to absolute byte ranges (needs the index table),
+        // then post only the not-yet-resident tile ranges to each worker.
+        let header = this.headerBySource.get(source);
+        if (!header) {
+            header = parseJxtcHeader(bytes);
+            this.headerBySource.set(source, header);
+        }
+        const ranges = this.resolveTileRanges(bytes, header, requestedTiles);
+        for (const h of handles) {
+            let perBytes = this.rangesByWorker.get(h.worker);
+            if (!perBytes) {
+                perBytes = new Map();
+                this.rangesByWorker.set(h.worker, perBytes);
+            }
+            let resident = perBytes.get(bytesId);
+            if (!resident) {
+                resident = new Set();
+                perBytes.set(bytesId, resident);
+            }
+            const fresh = ranges.filter((r) => !resident.has(r.offset));
+            if (fresh.length === 0)
+                continue;
+            const payload = fresh.map((r) => ({
+                offset: r.offset,
+                length: r.length,
+                gx: r.gx,
+                gy: r.gy,
+                // Zero-copy view; postMessage structured-clones only the range, not the container.
+                bytes: bytes.subarray(r.offset, r.offset + r.length),
+            }));
+            try {
+                h.worker.postMessage({ v: 1, type: 'load', bytesId, ranges: payload });
+                for (const r of fresh)
+                    resident.add(r.offset);
+            }
+            catch (e) {
+                if (DEV)
+                    console.warn(`[pyramid] ensureLoadedForTiles range post failed for bytesId ${bytesId}:`, e);
+            }
+        }
+    }
+    /**
+     * Map requested viewport tiles to their absolute container byte ranges plus grid origin
+     * (`gx`,`gy`) so a range-carrier worker can address the exact tile a decode `region` targets.
+     * Deduped by tile offset (a viewport may clip several sub-rects out of one grid tile).
+     */
+    resolveTileRanges(bytes, header, requestedTiles) {
+        const seen = new Set();
+        const out = [];
+        for (const tile of requestedTiles) {
+            // Snap the viewport-clipped tile to its grid origin so extract addresses a whole tile.
+            const gx = Math.floor(tile.x / header.tileSize) * header.tileSize;
+            const gy = Math.floor(tile.y / header.tileSize) * header.tileSize;
+            const view = extractTileBitstream(bytes, { x: gx, y: gy, w: 1, h: 1 }, header);
+            const offset = view.byteOffset - bytes.byteOffset;
+            if (seen.has(offset))
+                continue;
+            seen.add(offset);
+            out.push({ offset, length: view.byteLength, gx, gy });
+        }
+        return out;
+    }
+    /**
+     * Explicitly unload a bytesId from the given workers, releasing their resident bytes/ranges
+     * (finding 80). Resolves once every targeted worker acknowledges (unload-ack) or is gone.
+     */
+    async unload(handles, bytesId) {
+        const acks = [];
+        for (const h of handles) {
+            // Drop local resident-tracking regardless of ack outcome.
+            this.bytesIdByWorker.get(h.worker)?.delete(bytesId);
+            this.rangesByWorker.get(h.worker)?.delete(bytesId);
+            if (h.state === HandleState.Terminated || h.state === HandleState.Bad)
+                continue;
+            let waiters = this.unloadWaiters.get(h.worker);
+            if (!waiters) {
+                waiters = new Map();
+                this.unloadWaiters.set(h.worker, waiters);
+            }
+            const ack = new Promise((resolve) => {
+                waiters.set(bytesId, resolve);
+                // Safety timeout: never hang the caller on a silent worker.
+                globalThis.setTimeout(() => {
+                    if (waiters.get(bytesId)) {
+                        waiters.delete(bytesId);
+                        resolve();
+                    }
+                }, this.requestTimeoutMs ?? 5000);
+            });
+            try {
+                h.worker.postMessage({ v: 1, type: 'unload', bytesId });
+                acks.push(ack);
+            }
+            catch {
+                waiters.delete(bytesId);
+            }
+        }
+        await Promise.all(acks);
+    }
+    /** Test-only: spawn a ready-tracked handle without going through acquire()/coreBudget. */
+    spawnForTest() {
+        return this.spawnOne();
+    }
 }
 // Grok3 #38-39 module-level consts (evaluated once)
 const HWC = globalThis.navigator?.hardwareConcurrency ?? 4;
-const CAN_PARALLEL = canUseParallelTileWorkers();
+// NOTE: parallel-worker viability (canUseParallelTileWorkers) is queried at the decision site
+// rather than cached at module load — it depends only on `Worker` presence (finding 82) which a
+// test harness (or an SSR→hydration transition) may install after this module is first imported.
 /** Hoisted predicate (Grok4). */
 export function shouldUseParallel(opts, numTiles, envCanParallel) {
     return (opts?.parallel !== false) && envCanParallel && numTiles > 1 && !!(opts?.workerFactory || opts?.pool);
@@ -766,6 +931,9 @@ function parseWorkerReply(data) {
         return null;
     if (d.type === 'ready') {
         return { v: 1, type: 'ready' };
+    }
+    if (d.type === 'unload-ack' && typeof d.bytesId === 'number') {
+        return { v: 1, type: 'unload-ack', bytesId: d.bytesId };
     }
     if (d.type === 'decode-reply' && typeof d.id === 'number') {
         if (d.ok === true) {
@@ -1045,7 +1213,7 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
     try {
         const wantParallel = (options?.pool != null)
             ? (options?.parallel !== false) && plan.tiles.length > 1
-            : shouldUseParallel(options, plan.tiles.length, CAN_PARALLEL);
+            : shouldUseParallel(options, plan.tiles.length, canUseParallelTileWorkers());
         if (!wantParallel) {
             const direct = signal ? await raceWithAbort(decodeRegion(source.bytes, vp), signal) : await decodeRegion(source.bytes, vp);
             return finalizeDirectDecode(direct, vp, bpp, outBuffer, need, plan.format, cache, cacheKeyFinal, source.tileSize, source.level ?? 0, onTile);
@@ -1108,6 +1276,8 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
             return result;
         }
         // #41: pool from caller opts.pool (preferred) or module singleton (created once outside hot path via getOrCreate when factory provided)
+        // PyramidPoolLike is the structural surface both an injected pool and the module singleton satisfy;
+        // the impl below dereferences only that surface (allocateBytesId/acquire/ensureLoaded/release/requestTimeout).
         let p;
         if (options?.pool) {
             p = options.pool;
@@ -1134,7 +1304,15 @@ export async function decodeTiledViewportPooled(arg1, region, options) {
             const direct = signal ? await raceWithAbort(decodeRegion(source.bytes, vp), signal) : await decodeRegion(source.bytes, vp);
             return finalizeDirectDecode(direct, vp, bpp, outBuffer, need, plan.format, cache, cacheKeyFinal, source.tileSize, source.level ?? 0, onTile);
         }
-        p.ensureLoaded(usable, bytesId, source.bytes, useSAB);
+        // Carrier-aware load: only the requested (missed) tiles reach non-SAB workers, so total
+        // transferred bytes are bounded by requested tiles rather than workers*containerSize (findings
+        // 33, 79). Duck-typed pools lacking the method fall back to the whole-container load.
+        if (typeof p.ensureLoadedForTiles === 'function') {
+            p.ensureLoadedForTiles(usable, bytesId, source, misses, useSAB);
+        }
+        else {
+            p.ensureLoaded(usable, bytesId, source.bytes, useSAB);
+        }
         try {
             const baseTileOpts = {};
             if (signal != null)

@@ -9,7 +9,6 @@
 import { DecodeHandler } from "./decode-handler.js";
 import { EncodeHandler } from "./encode-handler.js";
 import { loadWasmModule, detectTier } from "./wasm-loader.js";
-import { DecoderPool } from "./decoder-pool.js";
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -33,7 +32,6 @@ let wasmModule = null;
 let wasmLoadPromise = null;
 let shuttingDown = false;
 let shutdownPromise = null;
-let decoderPool = null;
 // Cap per session to avoid unbounded cold-start buffering.
 const MAX_QUEUED_MESSAGES_PER_SESSION = 256;
 const MAX_QUEUED_BYTES_PER_SESSION = 128 * 1024 * 1024;
@@ -61,10 +59,6 @@ async function getWasm() {
             .then((m) => {
             clearTimeout(timeoutHandle);
             wasmModule = m;
-            // Initialize decoder pool on first WASM load
-            if (decoderPool === null) {
-                decoderPool = new DecoderPool(m);
-            }
             return m;
         })
             .catch((err) => {
@@ -353,7 +347,6 @@ async function handleDecodeStart(msg) {
                 if (decodeSessions.get(sessionId) === handler)
                     decodeSessions.delete(sessionId);
             },
-            decoderPool: decoderPool ?? undefined,
         });
         decodeSessions.set(msg.sessionId, handler);
         flushQueuedDecodeMessages(msg.sessionId, handler);
@@ -491,11 +484,6 @@ async function doShutdown() {
     queuedDecodeBytes.clear();
     queuedEncodeBytes.clear();
     abortedStarts.clear();
-    // Dispose decoder pool
-    if (decoderPool !== null) {
-        await decoderPool.dispose();
-        decoderPool = null;
-    }
     wasmModule = null;
     wasmLoadPromise = null;
     const ack = { type: "worker_shutdown_ack" };
@@ -543,6 +531,24 @@ self.addEventListener("messageerror", () => {
         ...(sid !== undefined ? { sessionId: sid } : {}),
     });
 });
+// ---------------------------------------------------------------------------
+// Dashboard stats (read-only, additive — no behavior change)
+// ---------------------------------------------------------------------------
+/**
+ * Lightweight snapshot of this worker's in-flight session counts.
+ * Read-only; no side effects. Exported for test inspection and future
+ * message-based pollers; not callable from the main thread directly.
+ */
+export function getWorkerStats() {
+    return {
+        decodeSessions: decodeSessions.size,
+        encodeSessions: encodeSessions.size,
+        pendingDecodeStarts: pendingDecodeStarts.size,
+        pendingEncodeStarts: pendingEncodeStarts.size,
+        wasmLoaded: wasmModule !== null,
+        shuttingDown,
+    };
+}
 // ---------------------------------------------------------------------------
 // Startup announcement
 // ---------------------------------------------------------------------------

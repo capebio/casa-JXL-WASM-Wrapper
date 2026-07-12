@@ -13,13 +13,14 @@ export async function decodePyramidLevel(ctx, bytes, opts) {
   if (opts.tiled) {
     if (!opts.region) throw new Error('tiled decode requires a viewport region');
     const { decodeTiledViewportPooled } = await import('../../packages/jxl-pyramid/dist/tiled-decode-pool.js');
-    // Forward the same contract fields as the non-tiled session branch so the tiled path
-    // is cancellable (signal), format-correct (rgba8/rgba16), and dedupe/priority-aware.
+    // Only options the pooled decoder actually declares are forwarded (finding 78): `format`,
+    // `priority`, and `sourceKey` were silently ignored by decodeTiledViewportPooled — that option
+    // drift is removed. The container's own JXTC header carries bits-per-sample (rgba8/rgba16), so
+    // the pool derives format itself; dedupe/priority are scheduler concerns that do not apply to the
+    // tile-container fast path. This ad-hoc pool (own worker per call) is used only when NO runtime is
+    // injected; the gallery routes tiled decodes through the single owned runtime (grid-controller).
     const tiled = await decodeTiledViewportPooled(bytes, opts.region, {
       parallel: true,
-      format: opts.format ?? 'rgba8',
-      priority: opts.priority ?? 'visible',
-      sourceKey: opts.contenthash,
       signal: opts.signal ?? undefined,
       workerFactory: () => new Worker(
         new URL('../lightbox/tiled-decode-worker.js', import.meta.url),
@@ -67,6 +68,47 @@ export async function decodePyramidLevel(ctx, bytes, opts) {
   await session.done();
   if (!rgba) throw new Error('decode produced no final frame');
   return { pixels: rgba, width, height };
+}
+
+/**
+ * Decode a resolved LOD (from `@casabio/jxl-pyramid` `resolveLod`) by dispatching on its `kind` to
+ * the RIGHT existing decode path — no new decoder is introduced (Task 6, finding 2):
+ *
+ *   - 'whole-level'        → `decodePyramidLevel` over the whole level bytes.
+ *   - 'progressive-prefix' → `decodePyramidLevel` over the Range-fetched prefix bytes (a
+ *                            boundary-aligned JXL prefix decodes to its progressive tier).
+ *   - 'jxtc-ranges'        → `decodePyramidRegion` over the JXTC container for the resolved
+ *                            `region` (the tile Range fetch is the transport optimization; the
+ *                            region path is the decode). `bytes` must be the JXTC container.
+ *
+ * @param {import('@casabio/jxl-session').JxlContext} ctx
+ * @param {import('@casabio/jxl-pyramid').LodResolution} resolution
+ * @param {Uint8Array} bytes  Whole-level / prefix bytes, or the JXTC container for jxtc-ranges.
+ * @param {{ format?: 'rgba8'|'rgba16'; priority?: 'visible'|'near'|'background'; signal?: AbortSignal }} [opts]
+ */
+export async function decodeResolvedLod(ctx, resolution, bytes, opts = {}) {
+  const format = opts.format ?? (resolution.level?.bitsPerSample === 16 ? 'rgba16' : 'rgba8');
+  switch (resolution.kind) {
+    case 'whole-level':
+    case 'progressive-prefix':
+      // Whole level, or a Range-fetched progressive prefix: same monolithic-frame decode path.
+      return decodePyramidLevel(ctx, bytes, {
+        contenthash: resolution.contenthash,
+        priority: opts.priority,
+        signal: opts.signal,
+        tiled: false,
+        format,
+      });
+    case 'jxtc-ranges': {
+      // The resolver picked the overlapping tiles + a clamped region; decode that region from the
+      // JXTC container through the existing region path (reuses decodeTileContainerRegion via
+      // decodePyramidRegion). The tile Range fetch already narrowed the bytes fetched.
+      const region = resolution.region;
+      return decodePyramidRegion(bytes, { format, region });
+    }
+    default:
+      throw new Error(`decodeResolvedLod: unknown resolution kind ${resolution?.kind}`);
+  }
 }
 
 /**

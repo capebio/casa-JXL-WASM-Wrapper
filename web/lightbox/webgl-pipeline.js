@@ -158,7 +158,18 @@ export function createHdrRenderer() {
   const fbo = gl.createFramebuffer();
   const fboTex = gl.createTexture();
 
+  // F12: track last allocated FBO dimensions so texImage2D is skipped when the
+  // caller renders the same size image repeatedly (e.g. opening the same lightbox
+  // card multiple times). Previously every call to runShader → ensureFbo would
+  // unconditionally call gl.texImage2D, reallocating the FBO texture even when
+  // width and height were unchanged. Under a long lightbox session this produced
+  // one GPU realloc per open — O(opens) instead of O(distinct sizes).
+  let _fboW = 0;
+  let _fboH = 0;
+
   function ensureFbo(w, h) {
+    // Skip realloc when the FBO is already sized correctly (F12 fix).
+    if (w === _fboW && h === _fboH) return;
     gl.bindTexture(gl.TEXTURE_2D, fboTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -172,6 +183,8 @@ export function createHdrRenderer() {
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    _fboW = w;
+    _fboH = h;
   }
 
   function uploadSource(bytes, width, height) {
@@ -359,6 +372,46 @@ export function renderRgba16AdjustedToCanvas(bytes, width, height, canvas, prese
 export function adjustedRgba16ForExport(bytes, width, height, preset, adjustments) {
   const floats = adjustRgba16ToFloat(bytes, width, height, preset, adjustments);
   return floatToRgba16(floats, width, height);
+}
+
+/**
+ * Testable factory that wraps a pre-created WebGL context and exposes only the
+ * `ensureFbo` function for unit tests (F12 fix verification). Production code
+ * uses `createHdrRenderer()` / `getRenderer()` which call the full factory with
+ * a real canvas; this entry-point lets tests inject a mock `gl` without a DOM.
+ *
+ * @param {object} gl  WebGL rendering context (real or mock).
+ * @param {{ isWebGL2?: boolean }} [opts]
+ * @returns {{ ensureFbo(w: number, h: number): void }}
+ */
+export function createHdrRendererWithReuse(gl, { isWebGL2 = false } = {}) {
+  const fboTex = gl.createTexture();
+  const fbo = gl.createFramebuffer();
+
+  // F12: dimension tracking — skip texImage2D when dims unchanged.
+  let _fboW = 0;
+  let _fboH = 0;
+
+  function ensureFbo(w, h) {
+    if (w === _fboW && h === _fboH) return;
+    gl.bindTexture(gl.TEXTURE_2D, fboTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (isWebGL2) {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    } else {
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.FLOAT, null);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    _fboW = w;
+    _fboH = h;
+  }
+
+  return { ensureFbo };
 }
 
 /** @deprecated use createHdrRenderer */

@@ -30,6 +30,7 @@ export declare function safeCacheName(key: string): string;
  * literal form `hash-<hex>` can never collide with a hashed long key (handoff A5 / B7).
  */
 export declare function cacheNameFor(key: string): string;
+type CacheBuffer = ArrayBuffer | SharedArrayBuffer;
 export declare class JxlCacheBrowser implements JxlCache {
     private readonly opts;
     private readonly memoryCache;
@@ -50,7 +51,7 @@ export declare class JxlCacheBrowser implements JxlCache {
     constructor(opts: CacheOptions);
     init(): Promise<void>;
     private doInit;
-    get(key: string): Promise<SharedArrayBuffer | undefined>;
+    get(key: string): Promise<CacheBuffer | undefined>;
     has(key: string): Promise<boolean>;
     set(key: string, buffer: ArrayBuffer): Promise<void>;
     delete(key: string): Promise<void>;
@@ -75,6 +76,16 @@ export declare class JxlCacheBrowser implements JxlCache {
         };
         hitRate: number | null;
     };
+    /**
+     * Lightweight dashboard-facing stats snapshot.
+     * Read-only; no side effects; additive (no behavior change).
+     */
+    getStats(): {
+        hits: number;
+        misses: number;
+        totalRequests: number;
+        hitRate: number | null;
+    };
     private getPersistent;
     private setPersistent;
     private writePersistentFile;
@@ -87,3 +98,4 @@ export declare class JxlCacheBrowser implements JxlCache {
     private drainManifest;
     private writeManifest;
 }
+export {};

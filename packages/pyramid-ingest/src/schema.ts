@@ -49,6 +49,17 @@ export const levelEntrySchema = z.object({
   qualityCurve: z.array(qualityCurvePointSchema).optional(),
 });
 
+// finding 66 (Task 5): a cheap change-detection sample of the SOURCE master, persisted so freshness
+// no longer relies on mtime alone. byteLength + quickHash catch a byte replacement that preserves the
+// original mtime; the optional contentHash is the authoritative full hash when a fast-path comparison
+// is ambiguous. This is NOT the per-level `contenthash` (which hashes an encoded pyramid level).
+export const masterFingerprintSchema = z.object({
+  byteLength: z.number().int().nonnegative(),
+  quickHash: z.string().min(1),
+  contentHash: z.string().min(1).optional(),
+});
+export type MasterFingerprint = z.infer<typeof masterFingerprintSchema>;
+
 export const masterInfoSchema = z.object({
   name: z.string(),
   // SCH-1: keep in sync with ingest RAW_EXT — pef/srw/x3f are advertised there, so a manifest with
@@ -68,6 +79,9 @@ export const masterInfoV5Schema = masterInfoSchema
     // still round-trip so provenance is never erased. Any non-empty string — matches the browser
     // reader (jxl-pyramid manifest-validate.ts), which already accepts any non-empty sourceFormat.
     sourceFormat: z.string().min(1).optional(),
+    // finding 66 (Task 5): optional freshness fingerprint of the source master (size + quickHash +
+    // optional full contentHash). Additive; legacy manifests without it fall back to mtime freshness.
+    fingerprint: masterFingerprintSchema.optional(),
   })
   .passthrough();
 
@@ -151,6 +165,10 @@ export const manifestSchemaV5 = z
   .object({
     schema: z.literal(5),
     imageId: z.string().regex(/^[0-9a-f]{16}$/),
+    // finding 66 (Task 5): persistent, content-derived catalog identity. Stable across MOVES (imageId
+    // is path-derived and changes when the file moves; catalogId does not). Additive + optional so a
+    // relink can rebind imageId while keeping catalogId. NOT the per-level content hash.
+    catalogId: z.string().regex(/^[0-9a-f]{16}$/).optional(),
     master: masterInfoV5Schema,
     // M-2: REQUIRED on v5 (the writer and migration always emit an OrientationDescriptor). This
     // aligns with the jxl-pyramid browser reader, which already requires it — no cross-parser gap.
@@ -219,18 +237,38 @@ export const READABLE_MANIFEST_SCHEMAS = [1, 2, 4, 5] as const;
 export const indexEntrySchema = z.object({
   imageId: z.string().regex(/^[0-9a-f]{16}$/),
   aspect: z.number().finite().positive(),
+  // finding 81: the L0 seed declares its PRECISION (bitsPerSample) and TRANSPORT (tiled + optional
+  // TilingDescriptor) so a seed decoder chooses a valid decode path instead of assuming a whole
+  // 8-bit RGBA bitstream. All three are optional + additive: a bare { contenthash, w, h } seed (the
+  // default) IS a monolithic 8-bit level, so pre-finding-81 indexes keep validating and decoding.
   l0: z.object({
     contenthash: z.string().length(16),
     w: z.number().int().positive(),
     h: z.number().int().positive(),
+    /** precision of the seed level's pixels; absent ⇒ 8-bit (monolithic-RGBA8 default). */
+    bitsPerSample: z.union([z.literal(8), z.literal(16)]).optional(),
+    /** whether the seed is a JXTC tile container; absent/false ⇒ a whole-frame bitstream. */
+    tiled: z.boolean().optional(),
+    /** present only when tiled: lets the seed decoder address tiles without decoding. */
+    tiling: tilingDescriptorSchema.optional(),
   }),
   // V4: optional for v2+ manifests (decoder etc not needed in index)
   schema: z.number().optional(),
+  // finding 76 (Task 7): mirror the shared jxl-pyramid reader's OPTIONAL index-entry fields so a
+  // produced index.json can carry them (the reader already validates + returns these; ingest just
+  // populates them). NOT a new dialect — the same contract, now emitted as well as read.
+  //   thumbhash — ~28-byte placeholder hash for an instant gallery skeleton before any JXL bytes.
+  //   group     — specimen/occurrence id grouping multi-view photogrammetry sets in the gallery.
+  thumbhash: z.string().min(1).optional(),
+  group: z.string().min(1).optional(),
 });
 
 export const galleryIndexSchema = z.object({
   schema: z.literal(1),  // index stays v1 for compat; entries tolerate v2 manifests
   images: z.array(indexEntrySchema),
+  // finding 76 (Task 7): optional pagination cursor for sharded (10k+ image) galleries — the
+  // relative path of the next index shard. Mirrors the shared reader's GalleryIndex.next.
+  next: z.string().min(1).optional(),
 });
 
 export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV4 | ManifestV5;
@@ -364,7 +402,7 @@ export const cliArgsSchema = z.object({
       message: '--shard must be "i/N" (0-based)',
     }),
   tier: z.enum(["simd", "scalar", "auto"]).optional().default("simd"),
-  tiling: z.enum(["adaptive", "tile-all"]).optional().default("adaptive"),
+  tiling: z.enum(["never", "adaptive", "tile-all"]).optional().default("adaptive"),
   "reindex-only": z.boolean().optional().default(false),
   "encoder-threads": z
     .string()
@@ -390,6 +428,10 @@ export const cliArgsSchema = z.object({
   "migrate-layout": z.string().optional(),
   "migrate-schema": z.string().optional(),
   "suggest-migrations": z.boolean().optional().default(false),
+  // finding 66 (Task 5): identity/relink REPORT. Read-only classification of masters vs the on-disk
+  // catalog (new/unchanged/relink/conflict). Never merges two catalog rows; --apply is opt-in.
+  relink: z.boolean().optional().default(false),
+  apply: z.boolean().optional().default(false),
   // K2: chaos injection for testing resume/GC under failure (unlocked by surface + locks + checkpoint)
   "chaos-test": z.boolean().optional().default(false),
   // B6: allow retrying prior failures recorded in checkpoint (transient errors like EBUSY/OOM during previous run)

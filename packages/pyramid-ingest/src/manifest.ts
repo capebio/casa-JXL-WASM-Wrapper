@@ -1,6 +1,7 @@
 import { contentHash16 } from "./hash.js";
 import type { MasterFormat, Orientation, PyramidLevelBytes } from "./backends.js";
 import { makeProducedBy, manifestSchema } from "./schema.js";
+import { isFresh, type SourceFingerprint } from "./source-identity.js";
 import type {
   Manifest,
   IndexEntry,
@@ -9,6 +10,7 @@ import type {
   LevelEntryV5,
   LevelSize,
   MasterInfo,
+  MasterFingerprint,
 } from "./schema.js";
 
 export type {
@@ -61,7 +63,9 @@ export function toEntry(level: PyramidLevelBytes, masterW: number, masterH: numb
 
 export function buildManifest(args: {
   imageId: string;
-  master: MasterInfo;
+  /** finding 66: persistent content-derived identity, stable across moves (NOT the per-level hash). */
+  catalogId?: string;
+  master: MasterInfo & { fingerprint?: MasterFingerprint };
   orientation: Orientation;
   width: number;
   height: number;
@@ -80,6 +84,7 @@ export function buildManifest(args: {
   const base = {
     schema: 5 as const,
     imageId: args.imageId,
+    ...(args.catalogId ? { catalogId: args.catalogId } : {}),
     master: args.master,
     orientation,
     width: args.width,
@@ -98,10 +103,40 @@ export function buildIndexEntry(manifest: Manifest): IndexEntry {
   // aspect is optional on v1 manifests; the index schema requires it, so fail loudly here
   // (previously undefined would flow through and fail galleryIndexSchema.parse later).
   if (manifest.aspect == null) throw new Error(`manifest ${manifest.imageId} has no aspect`);
+  // finding 81: make the L0 seed's precision + transport EXPLICIT so a seed decoder chooses a valid
+  // path. Monolithic 8-bit is the DEFAULT: a bare { contenthash, w, h } seed is decodable as a whole
+  // RGBA8 bitstream, so those fields are emitted only when they DIFFER from that default (tiled seed,
+  // 16-bit seed). This keeps the common seed minimal while letting a tiled/16-bit L0 be decoded.
+  const bits = (l0 as { bitsPerSample?: 8 | 16 }).bitsPerSample ?? 8;
+  const tiled = (l0 as { tiled?: boolean }).tiled === true;
+  const tiling = (l0 as { tiling?: unknown }).tiling;
+  // finding 76 (Task 7): forward the gallery-facing `thumbhash` + `group` from the manifest's
+  // EXISTING `metadata` dict into the index entry (both optional; only emitted when the manifest
+  // actually carries them). The gallery reads these to paint an instant placeholder and to keep
+  // multi-view specimen sets contiguous — no new manifest dialect, just population of shared fields.
+  const metadata = (manifest as { metadata?: Record<string, unknown> }).metadata;
+  const thumbhash =
+    typeof metadata?.thumbhash === "string" && metadata.thumbhash.length > 0 ? metadata.thumbhash : undefined;
+  const group =
+    typeof metadata?.group === "string" && metadata.group.length > 0 ? metadata.group : undefined;
   return {
     imageId: manifest.imageId,
     aspect: manifest.aspect,
-    l0: { contenthash: l0.contenthash, w: l0.w, h: l0.h },
+    ...(thumbhash ? { thumbhash } : {}),
+    ...(group ? { group } : {}),
+    l0: {
+      contenthash: l0.contenthash,
+      w: l0.w,
+      h: l0.h,
+      // Emit precision explicitly when the seed is non-default (16-bit) OR tiled, so the seed decoder
+      // never has to peek into the tiling descriptor to learn precision. A bare monolithic 8-bit seed
+      // omits it (default). This keeps the common seed minimal while a tiled/16-bit L0 stays explicit.
+      ...(bits === 16 || tiled ? { bitsPerSample: bits } : {}),
+      // A tiled seed MUST carry both the flag and (when present) the descriptor so the seed decoder
+      // routes to the tile-container path; permit a tiled L0 only when it declares its transport.
+      ...(tiled ? { tiled: true } : {}),
+      ...(tiled && tiling ? { tiling: tiling as IndexEntry["l0"]["tiling"] } : {}),
+    },
   };
 }
 
@@ -110,6 +145,39 @@ export function isUpToDate(existing: Manifest, mtimeMs: number, proxy = false): 
   // P7: proxy flag match for skip (when caller requests proxy, only proxy manifests count as uptodate)
   const proxyOk = proxy ? existing.proxy === true : existing.proxy !== true;
   return proxyOk && existing.master.mtimeMs === mtimeMs;
+}
+
+/**
+ * finding 66 (Task 5): fingerprint-aware freshness. Supersedes the mtime-only `isUpToDate` when the
+ * existing manifest recorded a source `fingerprint`. mtime ALONE never certifies freshness:
+ *
+ *  - replaced bytes with a PRESERVED mtime → STALE (size/quickHash differ),
+ *  - a pure `touch` (bumped mtime, same size+quickHash) → FRESH.
+ *
+ * `existing`  : the persisted manifest (its `master.fingerprint`, if any, is the last-ingest sample).
+ * `observed`  : the file as seen now (SourceFingerprint incl. mtimeMs — mtime is ignored for the
+ *               freshness verdict, matching source-identity `isFresh`).
+ * `proxy`     : caller wants a proxy manifest → only proxy manifests are ever fresh (mirrors isUpToDate).
+ *
+ * Legacy manifests (no recorded fingerprint) fall back to mtime-only freshness so pre-Task-5 catalogs
+ * still skip correctly. The persisted fingerprint has no mtimeMs of its own; the manifest's
+ * `master.mtimeMs` supplies it for the SourceFingerprint shape (mtime is not used in the comparison).
+ */
+export function isSourceFresh(existing: Manifest, observed: SourceFingerprint, proxy = false): boolean {
+  const proxyOk = proxy ? existing.proxy === true : existing.proxy !== true;
+  if (!proxyOk) return false;
+  const fp = (existing.master as MasterInfo & { fingerprint?: MasterFingerprint }).fingerprint;
+  if (fp === undefined) {
+    // Pre-Task-5 manifest: no content sample recorded → fall back to mtime equality.
+    return existing.master.mtimeMs === observed.mtimeMs;
+  }
+  const existingFp: SourceFingerprint = {
+    byteLength: fp.byteLength,
+    mtimeMs: existing.master.mtimeMs,
+    quickHash: fp.quickHash,
+    ...(fp.contentHash !== undefined ? { contentHash: fp.contentHash } : {}),
+  };
+  return isFresh(existingFp, observed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

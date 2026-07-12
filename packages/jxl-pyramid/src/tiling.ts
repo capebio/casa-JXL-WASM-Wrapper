@@ -197,12 +197,19 @@ type ParallelRuntime = {
   crossOriginIsolated?: boolean;
 };
 
-/** COOP/COEP + Worker availability — parallel tile workers are viable. */
+/**
+ * Worker availability — parallel tile workers are viable.
+ *
+ * Finding 82: Worker availability is INDEPENDENT of cross-origin isolation. Per-tile parallel
+ * decode works in any environment that exposes `Worker`; it does not require COOP/COEP. Cross-origin
+ * isolation only unlocks the zero-copy SharedArrayBuffer carrier (see `canShareContainerBytes`),
+ * which the pool uses opt-in — without it, container bytes are transferred/copied to each worker,
+ * still fully parallel. Gating the whole parallel path on `crossOriginIsolated` silently downgraded
+ * every non-isolated browser to single-threaded decode.
+ */
 export function canUseParallelTileWorkers(): boolean {
   const rt = globalThis as ParallelRuntime;
-  if (typeof rt.Worker === "undefined") return false;
-  if (typeof rt.crossOriginIsolated === "boolean") return rt.crossOriginIsolated;
-  return false;
+  return typeof rt.Worker !== "undefined";
 }
 
 /** Whether SharedArrayBuffer + crossOriginIsolated allows SAB-backed container bytes for zero-copy fanout to workers (Grok2 SAB opt-in). Split from canUseParallelTileWorkers. */

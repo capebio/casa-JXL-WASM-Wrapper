@@ -33,9 +33,22 @@ export function validateWorkerRequest(req) {
             if (typeof r.byteLength !== 'number' || r.byteLength <= 0)
                 throw new Error('[pyramid] WorkerRequest load: byteLength must be positive number');
         }
+        else if (r.ranges !== undefined) {
+            if (!Array.isArray(r.ranges) || r.ranges.length === 0)
+                throw new Error('[pyramid] WorkerRequest load: ranges must be a non-empty array');
+            for (const range of r.ranges) {
+                if (!range || typeof range.offset !== 'number' || typeof range.length !== 'number' ||
+                    typeof range.gx !== 'number' || typeof range.gy !== 'number' || !(range.bytes instanceof Uint8Array))
+                    throw new Error('[pyramid] WorkerRequest load: each range needs numeric offset,length,gx,gy + Uint8Array bytes');
+            }
+        }
         else if (!(r.bytes instanceof Uint8Array)) {
             throw new Error('[pyramid] WorkerRequest load: bytes must be a Uint8Array');
         }
+    }
+    else if (r.type === 'unload') {
+        if (typeof r.bytesId !== 'number')
+            throw new Error('[pyramid] WorkerRequest unload: bytesId not a number');
     }
     else if (r.type === 'decode') {
         if (typeof r.id !== 'number')
