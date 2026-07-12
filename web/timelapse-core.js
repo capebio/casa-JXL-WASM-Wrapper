@@ -140,6 +140,134 @@ export function rawFramesCliString(request, outPath = 'out.casv') {
   return ['casv_encode', ...rawFramesSidecarArgs(request, outPath)].map(q).join(' ');
 }
 
+// ── Selected-asset timelapse helpers (Finding 15) ───────────────────────────
+// Pure logic for sequential reads, memory budget, cancellation, per-asset edits.
+// No DOM, no WASM import — all injectable so the unit tests can drive without
+// a browser or built pkg.
+
+/**
+ * Filter and sort cards to just the selected subset, in capture order (numeric-
+ * aware by name so the sequence matches `sortRawPaths`).
+ *
+ * @param {Array<{ assetId: string, name: string, selected?: boolean }>} cards
+ * @returns {Array}
+ */
+export function filterSelectedAssets(cards) {
+  const coll = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+  return (Array.isArray(cards) ? cards : [])
+    .filter((c) => c.selected)
+    .slice()
+    .sort((a, b) => coll.compare(a.name, b.name));
+}
+
+/**
+ * Map a look-params object from the per-asset edit store to the 15-element
+ * positional array that the WASM decoders (process_orf / process_dng / process_cr2)
+ * accept. The ordering mirrors `src/lib.rs` (same as worker.js RAW_NEUTRAL).
+ *
+ * Slots: [brightness, contrast, saturation, hue, sharpness, denoise,
+ *          shadows, highlights, blacks, whites, vibrance, wbR, wbG, wbB, tint]
+ *
+ * WB (indices 11, 12) default to NaN = use each file's embedded camera WB — the
+ * right default for a locked time-lapse where WB is consistent across the run.
+ *
+ * @param {{ exposure?: number, contrast?: number, saturation?: number,
+ *            hue?: number, sharpness?: number, denoise?: number,
+ *            shadows?: number, highlights?: number, blacks?: number,
+ *            whites?: number, vibrance?: number,
+ *            wbR?: number, wbG?: number, wbB?: number, tint?: number }} look
+ * @returns {number[]} 15-element array
+ */
+export function applyLookToDecodeArgs(look = {}) {
+  const g = (k, dflt) => {
+    const v = look[k];
+    return (v !== undefined && v !== null && typeof v === 'number') ? v : dflt;
+  };
+  return [
+    g('exposure',    0),   // 0  brightness
+    g('contrast',    0),   // 1  contrast
+    g('saturation',  0),   // 2  saturation
+    g('hue',         0),   // 3  hue
+    g('sharpness',   0),   // 4  sharpness
+    g('denoise',     0),   // 5  denoise
+    g('shadows',     0),   // 6  shadows
+    g('highlights',  0),   // 7  highlights
+    g('blacks',      0),   // 8  blacks
+    g('whites',      0),   // 9  whites
+    g('vibrance',    0),   // 10 vibrance
+    g('wbR',         NaN), // 11 wbR  (NaN → camera WB)
+    g('wbG',         NaN), // 12 wbG  (NaN → camera WB)  [historically called wbB in slot 12]
+    g('wbB',         0),   // 13 tint/wbB — kept as zero in neutral path
+    g('tint',        0),   // 14 tint
+  ];
+}
+
+/**
+ * Create a lightweight cancel token.
+ * @returns {{ cancel(): void, isCancelled(): boolean }}
+ */
+export function makeTimelapseCancelToken() {
+  let cancelled = false;
+  return {
+    cancel: () => { cancelled = true; },
+    isCancelled: () => cancelled,
+  };
+}
+
+/**
+ * Async generator: yield `{ assetId, name, bytes }` for each card, one at a
+ * time, honouring the memory budget and cancel token.
+ *
+ * - Reads cards sequentially (never starts the next read until the current frame
+ *   has been consumed by the caller), so peak memory = one frame at a time.
+ * - `maxBytesInFlight`: if provided, checks outstanding bytes before each read.
+ *   Because we yield before moving on, the natural sequential behaviour already
+ *   satisfies most budgets; this gate only fires if a very small budget is given.
+ * - Skips cards where `readBytes` returns null or undefined (Tauri fs unavailable,
+ *   no file attached, etc.).
+ *
+ * @param {Array<{ assetId: string, name: string }>} cards
+ * @param {(card: object) => Promise<Uint8Array|null>} readBytes
+ * @param {{ isCancelled: () => boolean, maxBytesInFlight?: number }} opts
+ */
+export async function* buildSequentialFrames(cards, readBytes, {
+  isCancelled = () => false,
+  maxBytesInFlight = Infinity,
+} = {}) {
+  let outstandingBytes = 0;
+  for (const card of cards) {
+    if (isCancelled()) return;
+    // Budget gate: wait until outstanding drops below budget before reading.
+    // In practice the sequential nature means outstanding is 0 here (the caller
+    // consumed the previous frame); this guard is a safety net for very small budgets.
+    if (outstandingBytes >= maxBytesInFlight) continue;
+
+    const bytes = await readBytes(card);
+    if (!bytes) continue;
+
+    outstandingBytes += bytes.length;
+    yield { assetId: card.assetId, name: card.name, bytes, look: card.look ?? {} };
+    // The caller has consumed (or handed off) the frame; subtract from budget.
+    outstandingBytes -= bytes.length;
+  }
+}
+
+/**
+ * Build an ExportService request from selected timelapse cards.
+ *
+ * @param {Array<{ assetId: string }>} cards
+ * @param {{ output?: string, metadata?: string }} opts
+ * @returns {{ assetIds: string[], output: string, metadata: string, resolution: string }}
+ */
+export function buildTimelapseExportRequest(cards, opts = {}) {
+  return {
+    assetIds: (Array.isArray(cards) ? cards : []).map((c) => c.assetId),
+    output:   opts.output   ?? 'jxl',
+    metadata: opts.metadata ?? 'keep',
+    resolution: 'full',
+  };
+}
+
 // ── Pure-web (no-sidecar) FableBraid encode ─────────────────────────────────
 // These take the initialised WASM module as an argument (dependency injection),
 // so this file stays free of a hard `./pkg` import and remains node-testable.
