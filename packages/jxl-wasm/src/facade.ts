@@ -208,11 +208,13 @@ export interface EncoderOptions {
    *
    * Use the named constants in `JxlFrameSetting`.
    *
-   * @note **WASM no-op.** `_jxl_wasm_enc_create_image_adv` is not implemented in
-   * `bridge.cpp` and is not present in the compiled WASM binary. All entries are
-   * silently dropped in the WASM path. Use first-class options (`epf`, `gaborish`,
-   * `dots`, `decodingSpeed`, etc.) for settings that have named equivalents.
-   * Honoured by jxl-native (which calls `JxlEncoderFrameSettingsSetOption` directly).
+   * @note **P3-T2 (finding 18): now REAL in the WASM streaming path.** Each entry is forwarded
+   * verbatim to ONE generic, libjxl-validated bridge call (`_jxl_wasm_enc_set_frame_setting` →
+   * `JxlEncoderFrameSettingsSetOption`). An unknown/unsupported id is NOT silently ignored:
+   * libjxl rejects it at `enc_finish` and the encoder throws a deterministic error. A build
+   * lacking the setter fails loudly (no silent drop). Not supported together with inline
+   * ICC/EXIF/XMP metadata (the buffered one-shot encode has no encoder state to attach to —
+   * that combination throws). Also honoured by jxl-native.
    *
    * @example
    * createEncoder({
@@ -343,6 +345,14 @@ export interface ExtraChannel {
 
   /** Optional custom resampling factor for this channel. */
   resampling?: 1 | 2 | 4 | 8;
+
+  /**
+   * Single-channel pixel plane for this extra channel, tightly packed at
+   * `width * height * ceil(bitsPerSample/8)` bytes. Supplied to
+   * {@link encodeWithExtraChannels}; validated with checked byte math before the FFI call.
+   * Omit for header-only descriptors (encoder will emit an implicit plane where allowed).
+   */
+  plane?: Uint8Array | Uint16Array | ArrayBuffer;
 }
 
 /**
@@ -482,8 +492,10 @@ interface LibjxlWasmModule {
   _jxl_wasm_enc_set_intrinsic_size?(state: number, w: number, h: number): void;
   _jxl_wasm_enc_set_frame_flags?(state: number, disablePerceptual: number): void;
   _jxl_wasm_enc_set_codestream_level?(state: number, level: number): void;
-  // Advanced escape hatch variants
-  _jxl_wasm_enc_create_image_adv?(width: number, height: number, distance: number, effort: number, fmt: number, hasAlpha: number, progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, idsPtr: number, valuesPtr: number, count: number): number;
+  // P3-T2 (finding 18): ONE generic libjxl-validated frame setting. id + value forwarded verbatim
+  // to JxlEncoderFrameSettingsSetOption at enc_finish; libjxl rejects unknown/unsupported ids
+  // (surfaced as a non-zero enc_finish rc). Returns 0 on success, negative on bad state / OOM.
+  _jxl_wasm_enc_set_frame_setting?(state: number, id: number, value: number): number;
   _jxl_wasm_enc_pixels_ptr?(state: number, size: number): number;
   _jxl_wasm_enc_advance_written?(state: number, size: number): number;
   _jxl_wasm_enc_push_chunk?(state: number, dataPtr: number, size: number): number;
@@ -500,9 +512,20 @@ interface LibjxlWasmModule {
   _jxl_wasm_encode_tile_container_rgba16?(pixelsPtr: number, width: number, height: number, tileSize: number, distance: number, effort: number, hasAlpha: number): number;
   _jxl_wasm_decode_tile_container_region_rgba8?(inputPtr: number, inputSize: number, regionX: number, regionY: number, regionW: number, regionH: number): number;
   _jxl_wasm_decode_tile_container_region_rgba16?(inputPtr: number, inputSize: number, regionX: number, regionY: number, regionW: number, regionH: number): number;
-  // Task 3: WASM bridge encode with packed 72B extra channel descriptors (WasmExtraChannel layout) + per-EC planes
-  _jxl_wasm_encode_rgba8_with_extra_channels?(pixelsPtr: number, width: number, height: number, distance: number, effort: number, hasAlpha: number, ecDescPtr: number, numEc: number): number;
-  // Decode helper (test verification only): returns packed extra channel descriptors from codestream header (same 72B layout)
+  // P3-T2 (finding 19): extra-channel encode. Takes the full metadata-encode arg list plus a
+  // packed WasmExtraChannel[] (EC_BYTES stride, plane_ptr/name_ptr filled by the caller).
+  // alpha_distance < 0 = libjxl default; ec_resampling < 0 = inherit. Returns a buffer handle.
+  _jxl_wasm_encode_rgba8_with_metadata_ec?(
+    pixelsPtr: number, width: number, height: number,
+    distance: number, effort: number, fmt: number, hasAlpha: number,
+    progressiveDc: number, progressiveAc: number, qProgressiveAc: number, buffering: number, groupOrder: number,
+    modular: number, brotliEffort: number, decodingSpeed: number, photonNoiseIso: number, resampling: number,
+    iccPtr: number, iccSize: number, exifPtr: number, exifSize: number, xmpPtr: number, xmpSize: number,
+    alphaDistance: number, ecDescPtr: number, numEc: number, ecResampling: number,
+  ): number;
+  // Decode helper (round-trip verification): returns a packed WasmExtraChannel[] (EC_BYTES stride)
+  // read back from the codestream header; buffer .width = channel count. name bytes are appended
+  // after the descriptor array with name_ptr pointing at their absolute heap address.
   _jxl_wasm_get_extra_channels?(inputPtr: number, inputSize: number): number;
   // Butteraugli perceptual distance between two RGBA8 images (same dimensions).
   // Returns bit-cast float as int32 (>=0 = valid distance; -1 = error).
@@ -720,13 +743,17 @@ export function createDecoder(options: DecoderOptions): JxlDecoder {
   return new LibjxlDecoder(normalizeDecoderOptions(options));
 }
 
-// Task 3: 72-byte packed descriptor for WASM FFI (exact layout matches C++ struct WasmExtraChannel sizeof==72).
-// Byte layout (no padding; 4B aligned) — MUST match `struct WasmExtraChannel` in bridge.cpp (20 bytes):
-//   0:type(u32), 4:bits(u32), 8:distance(f32), 12:plane_ptr(u32), 16:plane_size(u32)
-// plane_ptr/plane_size left 0 by serialize; filled by TS caller after separate per-plane _malloc.
-// TODO: dimShift / spotColor / name on ExtraChannel are NOT yet wired to the C++ encoder
-// (no struct field reads them). They are intentionally not serialized until bridge.cpp grows them.
-export const EC_BYTES = 20;
+// P3-T2 (finding 19): 48-byte packed descriptor for the WASM extra-channel FFI. Grown from the
+// old 20-byte form so descriptor metadata (dim_shift, per-channel name, spot colour) actually
+// reaches libjxl instead of being silently dropped. Layout MUST match `struct WasmExtraChannel`
+// in bridge.cpp exactly (the only consumer/producer):
+//   0:type(u32)  4:bits(u32)  8:distance(f32)  12:plane_ptr(u32)  16:plane_size(u32)
+//   20:dim_shift(u32)  24:name_ptr(u32)  28:name_len(u32)
+//   32:spot_r(f32)  36:spot_g(f32)  40:spot_b(f32)  44:spot_solidity(f32)
+// plane_ptr/plane_size and name_ptr are left 0 by serialize; the caller fills them after the
+// per-plane / per-name _malloc. name_len IS set here (UTF-8 byte length) so the caller knows
+// how many bytes to allocate + copy for name_ptr.
+export const EC_BYTES = 48;
 
 const EXTRA_TYPE_TO_JXL: Record<ExtraChannelType, number> = {
   alpha: 0, depth: 1, selection: 3, spot: 2, thermal: 6,
@@ -734,14 +761,25 @@ const EXTRA_TYPE_TO_JXL: Record<ExtraChannelType, number> = {
   unknown: 15,
 };
 
+const JXL_TO_EXTRA_TYPE: Record<number, ExtraChannelType> = Object.fromEntries(
+  Object.entries(EXTRA_TYPE_TO_JXL).map(([k, v]) => [v, k as ExtraChannelType]),
+) as Record<number, ExtraChannelType>;
+
+// Reuse the module-level TEXT_ENCODER (declared near the top of the file) for name bytes.
+const TEXT_DECODER = new TextDecoder();
+
+// int32 bounds for the C `int`-typed frame-setting FFI (finding 18). Values outside this range
+// truncate silently at the WASM boundary, so applyAdvancedFrameSettings rejects them loudly.
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+
 /**
- * Serializes ExtraChannel[] to a 20*N byte ArrayBuffer for the EC encode FFI.
- * Layout matches `struct WasmExtraChannel` in bridge.cpp exactly — the ONLY consumer:
- *   0:type(u32), 4:bits(u32), 8:distance(f32), 12:plane_ptr(u32), 16:plane_size(u32).
- * plane_ptr/plane_size left as 0 (filled by caller after per-plane malloc).
- * Returns { buffer, view } for direct DataView writes of pointers/sizes by caller.
- * NOTE: dimShift / spotColor / name on ExtraChannel are NOT serialized — the C++ struct
- * does not read them yet. Wiring them requires growing WasmExtraChannel in bridge.cpp first.
+ * Serializes ExtraChannel[] to an EC_BYTES*N ArrayBuffer for the EC encode FFI.
+ * Layout matches `struct WasmExtraChannel` in bridge.cpp exactly (the ONLY consumer).
+ * plane_ptr/plane_size (12/16) and name_ptr (24) are left 0 for the caller to fill after
+ * per-plane / per-name malloc; name_len (28), dim_shift (20), and spot colour (32..44) ARE
+ * serialized here so the descriptor metadata reaches the encoder.
+ * Returns { buffer, view } for direct DataView writes of pointers/sizes by the caller.
  */
 export function serializeExtraChannelsForWasm(channels: ExtraChannel[]): { buffer: ArrayBuffer; view: DataView } {
   const n = channels.length;
@@ -754,9 +792,224 @@ export function serializeExtraChannelsForWasm(channels: ExtraChannel[]): { buffe
     dv.setUint32(off + 4, ch.bitsPerSample >>> 0, true);
     dv.setFloat32(off + 8, ch.distance ?? 0, true);
     // plane_ptr (12) and plane_size (16) filled by caller post-malloc
+    dv.setUint32(off + 20, (ch.dimShift ?? 0) >>> 0, true);
+    // name_ptr (24) filled by caller post-malloc; name_len (28) set here.
+    const nameLen = ch.name ? TEXT_ENCODER.encode(ch.name).byteLength : 0;
+    dv.setUint32(off + 28, nameLen >>> 0, true);
+    if (ch.type === 'spot' && ch.spotColor) {
+      dv.setFloat32(off + 32, ch.spotColor.red, true);
+      dv.setFloat32(off + 36, ch.spotColor.green, true);
+      dv.setFloat32(off + 40, ch.spotColor.blue, true);
+      dv.setFloat32(off + 44, ch.spotColor.solidity, true);
+    }
     off += EC_BYTES;
   }
   return { buffer: buf, view: dv };
+}
+
+/** Options for {@link encodeWithExtraChannels}. */
+export interface EncodeWithExtraChannelsOptions {
+  distance?: number;
+  effort?: number;
+  hasAlpha?: boolean;
+  /** Per-channel bytes for the interleaved main image. rgba8 only for now (bytesPerSample=1). */
+  bytesPerSample?: 1;
+}
+
+function bytesPerSampleForBits(bits: number): number {
+  return bits > 16 ? 4 : bits > 8 ? 2 : 1;
+}
+
+/**
+ * P3-T2 (finding 19): encode an RGBA8 image with typed extra channels whose descriptor metadata
+ * (dim_shift, name, spot colour) AND pixel planes are honoured by libjxl. Descriptor buffer and
+ * every per-plane / per-name allocation use CHECKED byte math and are freed on EVERY path
+ * (success, validation error, or WASM error) — no leak. Calls the existing `_ec` bridge.
+ *
+ * @param module a loaded libjxl WASM module (encoder superset).
+ * @param pixels interleaved RGBA8 main image, width*height*4 bytes.
+ * @param channels extra-channel descriptors; each `plane` (if present) must be exactly
+ *   `width * height * ceil(bitsPerSample/8)` bytes.
+ */
+export async function encodeWithExtraChannels(
+  module: LibjxlWasmModule,
+  pixels: Uint8Array | ArrayBuffer,
+  width: number,
+  height: number,
+  channels: ExtraChannel[],
+  options: EncodeWithExtraChannelsOptions = {},
+): Promise<Uint8Array> {
+  if (typeof module._jxl_wasm_encode_rgba8_with_metadata_ec !== "function") {
+    throw new CapabilityMissing(
+      "encodeWithExtraChannels requires a rebuilt WASM with the extra-channel bridge (_jxl_wasm_encode_rgba8_with_metadata_ec)",
+    );
+  }
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
+    throw new Error(`encodeWithExtraChannels: invalid dimensions ${width}×${height}`);
+  }
+  const nPixelBytes = width * height * 4;
+  if (!Number.isSafeInteger(nPixelBytes) || nPixelBytes <= 0) {
+    throw new Error(`encodeWithExtraChannels: pixel byte overflow for ${width}×${height}`);
+  }
+  const pixelView = copyOrBorrowInput(pixels, false);
+  if (pixelView.byteLength < nPixelBytes) {
+    throw new Error(
+      `encodeWithExtraChannels: main image buffer too small — expected ${nPixelBytes} bytes, got ${pixelView.byteLength}`,
+    );
+  }
+
+  const distance = options.distance ?? 1;
+  const effort = options.effort ?? 3;
+  const hasAlpha = options.hasAlpha ? 1 : 0;
+
+  // Validate every plane's byte math BEFORE any allocation so we never partially allocate.
+  const planeViews: Array<Uint8Array | null> = channels.map((ch) => {
+    if (ch.plane == null) return null;
+    const bps = bytesPerSampleForBits(ch.bitsPerSample);
+    const expected = width * height * bps;
+    const view =
+      ch.plane instanceof Uint16Array
+        ? new Uint8Array(ch.plane.buffer, ch.plane.byteOffset, ch.plane.byteLength)
+        : copyOrBorrowInput(ch.plane, false);
+    if (view.byteLength !== expected) {
+      throw new Error(
+        `encodeWithExtraChannels: extra-channel '${ch.type}' plane byte size ${view.byteLength} ` +
+          `does not match width*height*bytesPerSample (${expected})`,
+      );
+    }
+    return view;
+  });
+
+  // Build the packed descriptor buffer (name_len set; plane_ptr/name_ptr filled below).
+  const { buffer: descBuf, view: descView } = serializeExtraChannelsForWasm(channels);
+  const numEc = channels.length;
+
+  // Track every WASM allocation for guaranteed free-on-all-paths.
+  const allocs: number[] = [];
+  const alloc = (size: number, label: string): number => {
+    const p = mallocOrThrow(module, size, label);
+    allocs.push(p);
+    return p;
+  };
+
+  let pixelsPtr = 0;
+  let descPtr = 0;
+  let handle = 0;
+  try {
+    pixelsPtr = alloc(nPixelBytes, "encodeWithExtraChannels pixels");
+    module.HEAPU8.set(pixelView.subarray(0, nPixelBytes), pixelsPtr);
+
+    descPtr = numEc > 0 ? alloc(descBuf.byteLength, "encodeWithExtraChannels descriptors") : 0;
+
+    // Per-channel plane + name allocations, writing plane_ptr/plane_size + name_ptr into descBuf.
+    for (let i = 0; i < numEc; i++) {
+      const off = i * EC_BYTES;
+      const planeView = planeViews[i];
+      if (planeView && planeView.byteLength > 0) {
+        const planePtr = alloc(planeView.byteLength, `extra-channel[${i}] plane`);
+        module.HEAPU8.set(planeView, planePtr);
+        descView.setUint32(off + 12, planePtr, true);
+        descView.setUint32(off + 16, planeView.byteLength, true);
+      }
+      const ch = channels[i]!;
+      if (ch.name) {
+        const nameBytes = TEXT_ENCODER.encode(ch.name);
+        if (nameBytes.byteLength > 0) {
+          const namePtr = alloc(nameBytes.byteLength, `extra-channel[${i}] name`);
+          module.HEAPU8.set(nameBytes, namePtr);
+          descView.setUint32(off + 24, namePtr, true);
+          descView.setUint32(off + 28, nameBytes.byteLength, true);
+        }
+      }
+    }
+
+    // Copy the finalized descriptor buffer into the WASM heap.
+    if (descPtr !== 0) module.HEAPU8.set(new Uint8Array(descBuf), descPtr);
+
+    handle = module._jxl_wasm_encode_rgba8_with_metadata_ec(
+      pixelsPtr, width, height,
+      distance, effort, /*fmt=*/0, hasAlpha,
+      /*progressive_dc=*/0, /*progressive_ac=*/0, /*qprogressive_ac=*/0, /*buffering=*/0, /*group_order=*/0,
+      /*modular=*/-1, /*brotli_effort=*/-1, /*decoding_speed=*/-1, /*photon_noise_iso=*/0, /*resampling=*/1,
+      /*icc=*/0, /*icc_size=*/0, /*exif=*/0, /*exif_size=*/0, /*xmp=*/0, /*xmp_size=*/0,
+      /*alpha_distance=*/-1, descPtr, numEc, /*ec_resampling=*/-1,
+    );
+    // takeBuffer reads the error field and throws on a nonzero .error; frees the handle either way.
+    const out = takeBuffer(module, handle, "encodeWithExtraChannels");
+    handle = 0; // takeBuffer freed it
+    return out.data;
+  } finally {
+    if (handle !== 0) module._jxl_wasm_buffer_free(handle);
+    for (const p of allocs) module._free(p);
+  }
+}
+
+/**
+ * P3-T2 (finding 19): read back the extra-channel descriptors (incl. dim_shift, spot colour, and
+ * name) from an encoded JXL codestream, for round-trip verification. Consumes the
+ * `_jxl_wasm_get_extra_channels` bridge; returns one {@link DecodedExtraChannel}-like descriptor
+ * per channel (the main alpha channel included, if present).
+ */
+export function getExtraChannelsFromJxl(
+  module: LibjxlWasmModule,
+  input: Uint8Array | ArrayBuffer,
+): Array<DecodedExtraChannel & { spotColor?: SpotColorInfo; dimShift?: number }> {
+  if (typeof module._jxl_wasm_get_extra_channels !== "function") {
+    throw new CapabilityMissing(
+      "getExtraChannelsFromJxl requires a rebuilt WASM with the extra-channel decode helper (_jxl_wasm_get_extra_channels)",
+    );
+  }
+  const view = copyOrBorrowInput(input, false);
+  const inPtr = mallocOrThrow(module, view.byteLength, "getExtraChannelsFromJxl input");
+  let handle = 0;
+  try {
+    module.HEAPU8.set(view, inPtr);
+    handle = module._jxl_wasm_get_extra_channels(inPtr, view.byteLength)!;
+    // Retain (do NOT free yet): the packed descriptors AND the appended name bytes live in this
+    // owned buffer, and both name_ptr and buf.data point into it. Freeing before we finish reading
+    // would be a use-after-free. Release explicitly once every field + name string is copied out.
+    const buf = retainBufferView(module, handle, "getExtraChannelsFromJxl");
+    handle = 0; // ownership transferred to `buf`; released below
+    const out: Array<DecodedExtraChannel & { spotColor?: SpotColorInfo; dimShift?: number }> = [];
+    try {
+      const count = buf.width; // channel count packed into the width field
+      const dv = new DataView(buf.data.buffer, buf.data.byteOffset, buf.data.byteLength);
+      for (let i = 0; i < count; i++) {
+        const off = i * EC_BYTES;
+        const jxlType = dv.getUint32(off + 0, true);
+        const bits = dv.getUint32(off + 4, true);
+        const dimShift = dv.getUint32(off + 20, true);
+        const namePtr = dv.getUint32(off + 24, true);
+        const nameLen = dv.getUint32(off + 28, true);
+        const spotR = dv.getFloat32(off + 32, true);
+        const spotG = dv.getFloat32(off + 36, true);
+        const spotB = dv.getFloat32(off + 40, true);
+        const spotS = dv.getFloat32(off + 44, true);
+        const type = JXL_TO_EXTRA_TYPE[jxlType] ?? "unknown";
+        let name: string | undefined;
+        if (namePtr !== 0 && nameLen > 0) {
+          // name_ptr is an absolute heap address into the still-live buffer; TextDecoder copies.
+          name = TEXT_DECODER.decode(module.HEAPU8.subarray(namePtr, namePtr + nameLen));
+        }
+        const entry: DecodedExtraChannel & { spotColor?: SpotColorInfo; dimShift?: number } = {
+          type,
+          bitsPerSample: bits,
+          dimShift,
+          ...(name != null ? { name } : {}),
+        };
+        if (type === "spot") {
+          entry.spotColor = { red: spotR, green: spotG, blue: spotB, solidity: spotS };
+        }
+        out.push(entry);
+      }
+    } finally {
+      buf.release();
+    }
+    return out;
+  } finally {
+    if (handle !== 0) module._jxl_wasm_buffer_free(handle);
+    module._free(inPtr);
+  }
 }
 
 export function createEncoder(options: EncoderOptions): JxlEncoder {
@@ -2184,8 +2437,6 @@ class LibjxlEncoder implements JxlEncoder {
   private moduleInitPromise: Promise<LibjxlWasmModule> | null = null;
   private pendingPushPromise: Promise<void> = Promise.resolve();
   private pendingPushError: unknown = null;
-  private advIdsPtr = 0;
-  private advValuesPtr = 0;
 
   // Profiling accumulators (for console summary + optional onMetric if wired)
   private tCreateStart = 0;
@@ -2289,7 +2540,6 @@ class LibjxlEncoder implements JxlEncoder {
       const needsZ = caps.streamingInputZ && (o.orientation != null || o.intrinsicWidth != null || o.intrinsicHeight != null || o.disablePerceptualHeuristics != null || o.codestreamLevel != null || o.centerX != null || o.centerY != null);
       const needsY = !needsZ && caps.streamingInputY && (o.epf != null || o.gaborish != null || o.dots != null || o.colorTransform != null);
       const needsX = !needsZ && !needsY && caps.streamingInputX && (o.modular != null || o.brotliEffort != null || o.decodingSpeed != null || o.photonNoiseIso != null);
-      const needsAdv = !needsZ && !needsY && !needsX && !!module._jxl_wasm_enc_create_image_adv && !!o.advancedFrameSettings?.length;
 
       if (needsZ) {
         this.wasmEncState = module._jxl_wasm_enc_create_image_z!(
@@ -2330,31 +2580,6 @@ class LibjxlEncoder implements JxlEncoder {
           o.modular ?? modularDefault, o.brotliEffort ?? -1, o.decodingSpeed ?? -1, o.photonNoiseIso ?? 0, resampling,
           0, 0, 0, 0, 0, -1
         );
-      } else if (needsAdv) {
-        const adv = this.prepareAdvancedSettings(module);
-        this.advIdsPtr = adv.idsPtr;
-        this.advValuesPtr = adv.valuesPtr;
-        try {
-          if (adv.count > 0) {
-            this.wasmEncState = module._jxl_wasm_enc_create_image_adv!(
-              o.width, o.height, distance, o.effort,
-              fmtIndex, o.hasAlpha ? 1 : 0,
-              progressiveDc, progressiveAc, qProgressiveAc, buffering,
-              adv.idsPtr, adv.valuesPtr, adv.count
-            );
-          } else {
-            this.wasmEncState = module._jxl_wasm_enc_create_image!(
-              o.width, o.height, distance, o.effort,
-              fmtIndex, o.hasAlpha ? 1 : 0,
-              progressiveDc, progressiveAc, qProgressiveAc, buffering,
-              groupOrder, resampling
-            );
-          }
-        } finally {
-          adv.free();
-          this.advIdsPtr = 0;
-          this.advValuesPtr = 0;
-        }
       } else {
         this.wasmEncState = module._jxl_wasm_enc_create_image!(
           o.width, o.height, distance, o.effort,
@@ -2368,6 +2593,40 @@ class LibjxlEncoder implements JxlEncoder {
       this.streamingInputActive = true;
     }
     return module;
+  }
+
+  /**
+   * P3-T2 (finding 18): apply advancedFrameSettings via the ONE generic libjxl-validated setter.
+   * Called from the streaming chunks() path immediately before enc_finish so errors surface
+   * cleanly through the generator. These are NEVER silently dropped: a build lacking the setter
+   * fails loudly here, and libjxl rejects an unknown/unsupported id at enc_finish (nonzero rc).
+   */
+  private applyAdvancedFrameSettings(module: LibjxlWasmModule): void {
+    const adv = this.options.advancedFrameSettings;
+    if (!adv?.length) return;
+    if (typeof module._jxl_wasm_enc_set_frame_setting !== "function") {
+      throw new CapabilityMissing(
+        "advancedFrameSettings requires a rebuilt WASM with the generic frame setting bridge (_jxl_wasm_enc_set_frame_setting)",
+      );
+    }
+    for (const s of adv) {
+      // The FFI carries id + value as C `int` (int32). A value outside int32 would truncate
+      // via wraparound at the WASM boundary and reach libjxl as a silently-wrong number — the
+      // exact "silently ignored" failure this task forbids. Reject out-of-range LOUDLY instead.
+      // (Every integer JxlEncoderFrameSettingId in libjxl 0.11.x is a small bounded int; float
+      // settings are a separate API this integer escape hatch intentionally does not cover.)
+      if (!Number.isInteger(s.id) || s.id < INT32_MIN || s.id > INT32_MAX) {
+        throw new Error(`JXL frame setting id ${s.id} is not a valid int32`);
+      }
+      if (!Number.isInteger(s.value) || s.value < INT32_MIN || s.value > INT32_MAX) {
+        throw new Error(
+          `JXL frame setting ${s.id} value ${s.value} is out of int32 range; the integer frame-setting ` +
+            `bridge cannot represent it (float-valued settings are not supported via advancedFrameSettings)`,
+        );
+      }
+      const rc = module._jxl_wasm_enc_set_frame_setting(this.wasmEncState, s.id, s.value);
+      if (rc !== 0) throw new Error(`JXL frame setting ${s.id} rejected at queue time (${rc})`);
+    }
   }
 
   finish(): void {
@@ -2399,6 +2658,8 @@ class LibjxlEncoder implements JxlEncoder {
       // #16: Streaming input path — pixels already in WASM pixel buffer.
       // enc_finish runs the encode; enc_take_chunk drains the output.
       try {
+        // Apply generic frame settings (finding 18) before finish — errors surface via this try.
+        this.applyAdvancedFrameSettings(module);
         const tFin0 = performance.now();
         const rc = module._jxl_wasm_enc_finish!(this.wasmEncState);
         if (rc !== 0) throw new Error(`JXL streaming encode finish failed (${rc})`);
@@ -2552,41 +2813,38 @@ class LibjxlEncoder implements JxlEncoder {
               xmpSize = 0;
             }
 
-            const adv = this.prepareAdvancedSettings(module);
-            const useAdv = adv.count > 0 && module._jxl_wasm_encode_rgba8_with_metadata_adv;
+            // P3-T2 (finding 18): advancedFrameSettings must never be silently dropped. The
+            // buffered metadata (ICC/EXIF/XMP) one-shot encode has no encoder state to attach the
+            // generic frame setting to, so reject loudly and steer callers to the streaming path
+            // (which carries the generic libjxl-validated setter).
+            if (this.options.advancedFrameSettings?.length) {
+              if (iccPtr !== 0) module._free(iccPtr);
+              if (exifPtr !== 0) module._free(exifPtr);
+              if (xmpPtr !== 0) module._free(xmpPtr);
+              throw new Error(
+                "advancedFrameSettings are not supported together with ICC/EXIF/XMP metadata on the buffered encode path; " +
+                  "encode without inline metadata (streaming path) to apply generic frame settings",
+              );
+            }
 
             try {
               if (iccPtr !== 0) module.HEAPU8.set(iccView, iccPtr);
               if (exifPtr !== 0) module.HEAPU8.set(exifView, exifPtr);
               if (xmpPtr !== 0) module.HEAPU8.set(xmpView, xmpPtr);
 
-              if (useAdv) {
-                handle = module._jxl_wasm_encode_rgba8_with_metadata_adv!(
-                  ptr, this.options.width, this.options.height,
-                  distance, this.options.effort, fmt, hasAlpha,
-                  progressiveDc, progressiveAc, qProgressiveAc, buffering,
-                  groupOrder, resampling,
-                  iccPtr, iccSize,
-                  exifPtr, exifSize,
-                  xmpPtr, xmpSize,
-                  adv.idsPtr, adv.valuesPtr, adv.count
-                );
-              } else {
-                handle = module._jxl_wasm_encode_rgba8_with_metadata(
-                  ptr, this.options.width, this.options.height,
-                  distance, this.options.effort, fmt, hasAlpha,
-                  progressiveDc, progressiveAc, qProgressiveAc, buffering,
-                  groupOrder, resampling,
-                  iccPtr, iccSize,
-                  exifPtr, exifSize,
-                  xmpPtr, xmpSize
-                );
-              }
+              handle = module._jxl_wasm_encode_rgba8_with_metadata(
+                ptr, this.options.width, this.options.height,
+                distance, this.options.effort, fmt, hasAlpha,
+                progressiveDc, progressiveAc, qProgressiveAc, buffering,
+                groupOrder, resampling,
+                iccPtr, iccSize,
+                exifPtr, exifSize,
+                xmpPtr, xmpSize
+              );
             } finally {
               if (iccPtr !== 0) module._free(iccPtr);
               if (exifPtr !== 0) module._free(exifPtr);
               if (xmpPtr !== 0) module._free(xmpPtr);
-              adv.free();
             }
           } else {
             // Fallback: plain encode (no metadata) used when bridge fn absent
@@ -2634,51 +2892,10 @@ class LibjxlEncoder implements JxlEncoder {
   }
 
   private freeWasmState(): void {
-    if (this.wasmModule !== null) {
-      if (this.advIdsPtr !== 0) this.wasmModule._free(this.advIdsPtr);
-      if (this.advValuesPtr !== 0) this.wasmModule._free(this.advValuesPtr);
-      this.advIdsPtr = 0;
-      this.advValuesPtr = 0;
-    }
-
     if (this.wasmEncState !== 0 && this.wasmModule !== null) {
       this.wasmModule._jxl_wasm_enc_free!(this.wasmEncState);
       this.wasmEncState = 0;
     }
-  }
-
-  /**
-   * Allocates advancedFrameSettings (if present) into WASM memory and returns
-   * pointers + count. The caller is responsible for calling the returned free()
-   * after the encode call (or rely on freeWasmState / dispose).
-   */
-  private prepareAdvancedSettings(module: LibjxlWasmModule): { idsPtr: number; valuesPtr: number; count: number; free: () => void } {
-    const adv = this.options.advancedFrameSettings;
-    if (!adv || adv.length === 0 || !module._malloc) {
-      return { idsPtr: 0, valuesPtr: 0, count: 0, free: () => {} };
-    }
-
-    const count = adv.length;
-    const ids = new Int32Array(adv.map(s => s.id));
-    const values = new Int32Array(adv.map(s => s.value));
-
-    const idsPtr = module._malloc(ids.byteLength);
-    const valuesPtr = module._malloc(values.byteLength);
-    if (idsPtr === 0 || valuesPtr === 0) {
-      if (idsPtr !== 0) module._free(idsPtr);
-      if (valuesPtr !== 0) module._free(valuesPtr);
-      throw new Error("WASM OOM: failed to allocate advancedFrameSettings buffers");
-    }
-
-    module.HEAP32.set(ids, idsPtr >> 2);
-    module.HEAP32.set(values, valuesPtr >> 2);
-
-    const free = () => {
-      module._free(idsPtr);
-      module._free(valuesPtr);
-    };
-
-    return { idsPtr, valuesPtr, count, free };
   }
 
   private waitUntilFinished(): Promise<void> {
