@@ -254,25 +254,28 @@ fn dng_meta(state: &WalkState, raw: &RawIfd, width: usize, height: usize, cfa: C
     }
 }
 
-/// Streaming DNG raw-row source. comp=7 (LJPEG tiles) decodes one row-tile band at a
-/// time into a reused buffer; comp=1 (uncompressed) decodes the whole raw once and doles
-/// rows. Yields rows byte-identical to `decode_bytes().raw`, top-to-bottom, without the
-/// full-res demosaiced RGB. Feeds the generic `stream_preview::build_previews_streaming`.
+/// Streaming DNG raw-row source. Both comp=7 (LJPEG tiles) and comp=1 (uncompressed
+/// strips or tiles) decode one raster row-band at a time into a reused buffer and dole
+/// rows out of it — no full-resolution mosaic is ever materialised (finding 53). Yields
+/// rows byte-identical to `decode_bytes().raw`, top-to-bottom, without the full-res
+/// demosaiced RGB. Feeds the generic `stream_preview::build_previews_streaming`.
 pub struct DngRowSource<'a> {
     data: &'a [u8],
     raw: RawIfd,
     meta: DngMeta,
+    le: bool,
     row: usize,
-    // comp=7 tile-band streaming
+    // comp=7 LJPEG tile-band streaming
     tiled: bool,
     tw: usize,
     tl: usize,
     coltiles: usize,
+    // comp=1 uncompressed strip/tile-band streaming
+    uncompressed: Option<UncompressedLayout>,
+    // Shared row-band scratch (reused across bands; holds at most one row-band).
     band_buf: Vec<u16>,
     band_first: usize,
     band_rows: usize,
-    // comp=1 fallback: whole raw decoded up front
-    full: Vec<u16>,
 }
 
 impl<'a> DngRowSource<'a> {
@@ -323,37 +326,38 @@ impl<'a> DngRowSource<'a> {
                     data,
                     raw,
                     meta,
+                    le,
                     row: 0,
                     tiled: true,
                     tw,
                     tl,
                     coltiles,
+                    uncompressed: None,
                     band_buf: Vec::new(),
                     band_first: 0,
                     band_rows: 0,
-                    full: Vec::new(),
                 })
             }
             1 => {
-                // Uncompressed: decode the whole raw once (cheap, no entropy) and dole
-                // rows. Reuses the crate's endianness/strip/tile-aware unpack. Avoids the
-                // full-res RGB (the dominant DNG buffer); keeps the raw (~3.5× peak).
-                let mut full = vec![0u16; width * height];
-                decode_uncompressed(data, &raw, width, height, le, &mut full)
+                // Uncompressed: resolve the strip/tile layout once, then decode a single
+                // row-band on demand in `next_row_into` (finding 53). No full-res mosaic
+                // is allocated — peak is one row-band + the caller's preview outputs.
+                let layout = uncompressed_layout(&raw, width, height)
                     .map_err(|e| format!("DNG uncompressed: {e}"))?;
                 Ok(Self {
                     data,
                     raw,
                     meta,
+                    le,
                     row: 0,
                     tiled: false,
                     tw: 0,
                     tl: 0,
                     coltiles: 0,
+                    uncompressed: Some(layout),
                     band_buf: Vec::new(),
                     band_first: 0,
                     band_rows: 0,
-                    full,
                 })
             }
             c => Err(format!("DNG: compression {c} not streamable")),
@@ -383,6 +387,7 @@ impl crate::decompress::RawRowSource for DngRowSource<'_> {
         }
         let r = self.row;
         if self.tiled {
+            // comp=7 LJPEG: decode the row's tile-band into band_buf on first touch.
             if self.band_rows == 0 || r >= self.band_first + self.band_rows {
                 let tr = r / self.tl;
                 let row_start = tr * self.tl;
@@ -405,8 +410,35 @@ impl crate::decompress::RawRowSource for DngRowSource<'_> {
             }
             let local = r - self.band_first;
             dst[..w].copy_from_slice(&self.band_buf[local * w..local * w + w]);
+        } else if let Some(layout) = self.uncompressed {
+            // comp=1: decode the strip / tile-row containing row `r` into band_buf on
+            // first touch, then serve rows out of it (finding 53 — no full mosaic).
+            if self.band_rows == 0 || r >= self.band_first + self.band_rows {
+                let band_stride = match layout {
+                    UncompressedLayout::Tiled { tl, .. } => tl,
+                    UncompressedLayout::Strips { rows_per_strip } => rows_per_strip,
+                };
+                let band_first = (r / band_stride) * band_stride;
+                let rows = layout.band_rows(band_first, h);
+                self.band_buf.resize(rows * w, 0);
+                decode_uncompressed_band(
+                    self.data,
+                    &self.raw,
+                    layout,
+                    w,
+                    h,
+                    self.le,
+                    band_first,
+                    &mut self.band_buf,
+                )
+                .map_err(|e| format!("DNG uncompressed band @{band_first}: {e}"))?;
+                self.band_first = band_first;
+                self.band_rows = rows;
+            }
+            let local = r - self.band_first;
+            dst[..w].copy_from_slice(&self.band_buf[local * w..local * w + w]);
         } else {
-            dst[..w].copy_from_slice(&self.full[r * w..r * w + w]);
+            return Err("DNG: row source has no decode path".into());
         }
         self.row += 1;
         Ok(true)
@@ -680,17 +712,40 @@ fn fill_u16_row(dst: &mut [u16], bytes: &[u8], le: bool) {
     }
 }
 
-fn decode_uncompressed(
-    data: &[u8],
-    raw: &RawIfd,
-    width: usize,
-    height: usize,
-    le: bool,
-    out: &mut [u16],
-) -> Result<()> {
-    let bps = raw.bits_per_sample;
-    if bps != 16 {
-        bail!("uncompressed DNG: bps {} unsupported", bps);
+/// Which physical layout an uncompressed (compression=1) DNG uses. Resolved once
+/// so both the full decode and the streaming row source share the same geometry
+/// and per-band decode primitives — finding 53 (stream comp=1 rows without a full
+/// mosaic).
+#[derive(Clone, Copy)]
+enum UncompressedLayout {
+    /// TileWidth/TileLength grid; a raster row-band = one tile row (all col tiles).
+    Tiled { tw: usize, tl: usize, coltiles: usize },
+    /// Strip layout; a raster row-band = one strip (`rows_per_strip` rows).
+    Strips { rows_per_strip: usize },
+}
+
+impl UncompressedLayout {
+    /// Rows in the row-band starting at raster row `band_first` (the band the
+    /// streaming source materialises before serving rows out of it).
+    fn band_rows(&self, band_first: usize, height: usize) -> usize {
+        match *self {
+            UncompressedLayout::Tiled { tl, .. } => {
+                let row_end = band_first.saturating_add(tl).min(height);
+                row_end - band_first
+            }
+            UncompressedLayout::Strips { rows_per_strip } => {
+                let row_end = band_first.saturating_add(rows_per_strip).min(height);
+                row_end - band_first
+            }
+        }
+    }
+}
+
+/// Resolve the compression=1 layout (tiled vs strips) from the raw IFD, validating
+/// the same invariants the previous inline `decode_uncompressed` enforced.
+fn uncompressed_layout(raw: &RawIfd, width: usize, height: usize) -> Result<UncompressedLayout> {
+    if raw.bits_per_sample != 16 {
+        bail!("uncompressed DNG: bps {} unsupported", raw.bits_per_sample);
     }
     if !raw.tile_offsets.is_empty() {
         let tw = raw.tile_width.ok_or_else(|| anyhow!("TileWidth"))? as usize;
@@ -699,9 +754,38 @@ fn decode_uncompressed(
         if tw == 0 || tl == 0 {
             bail!("uncompressed DNG: zero TileWidth/TileLength");
         }
-        let coltiles = (width + tw - 1) / tw;
-        let rowtiles = (height + tl - 1) / tl;
-        for tr in 0..rowtiles {
+        let coltiles = width.div_ceil(tw);
+        Ok(UncompressedLayout::Tiled { tw, tl, coltiles })
+    } else if !raw.strip_offsets.is_empty() {
+        if raw.strip_offsets.len() != raw.strip_byte_counts.len() {
+            bail!("uncompressed DNG: strip count mismatch");
+        }
+        let rows_per_strip = raw.rows_per_strip.unwrap_or(height as u32).max(1) as usize;
+        Ok(UncompressedLayout::Strips { rows_per_strip })
+    } else {
+        bail!("uncompressed DNG: missing tile or strip offsets")
+    }
+}
+
+/// Decode one uncompressed row-band `[band_first, band_first+band_rows)` into `band`
+/// (len == band_rows*width, full-width raster order). Byte-identical to the inline
+/// per-strip / per-tile-row loops the whole-frame `decode_uncompressed` used; shared
+/// so `DngRowSource` can materialise only the requested band (finding 53).
+fn decode_uncompressed_band(
+    data: &[u8],
+    raw: &RawIfd,
+    layout: UncompressedLayout,
+    width: usize,
+    height: usize,
+    le: bool,
+    band_first: usize,
+    band: &mut [u16],
+) -> Result<()> {
+    match layout {
+        UncompressedLayout::Tiled { tw, tl, coltiles } => {
+            let tr = band_first / tl;
+            let row_start = tr * tl;
+            let row_end = ((tr + 1) * tl).min(height);
             for tc in 0..coltiles {
                 let idx = tr * coltiles + tc;
                 // Length guard before indexing, matching the compressed tile path
@@ -722,12 +806,7 @@ fn decode_uncompressed(
                     .ok_or_else(|| anyhow!("uncompressed DNG: tile {idx} OOB"))?;
                 let col_start = tc * tw;
                 let col_end = ((tc + 1) * tw).min(width);
-                let row_start = tr * tl;
-                let row_end = ((tr + 1) * tl).min(height);
-                // Per-row contiguous copy: dst run out[r*width+col_start .. col_end] and the
-                // source row segment are both dense u16 runs, so one bounds check + one
-                // fill_u16_row (memcpy on LE) per row replaces the per-pixel scatter + index
-                // recompute. Byte-identical; error path unchanged (bail on truncation).
+                // Per-row contiguous copy into the band (band-local row = r - row_start).
                 let cw = col_end - col_start; // ≤ tw
                 let mut sp = 0usize;
                 for r in row_start..row_end {
@@ -735,29 +814,21 @@ fn decode_uncompressed(
                     if sp + need > src.len() {
                         bail!("uncompressed DNG: tile {idx} truncated");
                     }
-                    let base = r * width + col_start;
-                    fill_u16_row(&mut out[base..base + cw], &src[sp..sp + need], le);
-                    // saturating: for valid tiles cw ≤ tw, so the row stride is tw*2;
-                    // guards underflow on hostile tw/width (000-security-27).
+                    let base = (r - band_first) * width + col_start;
+                    fill_u16_row(&mut band[base..base + cw], &src[sp..sp + need], le);
+                    // For valid tiles cw ≤ tw, so the row stride is tw*2.
                     sp += tw * 2;
                 }
             }
+            Ok(())
         }
-        return Ok(());
-    }
-    if !raw.strip_offsets.is_empty() {
-        if raw.strip_offsets.len() != raw.strip_byte_counts.len() {
-            bail!("uncompressed DNG: strip count mismatch");
-        }
-        let rows_per_strip = raw.rows_per_strip.unwrap_or(height as u32).max(1) as usize;
-        for (idx, (&off_u32, &bc_u32)) in raw
-            .strip_offsets
-            .iter()
-            .zip(raw.strip_byte_counts.iter())
-            .enumerate()
-        {
-            let off = off_u32 as usize;
-            let bc = bc_u32 as usize;
+        UncompressedLayout::Strips { rows_per_strip } => {
+            let idx = band_first / rows_per_strip;
+            if idx >= raw.strip_offsets.len() || idx >= raw.strip_byte_counts.len() {
+                bail!("uncompressed DNG: strip {idx} index out of range");
+            }
+            let off = raw.strip_offsets[idx] as usize;
+            let bc = raw.strip_byte_counts[idx] as usize;
             // checked_add (000-security-11): off+bc can wrap usize on wasm32.
             let end = off
                 .checked_add(bc)
@@ -765,44 +836,58 @@ fn decode_uncompressed(
             let src = data
                 .get(off..end)
                 .ok_or_else(|| anyhow!("uncompressed DNG: strip {idx} OOB"))?;
-            // checked_mul/add (000-security-11 style): idx*rows_per_strip and the
-            // strip's last row can wrap usize on wasm32 for hostile strip counts,
-            // defeating the OOB bound below. Saturate row_start past `height` so the
-            // empty range simply skips the strip.
-            let row_start = idx
-                .checked_mul(rows_per_strip)
-                .unwrap_or(usize::MAX)
-                .min(height);
-            let row_end = row_start
-                .checked_add(rows_per_strip)
-                .unwrap_or(usize::MAX)
-                .min(height);
-            // Per-row contiguous copy: a whole strip row out[r*width .. r*width+width] is a
-            // dense u16 run, so one OOB-checked dst slice + one bounds check + one
-            // fill_u16_row (memcpy on LE) per row replaces the per-pixel scatter, the
-            // per-element checked-mul/add and get_mut. Byte-identical; errors unchanged.
+            let row_end = (band_first + rows_per_strip).min(height);
+            // Per-row contiguous copy into the band. r*width+width can overflow on
+            // hostile width; the band slice bound preserves the old get_mut guard.
             let need = width * 2;
             let mut sp = 0usize;
-            for r in row_start..row_end {
+            for r in band_first..row_end {
                 if sp + need > src.len() {
                     bail!("uncompressed DNG: strip {idx} truncated");
                 }
-                // r*width+width can overflow on hostile width; checked range keeps the
-                // destination slice in range (preserves the old per-element get_mut guard).
-                let base = r
-                    .checked_mul(width)
-                    .ok_or_else(|| anyhow!("uncompressed DNG: strip {idx} dst OOB"))?;
+                let base = (r - band_first) * width;
                 let dst = base
                     .checked_add(width)
-                    .and_then(|end| out.get_mut(base..end))
+                    .and_then(|e| band.get_mut(base..e))
                     .ok_or_else(|| anyhow!("uncompressed DNG: strip {idx} dst OOB"))?;
                 fill_u16_row(dst, &src[sp..sp + need], le);
                 sp += need;
             }
+            Ok(())
         }
-        return Ok(());
     }
-    bail!("uncompressed DNG: missing tile or strip offsets");
+}
+
+fn decode_uncompressed(
+    data: &[u8],
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    le: bool,
+    out: &mut [u16],
+) -> Result<()> {
+    let layout = uncompressed_layout(raw, width, height)?;
+    // Whole-frame decode = decode every row-band directly into its slice of `out`.
+    // Byte-identical to the previous inline loops (same per-band primitive).
+    let band_stride = match layout {
+        UncompressedLayout::Tiled { tl, .. } => tl,
+        UncompressedLayout::Strips { rows_per_strip } => rows_per_strip,
+    };
+    let mut band_first = 0usize;
+    while band_first < height {
+        let rows = layout.band_rows(band_first, height);
+        // checked_mul: band_first can wrap usize on wasm32 for hostile strip counts,
+        // and the band slice keeps the destination in range.
+        let base = band_first
+            .checked_mul(width)
+            .ok_or_else(|| anyhow!("uncompressed DNG: band dst overflow"))?;
+        let dst = out
+            .get_mut(base..base + rows * width)
+            .ok_or_else(|| anyhow!("uncompressed DNG: band dst OOB"))?;
+        decode_uncompressed_band(data, raw, layout, width, height, le, band_first, dst)?;
+        band_first += band_stride;
+    }
+    Ok(())
 }
 
 /// Trim a mosaic so its top-left pixel lands on the RGGB phase.
