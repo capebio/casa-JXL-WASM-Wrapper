@@ -26,4 +26,9 @@ export { PoolState, HandleState } from "./tiled-decode-pool.js";
 // decoded-geometry union keeps the `LevelSource` name (line 11 above). Task 3 consolidates the
 // two orchestration engines behind this runtime.
 export { createPyramidRuntime, } from "./runtime.js";
+// Packet 2, Task 6 (findings 2, 26): the ONE gallery-facing LOD resolver. Maps a runtime
+// LodRequest + DecodeCapabilities + the pyramid manifest to a concrete delivery kind
+// (whole-level | jxtc-ranges | progressive-prefix). Consumers route level selection through it
+// (removing the duplicated choose-level copies) and deliver by HTTP Range where supported.
+export { resolveLod, toHttpRange, LodResolveError, } from "./lod-resolver.js";
 //# sourceMappingURL=index.js.map

@@ -36,7 +36,13 @@ import {
   canUseWebGL16,
 } from './webgl-pipeline.js';
 import { decodePyramidRegion } from '../pyramid-gallery/pyramid-decode.js';
-import { chooseLevelForTarget, shouldUpgrade, levelRank } from '../../packages/jxl-pyramid/dist/choose-level.js';
+import { shouldUpgrade, levelRank } from '../../packages/jxl-pyramid/dist/choose-level.js';
+// finding 26: ONE resolver across consumers. The lightbox no longer wraps chooseLevelForTarget
+// directly — pickLevelForTarget routes the (bit-depth-filtered) candidate set through resolveLod,
+// which owns the shared level selection. The lightbox is the range-capable consumer (zoom/ROI),
+// so a later ROI path can ask resolveLod for jxtc-ranges / progressive-prefix; this change wires
+// the resolution axis (the duplicated copy) through the single resolver.
+import { resolveLod } from '../../packages/jxl-pyramid/dist/lod-resolver.js';
 import { createLoadGuard } from './load-generation.js';
 
 /**
@@ -121,13 +127,22 @@ export function createPyramidLightbox(deps) {
     }
   }
 
-  // Internal helper: smallest level whose long edge >= target display size,
-  // restricted to the candidate set (bit-depth filtered). Wraps the shared
-  // chooseLevelForTarget (which throws on empty / takes a single target arg).
+  // Capabilities the lightbox reports to the resolver. The lightbox selects a whole level here
+  // (its LRU/decode path consumes whole-level pixels); Range-delivered ROI/prefix is a separate,
+  // future call. rangeRequests:false keeps resolveLod on the resolution axis (whole-level).
+  function lightboxCapabilities() {
+    return { workers: true, sharedMemory: false, rangeRequests: false, rgba16: is16bitMode === true };
+  }
+
+  // Internal helper: smallest level whose long edge >= target display size, restricted to the
+  // candidate set (bit-depth filtered). Routes selection through the ONE resolver (finding 26)
+  // instead of a local chooseLevelForTarget copy. dpr is folded into `target` by the callers, so
+  // the resolver runs with dpr:1 over the pre-scaled target.
   function pickLevelForTarget(cands, target) {
     if (!cands || cands.length === 0) return null;
     try {
-      return chooseLevelForTarget(cands, Math.max(1, Math.round(target)));
+      const res = resolveLod({ levels: cands }, { targetLongEdge: Math.max(1, Math.round(target)), dpr: 1 }, lightboxCapabilities());
+      return res?.level ?? cands[0] ?? null;
     } catch {
       return cands[0] || null;
     }

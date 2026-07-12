@@ -17,6 +17,9 @@ import { parsePyramidManifest } from "../../packages/jxl-pyramid/dist/manifest-v
 // through the single trusted boundary so paths are origin/root-contained (after normalization AND
 // redirects), byte-capped before + during streaming, and SHA-256-verified before cache/decode.
 import { fetchVerifiedAsset } from "./trusted-fetch.js";
+// Task 6: range-aware delivery of a resolved LOD (progressive-prefix / jxtc tile ranges) through
+// the SAME trusted boundary. These compose fetchVerifiedAsset's `range` option — no new fetch path.
+import { fetchLevelRange, fetchTileRanges } from "./range-fetch.js";
 
 /**
  * Validate a fetched manifest through the shared jxl-pyramid reader. Throws on structural violation
@@ -158,6 +161,45 @@ export function createImageStore({ cache, galleryBase, fetchImpl, subtle }) {
     }
   }
 
+  /**
+   * Range delivery of the `progressive-prefix` LOD kind: fetch `[range.start, range.end)` of a
+   * level via HTTP Range through the trusted boundary. Not cached under the whole-level key (a
+   * prefix is not the whole level); callers own the decoded result. Returns the exact window bytes.
+   * @param {string} contenthash
+   * @param {{ start: number, end: number }} range   Half-open `[start, end)` (resolver ByteRange).
+   * @param {{ sha256?: string; signal?: AbortSignal }} [opts]
+   * @returns {Promise<ArrayBuffer>}
+   */
+  async function getLevelRange(contenthash, range, opts = {}) {
+    return fetchLevelRange({
+      root: base,
+      relativePath: `levels/${contenthash}.jxl`,
+      range: { start: range.start, endExclusive: range.end },
+      sha256: opts.sha256,
+      signal: opts.signal,
+      fetchImpl,
+      subtle,
+    });
+  }
+
+  /**
+   * Range delivery of the `jxtc-ranges` LOD kind: one HTTP Range per overlapping tile, in order.
+   * @param {string} contenthash
+   * @param {{ start: number, end: number }[]} ranges
+   * @param {{ signal?: AbortSignal }} [opts]
+   * @returns {Promise<ArrayBuffer[]>}
+   */
+  async function getTileRanges(contenthash, ranges, opts = {}) {
+    return fetchTileRanges({
+      root: base,
+      relativePath: `levels/${contenthash}.jxl`,
+      ranges,
+      signal: opts.signal,
+      fetchImpl,
+      subtle,
+    });
+  }
+
   function clearManifest(imageId) {
     manifestCache.delete(imageId);
   }
@@ -169,6 +211,8 @@ export function createImageStore({ cache, galleryBase, fetchImpl, subtle }) {
   return {
     getManifest,
     getLevelBytes,
+    getLevelRange,
+    getTileRanges,
     clearManifest,
     clearAll,
     get base() { return base; },
