@@ -68,6 +68,10 @@ struct Region {
   uint32_t h = 0;
 };
 
+// Forward-declared: holds the persistent libjxl decoder + all resumable loop
+// state for the incremental (live) streaming path (Packet-3 Task 4 / finding 20).
+struct LiveDecodeState;
+
 struct DecoderData {
   std::vector<uint8_t> input;
   std::vector<napi_ref> events;
@@ -79,6 +83,34 @@ struct DecoderData {
   void* pinned_data = nullptr;
   size_t pinned_size = 0;
   bool multi_push = false;
+
+  // ---- Packet-3 Task 4: live/incremental streaming state ----
+  // events[] is now a live FIFO. events_head is the drain cursor for the live
+  // async iterator (events before events_head have been yielded; they stay as
+  // strong refs until dispose/finalize so the JS values remain valid, matching
+  // the previous snapshot-iterator retention). done marks that no further events
+  // will be produced (close/cancel/error reached a terminal state).
+  size_t events_head = 0;
+  bool done = false;
+  bool errored = false;               // a terminal "error" event was queued
+  bool live = false;                  // incremental path engaged (opts allow it)
+  std::string error_code;             // terminal error code (for close() rejection)
+  std::string error_message;          // terminal error message (for close() rejection)
+
+  // Single pending waiter for the live iterator: when a consumer calls next()
+  // and no event is available yet, we park a napi_deferred here and resolve it
+  // when the next event is queued or the stream ends. Only one in-flight next()
+  // is expected per the AsyncIterable contract (sequential await).
+  napi_deferred pending_next = nullptr;
+
+  // Bounded-queue backpressure: when the number of *undrained* queued events
+  // (events.size() - events_head) reaches this high-water mark, push() parks a
+  // napi_deferred here instead of resolving immediately; it resolves once the
+  // consumer drains below the mark. Bounds retained memory to
+  // (HWM events) + (active decode buffers).
+  napi_deferred backpressure = nullptr;
+
+  LiveDecodeState* live_state = nullptr;
 };
 
 static void release_pinned_decoder(napi_env env, DecoderData* data) {
@@ -88,6 +120,27 @@ static void release_pinned_decoder(napi_env env, DecoderData* data) {
     data->pinned_data = nullptr;
     data->pinned_size = 0;
   }
+}
+
+#if CASABIO_HAVE_LIBJXL
+// Defined later (uses libjxl types). Forward-declared here so the always-present
+// ReleaseLiveState wrapper below can tear the persistent decoder down from the
+// non-libjxl-gated decoder methods without duplicating #if guards at each site.
+static void DestroyLiveState(napi_env env, LiveDecodeState* st);
+#endif
+
+// Always-available: release the persistent live decoder state (no-op when
+// libjxl is absent, in which case live_state is never populated).
+static void ReleaseLiveState(napi_env env, DecoderData* data) {
+#if CASABIO_HAVE_LIBJXL
+  if (data->live_state != nullptr) {
+    DestroyLiveState(env, data->live_state);
+    data->live_state = nullptr;
+  }
+#else
+  (void)env;
+  (void)data;
+#endif
 }
 
 struct ExtraChannelDesc {
@@ -568,6 +621,123 @@ static napi_value MakeIterator(napi_env env, const std::vector<napi_ref>& refs) 
   return iterator;
 }
 
+// ---- Packet-3 Task 4: live (incremental) decoder event iterator ----
+//
+// Unlike MakeIterator (a snapshot over a fully-materialized vector), the live
+// iterator resolves against DecoderData::events as it grows. next() either:
+//   (a) yields the event at events_head (advancing the cursor), or
+//   (b) if done and drained, resolves {done:true}, or
+//   (c) parks a napi_deferred in data->pending_next, resolved later by push()/
+//       close()/cancel() when a new event arrives or the stream ends.
+//
+// Draining an event also relieves backpressure: if a push() promise is parked
+// in data->backpressure and the undrained depth has fallen below the HWM, we
+// resolve it here so the producer may accept more input.
+
+static const size_t kLiveEventHwm = 8;  // bounded queue high-water mark
+
+// Resolve the parked next() waiter (if any) with the given iterator result.
+static void ResolvePendingNext(napi_env env, DecoderData* data, napi_value result) {
+  if (data->pending_next == nullptr) return;
+  napi_deferred d = data->pending_next;
+  data->pending_next = nullptr;
+  napi_resolve_deferred(env, d, result);
+}
+
+// Relieve backpressure if a producer push() promise is parked and depth dropped.
+static void MaybeRelieveBackpressure(napi_env env, DecoderData* data) {
+  if (data->backpressure == nullptr) return;
+  size_t undrained = data->events.size() - data->events_head;
+  if (undrained < kLiveEventHwm || data->done) {
+    napi_deferred d = data->backpressure;
+    data->backpressure = nullptr;
+    napi_value undef;
+    napi_get_undefined(env, &undef);
+    napi_resolve_deferred(env, d, undef);
+  }
+}
+
+// Queue an event ref and wake a parked next() waiter if present.
+// The ref stays owned by DecoderData::events (released on dispose/finalize).
+static void QueueLiveEvent(napi_env env, DecoderData* data, napi_value event) {
+  napi_ref ref = RefValue(env, event);
+  data->events.push_back(ref);
+  if (data->pending_next != nullptr) {
+    // Yield this event immediately to the waiter and advance the cursor.
+    napi_value result = MakeValueResult(env, event);
+    // Advance head past the just-queued event since we are handing it out now.
+    // (Only valid because a parked waiter means the cursor was at the tail.)
+    data->events_head = data->events.size();
+    ResolvePendingNext(env, data, result);
+  }
+}
+
+// Mark the stream terminated and wake any parked waiter with {done:true}.
+static void FinishLiveStream(napi_env env, DecoderData* data) {
+  data->done = true;
+  if (data->pending_next != nullptr && data->events_head >= data->events.size()) {
+    ResolvePendingNext(env, data, MakeDoneResult(env));
+  }
+  // Unblock any parked producer as well (nothing more will be consumed).
+  MaybeRelieveBackpressure(env, data);
+}
+
+static napi_value LiveIteratorNext(napi_env env, napi_callback_info info) {
+  void* raw = nullptr;
+  napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &raw);
+  auto* data = static_cast<DecoderData*>(raw);
+  if (data == nullptr) return ResolveImmediate(env, MakeDoneResult(env));
+
+  // An event is already available at the cursor -> yield synchronously.
+  if (data->events_head < data->events.size()) {
+    napi_value value;
+    napi_get_reference_value(env, data->events[data->events_head], &value);
+    data->events_head++;
+    MaybeRelieveBackpressure(env, data);
+    return ResolveImmediate(env, MakeValueResult(env, value));
+  }
+
+  // Drained. If the stream is finished, we are done.
+  if (data->done) {
+    return ResolveImmediate(env, MakeDoneResult(env));
+  }
+
+  // Otherwise park a single waiter; push()/close() will resolve it.
+  napi_deferred deferred;
+  napi_value promise;
+  napi_create_promise(env, &deferred, &promise);
+  // If a previous waiter somehow lingers (should not per sequential contract),
+  // resolve it as done to avoid a leak, then install the new one.
+  if (data->pending_next != nullptr) {
+    napi_deferred stale = data->pending_next;
+    data->pending_next = nullptr;
+    napi_resolve_deferred(env, stale, MakeDoneResult(env));
+  }
+  data->pending_next = deferred;
+  return promise;
+}
+
+static napi_value MakeLiveIterator(napi_env env, DecoderData* data) {
+  napi_value iterator;
+  napi_create_object(env, &iterator);
+
+  napi_value next;
+  napi_create_function(env, "next", NAPI_AUTO_LENGTH, LiveIteratorNext, data, &next);
+  napi_set_named_property(env, iterator, "next", next);
+
+  napi_value global;
+  napi_get_global(env, &global);
+  napi_value symbol_ctor;
+  napi_get_named_property(env, global, "Symbol", &symbol_ctor);
+  napi_value async_iterator_symbol;
+  napi_get_named_property(env, symbol_ctor, "asyncIterator", &async_iterator_symbol);
+  napi_value self;
+  napi_create_function(env, "[Symbol.asyncIterator]", NAPI_AUTO_LENGTH, IteratorSelf, nullptr, &self);
+  napi_set_property(env, iterator, async_iterator_symbol, self);
+
+  return iterator;
+}
+
 #if CASABIO_HAVE_LIBJXL
 struct EffectiveRegion {
   uint32_t rx = 0;
@@ -913,14 +1083,501 @@ static void transform_fused_into(const uint8_t* src, ImageInfo& info, const Effe
   info.height = dh;
 }
 
+// ============================================================================
+// Packet-3 Task 4 (finding 20): live / incremental decode
+// ============================================================================
+//
+// Previously DecodeAll ran the whole decode at close() and materialized every
+// event before events() could yield anything. LiveDecodeState makes the decoder
+// resumable: a persistent JxlDecoder consumes the accumulated input as far as it
+// can on each push(), queueing events (header first, then progression/frames)
+// into DecoderData::events via QueueLiveEvent — so a consumer draining events()
+// sees the header/progress events BEFORE close(). The final full image still
+// arrives once all input has been pushed (libjxl cannot produce it earlier),
+// but it is emitted as soon as the last needed bytes arrive, which for a
+// single-shot close() is the same moment as before.
+//
+// Output equality: the per-pixel transform (region/downsample/EC/animation) is
+// the SAME code path as DecodeAll — factored into shared helpers used by both.
+// The batch DecodeAll is retained as the reference/fallback (opts that the live
+// path does not yet specialize fall back to it at close()).
+//
+// N-20 gate: extra-channel plane extraction stays behind opt-in so the common
+// RGBA path pays zero.
+// GAP NOTATION: extraPlanes attaches only to the non-animation final event; for
+// animation the EC buffers are overwritten per frame and are not emitted.
+
+struct LiveDecodeState {
+  JxlDecoder* dec = nullptr;
+#if CASABIO_HAVE_JXL_THREADS
+  void* runner = nullptr;
+#endif
+
+  // Decode options captured at first push.
+  PixelFormatKind format = PixelFormatKind::Rgba8;
+  ProgressionTarget target = ProgressionTarget::Final;
+  bool emit_every_pass = false;
+  bool decode_extra_channels = false;
+  std::string progressive_detail;
+  Region region{};
+  bool has_region = false;
+  uint32_t downsample = 1;
+  bool preserve_icc = false;
+  uint64_t max_pixels = 0;
+
+  // Accumulated, not-yet-consumed input. libjxl retains a pointer into this
+  // buffer between ProcessInput calls, so we must keep the *unconsumed* suffix
+  // stable. We compact consumed bytes off the front between pushes.
+  std::vector<uint8_t> pending;
+  bool input_set = false;   // JxlDecoderSetInput currently active on `pending`
+  bool input_closed = false;
+
+  // Resumable loop state (hoisted from DecodeAll locals).
+  JxlBasicInfo basic{};
+  ImageInfo info{};
+  bool info_known = false;
+  bool header_emitted = false;
+  std::vector<uint8_t> icc_bytes;
+
+  // The main image-out ArrayBuffer is allocated at NEED_IMAGE_OUT_BUFFER and may
+  // be read back at FULL_IMAGE in a *later* push()/close() native call. napi_value
+  // handles are only valid within the native call that created them, so we hold a
+  // persistent napi_ref across calls and re-deref to a napi_value on use.
+  // main_data (the raw backing pointer) stays stable for the AB's lifetime and is
+  // safe to cache — libjxl writes into it directly.
+  napi_ref main_ab_ref = nullptr;
+  void* main_data = nullptr;
+  size_t main_size = 0;
+  bool have_main_ab = false;
+
+  std::vector<std::vector<uint8_t>> ec_planes;
+
+  uint32_t current_frame_index = 0;
+  uint32_t current_frame_duration = 0;
+  std::string current_frame_name;
+
+  // Animation: we cannot know which FULL_IMAGE is the terminal frame until
+  // SUCCESS, and the batch contract labels only the LAST frame "final" (with
+  // animTicksPerSecond) while earlier frames are "progress". So we hold the most
+  // recent animation frame back by one: when a new frame arrives, the previously
+  // held one is flushed as "progress"; at SUCCESS the held frame becomes "final".
+  bool has_held_frame = false;
+  napi_ref held_frame_ref = nullptr;   // pins the held frame AB across calls
+  ImageInfo held_info{};
+  uint32_t held_index = 0;
+  uint32_t held_duration = 0;
+  std::string held_name;
+
+  bool final_emitted = false;
+};
+
+static void DestroyLiveState(napi_env env, LiveDecodeState* st) {
+  if (st == nullptr) return;
+  if (st->held_frame_ref != nullptr) {
+    napi_delete_reference(env, st->held_frame_ref);
+    st->held_frame_ref = nullptr;
+  }
+  if (st->main_ab_ref != nullptr) {
+    napi_delete_reference(env, st->main_ab_ref);
+    st->main_ab_ref = nullptr;
+  }
+  if (st->dec != nullptr) {
+    JxlDecoderDestroy(st->dec);
+    st->dec = nullptr;
+  }
+#if CASABIO_HAVE_JXL_THREADS
+  if (st->runner != nullptr) {
+    JxlThreadParallelRunnerDestroy(st->runner);
+    st->runner = nullptr;
+  }
+#endif
+  delete st;
+}
+
+enum class StepResult { NeedMore, Done, Error };
+
+// Emit the header event into the live queue exactly once.
+static void LiveEmitHeader(napi_env env, DecoderData* data, LiveDecodeState* st) {
+  if (st->header_emitted) return;
+  napi_value header = MakeHeaderEvent(env, st->info);
+  if (!st->icc_bytes.empty()) {
+    napi_value icc_ab = MakeArrayBuffer(env, st->icc_bytes.data(), st->icc_bytes.size());
+    napi_set_named_property(env, header, "iccProfile", icc_ab);
+  }
+  QueueLiveEvent(env, data, header);
+  st->header_emitted = true;
+}
+
+static void LiveEmitError(napi_env env, DecoderData* data, const char* code, const char* message) {
+  // Only the FIRST terminal error is recorded/queued; later ones are ignored so
+  // close() rejects with the true root cause (e.g. "image exceeds maxPixels"
+  // rather than a downstream generic failure).
+  if (data->errored) return;
+  napi_value ev;
+  napi_create_object(env, &ev);
+  napi_set_named_property(env, ev, "type", MakeString(env, "error"));
+  napi_set_named_property(env, ev, "code", MakeString(env, code));
+  napi_set_named_property(env, ev, "message", MakeString(env, message));
+  QueueLiveEvent(env, data, ev);
+  data->errored = true;
+  data->error_code = code;
+  data->error_message = message;
+}
+
+// Build a rejected promise carrying the recorded terminal error's message + code,
+// so close()'s rejection matches the batch behaviour (e.g. the exact
+// "image exceeds maxPixels" / "libjxl decode truncated ..." text).
+static napi_value RejectWithLiveError(napi_env env, DecoderData* data) {
+  napi_deferred deferred;
+  napi_value promise;
+  napi_create_promise(env, &deferred, &promise);
+  const char* msg = data->error_message.empty() ? "libjxl decode failed" : data->error_message.c_str();
+  napi_value msgv;
+  napi_create_string_utf8(env, msg, NAPI_AUTO_LENGTH, &msgv);
+  napi_value err;
+  napi_create_error(env, nullptr, msgv, &err);
+  if (!data->error_code.empty()) {
+    napi_set_named_property(env, err, "code", MakeString(env, data->error_code.c_str()));
+  }
+  napi_reject_deferred(env, deferred, err);
+  return promise;
+}
+
+// Attach region echo (NV-21) to an image event.
+static void AttachRegionEcho(napi_env env, napi_value ev, const Region* region, const ImageInfo& info) {
+  napi_value rgn;
+  napi_create_object(env, &rgn);
+  napi_set_named_property(env, rgn, "x", MakeUint32(env, region->x));
+  napi_set_named_property(env, rgn, "y", MakeUint32(env, region->y));
+  napi_set_named_property(env, rgn, "w", MakeUint32(env, info.width));
+  napi_set_named_property(env, rgn, "h", MakeUint32(env, info.height));
+  napi_set_named_property(env, ev, "region", rgn);
+}
+
+// Flush the held-back animation frame (if any) as a "progress" event. Used when
+// a new frame arrives (the previous one is now known not to be terminal).
+static void FlushHeldFrameAsProgress(napi_env env, DecoderData* data, LiveDecodeState* st) {
+  if (!st->has_held_frame) return;
+  napi_value pixels_ab;
+  napi_get_reference_value(env, st->held_frame_ref, &pixels_ab);
+  napi_value ev = MakeImageEventWithAB(env, "progress", "progress", st->held_info, st->format, pixels_ab);
+  napi_set_named_property(env, ev, "frameIndex", MakeUint32(env, st->held_index));
+  napi_set_named_property(env, ev, "frameDuration", MakeUint32(env, st->held_duration));
+  if (!st->held_name.empty()) {
+    napi_set_named_property(env, ev, "frameName", MakeString(env, st->held_name.c_str()));
+  }
+  if (st->has_region) AttachRegionEcho(env, ev, st->has_region ? &st->region : nullptr, st->held_info);
+  QueueLiveEvent(env, data, ev);
+  napi_delete_reference(env, st->held_frame_ref);
+  st->held_frame_ref = nullptr;
+  st->has_held_frame = false;
+}
+
+// Promote the held-back animation frame to the terminal "final" event.
+static void EmitHeldFrameAsFinal(napi_env env, DecoderData* data, LiveDecodeState* st) {
+  if (!st->has_held_frame) return;
+  napi_value pixels_ab;
+  napi_get_reference_value(env, st->held_frame_ref, &pixels_ab);
+  napi_value ev = MakeImageEventWithAB(env, "final", "final", st->held_info, st->format, pixels_ab);
+  napi_set_named_property(env, ev, "frameIndex", MakeUint32(env, st->held_index));
+  napi_set_named_property(env, ev, "frameDuration", MakeUint32(env, st->held_duration));
+  if (!st->held_name.empty()) {
+    napi_set_named_property(env, ev, "frameName", MakeString(env, st->held_name.c_str()));
+  }
+  double tps_den = st->basic.animation.tps_denominator > 0
+      ? static_cast<double>(st->basic.animation.tps_denominator) : 1.0;
+  double tps = static_cast<double>(st->basic.animation.tps_numerator) / tps_den;
+  if (tps <= 0.0) tps = 1.0;
+  napi_value tps_val;
+  napi_create_double(env, tps, &tps_val);
+  napi_set_named_property(env, ev, "animTicksPerSecond", tps_val);
+  if (st->has_region) AttachRegionEcho(env, ev, st->has_region ? &st->region : nullptr, st->held_info);
+  QueueLiveEvent(env, data, ev);
+  napi_delete_reference(env, st->held_frame_ref);
+  st->held_frame_ref = nullptr;
+  st->has_held_frame = false;
+  st->final_emitted = true;
+}
+
+// Feed the currently-accumulated `pending` bytes to libjxl and process as far
+// as possible. Queues header/progress/frame/final events as they are produced.
+// Returns NeedMore (waiting for more input), Done (final produced / SUCCESS), or
+// Error (a terminal error was queued). Never blocks.
+static StepResult ProcessDecodeAvailable(napi_env env, DecoderData* data, LiveDecodeState* st) {
+  JxlDecoder* dec = st->dec;
+  JxlPixelFormat pf = {4, DataTypeForFormat(st->format), JXL_NATIVE_ENDIAN, 0};
+  const Region* region = st->has_region ? &st->region : nullptr;
+  uint32_t ds = (st->downsample >= 1 && st->downsample <= 8) ? st->downsample : 1u;
+  bool needs_xform = st->has_region || (ds > 1u);
+
+  // (Re)establish libjxl's input pointer against the current pending buffer.
+  if (!st->input_set) {
+    JxlDecoderSetInput(dec, st->pending.data(), st->pending.size());
+    st->input_set = true;
+    if (st->input_closed) {
+      JxlDecoderCloseInput(dec);
+    }
+  }
+
+  for (;;) {
+    JxlDecoderStatus status = JxlDecoderProcessInput(dec);
+
+    if (status == JXL_DEC_ERROR) {
+      LiveEmitError(env, data, "InvalidJXL", "libjxl decode error (DEC_ERROR)");
+      return StepResult::Error;
+    }
+
+    if (status == JXL_DEC_NEED_MORE_INPUT) {
+      // Release consumed bytes and compact the unconsumed suffix to the front so
+      // the next push appends contiguously and libjxl's retained pointer stays valid.
+      size_t remaining = JxlDecoderReleaseInput(dec);
+      st->input_set = false;
+      if (remaining < st->pending.size()) {
+        st->pending.erase(st->pending.begin(),
+                          st->pending.begin() + (st->pending.size() - remaining));
+      }
+      if (st->input_closed) {
+        // Input already closed but libjxl wants more -> truncated stream.
+        LiveEmitError(env, data, "TruncatedInput",
+                      "libjxl decode truncated (NEED_MORE_INPUT after close)");
+        return StepResult::Error;
+      }
+      return StepResult::NeedMore;
+    }
+
+    if (status == JXL_DEC_SUCCESS) {
+      // Promote the last held animation frame to the terminal "final".
+      if (st->basic.have_animation) {
+        EmitHeldFrameAsFinal(env, data, st);
+      }
+      return StepResult::Done;
+    }
+
+    if (status == JXL_DEC_BASIC_INFO) {
+      if (JxlDecoderGetBasicInfo(dec, &st->basic) != JXL_DEC_SUCCESS) {
+        LiveEmitError(env, data, "DecodeFailed", "JxlDecoderGetBasicInfo failed");
+        return StepResult::Error;
+      }
+      uint64_t px = static_cast<uint64_t>(st->basic.xsize) * st->basic.ysize;
+      if (px > st->max_pixels) {
+        LiveEmitError(env, data, "ImageTooLarge", "image exceeds maxPixels");
+        return StepResult::Error;
+      }
+      st->info.width = st->basic.xsize;
+      st->info.height = st->basic.ysize;
+      st->info.bits_per_sample = BitsForFormat(st->format);
+      st->info.has_alpha = st->basic.alpha_bits > 0;
+      st->info.has_animation = st->basic.have_animation;
+      st->info.jpeg_reconstruction_available = false;
+
+      uint32_t n_ec = st->basic.num_extra_channels;
+      for (uint32_t i = 0; i < n_ec; ++i) {
+        JxlExtraChannelInfo ei{};
+        if (JxlDecoderGetExtraChannelInfo(dec, i, &ei) == JXL_DEC_SUCCESS) {
+          ImageInfo::DecodedExtra d{};
+          d.type = JxlExtraTypeName(ei.type);
+          d.bits_per_sample = ei.bits_per_sample;
+          d.dim_shift = ei.dim_shift;
+          if (ei.type == JXL_CHANNEL_SPOT_COLOR) {
+            d.has_spot = true;
+            d.spot_r = ei.spot_color[0];
+            d.spot_g = ei.spot_color[1];
+            d.spot_b = ei.spot_color[2];
+            d.spot_solidity = ei.spot_color[3];
+          }
+          if (ei.name_length > 0) {
+            std::vector<char> nm(ei.name_length + 1, '\0');
+            if (JxlDecoderGetExtraChannelName(dec, i, nm.data(), nm.size()) == JXL_DEC_SUCCESS) {
+              d.name.assign(nm.data(), ei.name_length);
+            }
+          }
+          st->info.extra_channels.push_back(d);
+        }
+      }
+      if (st->decode_extra_channels && n_ec > 0) {
+        st->ec_planes.assign(n_ec, std::vector<uint8_t>());
+      }
+      st->info_known = true;
+      if (!st->preserve_icc) {
+        LiveEmitHeader(env, data, st);
+        if (st->target == ProgressionTarget::Header) return StepResult::Done;
+      }
+      continue;
+    }
+
+    if (status == JXL_DEC_COLOR_ENCODING) {
+      size_t icc_size = 0;
+      if (JxlDecoderGetICCProfileSize(dec, JXL_COLOR_PROFILE_TARGET_DATA, &icc_size) == JXL_DEC_SUCCESS && icc_size > 0) {
+        st->icc_bytes.resize(icc_size);
+        if (JxlDecoderGetColorAsICCProfile(dec, JXL_COLOR_PROFILE_TARGET_DATA, st->icc_bytes.data(), icc_size) != JXL_DEC_SUCCESS) {
+          st->icc_bytes.clear();
+        }
+      }
+      LiveEmitHeader(env, data, st);
+      if (st->target == ProgressionTarget::Header) return StepResult::Done;
+      continue;
+    }
+
+    if (status == JXL_DEC_FRAME) {
+      if (st->basic.have_animation) {
+        JxlFrameHeader fh;
+        if (JxlDecoderGetFrameHeader(dec, &fh) == JXL_DEC_SUCCESS) {
+          st->current_frame_duration = fh.duration;
+          st->current_frame_name.clear();
+          if (fh.name_length > 0) {
+            std::vector<char> fnm(fh.name_length + 1, '\0');
+            if (JxlDecoderGetFrameName(dec, fnm.data(), fnm.size()) == JXL_DEC_SUCCESS) {
+              st->current_frame_name.assign(fnm.data(), fh.name_length);
+            }
+          }
+        }
+      }
+      continue;
+    }
+
+    if (status == JXL_DEC_NEED_IMAGE_OUT_BUFFER) {
+      LiveEmitHeader(env, data, st);
+      size_t buffer_size = 0;
+      if (JxlDecoderImageOutBufferSize(dec, &pf, &buffer_size) != JXL_DEC_SUCCESS) {
+        LiveEmitError(env, data, "DecodeFailed", "JxlDecoderImageOutBufferSize failed");
+        return StepResult::Error;
+      }
+      // Allocate the image-out AB and pin it with a strong ref so it survives to
+      // the FULL_IMAGE handler, which may run in a later native call. For
+      // animation a fresh AB is allocated per frame (NEED_IMAGE_OUT_BUFFER fires
+      // per frame); release the previous frame's pin first.
+      if (st->main_ab_ref != nullptr) {
+        napi_delete_reference(env, st->main_ab_ref);
+        st->main_ab_ref = nullptr;
+      }
+      napi_value main_ab_local = nullptr;
+      napi_create_arraybuffer(env, buffer_size, &st->main_data, &main_ab_local);
+      napi_create_reference(env, main_ab_local, 1, &st->main_ab_ref);
+      st->have_main_ab = true;
+      st->main_size = buffer_size;
+      if (JxlDecoderSetImageOutBuffer(dec, &pf, st->main_data, st->main_size) != JXL_DEC_SUCCESS) {
+        LiveEmitError(env, data, "DecodeFailed", "JxlDecoderSetImageOutBuffer failed");
+        return StepResult::Error;
+      }
+      if (st->decode_extra_channels && !st->ec_planes.empty()) {
+        for (uint32_t i = 0; i < st->ec_planes.size(); ++i) {
+          uint32_t bps = (i < st->info.extra_channels.size() && st->info.extra_channels[i].bits_per_sample)
+                             ? st->info.extra_channels[i].bits_per_sample : 8u;
+          JxlDataType dt = (bps == 16) ? JXL_TYPE_UINT16 : (bps > 16 ? JXL_TYPE_FLOAT : JXL_TYPE_UINT8);
+          JxlPixelFormat pf_ec = {1, dt, JXL_NATIVE_ENDIAN, 0};
+          size_t ec_size = 0;
+          if (JxlDecoderExtraChannelBufferSize(dec, &pf_ec, &ec_size, i) == JXL_DEC_SUCCESS && ec_size > 0) {
+            st->ec_planes[i].resize(ec_size);
+            JxlDecoderSetExtraChannelBuffer(dec, &pf_ec, st->ec_planes[i].data(), ec_size, i);
+          }
+        }
+      }
+      continue;
+    }
+
+    if (status == JXL_DEC_FRAME_PROGRESSION && st->info_known && st->have_main_ab) {
+      LiveEmitHeader(env, data, st);
+      const char* prog_stage = (st->target == ProgressionTarget::Dc) ? "dc" : "pass";
+      napi_value prog_ev_ab = nullptr;
+      ImageInfo ev_info = st->info;
+      if (needs_xform) {
+        void* snap = nullptr;
+        napi_value snap_ab;
+        napi_create_arraybuffer(env, st->main_size, &snap, &snap_ab);
+        bool flushed = JxlDecoderSetImageOutBuffer(dec, &pf, snap, st->main_size) == JXL_DEC_SUCCESS &&
+                       JxlDecoderFlushImage(dec) == JXL_DEC_SUCCESS;
+        JxlDecoderSetImageOutBuffer(dec, &pf, st->main_data, st->main_size);
+        if (flushed) {
+          uint32_t dw = 0, dh = 0;
+          EffectiveRegion eff;
+          if (fused_dims(ev_info, region, ds, &dw, &dh, &eff)) {
+            void* outd = nullptr;
+            napi_value out_ab;
+            napi_create_arraybuffer(env, static_cast<size_t>(dw) * dh * 4u * BytesPerChannel(st->format), &outd, &out_ab);
+            if (outd) {
+              transform_fused_into(static_cast<const uint8_t*>(snap), ev_info, eff, ds, st->format, static_cast<uint8_t*>(outd));
+            }
+            prog_ev_ab = out_ab;
+          }
+        }
+      } else {
+        void* snap = nullptr;
+        napi_value snap_ab;
+        napi_create_arraybuffer(env, st->main_size, &snap, &snap_ab);
+        bool flushed = JxlDecoderSetImageOutBuffer(dec, &pf, snap, st->main_size) == JXL_DEC_SUCCESS &&
+                       JxlDecoderFlushImage(dec) == JXL_DEC_SUCCESS;
+        JxlDecoderSetImageOutBuffer(dec, &pf, st->main_data, st->main_size);
+        if (flushed) prog_ev_ab = snap_ab;
+      }
+      if (prog_ev_ab != nullptr) {
+        napi_value progress = MakeImageEventWithAB(env, "progress", prog_stage, ev_info, st->format, prog_ev_ab);
+        if (st->has_region) AttachRegionEcho(env, progress, region, ev_info);
+        if (st->basic.have_animation) {
+          napi_set_named_property(env, progress, "frameIndex", MakeUint32(env, st->current_frame_index));
+        }
+        QueueLiveEvent(env, data, progress);
+      }
+      if (!st->emit_every_pass && st->target != ProgressionTarget::Final) {
+        return StepResult::Done;
+      }
+      continue;
+    }
+
+    if (status == JXL_DEC_FULL_IMAGE) {
+      ImageInfo ev_info = st->info;
+      napi_value pixels_ab = nullptr;
+      napi_get_reference_value(env, st->main_ab_ref, &pixels_ab);
+      if (needs_xform) {
+        uint32_t dw = 0, dh = 0;
+        EffectiveRegion eff;
+        if (fused_dims(ev_info, region, ds, &dw, &dh, &eff)) {
+          void* outd = nullptr;
+          napi_value out_ab;
+          napi_create_arraybuffer(env, static_cast<size_t>(dw) * dh * 4u * BytesPerChannel(st->format), &outd, &out_ab);
+          if (outd) {
+            transform_fused_into(static_cast<const uint8_t*>(st->main_data), ev_info, eff, ds, st->format, static_cast<uint8_t*>(outd));
+          }
+          pixels_ab = out_ab;
+        }
+      }
+
+      if (st->basic.have_animation) {
+        // Hold this frame back by one. Any previously held frame is now known to
+        // be non-terminal -> flush it as "progress". The held frame becomes the
+        // terminal "final" at SUCCESS (matching the batch labelling exactly).
+        FlushHeldFrameAsProgress(env, data, st);
+        napi_create_reference(env, pixels_ab, 1, &st->held_frame_ref);
+        st->held_info = ev_info;
+        st->held_index = st->current_frame_index;
+        st->held_duration = st->current_frame_duration;
+        st->held_name = st->current_frame_name;
+        st->has_held_frame = true;
+        st->current_frame_index++;
+        continue;
+      }
+
+      // Still image: this FULL_IMAGE is the final.
+      napi_value final = MakeImageEventWithAB(env, "final", "final", ev_info, st->format, pixels_ab);
+      if (st->has_region) AttachRegionEcho(env, final, region, ev_info);
+      if (st->decode_extra_channels && !st->ec_planes.empty()) {
+        napi_value arr;
+        napi_create_array_with_length(env, st->ec_planes.size(), &arr);
+        for (size_t i = 0; i < st->ec_planes.size(); ++i) {
+          napi_value ab = MakeArrayBuffer(env, st->ec_planes[i].data(), st->ec_planes[i].size());
+          napi_set_element(env, arr, static_cast<uint32_t>(i), ab);
+        }
+        napi_set_named_property(env, final, "extraPlanes", arr);
+      }
+      QueueLiveEvent(env, data, final);
+      st->final_emitted = true;
+      continue;
+    }
+  }
+}
+
 // N-20: gate extra channel plane extraction behind opt-in so common RGBA path pays zero.
-// N-15 design note (batch mode constraint): DecodeAll materializes *all* requested events (header + 0..N progress + final)
-// with their pixel ArrayBuffers into DecoderData::events before returning. Each strong napi_ref keeps the AB alive
-// until DecoderDispose (or GC finalize). With emitEveryPass + progressiveDetail:"passes" this is N*frame_bytes peak
-// (intentional for the iterator snapshot model; streaming/live iterator with incremental ProcessInput + release between
-// yields is the long-term fix but explicitly out of scope per Agent 2 constraints — do not build a push()-time decode loop here).
-// Future agents: batching is a known deliberate tradeoff for simple napi iterator surface + transferList compatibility.
-// GAP NOTATION: extraPlanes only attaches to the non-animation final event; for animation the EC buffers are overwritten per frame and never emitted. Implementing per-frame planes is out of scope.
+// Batch reference path (retained). Used as fallback and as the output-equality
+// oracle for the live path.
 static bool DecodeAll(napi_env env, DecoderData* data, PixelFormatKind format, ProgressionTarget target, bool emit_every_pass, bool decode_extra_channels, const std::string& progressive_detail, const Region* region, uint32_t downsample, bool preserve_icc, uint64_t max_pixels) {
   JxlDecoder* dec = JxlDecoderCreate(nullptr);
   if (dec == nullptr) return false;
@@ -1574,96 +2231,20 @@ static bool EncodeAll(napi_env env, EncoderData* data, std::vector<uint8_t>* out
 }
 #endif
 
-static napi_value DecoderPush(napi_env env, napi_callback_info info) {
-  size_t argc = 1;
-  napi_value args[1];
-  void* raw = nullptr;
-  napi_get_cb_info(env, info, &argc, args, nullptr, &raw);
-  auto* data = static_cast<DecoderData*>(raw);
-  if (data == nullptr || argc < 1) return Throw(env, "decoder.push requires bytes");
-  if (data->closed) return Throw(env, "decoder is already closed");
-  if (data->cancelled) return Throw(env, "decoder is cancelled");
-
-  // Mirror the encoder's pinned-input fast path
-  if (!data->multi_push && data->pinned_input == nullptr) {
-    void* input_buf_ptr = nullptr;
-    size_t input_buf_len = 0;
-    bool parsed = false;
-    bool is_ta = false;
-    napi_is_typedarray(env, args[0], &is_ta);
-    if (is_ta) {
-      napi_value ab;
-      size_t offset = 0;
-      size_t length = 0;
-      napi_typedarray_type type;
-      if (napi_get_typedarray_info(env, args[0], &type, &length, &input_buf_ptr, &ab, &offset) == napi_ok) {
-        size_t el_size = 1;
-        if (type == napi_int16_array || type == napi_uint16_array) el_size = 2;
-        else if (type == napi_int32_array || type == napi_uint32_array || type == napi_float32_array) el_size = 4;
-        else if (type == napi_float64_array) el_size = 8;
-        input_buf_len = length * el_size;
-        parsed = true;
-      }
-    } else {
-      if (napi_get_arraybuffer_info(env, args[0], &input_buf_ptr, &input_buf_len) == napi_ok) {
-        parsed = true;
-      }
-    }
-
-    if (parsed && input_buf_ptr != nullptr && input_buf_len > 0) {
-      napi_create_reference(env, args[0], 1, &data->pinned_input);
-      data->pinned_data = input_buf_ptr;
-      data->pinned_size = input_buf_len;
-      return Undefined(env);
-    }
-  }
-
-  // Fallback or second push:
-  data->multi_push = true;
-  if (data->pinned_input != nullptr) {
-    data->input.assign(static_cast<uint8_t*>(data->pinned_data), static_cast<uint8_t*>(data->pinned_data) + data->pinned_size);
-    napi_delete_reference(env, data->pinned_input);
-    data->pinned_input = nullptr;
-    data->pinned_data = nullptr;
-    data->pinned_size = 0;
-  }
-
-  if (!ReadBytes(env, args[0], &data->input)) return Throw(env, "decoder.push expects ArrayBuffer or Uint8Array");
-  return Undefined(env);
-}
-
-static napi_value DecoderClose(napi_env env, napi_callback_info info) {
-  void* raw = nullptr;
-  napi_value this_arg;
-  napi_get_cb_info(env, info, nullptr, nullptr, &this_arg, &raw);
-  auto* data = static_cast<DecoderData*>(raw);
-  if (data == nullptr) return Throw(env, "decoder is invalid");
-  if (data->closed) return Undefined(env);
-
-  // NV-11: Honor cancel at close
-  if (data->cancelled) {
-    std::vector<uint8_t>().swap(data->input);
-    release_pinned_decoder(env, data);
-    data->closed = true;
-    return Undefined(env);
-  }
-
-  data->closed = true;
 #if CASABIO_HAVE_LIBJXL
+// Read the decoder options object (_options on the wrapper) into a LiveDecodeState.
+static void ReadLiveDecoderOptions(napi_env env, napi_value this_arg, LiveDecodeState* st) {
   napi_value options;
   napi_get_named_property(env, this_arg, "_options", &options);
-  PixelFormatKind format = ParsePixelFormat(GetStringProp(env, options, "format", "rgba8"));
+  st->format = ParsePixelFormat(GetStringProp(env, options, "format", "rgba8"));
   std::string target_str = GetStringProp(env, options, "progressionTarget", "final");
-  bool emit_every_pass = GetBoolProp(env, options, "emitEveryPass", false);
-  bool decode_extra = GetBoolProp(env, options, "decodeExtraChannels", true);
-  std::string prog_detail = GetStringProp(env, options, "progressiveDetail", "");
-  ProgressionTarget target = ParseProgressionTarget(target_str);
-  bool preserve_icc = GetBoolProp(env, options, "preserveIcc", false);
-  uint64_t max_pixels = static_cast<uint64_t>(GetNullableNumberProp(env, options, "maxPixels", static_cast<double>(1u << 28)));
+  st->target = ParseProgressionTarget(target_str);
+  st->emit_every_pass = GetBoolProp(env, options, "emitEveryPass", false);
+  st->decode_extra_channels = GetBoolProp(env, options, "decodeExtraChannels", true);
+  st->progressive_detail = GetStringProp(env, options, "progressiveDetail", "");
+  st->preserve_icc = GetBoolProp(env, options, "preserveIcc", false);
+  st->max_pixels = static_cast<uint64_t>(GetNullableNumberProp(env, options, "maxPixels", static_cast<double>(1u << 28)));
 
-  // N-12: region/downsample (post-decode for native; libjxl direct ROI is in WASM bridge only)
-  Region reg{0, 0, 0, 0};
-  bool has_region = false;
   napi_value regv;
   if (GetProp(env, options, "region", &regv)) {
     napi_valuetype rt;
@@ -1674,28 +2255,198 @@ static napi_value DecoderClose(napi_env env, napi_callback_info info) {
       uint32_t w = GetUint32Prop(env, regv, "w", 0);
       uint32_t h = GetUint32Prop(env, regv, "h", 0);
       if (w > 0 && h > 0) {
-        reg = Region{x, y, w, h};
-        has_region = true;
+        st->region = Region{x, y, w, h};
+        st->has_region = true;
       }
     }
   }
   uint32_t downsample = GetUint32Prop(env, options, "downsample", 1);
   if (downsample != 1 && downsample != 2 && downsample != 4 && downsample != 8) downsample = 1;
+  st->downsample = downsample;
+}
 
-  // NV-6: Clear+shrink on failure path / No silent false
-  if (!DecodeAll(env, data, format, target, emit_every_pass, decode_extra, prog_detail, has_region ? &reg : nullptr, downsample, preserve_icc, max_pixels)) {
-    bool pending = false;
-    napi_is_exception_pending(env, &pending);
-    if (!pending) ThrowCode(env, "DecodeFailed", "libjxl decode failed (internal)");
+// Create the persistent decoder + parallel runner and subscribe to events.
+// Returns false (and queues an error) on failure.
+static bool EngageLiveDecoder(napi_env env, DecoderData* data, napi_value this_arg) {
+  auto* st = new LiveDecodeState();
+  ReadLiveDecoderOptions(env, this_arg, st);
+
+  st->dec = JxlDecoderCreate(nullptr);
+  if (st->dec == nullptr) {
+    DestroyLiveState(env, st);
+    LiveEmitError(env, data, "DecodeFailed", "JxlDecoderCreate failed");
+    return false;
+  }
+#if CASABIO_HAVE_JXL_THREADS
+  st->runner = JxlThreadParallelRunnerCreate(nullptr, JxlThreadParallelRunnerDefaultNumWorkerThreads());
+  if (st->runner) {
+    JxlDecoderSetParallelRunner(st->dec, JxlThreadParallelRunner, st->runner);
+  }
+#endif
+
+  int events = JXL_DEC_BASIC_INFO | JXL_DEC_FULL_IMAGE | JXL_DEC_FRAME;
+  if (st->preserve_icc) events |= JXL_DEC_COLOR_ENCODING;
+  if (st->emit_every_pass || st->target == ProgressionTarget::Dc || st->target == ProgressionTarget::Pass) {
+    events |= JXL_DEC_FRAME_PROGRESSION;
+  }
+  if (JxlDecoderSubscribeEvents(st->dec, events) != JXL_DEC_SUCCESS) {
+    DestroyLiveState(env, st);
+    LiveEmitError(env, data, "DecodeFailed", "JxlDecoderSubscribeEvents failed");
+    return false;
+  }
+  JxlProgressiveDetail jd = kDC;
+  if (st->progressive_detail == "lastPasses") jd = kLastPasses;
+  else if (st->progressive_detail == "passes") jd = kPasses;
+  else if (st->progressive_detail == "dcProgressive") jd = kDCProgressive;
+  else if (st->emit_every_pass || st->target == ProgressionTarget::Pass) jd = kLastPasses;
+  if (events & JXL_DEC_FRAME_PROGRESSION) {
+    JxlDecoderSetProgressiveDetail(st->dec, jd);
+  }
+
+  data->live_state = st;
+  data->live = true;
+  return true;
+}
+#endif  // CASABIO_HAVE_LIBJXL
+
+// push(bytes): append input, process as far as possible (emitting events), and
+// return a Promise. The Promise resolves immediately unless the bounded event
+// queue is full and no consumer is draining, in which case it parks until the
+// consumer drains (backpressure — the producer STOPS accepting more work).
+static napi_value DecoderPush(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value args[1];
+  napi_value this_arg = nullptr;
+  void* raw = nullptr;
+  napi_get_cb_info(env, info, &argc, args, &this_arg, &raw);
+  auto* data = static_cast<DecoderData*>(raw);
+  if (data == nullptr || argc < 1) return Throw(env, "decoder.push requires bytes");
+  if (data->closed) return Throw(env, "decoder is already closed");
+  if (data->cancelled) return Throw(env, "decoder is cancelled");
+
+#if CASABIO_HAVE_LIBJXL
+  if (!data->live && data->live_state == nullptr) {
+    if (!EngageLiveDecoder(env, data, this_arg)) {
+      // Error already queued + stream not yet terminal; mark done so consumers
+      // draining events() see the error then completion.
+      FinishLiveStream(env, data);
+      return ResolveImmediate(env, Undefined(env));
+    }
+  }
+  LiveDecodeState* st = data->live_state;
+
+  // Append the pushed bytes to the pending buffer. We copy here (bytes may be a
+  // transient view); the pending buffer owns the unconsumed suffix that libjxl
+  // retains between ProcessInput calls.
+  if (st->input_set) {
+    // libjxl still holds a pointer into `pending`; release it before mutating.
+    size_t remaining = JxlDecoderReleaseInput(st->dec);
+    st->input_set = false;
+    if (remaining < st->pending.size()) {
+      st->pending.erase(st->pending.begin(),
+                        st->pending.begin() + (st->pending.size() - remaining));
+    }
+  }
+  size_t before = st->pending.size();
+  if (!ReadBytes(env, args[0], &st->pending)) {
+    return Throw(env, "decoder.push expects ArrayBuffer or Uint8Array");
+  }
+  (void)before;
+
+  // Process as far as possible. This may queue header/progress/final events.
+  if (!data->done && !data->errored) {
+    StepResult r = ProcessDecodeAvailable(env, data, st);
+    if (r == StepResult::Error || r == StepResult::Done) {
+      FinishLiveStream(env, data);
+    }
+  }
+
+  // Backpressure: if the undrained queue depth is at/over the HWM and no waiter
+  // is currently draining, park the push() promise until the consumer drains.
+  size_t undrained = data->events.size() - data->events_head;
+  if (!data->done && undrained >= kLiveEventHwm) {
+    napi_deferred deferred;
+    napi_value promise;
+    napi_create_promise(env, &deferred, &promise);
+    // Only one producer promise parked at a time; resolve any stale one.
+    if (data->backpressure != nullptr) {
+      napi_deferred stale = data->backpressure;
+      data->backpressure = nullptr;
+      napi_value undef; napi_get_undefined(env, &undef);
+      napi_resolve_deferred(env, stale, undef);
+    }
+    data->backpressure = deferred;
+    return promise;
+  }
+  return ResolveImmediate(env, Undefined(env));
+#else
+  return Throw(env, "jxl-native was built without libjxl headers");
+#endif
+}
+
+static napi_value DecoderClose(napi_env env, napi_callback_info info) {
+  void* raw = nullptr;
+  napi_value this_arg;
+  napi_get_cb_info(env, info, nullptr, nullptr, &this_arg, &raw);
+  auto* data = static_cast<DecoderData*>(raw);
+  if (data == nullptr) return Throw(env, "decoder is invalid");
+  if (data->closed) return ResolveImmediate(env, Undefined(env));
+  data->closed = true;
+
+  // NV-11: Honor cancel at close.
+  if (data->cancelled) {
     std::vector<uint8_t>().swap(data->input);
     release_pinned_decoder(env, data);
-    return nullptr;
+    ReleaseLiveState(env, data);
+    FinishLiveStream(env, data);
+    return ResolveImmediate(env, Undefined(env));
   }
-  // N-14: drop input bytes promptly after successful decode.
-  std::vector<uint8_t>().swap(data->input);
+
+#if CASABIO_HAVE_LIBJXL
+  // If no bytes were ever pushed, engage now so we can surface a clean error.
+  if (!data->live && data->live_state == nullptr) {
+    if (!EngageLiveDecoder(env, data, this_arg)) {
+      FinishLiveStream(env, data);
+      release_pinned_decoder(env, data);
+      return ThrowCode(env, "DecodeFailed", "libjxl decode failed (internal)");
+    }
+  }
+  LiveDecodeState* st = data->live_state;
+
+  // Close libjxl input and process to completion.
+  if (!data->done && !data->errored) {
+    st->input_closed = true;
+    if (st->input_set) {
+      // Input pointer already active on `pending` -> close in place.
+      JxlDecoderCloseInput(st->dec);
+    }
+    // If input_set is false, ProcessDecodeAvailable re-runs SetInput and then
+    // applies CloseInput because input_closed is now true.
+    StepResult r = ProcessDecodeAvailable(env, data, st);
+    // If we still need more input after CloseInput, that is a truncated stream;
+    // ProcessDecodeAvailable already queued a TruncatedInput error in that case.
+    FinishLiveStream(env, data);
+
+    // N-14: input bytes are no longer needed once decoding is finalized.
+    std::vector<uint8_t>().swap(st->pending);
+
+    if (r == StepResult::Error || data->errored) {
+      // Surface the terminal error to the close() promise as a rejection, while
+      // the error event also remains observable via events(). Carry the true
+      // code+message (e.g. "image exceeds maxPixels", "TruncatedInput").
+      release_pinned_decoder(env, data);
+      return RejectWithLiveError(env, data);
+    }
+  } else if (data->errored) {
+    // Already errored during push; reject close() too for symmetry.
+    release_pinned_decoder(env, data);
+    return RejectWithLiveError(env, data);
+  }
+
   release_pinned_decoder(env, data);
-  return Undefined(env);
+  return ResolveImmediate(env, Undefined(env));
 #else
+  FinishLiveStream(env, data);
   return Throw(env, "jxl-native was built without libjxl headers");
 #endif
 }
@@ -1705,15 +2456,24 @@ static napi_value DecoderEvents(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &raw);
   auto* data = static_cast<DecoderData*>(raw);
   if (data == nullptr) return Throw(env, "decoder is invalid");
-  return MakeIterator(env, data->events);
+  // Live iterator drains DecoderData::events as it grows (incremental).
+  return MakeLiveIterator(env, data);
 }
 
 static napi_value DecoderCancel(napi_env env, napi_callback_info info) {
   void* raw = nullptr;
   napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &raw);
   auto* data = static_cast<DecoderData*>(raw);
-  if (data != nullptr) data->cancelled = true;
-  return Undefined(env);
+  if (data != nullptr) {
+    data->cancelled = true;
+    // Tear down the persistent decoder promptly; no further events will be
+    // produced. Already-queued events remain observable, then the iterator ends.
+    ReleaseLiveState(env, data);
+    std::vector<uint8_t>().swap(data->input);
+    release_pinned_decoder(env, data);
+    FinishLiveStream(env, data);
+  }
+  return ResolveImmediate(env, Undefined(env));
 }
 
 static napi_value DecoderDispose(napi_env env, napi_callback_info info) {
@@ -1721,12 +2481,26 @@ static napi_value DecoderDispose(napi_env env, napi_callback_info info) {
   napi_get_cb_info(env, info, nullptr, nullptr, nullptr, &raw);
   auto* data = static_cast<DecoderData*>(raw);
   if (data != nullptr) {
+    // Release every strong event ref (queued but undrained AND already drained).
     for (napi_ref ref : data->events) napi_delete_reference(env, ref);
     data->events.clear();
+    data->events_head = 0;
+    // Resolve any parked promises so awaiting JS does not hang after dispose.
+    if (data->pending_next != nullptr) {
+      napi_deferred d = data->pending_next; data->pending_next = nullptr;
+      napi_resolve_deferred(env, d, MakeDoneResult(env));
+    }
+    if (data->backpressure != nullptr) {
+      napi_deferred d = data->backpressure; data->backpressure = nullptr;
+      napi_value undef; napi_get_undefined(env, &undef);
+      napi_resolve_deferred(env, d, undef);
+    }
+    data->done = true;
+    ReleaseLiveState(env, data);
     std::vector<uint8_t>().swap(data->input); // NV-9 real release
     release_pinned_decoder(env, data);
   }
-  return Undefined(env);
+  return ResolveImmediate(env, Undefined(env));
 }
 
 static void release_pinned(napi_env env, EncoderData* data) {
@@ -1913,7 +2687,19 @@ static napi_value EncoderDispose(napi_env env, napi_callback_info info) {
 static void DecoderFinalize(napi_env env, void* raw, void*) {
   auto* data = static_cast<DecoderData*>(raw);
   if (data == nullptr) return;
+  // GC/teardown path. Release all event refs (drained + undrained), the
+  // persistent live decoder, and any pinned input. We deliberately do NOT
+  // resolve parked napi_deferred here: the object is only finalized once it is
+  // unreachable from JS, so no awaiting consumer can still be observing those
+  // promises, and resolving a deferred during env teardown is unsafe. Normal
+  // teardown goes through dispose()/close()/cancel(), which resolve them.
   for (napi_ref ref : data->events) napi_delete_reference(env, ref);
+  data->events.clear();
+  ReleaseLiveState(env, data);
+  if (data->pinned_input != nullptr) {
+    napi_delete_reference(env, data->pinned_input);
+    data->pinned_input = nullptr;
+  }
   delete data;
 }
 
