@@ -117,7 +117,19 @@ fn main() {
             (-2.0, -2.0, -2.0, false)
         };
 
-        let finding = if ext == "cr2" { "52 (+51)" } else { "50/51" };
+        // P3-T9 finding labelling by fixture name (dual-illuminant vs linear-RGB).
+        let lname = stem.to_ascii_lowercase();
+        let finding = if ext == "cr2" {
+            "52 (+51)"
+        } else if lname.contains("linear_rgb") {
+            "57 linear-RGB"
+        } else if lname.contains("dual") || lname.contains("real_pixel") {
+            "56 dual-illum"
+        } else if lname.contains("single") {
+            "56 single (zero-drift)"
+        } else {
+            "56/57"
+        };
         records.push(format!(
             "{{\"name\":{:?},\"ext\":{:?},\"finding\":{:?},\"w\":{},\"h\":{},\"meanDR\":{:.4},\"maxDR\":{:.1},\"pctChanged\":{:.4},\"dimsMatch\":{}}}",
             stem, ext, finding, aw, ah, mean_dr, max_dr, pct_changed, dims_match

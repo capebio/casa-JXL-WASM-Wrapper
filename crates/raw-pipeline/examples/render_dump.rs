@@ -86,7 +86,13 @@ fn render_dng(data: &[u8]) -> Option<(usize, usize, Vec<u8>, String)> {
         dng::Cfa::Gbrg => (1, 0),
         dng::Cfa::Bggr => (1, 1),
     };
-    let mut rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase).ok()?;
+    // Finding 57: linear/uncompressed-RGB DNGs are already demosaiced (img.raw is w*h*3
+    // interleaved RGB16) → bypass MHC. CFA DNGs demosaic as before.
+    let mut rgb16 = if img.is_linear_rgb {
+        img.raw.clone()
+    } else {
+        demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase).ok()?
+    };
     let mut params = pipeline::PipelineParams::default_olympus();
     params.black = img.black;
     params.white = img.white;
