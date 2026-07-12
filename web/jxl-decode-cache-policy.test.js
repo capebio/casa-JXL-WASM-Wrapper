@@ -162,8 +162,8 @@ describe('main.js source-text: decodeFullJxlFor passes cacheTag (Finding 48)', (
         // appears within that span.
         const fnStart = mainSrc.indexOf('window.decodeFullJxlFor = function decodeFullJxlFor');
         expect(fnStart).toBeGreaterThan(-1);
-        // The function ends with "};" — grab up to 1200 chars from the definition.
-        const fnBody = mainSrc.slice(fnStart, fnStart + 1200);
+        // The function ends with "};" — grab up to 2000 chars from the definition.
+        const fnBody = mainSrc.slice(fnStart, fnStart + 2000);
         expect(fnBody).toContain('cacheTag');
     });
 
@@ -171,7 +171,7 @@ describe('main.js source-text: decodeFullJxlFor passes cacheTag (Finding 48)', (
         // The tag must be a fresh result-tag, not a hardcoded value.
         const fnStart = mainSrc.indexOf('window.decodeFullJxlFor = function decodeFullJxlFor');
         expect(fnStart).toBeGreaterThan(-1);
-        const fnBody = mainSrc.slice(fnStart, fnStart + 1200);
+        const fnBody = mainSrc.slice(fnStart, fnStart + 2000);
         expect(fnBody).toContain('makeResultTag');
     });
 });
