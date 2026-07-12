@@ -434,57 +434,104 @@ fn canon_default_black_white(precision: u8, model: &str) -> (u16, u16) {
 /// a top-margin off-by-one; RGGB→GBRG). No-op when the derived phase already agrees
 /// or the frame is too flat to judge. Bodies whose error is instead a *column*
 /// off-by-one would need a column flip — verify per body against a reference sky.
+/// Row/column sampling stride for the green-phase probe. An ODD stride is required
+/// (an even stride would alias the 2×2 CFA grid and only ever sample one site class).
+/// `n` is the axis extent (width or height). Shared by the batch full-mosaic path and
+/// the streaming row source so both sample the identical sub-grid (finding 54).
+#[inline]
+fn green_phase_stride(n: usize) -> usize {
+    ((n / 512).max(1)) | 1
+}
+
+/// Accumulated per-site-class sums/counts for the green-phase diagonal test. Indexed
+/// by `(y & 1) * 2 + (x & 1)` where `(y, x)` are CROP-RELATIVE coordinates (the crop
+/// top-left is the CFA phase reference). Populated either from a full cropped mosaic
+/// (`accumulate_full`) or one crop-relative row at a time during row mapping
+/// (`accumulate_row`) — both yield the same sums, so the decision is bit-identical.
+#[derive(Default)]
+struct GreenPhaseStats {
+    sum: [u64; 4],
+    cnt: [u64; 4],
+}
+
+impl GreenPhaseStats {
+    /// Accumulate the sampled columns of one crop-relative row. `y` is the row's
+    /// crop-relative index; `xs` the odd column stride from `green_phase_stride(w)`.
+    /// `row` must be the row's `w` crop-relative pixels (a slice of the cropped raster).
+    #[inline]
+    fn accumulate_row(&mut self, row: &[u16], y: usize, xs: usize) {
+        let cls = (y & 1) * 2;
+        let mut x = 0;
+        while x < row.len() {
+            let i = cls + (x & 1);
+            self.sum[i] += row[x] as u64;
+            self.cnt[i] += 1;
+            x += xs;
+        }
+    }
+
+    /// Accumulate over a full cropped mosaic (batch path). Samples rows at the odd
+    /// row stride and columns at the odd column stride — identical (y, x) set to the
+    /// old inline loop.
+    fn accumulate_full(&mut self, raw: &[u16], w: usize, h: usize) {
+        let ys = green_phase_stride(h);
+        let xs = green_phase_stride(w);
+        let mut y = 0;
+        while y < h {
+            let base = y * w;
+            self.accumulate_row(&raw[base..base + w], y, xs);
+            y += ys;
+        }
+    }
+
+    /// Resolve the refined CFA phase from the accumulated stats and the derived phase.
+    /// No-op when the frame is too flat/neutral to judge or the derived phase already
+    /// has green on the correct diagonal.
+    fn decide(&self, derived: (u8, u8)) -> (u8, u8) {
+        let m = |i: usize| -> i64 {
+            if self.cnt[i] > 0 {
+                (self.sum[i] / self.cnt[i]) as i64
+            } else {
+                0
+            }
+        };
+        let (m00, m01, m10, m11) = (m(0), m(1), m(2), m(3));
+        let diff_main = (m00 - m11).abs(); // (0,0)&(1,1) equal ⇒ green on main diagonal
+        let diff_anti = (m01 - m10).abs(); // (0,1)&(1,0) equal ⇒ green on anti-diagonal
+        let level = ((m00 + m01 + m10 + m11) / 4).max(1);
+
+        // The green pair is the clearly-more-equal diagonal: its internal difference
+        // must be well below the singleton pair's AND the singleton pair must differ
+        // by a meaningful amount (else the frame is too neutral to judge — keep derived).
+        let (green_diff, singleton_diff, green_on_main) = if diff_main <= diff_anti {
+            (diff_main, diff_anti, true)
+        } else {
+            (diff_anti, diff_main, false)
+        };
+        let clear = singleton_diff > green_diff * 4 && singleton_diff * 100 > level;
+        if !clear {
+            return derived;
+        }
+
+        // Phases with green on the ANTI diagonal: (0,0) RGGB, (1,1) BGGR.
+        // Phases with green on the MAIN diagonal: (0,1) GRBG, (1,0) GBRG.
+        let derived_on_main = matches!(derived, (0, 1) | (1, 0));
+        if derived_on_main == green_on_main {
+            return derived; // already the correct diagonal (e.g. M5 RGGB)
+        }
+        // Green is on the wrong diagonal → flip the crop ROW parity (top-margin
+        // off-by-one). Render-verified: 550D (0,0)→(1,0) gives a blue sky, not orange.
+        (derived.0 ^ 1, derived.1)
+    }
+}
+
 fn refine_cfa_phase_by_green(raw: &[u16], w: usize, h: usize, derived: (u8, u8)) -> (u8, u8) {
     if w < 4 || h < 4 || raw.len() < w * h {
         return derived;
     }
-    // Mean of each of the 4 site classes over an ODD stride (an even stride would
-    // alias the 2×2 grid and only sample one class).
-    let mut sum = [0u64; 4];
-    let mut cnt = [0u64; 4];
-    let ys = ((h / 512).max(1)) | 1;
-    let xs = ((w / 512).max(1)) | 1;
-    let mut y = 0;
-    while y < h {
-        let base = y * w;
-        let mut x = 0;
-        while x < w {
-            sum[(y & 1) * 2 + (x & 1)] += raw[base + x] as u64;
-            cnt[(y & 1) * 2 + (x & 1)] += 1;
-            x += xs;
-        }
-        y += ys;
-    }
-    let m = |i: usize| -> i64 {
-        if cnt[i] > 0 { (sum[i] / cnt[i]) as i64 } else { 0 }
-    };
-    let (m00, m01, m10, m11) = (m(0), m(1), m(2), m(3));
-    let diff_main = (m00 - m11).abs(); // (0,0)&(1,1) equal ⇒ green on main diagonal
-    let diff_anti = (m01 - m10).abs(); // (0,1)&(1,0) equal ⇒ green on anti-diagonal
-    let level = ((m00 + m01 + m10 + m11) / 4).max(1);
-
-    // The green pair is the clearly-more-equal diagonal: its internal difference
-    // must be well below the singleton pair's AND the singleton pair must differ
-    // by a meaningful amount (else the frame is too neutral to judge — keep derived).
-    let (green_diff, singleton_diff, green_on_main) = if diff_main <= diff_anti {
-        (diff_main, diff_anti, true)
-    } else {
-        (diff_anti, diff_main, false)
-    };
-    let clear = singleton_diff > green_diff * 4 && singleton_diff * 100 > level;
-    if !clear {
-        return derived;
-    }
-
-    // Phases with green on the ANTI diagonal: (0,0) RGGB, (1,1) BGGR.
-    // Phases with green on the MAIN diagonal: (0,1) GRBG, (1,0) GBRG.
-    let derived_on_main = matches!(derived, (0, 1) | (1, 0));
-    if derived_on_main == green_on_main {
-        return derived; // already the correct diagonal (e.g. M5 RGGB)
-    }
-    // Green is on the wrong diagonal → flip the crop ROW parity (top-margin
-    // off-by-one). Render-verified: 550D (0,0)→(1,0) gives a blue sky, not orange.
-    (derived.0 ^ 1, derived.1)
+    let mut stats = GreenPhaseStats::default();
+    stats.accumulate_full(raw, w, h);
+    stats.decide(derived)
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,30 +1842,40 @@ pub fn cr2_row_source(data: &[u8]) -> Result<Cr2RowSource> {
     // use the same refined phase or the band-pull demosaic diverges from the batch
     // path (regression-gated by cr2_multi_slice_full_rgb_sha_parity — the raw rows
     // are bit-identical, so any RGB8 divergence is a phase/params mismatch here).
-    // Materialize the cropped mosaic exactly as `decode_impl` does, refine, drop it.
-    let cfa_phase = {
-        let cropped = if have_slices {
-            reassemble_slices_crop(
-                &raw,
-                stride,
-                sof_h,
-                cr2_slices[0] as usize,
-                cr2_slices[1] as usize,
-                cr2_slices[2] as usize,
-                left,
-                top,
-                crop_w,
-                crop_h,
-            )
-        } else {
-            let mut c = Vec::with_capacity(crop_w * crop_h);
-            for row in 0..crop_h {
-                let s = (top + row) * stride + left;
-                c.extend_from_slice(&raw[s..s + crop_w]);
+    //
+    // Finding 54: gather the green-phase statistics during the row mapping instead of
+    // materialising a whole crop_w×crop_h cropped mosaic. `refine_cfa_phase_by_green`
+    // only samples an odd-strided sub-grid, so we reconstruct just the SAMPLED crop
+    // rows (crop-relative y stepping by the odd row stride) into one reusable scratch
+    // row and accumulate — peak transient is one crop row, not a full cropped mosaic.
+    let cfa_phase = if crop_w < 4 || crop_h < 4 {
+        cfa_phase // matches refine_cfa_phase_by_green's small-frame guard
+    } else {
+        let ys = green_phase_stride(crop_h);
+        let xs = green_phase_stride(crop_w);
+        let mut stats = GreenPhaseStats::default();
+        let mut rowbuf = vec![0u16; crop_w];
+        let mut y = 0usize;
+        while y < crop_h {
+            // Reconstruct crop-relative row `y` into `rowbuf` — the same source pixels
+            // `reassemble_slices_crop` / the single-slice crop copy would place there.
+            if have_slices {
+                let sy = top + y;
+                let mut out_col = 0usize;
+                for s in &segs {
+                    let p = s.src_base + sy * s.sw + s.src_col;
+                    rowbuf[out_col..out_col + s.run].copy_from_slice(&raw[p..p + s.run]);
+                    out_col += s.run;
+                }
+                debug_assert_eq!(out_col, crop_w);
+            } else {
+                let sbase = (top + y) * stride + left;
+                rowbuf.copy_from_slice(&raw[sbase..sbase + crop_w]);
             }
-            c
-        };
-        refine_cfa_phase_by_green(&cropped, crop_w, crop_h, cfa_phase)
+            stats.accumulate_row(&rowbuf, y, xs);
+            y += ys;
+        }
+        stats.decide(cfa_phase)
     };
 
     Ok(Cr2RowSource {
