@@ -7,6 +7,9 @@ export declare function targetDimsForLongEdge(width: number, height: number, lon
 };
 /**
  * Encode RAW big levels {2048, full} as true 16-bit JXL via WASM downscale + encode.
+ * Master full always from original buffer; 2048+ sidecars downscale from it (desc).
+ * linear?: true reserves path for non-Riemannian / perceptual constancy (lens17) and photogram linear reflectance.
+ * Currently forwarded as no-op (encode path unchanged); when engine lands in Rust LookRenderer, plumb here.
  */
-export declare function encodeBigLevelsRgba16(packedRgb16: Uint8Array, masterW: number, masterH: number, plan: PyramidEncodeOptions): Promise<PyramidLevelBytes[]>;
+export declare function encodeBigLevelsRgba16(packedRgb16: Uint8Array, masterW: number, masterH: number, plan: PyramidEncodeOptions, linear?: boolean): Promise<PyramidLevelBytes[]>;
 //# sourceMappingURL=rgb16.d.ts.map

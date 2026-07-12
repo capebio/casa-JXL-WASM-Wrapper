@@ -94,7 +94,6 @@ jobs:
         with:
           path: |
             ~/.npm
-            node_modules
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
@@ -120,7 +119,6 @@ jobs:
         with:
           path: |
             ~/.npm
-            node_modules
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
@@ -153,7 +151,6 @@ jobs:
         with:
           path: |
             ~/.npm
-            node_modules
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
@@ -166,22 +163,31 @@ jobs:
   # web/ has no package.json and is not a workspace, so `npm run test` never
   # reaches it.  This job runs the node-safe subset directly.
   #
-  # Node-safe = uses node:test, no vitest, no browser/Playwright, no WASM pkg/.
+  # Node-safe = uses node:test, no bun:test, no browser/Playwright, no WASM pkg/.
   #
-  # Explicitly SKIPPED (env-gated) with reason:
-  #   • web/ai-id/decode.test.mjs       — imports pkg/raw_converter_wasm.js (WASM build needed)
-  #   • web/ai-id/export.test.mjs       — same (transitively imports decode.mjs → pkg/)
-  #   • web/ai-id/proxy-e2e.test.mjs    — same + requires real CR2 fixture on disk
-  #   • web/*.test.js (vitest)          — use `import { test, expect } from 'vitest'`;
-  #                                       not runnable with node --test
-  #   • web/casv-lightbox/*.test.js     — vitest
-  #   All vitest-based tests are skipped because vitest is a browser test runner;
-  #   they require a WASM pkg/ and browser context that is not available in CI.
+  # Classification is performed by tools/discover-node-tests.mjs (authoritative).
+  # The majority of web/*.test.js files use bun:test (not vitest); a few use
+  # node:test (e.g. casv-lightbox-core.test.js, timelapse-core.test.js).
   #
-  # Discovery: node --test with explicit glob over node:test-based files.
-  # Exclusions documented above are enforced by naming the safe glob explicitly.
+  # Explicitly SKIPPED with recorded reason in discover-node-tests.mjs:
+  #   • web/*.test.js (bun:test)        — majority use `import { test } from 'bun:test'`;
+  #                                       not runnable under node --test
+  #   • web/format-detect.test.js,      — use vitest; require browser/vitest runner
+  #     web/libraw-*.test.js,
+  #     web/raw-extensions.test.js
+  #   • web/multi-format-roundtrip.test.mjs — imports playwright; requires real browser
+  #   • web/ai-id/decode.test.mjs,      — transitively import pkg/raw_converter_wasm.js
+  #     web/ai-id/export.test.mjs,        (WASM build absent in CI) or require real
+  #     web/ai-id/proxy-e2e.test.mjs,     CR2 fixture at c:/Foo/raw-converter/tests/
+  #     web/ai-id/embedded-preview.test.mjs,  (absent in CI)
+  #     web/ai-id/proxy.test.mjs,
+  #     web/ai-id/sources.test.mjs
+  #
+  # OMISSION-GUARD: tools/discover-node-tests.mjs accounts for every *.test.mjs
+  # and *.test.js under web/ — any unclassified file is an error (fails the static
+  # verify-workflow.test.mjs assertion M-6+K1).
   web-tests:
-    name: web node-safe tests (node --test web/**/*.test.mjs + safe .test.js)
+    name: web node-safe tests (discover-node-tests --web)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -192,79 +198,59 @@ jobs:
         with:
           path: |
             ~/.npm
-            node_modules
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
-      - name: install dependencies (sharp required by web/ai-id/proxy.mjs)
+      - name: install dependencies
         run: npm ci --ignore-scripts
-      - name: run node-safe web tests
+      - name: run node-safe web tests (auto-discovered)
         run: |
-          # SKIPPED (pkg/WASM not built in CI): decode.test.mjs, export.test.mjs,
-          #   proxy-e2e.test.mjs — import pkg/raw_converter_wasm.js; Emscripten/Docker
-          #   unavailable in env; these are intentionally excluded, not silently passed.
-          # SKIPPED (vitest): web/*.test.js using 'import from vitest' — requires
-          #   browser/WASM context; not runnable under node --test.
-          # Node-safe surface (node:test, no WASM pkg/, no browser):
-          node --test \
-            web/ai-id/datetime-geo.test.mjs \
-            web/ai-id/embedded-preview.test.mjs \
-            web/ai-id/gps.test.mjs \
-            web/ai-id/manifest.test.mjs \
-            web/ai-id/proxy.test.mjs \
-            web/ai-id/sidecar.test.mjs \
-            web/ai-id/sources.test.mjs \
-            web/calibration/calibration.test.mjs \
-            web/casv-lightbox/casv-lightbox-core.test.js \
-            web/perceptual-color.test.mjs \
-            web/test/format-detect.test.mjs \
-            web/timelapse-core.test.js
+          # tools/discover-node-tests.mjs classifies every *.test.mjs / *.test.js under
+          # web/ as runnable, skip:<reason>, or pre-existing-failure:<detail>.
+          # Only the runnable set is passed to node --test here — new node:test files
+          # are automatically picked up; skipped files have a recorded reason.
+          # SKIPPED (bun:test/vitest/playwright/wasm-pkg): see discover-node-tests.mjs.
+          node --test $(node tools/discover-node-tests.mjs --web --paths | tr '\n' ' ')
 
   # ── Benchmark smoke/registration (GAP 2) ─────────────────────────────────────
   # benchmark/ is not a workspace.  Task 1 registered benchmark tests as a
   # distinct authoritative task.  This job runs the bounded/deterministic
   # subset that does NOT perform full microbenchmark timing.
   #
-  # Node-safe benchmark tests (use node:test, no bun:test, no browser, no WASM):
-  #   benchmark-history-conversion.test.mjs   — conversion logic unit tests
-  #   correlation-additional-benchmarks.test.mjs — correlation utils
-  #   graph-browser-launcher.test.mjs         — launcher config (no browser)
-  #   optimal-settings-timing-toon.test.mjs   — toon format registration
-  #   seam-comparison-threshold.test.mjs      — threshold utility
-  #   standard-multifile-history-graph.test.mjs — graph history parsing
-  #   targeted-wasm-timings-format.test.mjs   — format registration contract
+  # Classification is performed by tools/discover-node-tests.mjs (authoritative).
+  # Covered directories include: benchmark/, benchmark/test/, benchmark/optimize/test/
+  # (the latter two were omitted from the original hardcoded list — M-6/K1 fix).
   #
-  # SKIPPED (bun:test): progressive-flag-matrix.test.js, progressive-byte-benchmark.test.js,
-  #   jpeg-progressive-stream.test.js, progressive-prefix-probe.test.js
-  #   — these use `import { expect, test } from 'bun:test'` and cannot run under node --test.
-  # SKIPPED (session-worker-timings.test.mjs): asserts content of WASM browser worker script
-  #   that currently does not match expected patterns (pre-existing failure, not our regression).
+  # SKIPPED with recorded reason in discover-node-tests.mjs:
+  #   (bun:test) progressive-flag-matrix.test.js, progressive-byte-benchmark.test.js,
+  #              jpeg-progressive-stream.test.js, progressive-prefix-probe.test.js
+  #              — use bun:test; not runnable under node --test
+  #   (pre-existing-failure: source-mismatch)
+  #     session-worker-timings.test.mjs — asserts context.encode(makeEncoderOptions
+  #     pattern that is absent from benchmark/session-worker-timings-browser.js;
+  #     the source has drifted from the test expectations (not a regression from this branch)
+  #   (pre-existing-failure: dev-only deps)
+  #     benchmark/test/adapters16.test.mjs, benchmark/test/codec-adapters.test.mjs
+  #     — require sharp + pkg/raw_converter_wasm (dev-only; absent in CI without full install)
   #
-  # Registration guard: if a new benchmark directory gains a node:test smoke file,
-  # add it here so it runs on every PR.
+  # OMISSION-GUARD: tools/discover-node-tests.mjs accounts for every *.test.mjs
+  # and *.test.js under benchmark/ — any unclassified file is an error (fails the
+  # static verify-workflow.test.mjs assertion M-6+K1).
   benchmark-smoke:
-    name: benchmark smoke / registration (node --test benchmark/*.test.mjs)
+    name: benchmark smoke / registration (discover-node-tests --benchmark)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: run benchmark smoke tests (deterministic, no timing)
-        # SKIPPED (bun:test): progressive-flag-matrix.test.js and 3 others use bun:test
-        #   — not runnable under node --test; bun unavailable in env.
-        # SKIPPED (session-worker-timings.test.mjs): asserts browser worker file content
-        #   that does not match current patterns (pre-existing failure, env-blocked).
-        # All other .test.mjs files are node-safe deterministic registration/unit tests.
+      - name: run benchmark smoke tests (auto-discovered, deterministic, no timing)
+        # tools/discover-node-tests.mjs classifies every *.test.mjs / *.test.js under
+        # benchmark/ (including benchmark/test/ and benchmark/optimize/test/).
+        # Only the runnable set is passed to node --test.
+        # SKIPPED (bun:test/pre-existing-failures): see discover-node-tests.mjs registry.
         run: |
-          node --test \
-            benchmark/benchmark-history-conversion.test.mjs \
-            benchmark/correlation-additional-benchmarks.test.mjs \
-            benchmark/graph-browser-launcher.test.mjs \
-            benchmark/optimal-settings-timing-toon.test.mjs \
-            benchmark/seam-comparison-threshold.test.mjs \
-            benchmark/standard-multifile-history-graph.test.mjs \
-            benchmark/targeted-wasm-timings-format.test.mjs
+          node --test $(node tools/discover-node-tests.mjs --benchmark --paths | tr '\n' ' ')
 
   rust-parsers:
     name: rust parsers + golden ledger + fuzz-smoke + oracles
@@ -336,9 +322,13 @@ jobs:
   # is intentionally larger so self-hosted / larger runners can exploit it fully).
   #
   # Coverage: the five pure-Rust parser targets that build without libjxl.
-  # The four codec-gated targets (casv_header, casv_footer, casv_audio_box,
-  # jxtc_header) require libjxl/emscripten and are excluded from this job;
-  # they are covered by the fuzz-build 20 s smoke above.
+  # TODO (Packet 5 Task 4 / --features codec): casv_header, casv_footer,
+  #   casv_audio_box, and jxtc_header are currently no-op stubs — they are
+  #   listed in the matrix but will not exercise real codec paths until
+  #   `cargo fuzz build --features codec` is wired. Until that lands, these
+  #   four targets run against trivial stubs and provide minimal coverage.
+  #   Wire `--features codec` (requires libjxl/emscripten in the runner image)
+  #   before treating fuzz results from these targets as meaningful.
   fuzz:
     name: Fuzz ${{ matrix.target }} (nightly campaign)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -370,7 +360,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run fuzz campaign
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=86400 -jobs=4
+        run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time=86400 -jobs=4
         env:
           RUST_BACKTRACE: 1
       - name: Upload crash artifacts

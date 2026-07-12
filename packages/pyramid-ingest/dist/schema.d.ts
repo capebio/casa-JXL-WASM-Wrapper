@@ -11,27 +11,27 @@ export declare const producedBySchema: z.ZodObject<{
             proxy: z.ZodNumber;
         }, "strip", z.ZodTypeAny, {
             big: number;
-            grid: number;
             proxy: number;
+            grid: number;
         }, {
             big: number;
-            grid: number;
             proxy: number;
+            grid: number;
         }>;
     }, "strip", z.ZodTypeAny, {
         effort: number;
         quality: {
             big: number;
-            grid: number;
             proxy: number;
+            grid: number;
         };
         libjxl?: string | undefined;
     }, {
         effort: number;
         quality: {
             big: number;
-            grid: number;
             proxy: number;
+            grid: number;
         };
         libjxl?: string | undefined;
     }>;
@@ -42,8 +42,8 @@ export declare const producedBySchema: z.ZodObject<{
         effort: number;
         quality: {
             big: number;
-            grid: number;
             proxy: number;
+            grid: number;
         };
         libjxl?: string | undefined;
     };
@@ -54,8 +54,8 @@ export declare const producedBySchema: z.ZodObject<{
         effort: number;
         quality: {
             big: number;
-            grid: number;
             proxy: number;
+            grid: number;
         };
         libjxl?: string | undefined;
     };
@@ -100,8 +100,8 @@ export declare const levelEntrySchema: z.ZodObject<{
 }, "strip", z.ZodTypeAny, {
     w: number;
     h: number;
-    bytes: number;
     size: number | "full";
+    bytes: number;
     bitsPerSample: 8 | 16;
     contenthash: string;
     tiled: boolean;
@@ -114,8 +114,8 @@ export declare const levelEntrySchema: z.ZodObject<{
 }, {
     w: number;
     h: number;
-    bytes: number;
     size: number | "full";
+    bytes: number;
     bitsPerSample: 8 | 16;
     contenthash: string;
     tiled: boolean;
@@ -139,6 +139,61 @@ export declare const masterInfoSchema: z.ZodObject<{
     format: "orf" | "dng" | "cr2" | "jpg" | "unknown" | "nef" | "arw" | "raf" | "rw2" | "pef" | "srw" | "x3f";
     mtimeMs: number;
 }>;
+export declare const masterInfoV5Schema: z.ZodObject<{
+    name: z.ZodString;
+    format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+    mtimeMs: z.ZodNumber;
+} & {
+    sourceFormat: z.ZodOptional<z.ZodString>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    name: z.ZodString;
+    format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+    mtimeMs: z.ZodNumber;
+} & {
+    sourceFormat: z.ZodOptional<z.ZodString>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    name: z.ZodString;
+    format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+    mtimeMs: z.ZodNumber;
+} & {
+    sourceFormat: z.ZodOptional<z.ZodString>;
+}, z.ZodTypeAny, "passthrough">>;
+/** v5 OrientationDescriptor: the exact EXIF value (1..8) plus whether the stored pixels are already
+ *  upright. Replaces the v1–v4 "baked"|"source" string; migration maps the old string to
+ *  { exif: 1, pixels: <string> } when no EXIF orientation was recorded (MIG-2). */
+export declare const orientationDescriptorSchema: z.ZodObject<{
+    exif: z.ZodNumber;
+    pixels: z.ZodEnum<["source", "baked-upright"]>;
+}, "strip", z.ZodTypeAny, {
+    pixels: "source" | "baked-upright";
+    exif: number;
+}, {
+    pixels: "source" | "baked-upright";
+    exif: number;
+}>;
+export type OrientationDescriptor = z.infer<typeof orientationDescriptorSchema>;
+/** v5 TilingDescriptor persisted on a tiled level. `offsetBase: "file"` records that JXTC index
+ *  offsets are ABSOLUTE from byte zero of the file (bridge.cpp:1925-1931 / jxl-pyramid/tiling.ts). */
+export declare const tilingDescriptorSchema: z.ZodObject<{
+    container: z.ZodLiteral<"jxtc">;
+    version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+    tileSize: z.ZodNumber;
+    bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+    offsetBase: z.ZodLiteral<"file">;
+}, "strip", z.ZodTypeAny, {
+    tileSize: number;
+    bitsPerSample: 8 | 16;
+    version: 1 | 2;
+    container: "jxtc";
+    offsetBase: "file";
+}, {
+    tileSize: number;
+    bitsPerSample: 8 | 16;
+    version: 1 | 2;
+    container: "jxtc";
+    offsetBase: "file";
+}>;
+export type TilingDescriptor = z.infer<typeof tilingDescriptorSchema>;
 export declare const manifestSchemaV1: z.ZodObject<{
     schema: z.ZodLiteral<1>;
     imageId: z.ZodString;
@@ -184,8 +239,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
     }, "strip", z.ZodTypeAny, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -198,8 +253,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
     }, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -226,27 +281,27 @@ export declare const manifestSchemaV1: z.ZodObject<{
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -257,8 +312,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -269,8 +324,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -281,8 +336,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -293,8 +348,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -313,8 +368,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -325,11 +380,6 @@ export declare const manifestSchemaV1: z.ZodObject<{
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -337,12 +387,17 @@ export declare const manifestSchemaV1: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }, {
     schema: 1;
     imageId: string;
@@ -357,8 +412,8 @@ export declare const manifestSchemaV1: z.ZodObject<{
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -369,11 +424,6 @@ export declare const manifestSchemaV1: z.ZodObject<{
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -381,12 +431,17 @@ export declare const manifestSchemaV1: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }>;
 export declare const manifestSchemaV2Base: z.ZodObject<{
     imageId: z.ZodString;
@@ -432,8 +487,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
     }, "strip", z.ZodTypeAny, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -446,8 +501,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
     }, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -474,27 +529,27 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -505,8 +560,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -517,8 +572,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -529,8 +584,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -541,8 +596,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -563,8 +618,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -575,11 +630,6 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -587,12 +637,17 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }, {
     schema: 2;
     imageId: string;
@@ -607,8 +662,8 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -619,11 +674,6 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -631,12 +681,17 @@ export declare const manifestSchemaV2Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }>;
 export declare const manifestSchemaV4Base: z.ZodObject<{
     imageId: z.ZodString;
@@ -682,8 +737,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
     }, "strip", z.ZodTypeAny, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -696,8 +751,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
     }, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -724,27 +779,27 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -755,8 +810,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -767,8 +822,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -779,8 +834,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -791,8 +846,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -813,8 +868,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -825,11 +880,6 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -837,12 +887,17 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }, {
     schema: 4;
     imageId: string;
@@ -857,8 +912,8 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -869,11 +924,6 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -881,13 +931,899 @@ export declare const manifestSchemaV4Base: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }>;
+export declare const levelEntryV5Schema: z.ZodEffects<z.ZodObject<{
+    size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+    w: z.ZodNumber;
+    h: z.ZodNumber;
+    bytes: z.ZodNumber;
+    bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+    contenthash: z.ZodString;
+    tiled: z.ZodBoolean;
+    convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+    qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+        bytes: z.ZodNumber;
+        ssim: z.ZodOptional<z.ZodNumber>;
+        butteraugli: z.ZodOptional<z.ZodNumber>;
+    }, "strip", z.ZodTypeAny, {
+        bytes: number;
+        ssim?: number | undefined;
+        butteraugli?: number | undefined;
+    }, {
+        bytes: number;
+        ssim?: number | undefined;
+        butteraugli?: number | undefined;
+    }>, "many">>;
+} & {
+    tiling: z.ZodOptional<z.ZodObject<{
+        container: z.ZodLiteral<"jxtc">;
+        version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+        tileSize: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        offsetBase: z.ZodLiteral<"file">;
+    }, "strip", z.ZodTypeAny, {
+        tileSize: number;
+        bitsPerSample: 8 | 16;
+        version: 1 | 2;
+        container: "jxtc";
+        offsetBase: "file";
+    }, {
+        tileSize: number;
+        bitsPerSample: 8 | 16;
+        version: 1 | 2;
+        container: "jxtc";
+        offsetBase: "file";
+    }>>;
+}, "strip", z.ZodTypeAny, {
+    w: number;
+    h: number;
+    size: number | "full";
+    bytes: number;
+    bitsPerSample: 8 | 16;
+    contenthash: string;
+    tiled: boolean;
+    convergedByteEnd?: number | undefined;
+    qualityCurve?: {
+        bytes: number;
+        ssim?: number | undefined;
+        butteraugli?: number | undefined;
+    }[] | undefined;
+    tiling?: {
+        tileSize: number;
+        bitsPerSample: 8 | 16;
+        version: 1 | 2;
+        container: "jxtc";
+        offsetBase: "file";
+    } | undefined;
+}, {
+    w: number;
+    h: number;
+    size: number | "full";
+    bytes: number;
+    bitsPerSample: 8 | 16;
+    contenthash: string;
+    tiled: boolean;
+    convergedByteEnd?: number | undefined;
+    qualityCurve?: {
+        bytes: number;
+        ssim?: number | undefined;
+        butteraugli?: number | undefined;
+    }[] | undefined;
+    tiling?: {
+        tileSize: number;
+        bitsPerSample: 8 | 16;
+        version: 1 | 2;
+        container: "jxtc";
+        offsetBase: "file";
+    } | undefined;
+}>, {
+    w: number;
+    h: number;
+    size: number | "full";
+    bytes: number;
+    bitsPerSample: 8 | 16;
+    contenthash: string;
+    tiled: boolean;
+    convergedByteEnd?: number | undefined;
+    qualityCurve?: {
+        bytes: number;
+        ssim?: number | undefined;
+        butteraugli?: number | undefined;
+    }[] | undefined;
+    tiling?: {
+        tileSize: number;
+        bitsPerSample: 8 | 16;
+        version: 1 | 2;
+        container: "jxtc";
+        offsetBase: "file";
+    } | undefined;
+}, {
+    w: number;
+    h: number;
+    size: number | "full";
+    bytes: number;
+    bitsPerSample: 8 | 16;
+    contenthash: string;
+    tiled: boolean;
+    convergedByteEnd?: number | undefined;
+    qualityCurve?: {
+        bytes: number;
+        ssim?: number | undefined;
+        butteraugli?: number | undefined;
+    }[] | undefined;
+    tiling?: {
+        tileSize: number;
+        bitsPerSample: 8 | 16;
+        version: 1 | 2;
+        container: "jxtc";
+        offsetBase: "file";
+    } | undefined;
+}>;
+export declare const manifestSchemaV5: z.ZodObject<{
+    schema: z.ZodLiteral<5>;
+    imageId: z.ZodString;
+    master: z.ZodObject<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">>;
+    orientation: z.ZodObject<{
+        exif: z.ZodNumber;
+        pixels: z.ZodEnum<["source", "baked-upright"]>;
+    }, "strip", z.ZodTypeAny, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }>;
+    width: z.ZodOptional<z.ZodNumber>;
+    height: z.ZodOptional<z.ZodNumber>;
+    aspect: z.ZodOptional<z.ZodNumber>;
+    levels: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodObject<{
+        size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+        w: z.ZodNumber;
+        h: z.ZodNumber;
+        bytes: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        contenthash: z.ZodString;
+        tiled: z.ZodBoolean;
+        convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+        qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            bytes: z.ZodNumber;
+            ssim: z.ZodOptional<z.ZodNumber>;
+            butteraugli: z.ZodOptional<z.ZodNumber>;
+        }, "strip", z.ZodTypeAny, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }>, "many">>;
+    } & {
+        tiling: z.ZodOptional<z.ZodObject<{
+            container: z.ZodLiteral<"jxtc">;
+            version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+            tileSize: z.ZodNumber;
+            bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+            offsetBase: z.ZodLiteral<"file">;
+        }, "strip", z.ZodTypeAny, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }>>;
+    }, "strip", z.ZodTypeAny, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, "many">>;
+    layout: z.ZodOptional<z.ZodString>;
+    proxy: z.ZodOptional<z.ZodLiteral<true>>;
+    stub: z.ZodOptional<z.ZodLiteral<true>>;
+    metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    producedBy: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        tool: z.ZodLiteral<"pyramid-ingest">;
+        version: z.ZodString;
+        encoder: z.ZodObject<{
+            libjxl: z.ZodOptional<z.ZodString>;
+            effort: z.ZodNumber;
+            quality: z.ZodObject<{
+                grid: z.ZodNumber;
+                big: z.ZodNumber;
+                proxy: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }>;
+        }, "strip", z.ZodTypeAny, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }>;
+    }, "strip", z.ZodTypeAny, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    schema: z.ZodLiteral<5>;
+    imageId: z.ZodString;
+    master: z.ZodObject<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">>;
+    orientation: z.ZodObject<{
+        exif: z.ZodNumber;
+        pixels: z.ZodEnum<["source", "baked-upright"]>;
+    }, "strip", z.ZodTypeAny, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }>;
+    width: z.ZodOptional<z.ZodNumber>;
+    height: z.ZodOptional<z.ZodNumber>;
+    aspect: z.ZodOptional<z.ZodNumber>;
+    levels: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodObject<{
+        size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+        w: z.ZodNumber;
+        h: z.ZodNumber;
+        bytes: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        contenthash: z.ZodString;
+        tiled: z.ZodBoolean;
+        convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+        qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            bytes: z.ZodNumber;
+            ssim: z.ZodOptional<z.ZodNumber>;
+            butteraugli: z.ZodOptional<z.ZodNumber>;
+        }, "strip", z.ZodTypeAny, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }>, "many">>;
+    } & {
+        tiling: z.ZodOptional<z.ZodObject<{
+            container: z.ZodLiteral<"jxtc">;
+            version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+            tileSize: z.ZodNumber;
+            bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+            offsetBase: z.ZodLiteral<"file">;
+        }, "strip", z.ZodTypeAny, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }>>;
+    }, "strip", z.ZodTypeAny, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, "many">>;
+    layout: z.ZodOptional<z.ZodString>;
+    proxy: z.ZodOptional<z.ZodLiteral<true>>;
+    stub: z.ZodOptional<z.ZodLiteral<true>>;
+    metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    producedBy: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        tool: z.ZodLiteral<"pyramid-ingest">;
+        version: z.ZodString;
+        encoder: z.ZodObject<{
+            libjxl: z.ZodOptional<z.ZodString>;
+            effort: z.ZodNumber;
+            quality: z.ZodObject<{
+                grid: z.ZodNumber;
+                big: z.ZodNumber;
+                proxy: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }>;
+        }, "strip", z.ZodTypeAny, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }>;
+    }, "strip", z.ZodTypeAny, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    schema: z.ZodLiteral<5>;
+    imageId: z.ZodString;
+    master: z.ZodObject<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">>;
+    orientation: z.ZodObject<{
+        exif: z.ZodNumber;
+        pixels: z.ZodEnum<["source", "baked-upright"]>;
+    }, "strip", z.ZodTypeAny, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }>;
+    width: z.ZodOptional<z.ZodNumber>;
+    height: z.ZodOptional<z.ZodNumber>;
+    aspect: z.ZodOptional<z.ZodNumber>;
+    levels: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodObject<{
+        size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+        w: z.ZodNumber;
+        h: z.ZodNumber;
+        bytes: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        contenthash: z.ZodString;
+        tiled: z.ZodBoolean;
+        convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+        qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            bytes: z.ZodNumber;
+            ssim: z.ZodOptional<z.ZodNumber>;
+            butteraugli: z.ZodOptional<z.ZodNumber>;
+        }, "strip", z.ZodTypeAny, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }>, "many">>;
+    } & {
+        tiling: z.ZodOptional<z.ZodObject<{
+            container: z.ZodLiteral<"jxtc">;
+            version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+            tileSize: z.ZodNumber;
+            bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+            offsetBase: z.ZodLiteral<"file">;
+        }, "strip", z.ZodTypeAny, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }>>;
+    }, "strip", z.ZodTypeAny, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, "many">>;
+    layout: z.ZodOptional<z.ZodString>;
+    proxy: z.ZodOptional<z.ZodLiteral<true>>;
+    stub: z.ZodOptional<z.ZodLiteral<true>>;
+    metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    producedBy: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        tool: z.ZodLiteral<"pyramid-ingest">;
+        version: z.ZodString;
+        encoder: z.ZodObject<{
+            libjxl: z.ZodOptional<z.ZodString>;
+            effort: z.ZodNumber;
+            quality: z.ZodObject<{
+                grid: z.ZodNumber;
+                big: z.ZodNumber;
+                proxy: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }>;
+        }, "strip", z.ZodTypeAny, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }>;
+    }, "strip", z.ZodTypeAny, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>>;
+}, z.ZodTypeAny, "passthrough">>;
 export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObject<{
     schema: z.ZodLiteral<1>;
     imageId: z.ZodString;
@@ -933,8 +1869,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     }, "strip", z.ZodTypeAny, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -947,8 +1883,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     }, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -975,27 +1911,27 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -1006,8 +1942,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1018,8 +1954,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1030,8 +1966,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1042,8 +1978,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1062,8 +1998,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1074,11 +2010,6 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -1086,12 +2017,17 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }, {
     schema: 1;
     imageId: string;
@@ -1106,8 +2042,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1118,11 +2054,6 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -1130,12 +2061,17 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }>, z.ZodObject<{
     imageId: z.ZodString;
     master: z.ZodObject<{
@@ -1180,8 +2116,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     }, "strip", z.ZodTypeAny, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1194,8 +2130,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     }, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1222,27 +2158,27 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -1253,8 +2189,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1265,8 +2201,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1277,8 +2213,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1289,8 +2225,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1311,8 +2247,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1323,11 +2259,6 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -1335,12 +2266,17 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }, {
     schema: 2;
     imageId: string;
@@ -1355,8 +2291,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1367,11 +2303,6 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -1379,12 +2310,17 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }>, z.ZodObject<{
     imageId: z.ZodString;
     master: z.ZodObject<{
@@ -1429,8 +2365,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     }, "strip", z.ZodTypeAny, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1443,8 +2379,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     }, {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1471,27 +2407,27 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -1502,8 +2438,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1514,8 +2450,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1526,8 +2462,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1538,8 +2474,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1560,8 +2496,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1572,11 +2508,6 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -1584,12 +2515,17 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
 }, {
     schema: 4;
     imageId: string;
@@ -1604,8 +2540,8 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
     levels?: {
         w: number;
         h: number;
-        bytes: number;
         size: number | "full";
+        bytes: number;
         bitsPerSample: 8 | 16;
         contenthash: string;
         tiled: boolean;
@@ -1616,11 +2552,6 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             butteraugli?: number | undefined;
         }[] | undefined;
     }[] | undefined;
-    proxy?: true | undefined;
-    aspect?: number | undefined;
-    layout?: string | undefined;
-    stub?: true | undefined;
-    metadata?: Record<string, unknown> | undefined;
     producedBy?: {
         tool: "pyramid-ingest";
         version: string;
@@ -1628,15 +2559,778 @@ export declare const manifestSchema: z.ZodDiscriminatedUnion<"schema", [z.ZodObj
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
     } | undefined;
-}>]>;
+    proxy?: true | undefined;
+    aspect?: number | undefined;
+    layout?: string | undefined;
+    stub?: true | undefined;
+    metadata?: Record<string, unknown> | undefined;
+}>, z.ZodObject<{
+    schema: z.ZodLiteral<5>;
+    imageId: z.ZodString;
+    master: z.ZodObject<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">>;
+    orientation: z.ZodObject<{
+        exif: z.ZodNumber;
+        pixels: z.ZodEnum<["source", "baked-upright"]>;
+    }, "strip", z.ZodTypeAny, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }>;
+    width: z.ZodOptional<z.ZodNumber>;
+    height: z.ZodOptional<z.ZodNumber>;
+    aspect: z.ZodOptional<z.ZodNumber>;
+    levels: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodObject<{
+        size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+        w: z.ZodNumber;
+        h: z.ZodNumber;
+        bytes: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        contenthash: z.ZodString;
+        tiled: z.ZodBoolean;
+        convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+        qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            bytes: z.ZodNumber;
+            ssim: z.ZodOptional<z.ZodNumber>;
+            butteraugli: z.ZodOptional<z.ZodNumber>;
+        }, "strip", z.ZodTypeAny, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }>, "many">>;
+    } & {
+        tiling: z.ZodOptional<z.ZodObject<{
+            container: z.ZodLiteral<"jxtc">;
+            version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+            tileSize: z.ZodNumber;
+            bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+            offsetBase: z.ZodLiteral<"file">;
+        }, "strip", z.ZodTypeAny, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }>>;
+    }, "strip", z.ZodTypeAny, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, "many">>;
+    layout: z.ZodOptional<z.ZodString>;
+    proxy: z.ZodOptional<z.ZodLiteral<true>>;
+    stub: z.ZodOptional<z.ZodLiteral<true>>;
+    metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    producedBy: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        tool: z.ZodLiteral<"pyramid-ingest">;
+        version: z.ZodString;
+        encoder: z.ZodObject<{
+            libjxl: z.ZodOptional<z.ZodString>;
+            effort: z.ZodNumber;
+            quality: z.ZodObject<{
+                grid: z.ZodNumber;
+                big: z.ZodNumber;
+                proxy: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }>;
+        }, "strip", z.ZodTypeAny, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }>;
+    }, "strip", z.ZodTypeAny, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    schema: z.ZodLiteral<5>;
+    imageId: z.ZodString;
+    master: z.ZodObject<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">>;
+    orientation: z.ZodObject<{
+        exif: z.ZodNumber;
+        pixels: z.ZodEnum<["source", "baked-upright"]>;
+    }, "strip", z.ZodTypeAny, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }>;
+    width: z.ZodOptional<z.ZodNumber>;
+    height: z.ZodOptional<z.ZodNumber>;
+    aspect: z.ZodOptional<z.ZodNumber>;
+    levels: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodObject<{
+        size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+        w: z.ZodNumber;
+        h: z.ZodNumber;
+        bytes: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        contenthash: z.ZodString;
+        tiled: z.ZodBoolean;
+        convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+        qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            bytes: z.ZodNumber;
+            ssim: z.ZodOptional<z.ZodNumber>;
+            butteraugli: z.ZodOptional<z.ZodNumber>;
+        }, "strip", z.ZodTypeAny, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }>, "many">>;
+    } & {
+        tiling: z.ZodOptional<z.ZodObject<{
+            container: z.ZodLiteral<"jxtc">;
+            version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+            tileSize: z.ZodNumber;
+            bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+            offsetBase: z.ZodLiteral<"file">;
+        }, "strip", z.ZodTypeAny, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }>>;
+    }, "strip", z.ZodTypeAny, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, "many">>;
+    layout: z.ZodOptional<z.ZodString>;
+    proxy: z.ZodOptional<z.ZodLiteral<true>>;
+    stub: z.ZodOptional<z.ZodLiteral<true>>;
+    metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    producedBy: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        tool: z.ZodLiteral<"pyramid-ingest">;
+        version: z.ZodString;
+        encoder: z.ZodObject<{
+            libjxl: z.ZodOptional<z.ZodString>;
+            effort: z.ZodNumber;
+            quality: z.ZodObject<{
+                grid: z.ZodNumber;
+                big: z.ZodNumber;
+                proxy: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }>;
+        }, "strip", z.ZodTypeAny, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }>;
+    }, "strip", z.ZodTypeAny, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    schema: z.ZodLiteral<5>;
+    imageId: z.ZodString;
+    master: z.ZodObject<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        name: z.ZodString;
+        format: z.ZodEnum<["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"]>;
+        mtimeMs: z.ZodNumber;
+    } & {
+        sourceFormat: z.ZodOptional<z.ZodString>;
+    }, z.ZodTypeAny, "passthrough">>;
+    orientation: z.ZodObject<{
+        exif: z.ZodNumber;
+        pixels: z.ZodEnum<["source", "baked-upright"]>;
+    }, "strip", z.ZodTypeAny, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }, {
+        pixels: "source" | "baked-upright";
+        exif: number;
+    }>;
+    width: z.ZodOptional<z.ZodNumber>;
+    height: z.ZodOptional<z.ZodNumber>;
+    aspect: z.ZodOptional<z.ZodNumber>;
+    levels: z.ZodOptional<z.ZodArray<z.ZodEffects<z.ZodObject<{
+        size: z.ZodUnion<[z.ZodNumber, z.ZodLiteral<"full">]>;
+        w: z.ZodNumber;
+        h: z.ZodNumber;
+        bytes: z.ZodNumber;
+        bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+        contenthash: z.ZodString;
+        tiled: z.ZodBoolean;
+        convergedByteEnd: z.ZodOptional<z.ZodNumber>;
+        qualityCurve: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            bytes: z.ZodNumber;
+            ssim: z.ZodOptional<z.ZodNumber>;
+            butteraugli: z.ZodOptional<z.ZodNumber>;
+        }, "strip", z.ZodTypeAny, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }, {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }>, "many">>;
+    } & {
+        tiling: z.ZodOptional<z.ZodObject<{
+            container: z.ZodLiteral<"jxtc">;
+            version: z.ZodUnion<[z.ZodLiteral<1>, z.ZodLiteral<2>]>;
+            tileSize: z.ZodNumber;
+            bitsPerSample: z.ZodUnion<[z.ZodLiteral<8>, z.ZodLiteral<16>]>;
+            offsetBase: z.ZodLiteral<"file">;
+        }, "strip", z.ZodTypeAny, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }, {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        }>>;
+    }, "strip", z.ZodTypeAny, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }, {
+        w: number;
+        h: number;
+        size: number | "full";
+        bytes: number;
+        bitsPerSample: 8 | 16;
+        contenthash: string;
+        tiled: boolean;
+        convergedByteEnd?: number | undefined;
+        qualityCurve?: {
+            bytes: number;
+            ssim?: number | undefined;
+            butteraugli?: number | undefined;
+        }[] | undefined;
+        tiling?: {
+            tileSize: number;
+            bitsPerSample: 8 | 16;
+            version: 1 | 2;
+            container: "jxtc";
+            offsetBase: "file";
+        } | undefined;
+    }>, "many">>;
+    layout: z.ZodOptional<z.ZodString>;
+    proxy: z.ZodOptional<z.ZodLiteral<true>>;
+    stub: z.ZodOptional<z.ZodLiteral<true>>;
+    metadata: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodUnknown>>;
+    producedBy: z.ZodOptional<z.ZodEffects<z.ZodObject<{
+        tool: z.ZodLiteral<"pyramid-ingest">;
+        version: z.ZodString;
+        encoder: z.ZodObject<{
+            libjxl: z.ZodOptional<z.ZodString>;
+            effort: z.ZodNumber;
+            quality: z.ZodObject<{
+                grid: z.ZodNumber;
+                big: z.ZodNumber;
+                proxy: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }, {
+                big: number;
+                proxy: number;
+                grid: number;
+            }>;
+        }, "strip", z.ZodTypeAny, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }, {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        }>;
+    }, "strip", z.ZodTypeAny, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }, {
+        tool: "pyramid-ingest";
+        version: string;
+        encoder: {
+            effort: number;
+            quality: {
+                big: number;
+                proxy: number;
+                grid: number;
+            };
+            libjxl?: string | undefined;
+        };
+    }>>;
+}, z.ZodTypeAny, "passthrough">>]>;
 export type ManifestV2 = z.infer<typeof manifestSchemaV2Base>;
 export type ManifestV4 = z.infer<typeof manifestSchemaV4Base>;
+export type ManifestV5 = z.infer<typeof manifestSchemaV5>;
+/** The schema version this tool writes today. */
+export declare const CURRENT_MANIFEST_SCHEMA: 5;
+/** Every schema version this tool can READ (and additively migrate forward). */
+export declare const READABLE_MANIFEST_SCHEMAS: readonly [1, 2, 4, 5];
 export declare const indexEntrySchema: z.ZodObject<{
     imageId: z.ZodString;
     aspect: z.ZodNumber;
@@ -1712,7 +3406,6 @@ export declare const galleryIndexSchema: z.ZodObject<{
         schema?: number | undefined;
     }>, "many">;
 }, "strip", z.ZodTypeAny, {
-    schema: 1;
     images: {
         imageId: string;
         aspect: number;
@@ -1723,8 +3416,8 @@ export declare const galleryIndexSchema: z.ZodObject<{
         };
         schema?: number | undefined;
     }[];
+    schema: 1;
 }, {
-    schema: 1;
     images: {
         imageId: string;
         aspect: number;
@@ -1735,11 +3428,16 @@ export declare const galleryIndexSchema: z.ZodObject<{
         };
         schema?: number | undefined;
     }[];
+    schema: 1;
 }>;
-export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV4;
+export type Manifest = z.infer<typeof manifestSchemaV1> | ManifestV2 | ManifestV4 | ManifestV5;
 export type IndexEntry = z.infer<typeof indexEntrySchema>;
 export type GalleryIndex = z.infer<typeof galleryIndexSchema>;
 export type LevelEntry = z.infer<typeof levelEntrySchema>;
+/** v5 level entry (base + optional TilingDescriptor). What toEntry emits. */
+export type LevelEntryV5 = z.infer<typeof levelEntryV5Schema>;
+/** v5 TilingDescriptor as it appears on a persisted level. */
+export type LevelTilingDescriptor = z.infer<typeof tilingDescriptorSchema>;
 export type LevelSize = z.infer<typeof levelSizeSchema>;
 export type MasterInfo = z.infer<typeof masterInfoSchema>;
 export type ProducedBy = z.infer<typeof producedBySchema>;
@@ -1779,27 +3477,27 @@ export declare const runRecordSchema: z.ZodObject<{
                 proxy: z.ZodNumber;
             }, "strip", z.ZodTypeAny, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }, {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             }>;
         }, "strip", z.ZodTypeAny, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }, {
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         }>;
@@ -1810,8 +3508,8 @@ export declare const runRecordSchema: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1822,8 +3520,8 @@ export declare const runRecordSchema: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1895,8 +3593,8 @@ export declare const runRecordSchema: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -1935,8 +3633,8 @@ export declare const runRecordSchema: z.ZodObject<{
             effort: number;
             quality: {
                 big: number;
-                grid: number;
                 proxy: number;
+                grid: number;
             };
             libjxl?: string | undefined;
         };
@@ -2011,8 +3709,15 @@ export type CliEvent = {
     type: "gc-result" | "validate-result" | "rm-result" | "migrate-result";
     [k: string]: unknown;
 };
-export declare function parseManifest(text: string): Manifest;
-export declare function parseGalleryIndex(text: string): GalleryIndex;
+export declare function parseManifest(text: string | Uint8Array): Manifest;
+/** Canonical VALUE-LOSSLESS serialization of a manifest to JSON text. Every field zod passed
+ *  through — including unknown extension fields kept via `.passthrough()` — is preserved by VALUE:
+ *  writing with manifestToJson and re-reading with parseManifest is a faithful round trip for the
+ *  complete schema. Note: only the VALUES are guaranteed; the emit order of unknown keys normalizes
+ *  on re-emit (JSON.stringify follows the object's own key order, not the original text's). This is
+ *  the canonical persisted representation on `.json` paths. */
+export declare function manifestToJson(manifest: Manifest, pretty?: boolean): string;
+export declare function parseGalleryIndex(text: string | Uint8Array): GalleryIndex;
 export declare function makeProducedBy(): ProducedBy;
 export declare const cliArgsSchema: z.ZodObject<{
     out: z.ZodString;
@@ -2022,6 +3727,7 @@ export declare const cliArgsSchema: z.ZodObject<{
     "mem-budget-mb": z.ZodEffects<z.ZodOptional<z.ZodString>, number, string | undefined>;
     shard: z.ZodEffects<z.ZodOptional<z.ZodString>, string | undefined, string | undefined>;
     tier: z.ZodDefault<z.ZodOptional<z.ZodEnum<["simd", "scalar", "auto"]>>>;
+    tiling: z.ZodDefault<z.ZodOptional<z.ZodEnum<["adaptive", "tile-all"]>>>;
     "reindex-only": z.ZodDefault<z.ZodOptional<z.ZodBoolean>>;
     "encoder-threads": z.ZodEffects<z.ZodOptional<z.ZodString>, number | undefined, string | undefined>;
     verbose: z.ZodDefault<z.ZodOptional<z.ZodBoolean>>;
@@ -2046,6 +3752,7 @@ export declare const cliArgsSchema: z.ZodObject<{
     "runlog-keep": z.ZodEffects<z.ZodOptional<z.ZodString>, number, string | undefined>;
 }, "strip", z.ZodTypeAny, {
     "profile-convergence": boolean;
+    tiling: "adaptive" | "tile-all";
     out: string;
     force: boolean;
     "mem-budget-mb": number;
@@ -2078,6 +3785,7 @@ export declare const cliArgsSchema: z.ZodObject<{
     out: string;
     "profile-convergence"?: boolean | undefined;
     proxy?: string | undefined;
+    tiling?: "adaptive" | "tile-all" | undefined;
     force?: boolean | undefined;
     concurrency?: string | undefined;
     "mem-budget-mb"?: string | undefined;

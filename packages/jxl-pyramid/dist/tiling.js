@@ -77,12 +77,14 @@ export function getOrParseJxtcTileIndex(bytes, header) {
     const lengths = new Uint32Array(numTiles);
     let off = 32;
     for (let i = 0; i < numTiles; i++) {
+        // Store the offset EXACTLY as written: an absolute byte offset from byte 0.
+        // (Previously a separate `dataBase` was tracked and re-added on extract, which
+        // double-added the header+index size — finding 60.)
         offsets[i] = view.getUint32(off, true);
         lengths[i] = view.getUint32(off + 4, true);
         off += 8;
     }
-    const dataBase = 32 + numTiles * 8;
-    const idx = { offsets, lengths, dataBase };
+    const idx = { offsets, lengths };
     tileIndexMemo.set(bytes, idx);
     return idx;
 }
@@ -178,11 +180,22 @@ export function extractTileBitstream(container, tile, header) {
     const tileIdx = ty * tilesX + tx;
     // Fast path via pre-parsed table (populated on first extract for this container bytes).
     const table = getOrParseJxtcTileIndex(container, header);
-    const off = table.offsets[tileIdx];
+    const off = table.offsets[tileIdx]; // ABSOLUTE offset from byte 0 — no rebasing.
     const len = table.lengths[tileIdx];
-    const dataBase = table.dataBase + off;
-    if (dataBase + len > container.byteLength || len === 0)
+    // Trust-boundary + bounds checks (JXTC v1/v2 invariant):
+    //  1. A tile must live PAST the header+index region — an offset inside it could
+    //     feed index/header bytes to the JXL decoder. First tile data == 32 + N*8.
+    //  2. offset must be within the file, and offset+length must not run past EOF.
+    //     Use the OVERFLOW-SAFE form `len > byteLength - off` — never add `off + len`,
+    //     which wraps in fixed-width integer readers (wasm32 size_t): 0xFFFFFFF0 + 24
+    //     → 0x8. The explicit `off > byteLength` guard first makes `byteLength - off`
+    //     safe from underflow (mirrored in C++/Rust; see cross-language-jxtc.test.ts).
+    const indexEnd = 32 + header.tilesX * header.tilesY * 8;
+    if (off < indexEnd)
+        throw new PyramidError('JXTC_PARSE', 'tile offset inside header/index');
+    if (len === 0 || off > container.byteLength || len > container.byteLength - off) {
         throw new PyramidError('JXTC_PARSE', 'tile data OOB or empty');
-    return container.subarray(dataBase, dataBase + len);
+    }
+    return container.subarray(off, off + len);
 }
 //# sourceMappingURL=tiling.js.map

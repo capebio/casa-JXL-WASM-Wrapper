@@ -63,9 +63,11 @@ export const masterInfoSchema = z.object({
 // `.passthrough()` keeps unknown master-level fields (e.g. future EXIF/GPS provenance sidecars).
 export const masterInfoV5Schema = masterInfoSchema
   .extend({
-    sourceFormat: z
-      .enum(["orf", "dng", "cr2", "jpg", "nef", "arw", "raf", "rw2", "pef", "srw", "x3f", "unknown"])
-      .optional(),
+    // finding 64 / I-2: sourceFormat records the DETECTED source format, decoupled from the closed
+    // `format` decoder-capability enum. A source variant the decoder cannot handle (e.g. "cr3") must
+    // still round-trip so provenance is never erased. Any non-empty string — matches the browser
+    // reader (jxl-pyramid manifest-validate.ts), which already accepts any non-empty sourceFormat.
+    sourceFormat: z.string().min(1).optional(),
   })
   .passthrough();
 
@@ -150,7 +152,9 @@ export const manifestSchemaV5 = z
     schema: z.literal(5),
     imageId: z.string().regex(/^[0-9a-f]{16}$/),
     master: masterInfoV5Schema,
-    orientation: orientationDescriptorSchema.optional(),
+    // M-2: REQUIRED on v5 (the writer and migration always emit an OrientationDescriptor). This
+    // aligns with the jxl-pyramid browser reader, which already requires it — no cross-parser gap.
+    orientation: orientationDescriptorSchema,
     width: z.number().int().positive().optional(),
     height: z.number().int().positive().optional(),
     aspect: z.number().finite().positive().optional(),
@@ -196,45 +200,6 @@ export type ManifestV5 = z.infer<typeof manifestSchemaV5>;
 //
 // v5 ADDITIVE shape (implemented above: masterInfoV5Schema / orientationDescriptorSchema /
 // tilingDescriptorSchema / manifestSchemaV5):
-//   - master.sourceFormat: detected provenance, independent of decoder support.
-//   - orientation: OrientationDescriptor { exif: 1..8; pixels: "source"|"baked-upright" }
-//     (replaces the v1-v4 "baked"|"source" string; migration maps the old string
-//      to { exif: 1, pixels: <string> } when no EXIF orientation is recorded).
-//   - level.tiling: TilingDescriptor
-//     { container: "jxtc"; version: 1|2; tileSize; bitsPerSample: 8|16; offsetBase: "file" }
-//     (JXTC index offsets are ABSOLUTE from byte zero of the file — see
-//      packages/jxl-pyramid/src/tiling.ts and bridge.cpp:1925-1931).
-//   - Migration is additive and MUST preserve unknown fields (migrate.ts MIG-2).
-
-/** The schema version this tool writes today. */
-export const CURRENT_MANIFEST_SCHEMA = 5 as const;
-
-/** Every schema version this tool can READ (and additively migrate forward). */
-export const READABLE_MANIFEST_SCHEMAS = [1, 2, 4, 5] as const;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MANIFEST SCHEMA VERSION POLICY — single source of truth (Packet-1, finding 65)
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// This block RECORDS the approved v5 policy for Packet 1. It does NOT yet
-// implement v5 parsing or migration — that lands in Task 4. Until then the
-// discriminated union above still tops out at schema 4, so the v5 contract
-// fixtures (packages/pyramid-ingest/test/fixtures/contracts) intentionally do not
-// yet parse; contract-compat.test.ts pins that intent.
-//
-// Compatibility table:
-//   schema  status     notes
-//   ------  ---------  --------------------------------------------------------
-//   1       readable   earliest; geometry/levels optional. Migrate → 5.
-//   2       readable   V3 Phase2 discriminated bump (current writer output pre-v5).
-//   3       skipped    never emitted; reject as unsupported.
-//   4       readable   index-norm additive (tiling grid, layout, qualityCurve).
-//   5       current    additive: OrientationDescriptor + TilingDescriptor,
-//                      sourceFormat decoupled from decoder capability.
-//   >5      reject     future major written by a newer tool; refuse, never
-//                      silently reinterpret bytes.
-//
-// v5 ADDITIVE shape (target; implemented in Task 4 — do not add here yet):
 //   - master.sourceFormat: detected provenance, independent of decoder support.
 //   - orientation: OrientationDescriptor { exif: 1..8; pixels: "source"|"baked-upright" }
 //     (replaces the v1-v4 "baked"|"source" string; migration maps the old string
@@ -335,10 +300,12 @@ export function parseManifest(text: string | Uint8Array): Manifest {
   return manifestSchema.parse(JSON.parse(text)) as Manifest;
 }
 
-/** Canonical LOSSLESS serialization of a manifest to JSON text. Preserves every field zod
- *  passed through (including unknown extension fields kept via `.passthrough()`), so writing a
- *  manifest with manifestToJson and re-reading it with parseManifest is a faithful round trip for
- *  the complete schema. This is the canonical persisted representation on `.json` paths. */
+/** Canonical VALUE-LOSSLESS serialization of a manifest to JSON text. Every field zod passed
+ *  through — including unknown extension fields kept via `.passthrough()` — is preserved by VALUE:
+ *  writing with manifestToJson and re-reading with parseManifest is a faithful round trip for the
+ *  complete schema. Note: only the VALUES are guaranteed; the emit order of unknown keys normalizes
+ *  on re-emit (JSON.stringify follows the object's own key order, not the original text's). This is
+ *  the canonical persisted representation on `.json` paths. */
 export function manifestToJson(manifest: Manifest, pretty = true): string {
   return JSON.stringify(manifest, null, pretty ? 2 : undefined);
 }

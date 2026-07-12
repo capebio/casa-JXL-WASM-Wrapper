@@ -63,17 +63,7 @@ export function createTtyTelemetry(opts = {}) {
                 }
             }
         },
-        event(type, data) {
-            // TTY-5: level-encoded events shown at -vv (showStages) so operators see per-level JXTC timing.
-            if (!showStages)
-                return;
-            if (type === "level-encoded" && data) {
-                const { w, h, bits, jxtcEncodeMs, jxtcKb } = data;
-                const kb = typeof jxtcKb === "number" ? jxtcKb.toFixed(1) : "?";
-                const ms = typeof jxtcEncodeMs === "number" ? Math.round(jxtcEncodeMs) : "?";
-                out.write(`[Level ${w}×${h} ${bits}b] jxtcEncodeMs=${ms} jxtcKb=${kb}\n`);
-            }
-        },
+        event() { }, // events go to json/runlog in CLI wrapper; tty silent
     };
 }
 //# sourceMappingURL=telemetry-tty.js.map

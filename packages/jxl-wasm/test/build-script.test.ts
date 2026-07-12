@@ -84,3 +84,64 @@ test("size report can request symbol maps and prints real rebuild command", () =
   expect(source).toContain('"--emit-symbol-map"');
   expect(source).toContain('formatBuildCommand(["--size-report"])');
 });
+
+// ---------------------------------------------------------------------------
+// Finding 23 (P0): build provenance wiring
+// ---------------------------------------------------------------------------
+
+test("provenance module is imported from provenance.mjs", () => {
+  // All three consumers must be imported: computeInputDigest (stamp), canMergePartialTier
+  // (merge guard), validateProvenance (release-dirty rejection).
+  expect(source).toContain('import { computeInputDigest, canMergePartialTier, validateProvenance } from "./provenance.mjs"');
+});
+
+test("getSourceInfo reads git HEAD + dirty status of the package tree", () => {
+  // Must resolve the package root's git HEAD (sourceCommit) and run git status --porcelain
+  // (sourceDirty). Falls back without throwing when git is unavailable.
+  expect(source).toContain("async function getSourceInfo()");
+  expect(source).toMatch(/git.*rev-parse.*HEAD/);
+  expect(source).toMatch(/git.*status.*--porcelain/);
+  expect(source).toMatch(/commit.*dirty|dirty.*commit/);
+});
+
+test("hashFile helper computes SHA-256 of file contents", () => {
+  expect(source).toContain("async function hashFile(");
+  expect(source).toMatch(/createHash.*sha256.*update.*digest.*hex/);
+});
+
+test("provenance inputs are computed per kind before the build matrix", () => {
+  // bridgeSourceHash and buildScriptHash are hashed once; exportsHash is per-kind.
+  expect(source).toContain("const bridgeSourceHash = await hashFile(");
+  expect(source).toContain("const buildScriptHash = await hashFile(");
+  expect(source).toContain("const exportsHashByKind = {}");
+  expect(source).toMatch(/exportsHashByKind\[kind\] = await hashFile\(/);
+});
+
+test("each tier entry is stamped with a complete provenance object", () => {
+  // The tier entry written to manifest.tiers[tierKey] must include a provenance field
+  // containing inputDigest (computed via computeInputDigest), sourceCommit, sourceDirty,
+  // libjxlCommit, libjxlDirty, toolchain, role, tier, and flags.
+  expect(source).toContain("const provenance = {");
+  expect(source).toContain("inputDigest: computeInputDigest(provenanceInputs)");
+  expect(source).toContain("sourceCommit: sourceInfo.commit");
+  expect(source).toContain("sourceDirty: sourceInfo.dirty");
+  expect(source).toContain("provenance");
+});
+
+test("validateProvenance is called per tier and rejects release builds with dirty source", () => {
+  // validateProvenance must be called after building provenance, before writing the manifest entry.
+  // The --release flag must be forwarded so release builds reject dirty source/libjxl.
+  expect(source).toMatch(/validateProvenance\(provenance,/);
+  expect(source).toMatch(/releaseMode.*process\.argv\.includes\(["']--release["']\)/);
+});
+
+test("partial-tier manifest merge uses canMergePartialTier to guard stale entries", () => {
+  // The writeManifest merge must NOT blindly spread existing tiers into the new manifest.
+  // It must check canMergePartialTier for each existing entry before keeping it.
+  // Legacy entries (no provenance) must be rejected by the guard.
+  expect(source).toContain("canMergePartialTier(existingEntry, incomingEntry)");
+  // A mismatch must warn (not silently keep the stale entry).
+  // The warn message may span lines (template literal + string concat), so search for the
+  // key phrase independently of the console.warn call site.
+  expect(source).toMatch(/stale tier entry/);
+});
