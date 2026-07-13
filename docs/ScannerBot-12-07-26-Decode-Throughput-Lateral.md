@@ -59,7 +59,7 @@ Fresh-context browser harness, 20.5 MP `P2200619-prog-p6-q85.jxl`:
 | ID | Hypothesis | State | Local delta | End-to-end delta | Parity |
 |---|---|---|---:|---:|---|
 | MT-1 | Match libjxl runner width to the four-thread Emscripten pool and charge that measured width to the scheduler | accepted | legacy width 0 hard-stalled past 65 s; fixed width 4 median 641.0 ms | 66.94% lower than SIMD fallback (1939.0 ms), paired n=12/arm, high-trust IQR | exact: hash 2196883031, 0 differing pixels |
-| DH-1 | Skip awaiting when browser decoder push() / close() return synchronously | accepted | feed-loop overhead median 6.496 ms -> 0.557 ms for 100k sync chunks, -91.42%, n=30/arm high-trust | not isolated in image decode; removes per-chunk worker microtask overhead on the JXL WASM facade path | protocol output unchanged; handler tests 22 pass |
+| DH-1 | Skip awaiting when final-only browser decoder push() / close() return synchronously | accepted | feed-loop overhead median 32.823 ms -> 3.093 ms for 500k sync chunks, -90.58%, n=20/arm high-trust | not isolated in image decode; removes per-chunk worker microtask overhead on the JXL WASM facade final path; progressive/early targets keep cooperative yields | protocol output unchanged; handler tests 23 pass |
 
 ## Rejections
 
