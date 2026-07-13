@@ -74,6 +74,39 @@ jobs:
       - name: run runner self-tests + workflow static test
         run: node --test tools/run-workspaces.test.mjs tools/verify-workflow.test.mjs
 
+  # ── Dist freshness — prevents "dist rebuild owed" ────────────────────────────
+  # If a PR changes the jxl-wasm C++ bridge or its export lists but does NOT rebuild
+  # the compiled dist/, the shipped WASM silently drifts from source — the recurring
+  # "dist rebuild owed" trap (the shipped codec ends up missing exports the source
+  # declares). Fail closed so the rebuild can't be forgotten.
+  dist-freshness:
+    name: dist rebuild owed check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: fail if bridge/exports changed without a matching dist rebuild
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            BASE="${{ github.event.before }}"
+          else
+            BASE="HEAD~1"
+          fi
+          echo "Comparing $BASE...HEAD"
+          CHANGED=$(git diff --name-only "$BASE"...HEAD 2>/dev/null || git diff --name-only "$BASE" HEAD)
+          SRC=$(echo "$CHANGED" | grep -E '^packages/jxl-wasm/src/bridge\.cpp$|^packages/jxl-wasm/exports-.*\.txt$' || true)
+          DIST=$(echo "$CHANGED" | grep -E '^packages/jxl-wasm/dist/jxl-core\..*\.(wasm|js)$|^packages/jxl-wasm/dist/build-manifest\.json$' || true)
+          if [ -n "$SRC" ] && [ -z "$DIST" ]; then
+            echo "::error::jxl-wasm bridge/exports changed but dist/ was not rebuilt — 'dist rebuild owed'."
+            echo "Changed source:"; echo "$SRC"
+            echo "Rebuild: node packages/jxl-wasm/scripts/build.mjs --host-toolchain --include-mt"
+            exit 1
+          fi
+          echo "OK: no bridge/exports change left without a matching dist rebuild."
+
   # ── Workspace unit tests ──────────────────────────────────────────────────────
   # Calls the authoritative root command: npm run test
   # The runner owns workspace discovery, topo ordering, and the omission guard
