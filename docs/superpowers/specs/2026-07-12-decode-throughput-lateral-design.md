@@ -1,7 +1,7 @@
 # Decode Throughput Lateral Optimization Design
 
-Date: 2026-07-12  
-Branch: `grok/decode-throughput-lateral-2`  
+Date: 2026-07-12
+Branch: `grok/decode-throughput-lateral-2`
 Base: `main` at `b8bfc5c2`
 
 ## Goal
