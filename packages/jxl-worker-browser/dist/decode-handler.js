@@ -309,7 +309,9 @@ export class DecodeHandler {
                 if (chunk === null)
                     break;
                 const t0 = performance.now();
-                await decoder.push(chunk);
+                const pushed = decoder.push(chunk);
+                if (pushed !== undefined)
+                    await pushed;
                 // Reuse the post-push timestamp for drain coalescing — avoids a
                 // redundant performance.now() call in maybePostDrain.
                 const now = performance.now();
@@ -318,7 +320,9 @@ export class DecodeHandler {
                 this.maybePostDrain(now);
             }
             if (this.inputClosed && !this.ended) {
-                await decoder.close();
+                const closed = decoder.close();
+                if (closed !== undefined)
+                    await closed;
                 return;
             }
         }

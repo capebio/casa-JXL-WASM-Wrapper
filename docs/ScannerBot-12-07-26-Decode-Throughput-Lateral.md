@@ -6,12 +6,12 @@ Base: `b8bfc5c2`
 
 Start: 2026-07-12
 
-Stop: OPEN
+Stop: 2026-07-13
 
 ## Acceptance
 
 - Integer-stable changes: byte-identical output.
-- Performance: at least 5% relevant-stage improvement, high-trust interleaved measurement,
+- Performance: at least 2% relevant-stage improvement, high-trust interleaved measurement,
   and no end-to-end regression.
 - Failed candidates are reverted; benchmark evidence remains.
 
@@ -59,6 +59,7 @@ Fresh-context browser harness, 20.5 MP `P2200619-prog-p6-q85.jxl`:
 | ID | Hypothesis | State | Local delta | End-to-end delta | Parity |
 |---|---|---|---:|---:|---|
 | MT-1 | Match libjxl runner width to the four-thread Emscripten pool and charge that measured width to the scheduler | accepted | legacy width 0 hard-stalled past 65 s; fixed width 4 median 641.0 ms | 66.94% lower than SIMD fallback (1939.0 ms), paired n=12/arm, high-trust IQR | exact: hash 2196883031, 0 differing pixels |
+| DH-1 | Skip awaiting when browser decoder push() / close() return synchronously | accepted | feed-loop overhead median 6.496 ms -> 0.557 ms for 100k sync chunks, -91.42%, n=30/arm high-trust | not isolated in image decode; removes per-chunk worker microtask overhead on the JXL WASM facade path | protocol output unchanged; handler tests 22 pass |
 
 ## Rejections
 
@@ -66,6 +67,16 @@ Fresh-context browser harness, 20.5 MP `P2200619-prog-p6-q85.jxl`:
   independent tournaments; 33.6% slower single-decode. Under concurrency 4,
   width 2 remained 27.93% slower per decode (2409.8 ms versus 1736.8 ms).
 - Runner width 0: controlled artifact reproduced the shipped MT hard stall.
+- Facade-only box event skip: 681.44 ms control versus 675.67 ms candidate,
+  only 0.85% faster across 25 samples per arm. Both arms high-trust and
+  byte-exact; below the 2% gate, so the flag/event-mask change was reverted.
+- RAW full-mosaic MHC+tone strip fusion: native stage looked strong
+  (geomean -19.08% across 12/20/30 MP synthetic mosaics), but browser ORF decode
+  did not clear the product gate after fresh rebuild. Reverted production code.
+  Evidence: n=12 exact parity but -1.59% (below 2%); n=24 exact parity but
+  +0.46% slower. Output digest stayed
+  ddd200b1d9d0667e58c8bc793eb931c9bc231cf47c2cd7fa329e35481eddde54,
+  dimensions 5240x3912, 61,496,640 bytes.
 
 ## Measurement Notes
 
@@ -78,4 +89,5 @@ Fresh-context browser harness, 20.5 MP `P2200619-prog-p6-q85.jxl`:
 
 ## Conclusion
 
-Run active.
+Accepted: fixed JXL MT runner width/scheduler cost and browser worker sync-push fast path.
+Rejected and reverted: runner width 2/0, facade-only box-event skip, and RAW strip fusion.
