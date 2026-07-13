@@ -215,7 +215,6 @@ test("deadline at the pre-rename publish boundary: manifest is never renamed in"
   // synchronous encode checkpoint has passed (plan fully built) and fires while applyIngestPlan is
   // awaiting its first fs op — i.e. exactly at the pre-rename publish boundary, not during encode.
   const callerAc = new AbortController();
-  let armed = false;
   const raw: RawBackend = {
     async decode(): Promise<DecodedMaster> {
       return { rgba: gradientRgba(300, 200), width: 300, height: 200, orientation: "baked" };
@@ -223,18 +222,20 @@ test("deadline at the pre-rename publish boundary: manifest is never renamed in"
   };
   const jxl: JxlBackend = {
     async encodePyramid() { return []; },
-    async encodeTileContainer(_rgba, w, h) {
-      // Arm the deferred abort exactly once, on the first (full-level) encode. setTimeout(0) cannot
-      // fire between the remaining synchronous plan-completion + entry checks, only once
-      // applyIngestPlan yields on an await — so the pre-rename publish gate is what catches it.
-      if (!armed) { armed = true; setTimeout(() => callerAc.abort(), 0); }
-      return new Uint8Array([0xA0, w & 0xff, h & 0xff]);
-    },
+    async encodeTileContainer(_rgba, w, h) { return new Uint8Array([0xA0, w & 0xff, h & 0xff]); },
     async downscaleRgba8(_rgba, _sw, _sh, dw, dh) { return new Uint8Array(dw * dh * 4); },
     async transcodeJpeg(b) { return b; },
     async decodeToRgba8(b) { return { rgba: b, width: 4, height: 3 }; },
   } as any;
-  const backends: Backends = { raw, jxl, signal: callerAc.signal, __testInProcess: true } as any;
+  // Deterministic pre-publish abort: fire on the "manifest-built" telemetry stage — the last stage
+  // before the publish gate (ingest.ts: throwIfAborted(sig, "publish")). This replaces a setTimeout(0)
+  // race that was platform-dependent: it passed on Windows but failed on Linux CI, where the
+  // all-microtask mock pipeline drained to completion before the macrotask fired, so the abort landed
+  // after publish and never triggered the gate (err was null).
+  const backends: Backends = {
+    raw, jxl, signal: callerAc.signal, __testInProcess: true,
+    telemetry: { stage(name: string) { if (name === "manifest-built") callerAc.abort(); } },
+  } as any;
 
   const err = await ingestImage(master, backends, { outDir: out, tiling: "tile-all" }).then(() => null, (e) => e);
 

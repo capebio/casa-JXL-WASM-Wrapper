@@ -57,8 +57,8 @@ export function prepareDecodePlan(source: LevelSource, region: ImageRegion): Dec
     core = {
       header, bits, format, bpp: bppOfFormat(format),
       decodeRegion: bits === 16 ? REGION_DECODER_RGBA16 : REGION_DECODER_RGBA8, // F6 unchanged
-      lastRegion: undefined,
-      lastPlan: undefined,
+      // exactOptionalPropertyTypes: leave lastRegion/lastPlan ABSENT (not explicit `undefined`);
+      // both are populated on the first repeat-viewport call below. Absent === undefined at runtime.
     };
     coreMemo.set(source, core);
   }

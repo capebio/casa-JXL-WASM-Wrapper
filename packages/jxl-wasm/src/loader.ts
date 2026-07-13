@@ -49,7 +49,7 @@ export async function loadJxlModule(manifest: JxlWasmManifest, options: LoaderOp
 async function loadNodeModule(manifest: JxlWasmManifest, options: LoaderOptions): Promise<WebAssembly.Module> {
   const fs = options.nodeFs ?? (await import("node:fs/promises"));
   const wasmUrl = options.wasmUrl ?? manifest.wasmUrl;
-  const bytes = await fs.readFile(await resolveNodeWasmUrl(wasmUrl ?? ""), { signal: options.signal });
+  const bytes = await fs.readFile(await resolveNodeWasmUrl(wasmUrl ?? ""), { ...(options.signal ? { signal: options.signal } : {}) });
   return WebAssembly.compile(bytes as BufferSource);
 }
 
