@@ -1,10 +1,14 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+// Depend on the SHIPPED, committed RAW module (web/pkg) rather than the gitignored wasm-pack
+// intermediate (/pkg). web/pkg is the canonical `--target web` build (identical API: process_orf/
+// dng/cr2, default init with { module_or_path }); this resolves in a clean clone / CI so typecheck
+// can gate. Runtime is unchanged in shape — same functions, same ProcessResult.
 import init, {
   process_orf,
   process_dng,
   process_cr2,
-} from "../../../pkg/raw_converter_wasm.js";
+} from "../../../web/pkg/raw_converter_wasm.js";
 import type { DecodedMaster, RawBackend, RawFormat } from "./backends.js";
 import { throwIfAborted } from "./abort.js";
 
@@ -17,7 +21,7 @@ async function ensureWasm(): Promise<void> {
     initPromise = (async () => {
       // Dynamic to keep load async (no block worker thread) and singleton guard prevents double wasm read+init under any interleaving.
       const { readFile } = await import("node:fs/promises");
-      const url = new URL("../../../pkg/raw_converter_wasm_bg.wasm", import.meta.url);
+      const url = new URL("../../../web/pkg/raw_converter_wasm_bg.wasm", import.meta.url);
       const bytes = await readFile(fileURLToPath(url));
       await init({ module_or_path: bytes });
       initialized = true;
