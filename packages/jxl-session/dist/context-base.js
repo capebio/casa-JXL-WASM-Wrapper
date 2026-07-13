@@ -56,6 +56,8 @@ function defaultCapabilities() {
         libjxlVersion: "unknown",
     };
 }
+// Must match the measured decoder runner width in packages/jxl-wasm.
+export const DECODER_MT_WORKER_COST = 4;
 export function computeWorkerCostForWasmUrl(url) {
     if (!url)
         return 1;
@@ -63,7 +65,7 @@ export function computeWorkerCostForWasmUrl(url) {
         const u = new URL(url, "https://dummy.invalid");
         const tier = u.searchParams.get("jxlWorkerTier");
         if (tier === "relaxed-simd-mt" || tier === "simd-mt") {
-            return defaultCoreBudgetCapacity();
+            return Math.min(defaultCoreBudgetCapacity(), DECODER_MT_WORKER_COST);
         }
     }
     catch {

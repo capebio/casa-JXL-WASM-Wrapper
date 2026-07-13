@@ -244,15 +244,26 @@ static void FreeBufferNoChain(JxlWasmBuffer* buf) {
 // Only active on threaded builds (-pthread / __EMSCRIPTEN_PTHREADS__).
 // Cached as a module-level singleton: creating a runner is expensive (~50 ms).
 #ifdef __EMSCRIPTEN_PTHREADS__
+#ifndef JXL_WASM_DEC_RUNNER_WORKERS
+#define JXL_WASM_DEC_RUNNER_WORKERS 0
+#endif
+
+static size_t DecoderRunnerWorkerCount() {
+#if JXL_WASM_DEC_RUNNER_WORKERS > 0
+  return static_cast<size_t>(JXL_WASM_DEC_RUNNER_WORKERS);
+#else
+  return JxlThreadParallelRunnerDefaultNumWorkerThreads();
+#endif
+}
+
 static void* g_parallel_runner = nullptr;
 static void* GetSharedRunner() {
   if (g_parallel_runner == nullptr) {
-    // Pre-warmed Emscripten pool is sized to navigator.hardwareConcurrency
-    // (-sPTHREAD_POOL_SIZE in build.mjs); request the matching default worker
-    // count so libjxl uses those warm threads instead of running serially.
-    // Creating threads beyond the pool would deadlock: the worker thread is
-    // blocked synchronously in decode and cannot service new pthread spawns.
-    size_t workers = JxlThreadParallelRunnerDefaultNumWorkerThreads();
+    // Decoder artifacts compile the measured width to match their pre-warmed
+    // pool. Encoder artifacts leave the macro at zero and retain libjxl's
+    // hardware default. Exceeding the pre-warmed decoder pool can deadlock
+    // because the calling worker cannot service new pthread spawns.
+    size_t workers = DecoderRunnerWorkerCount();
     g_parallel_runner = JxlThreadParallelRunnerCreate(nullptr, workers);
   }
   return g_parallel_runner;

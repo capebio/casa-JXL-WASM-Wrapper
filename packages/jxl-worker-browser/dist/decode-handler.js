@@ -290,6 +290,7 @@ export class DecodeHandler {
         return this.chunkQueue.shift();
     }
     async feedDecoder(decoder) {
+        const finalOnly = this.opts.progressionTarget === "final" && !this.opts.emitEveryPass;
         while (!this.ended) {
             if (this.paused) {
                 await this.waitForResume();
@@ -309,7 +310,11 @@ export class DecodeHandler {
                 if (chunk === null)
                     break;
                 const t0 = performance.now();
-                await decoder.push(chunk);
+                const pushed = decoder.push(chunk);
+                if (pushed !== undefined)
+                    await pushed;
+                else if (!finalOnly)
+                    await Promise.resolve();
                 // Reuse the post-push timestamp for drain coalescing — avoids a
                 // redundant performance.now() call in maybePostDrain.
                 const now = performance.now();
@@ -318,7 +323,11 @@ export class DecodeHandler {
                 this.maybePostDrain(now);
             }
             if (this.inputClosed && !this.ended) {
-                await decoder.close();
+                const closed = decoder.close();
+                if (closed !== undefined)
+                    await closed;
+                else if (!finalOnly)
+                    await Promise.resolve();
                 return;
             }
         }

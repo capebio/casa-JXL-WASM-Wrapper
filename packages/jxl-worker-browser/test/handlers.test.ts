@@ -348,6 +348,46 @@ describe("browser codec handlers", () => {
     expect(ended).toEqual(["early-progress-target"]);
   });
 
+  test("decode handler preserves cooperative yields for header-only sync decoders", async () => {
+    const messages: WorkerToMainMessage[] = [];
+    const ended: string[] = [];
+    const pushed: number[] = [];
+    installWorkerPostMessage(messages);
+
+    const info = {
+      width: 1, height: 1, bitsPerSample: 8,
+      hasAlpha: true, hasAnimation: false, jpegReconstructionAvailable: false,
+    };
+    const codec = {
+      createDecoder() {
+        return {
+          push(chunk: ArrayBuffer) { pushed.push(chunk.byteLength); },
+          close() {},
+          cancel() {},
+          dispose() {},
+          async *events() {
+            while (pushed.length === 0) await Promise.resolve();
+            yield { type: "header", info };
+          },
+        };
+      },
+    };
+
+    const handler = new DecodeHandler(
+      { ...baseDecodeStart, sessionId: "header-sync-yield", progressionTarget: "header" },
+      codec as never,
+      { onSessionEnd: (sessionId) => ended.push(sessionId) },
+    );
+    for (let i = 0; i < 5; i++) handler.onChunk(new Uint8Array([i + 1]).buffer);
+    handler.onClose();
+
+    await waitFor(() => ended.length === 1);
+
+    expect(messages.some((msg) => msg.type === "decode_header")).toBe(true);
+    expect(pushed.length < 5).toBe(true);
+    expect(ended).toEqual(["header-sync-yield"]);
+  });
+
   test("decode handler checks budget before touching progress pixels", async () => {
     const messages: WorkerToMainMessage[] = [];
     const ended: string[] = [];
