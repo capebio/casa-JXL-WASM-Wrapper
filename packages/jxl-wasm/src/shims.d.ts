@@ -11,3 +11,12 @@ declare module "node:fs/promises" {
 declare module "node:url" {
   export function fileURLToPath(url: string | URL): string;
 }
+
+// Browser-safe ambient for Node detection / DEV flags. The loader + facade only touch `process`
+// behind `typeof process !== "undefined"` guards (Node-vs-browser branch, NODE_ENV DEV checks).
+// Declaring the minimal shape here keeps the browser tsconfig lib clean (no @types/node, no `node`
+// in `types`) while satisfying strict name resolution. Keep in sync with actual usage.
+declare const process: {
+  env?: Record<string, string | undefined>;
+  versions?: { readonly node?: string };
+} | undefined;

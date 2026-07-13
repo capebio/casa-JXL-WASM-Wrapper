@@ -89,7 +89,7 @@ export function selectCarrier(input: {
 }
 
 // Grok3 #16 single transition fn with table. Invalid throws in dev.
-const ALLOWED_TRANSITIONS: Record<HandleState, Record<HandleState, boolean>> = {
+const ALLOWED_TRANSITIONS: Record<HandleState, Partial<Record<HandleState, boolean>>> = {
   [HandleState.WarmFloor]: { [HandleState.Active]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },
   [HandleState.WarmReapable]: { [HandleState.Active]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },
   [HandleState.Active]: { [HandleState.WarmReapable]: true, [HandleState.Bad]: true, [HandleState.Terminated]: true },

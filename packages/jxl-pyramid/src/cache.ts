@@ -41,7 +41,7 @@ let idCounter = 0;
 // Defensive check: cache module assumes single-realm execution (main thread only).
 // If this is imported in a worker or shared across realms, idCounter and WeakMaps will be unsynchronized.
 // Use makeLevelCacheKey(contenthash) for multi-realm scenarios.
-if (typeof WorkerGlobalScope !== "undefined") {
+if (typeof (globalThis as { WorkerGlobalScope?: unknown }).WorkerGlobalScope !== "undefined") {
   console.warn(
     "cache.ts loaded in worker context; level IDs may conflict. Use contenthash-based cache keys instead.",
   );
