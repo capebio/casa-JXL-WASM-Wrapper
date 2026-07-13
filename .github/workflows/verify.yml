@@ -98,8 +98,8 @@ jobs:
           restore-keys: |
             node22-npm-
       - uses: oven-sh/setup-bun@v2
-      - name: install dependencies
-        run: npm ci --ignore-scripts
+      - name: install dependencies (bun — packages use the workspace:* protocol npm rejects)
+        run: bun install
       - name: npm run test (all workspaces, omission-guarded)
         run: npm run test
 
@@ -122,8 +122,9 @@ jobs:
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
-      - name: install dependencies
-        run: npm ci --ignore-scripts
+      - uses: oven-sh/setup-bun@v2
+      - name: install dependencies (bun — packages use the workspace:* protocol npm rejects)
+        run: bun install
       - name: npm run typecheck (all workspaces)
         run: npm run typecheck
 
@@ -154,8 +155,9 @@ jobs:
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
-      - name: install dependencies (with scripts for node-gyp / jxl-native)
-        run: npm ci
+      - uses: oven-sh/setup-bun@v2
+      - name: install dependencies (bun — packages use the workspace:* protocol npm rejects)
+        run: bun install
       - name: npm run build (all workspaces)
         run: npm run build
 
@@ -201,8 +203,9 @@ jobs:
           key: node22-npm-${{ hashFiles('package-lock.json', 'bun.lock', 'tools/run-workspaces.mjs') }}
           restore-keys: |
             node22-npm-
-      - name: install dependencies
-        run: npm ci --ignore-scripts
+      - uses: oven-sh/setup-bun@v2
+      - name: install dependencies (bun — packages use the workspace:* protocol npm rejects)
+        run: bun install
       - name: run node-safe web tests (auto-discovered)
         run: |
           # tools/discover-node-tests.mjs classifies every *.test.mjs / *.test.js under
@@ -244,6 +247,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - uses: oven-sh/setup-bun@v2
+      - name: install dependencies (bun — packages use the workspace:* protocol npm rejects)
+        run: bun install
       - name: run benchmark smoke tests (auto-discovered, deterministic, no timing)
         # tools/discover-node-tests.mjs classifies every *.test.mjs / *.test.js under
         # benchmark/ (including benchmark/test/ and benchmark/optimize/test/).
