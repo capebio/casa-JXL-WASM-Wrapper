@@ -239,7 +239,7 @@ function validateLevel(v: unknown, path: string, schema: number): PyramidLevel {
     level.qualityCurve = arr.map((pt, i) => {
       const p = requireObject(pt, `${path}.qualityCurve[${i}]`);
       const ptBytes = requireNumber(p["bytes"], `${path}.qualityCurve[${i}].bytes`);
-      const point: PyramidLevel["qualityCurve"] extends Array<infer T> ? T : never = { bytes: ptBytes };
+      const point: NonNullable<PyramidLevel["qualityCurve"]>[number] = { bytes: ptBytes };
       if (p["ssim"] !== undefined) (point as any).ssim = requireNumber(p["ssim"], `${path}.qualityCurve[${i}].ssim`);
       if (p["butteraugli"] !== undefined) (point as any).butteraugli = requireNumber(p["butteraugli"], `${path}.qualityCurve[${i}].butteraugli`);
       return point as NonNullable<PyramidLevel["qualityCurve"]>[number];
@@ -315,8 +315,8 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
 
   // Sizes must be strictly ascending numerically, with "full" last.
   for (let i = 1; i < levels.length; i++) {
-    const prev = levels[i - 1].size;
-    const curr = levels[i].size;
+    const prev = levels[i - 1]!.size;
+    const curr = levels[i]!.size;
     if (prev === "full") {
       // "full" at i-1 means i-1 was not the last — report at the "full" level's path
       fail(`manifest.levels[${i - 1}].size`, `"full" must be the last level`);
@@ -334,10 +334,13 @@ export function parsePyramidManifest(json: unknown): PyramidManifest {
     height,
     aspect,
     levels,
-    // schema 1 normalization defaults
-    stub: schema === 1 ? false : (typeof o["stub"] === "boolean" ? o["stub"] : undefined),
-    proxy: schema === 1 ? false : (typeof o["proxy"] === "boolean" ? o["proxy"] : undefined),
   };
+  // schema 1 normalization defaults. exactOptionalPropertyTypes: assign only when defined so an
+  // omitted stub/proxy stays ABSENT rather than explicit `undefined` (JSON-identical, contract-safe).
+  const stubVal = schema === 1 ? false : (typeof o["stub"] === "boolean" ? o["stub"] : undefined);
+  if (stubVal !== undefined) result.stub = stubVal;
+  const proxyVal = schema === 1 ? false : (typeof o["proxy"] === "boolean" ? o["proxy"] : undefined);
+  if (proxyVal !== undefined) result.proxy = proxyVal;
 
   if (o["producedBy"] !== undefined) result.producedBy = validateProducedBy(o["producedBy"], "manifest.producedBy");
   if (o["metadata"] !== undefined) { result.metadata = sanitizeOpaqueObject(requireObject(o["metadata"], "manifest.metadata"), "manifest.metadata"); }
