@@ -10,8 +10,58 @@ output-changing candidates are logged, not landed.
 
 **Net result: no candidate cleared the gate; nothing shippable was landed.** One material
 new finding surfaced (a ±1-LSB divergence between the shipped `dec.<tier>` and `enc.<tier>`
-WASM builds) that **blocks** the handoff's headline candidate and warrants a build
-reconciliation by the owner. Details below.
+WASM builds). See the correction below for what it actually means.
+
+---
+
+## CORRECTION (follow-up in the same session — supersedes the "enc may be buggy / unblock = rebuild" framing below)
+
+A reference-oracle arbitration and a re-measurement changed three conclusions. Read this
+first; the sections further down are the original notes and are partly superseded here.
+
+1. **The shipping decoder (`enc.<tier>`) is CONFORMANT — there is no production decode bug.**
+   Encoded a synthetic image losslessly with an *independent* reference (upstream libjxl via
+   `@jsquash/jxl 1.3.0`), then decoded it through all builds:
+   - our `enc.simd` vs original → **EXACT** (perfect lossless reconstruction)
+   - our `dec.simd` vs original → **EXACT**
+   - `@jsquash` reference vs original → **±1 on ~0.1% of channels** — i.e. the *reference*
+     is the rounder, not us. The earlier "enc may be the buggy outlier" read was wrong.
+
+2. **The ±1 divergence was `main`'s STALE `dec` artifact, not a "needs a rebuild" blocker —
+   parity-clean `dec` already exists.** The `623abb8d` (2026-07-07) build compiled `enc` and
+   `dec` from the *same* libjxl source; those decode **byte-identical** (verified on
+   `bench-pyramid-toggle-apples`, all fixtures + the lossy photo). `main`'s `b8bfc5c2`
+   (2026-07-12) rebuild of *only* `dec` from a different source is what introduced the ±1.
+   So R1 below ("rebuild dec+enc from the same source") is mis-stated: same-source dec already
+   exists; `main`'s newer dec is the regression. And since the role loader has no production
+   caller, `main`'s divergent dec is **unwired → harmless** today.
+
+3. **Even with a parity-clean `dec`, candidate 3 is net-negative for the primary workload —
+   no win, throughput OR footprint.** Re-measured `enc.simd` vs the parity-clean `dec.simd`
+   (cold instantiate + first-decode, interleaved, warmup-discard):
+
+   | image | enc.simd | dec.simd | Δ | module bytes |
+   |---|---|---|---|---|
+   | small (thumbnail) | 15.9 ms | 7.8 ms | **−51%** (dec wins, instantiate-bound) | enc 3.07MB / dec 1.06MB (−65%) |
+   | large (1.1MB q85) | 2131 ms | 2311 ms | **+8.5%** (dec loses) | — |
+
+   The decode-only build's kernels decode **~8% slower on large images** (consistent across two
+   independent dec builds). The app's main path is full-res/large → wiring decoder→dec would
+   **regress it ~8%**. The MT "641 ms" win was threading (runner-width alignment), already in
+   the `enc` path — the split adds no decode speed.
+
+   The narrow gain (small-image cold-start + −65% module memory) **has no clean home**:
+   - RAW thumbnails (the dominant many-small-images case) run on the **RAW pipeline WASM**
+     (`raw_converter_wasm`), not libjxl — `dec.<tier>` is irrelevant to them.
+   - Every JXL decode context (`web/jxl-decode-worker.js`, `web/lightbox/tiled-decode-worker.js`)
+     is general-purpose (preview + full) and `preloadJxlModule()`s the `enc` superset at
+     startup, so adding `dec` for previews loads **both** modules (+memory, no cold win);
+     switching a whole worker to `dec` costs the −8% large-decode penalty (and ±1) on the full
+     view.
+
+   **Bottom line: no shippable win. Candidates 1 and 3 are genuinely dead for this codebase's
+   decode paths as they stand.** The durable value is the knowledge above: conformant shipping
+   decoder; stale-but-unwired `main` dec; dec-only decode ~8% slower on large images.
 
 ---
 
@@ -168,12 +218,15 @@ candidate-1 case, already rejected. Not pursued.
 
 ## Recommendations
 
-- **R1 (unblocks candidate 3):** rebuild `dec.<tier>` and `enc.<tier>` from the **same**
-  libjxl source/flags so their decode output is byte-identical (verify with
-  `dec-vs-enc-parity-repro.mjs` → all MATCH). Then wiring the facade decoder to `dec.<tier>`
-  (esp. `dec.simd-mt` in the browser) can land with true parity, capturing both the
-  cold-start size win (−71% bytes) **and** the prior agent's MT decode-speed win. Until then,
-  keep the decoder on `enc.<tier>`.
+- **R1 (superseded by the correction — candidate 3 is dead, not just blocked):** wiring the
+  facade decoder to `dec.<tier>` is **not** worth pursuing even with parity-clean artifacts.
+  Parity is achievable (the `623abb8d` same-source `dec` byte-matches `enc`; it's `main`'s
+  `b8bfc5c2` dec rebuild that diverges ±1), but the decode-only build is **~8% slower on
+  large-image decode** — the app's primary path — and its cold-start/memory win has no clean
+  home (RAW thumbnails don't use libjxl; JXL workers already preload the `enc` superset). Keep
+  the decoder on `enc.<tier>`. The one hygiene action worth taking: either revert `main`'s
+  `dec.<tier>` to the same-source `623abb8d` build or rebuild it from `enc`'s source, so the
+  shipped-but-unwired `dec` artifacts stop being a ±1 trap for any future caller.
 - **R2:** if you want to revisit candidate 1, run a fresh `flipflopdom` RAW-pool sweep on the
   current corpus at topologies {12×12=144 (current), 12×2, 12×1, 4×1 (proposed)}, batch and
   single-image separately, output-checksum-gated. Expect 144 to win batch.
