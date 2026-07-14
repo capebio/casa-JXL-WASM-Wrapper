@@ -62,6 +62,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
 
 [[package]]
+name = "bliss-core"
+version = "0.1.0"
+
+[[package]]
+name = "bltv"
+version = "0.1.0"
+dependencies = [
+ "bliss-core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,6 +487,8 @@ dependencies = [
 name = "raw-converter-wasm"
 version = "0.1.0"
 dependencies = [
+ "bliss-core",
+ "bltv",
  "js-sys",
  "raw-pipeline",
  "rayon",

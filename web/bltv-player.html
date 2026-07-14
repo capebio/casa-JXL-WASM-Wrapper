@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LT2V Player</title>
+<title>BLTV Player</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; background: #0e0e0e; color: #e7e9ec; font: 14px/1.5 system-ui, sans-serif; }
@@ -50,10 +50,10 @@
 <body>
 
 <div id="header">
-  <h1>LT2V Player</h1>
-  <button id="pick">Open .lt2v file</button>
-  <input id="file-input" type="file" accept=".lt2v" style="display:none">
-  <span id="status">No file loaded — click Open or drag-drop a .lt2v file.</span>
+  <h1>BLTV Player</h1>
+  <button id="pick">Open .bltv file</button>
+  <input id="file-input" type="file" accept=".bltv" style="display:none">
+  <span id="status">No file loaded — click Open or drag-drop a .bltv file.</span>
 </div>
 
 <div id="main">
@@ -234,7 +234,7 @@ async function loadFile(file) {
   status.textContent = `Loading ${file.name} (${fmtSize(file.size)})…`;
   const data = new Uint8Array(await file.arrayBuffer());
 
-  worker = new Worker('../web/lt2v-worker.js', { type: 'module' });
+  worker = new Worker('../web/bltv-worker.js', { type: 'module' });
 
   worker.onmessage = (e) => {
     const msg = e.data;

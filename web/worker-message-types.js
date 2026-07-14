@@ -25,6 +25,7 @@ export const WorkerMsg = Object.freeze({
     PRELOAD:              'preload',
 
     // worker -> main (responses / progress)
+    BLISS_READY:    'bliss_ready',
     THUMB:          'thumb',
     LIGHTBOX:       'lightbox',
     LIGHTBOX_LIVE:  'lightbox_live',
