@@ -1,0 +1,336 @@
+<html><title>Lossless Photo Compression Benchmark</title>
+<body><center><h2>Lossless Photo Compression Benchmark</h2>updated on 14-Sept-2022<br>
+(c) Alex Rhatushnyak</center>
+<br>
+The results presented in this benchmark are free for scientific, commercial or private use, under the sole restriction of mentioning the source (this page).<br>
+All images are <a href=LPCB-data.html>24-bit RGB</a>, pages for <a href=http://web.archive.org/web/20140212141925/http://cdb.paradice-insight.us/?stats=clss&preset=1>8-bit</a>, 16, 32 and 48-bit images may be added later.
+<pre>
+<b>About test data.</b> Six sets with 107 images totalling 3.5 gigabytes:
+62 images (2254 MB) from <a href=http://photographyblog.com>http://photographyblog.com</a> and
+45 images (1208 MB) from <a href=http://photojournal.jpl.nasa.gov>http://photojournal.jpl.nasa.gov</a>. <a href=LPCB-data.html>More details on test data</a>.
+
+Notes:
+Click on <a href=list-gra111.txt>compressed sizes</a> for details. <b><font color=#ff0000>Red bold</font></b> value indicates that no compressor with higher quality is faster.
+
+<hr><b>Compressed         Compression    Decompression   Command line
+size</b>, bytes, %     <b>time</b>, seconds  <b>time</b>, seconds    (program and options)
+ <a href=paq8px_v206_lpcb_log.txt>906255650</a>  99.94<b><font color=#ff0000>   1653046       1710871   </font></b>     <i>(<a href=https://encode.su/threads/2325-Lossless-Photo-Compression-Benchmark?p=74354&viewfull=1#post74354>tested by Zoltan Gotthardt</a>)</i> paq8px_206.exe -9L $1.ppm
+ <a href=cmix-v16-tsv.txt      >906796260</a> 100.00   7936821       7890616        <i>(<a href=https://encode.su/threads/2325-Lossless-Photo-Compression-Benchmark?p=58335&viewfull=1#post58335>tested by the author of cmix</a>)</i> cmix -c $1.ppm $1.cmix
+ <a href=list-gra111.txt       >971986179</a> 107.18<b><font color=#ff0000>      1734.48       1897.09</font></b>     Gralic c %1.gra111 %1.ppm
+ <a href=list-bmf-s-q9.txt     >995740780</a> 109.80     11724.74       3051.34     bmf -s -q9 %1.ppm
+ <a href=list-bmf-s.txt        >996947712</a> 109.94      3678.03       3038.85     bmf -s %1.ppm
+<a href=list-zpaq.txt         >1012198342</a> 111.62     14338.27      14436.08     zpaq -mbmp_j4 c %1 %1.bmp
+<a href=list-flic21.txt       >1038434818</a> 114.51<b><font color=#ff0000>       209.85        231.50</font></b>     Flic c %1.flic21 %1.ppm
+<a href=list-sit2.txt         >1042883071</a> 115.00     ~3400         ~3400        (StuffIt Deluxe) console_stuffEN.exe /c -o --quiet --recompression-level=2 %1.bmp
+<a href=list-sit1.txt         >1046636212</a> 115.42     ~2670         ~2730        (StuffIt Deluxe) console_stuffEN.exe /c -o --quiet --recompression-level=1 %1.bmp
+<a href=list-sit0.txt         >1078284862</a> 118.91     ~1346         ~1347        (StuffIt Deluxe) console_stuffEN.exe /c -o --quiet --recompression-level=0 %1.bmp
+
+<a href=list-rkx.txt          >1089342602</a> 120.13      3853.10       2057.10     rkim cx %1.tga %1.rkx
+<a href=list-flif-E100.txt    >1126954659</a> 124.27     13390           716        <i>(64-bit Linux)</i> flif -e -N --effort=100 $1.ppm -o $1.flif-E100
+<a href=list-flif-N.txt       >1128702803</a> 124.47      7221           706        <i>(64-bit Linux)</i> flif -e -N $1.ppm -o $1.flif-N
+<a href=list-uhm.txt          >1131735795</a> 124.80      1756.70       1861.66     uhic m %1.bmp %1.uhm
+<a href=list-bmf.txt          >1139392552</a> 125.65       417.91        269.95     bmf %1.ppm
+<a href=list-rki.txt          >1141690596</a> 125.90      1390.06       1635.29     rkim c  %1.tga %1.rki
+<a href=list-bim3.txt         >1141833624</a> 125.91       369.13        356.59     bim c %1.ppm %1.bm3
+<a href=list-zcm.txt          >1149113301</a> 126.72       761.39        611.03     zcm a -m7 %1.zcm %1.ppm
+<a href=list-qlic2.txt        >1151144436</a> 126.94        <b><font color=#ff0000>40.31         34.08</font></b>     Qlic2 c %1.qlic2 %1.ppm
+<a href=list-py5.txt          >1152493991</a> 127.09      2502.29        566.23     (Pyramid Workshop) cbtpc -lv 8 -p 5 -c 65 %1.ppm %1.py5
+<a href=list-uhi.txt          >1154592106</a> 127.32       884.11        966.50     uhic e %1.bmp %1.uhi
+<a href=list-nk.txt           >1162946359</a> 128.24      2198.68        578.54     nk /s %1.bmp
+<a href=list-bci.txt          >1179957421</a> 130.12       832.30        167.29     bcif %1.bmp -c %1.bci
+<a href=list-cwebp-q100-m6.txt>1194936668</a> 131.77      8015            39.54     <i>(64-bit Linux)</i> cwebp -lossless -q 100 -m 6 $1.png -o $1.cwebp
+<a href=list-wic.txt          >1204711066</a> 132.85       465.47        525.43     wic c %1.bmp
+<a href=list-jxt0.txt         >1210043117</a> 133.44       314.55        267.99     JpegXT_gpl -ls 0 -cls %1.ppm %1.jxt0
+<a href=list-cwebp-q100.txt   >1222290070</a> 134.79      1653            35.78     <i>(64-bit Linux)</i> cwebp -lossless -q 100 $1.png -o $1.cwbp
+<a href=list-dli.txt          >1224419506</a><i> 135.02      1771.30        499.69     <a href=mse-dli.txt>(lossy)</a> dli c -q 100 -qc 80 -ac+ %1.ppm %1.dli</i>
+<a href=list-qli.txt          >1230795584</a> 135.73        <b><font color=#ff0000>38.39</font></b>         43.20     Qlic c %1.qli %1.ppm
+<a href=list-lsp_.txt         >1239884576</a> 136.73       173.31        230.86     lsp %1.ppm
+<a href=list-jpeg.txt         >1245914178</a><i> 137.39       176.91         66.93     <a href=mse-jpg.txt>(lossy JPEG)</a> NConvert -out jpeg -q 100 -subsampling 2 -opthuff %1.ppm</i>
+<a href=list-jpc.txt          >1247343688</a> 137.55       381.56        373.81     (LuraWave JPEG-2000) NConvert -out lwfjpc %1.ppm
+<a href=list-kdu.txt          >1247354537</a> 137.55       312.77        273.03     (Kakadu) kdu_compress -i %1.ppm -o %1.kdu Creversible=yes -quiet
+<a href=list-jpr.txt          >1247389133</a> 137.56       605.57        554.72     JasPer --input %1.ppm --input-format pnm --output %1.jpr --output-format jpc
+<a href=list-j2k.txt          >1247396798</a> 137.56      1849.07       1674.81     (OpenJPEG) image_to_j2k -i %1.ppm -o %1.j2k
+<a href=list-nz1.txt          >1275559788</a> 140.66      1269.50       1140.48     NanoZip a -m1g -cc %1.nz1 %1.ppm
+<a href=list-flif-E0.txt      >1283324851</a> 141.52       491           342        <i>(64-bit Linux)</i> flif -e -N --effort=0   $1.ppm -o $1.flif-E0
+<a href=list-qic.txt          >1285421855</a> 141.75        <b><font color=#ff0000>22.10         19.74</font></b>     Qic c %1.qic %1.ppm
+<a href=list-pgf.txt          >1290281728</a> 142.29       448.06        332.06     PGF -e %1.ppm %1.pgf
+<a href=list-loc.txt          >1293857955</a> 142.68       188.51        205.06     (JPEG-LS) locoe %1.ppm -o%1.loc
+<a href=list-chs.txt          >1293858918</a> 142.68       106.40         92.36     (JPEG-LS) CharLS -encodepnm %1.ppm %1.chs
+<a href=list-lr8.txt          >1299728137</a> 143.33       138.23        170.08     libra8 c %1.ppm %1.lr8 0
+<a href=list-lspf.txt         >1301083155</a> 143.48       131.05        179.92     lsp -f %1.ppm
+<a href=list-pyr.txt          >1308370225</a> 144.28       700.03        419.72     (Pyramid Workshop) cbtpc %1.ppm %1.pyr
+<a href=list-lspg.txt         >1320702831</a> 145.64       173.20        235.26     lsp -g %1.ppm
+<a href=list-uha-mx.txt       >1327774201</a> 146.42      3870.06       3456.27     uharc a -mx -md32768 %1.uha-mx  %1.ppm
+<a href=list-uha-mx-.txt      >1328708769</a> 146.52      3700.69       3313.41     uharc a -mx -md-     %1.uha-mx- %1.ppm
+<a href=list-apt.txt          >1331109154</a> 146.79      1664.23        333.05     capt %1.ppm %1.apt 100
+<a href=list-ppn.txt          >1338137564</a> 147.56      1067.99       1135.89     packPNM_10e %1.ppm
+<a href=list-uha-m3.txt       >1339149175</a> 147.67      4275.11        501.06     uharc a -m3 -md32768 %1.uha-m3  %1.ppm
+<a href=list-uha-m2.txt       >1341192869</a> 147.90      4110.98        501.49     uharc a -m2 -md32768 %1.uha-m2  %1.ppm
+<a href=list-uha-m1.txt       >1342696887</a> 148.07      3758.73        501.86     uharc a -m1 -md32768 %1.uha-m1  %1.ppm
+<a href=list-jpg.txt          >1348855983</a><i> 148.74       140.09         67.53     <a href=mse-jpg.txt>(lossy JPEG)</a> NConvert -out jpeg -q 100 -subsampling 2 %1.ppm</i>
+<a href=list-sid.txt          >1349164676</a> 148.78      ~696          ~768        GeoExpress 8
+<a href=list-uha-m3-.txt      >1354406543</a> 149.36       979.37        513.97     uharc a -m3 -md-     %1.uha-m3- %1.ppm
+<a href=list-uha-m2-.txt      >1354418303</a> 149.36       977.99        513.83     uharc a -m2 -md-     %1.uha-m2- %1.ppm
+<a href=list-uha-m1-.txt      >1354534276</a> 149.37       872.79        513.88     uharc a -m1 -md-     %1.uha-m1- %1.ppm
+<a href=list-nz2.txt          >1403325039</a> 154.75       330.28        206.08     NanoZip a -m1g -cD %1.nz2 %1.ppm
+<a href=list-jxr.txt          >1415606383</a> 156.11       446.11        369.23     (JPEG-XR reference software draft) JPEGXR -c %1.ppm -o %1.jxr
+<a href=list-jx1.txt          >1415614410</a> 156.11       128.06         93.69     (JPEG-XR) JXREncApp -i %1.ppm -o %1.jxr
+<a href=list-wdp.txt          >1422849993</a> 156.90       371.13        335.65     (JPEG-XR) WMPEncApp -i %1.ppm -o %1.wdp
+<a href=list-iz.txt           >1429846064</a> 157.68        22.92         21.19     (ImageZero) iz c %1.ppm %1.iz
+<a href=list-pngout.txt       >1432319902</a> 157.95     27819.14         68.47     (optimized PNG) pngout /c2 /f5 %1.png
+<a href=list-arc-grz.txt      >1449033110</a> 159.79       131.96        160.61     arc a -mmm:3*8+grzip:m4:l %1.arc-grz %1.ppm
+<a href=list-uha-mz.txt       >1459489679</a> 160.95       429.20        487.58     uharc a -mz -md32768 %1.uha-mz   %1.bmp
+<a href=list-ijpg9.txt        >1462885000</a> 161.32      1041.99        424.64     (IJG JPEG) cjpeg -rgb1 -block 1 -arithmetic -outfile %1.ijg %1.ppm
+<a href=list-png.txt          >1471885647</a> 162.31       844.37         72.62     (regular PNG) NConvert -out png %1.ppm
+<a href=list-ljp.txt          >1495870625</a> 164.96       266.29         86.48     (Lossless JPEG) lj-enc %1.ppm %1.ljp
+<a href=list-rar42-m5.txt     >1554944858</a> 171.47       627.80         59.77     rar a -m5  %1.ra5  %1.ppm
+<a href=list-rar42-m4.txt     >1555436675</a> 171.53       584.70         59.81     rar a -m4  %1.ra4  %1.ppm
+<a href=list-rar42-m3.txt     >1556568765</a> 171.65       531.40         59.86     rar a -m3  %1.ra3  %1.ppm
+<a href=list-bpg9.txt         >1556653187</a> 171.66      1801.95        317.91     BPGenc -lossless -e x265 -m9 -o %1.bpg9 %1.png
+<a href=list-bpg1.txt         >1557660259</a> 171.77      1028.07        318.17     BPGenc -lossless -e x265 -m1 -o %1.bpg1 %1.png
+<a href=list-lwf.txt          >1597320420</a> 176.14       534.52        429.35     (LuraWave Format) NConvert -out lwf %1.ppm
+<a href=list-arc1xb.txt       >1737745564</a> 191.63        29.86         28.63     arc a -mmm:3*8+1xb %1.arc1xb %1.ppm
+<a href=list-arcx.txt         >1742414838</a> 192.15      1932.40        207.70     arc a -mx  %1.arcx %1.ppm
+<a href=list-bz29.txt         >1755332419</a> 193.57       508.90        232.26     bzip2 -k -9 %1.ppm
+<a href=list-arc_.txt         >1796117884</a> 198.07       619.42        102.58     arc a      %1.arc_ %1.ppm
+<a href=list-bz25.txt         >1801111030</a> 198.62       489.99        229.56     bzip2 -k -5 %1.ppm
+<a href=list-7mx.txt          >1808959044</a> 199.48      1426.18        138.43     7z a -mx %1.7mx %1.ppm
+<a href=list-7z.txt           >1813113393</a> 199.94      1300.40        137.47     7z a     %1.7z  %1.ppm
+<a href=list-qbt.txt          >1854900746</a> 204.55       263.21        188.27     QBIT.exe QBIT %1.bmp
+<a href=list-arc3.txt         >1940273041</a> 213.97       277.22         76.29     arc a -m3  %1.arc3 %1.ppm
+<a href=list-bz21.txt         >1950146903</a> 215.05       476.15        218.26     bzip2 -k -1 %1.ppm
+<a href=list-arc2.txt         >2254090100</a> 248.57       106.67         43.11     arc a -m2  %1.arc2 %1.ppm
+<a href=list-mzf.txt          >2635901832</a> 290.68      1000+         ~165        MediaZip
+<a href=list-psd.txt          >3144733204</a> 346.79        27.94         23.09     (Adobe Photoshop) NConvert -out psd %1.ppm
+<a href=list-iff.txt          >3145652200</a> 346.89        39.24         73.97     (Explore (TDI) & Maya) NConvert -out tdi %1.ppm
+<a href=list-ppm.txt          >3462571880</a> 381.84<b><font color=#ff0000>         1.25          1.25</font></b>     copy/b %1.ppm nul
+
+<hr><b>History, comments and links</b>
+11 Apr 2011 - launched the benchmark, with 12 programs tested:
+              <a href=http://www.imagecompression.info/gralic/Gralic19d.zip>GraLIC 1.9.demo</a>, <a href=http://compression.ru/ds/bmf_2_01.rar>BMF 2.01</a>, <a href=http://www.imagecompression.info/gralic/paq8im.zip>PAQ8im</a>, <a href=http://www.imagecompression.info/gralic/flic14d.zip>FLIC 1.4.demo</a>,
+              <a href=http://www.researchandtechnology.net/bcif/downloads/bcif_native_windows_1_0_beta.zip>BCIF 1.0 beta</a>, <a href=http://www.kakadusoftware.com/executables/Kakadu_v64_demo_apps.msi>Kakadu 6.4.1</a>, <a href=http://www.ece.uvic.ca/~mdadams/jasper/software/jasper-1.900.1.zip>JasPer 1.900.1</a>, <a href=http://www.hpl.hp.com/loco/jlsrefV100.zip>LOCO-I/JPEG-LS from HP Labs</a>, <a href=http://www.elektronik.htw-aalen.de/packjpg/packJPG_m.htm>packPNM 1.0d</a>,
+              <a href=http://download.xnview.com/old_versions/NConvert-5.90-win.zip>regular PNG (created by NConvert 5.80)</a>, <a href=ftp://ftp.cs.cornell.edu/pub/multimed/ljpg.tar.Z>Lossless JPEG (Cornell University)</a>, <a href=http://www.rarlab.com/rar/wrar400.exe>RAR 4.00</a>.
+              Conversion to PPM and BMP formats was done by NConvert. JasPer failed to compress
+              <a href=http://photojournal.jpl.nasa.gov/tiff/PIA13843.tif>this large 139 Mb image</a> (in PPM format), the file created by Kakadu was taken instead.
+              JasPer and Lossless JPEG were compiled with GCC (version and options as in readme.txt in the FLIC package).
+              All programs were tested on an <a href=http://en.wikipedia.org/wiki/List_of_Intel_Core_i7_microprocessors#.22Bloomfield.22_.2845_nm.29>Intel Core i7-930 CPU</a>, 2.8 GHz, 3 Gb RAM, Windows XP.
+              
+12 Apr 2011 - added <a href=http://www.xeraina.ch/download/win/pgfconsole.msi>PGF Console Version 6.09.44</a> and <a href=http://advsys.net/ken/util/pngout.exe>PNGOUT Apr-10-2011</a> (hopefully no more that slow programs),
+              compiled page <a href=LPCB-top.html>Top 10 entries - more details</a>.
+              
+13 Apr 2011 - added two programs that were competing in 1999 and 2000: <a href=http://info.elf.stuba.sk/packages/pub/pc/pack/rkim106.zip>RKIM 1.06</a> and <a href=http://info.elf.stuba.sk/packages/pub/pc/pack/uhic20.zip>UHIC 2.0</a>.
+              UHIC dealt with images in BMP format (and <a href=http://en.wikipedia.org/wiki/8.3_filename>short 8.3 names</a>), while for RKIM they were converted to TGA.
+              UHIC fails to fully unpack olympu09.bmp compressed with command <b>e</b>.
+              For measuring decompression time, olympu11.uhi was decompressed instead of olympu09.uhi.
+              
+14 Apr 2011 - added <a href=http://replay.waybackmachine.org/20030126170744/http://www.cipr.rpi.edu/research/SPIHT/EW_Code/lsp.exe>LSP</a>, <a href=http://openjpeg.googlecode.com/files/openjpeg_v1_4_win32.zip>OpenJPEG 1.4</a>, RAR -m5 -mcc+, -m3, -m1.
+
+15 Apr 2011 - added <a href=http://sourceforge.net/projects/pyramidworkshop/>Pyramid Workshop</a> (ver. 21.03.2011 compiled by Niels Fröhling), RAR -m5 -mcc-, RAR -m3 -mcc-.
+              PW with <b>-lv 8 -p 5 -c 65</b> fails to compress <a href=http://photojournal.jpl.nasa.gov/tiff/PIA13458.tif>two</a> <a href=http://photojournal.jpl.nasa.gov/tiff/PIA13757.tif>images</a>, they were compressed with -lv 8 -p 5.
+              With no options it fails to losslessly decompress <a href=http://photojournal.jpl.nasa.gov/tiff/PIA13798.tif>two</a> <a href=http://photojournal.jpl.nasa.gov/tiff/PIA13799.tif>other</a> images, but only three bytes differ.
+
+16 Apr 2011 - added <a href=http://FreeArc.org/download/testing/FreeArc-console-0.67-alpha-win32.exe>FreeArc 0.67 (March 18 2011)</a>, PAQ8im decompression time, compiled page <a href=LPCB-top-percentage.html>Top 10 entries - percentage</a>.
+
+17 Apr 2011 - added <a href=http://ezcodesample.com/kodak/Libra8cmd.zip>Libra8</a> and <a href=http://www.mattmahoney.net/dc/zpaq.html>ZPAQ 2.05 with bmp_j4 model</a>.
+              ZPAQ was recompiled (to turn on the optimization "o" feature for faster compression and decompression
+              with config files) with this command:
+              <b>g++ -O3 -DNDEBUG -DOPT="\"g++ -O3 -DNDEBUG -march=pentiumpro -s -fomit-frame-pointer
+                      zpaq.cpp libzpaq.cpp zpaqopt.cpp -o zpaqopt.exe\"" zpaq.cpp libzpaq.cpp libzpaqo.cpp -o zpaq</b>
+              After you run it with command <b>okcbmp_j4.cfg</b>, it creates zpaqopt.exe,
+              and then you run zpaqopt.exe instead of zpaq.exe. Output is bit-exact, but speed is much higher.
+
+18 Apr 2011 - added <a href=http://downloads.sourceforge.net/sevenzip/7z920.exe>7-zip 9.20</a>, <a href=http://www.bzip.org/1.0.6/bzip2-1.0.6.tar.gz>BZIP2 1.0.6</a>, <a href=http://www.microsoft.com/downloads/en/details.aspx?FamilyID=285eeffd-d86c-48c3-ab93-3abd5ee7f1ce&displaylang=en>HD Photo DPK 1.0</a>.
+              7-zip exits with "Internal Error #1" if archive name is nul.ext, with "Unknown Error" if it's nul.exte,
+              it says "Error: I won't write compressed data to a terminal" if you try <b>7z a -so archive image</b>,
+              and finally "System error: Not implemented" if you try <b>7z a -so archive image >redirect</b>.
+              Bzip2 was compiled with GCC.
+              HD Photo DPK was compiled in Visual Studio 2008 - Release, no project settings were modified.
+              If the extension of compressed image file is not <a href=http://en.wikipedia.org/wiki/WDP>.wdp</a>, decompressor refuses to unpack the image,
+              although the format name has changed <a href=http://en.wikipedia.org/wiki/JPEG_XR>twice</a>: Windows Media Photo - HD Photo - JPEG XR.
+
+19 Apr 2011 - added <a href=http://www.intuac.com/userport/john/apt/apt1.0.tar.gz>APT 1.0</a> and <a href=http://www.stuffit.com/win-stuffit-download.html>StuffIt 2010 ver. 14.0.0.18</a> (Compression Technology version 14.0.0.15).
+              Compression time will be added later.
+
+20 Apr 2011 - added <a href=http://download.micran.ru/diis/download/nk2.zip>NK2</a> and compression time for APT and StuffIt. Started testing <a href=list_dli.txt>DLI</a>, first with <b>-q 100 -qc 80 -ac</b>.
+
+21 Apr 2011 - <b>DLI -or</b> is extremely slow. Looks like it will take more than 333 hours to compress all 109 images.
+              <a href=winrk-pwcm.png>Started</a> <a href=winrk-best-asymmetric.png>testing</a> <a href=http://www.msoftware.biz/downloads/43>WinRK 3.1.2</a>.
+
+29 Apr 2011 - added <a href=http://info.elf.stuba.sk/packages/pub/pc/pack/winrk312.exe>WinRK 3.1.2</a>. The only non command line program. Time is "Elapsed time" reported by WinRK itself.
+              It <a href=winrk-best-asymmetric.png>crashes</a> compressing the set of all 109 images with profile Best asymmetric. Does not crash if
+              five sets are compressed separately. Decompression was bit-exact for all images, both tested profiles.
+              <b>DLI -or -q 100 -qc 80 -ac</b> will finish compressing on Monday or Tuesday.
+
+04 May 2011 - added WinRK with profile HIGH and <a href=http://charls.codeplex.com/SourceControl/changeset/changes/64769>CharLS v.64769</a> ( \trunk\charls\test\test.vcproj ).
+              CharLS was compiled in Visual Studio 2008 - Release, no project settings were modified.
+              WinRK with profile HIGH <a href=logfile_rklog.txt>fails to decompress</a> 41st image (canon_eos_600d_14) and all remaining images.
+
+11 May 2011 - added FreeArc -mmm:3*8+1xb, FreeArc -mmm:3*8+grzip:m4:l,
+              and two lossy algorithms: <a href=http://sites.google.com/site/dlimagecomp/>DLI 2.1</a> and JPEG, both at best possible quality.
+
+13 May 2011 - <a href=http://info.elf.stuba.sk/packages/pub/pc/pack/uharc06b.zip>UHARC 0.6b</a> was <a href=list_uha.rar>tested</a>, C- and D-time will be added later.
+
+16 Jun 2011 - Added UHARC's compression time and decompression time.
+              With -mz it was compressing images in BMP format, because on PPM files compressed size was <a href=list_uha.rar>39% bigger</a>.
+
+21 Jun 2011 - NConvert 5.91 <a href=http://newsgroup.xnview.com/viewforum.php?f=57>was released</a>, it <a href=LPCB-data-June.html>doesn't fail</a> on raw images from Fujifilm FinePix X100 and Canon
+              EOS 1100D, so everything<b>*</b> will soon be re-tested with <a href=list-ppm.txt>the updated test set</a>. When the most recent
+              version 2.4 of <a href=http://www.imagecompression.info/gralic/Detector.zip>Detector for ex-JPEGs</a> is applied, 65 of 110 images from photojournal.jpl.nasa.gov
+              are detected as ex-JPEGs (and discarded), but none of the 62 images from photographyblog.com.
+
+              <b>*</b>Everything except <a href=http://www.msoftware.biz/downloads/43>WinRK</a>, DLI in slow mode, Libra8 with options 1 and 2.
+
+03 Jul 2011 - Everything was re-tested with the updated data set.
+              Previous version of LPCB main page is <a href=LPCB-June.html>here</a>.
+              This time more efforts were made to minimize the influence of HDD speed.
+              New versions of programs this time: WinRAR 4.01, PGF 6.11.22, DLI 2.2, NConvert 5.91.
+              Trial version of StuffIt Deluxe has expired, therefore only compression quality
+              was tested (on a different computer), therefore times are approximate.
+              Page <a href=LPCB-data.html>More details on test data</a> was updated.
+
+13 Jul 2011 - Added <a href=http://www.imagecompression.info/gralic/flic15d.zip>FLIC 1.5.demo</a>.
+
+15 Jul 2011 - Added <a href=http://www.imagecompression.info/gralic/Gralic110d.zip>GraLIC 1.10.demo</a>.
+
+17 Jul 2011 - Compiled pages <a href=LPCB-top.html>Top 10 entries - more details</a> and <a href=LPCB-top-percentage.html>Top 10 entries - percentage</a>.
+
+18 Jul 2011 - Added <a href=http://futalgo.planetaclix.pt/mediazip/>MediaZip 1.0</a>. Because there is no command-line executable,
+              and because in the GUI version you have to press OK after each file, timings are very approximate.
+              If it compresses images in BMP format, compression quality is not as good as with PPMs, e.g.
+              309976499 => 310621406 bytes (PPM=>BMP) on the Canon set. Flag "Use maximum compression"
+              was set in the options. If it is not, compressed size is ~4.5% bigger (the Canon set).
+
+20 Jul 2011 - Updated <a href=http://www.imagecompression.info/gralic/Gralic110d.zip>GraLIC 1.10.demo</a> and pages <a href=LPCB-top.html>Top 10 entries</a>/<a href=LPCB-top-percentage.html>Percentage</a>.
+
+30 Jul 2011 - Added <a href=http://www.imagecompression.info/gralic/Gralic111d.zip>GraLIC 1.11.demo</a>.
+
+22 Aug 2011 - Added <a href=http://www3.sympatico.ca/doug_houghton/qbit.html>Qbit 1.0.0.10</a>. It fails to losslessly decompress one file: canon_eos_1100d_11.qbt.
+
+25 Aug 2011 - Added <a href=http://www.imagecompression.info/gralic/flic16d.zip>FLIC 1.6.demo</a>.
+
+03 Sep 2011 - Added <a href=http://www.imagecompression.info/gralic/flic17d.zip>FLIC 1.7.demo</a>.
+
+12 Sep 2011 - Added <a href=http://www.xeraina.ch/download/win/pgfconsole.msi>PGF 6.11.29</a>, updated FLIC 1.7.demo.
+              If you want to see the scripts used for testing software, please send an e-mail.
+
+14 Sep 2011 - Added <a href=http://advsys.net/ken/util/pngout.exe>PNGOUT Jul 2 2011</a>.
+
+25 Sep 2011 - Added <a href=http://www.imagecompression.info/gralic/flic18d.zip>FLIC 1.8.demo</a>.
+
+03 Oct 2011 - Added JPEG-XR reference software draft (<a href=http://groups.google.com/group/comp.compression/browse_thread/thread/3a42ee3d3d6d27a6/d94c6f6bf473f918>from Thomas Richter</a>)
+
+05 Oct 2011 - Added <a href=http://www.xnview.com/download/plugins/lwf.zip>LuraWave Format</a>, <a href=http://www.xnview.com/download/plugins/jpg2000_lwf.zip>LuraWave JPEG-2000</a> (<b>NConvert</b>+<b>plugins</b>), PSD and TDI (just NConvert, no plugins).
+
+11 Oct 2011 - Added <a href=http://www.imagecompression.info/gralic/flic19d.zip>FLIC 1.9.demo</a>.
+
+14 Oct 2011 - Updated FLIC 1.9.demo.
+
+31 Oct 2011 - Added <a href=http://www.imagecompression.info/gralic/flic20d.zip>FLIC 2.0.demo</a>.
+
+01 Nov 2011 - Added <a href=http://www.lizardtech.com/downloads/index.php?section=geotrial#geotrial>GeoExpress 8</a>. Timings are based on outfile timestamps.
+              Bit-exactness after decompression could not be tested because all images were
+              <a href=STA13781-sid.png><b>"watermarked with small white "X"'s indicating that the imagery was created with the evaluation version".</b></a>
+
+09 Nov 2011 - Added <a href=http://www.nanozip.net/nanozip-0.09a.win32.zip>NanoZip 0.09 alpha</a>.
+
+10 Nov 2011 - Now you can download test images from <a href=http://compressionratings.com/download.html>CompressionRatings.Com</a> in GraLIC 1.11 format or in ZIP.
+
+15 Nov 2011 - Added <a href=http://mattmahoney.net/dc/zpaq.exe>ZPAQ 4.00</a>. Comparing to version 2.05, compressed size is the same,
+              compression time is ~14% less, decompression is ~7% faster.
+
+16 Nov 2011 - Added <a href=http://www.imagecompression.info/gralic/flic21d.zip>FLIC 2.1.demo</a>.
+
+20 Nov 2011 - Added <a href="http://www.elektronik.htw-aalen.de/packjpg/binaries/new(2.5)/packPNM%20v1.0e.zip">PackPNM 1.0e</a>. It was compiled with MinGW 4.5.2 and switches from the native makefile:
+              <b>g++ -O3 -s -pedantic -funroll-loops -ffast-math -fsched-spec-load -fomit-frame-pointer packPNM\*.cpp</b>
+
+23 Nov 2011 - Updated <a href=http://www.imagecompression.info/gralic/flic21d.zip>FLIC 2.1.demo</a> and pages <a href=LPCB-top.html>Top 10 entries</a>/<a href=LPCB-top-percentage.html>Percentage</a>.
+
+27 Sep 2012 - Added <a href=https://code.google.com/p/webp/downloads/detail?name=libwebp-0.2.0-windows-x86.zip&can=2&q=>WebP 0.2.0</a>. Compression time is approximate.
+              With "-lossless -m 6" it crashes on image <a href=PIA13894.webp>PIA13894</a>.
+
+03 Oct 2012 - Added <a href=http://skulpture.maxiom.de/playground/iz.exe>ImageZero 0.1</a> (<a href=http://encode.su/threads/1471>discussion</a>) and <a href=http://www.rarlab.com/rar/wrar420.exe>RAR 4.20</a>.
+              Previous version of LPCB main page is <a href=LPCB-Sept2012.html>here</a>.
+
+09 Nov 2012 - Added <a href=http://www.infai.org/jpeg/>version 9 of the Independent JPEG Group software</a>.
+              The <a href=http://www.infai.org/jpeg/files?get=jpegsr09.zip>source code</a> was compiled with MinGW 4.5.2: <b>gcc -O3 jpeg-9\*.c</b>
+
+04 Dec 2012 - Added <a href=http://encode.su/threads/1616>Quo Vadis JPEG released on 3-Dec-2012</a>.
+
+19 Dec 2012 - Added <a href=http://charls.codeplex.com/SourceControl/list/changesets>CharLS v.79962</a>
+              It was compiled in Visual Studio 2008 - Release, no project settings were modified.
+
+10 Jan 2013 - Added <a href=http://www.imagecompression.info/gralic/qlic1d.zip>QLIC 1.demo</a>, another image compressor written by Alex Rhatushnyak.
+
+19 Jan 2013 - Replaced links to the latest NConvert with links to <a href=http://download.xnview.com/old_versions/NConvert-5.90-win.zip>NConvert 5.91</a>.
+
+20 Jan 2013 - Added <a href=http://www.imagecompression.info/gralic/qic1d.zip>QIC 1.dem</a>, a twice faster and smaller edition of QLIC.
+
+02 Mar 2013 - Added <a href=http://encode.narod.ru/bim002.zip>BIM 0.02</a>.
+
+20 Apr 2013 - Added <a href=http://www.kakadusoftware.com/executables/KDU72_Demo_Apps_for_Win32_130117.msi>Kakadu 7.2</a>.
+
+19 Jul 2013 - Added <a href=http://sourceforge.net/projects/wic/files/?source=navbar>WIC released on 16-Jul-2013</a>.
+
+26 Jul 2013 - Added <a href=http://jxrlib.codeplex.com/downloads/get/685249>JXRlib 1.1</a>. It was compiled in Visual Studio 2012 - Win32 Release,
+              no project settings were modified except PlatformToolset = v110_xp.
+              It looks like lossy quality seetings 2 and 3 are meaningless:
+
+              Compressed   Quality
+                 size      setting
+              <a href=list-jx1.txt>1415614410</a>   -q 1  (lossless)
+              <a href=list-jx2.txt>1663032190</a>   -q 2
+              <a href=list-jx3.txt>1421662746</a>   -q 3
+              <a href=list-jx4.txt>1257297614</a>   -q 4
+              <a href=list-jx5.txt>1073834445</a>   -q 5
+               <a href=list-jx6.txt>973161174</a>   -q 6
+               <a href=list-jx7.txt>891111613</a>   -q 7
+               <a href=list-jx8.txt>823388957</a>   -q 8
+
+29 Sep 2013 - Added <a href=http://encode.narod.ru/bim003.zip>BIM 0.03</a>.
+
+04 Oct 2015 - Moved to new home: <a href=http://qlic.altervista.org/LPCB.html>qlic.altervista.org</a>.
+              Not sure for how long <a href=http://imagecompression.info/gralic/LPCB.html>imagecompression.info</a> will be accessible.
+
+11 Oct 2015 - Added <a href=https://github.com/FLIF-hub/FLIF/archive/v0.1-alpha.zip>FLIF v0.1-alpha</a>.
+              Win32 executable was provided by Bulat Ziganshin <a href=http://encode.su/attachment.php?attachmentid=3861&d=1443868093>here</a>.
+              With <b>-n --r=10</b> it crashes on STA13843.ppm,
+              with <a href=list-flif2.txt>-n --r=2</a> and <a href=list-flif5.txt>-n --r=5</a> compressed size is bigger, and decompression was not tested.
+
+17 Oct 2015 - Added <a href=http://heartofcomp.altervista.org/zcm093.zip>ZCM 0.93</a> and <a href=http://www.jpeg.org/downloads/jpegxt/jpeg_xt_20151012_gpl_src.zip>JPEG XT Demo Codec released on 12 Oct 2015</a> replacing earlier version
+              (Quo Vadis JPEG). As before, with <b>-ls N</b> when N>0 all three of (Csize, Ctime, Dtime) are bigger.
+
+18 Oct 2015 - Added <a href=http://bellard.org/bpg/bpg-0.9.5-win32.zip>BPG 0.9.5</a> and <a href=http://downloads.webmproject.org/releases/webp/libwebp-0.4.3-windows-x86.zip>WebP 0.4.3</a>.
+              BPG seems to run many threads, and there is no switch to ask it to run in single-threaded mode.
+
+24 Oct 2015 - Added <a href=http://my.smithmicro.com/downloads/files/StuffIt2010SR2-Multi-language.exe>StuffIt 14.0.0.16</a>.
+              As before, Ctime and Dtime were measured on a different computer
+              (because "Your StuffIt Deluxe trial period has expired")
+              and are very approximate. The "Top 10" pages will be updated later.
+
+25 Oct 2015 - Added <a href=qlic2d.zip>QLIC 2.demo</a>.
+
+28 Dec 2017 - Added <a href=https://encode.su/threads/342-paq8px?p=55287&viewfull=1#post55287>paq8px_v125</a>. Time was measured on a 64-bit desktop with
+              Intel Core i7-4770 CPU @ 3.40 GHz (running Windows 8.1 Enterprise),
+              then it was multiplied by 1734.48/1261.5 to estimate runtime on the original LPCB desktop.
+              Moved the <b>About test data</b> section to the top, and updated page <b><a href=LPCB-data.html>More details on test data</a></b>.
+
+29 Dec 2017 - Recompiled <a href=Detector.zip>Detector for ex-JPEGs</a>,
+              there are now four executables: 32-bit and 64-bit, Linux and Windows.
+
+30 Dec 2017 - Added <a href=https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-0.6.1-linux-x86-64.tar.gz>WebP 0.6.1</a> and <a href=https://github.com/FLIF-hub/FLIF/releases/tag/v0.3>FLIF 0.3</a>.
+              Time was measured on the original LPCB desktop, after <a href=https://encode.su/attachment.php?attachmentid=5587&d=1514435360>64-bit Linux was installed on it</a>.
+
+02 Jan 2018 - Added <a href=https://encode.su/threads/342-paq8px?p=55343&viewfull=1#post55343>paq8px_v127</a>. Time was measured on the original LPCB desktop running 64-bit Linux.
+              Temporarily removed pages LPCB-top and LPCB-top-percentage.
+
+04 Feb 2018 - Added <a href=http://www.byronknoll.com/cmix.html>cmix</a>, version from 24-Dec-2017. It was <a href=https://encode.su/threads/2325-Lossless-Photo-Compression-Benchmark?p=55688&viewfull=1#post55688>tested by the author (Byron Knoll) on Google Compute Engine instances</a>.
+
+06 Oct 2019 - Added <a href=https://encode.su/threads/342-paq8px?p=61611&viewfull=1#post61611>paq8px_v182fix1</a> and <a href=http://www.byronknoll.com/cmix.html>cmix</a>, version 16. Cmix was <a href=https://encode.su/threads/2325-Lossless-Photo-Compression-Benchmark?p=58335&viewfull=1#post58335>tested by the author on Google Compute Engine instances</a>.
+
+14 Sep 2022 - Updated paq8px: v.206.
+
+<hr>
+Please send your comments to <a href=http://linkedin.com/groups/Image-Compression-3363256>this group</a> or to Alex Rhatushnyak: gralic1 (alpha) g mail d_o_t com.
+Discussions on the most active data compression forum: <a href=http://encode.su/threads/2325>LPCB</a>, <a href=http://encode.su/threads/1322>Lossless image compressors</a>.
+
+</pre></body></html>

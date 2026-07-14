@@ -1,0 +1,16 @@
+export declare const CASV_MAGIC = 1447121731;
+export declare const CASV_VERSION = 1;
+export declare const CASV_HEADER_BYTES = 32;
+export declare const CASV_INDEX_ENTRY_BYTES = 8;
+export declare const CASV_PFRAME_FLAG = 2147483648;
+export declare const CASV_BBOX_FLAG = 1073741824;
+export declare const CASV_TILE_FLAG = 536870912;
+export declare const CASV_REPLACE_FLAG = 268435456;
+export declare const CASV_HDR_FABLE_FLAG = 2;
+export declare const CASV_TILE_V2_BIT = 32768;
+export declare const CASV_HDRFLAG_LOSSY = 1;
+export declare const CASV_FOOTER_MAGIC = 1179861315;
+export declare const CASV_FOOTER_BYTES = 32;
+export declare const CASV_AUDIO_BOX_MAGIC = 1430344515;
+export declare const CASV_RATE_BOX_MAGIC = 1381187907;
+//# sourceMappingURL=casv-format.d.ts.map

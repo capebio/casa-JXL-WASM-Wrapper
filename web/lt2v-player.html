@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LT2V Player</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0e0e0e; color: #e7e9ec; font: 14px/1.5 system-ui, sans-serif; }
+  #header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 10px 16px;
+    background: rgba(0,0,0,0.6);
+    border-bottom: 1px solid rgba(255,255,255,0.1);
+  }
+  #header h1 { margin: 0; font-size: 1rem; font-weight: 600; color: #a0b4ff; }
+  #pick { cursor: pointer; padding: 5px 12px; background: #2a2a5a; border: 1px solid #4a5aaa;
+          border-radius: 5px; color: #e0e4ff; font-size: 0.85rem; transition: background 0.15s; }
+  #pick:hover { background: #3a3a7a; }
+  #status { font-size: 0.8rem; color: #888; flex: 1; }
+
+  #main { display: flex; flex-direction: column; align-items: center; padding: 16px; gap: 12px; }
+  #canvas { border-radius: 6px; background: #111; max-width: 100%; max-height: 70vh; }
+  #controls {
+    display: flex; gap: 10px; align-items: center;
+    background: rgba(0,0,0,0.4); border-radius: 8px;
+    padding: 8px 14px; border: 1px solid rgba(255,255,255,0.07);
+  }
+  button { cursor: pointer; background: #222; border: 1px solid #444; color: #ddd;
+           border-radius: 4px; padding: 4px 14px; font-size: 0.85rem; }
+  button:hover { background: #333; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #scrubber { width: 300px; }
+  #timecode { font: 12px monospace; color: #88a; min-width: 80px; }
+
+  #stats {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 8px; width: 100%; max-width: 700px;
+  }
+  .stat {
+    background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 6px; padding: 8px 12px;
+  }
+  .stat .label { font-size: 0.72rem; color: #666; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .value { font-size: 1.1rem; font-weight: 600; color: #c8d8ff; margin-top: 2px; }
+  .stat .value.good { color: #7ded90; }
+  .stat .value.warn { color: #f0d070; }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>LT2V Player</h1>
+  <button id="pick">Open .lt2v file</button>
+  <input id="file-input" type="file" accept=".lt2v" style="display:none">
+  <span id="status">No file loaded — click Open or drag-drop a .lt2v file.</span>
+</div>
+
+<div id="main">
+  <canvas id="canvas" width="640" height="480"></canvas>
+
+  <div id="controls">
+    <button id="btn-play" disabled>▶</button>
+    <button id="btn-pause" disabled>⏸</button>
+    <button id="btn-rewind" disabled>⏮</button>
+    <input id="scrubber" type="range" min="0" max="0" value="0" disabled>
+    <span id="timecode">0:00 / 0:00</span>
+  </div>
+
+  <div id="stats">
+    <div class="stat"><div class="label">Resolution</div><div class="value" id="s-res">—</div></div>
+    <div class="stat"><div class="label">File size</div><div class="value" id="s-size">—</div></div>
+    <div class="stat"><div class="label">Ratio vs raw</div><div class="value good" id="s-ratio">—</div></div>
+    <div class="stat"><div class="label">Playback FPS</div><div class="value" id="s-playfps">—</div></div>
+    <div class="stat"><div class="label">Decode FPS</div><div class="value" id="s-decfps">—</div></div>
+    <div class="stat"><div class="label">Mode</div><div class="value" id="s-mode">—</div></div>
+  </div>
+</div>
+
+<script type="module">
+const WASM_URL = new URL('../pkg/raw_converter_wasm.js', import.meta.url).href;
+
+const canvas    = document.getElementById('canvas');
+const ctx2d     = canvas.getContext('2d');
+const status    = document.getElementById('status');
+const btnPlay   = document.getElementById('btn-play');
+const btnPause  = document.getElementById('btn-pause');
+const btnRewind = document.getElementById('btn-rewind');
+const scrubber  = document.getElementById('scrubber');
+const timecode  = document.getElementById('timecode');
+
+const s = {
+  res:     document.getElementById('s-res'),
+  size:    document.getElementById('s-size'),
+  ratio:   document.getElementById('s-ratio'),
+  playfps: document.getElementById('s-playfps'),
+  decfps:  document.getElementById('s-decfps'),
+  mode:    document.getElementById('s-mode'),
+};
+
+let worker = null;
+let frameBuffer = [];    // [{idx, imageData}]
+let videoMeta = null;
+let playing = false;
+let currentFrame = 0;
+let lastFrameTime = 0;
+let rafId = null;
+
+// Play/pause FPS measurement
+let playFpsFrames = 0;
+let playFpsStart = 0;
+let lastDecFps = 0;
+
+function fmtTime(frame, meta) {
+  const secs = frame / (meta.fpsNum / meta.fpsDen);
+  const m = Math.floor(secs / 60);
+  const s = (secs % 60).toFixed(1).padStart(4, '0');
+  return `${m}:${s}`;
+}
+
+function fmtSize(bytes) {
+  if (bytes >= 1e9) return (bytes / 1e9).toFixed(2) + ' GB';
+  if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + ' MB';
+  return (bytes / 1e3).toFixed(0) + ' KB';
+}
+
+function setStats(meta, fileSize) {
+  const rawBytes = meta.width * meta.height * 3 * meta.frameCount;
+  const ratio = rawBytes / fileSize;
+  s.res.textContent   = `${meta.width}×${meta.height}`;
+  s.size.textContent  = fmtSize(fileSize);
+  s.ratio.textContent = `${ratio.toFixed(1)}×`;
+  s.mode.textContent  = meta.isLossless ? 'Lossless' : 'Lossy';
+  scrubber.max = meta.frameCount - 1;
+  canvas.width  = meta.width;
+  canvas.height = meta.height;
+}
+
+function renderFrame(rgb) {
+  const w = videoMeta.width;
+  const h = videoMeta.height;
+  // Convert RGB24 → RGBA32 for putImageData
+  const rgba = new Uint8ClampedArray(w * h * 4);
+  for (let i = 0, j = 0; i < w * h * 3; i += 3, j += 4) {
+    rgba[j]   = rgb[i];
+    rgba[j+1] = rgb[i+1];
+    rgba[j+2] = rgb[i+2];
+    rgba[j+3] = 255;
+  }
+  ctx2d.putImageData(new ImageData(rgba, w, h), 0, 0);
+}
+
+function rafLoop(ts) {
+  if (!playing || frameBuffer.length === 0) {
+    rafId = requestAnimationFrame(rafLoop);
+    return;
+  }
+
+  const meta = videoMeta;
+  const frameDur = 1000 / (meta.fpsNum / meta.fpsDen); // ms per frame
+
+  if (lastFrameTime === 0) lastFrameTime = ts;
+  const elapsed = ts - lastFrameTime;
+
+  if (elapsed >= frameDur) {
+    const { idx, rgb } = frameBuffer.shift();
+    worker.postMessage({ type: 'ack' }); // allow worker to decode one more
+    renderFrame(rgb);
+    currentFrame = idx;
+    scrubber.value = idx;
+    timecode.textContent = `${fmtTime(idx, meta)} / ${fmtTime(meta.frameCount - 1, meta)}`;
+
+    // Playback FPS
+    playFpsFrames++;
+    if (playFpsFrames >= 10) {
+      const fps = playFpsFrames / ((ts - playFpsStart) / 1000);
+      s.playfps.textContent = fps.toFixed(1);
+      playFpsFrames = 0;
+      playFpsStart  = ts;
+    }
+    s.decfps.textContent = lastDecFps.toFixed(1);
+
+    lastFrameTime = ts - (elapsed % frameDur);
+  }
+  rafId = requestAnimationFrame(rafLoop);
+}
+
+function startPlayback() {
+  playing = true;
+  lastFrameTime = 0;
+  playFpsFrames = 0;
+  playFpsStart  = performance.now();
+  btnPlay.disabled  = true;
+  btnPause.disabled = false;
+  worker.postMessage({ type: 'resume' });
+  if (!rafId) rafId = requestAnimationFrame(rafLoop);
+}
+
+function pausePlayback() {
+  playing = false;
+  btnPlay.disabled  = false;
+  btnPause.disabled = true;
+  worker.postMessage({ type: 'pause' });
+}
+
+function rewind() {
+  frameBuffer = [];
+  currentFrame = 0;
+  scrubber.value = 0;
+  lastFrameTime = 0;
+  playing = false;
+  btnPlay.disabled  = false;
+  btnPause.disabled = true;
+  worker.postMessage({ type: 'seek', frame: 0 });
+}
+
+btnPlay.addEventListener('click',   startPlayback);
+btnPause.addEventListener('click',  pausePlayback);
+btnRewind.addEventListener('click', rewind);
+scrubber.addEventListener('change', () => {
+  const f = parseInt(scrubber.value);
+  frameBuffer = [];
+  currentFrame = f;
+  lastFrameTime = 0;
+  worker.postMessage({ type: 'seek', frame: f });
+});
+
+async function loadFile(file) {
+  if (worker) { worker.terminate(); worker = null; }
+  frameBuffer = [];
+  playing = false;
+  btnPlay.disabled = btnPause.disabled = btnRewind.disabled = true;
+
+  status.textContent = `Loading ${file.name} (${fmtSize(file.size)})…`;
+  const data = new Uint8Array(await file.arrayBuffer());
+
+  worker = new Worker('../web/lt2v-worker.js', { type: 'module' });
+
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    switch (msg.type) {
+      case 'ready':
+        videoMeta = msg;
+        setStats(msg, data.byteLength);
+        status.textContent = `${file.name} — ${msg.frameCount} frames @ ${msg.fpsNum}/${msg.fpsDen} fps`;
+        btnPlay.disabled    = false;
+        btnRewind.disabled  = false;
+        break;
+      case 'frame':
+        lastDecFps = msg.decFps;
+        frameBuffer.push({ idx: msg.idx, rgb: new Uint8Array(msg.rgb) });
+        // Don't ack yet — will ack when consumed in rafLoop
+        break;
+      case 'end':
+        playing = false;
+        btnPlay.disabled = false;
+        btnPause.disabled = true;
+        break;
+      case 'error':
+        status.textContent = 'Error: ' + msg.message;
+        console.error(msg.message);
+        break;
+    }
+  };
+
+  worker.postMessage({ type: 'load', wasmUrl: WASM_URL, data }, [data.buffer]);
+  if (!rafId) rafId = requestAnimationFrame(rafLoop);
+}
+
+// File input
+document.getElementById('pick').addEventListener('click', () =>
+  document.getElementById('file-input').click());
+document.getElementById('file-input').addEventListener('change', (e) => {
+  if (e.target.files[0]) loadFile(e.target.files[0]);
+});
+
+// Drag-drop
+document.body.addEventListener('dragover', (e) => { e.preventDefault(); });
+document.body.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (file) loadFile(file);
+});
+</script>
+</body>
+</html>

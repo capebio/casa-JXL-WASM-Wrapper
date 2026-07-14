@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gobabeb — Pyramid Lightbox</title>
+<script type="importmap">
+{
+  "imports": {
+    "@casabio/jxl-core":         "../packages/jxl-core/dist/index.js",
+    "@casabio/jxl-core/errors":  "../packages/jxl-core/dist/errors.js",
+    "@casabio/jxl-core/protocol":"../packages/jxl-core/dist/protocol.js",
+    "@casabio/jxl-core/types":   "../packages/jxl-core/dist/types.js",
+    "@casabio/jxl-wasm":         "../packages/jxl-wasm/dist/index.js",
+    "@casabio/jxl-worker-browser":"../packages/jxl-worker-browser/dist/index.js",
+    "@casabio/jxl-session":      "../packages/jxl-session/dist/index.js",
+    "@casabio/jxl-scheduler":    "../packages/jxl-scheduler/dist/index.js",
+    "@casabio/jxl-capabilities": "../packages/jxl-capabilities/dist/index.js",
+    "@casabio/jxl-policy":       "../packages/jxl-policy/dist/index.js",
+    "@casabio/jxl-cache":        "../packages/jxl-cache/dist/browser.js",
+    "@casabio/jxl-pyramid":      "../packages/jxl-pyramid/dist/index.js"
+  }
+}
+</script>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #e7e9ec; font-family: system-ui, sans-serif; }
+
+  #header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px;
+    background: rgba(0,0,0,0.6);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  #header h1 { margin: 0; font-size: 1rem; font-weight: 600; flex: 1; }
+  #header h1 em { font-style: normal; color: #88a; font-size: 0.85rem; margin-left: 8px; }
+  #status { font-size: 0.82rem; color: #888; min-width: 200px; }
+
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px; padding: 16px;
+  }
+  .thumb {
+    position: relative; border-radius: 8px; overflow: hidden;
+    background: #1c1c1c; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.07);
+    transition: border-color 0.15s, transform 0.1s;
+    aspect-ratio: 4/3;
+  }
+  .thumb:hover { border-color: rgba(74,158,255,0.5); transform: scale(1.01); }
+  .thumb img {
+    width: 100%; height: 100%; object-fit: cover;
+    display: block; opacity: 0;
+    transition: opacity 0.25s ease;
+  }
+  .thumb img.loaded { opacity: 1; }
+  .thumb .meta {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    padding: 6px 10px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.75));
+  }
+  .thumb .name { font-size: 0.72rem; color: #c0c4cc; display: block; }
+  .thumb.loading::before {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(90deg, #1c1c1c 25%, #2a2a2a 50%, #1c1c1c 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.2s infinite;
+  }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>Gobabeb 10 <em>pyramid lightbox</em></h1>
+  <span id="status">Initialising…</span>
+</div>
+
+<div id="grid"></div>
+
+<script type="module">
+import { createBrowserContext } from '@casabio/jxl-session';
+import { createPyramidLightbox } from './lightbox/pyramid-lightbox.js';
+
+const IMAGES = [
+  'P2200500_Hermannia_boraginiflora',
+  'P2200501',
+  'P2200508_Sesamum_triphyllum',
+  'P2200521',
+  'P2200571',
+  'P2200594',
+  'P2200610_Pergularia_daemia',
+  'P2200637_Hermannia_atrosanguinea',
+  'P2200673',
+  'P2200717',
+];
+
+const THUMB_DIR = 'gobabeb-gallery/thumbs/';
+const FULL_DIR  = 'gobabeb-gallery/full/';
+
+// ── JPEG→JXL image store ─────────────────────────────────────────────────────
+// Two levels per image: thumb (400px, shown first) and full (hi-res).
+// Each tier is decoded via createImageBitmap, re-encoded as lossless JXL on
+// first access, then cached. The lightbox auto-picks full for the viewport and
+// upgrades automatically; ▲Res forces the full level immediately.
+
+const bitmapCache = new Map();  // `${name}_thumb` | `${name}_full` → {bitmap,w,h}
+const jxlCache    = new Map();  // contenthash (`name__thumb` | `name__full`) → Uint8Array
+
+let ctx = null;
+
+async function getBitmap(name, tier) {
+  const key = `${name}_${tier}`;
+  if (bitmapCache.has(key)) return bitmapCache.get(key);
+  const url = (tier === 'full' ? FULL_DIR : THUMB_DIR) + name + '.jpg';
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`${resp.status} ${url}`);
+  const bitmap = await createImageBitmap(await resp.blob());
+  const entry = { bitmap, w: bitmap.width, h: bitmap.height };
+  bitmapCache.set(key, entry);
+  return entry;
+}
+
+async function encodeToJxl(bitmap, w, h, effort) {
+  const oc = new OffscreenCanvas(w, h);
+  oc.getContext('2d').drawImage(bitmap, 0, 0);
+  const rgba8 = oc.getContext('2d').getImageData(0, 0, w, h).data.buffer;
+  const enc = ctx.encode({ format: 'rgba8', width: w, height: h, hasAlpha: true,
+                            distance: 0, effort, priority: 'near' });
+  await enc.pushPixels(rgba8);
+  await enc.finish();
+  const parts = [];
+  for await (const chunk of enc.chunks())
+    parts.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk));
+  const total = parts.reduce((s, a) => s + a.byteLength, 0);
+  const jxl = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { jxl.set(p, off); off += p.byteLength; }
+  return jxl;
+}
+
+const imageStore = {
+  async getManifest(name) {
+    // Fetch thumb to get fast, exact dimensions for level-0
+    const { w: tw, h: th } = await getBitmap(name, 'thumb');
+    // Declare full level with estimated size (actual dims resolved on first decode)
+    return {
+      levels: [
+        { contenthash: `${name}__thumb`, w: tw,      h: th,      size: Math.max(tw, th) },
+        { contenthash: `${name}__full`,  w: tw * 12, h: th * 12, size: Math.max(tw, th) * 12 },
+      ],
+    };
+  },
+
+  async getLevelBytes(contenthash) {
+    if (jxlCache.has(contenthash)) return jxlCache.get(contenthash);
+    const isThumb = contenthash.endsWith('__thumb');
+    const name = contenthash.replace(/__thumb$|__full$/, '');
+    const { bitmap, w, h } = await getBitmap(name, isThumb ? 'thumb' : 'full');
+    const jxl = await encodeToJxl(bitmap, w, h, isThumb ? 3 : 1);
+    jxlCache.set(contenthash, jxl);
+    return jxl;
+  },
+};
+
+// ── Grid ─────────────────────────────────────────────────────────────────────
+
+const grid   = document.getElementById('grid');
+const status = document.getElementById('status');
+
+let lightbox = null;
+let items = null; // built once ctx is ready
+
+async function init() {
+  status.textContent = 'Starting JXL worker pool…';
+  ctx = createBrowserContext();
+
+  // Build the items list for navigation
+  items = IMAGES.map(name => ({ id: name, levels: [] }));
+
+  lightbox = createPyramidLightbox({ ctx, imageStore });
+
+  // Render thumbnail grid
+  grid.innerHTML = '';
+  for (let i = 0; i < IMAGES.length; i++) {
+    const name = IMAGES[i];
+    const card = document.createElement('div');
+    card.className = 'thumb loading';
+
+    const img = document.createElement('img');
+    img.alt = name;
+    img.onload  = () => { img.classList.add('loaded'); card.classList.remove('loading'); };
+    img.onerror = () => card.classList.remove('loading');
+    img.src = THUMB_DIR + name + '.jpg';
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    const label = document.createElement('span');
+    label.className = 'name';
+    label.textContent = name.replace(/_/g, ' ');
+    meta.appendChild(label);
+
+    card.appendChild(img);
+    card.appendChild(meta);
+    grid.appendChild(card);
+
+    card.addEventListener('click', () => lightbox.open(items, i));
+  }
+
+  status.textContent = `${IMAGES.length} images — click to open (full-res encodes ~1–3 s on first open, cached after).`;
+}
+
+init().catch(e => { status.textContent = 'Error: ' + e.message; console.error(e); });
+</script>
+</body>
+</html>

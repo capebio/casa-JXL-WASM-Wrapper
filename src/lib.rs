@@ -2463,7 +2463,6 @@ pub fn process_orf_with_options(
             cfa_index,
             noise_metadata,
             wb_from_camera,
-            baseline_exposure: 0.0, // ORF (Olympus) has no DNG BaselineExposure tag
         },
         output_flags,
         &opts.look,
@@ -5240,7 +5239,6 @@ pub fn process_raw_mosaic_with_options(
             cfa_index,
             noise_metadata,
             wb_from_camera: wb_r.is_finite() && wb_r > 0.0 && wb_b.is_finite() && wb_b > 0.0,
-            baseline_exposure: 0.0, // generic mosaic path; no DNG BaselineExposure
         },
         output_flags,
         &opts.look,
@@ -5605,7 +5603,6 @@ pub fn create_orf_denoise_session(
         cfa_index: 0, // Olympus is always RGGB
         noise_metadata,
         wb_from_camera: decoded.wb_from_camera,
-        baseline_exposure: 0.0, // ORF (Olympus) has no DNG BaselineExposure tag
     };
     Ok(DenoiseSession::from_decoded(dng, output_flags))
 }
@@ -5708,7 +5705,6 @@ pub fn create_raw_mosaic_denoise_session(
         cfa_index,
         noise_metadata,
         wb_from_camera: wb_r.is_finite() && wb_r > 0.0 && wb_b.is_finite() && wb_b > 0.0,
-        baseline_exposure: 0.0, // raw-mosaic path; no DNG BaselineExposure
     };
     Ok(DenoiseSession::from_decoded(dng, output_flags))
 }

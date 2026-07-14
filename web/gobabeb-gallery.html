@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gobabeb 10 Gallery</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #e7e9ec; font-family: system-ui, sans-serif; }
+
+  /* ── header ── */
+  #header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px;
+    background: rgba(0,0,0,0.6);
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+  }
+  #header h1 { margin: 0; font-size: 1rem; font-weight: 600; flex: 1; }
+  #status { font-size: 0.82rem; color: #888; min-width: 120px; }
+  #reload-btn {
+    background: rgba(74,158,255,0.2); color: #4a9eff;
+    border: 1px solid rgba(74,158,255,0.4); border-radius: 8px;
+    padding: 6px 16px; cursor: pointer; font-size: 0.85rem;
+  }
+  #reload-btn:hover { background: rgba(74,158,255,0.35); }
+
+  /* ── grid ── */
+  #grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+    gap: 10px; padding: 16px;
+  }
+  .thumb {
+    position: relative; border-radius: 8px; overflow: hidden;
+    background: #1c1c1c; cursor: pointer;
+    border: 1px solid rgba(255,255,255,0.07);
+    transition: border-color 0.15s, transform 0.1s;
+    aspect-ratio: 3/2;
+  }
+  .thumb:hover { border-color: rgba(74,158,255,0.5); transform: scale(1.01); }
+  .thumb img {
+    width: 100%; height: 100%; object-fit: cover;
+    display: block; opacity: 0;
+    transition: opacity 0.25s ease;
+  }
+  .thumb img.loaded { opacity: 1; }
+  .thumb .meta {
+    position: absolute; bottom: 0; left: 0; right: 0;
+    padding: 6px 10px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.75));
+  }
+  .thumb .name { font-size: 0.72rem; color: #c0c4cc; display: block; }
+  /* skeleton shimmer while loading */
+  .thumb.loading::before {
+    content: ''; position: absolute; inset: 0;
+    background: linear-gradient(90deg, #1c1c1c 25%, #2a2a2a 50%, #1c1c1c 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.2s infinite;
+  }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+
+  /* ── lightbox — use same classes as style.css but override just what's needed ── */
+  .lightbox {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.95);
+    z-index: 150; display: flex; flex-direction: column;
+    align-items: stretch;
+  }
+  .lightbox[hidden] { display: none !important; }
+
+  /* minimal toolbar: just image name */
+  .lb-gallery-title {
+    position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.65); backdrop-filter: blur(6px);
+    border-radius: 20px; padding: 6px 18px;
+    font-size: 0.82rem; color: #c0c4cc; z-index: 102;
+    pointer-events: none;
+  }
+
+  .lightbox-close {
+    position: fixed; top: 18px; right: 22px; z-index: 102;
+    width: 34px; height: 34px; border-radius: 50%;
+    background: rgba(255,255,255,0.12); border: none;
+    color: #e7e9ec; font-size: 1.1rem; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .lightbox-close:hover { background: rgba(44,100,255,0.85); }
+
+  .lightbox-prev, .lightbox-next {
+    position: fixed; top: 50%; transform: translateY(-50%); z-index: 102;
+    width: 40px; height: 40px; border-radius: 50%;
+    background: rgba(255,255,255,0.12); border: none;
+    color: #e7e9ec; font-size: 1.2rem; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .lightbox-prev { left: 22px; }
+  .lightbox-next { right: 22px; }
+  .lightbox-prev:hover, .lightbox-next:hover { background: rgba(44,100,255,0.85); }
+
+  .lightbox-viewport {
+    flex: 1; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; cursor: zoom-in;
+  }
+  .lightbox-viewport img {
+    max-width: 100%; max-height: 100%;
+    object-fit: contain;
+    transition: opacity 0.2s;
+  }
+  .lightbox-viewport img.loading { opacity: 0.4; }
+
+  /* counter badge */
+  .lb-counter {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.65); border-radius: 12px;
+    padding: 4px 14px; font-size: 0.8rem; color: #888;
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>Gobabeb 10</h1>
+  <span id="status">Loading…</span>
+  <button id="reload-btn">↺ Reload</button>
+</div>
+
+<div id="grid"></div>
+
+<!-- Lightbox (same CSS class names as raw-converter-wasm/web) -->
+<div id="lightbox" class="lightbox" hidden>
+  <div class="lb-gallery-title" id="lb-title"></div>
+  <button class="lightbox-close" id="lb-close" title="Close (Esc)">✕</button>
+  <button class="lightbox-prev" id="lb-prev" title="Previous (←)">‹</button>
+  <button class="lightbox-next" id="lb-next" title="Next (→)">›</button>
+  <div class="lightbox-viewport" id="lb-viewport">
+    <img id="lb-img" src="" alt="">
+  </div>
+  <div class="lb-counter" id="lb-counter"></div>
+</div>
+
+<script>
+const IMAGES = [
+  "P2200500_Hermannia_boraginiflora",
+  "P2200501",
+  "P2200508_Sesamum_triphyllum",
+  "P2200521",
+  "P2200571",
+  "P2200594",
+  "P2200610_Pergularia_daemia",
+  "P2200637_Hermannia_atrosanguinea",
+  "P2200673",
+  "P2200717"
+];
+
+const THUMB_DIR = "gobabeb-gallery/thumbs/";
+const FULL_DIR  = "gobabeb-gallery/full/";
+
+const grid      = document.getElementById("grid");
+const status    = document.getElementById("status");
+const lbEl      = document.getElementById("lightbox");
+const lbImg     = document.getElementById("lb-img");
+const lbTitle   = document.getElementById("lb-title");
+const lbCounter = document.getElementById("lb-counter");
+
+let lbIndex = 0;
+let loadCount = 0;
+let t0 = 0;
+
+// ── gallery load ─────────────────────────────────────────────────────────────
+
+async function loadGallery() {
+  grid.innerHTML = "";
+  loadCount = 0;
+  t0 = performance.now();
+  status.textContent = "Loading…";
+
+  // Create skeleton cards immediately
+  const imgs = IMAGES.map((name, i) => {
+    const card = document.createElement("div");
+    card.className = "thumb loading";
+    card.dataset.index = i;
+
+    const img = document.createElement("img");
+    img.alt = name;
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const label = document.createElement("span");
+    label.className = "name";
+    label.textContent = name.replace(/_/g, " ");
+    meta.appendChild(label);
+
+    card.appendChild(img);
+    card.appendChild(meta);
+    grid.appendChild(card);
+
+    card.addEventListener("click", () => openLightbox(i));
+    return { card, img };
+  });
+
+  // Load one at a time so user sees each appear
+  for (let i = 0; i < IMAGES.length; i++) {
+    const { card, img } = imgs[i];
+    await loadThumb(img, IMAGES[i]);
+    card.classList.remove("loading");
+    img.classList.add("loaded");
+    loadCount++;
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+    status.textContent = `${loadCount}/${IMAGES.length} — ${elapsed}s`;
+  }
+
+  const total = ((performance.now() - t0) / 1000).toFixed(2);
+  status.textContent = `${IMAGES.length}/${IMAGES.length} — ${total}s total`;
+}
+
+function loadThumb(img, name) {
+  return new Promise((resolve) => {
+    img.onload  = resolve;
+    img.onerror = resolve; // don't stall on error
+    img.src = THUMB_DIR + name + ".jpg";
+  });
+}
+
+// ── lightbox ─────────────────────────────────────────────────────────────────
+
+function openLightbox(index) {
+  lbIndex = index;
+  showLightboxImage();
+  lbEl.removeAttribute("hidden");
+  document.body.style.overflow = "hidden";
+}
+
+function closeLightbox() {
+  lbEl.setAttribute("hidden", "");
+  document.body.style.overflow = "";
+}
+
+function showLightboxImage() {
+  const name = IMAGES[lbIndex];
+  lbImg.classList.add("loading");
+  lbImg.src = FULL_DIR + name + ".jpg";
+  lbImg.onload = () => lbImg.classList.remove("loading");
+  lbTitle.textContent = name.replace(/_/g, " ");
+  lbCounter.textContent = `${lbIndex + 1} / ${IMAGES.length}`;
+}
+
+function lbPrev() {
+  lbIndex = (lbIndex - 1 + IMAGES.length) % IMAGES.length;
+  showLightboxImage();
+}
+
+function lbNext() {
+  lbIndex = (lbIndex + 1) % IMAGES.length;
+  showLightboxImage();
+}
+
+// ── event wiring ─────────────────────────────────────────────────────────────
+
+document.getElementById("lb-close").addEventListener("click", closeLightbox);
+document.getElementById("lb-prev").addEventListener("click", (e) => { e.stopPropagation(); lbPrev(); });
+document.getElementById("lb-next").addEventListener("click", (e) => { e.stopPropagation(); lbNext(); });
+
+document.addEventListener("keydown", (e) => {
+  if (lbEl.hasAttribute("hidden")) return;
+  if (e.key === "Escape")     closeLightbox();
+  if (e.key === "ArrowLeft")  lbPrev();
+  if (e.key === "ArrowRight") lbNext();
+});
+
+// Click outside image to close
+document.getElementById("lb-viewport").addEventListener("click", (e) => {
+  if (e.target === e.currentTarget) closeLightbox();
+});
+
+document.getElementById("reload-btn").addEventListener("click", loadGallery);
+
+// ── init ─────────────────────────────────────────────────────────────────────
+loadGallery();
+</script>
+</body>
+</html>
