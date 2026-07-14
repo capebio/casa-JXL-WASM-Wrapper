@@ -100,6 +100,14 @@ struct JxlWasmEncState {
   // EXIF orientation tag (1..8). 1 = identity, 3 = 180°, 6 = 90° CW, 8 = 90° CCW.
   // Stored in JXL basic info so pixels stay sensor-native — no CPU rotation.
   uint32_t enc_orientation;
+  // P3-T2 (finding 18): generic frame settings queued via jxl_wasm_enc_set_frame_setting.
+  // Each (id,value) is applied verbatim through JxlEncoderFrameSettingsSetOption at enc_finish;
+  // libjxl itself validates the id/value and rejects unknown/unsupported settings, so there is
+  // NO growing switch in either C++ or JS. Grown by doubling; freed in jxl_wasm_enc_free.
+  int32_t* enc_setting_ids;
+  int64_t* enc_setting_values;
+  size_t   enc_setting_count;
+  size_t   enc_setting_capacity;
 };
 
 // IMPROVEMENT-3: raw malloc for progressive decoder avoids std::vector<uint8_t> zero-init.
@@ -309,13 +317,26 @@ static JxlDataType BitsToDataType(uint32_t bits) {
 }
 
 // Packed extra-channel descriptor written by the TypeScript facade.
-// 20 bytes per entry, all fields 4-byte aligned. DataView layout must match exactly.
+// 48 bytes per entry, all fields 4-byte aligned. DataView layout must match exactly
+// (mirrored by serializeExtraChannelsForWasm + EC_BYTES in facade.ts).
+//
+// P3-T2 (finding 19): grown from 20→48 bytes so descriptor metadata (dim_shift, per-channel
+// name, and spot colour) actually reaches libjxl instead of being silently dropped. The new
+// tail fields are read by EncodeRgbaWithExtraChannels and reported back by
+// jxl_wasm_get_extra_channels for round-trip verification.
 struct WasmExtraChannel {
-  uint32_t type;       // JxlExtraChannelType value
-  uint32_t bits;       // bits_per_sample (8, 16, or 32)
-  float    distance;   // per-channel encode distance; < 0.0 = inherit main distance
-  uint32_t plane_ptr;  // WASM heap address of single-channel pixel data (0 = not provided)
-  uint32_t plane_size; // byte length of plane_ptr buffer
+  uint32_t type;         // offset  0: JxlExtraChannelType value
+  uint32_t bits;         // offset  4: bits_per_sample (8, 16, or 32)
+  float    distance;     // offset  8: per-channel encode distance; < 0.0 = inherit main distance
+  uint32_t plane_ptr;    // offset 12: WASM heap address of single-channel pixel data (0 = not provided)
+  uint32_t plane_size;   // offset 16: byte length of plane_ptr buffer
+  uint32_t dim_shift;    // offset 20: JxlExtraChannelInfo.dim_shift (axis downsample exponent)
+  uint32_t name_ptr;     // offset 24: WASM heap address of UTF-8 name bytes (0 = no name)
+  uint32_t name_len;     // offset 28: name byte length, excluding NUL
+  float    spot_r;       // offset 32: spot colour red   (JXL_CHANNEL_SPOT_COLOR only)
+  float    spot_g;       // offset 36: spot colour green
+  float    spot_b;       // offset 40: spot colour blue
+  float    spot_solidity;// offset 44: spot colour solidity
 };
 
 // Box-level options: container format control + Brotli metadata compression.
@@ -582,7 +603,11 @@ static JxlWasmBuffer* EncodeRgbaWithMetadata(
     int32_t disable_perceptual = -1,
     int32_t codestream_level = -1,
     int32_t premultiply_alpha = -1,
-    int32_t ec_resampling = -1) {
+    int32_t ec_resampling = -1,
+    // P3-T2 (finding 18): generic frame settings applied verbatim + libjxl-validated.
+    const int32_t* generic_setting_ids = nullptr,
+    const int64_t* generic_setting_values = nullptr,
+    size_t num_generic_settings = 0) {
   if (pixels == nullptr || width == 0 || height == 0) return MakeError(20);
 
   JxlEncoder* enc = JxlEncoderCreate(nullptr);
@@ -664,6 +689,19 @@ static JxlWasmBuffer* EncodeRgbaWithMetadata(
   if (color_transform >= 0) JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_COLOR_TRANSFORM, static_cast<int64_t>(std::clamp(color_transform, 0, 2)));
   // CasaSneyers_Parity: disable psychovisual heuristics (ID 39) — bypass butteraugli/XYB model.
   if (disable_perceptual > 0) JxlEncoderFrameSettingsSetOption(frame, JXL_ENC_FRAME_SETTING_DISABLE_PERCEPTUAL_HEURISTICS, 1LL);
+
+  // P3-T2 (finding 18): apply generic frame settings verbatim. libjxl validates each id/value
+  // and returns JXL_ENC_ERROR for an unknown/unsupported setting — surface that as a DETERMINISTIC
+  // error (140 + slot) rather than silently ignoring it. Integer-option ids only (SetOption).
+  if (generic_setting_ids != nullptr && generic_setting_values != nullptr) {
+    for (size_t i = 0; i < num_generic_settings; ++i) {
+      const JxlEncoderFrameSettingId id = static_cast<JxlEncoderFrameSettingId>(generic_setting_ids[i]);
+      if (JxlEncoderFrameSettingsSetOption(frame, id, generic_setting_values[i]) != JXL_ENC_SUCCESS) {
+        JxlEncoderDestroy(enc);
+        return MakeError(140);
+      }
+    }
+  }
 
   const size_t bytes_per_channel = (fmt == 2) ? 4u : (fmt == 1) ? 2u : 1u;
   // A3: fmt==3 means caller already provides 3-channel RGB (no alpha in buffer).
@@ -1184,12 +1222,28 @@ static JxlWasmBuffer* EncodeRgbaWithExtraChannels(
     const WasmExtraChannel& ec = extra_channels[i];
     const uint32_t ec_index = (has_alpha ? 1u : 0u) + i;
     JxlExtraChannelInfo ec_info;
-    memset(&ec_info, 0, sizeof(ec_info));
+    JxlEncoderInitExtraChannelInfo(static_cast<JxlExtraChannelType>(ec.type), &ec_info);
     ec_info.type = static_cast<JxlExtraChannelType>(ec.type);
     ec_info.bits_per_sample = ec.bits > 0u ? ec.bits : 8u;
     ec_info.exponent_bits_per_sample = (ec.bits == 32u) ? 8u : 0u;
+    // P3-T2 (finding 19): carry descriptor metadata through instead of dropping it.
+    ec_info.dim_shift = ec.dim_shift;
+    if (static_cast<JxlExtraChannelType>(ec.type) == JXL_CHANNEL_SPOT_COLOR) {
+      ec_info.spot_color[0] = ec.spot_r;
+      ec_info.spot_color[1] = ec.spot_g;
+      ec_info.spot_color[2] = ec.spot_b;
+      ec_info.spot_color[3] = ec.spot_solidity;
+    }
     if (JxlEncoderSetExtraChannelInfo(enc, ec_index, &ec_info) != JXL_ENC_SUCCESS) {
       JxlEncoderDestroy(enc); return MakeError(130);
+    }
+    // Per-channel UTF-8 name (finding 19): name_ptr/name_len point at heap bytes written by
+    // the facade after malloc. Skip when absent; a failure here is a hard descriptor error.
+    if (ec.name_ptr != 0u && ec.name_len > 0u) {
+      const char* name = reinterpret_cast<const char*>(static_cast<uintptr_t>(ec.name_ptr));
+      if (JxlEncoderSetExtraChannelName(enc, ec_index, name, ec.name_len) != JXL_ENC_SUCCESS) {
+        JxlEncoderDestroy(enc); return MakeError(136);
+      }
     }
   }
 
@@ -2942,6 +2996,113 @@ JxlWasmBuffer* jxl_wasm_encode_rgba8_with_metadata_ec_v2(
       alpha_distance, ec, n_ec, box_opts, 1u, ec_resampling);
 }
 
+// P3-T2 (finding 19): decode-side round-trip verification helper. Reads the codestream header
+// and returns the FULL descriptor set (type/bits/dim_shift/spot colour/name) for every extra
+// channel — INCLUDING the main alpha channel — packed as WasmExtraChannel[]. The result's
+// `width` field carries the channel count so the facade can size its read. Name bytes are
+// appended after the descriptor array in the SAME heap buffer; name_ptr is the absolute heap
+// address of those bytes (readable directly from HEAPU8 by the facade). plane_ptr/plane_size
+// and distance are left 0 (not part of the header). Returns an error buffer on failure.
+JxlWasmBuffer* jxl_wasm_get_extra_channels(const uint8_t* input, size_t input_size) {
+  if (input == nullptr || input_size == 0) return MakeError(160);
+
+  JxlDecoder* dec = JxlDecoderCreate(nullptr);
+  if (dec == nullptr) return MakeError(161);
+  JXL_SETUP_DEC_RUNNER(dec, MakeError(58));
+  if (JxlDecoderSubscribeEvents(dec, JXL_DEC_BASIC_INFO) != JXL_DEC_SUCCESS) {
+    JxlDecoderDestroy(dec); return MakeError(162);
+  }
+  JxlDecoderSetInput(dec, input, input_size);
+  JxlDecoderCloseInput(dec);
+
+  JxlBasicInfo info{};
+  bool have_info = false;
+  for (;;) {
+    const JxlDecoderStatus st = JxlDecoderProcessInput(dec);
+    if (st == JXL_DEC_ERROR || st == JXL_DEC_NEED_MORE_INPUT) {
+      JxlDecoderDestroy(dec); return MakeError(static_cast<int>(st));
+    }
+    if (st == JXL_DEC_BASIC_INFO) {
+      if (JxlDecoderGetBasicInfo(dec, &info) != JXL_DEC_SUCCESS) {
+        JxlDecoderDestroy(dec); return MakeError(163);
+      }
+      have_info = true;
+      break;
+    }
+    if (st == JXL_DEC_SUCCESS) break;
+  }
+  if (!have_info) { JxlDecoderDestroy(dec); return MakeError(164); }
+
+  const uint32_t n = info.num_extra_channels;
+  // Gather per-channel info + names first (need total name bytes to size the buffer).
+  // First pass: descriptor structs + name lengths.
+  const size_t desc_bytes = static_cast<size_t>(n) * sizeof(WasmExtraChannel);
+  // Compute total name bytes.
+  size_t total_name_bytes = 0;
+  for (uint32_t i = 0; i < n; ++i) {
+    JxlExtraChannelInfo eci{};
+    if (JxlDecoderGetExtraChannelInfo(dec, i, &eci) != JXL_DEC_SUCCESS) {
+      JxlDecoderDestroy(dec); return MakeError(165);
+    }
+    total_name_bytes += eci.name_length;
+  }
+
+  const size_t buf_bytes = desc_bytes + total_name_bytes;
+  uint8_t* packed = static_cast<uint8_t*>(calloc(1, buf_bytes == 0 ? 1u : buf_bytes));
+  if (packed == nullptr) { JxlDecoderDestroy(dec); return MakeError(166); }
+
+  WasmExtraChannel* out = reinterpret_cast<WasmExtraChannel*>(packed);
+  size_t name_cursor = desc_bytes; // names appended after the descriptor array
+  for (uint32_t i = 0; i < n; ++i) {
+    JxlExtraChannelInfo eci{};
+    if (JxlDecoderGetExtraChannelInfo(dec, i, &eci) != JXL_DEC_SUCCESS) {
+      free(packed); JxlDecoderDestroy(dec); return MakeError(167);
+    }
+    out[i].type          = static_cast<uint32_t>(eci.type);
+    out[i].bits          = eci.bits_per_sample;
+    out[i].distance      = 0.0f;
+    out[i].plane_ptr     = 0u;
+    out[i].plane_size    = 0u;
+    out[i].dim_shift     = eci.dim_shift;
+    out[i].name_len      = eci.name_length;
+    out[i].spot_r        = eci.spot_color[0];
+    out[i].spot_g        = eci.spot_color[1];
+    out[i].spot_b        = eci.spot_color[2];
+    out[i].spot_solidity = eci.spot_color[3];
+    if (eci.name_length > 0) {
+      char* name_dst = reinterpret_cast<char*>(packed + name_cursor);
+      // Buffer sized for name_length bytes (no NUL); pass name_length+1 as required by the API,
+      // temporarily borrowing the trailing byte of the buffer or a small stack scratch. We use a
+      // stack scratch to satisfy the "+1" contract without over-allocating the shared buffer.
+      if (eci.name_length < 1024) {
+        char scratch[1025];
+        if (JxlDecoderGetExtraChannelName(dec, i, scratch, eci.name_length + 1) != JXL_DEC_SUCCESS) {
+          free(packed); JxlDecoderDestroy(dec); return MakeError(168);
+        }
+        memcpy(name_dst, scratch, eci.name_length);
+      } else {
+        char* tmp = static_cast<char*>(malloc(eci.name_length + 1));
+        if (tmp == nullptr) { free(packed); JxlDecoderDestroy(dec); return MakeError(169); }
+        if (JxlDecoderGetExtraChannelName(dec, i, tmp, eci.name_length + 1) != JXL_DEC_SUCCESS) {
+          free(tmp); free(packed); JxlDecoderDestroy(dec); return MakeError(168);
+        }
+        memcpy(name_dst, tmp, eci.name_length);
+        free(tmp);
+      }
+      // Absolute heap address of the name bytes (readable from HEAPU8 in JS).
+      out[i].name_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(name_dst));
+      name_cursor += eci.name_length;
+    } else {
+      out[i].name_ptr = 0u;
+    }
+  }
+  JxlDecoderDestroy(dec);
+
+  JxlWasmBuffer* result = MakeBufferFromOwned(packed, buf_bytes, n, 0u, 8u, info.alpha_bits > 0 ? 1u : 0u);
+  if (result == nullptr) return MakeError(170); // MakeBufferFromOwned frees packed on failure
+  return result;
+}
+
 // Gain map encode: same as _with_metadata_x but attaches a jhgm box (JXL gain map).
 // gain_map_jxl: pre-encoded JXL codestream (the gain map image); 0 → no box added.
 // When JXL_GAIN_MAP_SUPPORTED is 0 (old libjxl), encodes normally without the box.
@@ -3479,7 +3640,8 @@ int jxl_wasm_enc_finish(JxlWasmEncState* s) {
       s->enc_disable_perceptual,
       s->enc_codestream_level,
       s->enc_premultiply_alpha,
-      s->enc_ec_resampling);
+      s->enc_ec_resampling,
+      s->enc_setting_ids, s->enc_setting_values, s->enc_setting_count);
 
   // libjxl is done with the pixel data — free it now to reclaim memory.
   free(s->pixels_buf);
@@ -3508,7 +3670,33 @@ void jxl_wasm_enc_free(JxlWasmEncState* s) {
   free(s->enc_icc);
   free(s->enc_exif);
   free(s->enc_xmp);
+  free(s->enc_setting_ids);
+  free(s->enc_setting_values);
   free(s);
+}
+
+// P3-T2 (finding 18): queue ONE generic frame setting (id + value) to be applied verbatim at
+// enc_finish through JxlEncoderFrameSettingsSetOption. There is no id switch here — libjxl is the
+// single validator and rejects unknown/unsupported ids at encode time (surfaced as a non-zero
+// enc_finish rc). `value` is int32 across the FFI (all integer frame settings fit in 32 bits;
+// avoids a JS BigInt at the boundary) and is widened to int64_t for the libjxl call.
+// Returns 0 on success, -1 on bad state, -2 on allocation failure.
+int jxl_wasm_enc_set_frame_setting(JxlWasmEncState* s, int32_t id, int32_t value) {
+  if (s == nullptr) return -1;
+  if (s->enc_setting_count == s->enc_setting_capacity) {
+    const size_t new_cap = s->enc_setting_capacity == 0 ? 8u : s->enc_setting_capacity * 2u;
+    int32_t* new_ids = static_cast<int32_t*>(realloc(s->enc_setting_ids, new_cap * sizeof(int32_t)));
+    if (new_ids == nullptr) { s->error_code = -2; return -2; }
+    s->enc_setting_ids = new_ids;
+    int64_t* new_vals = static_cast<int64_t*>(realloc(s->enc_setting_values, new_cap * sizeof(int64_t)));
+    if (new_vals == nullptr) { s->error_code = -2; return -2; }
+    s->enc_setting_values = new_vals;
+    s->enc_setting_capacity = new_cap;
+  }
+  s->enc_setting_ids[s->enc_setting_count] = id;
+  s->enc_setting_values[s->enc_setting_count] = static_cast<int64_t>(value);
+  s->enc_setting_count++;
+  return 0;
 }
 
 // B3: Store ICC/EXIF/XMP for the streaming-input path. Must be called before enc_finish.

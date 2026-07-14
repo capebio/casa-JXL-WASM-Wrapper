@@ -552,6 +552,15 @@ pub struct ProcessResult {
     retained_params: Option<pipeline::PipelineParams>,
     retained_w: usize,
     retained_h: usize,
+    // DNG deferred finish (finding 34): the ORF retain model (raw + params + dims,
+    // above) generalized to DNG. DNG needs two extra bits the ORF finish does not:
+    // the CFA phase (ORF is always RGGB) and the DNG BaselineExposure EV (folded
+    // into the render exposure). `Some(phase)` marks a DNG-retained result, routed
+    // to `finish_dng_full_rgb8` (demosaic_bayer_mhc + baseline fold) rather than the
+    // ORF `finish_full_rgb8` (demosaic_rggb_mhc, no baseline). `None` = not a DNG
+    // retain (ORF retain or a normal decode).
+    retained_dng_phase: Option<(u8, u8)>,
+    retained_dng_baseline: f32,
     // ── Noise/denoise telemetry (process_*_with_options) ──────────────────────
     #[wasm_bindgen(readonly)]
     pub denoise_requested: bool,
@@ -696,6 +705,94 @@ impl ProcessResult {
         self.wb_b_used = out.wb_b_used;
         self.retained_w = 0;
         self.retained_h = 0;
+        Ok(())
+    }
+
+    /// Deferred DNG/CR2 finish (finding 34): the DNG twin of `finish_full_rgb8`.
+    /// Finish the full-resolution RGB8 FROM the raw mosaic + CFA phase + camera
+    /// params + BaselineExposure retained by a phase-1 `OUT_RETAIN_RAW` DNG/CR2
+    /// decode — demosaic (`demosaic_bayer_mhc` with the file's phase) + baseline-
+    /// folded look + tone (+ optional disp16 / orientation) only, with NO second
+    /// container decode. Byte-identical to a fresh `OUT_FULL_RGB8` DNG decode because
+    /// both go through `finish_dng_from_raw`. Errors (JsError) if the result was not
+    /// produced with `OUT_RETAIN_RAW` on a DNG/CR2 path (i.e. `retained_dng_phase`
+    /// is unset — an ORF-retained result must use `finish_full_rgb8` instead). The
+    /// 14 look args match the trailing arguments of `process_dng_with_flags`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_dng_full_rgb8(
+        &mut self,
+        output_flags: u32,
+        exposure_ev: f32,
+        contrast: f32,
+        highlights: f32,
+        shadows: f32,
+        whites: f32,
+        blacks: f32,
+        saturation: f32,
+        vibrance: f32,
+        temp: f32,
+        tint: f32,
+        wb_r: f32,
+        wb_b: f32,
+        texture: f32,
+        clarity: f32,
+    ) -> Result<(), JsError> {
+        let phase = self.retained_dng_phase.ok_or_else(|| {
+            JsError::new(
+                "finish_dng_full_rgb8: no retained DNG raw (decode a DNG/CR2 with OUT_RETAIN_RAW first)",
+            )
+        })?;
+        let raw = self.retained_raw.take().ok_or_else(|| {
+            JsError::new("finish_dng_full_rgb8: no retained raw")
+        })?;
+        let params = self
+            .retained_params
+            .take()
+            .ok_or_else(|| JsError::new("finish_dng_full_rgb8: no retained params"))?;
+        let look = LookOverrides {
+            wb_r,
+            wb_b,
+            exposure_ev,
+            contrast,
+            highlights,
+            shadows,
+            whites,
+            blacks,
+            saturation,
+            vibrance,
+            temp,
+            tint,
+            texture,
+            clarity,
+        };
+        let out = finish_dng_from_raw(
+            raw,
+            self.retained_w,
+            self.retained_h,
+            phase,
+            params,
+            &look,
+            self.orientation,
+            self.retained_dng_baseline,
+            output_flags,
+        )?;
+        self.rgb = out.rgb8;
+        self.width = out.final_w as u32;
+        self.height = out.final_h as u32;
+        self.demosaic_ms = out.demosaic_ms;
+        self.tonemap_ms = out.tonemap_ms;
+        self.orient_ms = out.orient_ms;
+        self.rgb16_full = out.rgb16_full;
+        self.full16_w = out.full16_w;
+        self.full16_h = out.full16_h;
+        self.rgb16_disp = out.rgb16_disp;
+        self.disp16_w = out.disp16_w;
+        self.disp16_h = out.disp16_h;
+        self.wb_r_used = out.wb_r_used;
+        self.wb_b_used = out.wb_b_used;
+        self.retained_w = 0;
+        self.retained_h = 0;
+        self.retained_dng_phase = None;
         Ok(())
     }
 
@@ -1167,6 +1264,7 @@ pub fn estimate_decode_peak_bytes(width: u32, height: u32, output_flags: u32) ->
 /// histogram floor of real E-M1 III files sits here (~256).
 const OLYMPUS_BLACK_LEVEL: u16 = 256;
 
+#[derive(Clone, Copy)]
 struct LookOverrides {
     wb_r: f32,
     wb_b: f32,
@@ -1745,6 +1843,160 @@ fn finish_from_raw(
     })
 }
 
+/// Fold the DNG BaselineExposure EV into a look's render exposure (finding 34 /
+/// the 99ed8d00 night-DNG fix). The user's exposure slider composes on top of the
+/// camera's suggested baseline shift, so night/low-light Pixel DNGs (which set
+/// +1.3..+1.6 EV) reach their intended brightness. `0.0` baseline = unchanged.
+///
+/// This is the SINGLE definition of the baseline fold; both the monolithic DNG
+/// output stage (`process_dng_impl`) and the deferred finish (`finish_dng_from_raw`)
+/// route their look through it, so the two cannot drift on how brightness is applied.
+#[inline]
+fn look_with_baseline(look: &LookOverrides, baseline_exposure: f32) -> LookOverrides {
+    let mut l = *look;
+    l.exposure_ev += baseline_exposure;
+    l
+}
+
+/// Sole implementation of the full-res DNG/CR2 finish stage: MHC demosaic (with
+/// the file's CFA phase) → baseline-folded look → tone → optional disp16 →
+/// optional orientation. This is the DNG twin of the ORF `finish_from_raw`,
+/// specialised for a non-RGGB `phase` and the DNG BaselineExposure fold.
+///
+/// Called by BOTH the monolithic `process_dng_impl` (via [`finish_dng_from_decoded`])
+/// and the mode-3 deferred `ProcessResult::finish_dng_full_rgb8`, so the two are
+/// byte-identical by construction — the deferred final never re-decodes the
+/// container, it just re-runs THIS from the retained mosaic. Consumes `raw`
+/// (freed right after demosaic). `params` is camera-derived (pre-look); the look
+/// (with the baseline pre-folded) is applied here.
+#[allow(clippy::too_many_arguments)]
+fn finish_dng_from_raw(
+    raw: Vec<u16>,
+    w: usize,
+    h: usize,
+    phase: (u8, u8),
+    mut params: pipeline::PipelineParams,
+    look: &LookOverrides,
+    orientation: u16,
+    baseline_exposure: f32,
+    output_flags: u32,
+) -> Result<FinishOutputs, JsError> {
+    // MHC (quality) demosaic — full-res interleaved RGB16, honouring the CFA phase.
+    let t = now_ms();
+    let mut rgb16 = demosaic::demosaic_bayer_mhc(&raw, w, h, phase)
+        .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
+    let demosaic_ms = now_ms() - t;
+    drop(raw);
+
+    // Apply the baseline-folded look to the camera-derived params (WB override + sliders).
+    let folded = look_with_baseline(look, baseline_exposure);
+    apply_look_to_params(&mut params, &folded);
+    let wb_r_used = params.wb_r;
+    let wb_b_used = params.wb_b;
+
+    let want_full16 = output_flags & OUT_FULL_16 != 0;
+    let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
+    let (full16_w, full16_h) = if want_full16 {
+        (w as u32, h as u32)
+    } else {
+        (0, 0)
+    };
+
+    let t = now_ms();
+    let (rgb8, final_w, final_h, tonemap_ms, orient_ms, rgb16_full, rgb16_disp, disp16_w, disp16_h) =
+        if output_flags & OUT_FULL_RGB8 != 0 {
+            let will_unsharp = params.texture != 0.0 || params.clarity != 0.0;
+            let full16_pre = if want_full16 && will_unsharp {
+                Some(rgb16.clone())
+            } else {
+                None
+            };
+            if will_unsharp {
+                pipeline::apply_unsharp_masks(&mut rgb16, w, h, &params);
+            }
+            let mut rgb8 = vec![0u8; w * h * 3];
+            pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
+            let tonemap_ms = now_ms() - t;
+            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+                let disp = pipeline::process_16bit(&rgb16, &params);
+                if skip_orient || orientation == 1 {
+                    (disp, w as u32, h as u32)
+                } else {
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, orientation);
+                    (d, dw as u32, dh as u32)
+                }
+            } else {
+                (Vec::new(), 0u32, 0u32)
+            };
+            let rgb16_full = if want_full16 {
+                full16_pre.unwrap_or(rgb16)
+            } else {
+                drop(rgb16);
+                Vec::new()
+            };
+            let t2 = now_ms();
+            let (fr, fw, fh) = if skip_orient || orientation == 1 {
+                (rgb8, w, h)
+            } else {
+                pipeline::apply_orientation(rgb8, w, h, orientation)
+            };
+            (
+                fr,
+                fw,
+                fh,
+                tonemap_ms,
+                now_ms() - t2,
+                rgb16_full,
+                rgb16_disp,
+                disp16_w,
+                disp16_h,
+            )
+        } else {
+            let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
+            let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
+                let disp = pipeline::process_16bit(&rgb16, &params);
+                if skip_orient || orientation == 1 {
+                    (disp, w as u32, h as u32)
+                } else {
+                    let (d, dw, dh) = pipeline::apply_orientation_u16(disp, w, h, orientation);
+                    (d, dw as u32, dh as u32)
+                }
+            } else {
+                (Vec::new(), 0u32, 0u32)
+            };
+            let rgb16_full = if want_full16 { rgb16 } else { Vec::new() };
+            (
+                vec![],
+                0,
+                0,
+                0.0,
+                0.0,
+                rgb16_full,
+                rgb16_disp,
+                disp16_w,
+                disp16_h,
+            )
+        };
+
+    Ok(FinishOutputs {
+        rgb8,
+        final_w,
+        final_h,
+        demosaic_ms,
+        tonemap_ms,
+        orient_ms,
+        rgb16_full,
+        full16_w,
+        full16_h,
+        rgb16_disp,
+        disp16_w,
+        disp16_h,
+        wb_r_used,
+        wb_b_used,
+    })
+}
+
 /// Shared output stage: conditionally compute lb, thumb, and full RGB8 from
 /// pre-decoded ORF data according to `output_flags`.  Absent outputs have empty
 /// buffers and zero dims in the returned `ProcessResult`.
@@ -1955,6 +2207,10 @@ fn process_orf_impl(
         retained_params,
         retained_w,
         retained_h,
+        // ORF retain uses the ORF `finish_full_rgb8` (RGGB demosaic, no DNG
+        // baseline); the DNG-specific retain fields stay unset on this path.
+        retained_dng_phase: None,
+        retained_dng_baseline: 0.0,
         denoise_requested: false,
         denoise_applied: false,
         denoise_ms: 0.0,
@@ -2199,6 +2455,8 @@ pub fn process_orf_with_options(
             raw_mosaic: Vec::new(), // freed after denoise
             cfa_index,
             noise_metadata,
+            wb_from_camera,
+            baseline_exposure: 0.0, // ORF (Olympus) has no DNG BaselineExposure tag
         },
         output_flags,
         &opts.look,
@@ -3218,6 +3476,134 @@ mod tests {
         assert_eq!(rgba.len(), 16);
         assert!(rgba.chunks_exact(4).all(|px| px[3] == 255));
     }
+
+    // ── P3-T8 (finding 34): DNG deferred-finish native byte parity ────────────
+    //
+    // finish_dng_from_raw is the SINGLE shared full-res DNG finish. This proves it
+    // is byte-identical to the equivalent monolithic tone (demosaic → baseline-
+    // folded look → process_auto) on the same mosaic + params + look — i.e. the
+    // deferred final reproduces the monolithic full RGB8 exactly, and the
+    // BaselineExposure fold composes on top of the look exposure identically on
+    // both paths. Runs natively (no wasm / web-pkg dependency).
+
+    /// Deterministic synthetic RGGB mosaic (small even dims — full CFA blocks).
+    fn synth_mosaic(w: usize, h: usize) -> Vec<u16> {
+        let mut s: u32 = 0x9E37_79B9;
+        (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 11) & 0x3fff) as u16 // 14-bit-ish sensor counts
+            })
+            .collect()
+    }
+
+    fn dng_like_params() -> pipeline::PipelineParams {
+        let mut p = pipeline::PipelineParams::default_olympus();
+        p.black = 512;
+        p.white = 15300; // DNG-class 14-bit white
+        p.wb_r = 1.9;
+        p.wb_b = 1.6;
+        p
+    }
+
+    /// The monolithic reference tone: exactly what process_dng_impl's full-RGB8
+    /// branch does — WB override + apply_look_params(exposure_ev + baseline, …) on
+    /// the camera params, then process_auto over the MHC demosaic.
+    fn monolithic_full_rgb8(
+        raw: &[u16],
+        w: usize,
+        h: usize,
+        phase: (u8, u8),
+        base_params: &pipeline::PipelineParams,
+        look: &LookOverrides,
+        baseline: f32,
+    ) -> Vec<u8> {
+        let rgb16 = demosaic::demosaic_bayer_mhc(raw, w, h, phase).unwrap();
+        let mut params = base_params.clone();
+        if look.wb_r.is_finite() && look.wb_r > 0.0 {
+            params.wb_r = look.wb_r.min(8.0);
+        }
+        if look.wb_b.is_finite() && look.wb_b > 0.0 {
+            params.wb_b = look.wb_b.min(8.0);
+        }
+        raw_pipeline::pipeline::apply_look_params(
+            &mut params,
+            look.exposure_ev + baseline,
+            look.contrast,
+            look.highlights,
+            look.shadows,
+            look.whites,
+            look.blacks,
+            look.saturation,
+            look.vibrance,
+            look.temp,
+            look.tint,
+            look.texture,
+            look.clarity,
+        );
+        pipeline::process_auto(&rgb16, &params)
+    }
+
+    #[test]
+    fn finish_dng_from_raw_matches_monolithic_neutral() {
+        let (w, h) = (64usize, 48usize);
+        let raw = synth_mosaic(w, h);
+        let phase = dng_phase_from_cfa_index(0); // RGGB
+        let params = dng_like_params();
+        let look = LookOverrides::neutral();
+        let baseline = 0.0f32;
+
+        let mono = monolithic_full_rgb8(&raw, w, h, phase, &params, &look, baseline);
+        let out = finish_dng_from_raw(
+            raw.clone(),
+            w,
+            h,
+            phase,
+            params.clone(),
+            &look,
+            1, // orientation (no rotate)
+            baseline,
+            OUT_FULL_RGB8 | OUT_NO_ORIENT,
+        )
+        .unwrap();
+        assert_eq!(out.rgb8, mono, "deferred finish != monolithic (neutral)");
+        assert_eq!(out.final_w, w);
+        assert_eq!(out.final_h, h);
+    }
+
+    #[test]
+    fn finish_dng_from_raw_matches_monolithic_with_baseline_and_look() {
+        // Positive BaselineExposure (like a night Pixel DNG) + a non-neutral look:
+        // the fold and the slider must compose identically on both paths.
+        let (w, h) = (80usize, 64usize);
+        let raw = synth_mosaic(w, h);
+        let phase = dng_phase_from_cfa_index(2); // GBRG — exercise a non-RGGB phase
+        let params = dng_like_params();
+        let mut look = LookOverrides::neutral();
+        look.exposure_ev = 0.4;
+        look.contrast = 0.2;
+        look.shadows = 0.15;
+        look.saturation = 0.1;
+        let baseline = 1.35f32;
+
+        let mono = monolithic_full_rgb8(&raw, w, h, phase, &params, &look, baseline);
+        let out = finish_dng_from_raw(
+            raw.clone(),
+            w,
+            h,
+            phase,
+            params.clone(),
+            &look,
+            1,
+            baseline,
+            OUT_FULL_RGB8 | OUT_NO_ORIENT,
+        )
+        .unwrap();
+        assert_eq!(
+            out.rgb8, mono,
+            "deferred finish != monolithic (baseline + look)"
+        );
+    }
 }
 
 /// WASM-resident rendering state for a single image (lightbox or thumbnail).
@@ -3769,6 +4155,10 @@ struct DngDecoded {
     iso: u32,
     /// DNG BaselineExposure (EV); folded into the render exposure. 0.0 when absent.
     baseline_exposure: f32,
+    /// Finding 51: honest WB provenance carried from the decoder (`true` only when
+    /// WB genuinely came from AsShotNeutral / MakerNote 0x4001). Replaces the
+    /// hardcoded `wb_from_camera: true` the shared output stage used to emit.
+    wb_from_camera: bool,
     datetime: String,
     gps_lat: Option<f64>,
     gps_lon: Option<f64>,
@@ -3800,7 +4190,13 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     // path on any unsupported case (compression/CFA/dims). See design spec.
     let need_previews = output_flags & (OUT_LIGHTBOX | OUT_THUMB) != 0;
     let need_full_rgb = output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) != 0;
-    if need_previews && !need_full_rgb {
+    // Mode 3 (finding 34): OUT_RETAIN_RAW needs the full raw mosaic materialized to
+    // retain for the deferred finish, which the streaming preview-only path never
+    // produces — treat it like "raw is needed downstream" so retain takes the full
+    // decode path below (which also yields the eager rgb16 the previews downscale
+    // from, keeping preview bytes identical to the monolithic path).
+    let retain_raw = output_flags & OUT_RETAIN_RAW != 0;
+    if need_previews && !need_full_rgb && !retain_raw {
         if let Ok(src) = raw_pipeline::dng::DngRowSource::new(data) {
             let (w, h) = {
                 let m = src.meta();
@@ -3811,19 +4207,43 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 && w.checked_mul(h).unwrap_or(MAX_PIXELS + 1) <= MAX_PIXELS
             {
                 let phase = src.phase();
-                let (black, white, wb_r, wb_b, color_matrix, orientation, iso, baseline_exposure, make, model) = {
+                let (
+                    black,
+                    white,
+                    wb_r,
+                    wb_b,
+                    wb_from_camera,
+                    color_matrix,
+                    orientation,
+                    iso,
+                    baseline_exposure,
+                    make,
+                    model,
+                    datetime,
+                    gps_lat,
+                    gps_lon,
+                    gps_alt,
+                ) = {
                     let m = src.meta();
                     (
                         m.black,
                         m.white,
                         m.wb_r,
                         m.wb_b,
+                        // Finding 51: carry honest provenance out of the preview carrier.
+                        m.wb_from_camera,
                         m.color_matrix,
                         m.orientation,
                         m.iso.unwrap_or(100),
                         m.baseline_exposure,
                         m.make.clone(),
                         m.model.clone(),
+                        // Finding 50: preserve datetime/GPS on the streaming preview path
+                        // (previously dropped → info panel lost them for preview-only decodes).
+                        m.datetime.clone(),
+                        m.gps_lat,
+                        m.gps_lon,
+                        m.gps_alt,
                     )
                 };
                 let (lb_w, lb_h) = target_dims(w, h, 1800);
@@ -3867,10 +4287,11 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                     model,
                     iso,
                     baseline_exposure,
-                    datetime: String::new(),
-                    gps_lat: None,
-                    gps_lon: None,
-                    gps_alt: None,
+                    wb_from_camera,
+                    datetime,
+                    gps_lat,
+                    gps_lon,
+                    gps_alt,
                     lb_packed,
                     lb_w,
                     lb_h,
@@ -3953,6 +4374,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         model: img.model,
         iso,
         baseline_exposure: img.baseline_exposure,
+        wb_from_camera: img.wb_from_camera,
         datetime: img.datetime,
         gps_lat: img.gps_lat,
         gps_lon: img.gps_lon,
@@ -3968,6 +4390,21 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         cfa_index,
         noise_metadata,
     })
+}
+
+/// Map a `DngDecoded.cfa_index` (0=RGGB,1=GRBG,2=GBRG,3=BGGR) to the demosaic
+/// `(row_phase, col_phase)`. Inverse of the `cfa_index` assignment in
+/// `decode_dng_raw`; infallible because `cfa_index` is only ever set from that
+/// match (any other value is a programming error → default to RGGB (0,0)).
+#[inline]
+fn dng_phase_from_cfa_index(cfa_index: usize) -> (u8, u8) {
+    match cfa_index {
+        0 => (0, 0), // RGGB
+        1 => (0, 1), // GRBG
+        2 => (1, 0), // GBRG
+        3 => (1, 1), // BGGR
+        _ => (0, 0),
+    }
 }
 
 /// Shared DNG output stage: conditionally compute lb, thumb, and full RGB8 from
@@ -3991,6 +4428,7 @@ fn process_dng_impl(
         model,
         iso,
         baseline_exposure,
+        wb_from_camera,
         datetime,
         gps_lat,
         gps_lon,
@@ -4002,8 +4440,8 @@ fn process_dng_impl(
         thumb_w,
         thumb_h,
         fast_preview,
-        raw_mosaic: _,
-        cfa_index: _,
+        raw_mosaic,
+        cfa_index,
         noise_metadata: _,
     } = decoded;
 
@@ -4043,6 +4481,102 @@ fn process_dng_impl(
     } else {
         (vec![], 0, 0)
     };
+
+    // Mode 3 (deferred DNG finish, finding 34): retain the container-decoded raw
+    // mosaic + CFA phase + camera-derived (pre-look) params + BaselineExposure so a
+    // later `finish_dng_full_rgb8` produces the full RGB8 WITHOUT re-decoding the
+    // container (no second `dng::decode_bytes`, no second LJPEG un-decompress). The
+    // previews above are already built (from the eager full-res demosaic — the SAME
+    // source the monolithic path uses, so preview bytes never diverge); this branch
+    // just skips the full-res tone and hands the mosaic to the deferred finish.
+    //
+    // Generalises the proven ORF retain model (raw + params + dims) to DNG/CR2 by
+    // also carrying the phase and baseline. Explicit ownership: the raw mosaic is
+    // MOVED into `retained_raw` and freed when the finish consumes it (or on the
+    // result's free()). Mutually exclusive with a full-output flag in one call (the
+    // caller requests retain in phase 1, then finishes in phase 2).
+    let retain = output_flags & OUT_RETAIN_RAW != 0;
+    if retain {
+        debug_assert!(
+            output_flags & (OUT_FULL_RGB8 | OUT_FULL_16 | OUT_FULL_DISP16) == 0,
+            "OUT_RETAIN_RAW must not be combined with a full-output flag in one call"
+        );
+        // Report the look-adjusted WB (matching the classic path that feeds the live
+        // LookRenderer); the *retained* params stay pre-look so the deferred finish
+        // applies its own look args (incl. the baseline fold) from scratch.
+        let phase = dng_phase_from_cfa_index(cfa_index);
+        let mut reported = params.clone();
+        apply_look_to_params(&mut reported, &look_with_baseline(look, baseline_exposure));
+        drop(rgb16); // full-res buffer not needed on the retain path
+        return Ok(ProcessResult {
+            rgb: Vec::new(),
+            width: 0,
+            height: 0,
+            orientation,
+            decompress_ms: decode_ms,
+            demosaic_ms,
+            tonemap_ms: 0.0,
+            orient_ms: 0.0,
+            preview_demosaic_ms: 0.0,
+            preview_downscale_ms: 0.0,
+            fast_preview: false,
+            wb_r_used: reported.wb_r,
+            wb_b_used: reported.wb_b,
+            black_used: params.black,
+            white_used: params.white,
+            color_matrix_from_mn: params.color_matrix.to_option().is_some(),
+            make,
+            model,
+            rgb16_lb,
+            lb_w: out_lb_w as u32,
+            lb_h: out_lb_h as u32,
+            rgb16_thumb,
+            thumb_w: out_thumb_w as u32,
+            thumb_h: out_thumb_h as u32,
+            rgb16_full: Vec::new(),
+            full16_w: 0,
+            full16_h: 0,
+            rgb16_disp: Vec::new(),
+            disp16_w: 0,
+            disp16_h: 0,
+            color_matrix_flat,
+            lens: String::new(),
+            datetime,
+            exposure_num: 0,
+            exposure_den: 0,
+            fnumber_num: 0,
+            fnumber_den: 0,
+            iso,
+            focal_length_num: 0,
+            focal_length_den: 0,
+            focal_length_35: 0,
+            gps_lat: gps_lat.unwrap_or(0.0),
+            gps_lon: gps_lon.unwrap_or(0.0),
+            gps_alt: gps_alt.unwrap_or(0.0),
+            has_gps: gps_lat.is_some() && gps_lon.is_some(),
+            quality: 0,
+            wb_mode: 0xFFFF,
+            wb_from_camera,
+            retained_raw: Some(raw_mosaic),
+            retained_params: Some(params),
+            retained_w: aw,
+            retained_h: ah,
+            retained_dng_phase: Some(phase),
+            retained_dng_baseline: baseline_exposure,
+            denoise_requested: false,
+            denoise_applied: false,
+            denoise_ms: 0.0,
+            noise_score: 0.0,
+            noise_confidence: 0.0,
+            noise_source: String::new(),
+            denoise_backend: "none".to_string(),
+            denoise_reason: "disabled".to_string(),
+            denoise_model_version: String::new(),
+        });
+    }
+    // Non-retain paths never need the retained mosaic; drop it explicitly so the
+    // move-out in the retain branch above is the only owner of the raw buffer.
+    drop(raw_mosaic);
 
     // Apply look parameters
     if look.wb_r.is_finite() && look.wb_r > 0.0 {
@@ -4213,13 +4747,17 @@ fn process_dng_impl(
         has_gps: gps_lat.is_some() && gps_lon.is_some(),
         quality: 0,
         wb_mode: 0xFFFF,
-        wb_from_camera: true,
-        // DNG/CR2 stay monolithic (worker.js never sets OUT_RETAIN_RAW for them),
-        // so there is never a retained raw mosaic to finish later.
+        // Finding 51: honest provenance carried from the decoder — no longer the
+        // hardcoded `true` that masked the DNG grey / CR2 2.0-1.7 fallbacks.
+        wb_from_camera,
+        // Monolithic (non-retain) DNG/CR2 finish: no retained mosaic. The deferred
+        // path (OUT_RETAIN_RAW) returns early above with the retained fields set.
         retained_raw: None,
         retained_params: None,
         retained_w: 0,
         retained_h: 0,
+        retained_dng_phase: None,
+        retained_dng_baseline: 0.0,
         denoise_requested: false,
         denoise_applied: false,
         denoise_ms: 0.0,
@@ -4389,6 +4927,8 @@ struct Cr2Decoded {
     make: String,
     model: String,
     iso: u32,
+    /// Finding 51: honest WB provenance (true only when Canon MakerNote 0x4001 WB read).
+    wb_from_camera: bool,
     datetime: String,
     gps_lat: Option<f64>,
     gps_lon: Option<f64>,
@@ -4498,6 +5038,11 @@ fn process_raw_mosaic_impl(
     let mut params = pipeline::PipelineParams::default_olympus();
     params.black = black.min(u16::MAX as u32) as u16;
     params.white = white.min(u16::MAX as u32).max(params.black as u32 + 1) as u16;
+    // Finding 51: WB provenance for the generic mosaic (LibRaw) path is honest —
+    // true only when the caller supplied a valid finite positive WB (from LibRaw
+    // metadata); the 1.0 grey fallback below reports false, not a fake default.
+    let wb_from_camera =
+        wb_r.is_finite() && wb_r > 0.0 && wb_b.is_finite() && wb_b > 0.0;
     params.wb_r = if wb_r.is_finite() && wb_r > 0.0 {
         wb_r.min(8.0)
     } else {
@@ -4524,6 +5069,7 @@ fn process_raw_mosaic_impl(
             model: String::new(),
             iso: 0,
             baseline_exposure: 0.0, // generic mosaic path (LibRaw); no DNG BaselineExposure
+            wb_from_camera,
             datetime: String::new(),
             gps_lat: None,
             gps_lon: None,
@@ -4686,6 +5232,8 @@ pub fn process_raw_mosaic_with_options(
             raw_mosaic: Vec::new(),
             cfa_index,
             noise_metadata,
+            wb_from_camera: wb_r.is_finite() && wb_r > 0.0 && wb_b.is_finite() && wb_b > 0.0,
+            baseline_exposure: 0.0, // generic mosaic path; no DNG BaselineExposure
         },
         output_flags,
         &opts.look,
@@ -4758,9 +5306,20 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     params.white = cr2.white;
     params.wb_r = cr2.wb_r;
     params.wb_b = cr2.wb_b;
-    params.color_matrix = cr2.color_matrix.into();
+    // Finding 52: resolve the CR2 colour matrix ONCE and carry it into BOTH the
+    // in-WASM tone params AND the exported color_matrix_flat. `cr2.color_matrix` is
+    // now the single resolver output (per-model or Canon-generic fallback), so the
+    // in-WASM initial render and the interactive LookRenderer (which is fed
+    // color_matrix_flat) render with the identical matrix. Previously `params`
+    // fell through to the pipeline's *Olympus* generic while color_matrix_flat used
+    // the Canon generic, so a Canon CR2's colour jumped the moment a slider moved.
+    let cr2_matrix = cr2
+        .color_matrix
+        .or_else(|| raw_pipeline::cr2::resolved_color_matrix(&cr2.make, &cr2.model))
+        .unwrap_or(CANON_CAM_TO_SRGB);
+    params.color_matrix = Some(cr2_matrix).into();
     let color_matrix_flat: [f32; 9] = {
-        let m = params.color_matrix.to_option().unwrap_or(CANON_CAM_TO_SRGB);
+        let m = cr2_matrix;
         [
             m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
         ]
@@ -4798,6 +5357,7 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
         make: cr2.make,
         model: cr2.model,
         iso,
+        wb_from_camera: cr2.wb_from_camera,
         datetime: cr2.datetime,
         gps_lat: cr2.gps_lat,
         gps_lon: cr2.gps_lon,
@@ -4823,6 +5383,7 @@ impl From<Cr2Decoded> for DngDecoded {
             model: c.model,
             iso: c.iso,
             baseline_exposure: 0.0, // CR2 (Canon) has no DNG BaselineExposure tag
+            wb_from_camera: c.wb_from_camera,
             datetime: c.datetime,
             gps_lat: c.gps_lat,
             gps_lon: c.gps_lon,
@@ -5036,6 +5597,8 @@ pub fn create_orf_denoise_session(
         raw_mosaic: decoded.raw,
         cfa_index: 0, // Olympus is always RGGB
         noise_metadata,
+        wb_from_camera: decoded.wb_from_camera,
+        baseline_exposure: 0.0, // ORF (Olympus) has no DNG BaselineExposure tag
     };
     Ok(DenoiseSession::from_decoded(dng, output_flags))
 }
@@ -5137,6 +5700,8 @@ pub fn create_raw_mosaic_denoise_session(
         raw_mosaic: raw_u16.to_vec(),
         cfa_index,
         noise_metadata,
+        wb_from_camera: wb_r.is_finite() && wb_r > 0.0 && wb_b.is_finite() && wb_b > 0.0,
+        baseline_exposure: 0.0, // raw-mosaic path; no DNG BaselineExposure
     };
     Ok(DenoiseSession::from_decoded(dng, output_flags))
 }

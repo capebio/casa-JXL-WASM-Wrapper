@@ -16,7 +16,29 @@ use anyhow::{anyhow, bail, Context, Result};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+/// Global counter of container decodes (`decode_bytes` / `decode_bytes_inner`).
+///
+/// A DNG "container decode" is the expensive TIFF-walk + LJPEG/uncompressed
+/// un-decompress that produces the raw Bayer mosaic. The deferred-finish
+/// contract (P3-T8, finding 34) is that a preview→final two-phase flow decodes
+/// the container **exactly once** and reuses the retained mosaic for the final.
+/// This counter lets tests assert that invariant directly (`decode_count()`
+/// stays flat across a finish). Test-observability only — no effect on decode.
+static DECODE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of DNG container decodes performed since process start (or since the
+/// last `reset_decode_count`). See [`DECODE_COUNT`].
+pub fn decode_count() -> u64 {
+    DECODE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the container-decode counter to 0. Tests call this to fence a scenario.
+pub fn reset_decode_count() {
+    DECODE_COUNT.store(0, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cfa {
@@ -128,6 +150,9 @@ pub fn decode_bytes_blit(data: &[u8]) -> Result<DngImage> {
 }
 
 fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
+    // Count every container decode so the deferred-finish contract (decode the
+    // container exactly once, then reuse the retained mosaic) is testable.
+    DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
     let (state, raw, le) = load_dng(data)?;
 
     let width = raw.width as usize;
@@ -220,6 +245,11 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
 }
 
 /// Preview-path metadata (no raw). Mirrors the fields `decode_bytes_inner` derives.
+///
+/// Finding 50/51: this is the streaming-preview arm of the ONE metadata carrier.
+/// It must preserve the SAME datetime/GPS/wb-provenance the full decode (`DngImage`)
+/// carries — the streaming preview path used to drop them, so the info panel lost
+/// datetime/GPS and `wb_from_camera` was faked to `true` regardless of provenance.
 pub struct DngMeta {
     pub width: usize,
     pub height: usize,
@@ -228,6 +258,9 @@ pub struct DngMeta {
     pub white: u16,
     pub wb_r: f32,
     pub wb_b: f32,
+    /// `true` only when WB genuinely came from AsShotNeutral (or the derived
+    /// AsShotWhiteXY). `false` = the 1.0/1.0 grey fallback fired. Not a fake default.
+    pub wb_from_camera: bool,
     pub color_matrix: Option<[[f32; 3]; 3]>,
     pub iso: Option<u32>,
     pub baseline_exposure: f32,
@@ -236,6 +269,12 @@ pub struct DngMeta {
     pub model: String,
     /// Per-CFA-plane noise metadata (black/white levels, embedded NoiseProfile, etc.).
     pub noise_metadata: RawNoiseMetadata,
+    /// EXIF DateTimeOriginal (or DateTime), "YYYY:MM:DD HH:MM:SS", empty if absent.
+    pub datetime: String,
+    /// Decimal GPS (None when the file has no GPS IFD or it is out of range).
+    pub gps_lat: Option<f64>,
+    pub gps_lon: Option<f64>,
+    pub gps_alt: Option<f64>,
 }
 
 /// Build `DngMeta` from a parsed IFD + walk state. The expressions match
@@ -260,6 +299,8 @@ fn dng_meta(
         white: raw.white_level.unwrap_or(16383),
         wb_r: wb_g_neutral / wb_r_neutral.max(1e-6),
         wb_b: wb_g_neutral / wb_b_neutral.max(1e-6),
+        // Finding 51: honest provenance — mirrors DngImage (AsShotNeutral presence).
+        wb_from_camera: state.as_shot_neutral.is_some(),
         color_matrix: choose_camera_to_srgb_matrix(
             state.forward_matrix_1,
             state.forward_matrix_2,
@@ -272,6 +313,11 @@ fn dng_meta(
         make: state.make.clone(),
         model: state.model.clone(),
         noise_metadata,
+        // Finding 50: preserve the datetime/GPS the walk already parsed into state.exif.
+        datetime: state.exif.datetime.clone(),
+        gps_lat: state.exif.gps_lat,
+        gps_lon: state.exif.gps_lon,
+        gps_alt: state.exif.gps_alt,
     }
 }
 
