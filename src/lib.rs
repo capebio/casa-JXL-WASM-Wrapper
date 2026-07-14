@@ -17,6 +17,8 @@ use wasm_bindgen::prelude::*;
 
 mod denoise_options;
 mod denoise_session;
+mod bltv_wasm;
+mod bliss_wasm;
 use denoise_options::RawProcessOptions;
 use raw_pipeline::denoise::{
     classical_denoise, decide, estimate_noise, score_noise, resolve_noise_model,

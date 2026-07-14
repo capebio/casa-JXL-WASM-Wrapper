@@ -917,6 +917,14 @@ class WorkerPool {
             if (this._thumbLiveHandler) this._thumbLiveHandler(ev.data);
             return;
         }
+        if (type === WorkerMsg.BLISS_READY) {
+            blissCache.set(id, { bliss: ev.data.bliss, width: ev.data.width, height: ev.data.height });
+            // Persist to OPFS for cross-session instant preview.
+            const _bc = cardByTaskId.get(id);
+            const _baid = _bc && getCardState(_bc)?._assetId;
+            if (_baid) blissOpfsWrite(_baid, ev.data.bliss).catch(() => undefined);
+            return;
+        }
         if (type === WorkerMsg.ENCODE_REQUEST) {
             const { id, pixels, rgba, format, width, height, quality, effort, lossless, progressive, orientation, pipelineMs, phaseMs } = ev.data;
             // TTFP-4: ENCODE_REQUEST is the RAW worker's final message for a
@@ -962,6 +970,7 @@ class WorkerPool {
         else if (type === WorkerMsg.DONE) {
             if (handlers.onDone) handlers.onDone(ev.data);
             this.tasks.delete(id);  // Worker already freed on encode_request
+            blissCache.delete(id);
             // KEEP workerForTask[id] alive — the owning worker still holds
             // liveStateMap[id], so reprocess_live for the lightbox needs to
             // know which worker to message even long after JXL is done.
@@ -973,6 +982,7 @@ class WorkerPool {
             if (!t.released) this._releaseWorker(worker, id);
             this.tasks.delete(id);
             this.workerForTask.delete(id);
+            blissCache.delete(id);
         }
     }
 
@@ -1577,6 +1587,97 @@ const rawDecodeGovernor = new AssetStore({ name: 'raw-decode', maxBytes: RAW_DEC
 // recently viewed/prefetched cards in memory; older entries are evicted
 // automatically. Callers must use jxlDerivedCache.get/set/invalidate — not
 // _jxlDecoded directly — so the byte budget and LRU are always enforced.
+// BLISS in-memory cache: taskId → { bliss: ArrayBuffer, width, height }
+// Written by WorkerMsg.BLISS_READY (lightbox-sized encode); persisted to OPFS for cross-session use.
+const blissCache = new Map();
+
+// BLISS OPFS — simple subdirectory, no manifest, files keyed by assetId hash.
+let _blissOpfsDir = null;
+const _blissOpfsInit = (() => {
+    if (typeof navigator === 'undefined' || !navigator?.storage?.getDirectory) return Promise.resolve();
+    return navigator.storage.getDirectory()
+        .then(root => root.getDirectoryHandle('bliss', { create: true }))
+        .then(dir => { _blissOpfsDir = dir; })
+        .catch(() => {});
+})();
+
+function _blissCacheName(assetId) {
+    // assetId = "hex:filename" — use only the stable hash part
+    return assetId.split(':')[0];
+}
+
+async function blissOpfsWrite(assetId, bytes) {
+    await _blissOpfsInit;
+    if (!_blissOpfsDir) return;
+    try {
+        const fh = await _blissOpfsDir.getFileHandle(_blissCacheName(assetId), { create: true });
+        const wr = await fh.createWritable();
+        await wr.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        await wr.close();
+    } catch { /* non-fatal */ }
+}
+
+async function blissOpfsRead(assetId) {
+    await _blissOpfsInit;
+    if (!_blissOpfsDir) return null;
+    try {
+        const fh = await _blissOpfsDir.getFileHandle(_blissCacheName(assetId));
+        const file = await fh.getFile();
+        if (file.size === 0) return null;
+        return new Uint8Array(await file.arrayBuffer());
+    } catch { return null; } // NotFoundError = cache miss
+}
+
+// BLISS decode worker — single shared instance, prewarmed on first use.
+let _blissDecodeWorker = null;
+let _blissDecodeSeq = 0;
+const _blissDecodePending = new Map(); // seq → resolve
+
+function _initBlissDecodeWorker() {
+    if (_blissDecodeWorker) return;
+    _blissDecodeWorker = new Worker('./bliss-worker.js', { type: 'module' });
+    _blissDecodeWorker.onmessage = (ev) => {
+        const { seq, rgb, w, h } = ev.data;
+        const resolve = _blissDecodePending.get(seq);
+        if (resolve) {
+            _blissDecodePending.delete(seq);
+            resolve(rgb ? { rgb: new Uint8Array(rgb), w, h } : null);
+        }
+    };
+    _blissDecodeWorker.postMessage({ type: 'preload' });
+}
+
+function blissDecodeViaWorker(bytes) {
+    return new Promise((resolve) => {
+        _initBlissDecodeWorker();
+        const seq = ++_blissDecodeSeq;
+        _blissDecodePending.set(seq, resolve);
+        _blissDecodeWorker.postMessage({ type: 'bliss_decode', seq, bliss: bytes.buffer }, [bytes.buffer]);
+    });
+}
+
+// Try OPFS BLISS for instant lightbox preview; non-fatal, no-op if card changed.
+async function blissOpfsLoad(card, assetId) {
+    const bytes = await blissOpfsRead(assetId);
+    if (!bytes) return;
+    if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
+    if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
+    const result = await blissDecodeViaWorker(bytes).catch(() => null);
+    if (!result) return;
+    if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
+    if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
+    const { rgb, w, h } = result;
+    drawCanvas(lightboxCanvas, w, h, rgb);
+    if (lightboxCanvas.width > 0) {
+        const _ctx = lightboxCanvas.getContext('2d');
+        captureCleanAndApplyLens(_ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+    }
+    setPaintedSourceBadge('bliss');
+    lbLoadingBadge.hidden = true;
+    applyStraightenToLightboxCanvas(card);
+    syncZoomToDisplayLong();
+}
+
 const JXL_DERIVED_CACHE_BYTES = 3 * 24_000_000 * 4; // ~288 MB
 const jxlDerivedCache = createDerivedCache({
     name: 'jxl-derived',
@@ -3311,6 +3412,9 @@ function drawLightboxForCard(card) {
         lightboxCanvas.height = 1;
         if (lbPreviewBadge) lbPreviewBadge.hidden = true;
         lbLoadingBadge.hidden = false;
+        // BLISS OPFS: instant cross-session preview while RAW decode is in flight.
+        const _blissAid = getCardState(card)?._assetId;
+        if (_blissAid) blissOpfsLoad(card, _blissAid);
     }
     // Tauri lightbox no longer eagerly fetches the RAW RGB on open — that
     // happens only when the user moves a slider (triggerLiveUpdateTauri →
@@ -3351,7 +3455,7 @@ function updateToggleButtonState(card) {
 // sharpness with source resolution (Embedded JPEG ~1620×1080 vs JXL ~5184×3888).
 function setPaintedSourceBadge(source) {
     if (!lbPreviewBadge) return;
-    const labels = { raw: 'RAW', jxl: 'JPEG XL', jpeg: 'Embedded JPEG' };
+    const labels = { raw: 'RAW', jxl: 'JPEG XL', jpeg: 'Embedded JPEG', bliss: 'BLISS (cached)' };
     const label = labels[source] ?? labels.raw;
     const cw = lightboxCanvas.width | 0;
     const ch = lightboxCanvas.height | 0;

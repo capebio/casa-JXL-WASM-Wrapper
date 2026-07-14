@@ -77,7 +77,8 @@ async function loadWasm() {
        process_orf_with_look, process_dng_with_look, process_cr2_with_look,
        process_orf_with_options, process_dng_with_options, process_cr2_with_options, process_raw_mosaic_with_options,
        create_orf_denoise_session, create_dng_denoise_session, create_cr2_denoise_session, create_raw_mosaic_denoise_session,
-       decode_exr, decode_tiff, decode_jpeg } = rawWasm);
+       decode_exr, decode_tiff, decode_jpeg,
+       bliss_encode } = rawWasm);
 }
 
 // P3-T8 (finding 34): does the loaded wasm expose the DNG deferred-finish binding?
@@ -549,6 +550,17 @@ function processImageFormat(id, bytes, opts, look, route) {
         // lightbox
         const lbState = liveStateMap.get(id);
         const bigRgb = applyLookToState(lbState, look);
+        // BLISS: encode lightbox-sized RGB8 before transferring bigRgb.
+        // Stored in OPFS for cross-session instant preview. ~10-30ms at 1800px.
+        if (typeof bliss_encode === 'function' && lbState.outW % 2 === 0) {
+            try {
+                const blissBytes = bliss_encode(bigRgb, lbState.outW, lbState.outH, 2, 2);
+                self.postMessage(
+                    { id, type: WorkerMsg.BLISS_READY, bliss: blissBytes.buffer, width: lbState.outW, height: lbState.outH },
+                    [blissBytes.buffer],
+                );
+            } catch { /* non-fatal */ }
+        }
         self.postMessage(
             { id, type: WorkerMsg.LIGHTBOX, rgb: bigRgb,
               w: lbState.outW, h: lbState.outH,
@@ -1010,6 +1022,16 @@ self.addEventListener('message', async (ev) => {
         // lightbox RGB8 — same: apply look to the pre-scaled rgb16 (1800px) in liveStateMap.
         const lbState = liveStateMap.get(id);
         const bigRgb = applyLookToState(lbState, look);
+        // BLISS: encode lightbox-sized RGB8 before transferring bigRgb.
+        if (typeof bliss_encode === 'function' && lbState.outW % 2 === 0) {
+            try {
+                const blissBytes = bliss_encode(bigRgb, lbState.outW, lbState.outH, 2, 2);
+                self.postMessage(
+                    { id, type: WorkerMsg.BLISS_READY, bliss: blissBytes.buffer, width: lbState.outW, height: lbState.outH },
+                    [blissBytes.buffer],
+                );
+            } catch { /* non-fatal */ }
+        }
         self.postMessage(
             { id, type: WorkerMsg.LIGHTBOX, rgb: bigRgb,
               w: lbState.outW, h: lbState.outH,
@@ -1086,6 +1108,7 @@ self.addEventListener('message', async (ev) => {
         // fullRgb is nulled immediately below and never reused, so detaching it is safe.
         const rgbBuf = fullRgb.buffer;
         fullRgb = null; // allow GC (the transfer detaches the buffer anyway)
+
         self.postMessage(
             { id, type: WorkerMsg.ENCODE_REQUEST, pixels: rgbBuf, format: 'rgb8', width: encW, height: encH,
               quality: opts.lossless ? 100 : opts.quality,

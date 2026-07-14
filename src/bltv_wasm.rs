@@ -1,19 +1,19 @@
 use wasm_bindgen::prelude::*;
 
-/// WASM-facing LT2V decoder.  Load the full .lt2v byte stream once, then call
+/// WASM-facing BLTV decoder.  Load the full .bltv byte stream once, then call
 /// `decode_next_frame()` sequentially to get RGB24 frames at playback rate.
 #[wasm_bindgen]
-pub struct Lt2vDecoder {
-    inner: lt2v::Decoder,
+pub struct BltvDecoder {
+    inner: bltv::Decoder,
 }
 
 #[wasm_bindgen]
-impl Lt2vDecoder {
-    /// Create a decoder from the full LT2V file bytes.
+impl BltvDecoder {
+    /// Create a decoder from the full BLTV file bytes.
     #[wasm_bindgen(constructor)]
-    pub fn new(data: &[u8]) -> Result<Lt2vDecoder, JsValue> {
-        lt2v::Decoder::new(data.to_vec())
-            .map(|inner| Lt2vDecoder { inner })
+    pub fn new(data: &[u8]) -> Result<BltvDecoder, JsValue> {
+        bltv::Decoder::new(data.to_vec())
+            .map(|inner| BltvDecoder { inner })
             .map_err(|e| JsValue::from_str(&e.to_string()))
     }
 

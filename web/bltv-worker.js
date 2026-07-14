@@ -1,4 +1,4 @@
-// LT2V decode worker.
+// BLTV decode worker.
 // Messages from main: { type: 'load', wasmUrl, data: Uint8Array }
 //                     { type: 'seek', frame: number }
 //                     { type: 'pause' } / { type: 'resume' }
@@ -15,9 +15,9 @@ let decodeStart = 0;
 
 async function load(wasmUrl, data) {
   try {
-    const { default: init, Lt2vDecoder } = await import(wasmUrl);
+    const { default: init, BltvDecoder } = await import(wasmUrl);
     await init();
-    decoder = new Lt2vDecoder(data);
+    decoder = new BltvDecoder(data);
     const fileSize = data.byteLength;
     self.postMessage({
       type: 'ready',

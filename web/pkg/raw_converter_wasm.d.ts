@@ -2,6 +2,33 @@
 /* eslint-disable */
 
 /**
+ * WASM-facing BLTV decoder.  Load the full .bltv byte stream once, then call
+ * `decode_next_frame()` sequentially to get RGB24 frames at playback rate.
+ */
+export class BltvDecoder {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Decode and return the next RGB24 frame as a `Uint8Array`, or `null` at end.
+     */
+    decode_next_frame(): Uint8Array | undefined;
+    fps_den(): number;
+    fps_num(): number;
+    frame_count(): number;
+    height(): number;
+    is_lossless(): boolean;
+    /**
+     * Create a decoder from the full BLTV file bytes.
+     */
+    constructor(data: Uint8Array);
+    /**
+     * Seek so the next `decode_next_frame` returns frame `idx`.
+     */
+    seek(idx: number): void;
+    width(): number;
+}
+
+/**
  * Timing results for the decompress + demosaic stages only.
  * Skips tonemap, downscale, and orientation — isolates raw decode cost.
  */
@@ -287,6 +314,19 @@ export class ProcessResult {
      */
     color_matrix_used(): Float32Array;
     /**
+     * Deferred DNG/CR2 finish (finding 34): the DNG twin of `finish_full_rgb8`.
+     * Finish the full-resolution RGB8 FROM the raw mosaic + CFA phase + camera
+     * params + BaselineExposure retained by a phase-1 `OUT_RETAIN_RAW` DNG/CR2
+     * decode — demosaic (`demosaic_bayer_mhc` with the file's phase) + baseline-
+     * folded look + tone (+ optional disp16 / orientation) only, with NO second
+     * container decode. Byte-identical to a fresh `OUT_FULL_RGB8` DNG decode because
+     * both go through `finish_dng_from_raw`. Errors (JsError) if the result was not
+     * produced with `OUT_RETAIN_RAW` on a DNG/CR2 path (i.e. `retained_dng_phase`
+     * is unset — an ORF-retained result must use `finish_full_rgb8` instead). The
+     * 14 look args match the trailing arguments of `process_dng_with_flags`.
+     */
+    finish_dng_full_rgb8(output_flags: number, exposure_ev: number, contrast: number, highlights: number, shadows: number, whites: number, blacks: number, saturation: number, vibrance: number, temp: number, tint: number, wb_r: number, wb_b: number, texture: number, clarity: number): void;
+    /**
      * Mode 3 (single-decompress preview-first): finish the full-resolution RGB8
      * output FROM the raw mosaic retained by a phase-1 `OUT_RETAIN_RAW` decode —
      * demosaic + tone (+ optional disp16 / orientation) only, NO second
@@ -535,6 +575,21 @@ export function apply_look(rgb16_src: Uint16Array, width: number, height: number
 export function bench_decode_orf(data: Uint8Array): DecodeBench;
 
 /**
+ * Decode BLISS bytes → RGB24.  Returns a flat `Uint8Array` [r,g,b, r,g,b, …].
+ * Dimensions are prepended as two little-endian u32s (8 bytes total) so the
+ * caller can read width and height without a separate call.
+ *
+ * Layout: [width u32 LE][height u32 LE][rgb bytes…]
+ */
+export function bliss_decode(data: Uint8Array): Uint8Array;
+
+/**
+ * Encode an even-width RGB24 buffer as BLISS bytes.
+ * q_y=1, q_c=1 → lossless.  q_y=2, q_c=2 → near-lossless (good for display cache).
+ */
+export function bliss_encode(rgb: Uint8Array, w: number, h: number, q_y: number, q_c: number): Uint8Array;
+
+/**
  * Create a tiled denoise session from a Canon CR2 blob.
  */
 export function create_cr2_denoise_session(data: Uint8Array, options: any): DenoiseSession;
@@ -711,8 +766,6 @@ export function fstats_simd(): any;
  * Bench probe for the production exact-hash SIMD kernel (resident buffer, no copy).
  */
 export function fstats_simd_exact(): any;
-
-export function initThreadPool(num_threads: number): Promise<any>;
 
 /**
  * Parse ORF EXIF metadata only — no decompress, no demosaic, no tonemap.
@@ -915,20 +968,11 @@ export function rgb_to_rgba(rgb: Uint8Array): Uint8Array;
  */
 export function rotate_rgb8(src: Uint8Array, width: number, height: number, turns: number): RotateResult;
 
-export class wbg_rayon_PoolBuilder {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    build(): void;
-    numThreads(): number;
-    receiver(): number;
-}
-
-export function wbg_rayon_start_worker(receiver: number): void;
-
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
+    readonly memory: WebAssembly.Memory;
+    readonly __wbg_bltvdecoder_free: (a: number, b: number) => void;
     readonly __wbg_decodebench_free: (a: number, b: number) => void;
     readonly __wbg_decodedimage_free: (a: number, b: number) => void;
     readonly __wbg_denoisesession_free: (a: number, b: number) => void;
@@ -992,6 +1036,17 @@ export interface InitOutput {
     readonly __wbg_residentdeveloped_free: (a: number, b: number) => void;
     readonly apply_look: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number) => [number, number, number, number];
     readonly bench_decode_orf: (a: number, b: number) => [number, number, number];
+    readonly bliss_decode: (a: number, b: number) => [number, number, number, number];
+    readonly bliss_encode: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly bltvdecoder_decode_next_frame: (a: number) => [number, number, number, number];
+    readonly bltvdecoder_fps_den: (a: number) => number;
+    readonly bltvdecoder_fps_num: (a: number) => number;
+    readonly bltvdecoder_frame_count: (a: number) => number;
+    readonly bltvdecoder_height: (a: number) => number;
+    readonly bltvdecoder_is_lossless: (a: number) => number;
+    readonly bltvdecoder_new: (a: number, b: number) => [number, number, number];
+    readonly bltvdecoder_seek: (a: number, b: number) => [number, number];
+    readonly bltvdecoder_width: (a: number) => number;
     readonly create_cr2_denoise_session: (a: number, b: number, c: any) => [number, number, number];
     readonly create_dng_denoise_session: (a: number, b: number, c: any) => [number, number, number];
     readonly create_orf_denoise_session: (a: number, b: number, c: any) => [number, number, number];
@@ -1061,10 +1116,7 @@ export interface InitOutput {
     readonly fstats_copy: (a: number, b: number, c: number, d: number) => any;
     readonly fstats_fast: () => any;
     readonly fstats_prepare: (a: number, b: number) => void;
-    readonly fstats_scalar: () => any;
-    readonly fstats_simd: () => any;
     readonly fstats_simd_exact: () => any;
-    readonly lookrenderer_native_height: (a: number) => number;
     readonly lookrenderer_native_width: (a: number) => number;
     readonly lookrenderer_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly lookrenderer_new_with_options: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
@@ -1119,6 +1171,7 @@ export interface InitOutput {
     readonly processresult_denoise_backend: (a: number) => [number, number];
     readonly processresult_denoise_model_version: (a: number) => [number, number];
     readonly processresult_denoise_reason: (a: number) => [number, number];
+    readonly processresult_finish_dng_full_rgb8: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number];
     readonly processresult_finish_full_rgb8: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number];
     readonly processresult_lens: (a: number) => [number, number];
     readonly processresult_make: (a: number) => [number, number];
@@ -1155,18 +1208,14 @@ export interface InitOutput {
     readonly __wbg_get_processresult_tonemap_ms: (a: number) => number;
     readonly residentdeveloped_take_full_rgb16_le: (a: number) => [number, number];
     readonly rotateresult_take_rgb: (a: number) => [number, number];
+    readonly lookrenderer_native_height: (a: number) => number;
     readonly residentdeveloped_height: (a: number) => number;
     readonly residentdeveloped_width: (a: number) => number;
+    readonly fstats_scalar: () => any;
+    readonly fstats_simd: () => any;
     readonly __wbg_decodepeakestimate_free: (a: number, b: number) => void;
     readonly estimate_decode_peak_bytes: (a: number, b: number, c: number) => number;
     readonly __wbg_rotateresult_free: (a: number, b: number) => void;
-    readonly __wbg_wbg_rayon_poolbuilder_free: (a: number, b: number) => void;
-    readonly initThreadPool: (a: number) => any;
-    readonly wbg_rayon_poolbuilder_build: (a: number) => void;
-    readonly wbg_rayon_poolbuilder_numThreads: (a: number) => number;
-    readonly wbg_rayon_poolbuilder_receiver: (a: number) => number;
-    readonly wbg_rayon_start_worker: (a: number) => void;
-    readonly memory: WebAssembly.Memory;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;
@@ -1174,8 +1223,7 @@ export interface InitOutput {
     readonly __wbindgen_externrefs: WebAssembly.Table;
     readonly __externref_table_dealloc: (a: number) => void;
     readonly __wbindgen_free: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_thread_destroy: (a?: number, b?: number, c?: number) => void;
-    readonly __wbindgen_start: (a: number) => void;
+    readonly __wbindgen_start: () => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
@@ -1184,20 +1232,18 @@ export type SyncInitInput = BufferSource | WebAssembly.Module;
  * Instantiates the given `module`, which can either be bytes or
  * a precompiled `WebAssembly.Module`.
  *
- * @param {{ module: SyncInitInput, memory?: WebAssembly.Memory, thread_stack_size?: number }} module - Passing `SyncInitInput` directly is deprecated.
- * @param {WebAssembly.Memory} memory - Deprecated.
+ * @param {{ module: SyncInitInput }} module - Passing `SyncInitInput` directly is deprecated.
  *
  * @returns {InitOutput}
  */
-export function initSync(module: { module: SyncInitInput, memory?: WebAssembly.Memory, thread_stack_size?: number } | SyncInitInput, memory?: WebAssembly.Memory): InitOutput;
+export function initSync(module: { module: SyncInitInput } | SyncInitInput): InitOutput;
 
 /**
  * If `module_or_path` is {RequestInfo} or {URL}, makes a request and
  * for everything else, calls `WebAssembly.instantiate` directly.
  *
- * @param {{ module_or_path: InitInput | Promise<InitInput>, memory?: WebAssembly.Memory, thread_stack_size?: number }} module_or_path - Passing `InitInput` directly is deprecated.
- * @param {WebAssembly.Memory} memory - Deprecated.
+ * @param {{ module_or_path: InitInput | Promise<InitInput> }} module_or_path - Passing `InitInput` directly is deprecated.
  *
  * @returns {Promise<InitOutput>}
  */
-export default function __wbg_init (module_or_path?: { module_or_path: InitInput | Promise<InitInput>, memory?: WebAssembly.Memory, thread_stack_size?: number } | InitInput | Promise<InitInput>, memory?: WebAssembly.Memory): Promise<InitOutput>;
+export default function __wbg_init (module_or_path?: { module_or_path: InitInput | Promise<InitInput> } | InitInput | Promise<InitInput>): Promise<InitOutput>;
