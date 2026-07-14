@@ -1,6 +1,107 @@
 /* @ts-self-types="./raw_converter_wasm.d.ts" */
 
 /**
+ * WASM-facing BLTV decoder.  Load the full .bltv byte stream once, then call
+ * `decode_next_frame()` sequentially to get RGB24 frames at playback rate.
+ */
+export class BltvDecoder {
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        BltvDecoderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_bltvdecoder_free(ptr, 0);
+    }
+    /**
+     * Decode and return the next RGB24 frame as a `Uint8Array`, or `null` at end.
+     * @returns {Uint8Array | undefined}
+     */
+    decode_next_frame() {
+        const ret = wasm.bltvdecoder_decode_next_frame(this.__wbg_ptr);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        let v1;
+        if (ret[0] !== 0) {
+            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        }
+        return v1;
+    }
+    /**
+     * @returns {number}
+     */
+    fps_den() {
+        const ret = wasm.bltvdecoder_fps_den(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    fps_num() {
+        const ret = wasm.bltvdecoder_fps_num(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    frame_count() {
+        const ret = wasm.bltvdecoder_frame_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    height() {
+        const ret = wasm.bltvdecoder_height(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {boolean}
+     */
+    is_lossless() {
+        const ret = wasm.bltvdecoder_is_lossless(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Create a decoder from the full BLTV file bytes.
+     * @param {Uint8Array} data
+     */
+    constructor(data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.bltvdecoder_new(ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        this.__wbg_ptr = ret[0];
+        BltvDecoderFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * Seek so the next `decode_next_frame` returns frame `idx`.
+     * @param {number} idx
+     */
+    seek(idx) {
+        const ret = wasm.bltvdecoder_seek(this.__wbg_ptr, idx);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    width() {
+        const ret = wasm.bltvdecoder_width(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) BltvDecoder.prototype[Symbol.dispose] = BltvDecoder.prototype.free;
+
+/**
  * Timing results for the decompress + demosaic stages only.
  * Skips tonemap, downscale, and orientation — isolates raw decode cost.
  */
@@ -646,107 +747,6 @@ export class LookRenderer {
     }
 }
 if (Symbol.dispose) LookRenderer.prototype[Symbol.dispose] = LookRenderer.prototype.free;
-
-/**
- * WASM-facing LT2V decoder.  Load the full .lt2v byte stream once, then call
- * `decode_next_frame()` sequentially to get RGB24 frames at playback rate.
- */
-export class Lt2vDecoder {
-    __destroy_into_raw() {
-        const ptr = this.__wbg_ptr;
-        this.__wbg_ptr = 0;
-        Lt2vDecoderFinalization.unregister(this);
-        return ptr;
-    }
-    free() {
-        const ptr = this.__destroy_into_raw();
-        wasm.__wbg_lt2vdecoder_free(ptr, 0);
-    }
-    /**
-     * Decode and return the next RGB24 frame as a `Uint8Array`, or `null` at end.
-     * @returns {Uint8Array | undefined}
-     */
-    decode_next_frame() {
-        const ret = wasm.lt2vdecoder_decode_next_frame(this.__wbg_ptr);
-        if (ret[3]) {
-            throw takeFromExternrefTable0(ret[2]);
-        }
-        let v1;
-        if (ret[0] !== 0) {
-            v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
-            wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-        }
-        return v1;
-    }
-    /**
-     * @returns {number}
-     */
-    fps_den() {
-        const ret = wasm.lt2vdecoder_fps_den(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * @returns {number}
-     */
-    fps_num() {
-        const ret = wasm.lt2vdecoder_fps_num(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * @returns {number}
-     */
-    frame_count() {
-        const ret = wasm.lt2vdecoder_frame_count(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * @returns {number}
-     */
-    height() {
-        const ret = wasm.lt2vdecoder_height(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * @returns {boolean}
-     */
-    is_lossless() {
-        const ret = wasm.lt2vdecoder_is_lossless(this.__wbg_ptr);
-        return ret !== 0;
-    }
-    /**
-     * Create a decoder from the full LT2V file bytes.
-     * @param {Uint8Array} data
-     */
-    constructor(data) {
-        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.lt2vdecoder_new(ptr0, len0);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        this.__wbg_ptr = ret[0];
-        Lt2vDecoderFinalization.register(this, this.__wbg_ptr, this);
-        return this;
-    }
-    /**
-     * Seek so the next `decode_next_frame` returns frame `idx`.
-     * @param {number} idx
-     */
-    seek(idx) {
-        const ret = wasm.lt2vdecoder_seek(this.__wbg_ptr, idx);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
-        }
-    }
-    /**
-     * @returns {number}
-     */
-    width() {
-        const ret = wasm.lt2vdecoder_width(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-}
-if (Symbol.dispose) Lt2vDecoder.prototype[Symbol.dispose] = Lt2vDecoder.prototype.free;
 
 /**
  * EXIF metadata extracted without demosaic/tonemap.  Use for gallery thumbnails,
@@ -3402,6 +3402,9 @@ function __wbg_get_imports() {
     };
 }
 
+const BltvDecoderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_bltvdecoder_free(ptr, 1));
 const DecodeBenchFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_decodebench_free(ptr, 1));
@@ -3423,9 +3426,6 @@ const FableVideoEncoderFinalization = (typeof FinalizationRegistry === 'undefine
 const LookRendererFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_lookrenderer_free(ptr, 1));
-const Lt2vDecoderFinalization = (typeof FinalizationRegistry === 'undefined')
-    ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_lt2vdecoder_free(ptr, 1));
 const OrfMetadataFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_orfmetadata_free(ptr, 1));

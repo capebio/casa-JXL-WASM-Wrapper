@@ -2,6 +2,33 @@
 /* eslint-disable */
 
 /**
+ * WASM-facing BLTV decoder.  Load the full .bltv byte stream once, then call
+ * `decode_next_frame()` sequentially to get RGB24 frames at playback rate.
+ */
+export class BltvDecoder {
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Decode and return the next RGB24 frame as a `Uint8Array`, or `null` at end.
+     */
+    decode_next_frame(): Uint8Array | undefined;
+    fps_den(): number;
+    fps_num(): number;
+    frame_count(): number;
+    height(): number;
+    is_lossless(): boolean;
+    /**
+     * Create a decoder from the full BLTV file bytes.
+     */
+    constructor(data: Uint8Array);
+    /**
+     * Seek so the next `decode_next_frame` returns frame `idx`.
+     */
+    seek(idx: number): void;
+    width(): number;
+}
+
+/**
  * Timing results for the decompress + demosaic stages only.
  * Skips tonemap, downscale, and orientation — isolates raw decode cost.
  */
@@ -227,33 +254,6 @@ export class LookRenderer {
      * `apply_rotation=false` read this to drive display-time rotation.
      */
     readonly orientation: number;
-}
-
-/**
- * WASM-facing LT2V decoder.  Load the full .lt2v byte stream once, then call
- * `decode_next_frame()` sequentially to get RGB24 frames at playback rate.
- */
-export class Lt2vDecoder {
-    free(): void;
-    [Symbol.dispose](): void;
-    /**
-     * Decode and return the next RGB24 frame as a `Uint8Array`, or `null` at end.
-     */
-    decode_next_frame(): Uint8Array | undefined;
-    fps_den(): number;
-    fps_num(): number;
-    frame_count(): number;
-    height(): number;
-    is_lossless(): boolean;
-    /**
-     * Create a decoder from the full LT2V file bytes.
-     */
-    constructor(data: Uint8Array);
-    /**
-     * Seek so the next `decode_next_frame` returns frame `idx`.
-     */
-    seek(idx: number): void;
-    width(): number;
 }
 
 /**
@@ -972,6 +972,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
+    readonly __wbg_bltvdecoder_free: (a: number, b: number) => void;
     readonly __wbg_decodebench_free: (a: number, b: number) => void;
     readonly __wbg_decodedimage_free: (a: number, b: number) => void;
     readonly __wbg_denoisesession_free: (a: number, b: number) => void;
@@ -1028,7 +1029,6 @@ export interface InitOutput {
     readonly __wbg_get_rotateresult_height: (a: number) => number;
     readonly __wbg_get_rotateresult_width: (a: number) => number;
     readonly __wbg_lookrenderer_free: (a: number, b: number) => void;
-    readonly __wbg_lt2vdecoder_free: (a: number, b: number) => void;
     readonly __wbg_orfmetadata_free: (a: number, b: number) => void;
     readonly __wbg_perceptualcomparer_free: (a: number, b: number) => void;
     readonly __wbg_processresult_free: (a: number, b: number) => void;
@@ -1038,6 +1038,15 @@ export interface InitOutput {
     readonly bench_decode_orf: (a: number, b: number) => [number, number, number];
     readonly bliss_decode: (a: number, b: number) => [number, number, number, number];
     readonly bliss_encode: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
+    readonly bltvdecoder_decode_next_frame: (a: number) => [number, number, number, number];
+    readonly bltvdecoder_fps_den: (a: number) => number;
+    readonly bltvdecoder_fps_num: (a: number) => number;
+    readonly bltvdecoder_frame_count: (a: number) => number;
+    readonly bltvdecoder_height: (a: number) => number;
+    readonly bltvdecoder_is_lossless: (a: number) => number;
+    readonly bltvdecoder_new: (a: number, b: number) => [number, number, number];
+    readonly bltvdecoder_seek: (a: number, b: number) => [number, number];
+    readonly bltvdecoder_width: (a: number) => number;
     readonly create_cr2_denoise_session: (a: number, b: number, c: any) => [number, number, number];
     readonly create_dng_denoise_session: (a: number, b: number, c: any) => [number, number, number];
     readonly create_orf_denoise_session: (a: number, b: number, c: any) => [number, number, number];
@@ -1108,21 +1117,12 @@ export interface InitOutput {
     readonly fstats_fast: () => any;
     readonly fstats_prepare: (a: number, b: number) => void;
     readonly fstats_simd_exact: () => any;
-    readonly lookrenderer_native_height: (a: number) => number;
     readonly lookrenderer_native_width: (a: number) => number;
     readonly lookrenderer_new: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
     readonly lookrenderer_new_with_options: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => [number, number, number];
     readonly lookrenderer_orientation: (a: number) => number;
     readonly lookrenderer_render: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number) => [number, number, number, number];
     readonly lookrenderer_render_look: (a: number, b: any) => [number, number, number, number];
-    readonly lt2vdecoder_decode_next_frame: (a: number) => [number, number, number, number];
-    readonly lt2vdecoder_fps_den: (a: number) => number;
-    readonly lt2vdecoder_fps_num: (a: number) => number;
-    readonly lt2vdecoder_frame_count: (a: number) => number;
-    readonly lt2vdecoder_is_lossless: (a: number) => number;
-    readonly lt2vdecoder_new: (a: number, b: number) => [number, number, number];
-    readonly lt2vdecoder_seek: (a: number, b: number) => [number, number];
-    readonly lt2vdecoder_width: (a: number) => number;
     readonly orfmetadata_datetime: (a: number) => [number, number];
     readonly orfmetadata_lens: (a: number) => [number, number];
     readonly orfmetadata_make: (a: number) => [number, number];
@@ -1208,7 +1208,7 @@ export interface InitOutput {
     readonly __wbg_get_processresult_tonemap_ms: (a: number) => number;
     readonly residentdeveloped_take_full_rgb16_le: (a: number) => [number, number];
     readonly rotateresult_take_rgb: (a: number) => [number, number];
-    readonly lt2vdecoder_height: (a: number) => number;
+    readonly lookrenderer_native_height: (a: number) => number;
     readonly residentdeveloped_height: (a: number) => number;
     readonly residentdeveloped_width: (a: number) => number;
     readonly fstats_scalar: () => any;
