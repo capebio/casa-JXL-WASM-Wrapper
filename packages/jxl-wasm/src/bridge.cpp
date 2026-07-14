@@ -171,6 +171,14 @@ struct JxlWasmDecState {
   uint32_t roi_downsample;   // 1/2/4/8
   uint8_t* roi_buf;          // grow-only owned crop output (borrowed out; freed in dec_free)
   size_t   roi_cap;
+  // 0 = final-only (no FRAME_PROGRESSION subscribe, no opportunistic FlushImage, no
+  // zero-fill of the out buffer). Non-zero = progressive UI path; keep flush checkpoints.
+  uint32_t progressive_detail;
+  // When true, SetInput points at the caller's WASM heap region for this push (zero-copy).
+  // Before returning NEED_MORE/PROGRESS to JS, unconsumed tail is promoted into input_buf
+  // so the next HEAPU8.set cannot corrupt remaining decoder input.
+  bool input_external;
+  const uint8_t* input_external_base;
 };
 
 #define JXL_DEC_RESULT_NEED_MORE  0
@@ -244,15 +252,26 @@ static void FreeBufferNoChain(JxlWasmBuffer* buf) {
 // Only active on threaded builds (-pthread / __EMSCRIPTEN_PTHREADS__).
 // Cached as a module-level singleton: creating a runner is expensive (~50 ms).
 #ifdef __EMSCRIPTEN_PTHREADS__
+#ifndef JXL_WASM_DEC_RUNNER_WORKERS
+#define JXL_WASM_DEC_RUNNER_WORKERS 0
+#endif
+
+static size_t DecoderRunnerWorkerCount() {
+#if JXL_WASM_DEC_RUNNER_WORKERS > 0
+  return static_cast<size_t>(JXL_WASM_DEC_RUNNER_WORKERS);
+#else
+  return JxlThreadParallelRunnerDefaultNumWorkerThreads();
+#endif
+}
+
 static void* g_parallel_runner = nullptr;
 static void* GetSharedRunner() {
   if (g_parallel_runner == nullptr) {
-    // Pre-warmed Emscripten pool is sized to navigator.hardwareConcurrency
-    // (-sPTHREAD_POOL_SIZE in build.mjs); request the matching default worker
-    // count so libjxl uses those warm threads instead of running serially.
-    // Creating threads beyond the pool would deadlock: the worker thread is
-    // blocked synchronously in decode and cannot service new pthread spawns.
-    size_t workers = JxlThreadParallelRunnerDefaultNumWorkerThreads();
+    // Decoder artifacts compile the measured width to match their pre-warmed
+    // pool. Encoder artifacts leave the macro at zero and retain libjxl's
+    // hardware default. Exceeding the pre-warmed decoder pool can deadlock
+    // because the calling worker cannot service new pthread spawns.
+    size_t workers = DecoderRunnerWorkerCount();
     g_parallel_runner = JxlThreadParallelRunnerCreate(nullptr, workers);
   }
   return g_parallel_runner;
@@ -2427,6 +2446,9 @@ static JxlWasmDecState* DecCreateInternal(uint32_t format, uint32_t progressive_
   s->dec = dec;
   s->pixel_format = { 4, FormatToDataType(format), JXL_NATIVE_ENDIAN, 0 };
   s->suppress_duplicate_progress = (flags & 1u) != 0;
+  s->progressive_detail = progressive_detail;
+  s->input_external = false;
+  s->input_external_base = nullptr;
   return s;
 }
 
@@ -2462,40 +2484,97 @@ void jxl_wasm_dec_set_region(JxlWasmDecState* s, uint32_t x, uint32_t y, uint32_
   s->roi_active = true;
 }
 
+// Ensure owned input_buf can hold `needed` bytes. Returns false on OOM.
+static bool DecEnsureInputCap(JxlWasmDecState* s, size_t needed) {
+  if (needed <= s->input_capacity) return true;
+  size_t new_cap = s->input_capacity ? s->input_capacity : 65536u;
+  while (new_cap < needed) {
+    size_t next = new_cap * 2;
+    if (next <= new_cap) { next = needed; }
+    new_cap = next;
+  }
+  uint8_t* grown = static_cast<uint8_t*>(realloc(s->input_buf, new_cap));
+  if (grown == nullptr) return false;
+  s->input_buf = grown;
+  s->input_capacity = new_cap;
+  return true;
+}
+
+// When SetInput borrowed the caller's buffer, copy any unconsumed tail into owned
+// input_buf before returning to JS (next HEAPU8.set would otherwise overwrite it).
+// Returns false on OOM.
+static bool DecPromoteExternalInput(JxlWasmDecState* s) {
+  if (!s->input_external || !s->input_set) return true;
+  size_t remaining = JxlDecoderReleaseInput(s->dec);
+  if (remaining > s->input_size) remaining = 0;
+  s->input_set = false;
+  s->input_external = false;
+  if (remaining == 0 || s->input_external_base == nullptr) {
+    s->input_size = 0;
+    s->input_external_base = nullptr;
+    return true;
+  }
+  const uint8_t* src = s->input_external_base + (s->input_size - remaining);
+  if (!DecEnsureInputCap(s, remaining)) return false;
+  memmove(s->input_buf, src, remaining);
+  s->input_size = remaining;
+  s->input_external_base = nullptr;
+  JxlDecoderSetInput(s->dec, s->input_buf, s->input_size);
+  s->input_set = true;
+  return true;
+}
+
 int jxl_wasm_dec_push(JxlWasmDecState* s, const uint8_t* data, size_t size) {
   if (s == nullptr || s->error_code != 0) return JXL_DEC_RESULT_ERROR;
   if (data != nullptr && size > 0) {
     size_t remaining = 0;
     if (s->input_set) {
+      // Owned path only: external input is always promoted before a prior return,
+      // so input_external must be false here. Defensive release if not.
       remaining = JxlDecoderReleaseInput(s->dec);
       if (remaining > s->input_size) remaining = 0;
       if (remaining > 0) {
-        memmove(s->input_buf, s->input_buf + (s->input_size - remaining), remaining);
+        if (s->input_external) {
+          // Promote leftover from the previous external buffer before overwrite.
+          const uint8_t* src = (s->input_external_base != nullptr)
+            ? s->input_external_base + (s->input_size - remaining)
+            : nullptr;
+          if (src == nullptr || !DecEnsureInputCap(s, remaining)) {
+            s->error_code = 15; return JXL_DEC_RESULT_ERROR;
+          }
+          memmove(s->input_buf, src, remaining);
+        } else {
+          memmove(s->input_buf, s->input_buf + (s->input_size - remaining), remaining);
+        }
       }
       s->input_size = remaining;
       s->input_set = false;
+      s->input_external = false;
+      s->input_external_base = nullptr;
     }
 
-    const size_t needed = s->input_size + size;
-    if (needed > s->input_capacity) {
-      // Geometric growth eliminates O(n²) memcpy on every append (A1).
-      // Track capacity separately; realloc only on overflow, then double.
-      size_t new_cap = s->input_capacity ? s->input_capacity : 65536u;
-      while (new_cap < needed) {
-        size_t next = new_cap * 2;
-        if (next <= new_cap) { next = needed; } // overflow guard
-        new_cap = next;
-      }
-      uint8_t* grown = static_cast<uint8_t*>(realloc(s->input_buf, new_cap));
-      if (grown == nullptr) { s->error_code = 15; return JXL_DEC_RESULT_ERROR; }
-      s->input_buf = grown;
-      s->input_capacity = new_cap;
+    if (remaining == 0) {
+      // Zero-copy: point libjxl at the caller's buffer for this push. Avoids a
+      // second full-stream memcpy (HEAPU8.set already brought bytes into WASM).
+      // Unconsumed tails are promoted in DecPromoteExternalInput before return.
+      s->input_size = size;
+      s->input_external = true;
+      s->input_external_base = data;
+      s->input_generation++;
+      JxlDecoderSetInput(s->dec, data, size);
+      s->input_set = true;
+    } else {
+      // Append new bytes after unconsumed owned tail (geometric growth, A1).
+      const size_t needed = s->input_size + size;
+      if (!DecEnsureInputCap(s, needed)) { s->error_code = 15; return JXL_DEC_RESULT_ERROR; }
+      memcpy(s->input_buf + s->input_size, data, size);
+      s->input_size = needed;
+      s->input_external = false;
+      s->input_external_base = nullptr;
+      s->input_generation++;
+      JxlDecoderSetInput(s->dec, s->input_buf, s->input_size);
+      s->input_set = true;
     }
-    memcpy(s->input_buf + s->input_size, data, size);
-    s->input_size = needed;
-    s->input_generation++;
-    JxlDecoderSetInput(s->dec, s->input_buf, s->input_size);
-    s->input_set = true;
   }
 
   JxlDecoderStatus status;
@@ -2509,16 +2588,23 @@ int jxl_wasm_dec_push(JxlWasmDecState* s, const uint8_t* data, size_t size) {
       // opportunistic flush path. Removing it collapses Single Progressive back
       // to one non-final stage plus final.
       // Keep the generation gate so callers cannot drain the same snapshot forever.
-      if (s->frame_started && !s->final_ready &&
+      //
+      // progressive_detail==0 (plain final decode): skip FlushImage entirely.
+      // Facade already discards intermediate frames when progressionTarget=final
+      // && !emitEveryPass — the flush was pure waste (full-frame work, then free).
+      if (s->progressive_detail != 0 &&
+          s->frame_started && !s->final_ready &&
           s->opportunistic_flush_generation != s->input_generation &&
           TryFlushProgressiveImage(s)) {
         s->opportunistic_flush_generation = s->input_generation;
+        if (!DecPromoteExternalInput(s)) { s->error_code = 15; return JXL_DEC_RESULT_ERROR; }
         return JXL_DEC_RESULT_PROGRESS;
       }
       if (s->input_closed) {
         s->error_code = static_cast<int>(status);
         return JXL_DEC_RESULT_ERROR;
       }
+      if (!DecPromoteExternalInput(s)) { s->error_code = 15; return JXL_DEC_RESULT_ERROR; }
       return JXL_DEC_RESULT_NEED_MORE;
     }
     if (status == JXL_DEC_SUCCESS) {
@@ -2603,18 +2689,25 @@ int jxl_wasm_dec_push(JxlWasmDecState* s, const uint8_t* data, size_t size) {
         s->pixels = grown;
         s->pixels_size = buf_size;
       }
-      // Zero the buffer so opportunistic FlushImage snapshots show transparent black for
-      // groups libjxl hasn't decoded yet (instead of uninitialized realloc garbage that
-      // surfaces as solid red — R-byte garbage with alpha-byte garbage at 255 — in the
-      // consumer canvas).
-      memset(s->pixels, 0, s->pixels_size);
+      // Zero only when progressive flushes can surface the buffer mid-decode.
+      // Final-only (progressive_detail==0) never FlushImage's — FULL_IMAGE writes
+      // the complete frame, so an 80+ MB memset is pure overhead.
+      if (s->progressive_detail != 0) {
+        // Opportunistic FlushImage snapshots show transparent black for groups
+        // libjxl hasn't decoded yet (instead of uninitialized realloc garbage that
+        // surfaces as solid red in the consumer canvas).
+        memset(s->pixels, 0, s->pixels_size);
+      }
       if (JxlDecoderSetImageOutBuffer(s->dec, &s->pixel_format, s->pixels, s->pixels_size) != JXL_DEC_SUCCESS) {
         s->error_code = 12; return JXL_DEC_RESULT_ERROR;
       }
       continue;
     }
     if (status == JXL_DEC_FRAME_PROGRESSION) {
-      if (TryFlushProgressiveImage(s)) return JXL_DEC_RESULT_PROGRESS;
+      if (TryFlushProgressiveImage(s)) {
+        if (!DecPromoteExternalInput(s)) { s->error_code = 15; return JXL_DEC_RESULT_ERROR; }
+        return JXL_DEC_RESULT_PROGRESS;
+      }
       continue;
     }
     if (status == JXL_DEC_FULL_IMAGE) {

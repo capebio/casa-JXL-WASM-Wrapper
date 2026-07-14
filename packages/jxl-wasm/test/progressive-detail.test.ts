@@ -124,6 +124,10 @@ test('stateful progressive decoder flushes on JXL_DEC_FRAME_PROGRESSION and one 
   expect(bridge).toContain('flush_count');
   expect(bridge).toContain('s->flush_count == 0');
   expect(bridge).toContain('progressive UI');
+  // Final-only (progressive_detail==0) must not pay FlushImage / out-buffer zeroing.
+  // Progressive paths keep the open-stream checkpoint contract above.
+  expect(bridge).toContain('s->progressive_detail != 0');
+  expect(bridge).toContain('DecPromoteExternalInput');
 });
 
 test('stateful progressive decoder exposes progress snapshots as borrowed buffers', () => {

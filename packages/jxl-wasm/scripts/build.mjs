@@ -92,6 +92,13 @@ const moduleKinds = process.env.JXL_WASM_ONLY_KIND
   ? [process.env.JXL_WASM_ONLY_KIND]
   : ["dec", "enc"];
 
+const decoderRunnerWorkers = process.env.JXL_WASM_DEC_RUNNER_WORKERS ?? '4';
+if (!new Set(['0', '1', '2', '4']).has(decoderRunnerWorkers)) {
+  throw new Error(
+    `JXL_WASM_DEC_RUNNER_WORKERS must be 0, 1, 2, or 4; got ${decoderRunnerWorkers}`
+  );
+}
+
 const baseFlags = [
   "-O3",
   "-sENVIRONMENT=web,worker",
@@ -309,7 +316,11 @@ async function main() {
       // For dec MT inside pooled workers, cap or STRICT=0 for lazy. Numeric values require benchmark on target HW before merge.
       const mallocFlag = isDec ? "-sMALLOC=emmalloc" : undefined;
 
+      const decoderRunnerFlag = isMt && isDec
+        ? `-DJXL_WASM_DEC_RUNNER_WORKERS=${decoderRunnerWorkers}`
+        : undefined;
       const tierFlags = [
+        ...(decoderRunnerFlag ? [decoderRunnerFlag] : []),
         ...baseFlags,
         getIncomingModuleJsApiFlag(),
         `-sINITIAL_MEMORY=${initialMem}`,

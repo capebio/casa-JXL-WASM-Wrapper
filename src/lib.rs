@@ -1750,7 +1750,14 @@ fn finish_from_raw(
             }
             // Lens 23/24: use process_into + preallocated buffer to avoid internal Vec alloc
             // inside the tone path (reuses the "into" pattern from demosaic/pipeline).
-            let mut rgb8 = vec![0u8; w * h * 3];
+            // Skip zero-init: process_into_auto writes every output byte (asserted size match).
+            // On 20 MP this saves a ~60 MiB memset that was pure overhead before tone.
+            let nbytes = w * h * 3;
+            let mut rgb8 = Vec::with_capacity(nbytes);
+            // SAFETY: capacity == nbytes; process_into_auto fully overwrites [0, nbytes).
+            unsafe {
+                rgb8.set_len(nbytes);
+            }
             // Chapter 1: SIMD bulk tone on wasm/x86 for the plain path (the 90% case),
             // scalar parity path only for perceptual_constancy. The big full-res win.
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
@@ -2440,6 +2447,7 @@ pub fn process_orf_with_options(
             make: decoded.info.make,
             model: decoded.info.model,
             iso: decoded.info.iso.unwrap_or(0),
+            baseline_exposure: 0.0, // ORF has no DNG BaselineExposure tag
             datetime: decoded.info.datetime,
             gps_lat: decoded.info.gps_lat,
             gps_lon: decoded.info.gps_lon,
@@ -5216,6 +5224,7 @@ pub fn process_raw_mosaic_with_options(
             make: String::new(),
             model: String::new(),
             iso,
+            baseline_exposure: 0.0, // generic/LibRaw mosaic path; no DNG BaselineExposure
             datetime: String::new(),
             gps_lat: None,
             gps_lon: None,
@@ -5580,6 +5589,7 @@ pub fn create_orf_denoise_session(
         make: decoded.info.make,
         model: decoded.info.model,
         iso: decoded.info.iso.unwrap_or(0),
+        baseline_exposure: 0.0, // ORF has no DNG BaselineExposure tag
         datetime: decoded.info.datetime,
         gps_lat: decoded.info.gps_lat,
         gps_lon: decoded.info.gps_lon,
@@ -5682,6 +5692,7 @@ pub fn create_raw_mosaic_denoise_session(
         make: String::new(),
         model: String::new(),
         iso,
+        baseline_exposure: 0.0, // generic/LibRaw mosaic path; no DNG BaselineExposure
         datetime: String::new(),
         gps_lat: None,
         gps_lon: None,

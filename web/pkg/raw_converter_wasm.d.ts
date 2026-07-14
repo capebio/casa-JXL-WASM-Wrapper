@@ -42,6 +42,15 @@ export class DecodedImage {
     free(): void;
     [Symbol.dispose](): void;
     /**
+     * PRODUCT PATH entry: convert the resident RGBA pixels to the packed linear
+     * RGB16-LE full buffer ONCE, inside wasm, and hand back a [`ResidentDeveloped`]
+     * handle that builds the full / lightbox / thumbnail `LookRenderer`s from that
+     * resident buffer — the full pixels never cross the wasm boundary (finding 58).
+     * Consumes the source pixels (emptied afterwards). Call a `take_*` escape hatch
+     * first if you also need the raw typed pixels out of wasm.
+     */
+    into_resident(): ResidentDeveloped;
+    /**
      * RGBA16 packed little-endian, 8 bytes/px (bit_depth == 16). Empty otherwise.
      */
     take_rgba16_le(): Uint8Array;
@@ -57,9 +66,54 @@ export class DecodedImage {
      * Display-ready RGBA8 regardless of source depth (f32 -> linear->sRGB).
      */
     to_display_rgba8(): Uint8Array;
+    /**
+     * Resident RGBA → packed **linear RGB16-LE** (6 B/px, alpha dropped) — the
+     * buffer `LookRenderer` consumes. Byte-identical to the worker's legacy
+     * `decodedToLinearRgb16` (proven in the raw-pipeline test suite), but the
+     * source pixels never leave wasm. Compatibility helper for any JS caller that
+     * wants the packed bytes directly; the product path uses
+     * [`Self::into_full_renderer`] which additionally keeps the packed bytes
+     * resident when constructing the renderer.
+     */
+    to_linear_rgb16_le(): Uint8Array;
     readonly bit_depth: number;
     readonly height: number;
     readonly width: number;
+}
+
+/**
+ * Tiled learned-denoise session. Owns decoded inputs and the assembled output;
+ * exposes packed input tiles and residual commits to a JS model runner.
+ */
+export class DenoiseSession {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    all_tiles_committed(): boolean;
+    /**
+     * Commits a `[12, 256, 256]` residual tensor for `(tile_x, tile_y)`.
+     */
+    commit_output_tile(tile_x: number, tile_y: number, residuals: Float32Array): void;
+    /**
+     * Finish via the classical (model-free) denoiser from Task 5. No tile commits
+     * are required — the raw mosaic and MHC baseline drive the classical path.
+     */
+    finish_classical(options: any): ProcessResult;
+    /**
+     * Finish via the learned model output. Every tile must be committed. The
+     * assembled (already normalised) RGB16 becomes the pipeline input, so black
+     * and white are pinned to 0/65535 before the look/tone path runs.
+     */
+    finish_with_options(options: any): ProcessResult;
+    height(): number;
+    is_tile_committed(tile_x: number, tile_y: number): boolean;
+    /**
+     * Returns the packed CHW `[20, 320, 320]` input tensor for `(tile_x, tile_y)`.
+     */
+    take_input_tile(tile_x: number, tile_y: number): Float32Array;
+    tiles_x(): number;
+    tiles_y(): number;
+    width(): number;
 }
 
 /**
@@ -313,6 +367,9 @@ export class ProcessResult {
     readonly color_matrix_from_mn: boolean;
     readonly decompress_ms: number;
     readonly demosaic_ms: number;
+    readonly denoise_applied: boolean;
+    readonly denoise_ms: number;
+    readonly denoise_requested: boolean;
     readonly disp16_h: number;
     readonly disp16_w: number;
     readonly exposure_den: number;
@@ -333,6 +390,14 @@ export class ProcessResult {
     readonly iso: number;
     readonly lb_h: number;
     readonly lb_w: number;
+    /**
+     * Estimation confidence [0, 1]; 0.0 if not measured.
+     */
+    readonly noise_confidence: number;
+    /**
+     * 90th-percentile display-space sigma (0–255 scale); 0.0 if not measured.
+     */
+    readonly noise_score: number;
     readonly orient_ms: number;
     readonly orientation: number;
     readonly preview_demosaic_ms: number;
@@ -360,9 +425,13 @@ export class ProcessResult {
     readonly white_used: number;
     readonly width: number;
     readonly datetime: string;
+    readonly denoise_backend: string;
+    readonly denoise_model_version: string;
+    readonly denoise_reason: string;
     readonly lens: string;
     readonly make: string;
     readonly model: string;
+    readonly noise_source: string;
 }
 
 export class RawStreamExporter {
@@ -386,6 +455,52 @@ export class RawStreamExporter {
      * the spatial (look-adjusted) band-halo path; all-zero keeps the tone-only fast path.
      */
     static from_orf(bytes: Uint8Array, nr_strength: number): RawStreamExporter;
+    readonly height: number;
+    readonly width: number;
+}
+
+/**
+ * A developed image kept RESIDENT in wasm as a packed linear RGB16-LE full buffer
+ * (finding 58). Produced by [`DecodedImage::into_resident`]. Builds the full-res
+ * encode renderer and the downscaled lightbox / thumbnail live-edit renderers
+ * entirely inside wasm linear memory, so the full pixel buffer never round-trips
+ * out to JS (`take_*`) and back in (`LookRenderer.new_with_options`).
+ *
+ * Every renderer is byte-identical to the legacy worker path: the resident
+ * RGBA→RGB16-LE conversion mirrors `decodedToLinearRgb16`, the resident downscale
+ * mirrors `downscaleRgb16LE`, and `from_packed_le` reproduces `new_with_options`
+ * for the same bytes/dims (all proven in
+ * `crates/raw-pipeline/tests/resident_image_pipeline.rs`).
+ */
+export class ResidentDeveloped {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Build a downscaled preview `LookRenderer` (lightbox at long-edge 1800, thumb
+     * at 360) from the resident full buffer, resident. The downscale is byte-exact
+     * vs the worker's `downscaleRgb16LE` at the `targetDims`-derived size. Does NOT
+     * consume the full buffer, so lightbox and thumb can both be built before
+     * [`Self::take_full_renderer`] moves it out.
+     */
+    preview_renderer(long_edge: number): LookRenderer;
+    /**
+     * Build the full-resolution encode `LookRenderer`, MOVING the resident full
+     * buffer into it (no copy, no boundary crossing). After this call the resident
+     * buffer is empty, so build the lightbox/thumb renderers (which downscale from
+     * the full buffer) BEFORE calling this — matching the worker, which builds the
+     * downscaled previews from `fullRgb16` first and constructs the full renderer
+     * last for the transient encode.
+     */
+    take_full_renderer(): LookRenderer;
+    /**
+     * Compatibility ESCAPE HATCH (finding 58): move the packed linear RGB16-LE full
+     * buffer out to JS. NOT the product path — the product path keeps the buffer
+     * resident via [`Self::take_full_renderer`] / [`Self::preview_renderer`]. Kept
+     * so a JS consumer that still needs the packed bytes (e.g. a bespoke downscale)
+     * can obtain them without re-deriving the resident conversion.
+     */
+    take_full_rgb16_le(): Uint8Array;
     readonly height: number;
     readonly width: number;
 }
@@ -420,7 +535,30 @@ export function apply_look(rgb16_src: Uint16Array, width: number, height: number
 export function bench_decode_orf(data: Uint8Array): DecodeBench;
 
 /**
- * Decode an OpenEXR image to RGBA f32 (linear HDR preserved).
+ * Create a tiled denoise session from a Canon CR2 blob.
+ */
+export function create_cr2_denoise_session(data: Uint8Array, options: any): DenoiseSession;
+
+/**
+ * Create a tiled denoise session from an Adobe DNG blob.
+ */
+export function create_dng_denoise_session(data: Uint8Array, options: any): DenoiseSession;
+
+/**
+ * Create a tiled denoise session from an Olympus ORF blob.
+ */
+export function create_orf_denoise_session(data: Uint8Array, options: any): DenoiseSession;
+
+/**
+ * Create a tiled denoise session from a generic Bayer mosaic (see
+ * `process_raw_mosaic_with_options` for the argument contract).
+ */
+export function create_raw_mosaic_denoise_session(raw_u16: Uint16Array, width: number, height: number, cfa_phase: number, black: number, white: number, wb_r: number, wb_b: number, orientation: number, color_matrix_flat: Float32Array, iso: number, options: any): DenoiseSession;
+
+/**
+ * Decode an OpenEXR image to RGBA f32 (linear HDR preserved). Preflights the
+ * header against the platform decode-limit profile (EXR f32 is 16 B/px, so the
+ * output-byte cap is the governing constraint) before decoding.
  */
 export function decode_exr(bytes: Uint8Array): DecodedImage;
 
@@ -428,11 +566,14 @@ export function decode_exr(bytes: Uint8Array): DecodedImage;
  * Decode a JPEG to RGBA8 for the developed-image edit path (mirrors
  * `decode_tiff`/`decode_exr`). The lossless archival transcode is a separate
  * facade path (`transcodeJpegToJxl`); this is the editable-pixels decode.
+ * Preflights the header against the platform decode-limit profile first.
  */
 export function decode_jpeg(bytes: Uint8Array): DecodedImage;
 
 /**
- * Decode a general RGB(A) TIFF (u8 or u16) to RGBA.
+ * Decode a general RGB(A) TIFF (u8 or u16) to RGBA. Preflights the header
+ * against the platform decode-limit profile, rejecting oversized / bomb inputs
+ * before any pixel buffer is allocated.
  */
 export function decode_tiff(bytes: Uint8Array): DecodedImage;
 
@@ -469,6 +610,12 @@ export function demosaic_bench_shuffle_simd(): number;
 export function demosaic_bench_simd(): number;
 
 export function demtone_bench_mhc(): number;
+
+export function demtone_bench_mhc_equal(): boolean;
+
+export function demtone_bench_mhc_scalar(): number;
+
+export function demtone_bench_mhc_simd128(): number;
 
 export function demtone_bench_prepare(w: number, h: number): void;
 
@@ -627,6 +774,11 @@ export function process_cr2_with_flags(data: Uint8Array, output_flags: number, e
 export function process_cr2_with_look(data: Uint8Array, output_flags: number, look: any): ProcessResult;
 
 /**
+ * T6 noise-aware API for CR2 (see `process_dng_with_options`).
+ */
+export function process_cr2_with_options(data: Uint8Array, output_flags: number, options: any): ProcessResult;
+
+/**
  * Parse + decode a DNG file blob. Returns an error string on failure.
  * (Rayon when parallel-wasm feature active.) Look params: LR-style (-1..+1), except
  * exposure_ev in stops.  Pass NaN/≤0 for wb_r_override/wb_b_override to use defaults.
@@ -654,6 +806,16 @@ export function process_dng_with_flags(data: Uint8Array, output_flags: number, e
  * K6#1: named-object look API for DNG (see [`process_orf_with_look`]).
  */
 export function process_dng_with_look(data: Uint8Array, output_flags: number, look: any): ProcessResult;
+
+/**
+ * T6 noise-aware API for DNG.
+ *
+ * `options` is a plain JS object with two optional keys: `"look"` (same
+ * shape as `process_dng_with_look`) and `"denoise"` (see spec). Unknown
+ * key → `JsError`. When `denoise.enabled` is `false` (the default) the
+ * function is byte-identical to `process_dng_with_look`.
+ */
+export function process_dng_with_options(data: Uint8Array, output_flags: number, options: any): ProcessResult;
 
 /**
  * Parse + decode an ORF file blob.  Returns an error string on failure.
@@ -696,7 +858,24 @@ export function process_orf_with_flags(data: Uint8Array, output_flags: number, e
  */
 export function process_orf_with_look(data: Uint8Array, output_flags: number, look: any): ProcessResult;
 
+/**
+ * T6 noise-aware API for ORF (see `process_dng_with_options`).
+ *
+ * When `denoise.enabled` is true the full raw mosaic is always materialized
+ * (equivalent to including `OUT_FULL_RGB8`), so the streaming preview-only
+ * fast path will not fire even if only lb/thumb are requested.
+ */
+export function process_orf_with_options(data: Uint8Array, output_flags: number, options: any): ProcessResult;
+
 export function process_raw_mosaic_with_flags(raw: Uint16Array, width: number, height: number, cfa_phase: number, black: number, white: number, wb_r: number, wb_b: number, orientation: number, color_matrix_flat: Float32Array, output_flags: number, exposure_ev: number, contrast: number, highlights: number, shadows: number, whites: number, blacks: number, saturation: number, vibrance: number, temp: number, tint: number, texture: number, clarity: number): ProcessResult;
+
+/**
+ * T6 noise-aware API for a generic Bayer mosaic (see `process_dng_with_options`).
+ *
+ * `raw_u16`: flat u16 Bayer mosaic (row-major). `iso` = sensor ISO (used as
+ * denoise policy hint). `options` is parsed identically to `process_dng_with_options`.
+ */
+export function process_raw_mosaic_with_options(raw_u16: Uint16Array, width: number, height: number, cfa_phase: number, black: number, white: number, wb_r: number, wb_b: number, orientation: number, color_matrix_flat: Float32Array, output_flags: number, iso: number, options: any): ProcessResult;
 
 /**
  * S6 — decode only a rectangular region of an Olympus ORF file.
@@ -752,6 +931,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly __wbg_decodebench_free: (a: number, b: number) => void;
     readonly __wbg_decodedimage_free: (a: number, b: number) => void;
+    readonly __wbg_denoisesession_free: (a: number, b: number) => void;
     readonly __wbg_fabledeltasession_free: (a: number, b: number) => void;
     readonly __wbg_fablevideoencoder_free: (a: number, b: number) => void;
     readonly __wbg_get_decodebench_decompress_ms: (a: number) => number;
@@ -764,6 +944,9 @@ export interface InitOutput {
     readonly __wbg_get_orfmetadata_orientation: (a: number) => number;
     readonly __wbg_get_processresult_black_used: (a: number) => number;
     readonly __wbg_get_processresult_color_matrix_from_mn: (a: number) => number;
+    readonly __wbg_get_processresult_denoise_applied: (a: number) => number;
+    readonly __wbg_get_processresult_denoise_ms: (a: number) => number;
+    readonly __wbg_get_processresult_denoise_requested: (a: number) => number;
     readonly __wbg_get_processresult_disp16_h: (a: number) => number;
     readonly __wbg_get_processresult_disp16_w: (a: number) => number;
     readonly __wbg_get_processresult_exposure_den: (a: number) => number;
@@ -784,6 +967,8 @@ export interface InitOutput {
     readonly __wbg_get_processresult_iso: (a: number) => number;
     readonly __wbg_get_processresult_lb_h: (a: number) => number;
     readonly __wbg_get_processresult_lb_w: (a: number) => number;
+    readonly __wbg_get_processresult_noise_confidence: (a: number) => number;
+    readonly __wbg_get_processresult_noise_score: (a: number) => number;
     readonly __wbg_get_processresult_orient_ms: (a: number) => number;
     readonly __wbg_get_processresult_orientation: (a: number) => number;
     readonly __wbg_get_processresult_preview_demosaic_ms: (a: number) => number;
@@ -804,18 +989,24 @@ export interface InitOutput {
     readonly __wbg_perceptualcomparer_free: (a: number, b: number) => void;
     readonly __wbg_processresult_free: (a: number, b: number) => void;
     readonly __wbg_rawstreamexporter_free: (a: number, b: number) => void;
-    readonly __wbg_rotateresult_free: (a: number, b: number) => void;
+    readonly __wbg_residentdeveloped_free: (a: number, b: number) => void;
     readonly apply_look: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number) => [number, number, number, number];
     readonly bench_decode_orf: (a: number, b: number) => [number, number, number];
+    readonly create_cr2_denoise_session: (a: number, b: number, c: any) => [number, number, number];
+    readonly create_dng_denoise_session: (a: number, b: number, c: any) => [number, number, number];
+    readonly create_orf_denoise_session: (a: number, b: number, c: any) => [number, number, number];
+    readonly create_raw_mosaic_denoise_session: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: any) => [number, number, number];
     readonly decode_exr: (a: number, b: number) => [number, number, number];
     readonly decode_jpeg: (a: number, b: number) => [number, number, number];
     readonly decode_tiff: (a: number, b: number) => [number, number, number];
     readonly decodedimage_bit_depth: (a: number) => number;
     readonly decodedimage_height: (a: number) => number;
+    readonly decodedimage_into_resident: (a: number) => number;
     readonly decodedimage_take_rgba16_le: (a: number) => [number, number];
     readonly decodedimage_take_rgba8: (a: number) => [number, number];
     readonly decodedimage_take_rgba_f32: (a: number) => [number, number];
     readonly decodedimage_to_display_rgba8: (a: number) => [number, number];
+    readonly decodedimage_to_linear_rgb16_le: (a: number) => [number, number];
     readonly decodedimage_width: (a: number) => number;
     readonly decompress_bench_byteloop: () => number;
     readonly decompress_bench_equal: () => number;
@@ -834,8 +1025,21 @@ export interface InitOutput {
     readonly demosaic_bench_shuffle_simd: () => number;
     readonly demosaic_bench_simd: () => number;
     readonly demtone_bench_mhc: () => number;
+    readonly demtone_bench_mhc_equal: () => number;
+    readonly demtone_bench_mhc_scalar: () => number;
+    readonly demtone_bench_mhc_simd128: () => number;
     readonly demtone_bench_prepare: (a: number, b: number) => void;
     readonly demtone_bench_tone: () => number;
+    readonly denoisesession_all_tiles_committed: (a: number) => number;
+    readonly denoisesession_commit_output_tile: (a: number, b: number, c: number, d: number, e: number) => [number, number];
+    readonly denoisesession_finish_classical: (a: number, b: any) => [number, number, number];
+    readonly denoisesession_finish_with_options: (a: number, b: any) => [number, number, number];
+    readonly denoisesession_height: (a: number) => number;
+    readonly denoisesession_is_tile_committed: (a: number, b: number, c: number) => number;
+    readonly denoisesession_take_input_tile: (a: number, b: number, c: number) => [number, number, number, number];
+    readonly denoisesession_tiles_x: (a: number) => number;
+    readonly denoisesession_tiles_y: (a: number) => number;
+    readonly denoisesession_width: (a: number) => number;
     readonly downscale_rgb: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly downscale_rgb16_pub: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly downscale_rgba: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
@@ -898,20 +1102,28 @@ export interface InitOutput {
     readonly process_cr2: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number, number];
     readonly process_cr2_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => [number, number, number];
     readonly process_cr2_with_look: (a: number, b: number, c: number, d: any) => [number, number, number];
+    readonly process_cr2_with_options: (a: number, b: number, c: number, d: any) => [number, number, number];
     readonly process_dng: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number, number];
     readonly process_dng_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => [number, number, number];
     readonly process_dng_with_look: (a: number, b: number, c: number, d: any) => [number, number, number];
+    readonly process_dng_with_options: (a: number, b: number, c: number, d: any) => [number, number, number];
     readonly process_orf: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number, number];
     readonly process_orf_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number) => [number, number, number];
     readonly process_orf_with_look: (a: number, b: number, c: number, d: any) => [number, number, number];
+    readonly process_orf_with_options: (a: number, b: number, c: number, d: any) => [number, number, number];
     readonly process_raw_mosaic_with_flags: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number, q: number, r: number, s: number, t: number, u: number, v: number, w: number, x: number, y: number) => [number, number, number];
+    readonly process_raw_mosaic_with_options: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: any) => [number, number, number];
     readonly process_region: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number, number];
     readonly processresult_color_matrix_used: (a: number) => [number, number];
     readonly processresult_datetime: (a: number) => [number, number];
+    readonly processresult_denoise_backend: (a: number) => [number, number];
+    readonly processresult_denoise_model_version: (a: number) => [number, number];
+    readonly processresult_denoise_reason: (a: number) => [number, number];
     readonly processresult_finish_full_rgb8: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number, m: number, n: number, o: number, p: number) => [number, number];
     readonly processresult_lens: (a: number) => [number, number];
     readonly processresult_make: (a: number) => [number, number];
     readonly processresult_model: (a: number) => [number, number];
+    readonly processresult_noise_source: (a: number) => [number, number];
     readonly processresult_rgb: (a: number) => [number, number];
     readonly processresult_rgba: (a: number) => [number, number];
     readonly processresult_take_lightbox_renderer: (a: number) => number;
@@ -927,6 +1139,8 @@ export interface InitOutput {
     readonly rawstreamexporter_from_orf: (a: number, b: number, c: number) => [number, number, number];
     readonly rawstreamexporter_height: (a: number) => number;
     readonly rawstreamexporter_width: (a: number) => number;
+    readonly residentdeveloped_preview_renderer: (a: number, b: number) => number;
+    readonly residentdeveloped_take_full_renderer: (a: number) => number;
     readonly rgb16_to_rgba16: (a: number, b: number) => [number, number];
     readonly rgb_to_rgba: (a: number, b: number) => [number, number];
     readonly rotate_rgb8: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
@@ -939,9 +1153,13 @@ export interface InitOutput {
     readonly __wbg_get_processresult_decompress_ms: (a: number) => number;
     readonly __wbg_get_processresult_demosaic_ms: (a: number) => number;
     readonly __wbg_get_processresult_tonemap_ms: (a: number) => number;
+    readonly residentdeveloped_take_full_rgb16_le: (a: number) => [number, number];
     readonly rotateresult_take_rgb: (a: number) => [number, number];
+    readonly residentdeveloped_height: (a: number) => number;
+    readonly residentdeveloped_width: (a: number) => number;
     readonly __wbg_decodepeakestimate_free: (a: number, b: number) => void;
     readonly estimate_decode_peak_bytes: (a: number, b: number, c: number) => number;
+    readonly __wbg_rotateresult_free: (a: number, b: number) => void;
     readonly __wbg_wbg_rayon_poolbuilder_free: (a: number, b: number) => void;
     readonly initThreadPool: (a: number) => any;
     readonly wbg_rayon_poolbuilder_build: (a: number) => void;
