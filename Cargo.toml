@@ -8,7 +8,12 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 # A2: enable rayon parallelism in the RAW pipeline for WASM (requires COOP/COEP, already required by libjxl MT)
-parallel-wasm = ["raw-pipeline/parallel", "dep:wasm-bindgen-rayon"]
+# Also forwards bliss-core/parallel so a STANDALONE MT tier (bench/large-file tool) threads BLISS
+# decode/encode band-parallel. WARNING: the app's RAW path already runs a per-image worker pool of
+# min(cores,12) (main.js POOL_SIZE), which saturates all cores — do NOT run band-threaded BLISS inside
+# those pool workers (12 workers × 8 rayon threads = oversubscription, measured slower). The shipped
+# app uses single-thread v128 BLISS (web/pkg); band-threading is only for standalone/benchmark builds.
+parallel-wasm = ["raw-pipeline/parallel", "bliss-core/parallel", "bltv/parallel", "dep:wasm-bindgen-rayon"]
 
 # P3-T11 (finding 21): opt-in wasm SIMD128 MHC interior demosaic kernel. Bit-exact to scalar;
 # OFF by default. Only flip on for a shipped pkg AFTER the ≥15% median browser+Node-WASM

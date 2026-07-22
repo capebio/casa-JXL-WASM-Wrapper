@@ -1,0 +1,778 @@
+diff --git a/bliss-core/src/band.rs b/bliss-core/src/band.rs
+index e2da1b9..78e8a1e 100644
+--- a/bliss-core/src/band.rs
++++ b/bliss-core/src/band.rs
+@@ -179,6 +179,14 @@ fn deinterleave_into(rgb: &[u8], w: usize, rows: usize, rct: bool, p: &mut [Vec<
+         unsafe { avx2::deinterleave3(rgb, &mut p0[0], &mut p1[0], &mut p2[0], rct) };
+         return;
+     }
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        let (p0, rest) = p.split_at_mut(1);
++        let (p1, p2) = rest.split_at_mut(1);
++        unsafe { crate::band_wasm::deinterleave3_v128(rgb, &mut p0[0], &mut p1[0], &mut p2[0], rct) };
++        return;
++    }
++    #[allow(unreachable_code)]
+     for i in 0..n {
+         let gi = rgb[i * 3 + 1];
+         p[0][i] = if rct { rgb[i * 3].wrapping_sub(gi) } else { rgb[i * 3] };
+@@ -341,7 +349,9 @@ fn encode_band_from_planes(
+         } else {
+             ctx_row_planar(src_g, dst);
+         }
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++        unsafe { crate::band_wasm::ctx_row_v128(src_g, dst) };
++        #[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "wasm32", target_feature = "simd128"))))]
+         ctx_row_planar(src_g, dst);
+         // count while dst is cache-hot; SIMD path ~32× faster than scalar
+         if !err_ctx {
+@@ -352,7 +362,9 @@ fn encode_band_from_planes(
+             } else {
+                 for j in 0..w { per[j & 1][dst[j] as usize] += 1; }
+             }
+-            #[cfg(not(target_arch = "x86_64"))]
++            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++            unsafe { crate::band_wasm::count_ctx_row_per_v128(dst, &mut per) };
++            #[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "wasm32", target_feature = "simd128"))))]
+             for j in 0..w { per[j & 1][dst[j] as usize] += 1; }
+             for ph in 0..2 {
+                 for c in 0..NCTX {
+@@ -403,7 +415,9 @@ fn encode_band_from_planes(
+                     res_o[j] = cur[j].wrapping_sub(med_o[j]);
+                 }
+             }
+-            #[cfg(not(target_arch = "x86_64"))]
++            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++            unsafe { crate::band_wasm::residual_rows_v128(cur, prev, res_e, res_o) };
++            #[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "wasm32", target_feature = "simd128"))))]
+             {
+                 med_row_prev(prev, med_e);
+                 med_row_horiz(cur, prev, med_o);
+@@ -523,7 +537,14 @@ fn encode_band_from_planes(
+         } else {
+             rans::encode_lanes(b, &t, lanes)
+         };
+-        #[cfg(not(target_arch = "x86_64"))]
++        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++        let words = if lanes == 16 {
++            let et = crate::rans_wasm::enc_tables(&t);
++            unsafe { crate::rans_wasm::encode16l_v128(b, &t, &et) }
++        } else {
++            rans::encode_lanes(b, &t, lanes)
++        };
++        #[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "wasm32", target_feature = "simd128"))))]
+         let words = rans::encode_lanes(b, &t, lanes);
+         blob.push(2);
+         blob.extend_from_slice(&n.to_le_bytes());
+@@ -556,6 +577,23 @@ pub(crate) fn decode_band(blob: &[u8], w: usize, rows: usize, lanes: usize) -> R
+ }
+ 
+ /// Decode a band blob directly into `dst` (must be exactly `rows * w * 3` bytes).
++/// Non-x86 rANS stream decode. On wasm32 with simd128 the 16-lane stream uses the `v128` kernel;
++/// everything else (other lane counts, non-simd targets) falls to the scalar decoder.
++#[cfg(not(target_arch = "x86_64"))]
++fn decode_stream_fallback(words: &[u16], nw: usize, n: usize, t: &Table, lanes: usize) -> Vec<u8> {
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        if lanes == 16 {
++            let plut = crate::rans_wasm::packed_lut(t);
++            let mut out = vec![0u8; n];
++            unsafe { crate::rans_wasm::decode16l_v128(words, n, &plut, &mut out) };
++            return out;
++        }
++    }
++    let lut = t.lut();
++    rans::decode_lanes(&words[..nw], n, t, &lut, lanes)
++}
++
+ pub(crate) fn decode_band_ctx(blob: &[u8], w: usize, rows: usize, lanes: usize, err_ctx: bool, ctx2: bool, rct: bool, dst: &mut [u8]) -> Result<(), Error> {
+     let mut off = 0usize;
+     let take = |off: &mut usize, n: usize| -> Result<&[u8], Error> {
+@@ -624,8 +662,7 @@ pub(crate) fn decode_band_ctx(blob: &[u8], w: usize, rows: usize, lanes: usize,
+                 }
+                 #[cfg(not(target_arch = "x86_64"))]
+                 {
+-                    let lut = t.lut();
+-                    streams.push(rans::decode_lanes(&words[..nw], n, &t, &lut, lanes));
++                    streams.push(decode_stream_fallback(&words, nw, n, &t, lanes));
+                 }
+             }
+             _ => return Err(Error::BadHeader("stream mode")),
+@@ -681,7 +718,9 @@ pub(crate) fn decode_band_ctx(blob: &[u8], w: usize, rows: usize, lanes: usize,
+                 } else {
+                     ctx_row_planar(g, &mut crow);
+                 }
+-                #[cfg(not(target_arch = "x86_64"))]
++                #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++                unsafe { crate::band_wasm::ctx_row_v128(g, &mut crow) };
++                #[cfg(all(not(target_arch = "x86_64"), not(all(target_arch = "wasm32", target_feature = "simd128"))))]
+                 ctx_row_planar(g, &mut crow);
+             }
+         }
+@@ -766,31 +805,41 @@ pub(crate) fn decode_band_ctx(blob: &[u8], w: usize, rows: usize, lanes: usize,
+                     j += 2;
+                 }
+             }
+-            #[cfg(target_arch = "x86_64")]
+-            let fast = use_avx2();
+-            #[cfg(not(target_arch = "x86_64"))]
+-            let fast = false;
+-            if fast {
++            // wasm32+simd128: v128 checkerboard-median recon (even phase writes all w; odd blends
++            // in-place — same contract as the AVX2 pair).
++            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++            unsafe {
++                crate::band_wasm::recon_even_row_v128(prev, &res, curr);
++                crate::band_wasm::recon_odd_row_inplace_v128(curr, prev, &res);
++            }
++            #[cfg(not(all(target_arch = "wasm32", target_feature = "simd128")))]
++            {
+                 #[cfg(target_arch = "x86_64")]
+-                unsafe {
+-                    // Even phase writes all w positions; odd positions are even-median junk but
+-                    // recon_odd_row_inplace only reads curr at even offsets (j±1 for odd j),
+-                    // then blends new odd values in-place via _mm256_blendv_epi8.
+-                    avx2::recon_even_row(prev, &res, curr);
+-                    avx2::recon_odd_row_inplace(curr, prev, &res);
+-                }
+-            } else {
+-                med_row_prev(prev, &mut med_e);
+-                let mut j = 0;
+-                while j < w {
+-                    curr[j] = med_e[j].wrapping_add(res[j]);
+-                    j += 2;
+-                }
+-                med_row_horiz(curr, prev, &mut med_o);
+-                let mut j = 1;
+-                while j < w {
+-                    curr[j] = med_o[j].wrapping_add(res[j]);
+-                    j += 2;
++                let fast = use_avx2();
++                #[cfg(not(target_arch = "x86_64"))]
++                let fast = false;
++                if fast {
++                    #[cfg(target_arch = "x86_64")]
++                    unsafe {
++                        // Even phase writes all w positions; odd positions are even-median junk but
++                        // recon_odd_row_inplace only reads curr at even offsets (j±1 for odd j),
++                        // then blends new odd values in-place via _mm256_blendv_epi8.
++                        avx2::recon_even_row(prev, &res, curr);
++                        avx2::recon_odd_row_inplace(curr, prev, &res);
++                    }
++                } else {
++                    med_row_prev(prev, &mut med_e);
++                    let mut j = 0;
++                    while j < w {
++                        curr[j] = med_e[j].wrapping_add(res[j]);
++                        j += 2;
++                    }
++                    med_row_horiz(curr, prev, &mut med_o);
++                    let mut j = 1;
++                    while j < w {
++                        curr[j] = med_o[j].wrapping_add(res[j]);
++                        j += 2;
++                    }
+                 }
+             }
+         }
+@@ -802,6 +851,12 @@ pub(crate) fn decode_band_ctx(blob: &[u8], w: usize, rows: usize, lanes: usize,
+         unsafe { avx2::interleave3(&planes[0], &planes[1], &planes[2], dst, rct) };
+         return Ok(());
+     }
++    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
++    {
++        unsafe { crate::band_wasm::interleave3_v128(&planes[0], &planes[1], &planes[2], dst, rct) };
++        return Ok(());
++    }
++    #[allow(unreachable_code)]
+     for i in 0..w * rows {
+         let gi = planes[1][i];
+         dst[i * 3] = if rct { planes[0][i].wrapping_add(gi) } else { planes[0][i] };
+@@ -810,3 +865,40 @@ pub(crate) fn decode_band_ctx(blob: &[u8], w: usize, rows: usize, lanes: usize,
+     }
+     Ok(())
+ }
++
++#[cfg(test)]
++mod count_tests {
++    /// Validates the v128 count algorithm's bit-logic portably: a 16-bit lane bitmask masked by
++    /// 0x5555 (even lanes) / 0xAAAA (odd lanes) and popcounted must equal the scalar per[phase][ctx]
++    /// count. The wasm intrinsic `u8x16_bitmask(u8x16_eq(v,k))` produces exactly this `bm`.
++    #[test]
++    fn count_ctx_bitmask_matches_scalar() {
++        for len in [0usize, 1, 15, 16, 17, 31, 100, 257] {
++            let row: Vec<u8> = (0..len).map(|i| ((i * 7 + i / 3) % 4) as u8).collect();
++            let mut scalar = [[0usize; 4]; 2];
++            for j in 0..len {
++                scalar[j & 1][row[j] as usize] += 1;
++            }
++            let mut bm_count = [[0usize; 4]; 2];
++            let mut j = 0usize;
++            while j + 16 <= len {
++                for k in 0..4u8 {
++                    let mut bm = 0u16;
++                    for lane in 0..16 {
++                        if row[j + lane] == k {
++                            bm |= 1 << lane;
++                        }
++                    }
++                    bm_count[0][k as usize] += (bm & 0x5555).count_ones() as usize;
++                    bm_count[1][k as usize] += (bm & 0xAAAA).count_ones() as usize;
++                }
++                j += 16;
++            }
++            while j < len {
++                bm_count[j & 1][row[j] as usize] += 1;
++                j += 1;
++            }
++            assert_eq!(scalar, bm_count, "len={len}");
++        }
++    }
++}
+diff --git a/bliss-core/src/band_wasm.rs b/bliss-core/src/band_wasm.rs
+new file mode 100644
+index 0000000..07890d0
+--- /dev/null
++++ b/bliss-core/src/band_wasm.rs
+@@ -0,0 +1,237 @@
++//! WASM `v128` reconstruction kernels — the browser sibling of `avx2.rs` (decode side only).
++//! 16 bytes/iteration; bit-identical to the scalar recon in `band.rs` (edges scalar, interior SIMD).
++//! Covers the near-lossless cache-tier decode path: `ctx_row` + checkerboard-median recon + RCT
++//! interleave. No serial bias loop on that path, so these are the whole remaining scalar cost.
++#![allow(unsafe_op_in_unsafe_fn)]
++use core::arch::wasm32::*;
++
++#[inline]
++fn med3s(a: u8, b: u8, c: u8) -> u8 {
++    a.min(b).max(a.max(b).min(c))
++}
++#[inline]
++fn med3_v(a: v128, b: v128, c: v128) -> v128 {
++    let mn = u8x16_min(a, b);
++    let mx = u8x16_max(a, b);
++    u8x16_max(mn, u8x16_min(mx, c))
++}
++
++/// out[j] = med3(prev[j], prev[j-1], prev[j+1]) + res[j]  (whole row; caller uses even j).
++#[target_feature(enable = "simd128")]
++pub unsafe fn recon_even_row_v128(prev: &[u8], res: &[u8], out: &mut [u8]) {
++    let w = prev.len();
++    out[0] = med3s(prev[0], prev[0], prev[1.min(w - 1)]).wrapping_add(res[0]);
++    out[w - 1] = med3s(prev[w - 1], prev[w - 2], prev[w - 1]).wrapping_add(res[w - 1]);
++    let mut j = 1usize;
++    while j + 16 <= w - 1 {
++        let p = v128_load(prev.as_ptr().add(j) as *const v128);
++        let pl = v128_load(prev.as_ptr().add(j - 1) as *const v128);
++        let pr = v128_load(prev.as_ptr().add(j + 1) as *const v128);
++        let r = v128_load(res.as_ptr().add(j) as *const v128);
++        v128_store(out.as_mut_ptr().add(j) as *mut v128, i8x16_add(med3_v(p, pl, pr), r));
++        j += 16;
++    }
++    while j < w - 1 {
++        out[j] = med3s(prev[j], prev[j - 1], prev[j + 1]).wrapping_add(res[j]);
++        j += 1;
++    }
++}
++
++/// In-place odd phase: curr[j] = med3(curr[j-1], curr[j+1], prev[j]) + res[j] for odd j.
++/// curr already holds reconstructed even columns; the vector computes all lanes and blends only the
++/// odd-absolute ones (vector-even lanes, since the loop starts at j=1).
++#[target_feature(enable = "simd128")]
++pub unsafe fn recon_odd_row_inplace_v128(curr: &mut [u8], prev: &[u8], res: &[u8]) {
++    let w = curr.len();
++    // mask bytes [0xFF,0x00,0xFF,0x00,…] → bitselect picks new_vals at vector-even lanes (odd abs pos)
++    let mask = u16x8_splat(0x00FF);
++    let mut j = 1usize;
++    while j + 16 <= w - 1 {
++        let existing = v128_load(curr.as_ptr().add(j) as *const v128);
++        let cl = v128_load(curr.as_ptr().add(j - 1) as *const v128);
++        let cr = v128_load(curr.as_ptr().add(j + 1) as *const v128);
++        let p = v128_load(prev.as_ptr().add(j) as *const v128);
++        let r = v128_load(res.as_ptr().add(j) as *const v128);
++        let new_vals = i8x16_add(med3_v(cl, cr, p), r);
++        v128_store(curr.as_mut_ptr().add(j) as *mut v128, v128_bitselect(new_vals, existing, mask));
++        j += 16;
++    }
++    while j < w - 1 {
++        curr[j] = med3s(curr[j - 1], curr[j + 1], prev[j]).wrapping_add(res[j]);
++        j += 2;
++    }
++    if w >= 2 && (w - 1) & 1 == 1 {
++        curr[w - 1] = med3s(curr[w - 2], curr[w - 2], prev[w - 1]).wrapping_add(res[w - 1]);
++    }
++}
++
++/// ctx[j] = classify(|g[j]-g[j-1]| +sat |g[j]-g[j+1]|), bins at [1,4,16).
++#[target_feature(enable = "simd128")]
++pub unsafe fn ctx_row_v128(g: &[u8], out: &mut [u8]) {
++    let w = g.len();
++    let ad = |a: u8, b: u8| a.max(b) - a.min(b);
++    let cls = |s: u8| (s >= 1) as u8 + (s >= 4) as u8 + (s >= 16) as u8;
++    out[0] = cls(ad(g[0], g[1.min(w - 1)]));
++    out[w - 1] = cls(ad(g[w - 1], g[w - 2]));
++    let one = u8x16_splat(1);
++    let (t1, t4, t16) = (u8x16_splat(1), u8x16_splat(4), u8x16_splat(16));
++    let mut j = 1usize;
++    while j + 16 <= w - 1 {
++        let x = v128_load(g.as_ptr().add(j) as *const v128);
++        let xl = v128_load(g.as_ptr().add(j - 1) as *const v128);
++        let xr = v128_load(g.as_ptr().add(j + 1) as *const v128);
++        let d1 = i8x16_sub(u8x16_max(x, xl), u8x16_min(x, xl)); // exact |diff| (max>=min)
++        let d2 = i8x16_sub(u8x16_max(x, xr), u8x16_min(x, xr));
++        let s = u8x16_add_sat(d1, d2); // unsigned saturating
++        // unsigned s >= t  <=>  max(s,t) == s
++        let ge1 = u8x16_eq(u8x16_max(s, t1), s);
++        let ge4 = u8x16_eq(u8x16_max(s, t4), s);
++        let ge16 = u8x16_eq(u8x16_max(s, t16), s);
++        let c = i8x16_add(
++            i8x16_add(v128_and(ge1, one), v128_and(ge4, one)),
++            v128_and(ge16, one),
++        );
++        v128_store(out.as_mut_ptr().add(j) as *mut v128, c);
++        j += 16;
++    }
++    while j < w - 1 {
++        let s = ad(g[j], g[j - 1]).saturating_add(ad(g[j], g[j + 1]));
++        out[j] = cls(s);
++        j += 1;
++    }
++}
++
++/// Count even/odd occurrences of ctx values {0,1,2,3} in a row → per[phase][ctx] (encode presize).
++/// v128 has no SAD, so we bitmask the equality (16-bit, one bit per lane) and popcount the even bits
++/// (0x5555) and odd bits (0xAAAA). `j` steps by 16 (even) so block-lane parity == absolute parity.
++#[target_feature(enable = "simd128")]
++pub unsafe fn count_ctx_row_per_v128(row: &[u8], per: &mut [[usize; 4]; 2]) {
++    let w = row.len();
++    let (k0, k1, k2, k3) = (u8x16_splat(0), u8x16_splat(1), u8x16_splat(2), u8x16_splat(3));
++    let mut j = 0usize;
++    while j + 16 <= w {
++        let v = v128_load(row.as_ptr().add(j) as *const v128);
++        for (k, kv) in [k0, k1, k2, k3].iter().enumerate() {
++            let bm = u8x16_bitmask(u8x16_eq(v, *kv)); // bit lane set where row[j+lane]==k
++            per[0][k] += (bm & 0x5555).count_ones() as usize; // even lanes = even abs positions
++            per[1][k] += (bm & 0xAAAA).count_ones() as usize; // odd lanes
++        }
++        j += 16;
++    }
++    while j < w {
++        per[j & 1][row[j] as usize] += 1;
++        j += 1;
++    }
++}
++
++/// Forward predictor residuals (encode side). Mirror of `avx2::residual_rows`, 16 bytes/iter.
++///   res_e[j] = cur[j] - med3(prev[j], prev[j-1], prev[j+1])
++///   res_o[j] = cur[j] - med3(cur[j-1], cur[j+1], prev[j])
++/// Both computed for all j; caller uses res_e at even j, res_o at odd j.
++#[target_feature(enable = "simd128")]
++pub unsafe fn residual_rows_v128(cur: &[u8], prev: &[u8], res_e: &mut [u8], res_o: &mut [u8]) {
++    let w = cur.len();
++    // edges scalar (match band.rs clamping)
++    res_e[0] = cur[0].wrapping_sub(med3s(prev[0], prev[0], prev[1.min(w - 1)]));
++    res_o[0] = cur[0].wrapping_sub(med3s(cur[0], cur[1.min(w - 1)], prev[0]));
++    res_e[w - 1] = cur[w - 1].wrapping_sub(med3s(prev[w - 1], prev[w - 2], prev[w - 1]));
++    res_o[w - 1] = cur[w - 1].wrapping_sub(med3s(cur[w - 2], cur[w - 2], prev[w - 1]));
++    let mut j = 1usize;
++    while j + 16 <= w - 1 {
++        let p = v128_load(prev.as_ptr().add(j) as *const v128);
++        let pl = v128_load(prev.as_ptr().add(j - 1) as *const v128);
++        let pr = v128_load(prev.as_ptr().add(j + 1) as *const v128);
++        let c = v128_load(cur.as_ptr().add(j) as *const v128);
++        let cl = v128_load(cur.as_ptr().add(j - 1) as *const v128);
++        let cr = v128_load(cur.as_ptr().add(j + 1) as *const v128);
++        v128_store(res_e.as_mut_ptr().add(j) as *mut v128, i8x16_sub(c, med3_v(p, pl, pr)));
++        v128_store(res_o.as_mut_ptr().add(j) as *mut v128, i8x16_sub(c, med3_v(cl, cr, p)));
++        j += 16;
++    }
++    while j < w - 1 {
++        res_e[j] = cur[j].wrapping_sub(med3s(prev[j], prev[j - 1], prev[j + 1]));
++        res_o[j] = cur[j].wrapping_sub(med3s(cur[j - 1], cur[j + 1], prev[j]));
++        j += 1;
++    }
++}
++
++/// RGB24 → R/G/B planes with fused RCT forward (subtract G from R,B when rct). Mirror of
++/// `avx2::deinterleave3`, 16 px/iter via swizzle. Inverse of `interleave3_v128`.
++#[target_feature(enable = "simd128")]
++pub unsafe fn deinterleave3_v128(rgb: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8], rct: bool) {
++    let n = r.len();
++    const X: u8 = 0xFF; // swizzle: index >= 16 → 0
++    let ma_r = u8x16(0, 3, 6, 9, 12, 15, X, X, X, X, X, X, X, X, X, X);
++    let mb_r = u8x16(X, X, X, X, X, X, 2, 5, 8, 11, 14, X, X, X, X, X);
++    let mc_r = u8x16(X, X, X, X, X, X, X, X, X, X, X, 1, 4, 7, 10, 13);
++    let ma_g = u8x16(1, 4, 7, 10, 13, X, X, X, X, X, X, X, X, X, X, X);
++    let mb_g = u8x16(X, X, X, X, X, 0, 3, 6, 9, 12, 15, X, X, X, X, X);
++    let mc_g = u8x16(X, X, X, X, X, X, X, X, X, X, X, 2, 5, 8, 11, 14);
++    let ma_b = u8x16(2, 5, 8, 11, 14, X, X, X, X, X, X, X, X, X, X, X);
++    let mb_b = u8x16(X, X, X, X, X, 1, 4, 7, 10, 13, X, X, X, X, X, X);
++    let mc_b = u8x16(X, X, X, X, X, X, X, X, X, X, 0, 3, 6, 9, 12, 15);
++    let mut i = 0usize;
++    while i + 16 <= n {
++        let a = v128_load(rgb.as_ptr().add(i * 3) as *const v128);
++        let bb = v128_load(rgb.as_ptr().add(i * 3 + 16) as *const v128);
++        let c = v128_load(rgb.as_ptr().add(i * 3 + 32) as *const v128);
++        let mut rv = v128_or(v128_or(i8x16_swizzle(a, ma_r), i8x16_swizzle(bb, mb_r)), i8x16_swizzle(c, mc_r));
++        let gv = v128_or(v128_or(i8x16_swizzle(a, ma_g), i8x16_swizzle(bb, mb_g)), i8x16_swizzle(c, mc_g));
++        let mut bv = v128_or(v128_or(i8x16_swizzle(a, ma_b), i8x16_swizzle(bb, mb_b)), i8x16_swizzle(c, mc_b));
++        if rct {
++            rv = i8x16_sub(rv, gv);
++            bv = i8x16_sub(bv, gv);
++        }
++        v128_store(r.as_mut_ptr().add(i) as *mut v128, rv);
++        v128_store(g.as_mut_ptr().add(i) as *mut v128, gv);
++        v128_store(b.as_mut_ptr().add(i) as *mut v128, bv);
++        i += 16;
++    }
++    while i < n {
++        let gi = rgb[i * 3 + 1];
++        r[i] = if rct { rgb[i * 3].wrapping_sub(gi) } else { rgb[i * 3] };
++        g[i] = gi;
++        b[i] = if rct { rgb[i * 3 + 2].wrapping_sub(gi) } else { rgb[i * 3 + 2] };
++        i += 1;
++    }
++}
++
++/// Planar → RGB24 with fused RCT inverse (add G back to R,B when rct). 16 px / iteration via swizzle.
++#[target_feature(enable = "simd128")]
++pub unsafe fn interleave3_v128(r: &[u8], g: &[u8], b: &[u8], rgb: &mut [u8], rct: bool) {
++    let n = r.len();
++    const X: u8 = 0xFF; // swizzle: index >= 16 → 0
++    let ra = u8x16(0, X, X, 1, X, X, 2, X, X, 3, X, X, 4, X, X, 5);
++    let ga = u8x16(X, 0, X, X, 1, X, X, 2, X, X, 3, X, X, 4, X, X);
++    let ba = u8x16(X, X, 0, X, X, 1, X, X, 2, X, X, 3, X, X, 4, X);
++    let rb = u8x16(X, X, 6, X, X, 7, X, X, 8, X, X, 9, X, X, 10, X);
++    let gb = u8x16(5, X, X, 6, X, X, 7, X, X, 8, X, X, 9, X, X, 10);
++    let bb = u8x16(X, 5, X, X, 6, X, X, 7, X, X, 8, X, X, 9, X, X);
++    let rc = u8x16(X, 11, X, X, 12, X, X, 13, X, X, 14, X, X, 15, X, X);
++    let gc = u8x16(X, X, 11, X, X, 12, X, X, 13, X, X, 14, X, X, 15, X);
++    let bc = u8x16(10, X, X, 11, X, X, 12, X, X, 13, X, X, 14, X, X, 15);
++    let mut i = 0usize;
++    while i + 16 <= n {
++        let mut rv = v128_load(r.as_ptr().add(i) as *const v128);
++        let gv = v128_load(g.as_ptr().add(i) as *const v128);
++        let mut bv = v128_load(b.as_ptr().add(i) as *const v128);
++        if rct {
++            rv = i8x16_add(rv, gv);
++            bv = i8x16_add(bv, gv);
++        }
++        let a = v128_or(v128_or(i8x16_swizzle(rv, ra), i8x16_swizzle(gv, ga)), i8x16_swizzle(bv, ba));
++        let bo = v128_or(v128_or(i8x16_swizzle(rv, rb), i8x16_swizzle(gv, gb)), i8x16_swizzle(bv, bb));
++        let co = v128_or(v128_or(i8x16_swizzle(rv, rc), i8x16_swizzle(gv, gc)), i8x16_swizzle(bv, bc));
++        v128_store(rgb.as_mut_ptr().add(i * 3) as *mut v128, a);
++        v128_store(rgb.as_mut_ptr().add(i * 3 + 16) as *mut v128, bo);
++        v128_store(rgb.as_mut_ptr().add(i * 3 + 32) as *mut v128, co);
++        i += 16;
++    }
++    while i < n {
++        let gi = g[i];
++        rgb[i * 3] = if rct { r[i].wrapping_add(gi) } else { r[i] };
++        rgb[i * 3 + 1] = gi;
++        rgb[i * 3 + 2] = if rct { b[i].wrapping_add(gi) } else { b[i] };
++        i += 1;
++    }
++}
+diff --git a/bliss-core/src/lib.rs b/bliss-core/src/lib.rs
+index 42cdc92..1449bee 100644
+--- a/bliss-core/src/lib.rs
++++ b/bliss-core/src/lib.rs
+@@ -13,6 +13,10 @@
+ pub mod rans;
+ #[cfg(target_arch = "x86_64")]
+ pub mod rans_avx2;
++#[cfg(target_arch = "wasm32")]
++pub mod rans_wasm;
++#[cfg(target_arch = "wasm32")]
++pub(crate) mod band_wasm;
+ #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+ pub(crate) mod rans_avx512;
+ #[cfg(target_arch = "x86_64")]
+diff --git a/bliss-core/src/rans_wasm.rs b/bliss-core/src/rans_wasm.rs
+new file mode 100644
+index 0000000..bf2342d
+--- /dev/null
++++ b/bliss-core/src/rans_wasm.rs
+@@ -0,0 +1,281 @@
++//! WASM `v128` (128-bit SIMD) rANS decode — the browser sibling of `rans_avx2`.
++//! 16-lane stream, 4×`v128` (4 u32 lanes each), bit-identical to the scalar decoder in `rans.rs`
++//! (asserted by roundtrip tests). Same packed LUT [sym:8 | freq-1:12 | start:12] per 12-bit slot.
++//!
++//! WASM SIMD has no gather → `plut[c]` is emulated per lane (extract → scalar L1 load → build).
++//! Renorm reads are sequential/lane-ascending (must match `rans::decode_lanes` word order exactly),
++//! so they run as a scalar per-lane pass over the ≤16 active lanes — simple and provably correct.
++//! Decode uses only 32-bit math (`i32x4_mul` low 32 = exact). The ENCODER (`encode16l_v128`, below)
++//! also lives here: its Lemire division uses the widening 32×32→64 multiply (`u64x2_extmul_*`).
++#![allow(unsafe_op_in_unsafe_fn)]
++use crate::rans::{Table, PROB_BITS};
++use core::arch::wasm32::*;
++
++const RANS_L: u32 = 1 << 16;
++
++/// Packed LUT: one u32 per 12-bit slot = [sym:8 | (freq-1):12 | start:12]. Same layout as
++/// `rans_avx2::packed_lut` (that one is x86-gated; this is the wasm-visible copy).
++pub fn packed_lut(t: &Table) -> Vec<u32> {
++    let mut lut = vec![0u32; 1 << PROB_BITS];
++    for s in 0..256 {
++        let f = t.freq[s] as u32;
++        if f == 0 {
++            continue;
++        }
++        let v = ((s as u32) << 24) | ((f - 1) << 12) | t.start[s];
++        for slot in t.start[s]..t.start[s + 1] {
++            lut[slot as usize] = v;
++        }
++    }
++    lut
++}
++
++// ================= 16-lane rANS ENCODE (v128) — mirror of rans_avx2::encode16l =================
++// The encoder walks symbols in reverse (lanes descending within a step); one global reversal makes
++// the decoder read forward. Lemire division q = (x*M)>>64 uses the widening 32×32→64 multiply
++// (`u64x2_extmul_*`), 2 lanes at a time. Bit-identical to `rans::encode_lanes(sym, t, 16)`.
++
++/// SoA encode tables: fs_st = [freq:16 | start:16]; mlo/mhi = the two halves of M = ⌊2^64/f⌋+1 (0 if f≤1).
++#[derive(Clone)]
++pub struct EncTables {
++    pub fs_st: Vec<u32>,
++    pub mlo: Vec<u32>,
++    pub mhi: Vec<u32>,
++}
++
++pub fn enc_tables(t: &Table) -> EncTables {
++    let mut fs_st = vec![0u32; 256];
++    let mut mlo = vec![0u32; 256];
++    let mut mhi = vec![0u32; 256];
++    for s in 0..256 {
++        let f = t.freq[s] as u32;
++        fs_st[s] = (f << 16) | t.start[s];
++        let m: u64 = if f <= 1 { 0 } else { (u64::MAX / f as u64) + 1 };
++        mlo[s] = m as u32;
++        mhi[s] = (m >> 32) as u32;
++    }
++    EncTables { fs_st, mlo, mhi }
++}
++
++#[inline]
++unsafe fn scalar_step_enc(s: u8, x: &mut u32, t: &Table, outp: *mut u16, opos: &mut usize) {
++    let si = s as usize;
++    let fs = t.freq[si] as u32;
++    if *x >= (fs << 20) {
++        *outp.add(*opos) = (*x & 0xFFFF) as u16;
++        *opos += 1;
++        *x >>= 16;
++    }
++    let m: u64 = if fs <= 1 { 0 } else { (u64::MAX / fs as u64) + 1 };
++    let q = if m == 0 { *x } else { ((*x as u128 * m as u128) >> 64) as u32 };
++    let r = *x - q * fs;
++    *x = (q << PROB_BITS) + r + t.start[si];
++}
++
++/// q = ⌊x·M / 2^64⌋ for 4 u32 lanes, M per-lane u64 (mhi:mlo). Uses `extmul` (32×32→64), 2 lanes/op.
++#[inline]
++#[target_feature(enable = "simd128")]
++unsafe fn lemire_q_v128(x: v128, mlo: v128, mhi: v128) -> v128 {
++    // lanes 0,1 via extmul_low ; lanes 2,3 via extmul_high
++    let hi1_lo = u64x2_shr(u64x2_extmul_low_u32x4(x, mlo), 32);
++    let hi1_hi = u64x2_shr(u64x2_extmul_high_u32x4(x, mlo), 32);
++    let sum_lo = i64x2_add(hi1_lo, u64x2_extmul_low_u32x4(x, mhi));
++    let sum_hi = i64x2_add(hi1_hi, u64x2_extmul_high_u32x4(x, mhi));
++    let q_lo = u64x2_shr(sum_lo, 32); // q0 in low32 of lane0, q1 in low32 of lane1
++    let q_hi = u64x2_shr(sum_hi, 32); // q2, q3
++    // pack low32 of each i64 lane → u32x4 [q0,q1,q2,q3]
++    i8x16_shuffle::<0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27>(q_lo, q_hi)
++}
++
++/// Encode into a 16-lane stream; bit-identical to `rans::encode_lanes(sym, t, 16)`.
++#[target_feature(enable = "simd128")]
++pub unsafe fn encode16l_v128(sym: &[u8], t: &Table, et: &EncTables) -> Vec<u16> {
++    let n = sym.len();
++    let mut x = [RANS_L; 16];
++    let mut out: Vec<u16> = Vec::with_capacity(n + 2 * 16 + 64);
++    let outp = out.as_mut_ptr();
++    let mut opos = 0usize;
++    let steps = n.div_ceil(16);
++    // first (possibly partial) reverse step scalar — matches encode16l
++    let mut first_full = steps;
++    if steps * 16 != n || steps == 0 {
++        first_full = steps.saturating_sub(1);
++        if steps > 0 {
++            let step = steps - 1;
++            for j in (0..16).rev() {
++                let idx = step * 16 + j;
++                if idx >= n {
++                    continue;
++                }
++                scalar_step_enc(sym[idx], &mut x[j], t, outp, &mut opos);
++            }
++        }
++    }
++    let mut xr = [
++        v128_load(x.as_ptr() as *const v128),
++        v128_load(x.as_ptr().add(4) as *const v128),
++        v128_load(x.as_ptr().add(8) as *const v128),
++        v128_load(x.as_ptr().add(12) as *const v128),
++    ];
++    let m16 = u32x4_splat(0xFFFF);
++    let one = u32x4_splat(1);
++    let (fsp, mlop, mhip, symp) = (et.fs_st.as_ptr(), et.mlo.as_ptr(), et.mhi.as_ptr(), sym.as_ptr());
++
++    for step in (0..first_full).rev() {
++        let mut freq = [u32x4_splat(0); 4];
++        let mut start = [u32x4_splat(0); 4];
++        let mut mlo = [u32x4_splat(0); 4];
++        let mut mhi = [u32x4_splat(0); 4];
++        let mut ge = [u32x4_splat(0); 4];
++        for r in 0..4 {
++            let base = step * 16 + r * 4;
++            let s0 = *symp.add(base) as usize;
++            let s1 = *symp.add(base + 1) as usize;
++            let s2 = *symp.add(base + 2) as usize;
++            let s3 = *symp.add(base + 3) as usize;
++            let fs = u32x4(*fsp.add(s0), *fsp.add(s1), *fsp.add(s2), *fsp.add(s3));
++            let f = u32x4_shr(fs, 16);
++            freq[r] = f;
++            start[r] = v128_and(fs, m16);
++            mlo[r] = u32x4(*mlop.add(s0), *mlop.add(s1), *mlop.add(s2), *mlop.add(s3));
++            mhi[r] = u32x4(*mhip.add(s0), *mhip.add(s1), *mhip.add(s2), *mhip.add(s3));
++            // renorm needed: unsigned x >= xmax, xmax = freq << 20
++            ge[r] = u32x4_ge(xr[r], u32x4_shl(f, 20));
++        }
++        // emit low16 of masked lanes, DESC lane order: lanes 15..0 = reg3, reg2, reg1, reg0
++        for r in (0..4).rev() {
++            let m = u32x4_bitmask(ge[r]);
++            if m != 0 {
++                let xv = xr[r];
++                let l = [
++                    u32x4_extract_lane::<0>(xv),
++                    u32x4_extract_lane::<1>(xv),
++                    u32x4_extract_lane::<2>(xv),
++                    u32x4_extract_lane::<3>(xv),
++                ];
++                for lane in (0..4).rev() {
++                    if (m >> lane) & 1 != 0 {
++                        *outp.add(opos) = (l[lane] & 0xFFFF) as u16;
++                        opos += 1;
++                    }
++                }
++                xr[r] = v128_bitselect(u32x4_shr(xv, 16), xv, ge[r]); // shift masked lanes
++            }
++        }
++        // Lemire update all regs: q=(x*M)>>64 (q=x when freq==1); x = (q<<12) + (x - q*freq) + start
++        for r in 0..4 {
++            let q0 = lemire_q_v128(xr[r], mlo[r], mhi[r]);
++            let q = v128_bitselect(xr[r], q0, u32x4_eq(freq[r], one));
++            let rr = u32x4_sub(xr[r], i32x4_mul(q, freq[r]));
++            xr[r] = u32x4_add(u32x4_add(u32x4_shl(q, PROB_BITS), rr), start[r]);
++        }
++    }
++    v128_store(x.as_mut_ptr() as *mut v128, xr[0]);
++    v128_store(x.as_mut_ptr().add(4) as *mut v128, xr[1]);
++    v128_store(x.as_mut_ptr().add(8) as *mut v128, xr[2]);
++    v128_store(x.as_mut_ptr().add(12) as *mut v128, xr[3]);
++    for j in (0..16).rev() {
++        *outp.add(opos) = (x[j] & 0xFFFF) as u16;
++        *outp.add(opos + 1) = (x[j] >> 16) as u16;
++        opos += 2;
++    }
++    out.set_len(opos);
++    out.reverse();
++    out
++}
++
++/// Decode `n` symbols from a 16-lane stream. `words` must have >= 16 u16 of readable padding at the
++/// end (renorm look-ahead). Bit-identical to `rans::decode_lanes(words, n, t, lut, 16)`.
++#[target_feature(enable = "simd128")]
++pub unsafe fn decode16l_v128(words: &[u16], n: usize, plut: &[u32], out: &mut [u8]) {
++    let mut pos = 0usize;
++    let mut x = [0u32; 16];
++    for lane in &mut x {
++        *lane = ((words[pos] as u32) << 16) | words[pos + 1] as u32;
++        pos += 2;
++    }
++    let full_steps = n / 16;
++    let mut xr = [
++        v128_load(x.as_ptr() as *const v128),
++        v128_load(x.as_ptr().add(4) as *const v128),
++        v128_load(x.as_ptr().add(8) as *const v128),
++        v128_load(x.as_ptr().add(12) as *const v128),
++    ];
++    let mask12 = u32x4_splat(0xFFF);
++    let one = u32x4_splat(1);
++    let plutp = plut.as_ptr();
++    let outp = out.as_mut_ptr();
++
++    for step in 0..full_steps {
++        for r in 0..4 {
++            let xv = xr[r];
++            let c = v128_and(xv, mask12);
++            // emulate gather plut[c] for the 4 lanes (LUT is 16 KB, L1-resident)
++            let c0 = u32x4_extract_lane::<0>(c) as usize;
++            let c1 = u32x4_extract_lane::<1>(c) as usize;
++            let c2 = u32x4_extract_lane::<2>(c) as usize;
++            let c3 = u32x4_extract_lane::<3>(c) as usize;
++            let lv = u32x4(
++                *plutp.add(c0),
++                *plutp.add(c1),
++                *plutp.add(c2),
++                *plutp.add(c3),
++            );
++            // symbols = lv >> 24, one byte per lane
++            let base = step * 16 + r * 4;
++            *outp.add(base) = (u32x4_extract_lane::<0>(lv) >> 24) as u8;
++            *outp.add(base + 1) = (u32x4_extract_lane::<1>(lv) >> 24) as u8;
++            *outp.add(base + 2) = (u32x4_extract_lane::<2>(lv) >> 24) as u8;
++            *outp.add(base + 3) = (u32x4_extract_lane::<3>(lv) >> 24) as u8;
++            // x = freq*(x>>12) + c - start ; freq = ((lv>>12)&0xFFF)+1 ; start = lv&0xFFF
++            let freq = u32x4_add(v128_and(u32x4_shr(lv, 12), mask12), one);
++            let start = v128_and(lv, mask12);
++            let xq = u32x4_shr(xv, PROB_BITS);
++            xr[r] = u32x4_sub(u32x4_add(i32x4_mul(freq, xq), c), start);
++        }
++        // renorm: lane-ascending (matches scalar word order). Register-resident — extract/merge/
++        // replace only the lanes that fire, no per-step memory round-trip. Skip regs with no active
++        // lane via the i32x4 need-mask (bitmask).
++        macro_rules! renorm_reg {
++            ($r:expr) => {{
++                let xv = xr[$r];
++                // need = (x >> 16) == 0  (unsigned x < 2^16)
++                let need = u32x4_eq(u32x4_shr(xv, 16), u32x4_splat(0));
++                if u32x4_bitmask(need) != 0 {
++                    let mut l0 = u32x4_extract_lane::<0>(xv);
++                    let mut l1 = u32x4_extract_lane::<1>(xv);
++                    let mut l2 = u32x4_extract_lane::<2>(xv);
++                    let mut l3 = u32x4_extract_lane::<3>(xv);
++                    if l0 < RANS_L { l0 = (l0 << 16) | words[pos] as u32; pos += 1; }
++                    if l1 < RANS_L { l1 = (l1 << 16) | words[pos] as u32; pos += 1; }
++                    if l2 < RANS_L { l2 = (l2 << 16) | words[pos] as u32; pos += 1; }
++                    if l3 < RANS_L { l3 = (l3 << 16) | words[pos] as u32; pos += 1; }
++                    xr[$r] = u32x4(l0, l1, l2, l3);
++                }
++            }};
++        }
++        renorm_reg!(0);
++        renorm_reg!(1);
++        renorm_reg!(2);
++        renorm_reg!(3);
++    }
++
++    // recover scalar state for the tail
++    v128_store(x.as_mut_ptr() as *mut v128, xr[0]);
++    v128_store(x.as_mut_ptr().add(4) as *mut v128, xr[1]);
++    v128_store(x.as_mut_ptr().add(8) as *mut v128, xr[2]);
++    v128_store(x.as_mut_ptr().add(12) as *mut v128, xr[3]);
++    for idx in full_steps * 16..n {
++        let j = idx % 16;
++        let c = x[j] & ((1 << PROB_BITS) - 1);
++        let v = plut[c as usize];
++        out[idx] = (v >> 24) as u8;
++        let f = ((v >> 12) & 0xFFF) + 1;
++        let st = v & 0xFFF;
++        x[j] = f * (x[j] >> PROB_BITS) + c - st;
++        if x[j] < RANS_L {
++            x[j] = (x[j] << 16) | words[pos] as u32;
++            pos += 1;
++        }
++    }
++}

@@ -1,0 +1,89 @@
+{
+  "note": "BLISS in-browser ENCODE, one grounded run: scalar / v128 / mt8. Real Gobabeb pixels, headless Chromium, median of 15. Encode output byte-identical scalar==v128 (see enc-compare.mjs).",
+  "measuredAt": "2026-07-22T09:26:44.106Z",
+  "corpus": "Gobabeb 10 (Olympus ORF)",
+  "cores": 8,
+  "reps": 15,
+  "encodeMps": {
+    "thumbnail512": {
+      "scalar": 13.3,
+      "v128": 25.4,
+      "mt8": 28.5,
+      "v128Speedup": 1.91,
+      "bands": 1
+    },
+    "lightbox1800": {
+      "scalar": 14.3,
+      "v128": 26.7,
+      "mt8": 74.1,
+      "v128Speedup": 1.87,
+      "mt8SpeedupVsV128": 2.78,
+      "totalSpeedupVsScalar": 5.18,
+      "bands": 5
+    },
+    "large3400": {
+      "scalar": 14.4,
+      "v128": 26.6,
+      "mt8": 105.3,
+      "v128Speedup": 1.85,
+      "mt8SpeedupVsV128": 3.96,
+      "totalSpeedupVsScalar": 7.31,
+      "bands": 8
+    }
+  },
+  "lightboxMs": {
+    "scalar": 169.02,
+    "v128": 90.67,
+    "mt8": 32.66
+  },
+  "perImage": {
+    "thumbnail": {
+      "mp": 0.2,
+      "bands": 1,
+      "scalar": {
+        "mps": 13.3,
+        "medMs": 14.75
+      },
+      "v128": {
+        "mps": 25.4,
+        "medMs": 7.7
+      },
+      "mt8": {
+        "mps": 28.5,
+        "medMs": 6.87
+      }
+    },
+    "lightbox": {
+      "mp": 2.42,
+      "bands": 5,
+      "scalar": {
+        "mps": 14.3,
+        "medMs": 169.02
+      },
+      "v128": {
+        "mps": 26.7,
+        "medMs": 90.67
+      },
+      "mt8": {
+        "mps": 74.1,
+        "medMs": 32.66
+      }
+    },
+    "large": {
+      "mp": 8.63,
+      "bands": 8,
+      "scalar": {
+        "mps": 14.4,
+        "medMs": 598.9
+      },
+      "v128": {
+        "mps": 26.6,
+        "medMs": 323.97
+      },
+      "mt8": {
+        "mps": 105.3,
+        "medMs": 81.95
+      }
+    }
+  }
+}
