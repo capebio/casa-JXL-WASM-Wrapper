@@ -1,0 +1,95 @@
+{
+  "note": "BLISS in-browser decode, one grounded run: scalar / v128 (wasm SIMD, 1 thread) / mt8 (v128 + rayon threads). Identical real-Gobabeb .bliss decoded by all three; output bit-identical. Headless Chromium, COOP/COEP, median of 15.",
+  "measuredAt": "2026-07-22T08:36:20.598Z",
+  "corpus": "Gobabeb 10 (Olympus ORF)",
+  "cores": 8,
+  "reps": 15,
+  "substrate": {
+    "scalar": "WASM, no SIMD",
+    "v128": "WASM SIMD, 1 thread",
+    "mt8": "WASM SIMD + 8 rayon threads (SharedArrayBuffer)"
+  },
+  "decodeMps": {
+    "thumbnail512": {
+      "scalar": 23.8,
+      "v128": 45.3,
+      "mt8": 52,
+      "v128Speedup": 1.9,
+      "bands": 1
+    },
+    "lightbox1800": {
+      "scalar": 25.1,
+      "v128": 45.3,
+      "mt8": 176.3,
+      "v128Speedup": 1.8,
+      "mt8SpeedupVsV128": 3.89,
+      "totalSpeedupVsScalar": 7.02,
+      "bands": 5
+    },
+    "large3400": {
+      "scalar": 25.4,
+      "v128": 46.1,
+      "mt8": 190.7,
+      "v128Speedup": 1.81,
+      "mt8SpeedupVsV128": 4.14,
+      "totalSpeedupVsScalar": 7.51,
+      "bands": 8
+    }
+  },
+  "coldOpenLightboxMs": {
+    "scalar": 96.25,
+    "v128": 53.37,
+    "mt8": 13.73
+  },
+  "parity": "bit-identical decode across scalar / v128 / mt8",
+  "perImage": {
+    "thumbnail": {
+      "mp": 0.2,
+      "bands": 1,
+      "scalar": {
+        "mps": 23.8,
+        "medMs": 8.39
+      },
+      "v128": {
+        "mps": 45.3,
+        "medMs": 4.41
+      },
+      "mt8": {
+        "mps": 52,
+        "medMs": 3.84
+      }
+    },
+    "lightbox": {
+      "mp": 2.42,
+      "bands": 5,
+      "scalar": {
+        "mps": 25.1,
+        "medMs": 96.25
+      },
+      "v128": {
+        "mps": 45.3,
+        "medMs": 53.37
+      },
+      "mt8": {
+        "mps": 176.3,
+        "medMs": 13.73
+      }
+    },
+    "large": {
+      "mp": 8.63,
+      "bands": 8,
+      "scalar": {
+        "mps": 25.4,
+        "medMs": 339.9
+      },
+      "v128": {
+        "mps": 46.1,
+        "medMs": 187.31
+      },
+      "mt8": {
+        "mps": 190.7,
+        "medMs": 45.25
+      }
+    }
+  }
+}
