@@ -1606,13 +1606,32 @@ function _blissCacheName(assetId) {
     return assetId.split(':')[0];
 }
 
+// CRC32 (IEEE) for cache integrity. A corrupt OPFS entry (bit-rot / partial write) fed to the WASM
+// decoder can trap it (panic=abort → buffer leak); verifying a checksum before decode means only
+// intact bytes ever reach the codec. Cached format: [crc32 payload, 4 bytes LE][bliss payload].
+const _crc32Table = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+    return t;
+})();
+function _crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) c = _crc32Table[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
 async function blissOpfsWrite(assetId, bytes) {
     await _blissOpfsInit;
     if (!_blissOpfsDir) return;
     try {
+        const payload = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+        const crc = _crc32(payload);
+        const framed = new Uint8Array(4 + payload.length);
+        framed[0] = crc & 0xFF; framed[1] = (crc >>> 8) & 0xFF; framed[2] = (crc >>> 16) & 0xFF; framed[3] = (crc >>> 24) & 0xFF;
+        framed.set(payload, 4);
         const fh = await _blissOpfsDir.getFileHandle(_blissCacheName(assetId), { create: true });
         const wr = await fh.createWritable();
-        await wr.write(bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+        await wr.write(framed);
         await wr.close();
     } catch { /* non-fatal */ }
 }
@@ -1623,8 +1642,16 @@ async function blissOpfsRead(assetId) {
     try {
         const fh = await _blissOpfsDir.getFileHandle(_blissCacheName(assetId));
         const file = await fh.getFile();
-        if (file.size === 0) return null;
-        return new Uint8Array(await file.arrayBuffer());
+        if (file.size <= 4) return null;
+        const framed = new Uint8Array(await file.arrayBuffer());
+        const stored = (framed[0] | (framed[1] << 8) | (framed[2] << 16) | (framed[3] << 24)) >>> 0;
+        const payload = framed.slice(4); // own buffer — safe to transfer to the decode worker
+        if (_crc32(payload) !== stored) {
+            // corrupt (bit-rot / partial write) or pre-CRC legacy cache → drop it and miss → RAW fallback re-caches
+            _blissOpfsDir.removeEntry(_blissCacheName(assetId)).catch(() => undefined);
+            return null;
+        }
+        return payload;
     } catch { return null; } // NotFoundError = cache miss
 }
 
