@@ -152,9 +152,11 @@ with fuzzed corruption:
   residuals. Each is **caught by the app** (`bliss-worker.js` try/catch → falls back to re-decoding the
   RAW) and the wasm instance **recovers** (verified: good decodes work after a trap). The only cost is
   a per-trap buffer leak, now 70% rarer.
-- **Complete fix (recommended follow-up, app-level):** store a CRC/hash beside each cached `.bliss` and
-  verify on read — feed the decoder only bytes that pass, eliminating the trap path entirely. A cache is
-  the right place for an integrity check.
+- **Complete fix (DONE, app-level):** the OPFS BLISS cache now frames each entry as `[crc32:4 LE][payload]`
+  (`web/main.js` `blissOpfsWrite`/`blissOpfsRead`). On read the CRC is verified; a mismatch drops the entry
+  and returns a cache miss, so the RAW pipeline re-decodes and re-caches. Corrupt (or legacy pre-CRC) bytes
+  never reach the codec → the trap path is eliminated at the source. Verified: 1000/1000 fuzzed corruptions
+  rejected, legacy entries transparently re-cached.
 
 ## Verify / bench harnesses (in `bliss-wasm-sandbox/`)
 - `enc-compare.mjs` — byte-identity (scalar==v128) + Node speed check.
