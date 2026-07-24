@@ -240,9 +240,16 @@ mod tests {
 
     #[test]
     fn selector_accepts_laplace_and_rejects_uniform() {
-        let skew: Vec<u8> = (0..100_000).map(|i| ((i * 17) % 13) as u8).collect();
+        let skew: Vec<u8> = (0..10_000).map(|i| ((i * 17) % 13) as u8).collect();
+        let oversized_mismatch: Vec<u8> =
+            (0..100_000).map(|i| ((i * 17) % 13) as u8).collect();
         let uniform: Vec<u8> = (0..65_536).map(|i| i as u8).collect();
         assert!(choose(CodebookKind::Zigzag, &Table::build(&skew), skew.len()).is_some());
+        assert!(choose(
+            CodebookKind::Zigzag,
+            &Table::build(&oversized_mismatch),
+            oversized_mismatch.len(),
+        ).is_none());
         assert!(choose(CodebookKind::Wrapped, &Table::build(&uniform), uniform.len()).is_none());
     }
 }
@@ -291,7 +298,7 @@ pub fn table(kind: CodebookKind, id: u8) -> Option<&'static Table> {
 }
 ```
 
-`choose` computes ideal and candidate cross-entropy from `optimal.freq`; it returns a codebook only when estimated saving is at least 64 bytes and at least 1% of estimated explicit-table stream size.
+`choose` computes ideal and candidate cross-entropy from `optimal.freq`, scales the entropy delta by `symbols`, and estimates bytes saved as the 511-byte table-to-id overhead reduction minus that coding penalty. It returns a codebook only when estimated saving is at least 64 bytes and at least 1% of estimated explicit-table stream size. Never ignore `symbols`: the 100,000-symbol mismatch must reject even though its 10,000-symbol counterpart wins.
 
 - [ ] **Step 4: Export module and verify GREEN**
 
