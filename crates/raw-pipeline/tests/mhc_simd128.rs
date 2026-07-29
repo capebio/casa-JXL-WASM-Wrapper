@@ -21,7 +21,37 @@
 //! edge-row/scalar handoff and the height<5 fallback; full 16-bit values to stress the signed
 //! negative-intermediate clamps; and small images.
 
-use raw_pipeline::demosaic;
+use raw_pipeline::demosaic::{self, MhcGains};
+
+/// Gain sets every parity assertion is repeated over. `UNITY` pins the historical
+/// arithmetic; the WB-derived set is what the ORF/DNG paths actually ship; the extreme
+/// set sits at the clamp bounds and, combined with `full_range` fills, stresses the
+/// widest `gain × laplacian` product the i32 accumulator ever sees.
+const GAIN_CASES: [(&str, MhcGains); 3] = [
+    ("unity", MhcGains::UNITY),
+    (
+        "olympus-wb",
+        MhcGains {
+            g_at_r: 484,
+            g_at_b: 482,
+            r_at_g: 135,
+            b_at_g: 136,
+            r_at_b: 135,
+            b_at_r: 136,
+        },
+    ),
+    (
+        "extreme",
+        MhcGains {
+            g_at_r: 1024,
+            g_at_b: 32,
+            r_at_g: 32,
+            b_at_g: 1024,
+            r_at_b: 1024,
+            b_at_r: 32,
+        },
+    ),
+];
 
 /// Deterministic LCG fill, seeded per (w,h) so cases don't share a stream.
 fn fill(w: usize, h: usize, seed: u32, full_range: bool) -> Vec<u16> {
@@ -63,38 +93,44 @@ fn simd128_ref_op_order_bit_identical_to_clamped_reference() {
         for full_range in [false, true] {
             let raw = fill(w, h, 0x5EED, full_range);
             for &phase in &[(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
-                // Build the expected buffer with the all-clamped scalar reference.
-                let refr = demosaic::demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
+                for (gname, gains) in GAIN_CASES {
+                    // Build the expected buffer with the all-clamped scalar reference.
+                    let refr =
+                        demosaic::demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, gains).unwrap();
 
-                // Now build a buffer where the interior rows' interior span is produced by the
-                // SIMD128 scalar mirror, and everything else by the shipped scalar path — exactly
-                // as the dispatch composes them. We reuse `demosaic_bayer_mhc` for the scalar
-                // baseline (borders/tails/edge rows), then overwrite the interior span of each
-                // interior row via the mirror and assert it did not change any byte.
-                let mut got = demosaic::demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
-                let (int_start, int_end) = if w >= 4 { (2usize, w - 2) } else { (w, w) };
-                if int_end > int_start {
-                    for row in 2..h.saturating_sub(2) {
-                        let base = row * w * 3;
-                        let out_row = &mut got[base..base + w * 3];
-                        let stop = demosaic::mhc_row_interior_simd128_ref(
-                            &raw,
-                            w,
-                            row,
-                            int_start,
-                            int_end,
-                            (phase.0 as usize, phase.1 as usize),
-                            out_row,
-                        );
-                        // The mirror must have consumed at least the first chunk when there is
-                        // room for one (>= 12-wide images have >= 8 interior cols).
-                        assert!(stop >= int_start, "w={w} h={h} row={row} produced no start");
+                    // Now build a buffer where the interior rows' interior span is produced by the
+                    // SIMD128 scalar mirror, and everything else by the shipped scalar path — exactly
+                    // as the dispatch composes them. We reuse `demosaic_bayer_mhc_gains` for the
+                    // scalar baseline (borders/tails/edge rows), then overwrite the interior span of
+                    // each interior row via the mirror and assert it did not change any byte.
+                    let mut got =
+                        demosaic::demosaic_bayer_mhc_gains(&raw, w, h, phase, gains).unwrap();
+                    let (int_start, int_end) = if w >= 4 { (2usize, w - 2) } else { (w, w) };
+                    if int_end > int_start {
+                        for row in 2..h.saturating_sub(2) {
+                            let base = row * w * 3;
+                            let out_row = &mut got[base..base + w * 3];
+                            let stop = demosaic::mhc_row_interior_simd128_ref(
+                                &raw,
+                                w,
+                                row,
+                                int_start,
+                                int_end,
+                                (phase.0 as usize, phase.1 as usize),
+                                gains,
+                                out_row,
+                            );
+                            // The mirror must have consumed at least the first chunk when there is
+                            // room for one (>= 12-wide images have >= 8 interior cols).
+                            assert!(stop >= int_start, "w={w} h={h} row={row} produced no start");
+                        }
                     }
+                    assert_eq!(
+                        got, refr,
+                        "SIMD128 mirror mismatch w={w} h={h} phase={phase:?} \
+                         full_range={full_range} gains={gname}"
+                    );
                 }
-                assert_eq!(
-                    got, refr,
-                    "SIMD128 mirror mismatch w={w} h={h} phase={phase:?} full_range={full_range}"
-                );
             }
         }
     }
@@ -127,12 +163,16 @@ fn simd_dispatch_bit_identical_to_clamped_reference() {
         for full_range in [false, true] {
             let raw = fill(w, h, 0xBEEF, full_range);
             for &phase in &[(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
-                let got = demosaic::demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
-                let refr = demosaic::demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
-                assert_eq!(
-                    got, refr,
-                    "dispatch mismatch w={w} h={h} phase={phase:?} full_range={full_range}"
-                );
+                for (gname, gains) in GAIN_CASES {
+                    let got = demosaic::demosaic_bayer_mhc_gains(&raw, w, h, phase, gains).unwrap();
+                    let refr =
+                        demosaic::demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, gains).unwrap();
+                    assert_eq!(
+                        got, refr,
+                        "dispatch mismatch w={w} h={h} phase={phase:?} \
+                         full_range={full_range} gains={gname}"
+                    );
+                }
             }
         }
     }
@@ -145,10 +185,14 @@ fn simd_dispatch_all_max_no_wrap() {
     for &(w, h) in &[(12usize, 5usize), (16, 8), (33, 11)] {
         let raw = vec![65535u16; w * h];
         for &phase in &[(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
-            let got = demosaic::demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
-            let refr = demosaic::demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
-            assert_eq!(got, refr, "all-max mismatch w={w} h={h} phase={phase:?}");
-            assert!(got.iter().all(|&v| v == 65535), "all-max must stay 65535");
+            for (gname, gains) in GAIN_CASES {
+                let got = demosaic::demosaic_bayer_mhc_gains(&raw, w, h, phase, gains).unwrap();
+                let refr =
+                    demosaic::demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, gains).unwrap();
+                assert_eq!(got, refr, "all-max mismatch w={w} h={h} phase={phase:?} gains={gname}");
+                // A flat field has a zero laplacian everywhere, so no gain can move it.
+                assert!(got.iter().all(|&v| v == 65535), "all-max must stay 65535 ({gname})");
+            }
         }
     }
 }

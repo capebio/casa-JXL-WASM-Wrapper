@@ -15,7 +15,7 @@
 
 use crate::cr2::Cr2RowSource;
 use crate::decompress::{OrfRowDecoder, RawRowSource};
-use crate::demosaic::demosaic_bayer_mhc_band;
+use crate::demosaic::demosaic_bayer_mhc_band_gains;
 use crate::dng::DngRowSource;
 use crate::pipeline::{self, PipelineParams};
 
@@ -198,7 +198,7 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                 // elements and derives the same local parity, so bytes are unchanged.
                 let a = (s0 - 2 - self.raw_first) * w;
                 let b = (s1 + 2 - self.raw_first) * w;
-                demosaic_bayer_mhc_band(
+                demosaic_bayer_mhc_band_gains(
                     &self.raw_win[a..b],
                     w,
                     ctx_h,
@@ -206,6 +206,11 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     self.phase,
                     0,
                     ns,
+                    crate::demosaic::MhcGains::from_wb(
+                        self.params.wb_r,
+                        self.params.wb_g,
+                        self.params.wb_b,
+                    ),
                     &mut self.rgb16,
                 )?;
             } else {
@@ -216,7 +221,7 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     let li = g - self.raw_first;
                     self.ctx[i * w..i * w + w].copy_from_slice(&self.raw_win[li * w..li * w + w]);
                 }
-                demosaic_bayer_mhc_band(
+                demosaic_bayer_mhc_band_gains(
                     &self.ctx,
                     w,
                     ctx_h,
@@ -224,6 +229,11 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     self.phase,
                     0,
                     ns,
+                    crate::demosaic::MhcGains::from_wb(
+                        self.params.wb_r,
+                        self.params.wb_g,
+                        self.params.wb_b,
+                    ),
                     &mut self.rgb16,
                 )?;
             }
@@ -290,7 +300,7 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                 // borrow it directly (same bytes the copy loop below would assemble).
                 let a = (b_lo - 2 - self.raw_first) * w;
                 let b = (b_hi + 2 - self.raw_first) * w;
-                demosaic_bayer_mhc_band(
+                demosaic_bayer_mhc_band_gains(
                     &self.raw_win[a..b],
                     w,
                     ctx_h,
@@ -298,6 +308,11 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     self.phase,
                     0,
                     b_h,
+                    crate::demosaic::MhcGains::from_wb(
+                        self.params.wb_r,
+                        self.params.wb_g,
+                        self.params.wb_b,
+                    ),
                     &mut self.rgb16,
                 )?;
             } else {
@@ -307,7 +322,7 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     let li = g - self.raw_first;
                     self.ctx[i * w..i * w + w].copy_from_slice(&self.raw_win[li * w..li * w + w]);
                 }
-                demosaic_bayer_mhc_band(
+                demosaic_bayer_mhc_band_gains(
                     &self.ctx,
                     w,
                     ctx_h,
@@ -315,6 +330,11 @@ impl<S: RawRowSource> StreamingBandSource<S> {
                     self.phase,
                     0,
                     b_h,
+                    crate::demosaic::MhcGains::from_wb(
+                        self.params.wb_r,
+                        self.params.wb_g,
+                        self.params.wb_b,
+                    ),
                     &mut self.rgb16,
                 )?;
             }
@@ -372,6 +392,10 @@ impl<'a> StreamingBandSource<OrfRowDecoder<'a>> {
             .ok_or("strip OOB")?;
         let mut params = PipelineParams::default_olympus();
         params.black = 256; // Olympus 12-bit pedestal (matches decode_orf_raw)
+        if info.iso.is_some_and(|i| i < 200) {
+            // Extended-LOW ISO pull, matches decode_orf_raw.
+            params.baseline_ev = crate::pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
+        }
         if let Some(r) = info.wb_r {
             params.wb_r = r;
         }
@@ -464,7 +488,8 @@ fn pipe_process_strip(
     ctx: &[u16], k: usize, w: usize, phase: (u8, u8), params: &PipelineParams, dst: &mut [u8],
 ) -> Result<(), String> {
     let mut rgb16 = vec![0u16; k * w * 3];
-    demosaic_bayer_mhc_band(ctx, w, k + 4, 2, phase, 0, k, &mut rgb16)?;
+    let gains = crate::demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b);
+    demosaic_bayer_mhc_band_gains(ctx, w, k + 4, 2, phase, 0, k, gains, &mut rgb16)?;
     pipeline::process_into_auto(&rgb16, params, dst);
     Ok(())
 }
@@ -620,8 +645,14 @@ mod tests {
         ] {
             let strip = decompress::tests_synth_payload(w, h, seed);
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
             let params = pipeline::PipelineParams::default_olympus();
+            let rgb16 = demosaic::demosaic_rggb_mhc_gains(
+                &raw,
+                w,
+                h,
+                demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+            )
+            .unwrap();
             let mut want = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut want);
 
@@ -642,8 +673,14 @@ mod tests {
         for (w, h) in [(64usize, 96usize), (66, 130), (17, 300), (40, 700)] {
             let strip = decompress::tests_synth_payload(w, h, 0xEE11);
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
             let params = pipeline::PipelineParams::default_olympus();
+            let rgb16 = demosaic::demosaic_rggb_mhc_gains(
+                &raw,
+                w,
+                h,
+                demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+            )
+            .unwrap();
             let mut want = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut want);
 
@@ -677,8 +714,14 @@ mod tests {
         for (w, h) in [(64usize, 96usize), (48, 258), (32, 16), (40, 700)] {
             let strip = decompress::tests_synth_payload(w, h, 0xB16B);
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
             let params = pipeline::PipelineParams::default_olympus();
+            let rgb16 = demosaic::demosaic_rggb_mhc_gains(
+                &raw,
+                w,
+                h,
+                demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+            )
+            .unwrap();
             let mut want = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut want);
 
@@ -716,7 +759,13 @@ mod tests {
             let nr = 0.3f32;
 
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let mut rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let mut rgb16 = demosaic::demosaic_rggb_mhc_gains(
+                &raw,
+                w,
+                h,
+                demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+            )
+            .unwrap();
             pipeline::apply_luminance_nr(&mut rgb16, w, h, nr);
             pipeline::apply_unsharp_masks(&mut rgb16, w, h, &params);
             let mut want = vec![0u8; w * h * 3];

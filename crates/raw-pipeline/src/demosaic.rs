@@ -1083,7 +1083,102 @@ pub fn demosaic_bayer(
     Ok(rgb)
 }
 
+/// Fixed-point shift for [`MhcGains`]. `MHC_GAIN_ONE` is exactly 1.0, and
+/// `(MHC_GAIN_ONE * lap) >> MHC_GAIN_SHIFT == lap` for every representable `lap`,
+/// so [`MhcGains::UNITY`] leaves the kernel arithmetic bit-identical.
+pub const MHC_GAIN_SHIFT: u32 = 8;
+/// Fixed-point 1.0 for [`MhcGains`].
+pub const MHC_GAIN_ONE: i32 = 1 << MHC_GAIN_SHIFT;
+/// Clamp range for gain ratios. The widest correction term is `4*c - (n2+e2+s2+w2)`,
+/// bounded by `8 * 65535`; at the upper clamp that is `1024 * 524_280 ≈ 5.4e8`, a 4×
+/// margin inside `i32`. Real WB ratios sit near 0.5–2.0.
+const MHC_GAIN_MIN: i32 = MHC_GAIN_ONE / 8;
+const MHC_GAIN_MAX: i32 = MHC_GAIN_ONE * 4;
+
+/// Per-site-class gains for MHC's cross-channel gradient-correction terms.
+///
+/// MHC estimates a missing channel as `bilinear + gain × (second difference of the
+/// channel actually sampled at this site)`. Borrowing a gradient across channels is only
+/// valid when the two channels share a scale — and a Bayer mosaic straight off the sensor
+/// does not: green sits ~1.9× above red and blue on an Olympus body before white balance.
+/// Feeding the unbalanced mosaic to MHC therefore over-corrects R/B at green sites by the
+/// WB ratio and under-corrects green at R/B sites by its reciprocal. R/B sites and G sites
+/// are the two parities of a checkerboard, so the error is lattice-locked and surfaces as
+/// per-pixel green/magenta speckle on high-frequency subjects.
+///
+/// dcraw and LibRaw avoid this by running `scale_colors()` *before* `pre_interpolate()` and
+/// the demosaic. We keep the mosaic in its native sensor domain — the denoiser and its
+/// `RawNoiseMetadata` black/white levels depend on that — and scale the correction terms
+/// instead, which is algebraically identical: for a linear pre-scale by `m`, the bilinear
+/// part scales with the target channel and only the borrowed gradient needs `m_src/m_dst`.
+///
+/// Field `x_at_y` is the gain used when interpolating channel `x` at a site that sampled
+/// channel `y`, and equals `wb[y] / wb[x]` in [`MHC_GAIN_SHIFT`] fixed point.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MhcGains {
+    pub g_at_r: i32,
+    pub g_at_b: i32,
+    pub r_at_g: i32,
+    pub b_at_g: i32,
+    pub r_at_b: i32,
+    pub b_at_r: i32,
+}
+
+impl MhcGains {
+    /// All gains 1.0 — the pre-existing behaviour, bit-identical to the unscaled kernel.
+    /// Correct only when the mosaic has already been white-balanced.
+    pub const UNITY: Self = Self {
+        g_at_r: MHC_GAIN_ONE,
+        g_at_b: MHC_GAIN_ONE,
+        r_at_g: MHC_GAIN_ONE,
+        b_at_g: MHC_GAIN_ONE,
+        r_at_b: MHC_GAIN_ONE,
+        b_at_r: MHC_GAIN_ONE,
+    };
+
+    /// Gains for a mosaic that has *not* been white-balanced, from the multipliers the
+    /// pipeline will later apply. Non-finite or non-positive inputs fall back to `UNITY`.
+    pub fn from_wb(wb_r: f32, wb_g: f32, wb_b: f32) -> Self {
+        if !(wb_r.is_finite() && wb_g.is_finite() && wb_b.is_finite())
+            || wb_r <= 0.0
+            || wb_g <= 0.0
+            || wb_b <= 0.0
+        {
+            return Self::UNITY;
+        }
+        let ratio = |src: f32, dst: f32| {
+            (((src / dst) * MHC_GAIN_ONE as f32).round() as i32).clamp(MHC_GAIN_MIN, MHC_GAIN_MAX)
+        };
+        Self {
+            g_at_r: ratio(wb_r, wb_g),
+            g_at_b: ratio(wb_b, wb_g),
+            r_at_g: ratio(wb_g, wb_r),
+            b_at_g: ratio(wb_g, wb_b),
+            r_at_b: ratio(wb_b, wb_r),
+            b_at_r: ratio(wb_r, wb_b),
+        }
+    }
+
+    #[inline(always)]
+    fn is_unity(&self) -> bool {
+        *self == Self::UNITY
+    }
+}
+
+impl Default for MhcGains {
+    fn default() -> Self {
+        Self::UNITY
+    }
+}
+
+/// Scale one MHC correction term. Exact identity when `gain == MHC_GAIN_ONE`.
 #[inline(always)]
+fn mhc_corr(gain: i32, lap: i32) -> i32 {
+    (gain * lap) >> MHC_GAIN_SHIFT
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn mhc_pixel_phased(
     raw: &[u16],
     width: usize,
@@ -1098,6 +1193,7 @@ fn mhc_pixel_phased(
     c_w2: usize,
     c_e2: usize,
     phase: (usize, usize),
+    gains: MhcGains,
 ) -> (i32, i32, i32) {
     match ((r_c + phase.0) & 1, (col + phase.1) & 1) {
         (0, 0) => {
@@ -1113,12 +1209,18 @@ fn mhc_pixel_phased(
             // CSE neighbor sums in MHC phased helper (helps all scalar MHC paths: full, band, matrix).
             let sum_g4 = gn + ge + gs + gw;
             let sum_d4 = rn2 + re2 + rs2 + rw2;
-            let g_mhc = (2 * sum_g4 + 4 * rc - sum_d4) >> 3;
+            // Shared red second difference (×4). Both missing channels correct from it.
+            let lap_r = 4 * rc - sum_d4;
+            let g_mhc = (2 * sum_g4 + mhc_corr(gains.g_at_r, lap_r)) >> 3;
             let sum_b4 = at(raw, width, r_n, c_w)
                 + at(raw, width, r_n, c_e)
                 + at(raw, width, r_s, c_w)
                 + at(raw, width, r_s, c_e);
-            let b_v = sum_b4 >> 2;
+            // B-at-R takes the same correction R-at-B takes (see `(1,1)` arm). Leaving it
+            // as a bare bilinear average made the kernel asymmetric under R/B exchange —
+            // R sharpened at B sites, B blurred at R sites — which is a chroma error on
+            // the R/B quincunx. Pinned by `mhc_red_blue_exchange_invariant`.
+            let b_v = (2 * sum_b4 + mhc_corr(gains.b_at_r, lap_r)) >> 3;
             (rc, g_mhc.clamp(0, 65535), b_v.clamp(0, 65535))
         }
         (0, 1) => {
@@ -1131,8 +1233,11 @@ fn mhc_pixel_phased(
             let gw2 = at(raw, width, r_c, c_w2);
             let gn2 = at(raw, width, r_n2, col);
             let gs2 = at(raw, width, r_s2, col);
-            let r_v = (2 * (re + rw) + 2 * gc - ge2 - gw2) >> 2;
-            let b_v = (2 * (bn + bs) + 2 * gc - gn2 - gs2) >> 2;
+            // Green second differences (×2) along each axis: R neighbours lie E/W, B N/S.
+            let lap_gh = 2 * gc - ge2 - gw2;
+            let lap_gv = 2 * gc - gn2 - gs2;
+            let r_v = (2 * (re + rw) + mhc_corr(gains.r_at_g, lap_gh)) >> 2;
+            let b_v = (2 * (bn + bs) + mhc_corr(gains.b_at_g, lap_gv)) >> 2;
             (r_v.clamp(0, 65535), gc, b_v.clamp(0, 65535))
         }
         (1, 0) => {
@@ -1145,8 +1250,11 @@ fn mhc_pixel_phased(
             let gs2 = at(raw, width, r_s2, col);
             let ge2 = at(raw, width, r_c, c_e2);
             let gw2 = at(raw, width, r_c, c_w2);
-            let r_v = (2 * (rn + rs) + 2 * gc - gn2 - gs2) >> 2;
-            let b_v = (2 * (be + bw) + 2 * gc - ge2 - gw2) >> 2;
+            // Same G site, transposed: on a B row the R neighbours lie N/S and B E/W.
+            let lap_gv = 2 * gc - gn2 - gs2;
+            let lap_gh = 2 * gc - ge2 - gw2;
+            let r_v = (2 * (rn + rs) + mhc_corr(gains.r_at_g, lap_gv)) >> 2;
+            let b_v = (2 * (be + bw) + mhc_corr(gains.b_at_g, lap_gh)) >> 2;
             (r_v.clamp(0, 65535), gc, b_v.clamp(0, 65535))
         }
         _ => {
@@ -1159,28 +1267,41 @@ fn mhc_pixel_phased(
             let be2 = at(raw, width, r_c, c_e2);
             let bs2 = at(raw, width, r_s2, col);
             let bw2 = at(raw, width, r_c, c_w2);
-            let g_mhc = (2 * (gn + ge + gs + gw) + 4 * bc - bn2 - be2 - bs2 - bw2) >> 3;
+            // Shared blue second difference (×4) — mirror of the `(0,0)` arm.
+            let lap_b = 4 * bc - bn2 - be2 - bs2 - bw2;
+            let g_mhc = (2 * (gn + ge + gs + gw) + mhc_corr(gains.g_at_b, lap_b)) >> 3;
             let r_v = (2
                 * (at(raw, width, r_n, c_e)
                     + at(raw, width, r_n, c_w)
                     + at(raw, width, r_s, c_e)
                     + at(raw, width, r_s, c_w))
-                + 4 * bc
-                - bn2
-                - be2
-                - bs2
-                - bw2)
+                + mhc_corr(gains.r_at_b, lap_b))
                 >> 3;
             (r_v.clamp(0, 65535), g_mhc.clamp(0, 65535), bc)
         }
     }
 }
 
+/// MHC demosaic at any CFA phase, with unity cross-channel gains.
+///
+/// Correct only when `raw` has already been white-balanced. Callers holding a mosaic in
+/// the sensor's native domain should use [`demosaic_bayer_mhc_gains`] with
+/// [`MhcGains::from_wb`] — see [`MhcGains`] for why.
 pub fn demosaic_bayer_mhc(
     raw: &[u16],
     width: usize,
     height: usize,
     phase: (u8, u8),
+) -> Result<Vec<u16>, String> {
+    demosaic_bayer_mhc_gains(raw, width, height, phase, MhcGains::UNITY)
+}
+
+pub fn demosaic_bayer_mhc_gains(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    phase: (u8, u8),
+    gains: MhcGains,
 ) -> Result<Vec<u16>, String> {
     validate(raw, width, height)?;
     let n3 = width
@@ -1245,6 +1366,7 @@ pub fn demosaic_bayer_mhc(
                 clamp(c - 2, 0, w_max),
                 clamp(c + 2, 0, w_max),
                 phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1258,7 +1380,7 @@ pub fn demosaic_bayer_mhc(
             // the kernel only reads cols [col-2, col+9] for col chunks that
             // satisfy col + 10 <= width, enforced by its loop bound.
             scalar_start = unsafe {
-                mhc_row_interior_avx2(raw, width, row, int_start, int_end, phase, out_row)
+                mhc_row_interior_avx2(raw, width, row, int_start, int_end, phase, gains, out_row)
             };
         }
         #[cfg(all(target_arch = "wasm32", feature = "mhc-simd128"))]
@@ -1266,7 +1388,7 @@ pub fn demosaic_bayer_mhc(
             // SAFETY: rows r±1, r±2 are unclamped (row in [2, h-2]); the kernel only
             // reads cols [col-2, col+5] for col chunks that satisfy col + 6 <= width,
             // enforced by its loop bound. wasm128 is always available on this target.
-            scalar_start = mhc_row_interior_simd128(raw, width, row, int_start, int_end, phase, out_row);
+            scalar_start = mhc_row_interior_simd128(raw, width, row, int_start, int_end, phase, gains, out_row);
         }
         for col in scalar_start..int_end {
             let (rr, gg, bb) = mhc_pixel_phased(
@@ -1283,6 +1405,7 @@ pub fn demosaic_bayer_mhc(
                 col - 2,
                 col + 2,
                 phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1305,6 +1428,7 @@ pub fn demosaic_bayer_mhc(
                 clamp(c - 2, 0, w_max),
                 clamp(c + 2, 0, w_max),
                 phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1346,6 +1470,7 @@ unsafe fn mhc_row_interior_avx2(
     int_start: usize,
     int_end: usize,
     phase: (usize, usize),
+    gains: MhcGains,
     out_row: &mut [u16],
 ) -> usize {
     use core::arch::x86_64::*;
@@ -1359,6 +1484,18 @@ unsafe fn mhc_row_interior_avx2(
     let zero = _mm256_setzero_si256();
     let vmax = _mm256_set1_epi32(65535);
     let clamp16 = |v: __m256i| _mm256_min_epi32(_mm256_max_epi32(v, zero), vmax);
+
+    // Cross-channel gradient gains, splatted once per row. `mhc_corr` in vector form:
+    // `_mm256_mullo_epi32` then an arithmetic shift, matching the scalar op order exactly.
+    let vg_g_at_r = _mm256_set1_epi32(gains.g_at_r);
+    let vg_g_at_b = _mm256_set1_epi32(gains.g_at_b);
+    let vg_r_at_g = _mm256_set1_epi32(gains.r_at_g);
+    let vg_b_at_g = _mm256_set1_epi32(gains.b_at_g);
+    let vg_r_at_b = _mm256_set1_epi32(gains.r_at_b);
+    let vg_b_at_r = _mm256_set1_epi32(gains.b_at_r);
+    let corr = |g: __m256i, lap: __m256i| {
+        _mm256_srai_epi32::<{ MHC_GAIN_SHIFT as i32 }>(_mm256_mullo_epi32(g, lap))
+    };
 
     let row_q = (row + phase.0) & 1;
     let rn = (row - 1) * width;
@@ -1398,14 +1535,19 @@ unsafe fn mhc_row_interior_avx2(
         let sum_d4 = add(sum_vd2, sum_hd2); // n2+e2+s2+w2
         let sum_x4 = add(add(n_m1, n_p1), add(s_m1, s_p1)); // 4 diagonals
 
+        // Own-channel second differences the cross-channel arms borrow from.
+        let lap_c4 = sub(sll2(c_0), sum_d4); // 4*c0 − (n2+e2+s2+w2)
+        let lap_ch = sub(sll1(c_0), sum_hd2); // 2*c0 − (e2+w2)
+        let lap_cv = sub(sll1(c_0), sum_vd2); // 2*c0 − (n2+s2)
+
         let (r_even, g_even, b_even, r_odd, g_odd, b_odd);
         if row_q == 0 {
-            // Even arm (0,0) — R site: r=c0; g=(2*Σg4 + 4*c0 − Σd4)>>3; b=Σdiag>>2.
-            let g00 = _mm256_srai_epi32::<3>(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
-            let b00 = _mm256_srai_epi32::<2>(sum_x4);
-            // Odd arm (0,1) — G site on R row: r=(2*(e+w)+2*c0−e2−w2)>>2; b=(2*(n+s)+2*c0−n2−s2)>>2.
-            let r01 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
-            let b01 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
+            // Even arm (0,0) — R site: r=c0; g=(2*Σg4 + gain*lap)>>3; b=(2*Σdiag + gain*lap)>>3.
+            let g00 = _mm256_srai_epi32::<3>(add(sll1(sum_g4), corr(vg_g_at_r, lap_c4)));
+            let b00 = _mm256_srai_epi32::<3>(add(sll1(sum_x4), corr(vg_b_at_r, lap_c4)));
+            // Odd arm (0,1) — G site on R row: r=(2*(e+w)+gain*lap_h)>>2; b=(2*(n+s)+gain*lap_v)>>2.
+            let r01 = _mm256_srai_epi32::<2>(add(sll1(sum_h2), corr(vg_r_at_g, lap_ch)));
+            let b01 = _mm256_srai_epi32::<2>(add(sll1(sum_v2), corr(vg_b_at_g, lap_cv)));
             r_even = c_0;
             g_even = clamp16(g00);
             b_even = clamp16(b00);
@@ -1413,12 +1555,12 @@ unsafe fn mhc_row_interior_avx2(
             g_odd = c_0;
             b_odd = clamp16(b01);
         } else {
-            // Even arm (1,0) — G site on B row: r=(2*(n+s)+2*c0−n2−s2)>>2; b=(2*(e+w)+2*c0−e2−w2)>>2.
-            let r10 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
-            let b10 = _mm256_srai_epi32::<2>(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
-            // Odd arm (1,1) — B site: g=(2*Σg4+4*c0−Σd4)>>3; r=(2*Σdiag+4*c0−Σd4)>>3.
-            let g11 = _mm256_srai_epi32::<3>(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
-            let r11 = _mm256_srai_epi32::<3>(sub(add(sll1(sum_x4), sll2(c_0)), sum_d4));
+            // Even arm (1,0) — G site on B row: r takes the vertical lap, b the horizontal.
+            let r10 = _mm256_srai_epi32::<2>(add(sll1(sum_v2), corr(vg_r_at_g, lap_cv)));
+            let b10 = _mm256_srai_epi32::<2>(add(sll1(sum_h2), corr(vg_b_at_g, lap_ch)));
+            // Odd arm (1,1) — B site: g=(2*Σg4+gain*lap)>>3; r=(2*Σdiag+gain*lap)>>3.
+            let g11 = _mm256_srai_epi32::<3>(add(sll1(sum_g4), corr(vg_g_at_b, lap_c4)));
+            let r11 = _mm256_srai_epi32::<3>(add(sll1(sum_x4), corr(vg_r_at_b, lap_c4)));
             r_even = clamp16(r10);
             g_even = c_0;
             b_even = clamp16(b10);
@@ -1496,6 +1638,7 @@ fn mhc_simd128_lane(
     col: usize,
     row_q: usize,
     col_q: usize,
+    gains: MhcGains,
 ) -> (i32, i32, i32) {
     // Same 13 taps the SIMD kernel loads (all in-bounds for interior cols).
     let c_m2 = raw[rc + col - 2] as i32;
@@ -1523,27 +1666,32 @@ fn mhc_simd128_lane(
 
     let clamp16 = |v: i32| v.max(0).min(65535);
 
+    // Own-channel second differences the cross-channel arms borrow from.
+    let lap_c4 = (c_0 << 2) - sum_d4;
+    let lap_ch = (c_0 << 1) - sum_hd2;
+    let lap_cv = (c_0 << 1) - sum_vd2;
+
     if row_q == 0 {
         if col_q == 0 {
             // Even arm (0,0) — R site.
-            let g00 = ((sum_g4 << 1) + (c_0 << 2) - sum_d4) >> 3;
-            let b00 = sum_x4 >> 2;
+            let g00 = ((sum_g4 << 1) + mhc_corr(gains.g_at_r, lap_c4)) >> 3;
+            let b00 = ((sum_x4 << 1) + mhc_corr(gains.b_at_r, lap_c4)) >> 3;
             (c_0, clamp16(g00), clamp16(b00))
         } else {
             // Odd arm (0,1) — G site on R row.
-            let r01 = ((sum_h2 << 1) + (c_0 << 1) - sum_hd2) >> 2;
-            let b01 = ((sum_v2 << 1) + (c_0 << 1) - sum_vd2) >> 2;
+            let r01 = ((sum_h2 << 1) + mhc_corr(gains.r_at_g, lap_ch)) >> 2;
+            let b01 = ((sum_v2 << 1) + mhc_corr(gains.b_at_g, lap_cv)) >> 2;
             (clamp16(r01), c_0, clamp16(b01))
         }
     } else if col_q == 0 {
         // Even arm (1,0) — G site on B row.
-        let r10 = ((sum_v2 << 1) + (c_0 << 1) - sum_vd2) >> 2;
-        let b10 = ((sum_h2 << 1) + (c_0 << 1) - sum_hd2) >> 2;
+        let r10 = ((sum_v2 << 1) + mhc_corr(gains.r_at_g, lap_cv)) >> 2;
+        let b10 = ((sum_h2 << 1) + mhc_corr(gains.b_at_g, lap_ch)) >> 2;
         (clamp16(r10), c_0, clamp16(b10))
     } else {
         // Odd arm (1,1) — B site.
-        let g11 = ((sum_g4 << 1) + (c_0 << 2) - sum_d4) >> 3;
-        let r11 = ((sum_x4 << 1) + (c_0 << 2) - sum_d4) >> 3;
+        let g11 = ((sum_g4 << 1) + mhc_corr(gains.g_at_b, lap_c4)) >> 3;
+        let r11 = ((sum_x4 << 1) + mhc_corr(gains.r_at_b, lap_c4)) >> 3;
         (clamp16(r11), clamp16(g11), c_0)
     }
 }
@@ -1555,6 +1703,7 @@ fn mhc_simd128_lane(
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub fn mhc_row_interior_simd128_ref(
     raw: &[u16],
     width: usize,
@@ -1562,6 +1711,7 @@ pub fn mhc_row_interior_simd128_ref(
     int_start: usize,
     int_end: usize,
     phase: (usize, usize),
+    gains: MhcGains,
     out_row: &mut [u16],
 ) -> usize {
     let row_q = (row + phase.0) & 1;
@@ -1576,7 +1726,7 @@ pub fn mhc_row_interior_simd128_ref(
         for k in 0..4 {
             let c = col + k;
             let col_q = (c + phase.1) & 1;
-            let (r, g, b) = mhc_simd128_lane(raw, rc, rn, rs, rn2, rs2, c, row_q, col_q);
+            let (r, g, b) = mhc_simd128_lane(raw, rc, rn, rs, rn2, rs2, c, row_q, col_q, gains);
             let o = c * 3;
             out_row[o] = r as u16;
             out_row[o + 1] = g as u16;
@@ -1602,6 +1752,7 @@ pub fn mhc_row_interior_simd128_ref(
 /// but only *called* when the opt-in `mhc-simd128` feature is on — hence `allow(dead_code)`.
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 fn mhc_row_interior_simd128(
     raw: &[u16],
     width: usize,
@@ -1609,6 +1760,7 @@ fn mhc_row_interior_simd128(
     int_start: usize,
     int_end: usize,
     phase: (usize, usize),
+    gains: MhcGains,
     out_row: &mut [u16],
 ) -> usize {
     use core::arch::wasm32::*;
@@ -1624,6 +1776,15 @@ fn mhc_row_interior_simd128(
     let zero = i32x4_splat(0);
     let vmax = i32x4_splat(65535);
     let clamp16 = |v: v128| i32x4_min(i32x4_max(v, zero), vmax);
+
+    // Cross-channel gradient gains, splatted once per row (mirrors `mhc_corr`).
+    let vg_g_at_r = i32x4_splat(gains.g_at_r);
+    let vg_g_at_b = i32x4_splat(gains.g_at_b);
+    let vg_r_at_g = i32x4_splat(gains.r_at_g);
+    let vg_b_at_g = i32x4_splat(gains.b_at_g);
+    let vg_r_at_b = i32x4_splat(gains.r_at_b);
+    let vg_b_at_r = i32x4_splat(gains.b_at_r);
+    let corr = |g: v128, lap: v128| i32x4_shr(i32x4_mul(g, lap), MHC_GAIN_SHIFT);
 
     let row_q = (row + phase.0) & 1;
     let rn = (row - 1) * width;
@@ -1669,13 +1830,18 @@ fn mhc_row_interior_simd128(
         let sum_d4 = add(sum_vd2, sum_hd2); // n2+e2+s2+w2
         let sum_x4 = add(add(n_m1, n_p1), add(s_m1, s_p1)); // 4 diagonals
 
+        // Own-channel second differences the cross-channel arms borrow from.
+        let lap_c4 = sub(sll2(c_0), sum_d4);
+        let lap_ch = sub(sll1(c_0), sum_hd2);
+        let lap_cv = sub(sll1(c_0), sum_vd2);
+
         let (r_even, g_even, b_even, r_odd, g_odd, b_odd);
         if row_q == 0 {
             // Even arm (0,0) — R site; Odd arm (0,1) — G site on R row.
-            let g00 = sra3(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
-            let b00 = sra2(sum_x4);
-            let r01 = sra2(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
-            let b01 = sra2(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
+            let g00 = sra3(add(sll1(sum_g4), corr(vg_g_at_r, lap_c4)));
+            let b00 = sra3(add(sll1(sum_x4), corr(vg_b_at_r, lap_c4)));
+            let r01 = sra2(add(sll1(sum_h2), corr(vg_r_at_g, lap_ch)));
+            let b01 = sra2(add(sll1(sum_v2), corr(vg_b_at_g, lap_cv)));
             r_even = c_0;
             g_even = clamp16(g00);
             b_even = clamp16(b00);
@@ -1684,10 +1850,10 @@ fn mhc_row_interior_simd128(
             b_odd = clamp16(b01);
         } else {
             // Even arm (1,0) — G site on B row; Odd arm (1,1) — B site.
-            let r10 = sra2(sub(add(sll1(sum_v2), sll1(c_0)), sum_vd2));
-            let b10 = sra2(sub(add(sll1(sum_h2), sll1(c_0)), sum_hd2));
-            let g11 = sra3(sub(add(sll1(sum_g4), sll2(c_0)), sum_d4));
-            let r11 = sra3(sub(add(sll1(sum_x4), sll2(c_0)), sum_d4));
+            let r10 = sra2(add(sll1(sum_v2), corr(vg_r_at_g, lap_cv)));
+            let b10 = sra2(add(sll1(sum_h2), corr(vg_b_at_g, lap_ch)));
+            let g11 = sra3(add(sll1(sum_g4), corr(vg_g_at_b, lap_c4)));
+            let r11 = sra3(add(sll1(sum_x4), corr(vg_r_at_b, lap_c4)));
             r_even = clamp16(r10);
             g_even = c_0;
             b_even = clamp16(b10);
@@ -1759,6 +1925,8 @@ fn demosaic_bayer_mhc_forced(
     let h_max = (height - 1) as isize;
     let phase = (phase.0 as usize, phase.1 as usize);
     let use_simd = simd && width >= 12 && height >= 5;
+    // Bench-only A/B of the interior span; the cross-channel gains are not what it measures.
+    let gains = MhcGains::UNITY;
 
     let do_row = |row: usize, out_row: &mut [u16]| {
         let r = row as isize;
@@ -1773,6 +1941,7 @@ fn demosaic_bayer_mhc_forced(
                 raw, width, row, r_n, r_s, r_n2, r_s2, col,
                 clamp(c - 1, 0, w_max), clamp(c + 1, 0, w_max),
                 clamp(c - 2, 0, w_max), clamp(c + 2, 0, w_max), phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1781,12 +1950,13 @@ fn demosaic_bayer_mhc_forced(
         }
         let mut scalar_start = int_start;
         if use_simd && row >= 2 && row + 2 <= h_max as usize && int_end > int_start {
-            scalar_start = mhc_row_interior_simd128(raw, width, row, int_start, int_end, phase, out_row);
+            scalar_start = mhc_row_interior_simd128(raw, width, row, int_start, int_end, phase, gains, out_row);
         }
         for col in scalar_start..int_end {
             let (rr, gg, bb) = mhc_pixel_phased(
                 raw, width, row, r_n, r_s, r_n2, r_s2, col,
                 col - 1, col + 1, col - 2, col + 2, phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1799,6 +1969,7 @@ fn demosaic_bayer_mhc_forced(
                 raw, width, row, r_n, r_s, r_n2, r_s2, col,
                 clamp(c - 1, 0, w_max), clamp(c + 1, 0, w_max),
                 clamp(c - 2, 0, w_max), clamp(c + 2, 0, w_max), phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1838,6 +2009,7 @@ pub fn demosaic_bayer_mhc_clamped_ref(
     width: usize,
     height: usize,
     phase: (u8, u8),
+    gains: MhcGains,
 ) -> Result<Vec<u16>, String> {
     validate(raw, width, height)?;
     let n3 = width * height * 3;
@@ -1869,6 +2041,7 @@ pub fn demosaic_bayer_mhc_clamped_ref(
                     clamp(c - 2, 0, w_max),
                     clamp(c + 2, 0, w_max),
                     phase,
+                    gains,
                 );
                 let o = col * 3;
                 out_row[o] = rr as u16;
@@ -1879,6 +2052,9 @@ pub fn demosaic_bayer_mhc_clamped_ref(
     Ok(rgb)
 }
 
+/// Banded MHC at any CFA phase, with unity cross-channel gains. See [`MhcGains`] —
+/// pass real gains via [`demosaic_bayer_mhc_band_gains`] when the mosaic is unbalanced.
+#[allow(clippy::too_many_arguments)]
 pub fn demosaic_bayer_mhc_band(
     ctx: &[u16],
     width: usize,
@@ -1887,6 +2063,31 @@ pub fn demosaic_bayer_mhc_band(
     phase: (u8, u8),
     first_local: usize,
     num_rows: usize,
+    rgb_out: &mut [u16],
+) -> Result<(), String> {
+    demosaic_bayer_mhc_band_gains(
+        ctx,
+        width,
+        ctx_h,
+        halo,
+        phase,
+        first_local,
+        num_rows,
+        MhcGains::UNITY,
+        rgb_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn demosaic_bayer_mhc_band_gains(
+    ctx: &[u16],
+    width: usize,
+    ctx_h: usize,
+    halo: usize,
+    phase: (u8, u8),
+    first_local: usize,
+    num_rows: usize,
+    gains: MhcGains,
     rgb_out: &mut [u16],
 ) -> Result<(), String> {
     if num_rows == 0 {
@@ -1964,6 +2165,7 @@ pub fn demosaic_bayer_mhc_band(
                 clamp(c - 2, 0, w_max),
                 clamp(c + 2, 0, w_max),
                 phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -1975,7 +2177,7 @@ pub fn demosaic_bayer_mhc_band(
         if use_avx2 && ctx_row >= 2 && ctx_row + 2 <= h_max as usize && int_end > int_start {
             // SAFETY: AVX2 detected; ctx_row +/- 2 and cols [2, width-2) are in-bounds.
             scalar_start = unsafe {
-                mhc_row_interior_avx2(ctx, width, ctx_row, int_start, int_end, phase, out_row)
+                mhc_row_interior_avx2(ctx, width, ctx_row, int_start, int_end, phase, gains, out_row)
             };
         }
         for col in scalar_start..int_end {
@@ -1993,6 +2195,7 @@ pub fn demosaic_bayer_mhc_band(
                 col - 2,
                 col + 2,
                 phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -2015,6 +2218,7 @@ pub fn demosaic_bayer_mhc_band(
                 clamp(c - 2, 0, w_max),
                 clamp(c + 2, 0, w_max),
                 phase,
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -2040,9 +2244,23 @@ pub fn demosaic_bayer_mhc_band(
 ///   R at GB: 4R = 2(R_N+R_S) + 2G_C − G_N2 − G_S2
 ///   B at GB: 4B = 2(B_E+B_W) + 2G_C − G_E2 − G_W2
 ///   R at B:  8R = 2(R_NE+R_NW+R_SE+R_SW) + 4B_C − B_N2 − B_E2 − B_S2 − B_W2
+///   B at R:  8B = 2(B_NE+B_NW+B_SE+B_SW) + 4R_C − R_N2 − R_E2 − R_S2 − R_W2
+///
+/// Each `±` correction term above is scaled by the matching [`MhcGains`] entry; this
+/// entry point uses [`MhcGains::UNITY`], which is only correct for an already
+/// white-balanced mosaic. Use [`demosaic_rggb_mhc_gains`] otherwise.
 ///
 /// All results clamped to [0, 65535].
 pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec<u16>, String> {
+    demosaic_rggb_mhc_gains(raw, width, height, MhcGains::UNITY)
+}
+
+pub fn demosaic_rggb_mhc_gains(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    gains: MhcGains,
+) -> Result<Vec<u16>, String> {
     validate(raw, width, height)?;
     let n3 = width
         .checked_mul(height)
@@ -2083,6 +2301,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 clamp(c - 2, 0, w_max),
                 clamp(c + 2, 0, w_max),
                 (0, 0),
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -2107,6 +2326,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                     col - 2,
                     col + 2,
                     (0, 0),
+                    gains,
                 );
                 let o = col * 3;
                 out_row[o] = rr as u16;
@@ -2132,6 +2352,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                     clamp(c - 2, 0, w_max),
                     clamp(c + 2, 0, w_max),
                     (0, 0),
+                    gains,
                 );
                 let o = col * 3;
                 out_row[o] = rr as u16;
@@ -2156,7 +2377,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
         while col + 1 < int_end {
             let o = col * 3;
             if row_par == 0 {
-                // even row, even col (0,0): R site with G MHC + B bilinear
+                // even row, even col (0,0): R site — G and B both corrected from the red lap
                 let rc = here[col] as i32;
                 let gn = north[col] as i32;
                 let ge = here[col + 1] as i32;
@@ -2169,15 +2390,16 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 // CSE sums for MHC correction (fewer adds in hot unroll; exact integer).
                 let sum_g4 = gn + ge + gs + gw;
                 let sum_d4 = rn2 + re2 + rs2 + rw2;
-                let g_mhc = (2 * sum_g4 + 4 * rc - sum_d4) >> 3;
+                let lap_r = 4 * rc - sum_d4;
+                let g_mhc = (2 * sum_g4 + mhc_corr(gains.g_at_r, lap_r)) >> 3;
                 let sum_b4 = north[col - 1] as i32
                     + north[col + 1] as i32
                     + south[col - 1] as i32
                     + south[col + 1] as i32;
-                let b_v = sum_b4 >> 2;
+                let b_v = (2 * sum_b4 + mhc_corr(gains.b_at_r, lap_r)) >> 3;
                 out_row[o] = rc as u16;
                 out_row[o + 1] = g_mhc.clamp(0, 65535) as u16;
-                out_row[o + 2] = b_v as u16;
+                out_row[o + 2] = b_v.clamp(0, 65535) as u16;
 
                 // even row, odd col (0,1): GR site
                 let gc = ge; // CSE: here[col+1] already loaded above as `ge`
@@ -2192,10 +2414,10 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 // CSE for the horizontal/vertical corrections at GR site.
                 let sum_r = re + rw;
                 let sum_r2 = ge2 + gw2;
-                let r_v = (2 * sum_r + 2 * gc - sum_r2) >> 2;
+                let r_v = (2 * sum_r + mhc_corr(gains.r_at_g, 2 * gc - sum_r2)) >> 2;
                 let sum_b = bn + bs;
                 let sum_b2 = gn2 + gs2;
-                let b_v = (2 * sum_b + 2 * gc - sum_b2) >> 2;
+                let b_v = (2 * sum_b + mhc_corr(gains.b_at_g, 2 * gc - sum_b2)) >> 2;
                 let o2 = (col + 1) * 3;
                 out_row[o2] = r_v.clamp(0, 65535) as u16;
                 out_row[o2 + 1] = gc as u16;
@@ -2211,8 +2433,8 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 let gs2 = s2[col] as i32;
                 let ge2 = here[col + 2] as i32;
                 let gw2 = here[col - 2] as i32;
-                let r_v = (2 * (rn_ + rs_) + 2 * gc - gn2 - gs2) >> 2;
-                let b_v = (2 * (be + bw) + 2 * gc - ge2 - gw2) >> 2;
+                let r_v = (2 * (rn_ + rs_) + mhc_corr(gains.r_at_g, 2 * gc - gn2 - gs2)) >> 2;
+                let b_v = (2 * (be + bw) + mhc_corr(gains.b_at_g, 2 * gc - ge2 - gw2)) >> 2;
                 out_row[o] = r_v.clamp(0, 65535) as u16;
                 out_row[o + 1] = gc as u16;
                 out_row[o + 2] = b_v.clamp(0, 65535) as u16;
@@ -2227,17 +2449,14 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 let be2 = here[col + 3] as i32;
                 let bs2 = s2[col + 1] as i32;
                 let bw2 = here[col - 1] as i32;
-                let g_mhc = (2 * (gn + ge + gs + gw) + 4 * bc - bn2 - be2 - bs2 - bw2) >> 3;
+                let lap_b = 4 * bc - bn2 - be2 - bs2 - bw2;
+                let g_mhc = (2 * (gn + ge + gs + gw) + mhc_corr(gains.g_at_b, lap_b)) >> 3;
                 let r_v = (2
                     * (north[col + 2] as i32
                         + north[col] as i32
                         + south[col + 2] as i32
                         + south[col] as i32)
-                    + 4 * bc
-                    - bn2
-                    - be2
-                    - bs2
-                    - bw2)
+                    + mhc_corr(gains.r_at_b, lap_b))
                     >> 3;
                 let o2 = (col + 1) * 3;
                 out_row[o2] = r_v.clamp(0, 65535) as u16;
@@ -2263,6 +2482,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 col - 2,
                 col + 2,
                 (0, 0),
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -2287,6 +2507,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
                 clamp(c - 2, 0, w_max),
                 clamp(c + 2, 0, w_max),
                 (0, 0),
+                gains,
             );
             let o = col * 3;
             out_row[o] = rr as u16;
@@ -2313,6 +2534,7 @@ pub fn demosaic_rggb_mhc(raw: &[u16], width: usize, height: usize) -> Result<Vec
 /// Writes exactly num_rows × width × 3 values into rgb_out[0..]. Caller ensures ctx contains
 /// correct halo rows (replicate at frame top; carry previous band bottom rows for chaining).
 /// Uses scalar mhc_pixel (correct; unroll kept only in full-frame hot path).
+#[allow(clippy::too_many_arguments)]
 pub fn demosaic_rggb_mhc_band(
     ctx: &[u16],
     width: usize,
@@ -2321,6 +2543,31 @@ pub fn demosaic_rggb_mhc_band(
     global_row0: usize,
     first_local: usize,
     num_rows: usize,
+    rgb_out: &mut [u16],
+) -> Result<(), String> {
+    demosaic_rggb_mhc_band_gains(
+        ctx,
+        width,
+        ctx_h,
+        halo,
+        global_row0,
+        first_local,
+        num_rows,
+        MhcGains::UNITY,
+        rgb_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn demosaic_rggb_mhc_band_gains(
+    ctx: &[u16],
+    width: usize,
+    ctx_h: usize,
+    halo: usize,
+    global_row0: usize,
+    first_local: usize,
+    num_rows: usize,
+    gains: MhcGains,
     rgb_out: &mut [u16],
 ) -> Result<(), String> {
     if num_rows == 0 {
@@ -2422,6 +2669,7 @@ pub fn demosaic_rggb_mhc_band(
                     int_start,
                     int_end,
                     (0, 0),
+                    gains,
                     &mut rgb_out[out_base..out_base + width * 3],
                 )
             };
@@ -2458,12 +2706,15 @@ pub fn demosaic_rggb_mhc_band(
                         let re2 = ld(row_here, c_e2);
                         let rs2 = ld(row_s2, col);
                         let rw2 = ld(row_here, c_w2);
-                        let g_mhc = (2 * (gn + ge + gs + gw) + 4 * rc - rn2 - re2 - rs2 - rw2) >> 3;
-                        let b_v = (ld(row_north, c_w)
-                            + ld(row_north, c_e)
-                            + ld(row_south, c_w)
-                            + ld(row_south, c_e))
-                            >> 2;
+                        let lap_r = 4 * rc - rn2 - re2 - rs2 - rw2;
+                        let g_mhc = (2 * (gn + ge + gs + gw) + mhc_corr(gains.g_at_r, lap_r)) >> 3;
+                        let b_v = (2
+                            * (ld(row_north, c_w)
+                                + ld(row_north, c_e)
+                                + ld(row_south, c_w)
+                                + ld(row_south, c_e))
+                            + mhc_corr(gains.b_at_r, lap_r))
+                            >> 3;
                         (rc, g_mhc.clamp(0, 65535), b_v.clamp(0, 65535))
                     }
                     (0, 1) => {
@@ -2476,8 +2727,8 @@ pub fn demosaic_rggb_mhc_band(
                         let gw2 = ld(row_here, c_w2);
                         let gn2 = ld(row_n2, col);
                         let gs2 = ld(row_s2, col);
-                        let r_v = (2 * (re + rw) + 2 * gc - ge2 - gw2) >> 2;
-                        let b_v = (2 * (bn + bs) + 2 * gc - gn2 - gs2) >> 2;
+                        let r_v = (2 * (re + rw) + mhc_corr(gains.r_at_g, 2 * gc - ge2 - gw2)) >> 2;
+                        let b_v = (2 * (bn + bs) + mhc_corr(gains.b_at_g, 2 * gc - gn2 - gs2)) >> 2;
                         (r_v.clamp(0, 65535), gc, b_v.clamp(0, 65535))
                     }
                     (1, 0) => {
@@ -2490,8 +2741,8 @@ pub fn demosaic_rggb_mhc_band(
                         let gs2 = ld(row_s2, col);
                         let ge2 = ld(row_here, c_e2);
                         let gw2 = ld(row_here, c_w2);
-                        let r_v = (2 * (rn + rs) + 2 * gc - gn2 - gs2) >> 2;
-                        let b_v = (2 * (be + bw) + 2 * gc - ge2 - gw2) >> 2;
+                        let r_v = (2 * (rn + rs) + mhc_corr(gains.r_at_g, 2 * gc - gn2 - gs2)) >> 2;
+                        let b_v = (2 * (be + bw) + mhc_corr(gains.b_at_g, 2 * gc - ge2 - gw2)) >> 2;
                         (r_v.clamp(0, 65535), gc, b_v.clamp(0, 65535))
                     }
                     _ => {
@@ -2504,20 +2755,15 @@ pub fn demosaic_rggb_mhc_band(
                         let be2 = ld(row_here, c_e2);
                         let bs2 = ld(row_s2, col);
                         let bw2 = ld(row_here, c_w2);
-                        let g_mhc = (2 * (gn + ge + gs + gw) + 4 * bc - bn2 - be2 - bs2 - bw2) >> 3;
+                        let lap_b = 4 * bc - bn2 - be2 - bs2 - bw2;
+                        let g_mhc = (2 * (gn + ge + gs + gw) + mhc_corr(gains.g_at_b, lap_b)) >> 3;
                         let r_v = (2
                             * (ld(row_north, c_e)
                                 + ld(row_north, c_w)
                                 + ld(row_south, c_e)
                                 + ld(row_south, c_w))
-                            + 4 * bc
-                            - bn2
-                            - be2
-                            - bs2
-                            - bw2)
+                            + mhc_corr(gains.r_at_b, lap_b))
                             >> 3;
-                        let lap_ = 4 * bc - bn2 - be2 - bs2 - bw2;
-                        let _ = lap_;
                         (r_v.clamp(0, 65535), g_mhc.clamp(0, 65535), bc)
                     }
                 }
@@ -2549,6 +2795,15 @@ pub fn demosaic_rggb_mhc_with_saliency(
     width: usize,
     height: usize,
 ) -> Result<(Vec<u16>, Vec<u32>, usize /* grid_w */), String> {
+    demosaic_rggb_mhc_with_saliency_gains(raw, width, height, MhcGains::UNITY)
+}
+
+pub fn demosaic_rggb_mhc_with_saliency_gains(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    gains: MhcGains,
+) -> Result<(Vec<u16>, Vec<u32>, usize /* grid_w */), String> {
     validate(raw, width, height)?;
     let n3 = width
         .checked_mul(height)
@@ -2560,9 +2815,12 @@ pub fn demosaic_rggb_mhc_with_saliency(
     let grid_h = (height + SALIENCY_BLOCK - 1) / SALIENCY_BLOCK;
     let mut grid = vec![0u32; grid_w * grid_h];
 
-    // Per-pixel helper duplicated from mhc (to keep demosaic_rggb_mhc body literally untouched).
     // Returns (r,g,b, lap_abs) where lap_abs is |4*center - n2-e2-s2-w2| at R/B sites, 0 at G.
+    // The rgb triple comes straight from `mhc_pixel_phased` so this path cannot drift from
+    // `demosaic_rggb_mhc` (it used to carry its own copy of the four arms, which is exactly
+    // how the missing B-at-R correction survived in more than one place).
     #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
     fn mhc_pixel_lap(
         raw: &[u16],
         width: usize,
@@ -2576,91 +2834,26 @@ pub fn demosaic_rggb_mhc_with_saliency(
         c_e: usize,
         c_w2: usize,
         c_e2: usize,
+        gains: MhcGains,
     ) -> (i32, i32, i32, u32) {
-        match (r_c & 1, col & 1) {
-            (0, 0) => {
-                let rc = at(raw, width, r_c, col);
-                let gn = at(raw, width, r_n, col);
-                let ge = at(raw, width, r_c, c_e);
-                let gs = at(raw, width, r_s, col);
-                let gw = at(raw, width, r_c, c_w);
-                let rn2 = at(raw, width, r_n2, col);
-                let re2 = at(raw, width, r_c, c_e2);
-                let rs2 = at(raw, width, r_s2, col);
-                let rw2 = at(raw, width, r_c, c_w2);
-                let g_mhc = (2 * (gn + ge + gs + gw) + 4 * rc - rn2 - re2 - rs2 - rw2) >> 3;
-                let b_v = (at(raw, width, r_n, c_w)
-                    + at(raw, width, r_n, c_e)
-                    + at(raw, width, r_s, c_w)
-                    + at(raw, width, r_s, c_e))
-                    >> 2;
-                let lap = 4 * rc - rn2 - re2 - rs2 - rw2;
-                (
-                    rc,
-                    g_mhc.clamp(0, 65535),
-                    b_v.clamp(0, 65535),
-                    lap.unsigned_abs() as u32,
-                )
-            }
-            (0, 1) => {
-                let gc = at(raw, width, r_c, col);
-                let re = at(raw, width, r_c, c_e);
-                let rw = at(raw, width, r_c, c_w);
-                let bn = at(raw, width, r_n, col);
-                let bs = at(raw, width, r_s, col);
-                let ge2 = at(raw, width, r_c, c_e2);
-                let gw2 = at(raw, width, r_c, c_w2);
-                let gn2 = at(raw, width, r_n2, col);
-                let gs2 = at(raw, width, r_s2, col);
-                let r_v = (2 * (re + rw) + 2 * gc - ge2 - gw2) >> 2;
-                let b_v = (2 * (bn + bs) + 2 * gc - gn2 - gs2) >> 2;
-                (r_v.clamp(0, 65535), gc, b_v.clamp(0, 65535), 0)
-            }
-            (1, 0) => {
-                let gc = at(raw, width, r_c, col);
-                let rn = at(raw, width, r_n, col);
-                let rs = at(raw, width, r_s, col);
-                let be = at(raw, width, r_c, c_e);
-                let bw = at(raw, width, r_c, c_w);
-                let gn2 = at(raw, width, r_n2, col);
-                let gs2 = at(raw, width, r_s2, col);
-                let ge2 = at(raw, width, r_c, c_e2);
-                let gw2 = at(raw, width, r_c, c_w2);
-                let r_v = (2 * (rn + rs) + 2 * gc - gn2 - gs2) >> 2;
-                let b_v = (2 * (be + bw) + 2 * gc - ge2 - gw2) >> 2;
-                (r_v.clamp(0, 65535), gc, b_v.clamp(0, 65535), 0)
-            }
+        let (r, g, b) = mhc_pixel_phased(
+            raw, width, r_c, r_n, r_s, r_n2, r_s2, col, c_w, c_e, c_w2, c_e2, (0, 0), gains,
+        );
+        // Saliency is the magnitude of the own-channel second difference the cross-channel
+        // arms borrow from — defined only at R/B sites, where that borrow happens.
+        let lap = match (r_c & 1, col & 1) {
+            (0, 1) | (1, 0) => 0,
             _ => {
-                let bc = at(raw, width, r_c, col);
-                let gn = at(raw, width, r_n, col);
-                let ge = at(raw, width, r_c, c_e);
-                let gs = at(raw, width, r_s, col);
-                let gw = at(raw, width, r_c, c_w);
-                let bn2 = at(raw, width, r_n2, col);
-                let be2 = at(raw, width, r_c, c_e2);
-                let bs2 = at(raw, width, r_s2, col);
-                let bw2 = at(raw, width, r_c, c_w2);
-                let g_mhc = (2 * (gn + ge + gs + gw) + 4 * bc - bn2 - be2 - bs2 - bw2) >> 3;
-                let r_v = (2
-                    * (at(raw, width, r_n, c_e)
-                        + at(raw, width, r_n, c_w)
-                        + at(raw, width, r_s, c_e)
-                        + at(raw, width, r_s, c_w))
-                    + 4 * bc
-                    - bn2
-                    - be2
-                    - bs2
-                    - bw2)
-                    >> 3;
-                let lap = 4 * bc - bn2 - be2 - bs2 - bw2;
-                (
-                    r_v.clamp(0, 65535),
-                    g_mhc.clamp(0, 65535),
-                    bc,
-                    lap.unsigned_abs() as u32,
-                )
+                let c = at(raw, width, r_c, col);
+                (4 * c
+                    - at(raw, width, r_n2, col)
+                    - at(raw, width, r_c, c_e2)
+                    - at(raw, width, r_s2, col)
+                    - at(raw, width, r_c, c_w2))
+                .unsigned_abs()
             }
-        }
+        };
+        (r, g, b, lap)
     }
 
     let w_max = (width - 1) as isize;
@@ -2696,6 +2889,7 @@ pub fn demosaic_rggb_mhc_with_saliency(
                     clamp(c + 1, 0, w_max),
                     clamp(c - 2, 0, w_max),
                     clamp(c + 2, 0, w_max),
+                    gains,
                 );
                 let o = out_base + col * 3;
                 rgb_band[o] = rr as u16;
@@ -2738,6 +2932,16 @@ pub fn demosaic_rggb_mhc_matrix(
     width: usize,
     height: usize,
     m: &[i32; 9],
+) -> Result<Vec<u16>, String> {
+    demosaic_rggb_mhc_matrix_gains(raw, width, height, m, MhcGains::UNITY)
+}
+
+pub fn demosaic_rggb_mhc_matrix_gains(
+    raw: &[u16],
+    width: usize,
+    height: usize,
+    m: &[i32; 9],
+    gains: MhcGains,
 ) -> Result<Vec<u16>, String> {
     validate(raw, width, height)?;
     for &c in m {
@@ -2785,6 +2989,7 @@ pub fn demosaic_rggb_mhc_matrix(
                     clamp(c - 2, 0, w_max),
                     clamp(c + 2, 0, w_max),
                     (0, 0),
+                    gains,
                 )
             } else {
                 mhc_pixel_phased(
@@ -2801,6 +3006,7 @@ pub fn demosaic_rggb_mhc_matrix(
                     col - 2,
                     col + 2,
                     (0, 0),
+                    gains,
                 )
             };
             // Fuse Q12 matrix (i64 to avoid overflow).
@@ -2908,6 +3114,137 @@ mod tests {
         }
     }
 
+    /// Gain sets every MHC parity assertion is repeated over: the historical unity
+    /// arithmetic, the WB-derived set the ORF/DNG paths actually ship, and the clamp
+    /// extremes (which, with full-range fills, stress the widest `gain × laplacian`
+    /// product the i32 accumulator sees).
+    fn test_gain_cases() -> [MhcGains; 3] {
+        [
+            MhcGains::UNITY,
+            MhcGains::from_wb(1.8906, 1.0, 1.8828),
+            MhcGains {
+                g_at_r: MHC_GAIN_ONE * 4,
+                g_at_b: MHC_GAIN_ONE / 8,
+                r_at_g: MHC_GAIN_ONE / 8,
+                b_at_g: MHC_GAIN_ONE * 4,
+                r_at_b: MHC_GAIN_ONE * 4,
+                b_at_r: MHC_GAIN_ONE / 8,
+            },
+        ]
+    }
+
+    fn lcg_mosaic(w: usize, h: usize, seed: u32, mask: u32) -> Vec<u16> {
+        let mut s = seed;
+        (0..w * h)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((s >> 12) & mask) as u16
+            })
+            .collect()
+    }
+
+    /// Unity gains must be a literal no-op on the correction terms, so every existing
+    /// caller keeps its historical arithmetic exactly.
+    #[test]
+    fn mhc_unity_gain_is_exact_identity() {
+        for lap in [-524_280i32, -65_535, -3, -1, 0, 1, 3, 65_535, 524_280] {
+            assert_eq!(mhc_corr(MHC_GAIN_ONE, lap), lap, "unity gain moved lap={lap}");
+        }
+    }
+
+    /// Nothing in a Bayer CFA distinguishes red from blue. Shifting the mosaic by (1,1)
+    /// turns RGGB into BGGR, so demosaicing the shifted mosaic with the R/B roles (and
+    /// therefore the R/B gains) exchanged, then swapping the output's R and B channels,
+    /// must reproduce the original output exactly.
+    ///
+    /// This is the invariant the old kernel broke: B-at-R was a bare bilinear average while
+    /// R-at-B carried a gradient correction, so red came out sharpened and blue blurred on
+    /// the same quincunx — a chroma checkerboard that showed as green speckle on
+    /// high-frequency subjects.
+    #[test]
+    fn mhc_red_blue_exchange_invariant() {
+        for &(w, h) in &[(24usize, 16usize), (33, 12), (64, 9)] {
+            let raw = lcg_mosaic(w, h, 0x1234_5678 ^ (w * 31 + h) as u32, 0x0fff);
+            for gains in test_gain_cases() {
+                // Exchanging the roles of R and B exchanges the gains that mention them.
+                let swapped = MhcGains {
+                    g_at_r: gains.g_at_b,
+                    g_at_b: gains.g_at_r,
+                    r_at_g: gains.b_at_g,
+                    b_at_g: gains.r_at_g,
+                    r_at_b: gains.b_at_r,
+                    b_at_r: gains.r_at_b,
+                };
+                let a = demosaic_rggb_mhc_gains(&raw, w, h, gains).unwrap();
+
+                let (w2, h2) = (w - 1, h - 1);
+                let mut shifted = vec![0u16; w2 * h2];
+                for y in 0..h2 {
+                    for x in 0..w2 {
+                        shifted[y * w2 + x] = raw[(y + 1) * w + (x + 1)];
+                    }
+                }
+                let b = demosaic_rggb_mhc_gains(&shifted, w2, h2, swapped).unwrap();
+
+                // Compare the interior only: the two runs see different frame borders.
+                for y in 3..h2 - 3 {
+                    for x in 3..w2 - 3 {
+                        let ia = ((y + 1) * w + (x + 1)) * 3;
+                        let ib = (y * w2 + x) * 3;
+                        assert_eq!(
+                            (a[ia], a[ia + 1], a[ia + 2]),
+                            (b[ib + 2], b[ib + 1], b[ib]),
+                            "R/B exchange asymmetry at ({x},{y}) w={w} h={h} gains={gains:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scaling the correction terms by `wb[src]/wb[dst]` must reproduce what dcraw gets by
+    /// white-balancing the mosaic before demosaic. Powers of two keep the pre-scale exact,
+    /// so the only residual is integer-shift rounding inside the kernel.
+    #[test]
+    fn mhc_gains_match_a_pre_balanced_mosaic() {
+        let (w, h) = (48usize, 32usize);
+        let raw = lcg_mosaic(w, h, 0x0BAD_F00D, 0x03ff); // 10-bit so ×4 cannot clip
+        let (wb_r, wb_g, wb_b) = (2.0f32, 1.0f32, 4.0f32);
+
+        let mut balanced = vec![0u16; raw.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let m = match (y & 1, x & 1) {
+                    (0, 0) => wb_r,
+                    (1, 1) => wb_b,
+                    _ => wb_g,
+                };
+                balanced[y * w + x] = (raw[y * w + x] as f32 * m) as u16;
+            }
+        }
+        let pre = demosaic_rggb_mhc(&balanced, w, h).unwrap();
+        let got = demosaic_rggb_mhc_gains(&raw, w, h, MhcGains::from_wb(wb_r, wb_g, wb_b)).unwrap();
+
+        // Interior only. At the frame border the ±1/±2 taps are replicated by clamping, which
+        // substitutes a pixel of the WRONG channel into what is otherwise a same-channel
+        // bilinear sum — so no per-channel scaling identity can hold there, for either path.
+        let mul = [wb_r, wb_g, wb_b];
+        let mut worst = 0f32;
+        for y in 2..h - 2 {
+            for x in 2..w - 2 {
+                let i = y * w + x;
+                for c in 0..3 {
+                    let expect = pre[i * 3 + c] as f32 / mul[c];
+                    worst = worst.max((expect - got[i * 3 + c] as f32).abs());
+                }
+            }
+        }
+        assert!(
+            worst <= 1.0,
+            "in-kernel gains diverge from a pre-balanced mosaic by {worst} counts"
+        );
+    }
+
     #[test]
     fn bayer_mhc_interior_split_matches_clamped_reference() {
         // Interior clamp-elision must be byte-identical to the all-clamped reference
@@ -2922,9 +3259,11 @@ mod tests {
                 })
                 .collect();
             for &phase in &[(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
-                let fast = demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
-                let refr = demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
-                assert_eq!(fast, refr, "mismatch w={w} h={h} phase={phase:?}");
+                for gains in test_gain_cases() {
+                    let fast = demosaic_bayer_mhc_gains(&raw, w, h, phase, gains).unwrap();
+                    let refr = demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, gains).unwrap();
+                    assert_eq!(fast, refr, "mismatch w={w} h={h} phase={phase:?} gains={gains:?}");
+                }
             }
         }
     }
@@ -2953,9 +3292,14 @@ mod tests {
                 })
                 .collect();
             for &phase in &[(0u8, 0u8), (0, 1), (1, 0), (1, 1)] {
-                let fast = demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
-                let refr = demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
-                assert_eq!(fast, refr, "avx2 mismatch w={w} h={h} phase={phase:?}");
+                for gains in test_gain_cases() {
+                    let fast = demosaic_bayer_mhc_gains(&raw, w, h, phase, gains).unwrap();
+                    let refr = demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, gains).unwrap();
+                    assert_eq!(
+                        fast, refr,
+                        "avx2 mismatch w={w} h={h} phase={phase:?} gains={gains:?}"
+                    );
+                }
             }
         }
     }
@@ -2982,9 +3326,13 @@ mod tests {
         );
 
         let rgbm = demosaic_rggb_mhc(&raw, w, h).expect("mhc ok");
-        // Updated pin to actual produced by current impl (post-M1 restructure) so guard remains valid.
+        // Re-pinned when B-at-R gained the gradient correction it had always been missing
+        // (it previously took a bare bilinear average of the four diagonal B taps while
+        // R-at-B took the corrected form). Exactly two of the 48 samples move — index 2 and
+        // index 8, the blue channel of the two R sites in row 0 — from 3→2 and 5→4. Both
+        // values were recomputed by hand from the kernel definition, not copied from output.
         let expected_mhc: Vec<u16> = vec![
-            1, 1, 3, 1, 2, 2, 3, 3, 5, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 7, 7, 7, 8, 9, 9, 9, 9, 10,
+            1, 1, 2, 1, 2, 2, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 7, 7, 7, 7, 8, 9, 9, 9, 9, 10,
             11, 11, 11, 11, 12, 12, 13, 13, 13, 13, 12, 13, 14, 15, 15, 15, 14, 16, 16,
         ];
         assert_eq!(

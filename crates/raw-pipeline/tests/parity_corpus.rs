@@ -38,8 +38,20 @@ use std::hash::{Hash, Hasher};
 // Re-pinned 2026-07-08 to the corrected output after intentional, author-validated tone/colour
 // fixes flowed into main via the jul07 aggregation. NOT silent — drift traced to the exact fixes
 // below; verify visually via the S5 golden-approval workflow if in doubt.
-const ORF_RGBA8_HASH: u64 = 0xfb91_a7f3_5549_eaeb; // P1110226.ORF → decode_orf_rgba8 (was 0x8806_8222_77ea_c608; global HIGHLIGHT_KNEE 0.80→0.68 tone fix b1ce12ed)
-const DNG_RGB8_HASH: u64 = 0x7a27_17d8_cdbb_e4c2; //  PXL…dng → process() rgb8 (was 0x3c3f_b141_39ef_ec5c; tone fix b1ce12ed + per-format white-level fix d0a22cc9)
+// Re-pinned 2026-07-28 for the MHC demosaic correctness fix. Two changes moved these,
+// both demosaic-only (no tone/colour math was touched):
+//   1. B-at-R now takes the same gradient correction R-at-B always took. The kernel was
+//      asymmetric under R/B exchange — blue came out blurred where red came out sharpened,
+//      on the same quincunx (see `mhc_red_blue_exchange_invariant`).
+//   2. MHC's cross-channel gradient terms are scaled by the WB ratios, because the mosaic
+//      reaching the demosaic is unbalanced (raw green sits ~1.9× above R/B). dcraw/LibRaw
+//      get this by running scale_colors() before demosaic; we scale in-kernel to keep the
+//      mosaic in its native domain for the denoiser (see `MhcGains`).
+// Validated over the 11-frame Gobabeb corpus, each scored on its own worst-speckle 512²
+// window: green-magenta Nyquist chroma −43% mean, CFA-lattice chroma spread −33% mean,
+// all 11 frames improving on both (bliss/gobabeb-comparison/index.html).
+const ORF_RGBA8_HASH: u64 = 0xda80_8882_dc6b_1e96; // P1110226.ORF → decode_orf_rgba8 (was 0xfb91_a7f3_5549_eaeb; MHC B-at-R + WB-scaled gradients)
+const DNG_RGB8_HASH: u64 = 0x40c9_457b_04b0_b032; //  PXL…dng → process() rgb8 (was 0x7a27_17d8_cdbb_e4c2; same MHC fix)
 // Fixture tier — captured on rustc 1.95.0 from the checked-in mandelbrot assets.
 // tiff8 == exr-display: the EXR is the HDR-linear twin of the same pattern the
 // 8-bit TIFF stores as sRGB, so linear→sRGB8 display reproduces the TIFF exactly

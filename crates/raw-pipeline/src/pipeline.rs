@@ -315,9 +315,24 @@ pub fn validate_pixel_buffer_u16(
 /// Always-applied baselines that emulate Olympus Picture-Mode (Natural).
 /// Without these, raw matrix output looks "flat" relative to the embedded
 /// JPEG.  User look sliders adjust on top.
-const BASELINE_SAT: f32 = 1.30; // chroma scale around luma — tuned to embedded JPEG saturation
+const BASELINE_SAT: f32 = 1.00; // chroma scale around luma — tuned to embedded JPEG saturation
 const BASELINE_CONTRAST: f32 = 0.55; // S-curve blend, [0,1] — tuned to embedded JPEG luma std-dev
-const BASELINE_EXP_EV: f32 = 1.40; // tuned to embedded JPEG luminance
+/// Legacy always-on exposure baseline, now CR2/DNG only (the `baseline_ev` default).
+/// Measured within ±10 mean luma of the Canon embedded JPEGs on the calibration
+/// corpus (tests/highlight_tune.rs fixtures, 2026-07-29), so those formats keep it.
+pub const BASELINE_EXP_EV: f32 = 1.40;
+/// ORF baseline for extended-LOW ISO (< 200). Olympus bodies with native base
+/// ISO 200 shoot "LOW" (64/100) by exposing the sensor ~+1 EV hot and pulling it
+/// back in the JPEG engine; rendering those raws with the native 1.40 baseline is
+/// ~+1 EV over — measured +55 mean luma vs the embedded JPEG on the ISO-100
+/// Gobabeb frames, highlights blown flat (P2200592: 15.3% of frame ≥240 luma vs
+/// the camera's 0.14%) and real green micro-glints railed to saturated green
+/// ("sparkles"). 0.40 lands P2200592 at luma 129.8 vs embedded 130.2, near-white
+/// 0.137% vs 0.136%; the other ISO-100 frames match within −0.4..−2.8 luma.
+/// Native-ISO ORF (≥ 200) keeps [`BASELINE_EXP_EV`]: at 1.40 the ISO-200 frames
+/// sit ~−10 luma vs embedded (P2200500: 123.8 vs 134.1; optimum ≈ 1.6) — a small
+/// pre-existing offset deliberately NOT retuned in the low-ISO fix.
+pub const ORF_LOW_ISO_BASELINE_EXP_EV: f32 = 0.40;
 
 // Luma coeffs (BT.709) hoisted for FMA + ILP in per-pixel apply.
 const LUMA_R: f32 = 0.2126;
@@ -359,6 +374,13 @@ pub struct PipelineParams {
     /// linearised value (< 0.002%), invisible after 8-bit quantisation.
     /// Set `true` for maximum throughput; `false` (default) for bit-exact reproducibility.
     pub compact_lut: bool,
+    /// Always-on exposure baseline (EV) added to `exposure_ev` at tone time.
+    /// Per-format/per-shot: ORF ingest sets [`ORF_LOW_ISO_BASELINE_EXP_EV`] (0.40)
+    /// for extended-LOW ISO (< 200) raws, which the sensor exposes ~+1 EV hot;
+    /// native-ISO ORF and CR2/DNG keep the legacy [`BASELINE_EXP_EV`] default
+    /// (1.40). Any live re-tone path must carry the SAME value the initial decode
+    /// used, or the first slider touch jumps the image ±1 EV.
+    pub baseline_ev: f32,
 }
 
 impl PipelineParams {
@@ -384,6 +406,7 @@ impl PipelineParams {
             clarity: 0.0,
             perceptual_constancy: false,
             compact_lut: false,
+            baseline_ev: BASELINE_EXP_EV,
         }
     }
 }
@@ -1838,7 +1861,7 @@ struct ToneInputs {
 }
 
 fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
-    let exp_gain = 2f32.powf((params.exposure_ev + BASELINE_EXP_EV).clamp(-3.0, 4.0));
+    let exp_gain = 2f32.powf((params.exposure_ev + params.baseline_ev).clamp(-3.0, 4.0));
     let temp = params.temp.clamp(-1.0, 1.0);
     let tint = params.tint.clamp(-1.0, 1.0);
     let wb_r = params.wb_r * (1.0 + temp * 0.40) * (1.0 + tint * 0.10);
@@ -4224,6 +4247,7 @@ mod tonemap_flip_flops {
             clarity: 0.0,
             perceptual_constancy: false,
             compact_lut: false,
+            baseline_ev: BASELINE_EXP_EV,
         };
 
         // Support graphing stabilization: print CSV + running stats. 30 is often excessive; bench shows signal settles ~8-12.

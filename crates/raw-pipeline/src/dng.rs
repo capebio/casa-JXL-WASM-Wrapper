@@ -2148,6 +2148,9 @@ pub(crate) fn decode_bytes_demosaiced_impl(
     let wb_r = wb_g_neutral / wb_r_neutral.max(1e-6);
     let wb_g = 1.0;
     let wb_b = wb_g_neutral / wb_b_neutral.max(1e-6);
+    // The mosaic reaching the demosaic is unbalanced, so MHC's cross-channel gradient
+    // terms must be scaled by the WB ratios it will later be corrected with. See `MhcGains`.
+    let band_gains = demosaic::MhcGains::from_wb(wb_r, wb_g, wb_b);
     let black = raw.black_level.unwrap_or(0);
     let white = raw.white_level.unwrap_or(16383);
     let color_matrix = choose_camera_to_srgb_matrix(
@@ -2177,7 +2180,13 @@ pub(crate) fn decode_bytes_demosaiced_impl(
         }
         let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let t1 = Instant::now();
-        let rgb = demosaic::demosaic_bayer_mhc(&img.raw, img.width, img.height, cfa_phase(img.cfa))
+        let rgb = demosaic::demosaic_bayer_mhc_gains(
+            &img.raw,
+            img.width,
+            img.height,
+            cfa_phase(img.cfa),
+            demosaic::MhcGains::from_wb(img.wb_r, img.wb_g, img.wb_b),
+        )
             .map_err(|e| anyhow!("demosaic: {}", e))?;
         let demosaic_ms = t1.elapsed().as_secs_f64() * 1000.0;
         return Ok(DngDemosaiced {
@@ -2216,7 +2225,13 @@ pub(crate) fn decode_bytes_demosaiced_impl(
             let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
             let t1 = Instant::now();
             let rgb =
-                demosaic::demosaic_bayer_mhc(&img.raw, img.width, img.height, cfa_phase(img.cfa))
+                demosaic::demosaic_bayer_mhc_gains(
+            &img.raw,
+            img.width,
+            img.height,
+            cfa_phase(img.cfa),
+            demosaic::MhcGains::from_wb(img.wb_r, img.wb_g, img.wb_b),
+        )
                     .map_err(|e| anyhow!("demosaic: {}", e))?;
             let demosaic_ms = t1.elapsed().as_secs_f64() * 1000.0;
             return Ok(DngDemosaiced {
@@ -2355,7 +2370,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
             let south_top = &ctx[band_off..band_off + c_halo * width];
             let south_off = (c_halo + c_halo) * width;
             c_ctx[south_off..south_off + c_halo * width].copy_from_slice(south_top);
-            demosaic::demosaic_rggb_mhc_band(
+            demosaic::demosaic_rggb_mhc_band_gains(
                 &c_ctx,
                 width,
                 c_h,
@@ -2363,6 +2378,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
                 carried_g0,
                 0,
                 c_halo,
+                band_gains,
                 &mut rgb[(rgb_write_row * width * 3)..],
             )
             .map_err(|e| anyhow!("demosaic carried: {}", e))?;
@@ -2375,7 +2391,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
             row_h.saturating_sub(halo)
         };
         if safe > 0 {
-            demosaic::demosaic_rggb_mhc_band(
+            demosaic::demosaic_rggb_mhc_band_gains(
                 &ctx,
                 width,
                 ctx_h,
@@ -2383,6 +2399,7 @@ pub(crate) fn decode_bytes_demosaiced_impl(
                 row_start,
                 0,
                 safe,
+                band_gains,
                 &mut rgb[(rgb_write_row * width * 3)..],
             )
             .map_err(|e| anyhow!("demosaic band: {}", e))?;

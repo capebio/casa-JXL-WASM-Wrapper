@@ -1217,7 +1217,7 @@ pub fn bench_decode_orf(data: &[u8]) -> Result<DecodeBench> {
     let decompress_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = std::time::Instant::now();
-    let _rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
+    let _rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
     let demosaic_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     Ok(DecodeBench {
@@ -1242,6 +1242,15 @@ pub struct PipelineBench {
     pub orientation_ms: f64,
     pub width: u32,
     pub height: u32,
+}
+
+/// Cross-channel MHC gains matching the `default_olympus()` white balance these
+/// helpers render with. The mosaic they demosaic is unbalanced, so the gradient
+/// corrections must be scaled by the same ratios the tone pass will apply — see
+/// [`crate::demosaic::MhcGains`].
+fn olympus_default_gains() -> crate::demosaic::MhcGains {
+    let p = crate::pipeline::PipelineParams::default_olympus();
+    crate::demosaic::MhcGains::from_wb(p.wb_r, p.wb_g, p.wb_b)
 }
 
 /// Time parse + decompress + demosaic + tone (pipeline::process) + orientation
@@ -1269,7 +1278,7 @@ pub fn bench_pipeline_orf(data: &[u8]) -> Result<PipelineBench> {
     let decompress_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let t = std::time::Instant::now();
-    let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
+    let rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
     let demosaic_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     let params = crate::pipeline::PipelineParams::default_olympus();
@@ -1310,7 +1319,7 @@ pub fn bench_tone_split_orf(data: &[u8]) -> Result<(f64, f64)> {
         .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
-    let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
+    let rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
     let params = crate::pipeline::PipelineParams::default_olympus();
     Ok(crate::pipeline::bench_tone_split(&rgb16, &params))
 }
@@ -1336,8 +1345,11 @@ pub fn decode_orf_rgba8(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
         .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
-    let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
-    let params = crate::pipeline::PipelineParams::default_olympus();
+    let rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
+    let mut params = crate::pipeline::PipelineParams::default_olympus();
+    if info.iso.is_some_and(|i| i < 200) {
+        params.baseline_ev = crate::pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
+    }
     let rgba8 = crate::pipeline::process_rgba(&rgb16, &params);
     Ok((rgba8, info.width, info.height))
 }
@@ -1360,7 +1372,7 @@ pub fn bench_tone_e2e_orf(data: &[u8]) -> Result<(f64, f64, u8, usize)> {
         .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
-    let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
+    let rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
     let params = crate::pipeline::PipelineParams::default_olympus();
     let n = rgb16.len();
     let mut a = vec![0u8; n];
@@ -1408,7 +1420,7 @@ pub fn bench_tone_stage_3way_orf(data: &[u8]) -> Result<(f64, f64, f64)> {
         .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
-    let rgb16 = crate::demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| anyhow!("{e}"))?;
+    let rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
     let params = crate::pipeline::PipelineParams::default_olympus();
     Ok(crate::pipeline::bench_tone_stage_3way(&rgb16, &params))
 }

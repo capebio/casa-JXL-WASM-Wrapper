@@ -479,6 +479,13 @@ pub struct ProcessResult {
     /// ~3.7× over-exposure. Twin of `black_used`.
     #[wasm_bindgen(readonly)]
     pub white_used: u16,
+    /// Exposure baseline (EV) the pipeline rendered with (per-shot: ORF at
+    /// extended-LOW ISO 0.40, everything else legacy 1.40 — see
+    /// `pipeline::ORF_LOW_ISO_BASELINE_EXP_EV`). A live LookRenderer built outside
+    /// the take_*_renderer seams must be given this same value or the first
+    /// slider touch jumps the preview ±1 EV.
+    #[wasm_bindgen(readonly)]
+    pub baseline_ev_used: f32,
     #[wasm_bindgen(readonly)]
     pub color_matrix_from_mn: bool,
     make: String,
@@ -874,6 +881,7 @@ impl ProcessResult {
             false,
             self.black_used,
             self.white_used,
+            self.baseline_ev_used,
         )
     }
 
@@ -890,6 +898,7 @@ impl ProcessResult {
             false,
             self.black_used,
             self.white_used,
+            self.baseline_ev_used,
         )
     }
 }
@@ -1478,6 +1487,9 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
 
             let mut params = pipeline::PipelineParams::default_olympus();
             params.black = OLYMPUS_BLACK_LEVEL;
+            if info.iso.is_some_and(|i| i < 200) {
+                params.baseline_ev = pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
+            }
             if let Some(r) = info.wb_r {
                 params.wb_r = r;
             }
@@ -1588,6 +1600,12 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
     // contrast/darkness. 256 is the canonical Olympus 12-bit pedestal — validated on
     // E-M1 Mark III; other bodies share this floor but were not individually checked.
     params.black = OLYMPUS_BLACK_LEVEL;
+    // Extended-LOW ISO (< 200) raws are exposed ~+1 EV hot and pulled back by the
+    // camera; without the pull our render blows highlights and rails green glints.
+    // Native ISO keeps the legacy baseline. See pipeline::ORF_LOW_ISO_BASELINE_EXP_EV.
+    if info.iso.is_some_and(|i| i < 200) {
+        params.baseline_ev = pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
+    }
     // Trust camera WB_RBLevels (ImageProcessing 0x0100 / MakerNote 0x1017/1018/1029)
     // unconditionally.  This is the calibration the in-camera JPEG uses, so
     // matching it gives colour fidelity to the embedded preview.  Gray-world
@@ -1716,16 +1734,26 @@ fn finish_from_raw(
     _iso: u32,
     output_flags: u32,
 ) -> Result<FinishOutputs, JsError> {
-    // MHC (quality) demosaic — full-res interleaved RGB16.
-    let t = now_ms();
-    let mut rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).map_err(|e| JsError::new(&e))?;
-    let demosaic_ms = now_ms() - t;
-    drop(raw);
-
-    // Apply the look to the camera-derived params (WB override + LR sliders).
+    // Apply the look FIRST: it can override white balance, and the demosaic needs the final
+    // multipliers to scale its cross-channel gradient terms (see `MhcGains`).
     apply_look_to_params(&mut params, look);
     let wb_r_used = params.wb_r;
     let wb_b_used = params.wb_b;
+
+    // MHC (quality) demosaic — full-res interleaved RGB16. The mosaic is still in the
+    // sensor's native domain (unbalanced), so MHC gets the WB-derived gains; without them
+    // its cross-channel corrections run ~1.9x hot on R/B and ~0.5x cold on G, which is
+    // lattice-locked and shows up as green speckle on high-frequency subjects.
+    let t = now_ms();
+    let mut rgb16 = demosaic::demosaic_rggb_mhc_gains(
+        &raw,
+        w,
+        h,
+        demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+    )
+    .map_err(|e| JsError::new(&e))?;
+    let demosaic_ms = now_ms() - t;
+    drop(raw);
 
     let want_full16 = output_flags & OUT_FULL_16 != 0;
     let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
@@ -1890,18 +1918,25 @@ fn finish_dng_from_raw(
     baseline_exposure: f32,
     output_flags: u32,
 ) -> Result<FinishOutputs, JsError> {
-    // MHC (quality) demosaic — full-res interleaved RGB16, honouring the CFA phase.
-    let t = now_ms();
-    let mut rgb16 = demosaic::demosaic_bayer_mhc(&raw, w, h, phase)
-        .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
-    let demosaic_ms = now_ms() - t;
-    drop(raw);
-
-    // Apply the baseline-folded look to the camera-derived params (WB override + sliders).
+    // Apply the baseline-folded look FIRST: it can override white balance, and the demosaic
+    // needs the final multipliers to scale its cross-channel gradient terms (see `MhcGains`).
     let folded = look_with_baseline(look, baseline_exposure);
     apply_look_to_params(&mut params, &folded);
     let wb_r_used = params.wb_r;
     let wb_b_used = params.wb_b;
+
+    // MHC (quality) demosaic — full-res interleaved RGB16, honouring the CFA phase.
+    let t = now_ms();
+    let mut rgb16 = demosaic::demosaic_bayer_mhc_gains(
+        &raw,
+        w,
+        h,
+        phase,
+        demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+    )
+    .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
+    let demosaic_ms = now_ms() - t;
+    drop(raw);
 
     let want_full16 = output_flags & OUT_FULL_16 != 0;
     let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
@@ -2039,6 +2074,7 @@ fn process_orf_impl(
     // look; capture them before `params` is moved into the finish / retain path.
     let black_used = params.black;
     let white_used = params.white;
+    let baseline_ev_used = params.baseline_ev;
 
     // Previews (already built in decode_orf_raw) are surfaced per requested flags.
     let (rgb16_lb, out_lb_w, out_lb_h) = if output_flags & OUT_LIGHTBOX != 0 {
@@ -2178,6 +2214,7 @@ fn process_orf_impl(
         wb_b_used,
         black_used,
         white_used,
+        baseline_ev_used,
         color_matrix_from_mn,
         make: info.make,
         model: info.model,
@@ -2415,10 +2452,21 @@ pub fn process_orf_with_options(
     };
     // cfa_index 0 = RGGB (Olympus is always RGGB).
     let cfa_index = 0usize;
-    // Demosaic the raw to produce the MHC baseline.
+    // Demosaic the raw to produce the MHC baseline. The mosaic is unbalanced here (and stays
+    // that way — `run_denoise_on_rgb16` below reads it against the black/white levels above),
+    // so MHC gets the WB-derived cross-channel gains instead. See `MhcGains`.
     let t_dem = now_ms();
-    let rgb16 = demosaic::demosaic_rggb_mhc(&decoded.raw, w, h)
-        .map_err(|e| JsError::new(&format!("ORF demosaic: {}", e)))?;
+    let rgb16 = demosaic::demosaic_rggb_mhc_gains(
+        &decoded.raw,
+        w,
+        h,
+        demosaic::MhcGains::from_wb(
+            decoded.params.wb_r,
+            decoded.params.wb_g,
+            decoded.params.wb_b,
+        ),
+    )
+    .map_err(|e| JsError::new(&format!("ORF demosaic: {}", e)))?;
     let demosaic_ms = now_ms() - t_dem;
     let (tel, denoised_rgb16) = run_denoise_on_rgb16(
         &decoded.raw,
@@ -3035,6 +3083,7 @@ pub fn apply_look(
     tint: f32,
     texture: f32,
     clarity: f32,
+    baseline_ev: Option<f32>,
 ) -> Result<Vec<u8>, JsError> {
     let w = width as usize;
     let h = height as usize;
@@ -3065,6 +3114,11 @@ pub fn apply_look(
             }
         }
         params.color_matrix = Some(m).into();
+    }
+    // Per-format exposure baseline from the initial decode (`baseline_ev_used`);
+    // `undefined` from legacy callers keeps the pre-split 1.40.
+    if let Some(b) = baseline_ev.filter(|b| b.is_finite()) {
+        params.baseline_ev = b;
     }
     raw_pipeline::pipeline::apply_look_params(
         &mut params,
@@ -3644,6 +3698,10 @@ pub struct LookRenderer {
     // normalises by this; without it CR2/DNG 14-bit previews blow out under the
     // Olympus 4095 default (~3.7× over-exposure).
     white: u16,
+    // Per-shot exposure baseline (ORF extended-LOW ISO 0.40, else legacy 1.40).
+    // render() must apply the same baseline the initial decode used or slider
+    // edits jump ±1 EV.
+    baseline_ev: f32,
 }
 
 impl LookRenderer {
@@ -3668,6 +3726,7 @@ impl LookRenderer {
         apply_rotation: bool,
         black: u16,
         white: u16,
+        baseline_ev: f32,
     ) -> LookRenderer {
         let w = width as usize;
         let h = height as usize;
@@ -3691,6 +3750,7 @@ impl LookRenderer {
             color_matrix,
             black,
             white,
+            baseline_ev,
         }
     }
 }
@@ -3720,6 +3780,7 @@ impl LookRenderer {
             true,
             0,
             0,
+            None,
         )
     }
 
@@ -3737,6 +3798,7 @@ impl LookRenderer {
         apply_rotation: bool,
         black: u16,
         white: u16,
+        baseline_ev: Option<f32>,
     ) -> Result<LookRenderer, JsError> {
         let w = width as usize;
         let h = height as usize;
@@ -3774,6 +3836,11 @@ impl LookRenderer {
             pipeline::CAM_TO_SRGB
         };
         let rgb16 = unpack_rgb16_le(rgb16_bytes);
+        // `undefined` from legacy JS callers → the pre-split 1.40; the app path passes
+        // `baseline_ev_used` from the decode so ORF re-tones match the initial render.
+        let baseline_ev = baseline_ev
+            .filter(|b| b.is_finite())
+            .unwrap_or(pipeline::BASELINE_EXP_EV);
         Ok(Self {
             rgb16,
             width: w,
@@ -3783,6 +3850,7 @@ impl LookRenderer {
             color_matrix,
             black,
             white,
+            baseline_ev,
         })
     }
 
@@ -3834,6 +3902,9 @@ impl LookRenderer {
         if self.white > self.black {
             params.white = self.white;
         }
+        // Same per-format exposure baseline as the initial decode (ORF 0.40 vs the
+        // legacy 1.40) — else the first slider touch jumps the preview ±1 EV.
+        params.baseline_ev = self.baseline_ev;
         if wb_r.is_finite() && wb_r > 0.0 {
             params.wb_r = wb_r;
         }
@@ -4532,6 +4603,7 @@ fn process_dng_impl(
             wb_b_used: reported.wb_b,
             black_used: params.black,
             white_used: params.white,
+            baseline_ev_used: params.baseline_ev,
             color_matrix_from_mn: params.color_matrix.to_option().is_some(),
             make,
             model,
@@ -4722,6 +4794,7 @@ fn process_dng_impl(
         wb_b_used: params.wb_b,
         black_used: params.black,
         white_used: params.white,
+        baseline_ev_used: params.baseline_ev,
         color_matrix_from_mn: params.color_matrix.to_option().is_some(),
         make,
         model,
@@ -6776,6 +6849,9 @@ impl ResidentDeveloped {
             false,
             0,
             0,
+            // Developed (non-RAW) pixels keep the legacy baseline — byte-identical to
+            // the worker path, whose new_with_options call omits the arg.
+            pipeline::BASELINE_EXP_EV,
         )
     }
 
@@ -6795,7 +6871,17 @@ impl ResidentDeveloped {
             dw as usize,
             dh as usize,
         );
-        LookRenderer::from_packed_le(packed, dw, dh, 1, &IDENTITY_COLOR_MATRIX, false, 0, 0)
+        LookRenderer::from_packed_le(
+            packed,
+            dw,
+            dh,
+            1,
+            &IDENTITY_COLOR_MATRIX,
+            false,
+            0,
+            0,
+            pipeline::BASELINE_EXP_EV,
+        )
     }
 
     /// Compatibility ESCAPE HATCH (finding 58): move the packed linear RGB16-LE full
