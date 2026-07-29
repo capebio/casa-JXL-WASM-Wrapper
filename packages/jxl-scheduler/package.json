@@ -19,6 +19,9 @@
   "dependencies": {
     "@casabio/jxl-core": "^0.1.0"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "typescript": "5.5.4",
     "@types/node": "^22.12.0"

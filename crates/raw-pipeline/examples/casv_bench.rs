@@ -94,6 +94,13 @@ fn main() {
     show(format!("bbox g{gop}"), &bbox, e_bbox);
     show(format!("tile g{gop} t{tile}"), &tiled, e_tile);
 
+    // --- FableBraid lossless tier (braided-rANS) ---
+    let t = Instant::now();
+    let fable = raw_pipeline::casa_video::encode_casv_fable_rgb8(&refs, w, h, 24, 1, gop)
+        .expect("fable encode");
+    let e_fable = ms(t);
+    show(format!("fable g{gop}"), &fable, e_fable);
+
     // --- lossy tier (distance 1.0): all-intra vs fresh-pixel replace-skip ---
     println!("\nlossy tier (distance 1.0), decode = playback:");
     println!(

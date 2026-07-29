@@ -14,6 +14,8 @@ This is the catalogue of what shipped and why it matters. It is written to one r
 - [4. Decode and Viewer Pipeline](#4-decode-and-viewer-pipeline) — the browser decode stack and gallery
 - [5. The Compression Engine](#5-the-compression-engine) — the byte-exact speed campaign
 - [6. Reliability, Memory and Build Infrastructure](#6-reliability-memory-and-build-infrastructure) — the parts that hold it together
+- [7. BLISS: Instant Local Preview Cache](#7-bliss-instant-local-preview-cache) — the OPFS instant-preview codec and three-format model
+- [8. The Web Application](#8-the-web-application) — the gallery, editor, export, timelapse and ID product layer
 - [How We Keep Ourselves Honest](#how-we-keep-ourselves-honest) — the method, in full
 
 ## At a Glance
@@ -30,6 +32,11 @@ This is the catalogue of what shipped and why it matters. It is written to one r
 | **9×** | image-quality scoring, exact same numbers (lookup table) | [§ 4](#4-decode-and-viewer-pipeline) |
 | **70 → 36 MB** | Canon CR2 peak decode memory (crop in place) | [§ 3](#3-raw-decode-pipeline) |
 | **~103** | byte-exact compression-engine passes — same bytes out, only faster | [§ 5](#5-the-compression-engine) |
+| **~10×** | BLISS cached-preview decode vs cold RAW re-decode (codec time, scalar WASM) | [§ 7](#7-bliss-instant-local-preview-cache) |
+| **multi-GB** | gigapixel scans panned as 512-px JXL tiles — viewport-only decode, never the whole frame | [§ 4](#4-decode-and-viewer-pipeline) |
+| **−74…98%** | browser-decode boundary waste removed (owned-copy / final flush / input memcpy) | [§ 4](#4-decode-and-viewer-pipeline) |
+| **opt-in** | noise-aware RAW denoise from a measured sensor model, never an ISO guess | [§ 3](#3-raw-decode-pipeline) |
+| **8 formats** | browser ingest beyond RAW+JXL — PNG/JPEG/GIF/WebP/AVIF/TIFF/EXR, bit-depth aware | [§ 3](#3-raw-decode-pipeline) |
 
 ## How to Read This
 
@@ -204,6 +211,30 @@ This is the core: Olympus ORF, Canon CR2, and phone DNG turned into finished pix
 
 Tonemapping was 45–55% of in-browser RAW decode and ran fully scalar on the WASM SIMD128 path. A ~60-line `f32x4` body with fallback routing halves it. Measured on 8 real RAW files: **average decode 1815 → 992 ms (−45%)**, tonemap kernel 942 → 429 ms (−54%). Because the same path backs every editor slider, every lightbox exposure or white-balance tweak got cheaper too. The largest RAW-decode speedup on record.
 
+### Noise-Aware RAW Denoise — Measured Sensor Model, Not an ISO Guess (2026-07-10 → 07-13)
+
+*Files: `crates/raw-pipeline/src/denoise/{mod,estimate,calibrate,vst,bm3d,classical,policy,profiles,score,dng_tags}.rs`, `src/denoise_session.rs`, `src/denoise_options.rs`, `tools/denoise-benchmark.mjs`, `docs/denoise/validation.md`*
+
+**opt-in** (`denoise.enabled`, default off). Older sensors are noisy even at ISO 200–400, and the old pipeline reached for a crude implicit ISO-to-Gaussian blur that had no idea what the sensor actually did. The replacement resolves a *heteroscedastic* per-CFA noise model — `Var[n_c | x] = S_c·x + O_c` — from the best source available, tried in order: the DNG `NoiseProfile` tag, a measured per-camera profile, a robust single-image fit, and only then an ISO fallback. That model plus the image histogram becomes one display-referred noise score, and a strict policy gate decides whether to act. **Camera release year is deliberately never a trigger** — the coefficients decide, not the calendar. When it fires, a noise-conditioned learned joint denoise/demosaic residual model runs on WebGPU (≤ 8 MiB FP16 artifact, 320×320 tiles with a 32-px halo committing a 256×256 core), with a deterministic variance-stabilized BM3D fallback in Rust/WASM. Tone, colour, texture, clarity and sharpening all remain strictly downstream. The disabled and below-threshold paths run **no** kernel and are byte-identical to the no-denoise oracle — so turning the feature off costs exactly nothing.
+
+### RAW Metadata and Colour Truth Preserved (findings 50–52) (2026-07-11)
+
+*Files: `crates/raw-pipeline/src/{cr2,dng}.rs`, `src/lib.rs`, `crates/raw-pipeline/tests/raw_metadata_colour.rs`, `examples/drift_report.rs`*
+
+Three honesty fixes to what a decode reports about itself. **(50)** The DNG streaming-preview carrier used to drop `datetime` and GPS; it now matches the full-decode struct field-for-field, so a Pixel capture keeps its date and coordinates through the fast path. **(51)** `wb_from_camera` was hardcoded `true` even when white balance had silently fallen back to a grey default — it now truthfully reports whether WB came from camera metadata (Canon MakerNote `0x4001` / DNG `AsShotNeutral`) or a fallback. **(52)** CR2 preview and final render used *two different* colour matrices (Olympus-generic vs. Canon-generic), which produced a visible colour jump the instant you touched a slider; both now resolve through one `cr2::resolved_color_matrix`. The colour change was measured and owner-approved via a native drift harness (`examples/drift_report.rs`), not waved through. *(Commit `dbfd3e1c`, merge `982b9d48`.)*
+
+### DNG Deferred Final Development — Decode the Container Once (finding 34) (2026-07-13)
+
+*Files: `src/lib.rs` (`finish_dng_from_raw`), `crates/raw-pipeline/tests/dng_deferred_finish.rs`*
+
+DNG now mirrors the proven two-phase ORF flow: walk the TIFF and un-decompress the LJPEG mosaic **once**, show a preview, then finish the full-resolution demosaic + tone from the *retained* raw mosaic, CFA phase and `BaselineExposure` — with no second container decode. The regression gate asserts `decode_count() == 1` and byte-parity against the naive decode-twice path on real Pixel DNGs (including a GPS/`BaselineExposure` night fixture); the retained working set is **18.9 MiB** for a 3628×2732 u16 mosaic. *(Commits `f37df827`, `41d7c510`, merge `db68ca8e`.)*
+
+### Multi-Format Ingestion — TIFF / EXR + Browser SDR, Bit-Depth Aware (PR #8) (2026-06-23)
+
+*Files: `crates/raw-pipeline/src/image_formats.rs` (`decode_exr`, `decode_tiff`, `f32_linear_to_srgb8`), `crates/raw-pipeline/tests/image_formats_roundtrip.rs`, `web/format-detect.js`, `web/multi-format-roundtrip.test.mjs`*
+
+**browser-only.** A field user can now drop far more than RAW and JXL: **PNG, JPEG, GIF, WebP, AVIF, TIFF and EXR**, each handled at its true bit depth. Ordinary SDR formats route through the browser's own `createImageBitmap` (no new dependencies; AVIF follows native browser support). High-bit-depth formats get pure-Rust decoders over the `image` crate already in the tree — `decode_exr` preserves **f32** linear HDR (values above 1.0 survive), `decode_tiff` handles general u8/u16 RGB TIFF (distinct from the Bayer `tiff.rs`). `exr` was verified to cross-compile to `wasm32`; `avif`/dav1d was dropped from the crate precisely because it won't (and the browser decodes AVIF natively anyway). A magic-byte `detectFormat` dispatcher routes each upload, disambiguating RAW TIFF-containers (ORF/DNG/CR2) by extension. Verified in-browser end to end via Playwright under COOP/COEP on a synthetic HDR EXR.
+
 ### Canon CR2 Crop Rectangle Fixed (2026-07-02)
 
 *Files: `crates/raw-pipeline/src/cr2.rs`*
@@ -289,6 +320,32 @@ A small housekeeping cleanup was also made in the colour-and-tone engine these t
 ## 4. Decode and Viewer Pipeline
 
 The browser decode stack — worker pool, scheduler, progressive paint, and the gallery that sits on top.
+
+### ★ Gigapixel Tiling — Pan a Multi-Gigabyte Scan Without Decoding It (JXTC)
+
+*Files: `packages/jxl-pyramid/src/tiling.ts`, `plan.ts`, `tiled-decode-pool.ts`, `decode-level.ts`; writers at `packages/jxl-wasm/src/bridge.cpp` and the Rust `build_jxtc` helpers*
+
+A whole-frame JXL is the wrong shape for a specimen scan that is tens of thousands of pixels on a side — decoding it means holding the entire image in memory just to look at one corner. When ingest sees a *massive* top level — **long edge > 8000 px or > 40 megapixels** — it replaces the whole-frame encode with a **JXTC container**: the image sliced into independent **512×512** JXL tiles behind a 32-byte header and an offset/length index table. From then on the viewer only ever touches the tiles that intersect the current viewport. `tilesOverlappingRegion` computes the tile-aligned intersection of a pan/zoom rectangle with the grid; `extractTileBitstream` returns a **zero-copy `subarray`** view of exactly one tile's standalone JXL bytes (the tile index table is parsed once per container and memoised in a `WeakMap`, so every subsequent extract is an array lookup, not a fresh `DataView` walk). The result: panning and zooming across a multi-gigabyte image costs a handful of small tile decodes per frame instead of one enormous one, and peak memory tracks the viewport, not the file.
+
+Two properties make it safe and fast in the field. **Parallelism doesn't need special headers** (finding 82): per-tile decode fans out across workers in *any* browser that exposes `Worker` — cross-origin isolation is not required, and gating the whole parallel path on `crossOriginIsolated` (as an earlier version did) silently downgraded every non-isolated browser to single-threaded. Isolation only unlocks the opt-in `SharedArrayBuffer` zero-copy carrier for the container bytes; without it the bytes are transferred or copied per worker, still fully parallel. And the parser treats the container as **untrusted**: adversarial dimensions, tile counts and offsets are all bounds-checked (a tile offset landing inside the header/index region, or `off + len` running past EOF, is rejected with overflow-safe arithmetic — never `off + len`, which wraps in a wasm32 `size_t`; see finding 60 on the absolute-offset convention that an earlier reader double-counted).
+
+### Decode-Throughput Lateral Wins — Boundary Waste, Not Kernel Work (2026-07-12)
+
+*Files: `packages/jxl-worker-browser/src/decode-handler.ts`, `packages/jxl-wasm/src/bridge.cpp`, `src/lib.rs`; design + evidence in `docs/Grok-decode-speed-lateral-2026-07-12.md`*
+
+A sweep that left the decode kernel completely untouched and only removed waste at the seams — each change gated by an interleaved flip-flop on a real photo. **(1)** When the facade hands back an *owned* typed array (`byteOffset === 0`, full buffer), the worker now transfers it instead of `.slice()`-copying it — **~74% off** that step at 16 MP (45.8 → 6.2 ms); sub-views still slice, so progressive is unchanged. **(2)** The opportunistic `JxlDecoderFlushImage` + output-buffer `memset` are now gated on `progressive_detail != 0`, so a final-only decode skips work it never used — **~86% off** that stage at 20.5 MP (7.6 → 1.0 ms); every progressive checkpoint contract is preserved. **(3)** `JxlDecoderSetInput` now points straight at the caller's WASM-heap bytes (with promote-on-return for any unconsumed tail) instead of a defensive `memcpy` — **~98% off** input handling on a real JXL. **(4)** The RGB8 output vec is `with_capacity` + `set_len` rather than zero-filled. All four are outcome-preserving; the aligned decoder-runner rebuild also shrank the `simd-mt` WASM artifact by ~50 KB. *(Commits `7453e9e9`, `a94e846a`, `be678133`, `f99b0010`, baselines `172ee86c`.)*
+
+### Advanced JXL Encoder Settings + Real Extra Channels (findings 18–19) (2026-07)
+
+*Files: `packages/jxl-wasm/src/bridge.cpp`, `packages/jxl-wasm/src/facade.ts`, `exports-enc.txt`*
+
+Two encoder capabilities that were quietly no-ops became real. **(18)** `advancedFrameSettings` used to be silently dropped; there is now a generic `jxl_wasm_enc_set_frame_setting(id, value)` ABI that queues each `(id, value)` and applies it verbatim through `JxlEncoderFrameSettingsSetOption` at finish. There is deliberately **no id switch** in C++ or JS — libjxl is the single validator, and an unknown or unsupported id is rejected with a nonzero code that surfaces as a deterministic thrown error rather than a silent drop. **(19)** Extra channels became real: the descriptor grew 20 → 48 bytes to carry `dim_shift`, channel name and spot colour, `encodeWithExtraChannels()` applies them (names included), and a decode helper reads the descriptors back for round-trip verification. *(Commit `9037409d`; dist rebuild `50f747c5`.)*
+
+### Perceptual + Scale-Aware Progressive Manifest (PR #9) (2026-06-26)
+
+*Files: `packages/jxl-progressive/*`*
+
+The progressive manifest now carries a **measured perceptual score per tier** and a **display-scale frontier**: a small render fetches and decodes fewer bytes because a pass that is insufficient at native resolution can be sufficient downscaled. An offline profiler captures per-pass pixels and does threshold-driven tier selection; the metric is consume-time selectable (SSIM eager, Butteraugli lazy), served through a lazy cache-or-build service that dedups concurrent builds, with an authoritative edge resolver because a client Range request is only a hint and premium gating must be enforced server-side. A `capBytesForDisplay` gallery helper caps decode bytes by display size. 117 package tests green. *(Found-and-fixed along the way: an identical-pass `psnr = Infinity` that had to be clamped to finite JSON.)*
 
 ### Warm-Start the Decode Stack — Prewarm WASM (TTFP) (2026-07-02)
 
@@ -490,6 +547,16 @@ The rolling campaign's parked perf branches are folded onto two clean heads — 
 
 Closed a set of silent failures that only surfaced under concurrency: session-id poisoning by a stale successor; a generation race clobbering a new session's chunks with old data; a worker crash masquerading as a graceful `exit(0)` (now surfaced as `WorkerCrashed`); and a `pause` that actually waits for the worker rather than fire-and-forgetting.
 
+### jxl-native — Genuinely Incremental N-API Streaming (finding 20) (2026-07)
+
+*Files: `packages/jxl-native/native.cc`*
+
+The Node-native decoder used to materialize everything at `close()`; it now streams. A persistent `LiveDecodeState` runs `JxlDecoderProcessInput` as far as the accumulated bytes allow, queueing header / progress / frame / final events into a bounded FIFO as they are produced — so a consumer sees the header and progress events *before* the stream is closed. Backpressure is real: `push()` returns a promise that parks when undrained depth hits the high-water mark (8) and resolves once the consumer drains below it, so the producer stops accepting work and retained memory is bounded by (HWM events) + one active frame buffer. N-API refs pin the image-out and held animation-frame buffers across native calls. *(Commits `cae24c8a`, test `9d883db6`, merge `1b223413`.)*
+
+### Dependency Security Hygiene — Dependabot, Kept Honest (ongoing)
+
+The tree is watched by Dependabot and the alerts are triaged, not rubber-stamped. The `jxl-oxide` bump `0.11 → 0.12` clears three advisories including **`jxl-grid` HIGH (CVE-2026-52834)** — and the PR states the honest scope: `jxl-oxide` is a `[dev-dependency]` used by exactly one `#[cfg(feature = "jxl-codec")]` test that decodes what our own encoder just produced, so it is **not in shipped code and has no untrusted-input path** — dependency hygiene, not a live-vulnerability patch. A parallel effort greened the trunk: strict-TS `typecheck` fixes took the workspace from failing at package #8 to **15 of 16 packages clean**, with `jxl-pyramid` at 209/0 tests. *(PRs #19, #21; earlier `#10` superseded by #21.)*
+
 ### Branch-Consolidation Audit — 29-Agent Read-Only Pass (2026-07-01)
 
 A 29-agent read-only workflow audited 27 parked perf branches into a merge-order plan — and *debunked* a phantom `jxl_casaencoder` "corruption on realloc" concern with a TDD characterization test that passes cleanly on unmodified `main`. (Grounding: memory-only — the ledger lives in an external worktree.)
@@ -510,6 +577,79 @@ A 29-agent read-only workflow audited 27 parked perf branches into a merge-order
 
 - **CASAVA "JXL as a video codec" design doc** (`docs/superpowers/specs/2026-07-01-jxl-video-codec-design.md`). A JXL transform + entropy backend with a pluggable prediction front-end. The codec is largely shipped (see § 1); this doc is the rationale and forward roadmap. Honest non-goals: no hardware decode; won't beat VVC/AV1 on high-motion.
 - **"The CasaWASM Media Engine" — JOSE wins paper** (`C:\Foo\Jose\Features and Wins\`, HTML + LaTeX + PDF). 20 performance / 10 memory / 10 feature wins. Opus audio is presented there as designed-not-yet-coded. (Grounding: memory-only — the artifact lives outside this repo.)
+
+---
+
+## 7. BLISS: Instant Local Preview Cache
+
+CasaWASM runs on a deliberate **three-format model**, and BLISS is the piece that lets a re-opened gallery paint from cache instead of stalling. JXL is the archival and delivery format (effort-3, ~8 MB, server → CDN → client). CASV/BLTV are the video formats. **BLISS** is the odd one out: a codec that never touches the network and exists only to *decode* a preview from the local OPFS cache far faster than the RAW file could be re-decoded.
+
+*Files: `src/bliss_wasm.rs`, `src/bltv_wasm.rs`, `web/bliss-worker.js`, `web/main.js`, `web/bltv-player.html`, `web/bltv-worker.js`; codec in the sibling `C:\Foo\bliss` workspace (`bliss-core`, `bltv`). Integration merged as PR #22.*
+
+### The Instant-Preview Cache (BLISS)
+
+On ingest, the worker encodes the 1800-px lightbox RGB to BLISS the moment the lightbox frame exists and writes it fire-and-forget to `OPFS/bliss/<assetId>` — the `assetId` an FNV-1a hash of path + size + mtime, stable across sessions. On the next open, `drawLightboxForCard` finds the card not yet decoded, reads the BLISS bytes back from OPFS, decodes them on a dedicated `bliss-worker.js`, and paints a **"BLISS (cached)"** frame before the full RAW re-decode arrives at full quality. What is actually *measured* (not estimated): the BLISS decode step takes **~86 ms** for a detailed 20 MP-derived 1800-px foliage frame on the scalar WASM decoder in Node, median of eight (`benchmark/cold-open-latency.mjs`) — about **10× cheaper than re-decoding the RAW** (~840 ms) and ~2.7× cheaper than decoding the archival JXL. The end-to-end on-device **time-to-first-pixel** — OPFS read + decode + canvas paint, on a real browser's SIMD/threaded decoder rather than this scalar path — has **not** been benchmarked and would differ (the browser decoder may be faster than the scalar figure, while OPFS I/O and paint add to it). File size is content-dependent: these detailed specimens land at **2–4 MB** at near-lossless `q=2`; a smoother `1800×1200` frame is far smaller. BLISS is honest about what it is *not*: at equal quality it is always larger than JXL effort-3, so it is never sent over the wire — it earns its place purely as a local decode-latency cache. `bliss_encode` takes `q_y=1, q_c=1` for lossless or `q_y=2, q_c=2` for the near-lossless display cache; magic bytes `BLSR`.
+
+The codec itself (in the sibling `bliss-core` crate) is a checkerboard-median predictor over an adaptive RCT feeding a context-modelled rANS entropy stage. On the native server / Tauri path it carries an **AVX-512F rANS decode** — 16 lanes in one `__m512i`, using `_mm512_mask_expand_epi32` for renormalization with no rank lookup table, runtime-detected via `is_x86_feature_detected!` and gated behind an `avx512` feature; WASM and non-x86 fall back to scalar. 15/15 decode tests pass on AVX-512 hardware.
+
+### BLTV — Lossless Video Reference
+
+*Files: `src/bltv_wasm.rs` (`BltvDecoder`), `web/bltv-player.html`, `web/bltv-worker.js`*
+
+BLTV ("Bliss TV") is the video sibling: I-frames plus delta P-frames, a lossless master format for local use and codec research. It has a standalone browser player and decode worker (`BltvDecoder` exposes `width/height/frame_count/fps/is_lossless/decode_next_frame/seek`). It is explicitly **not** used for CASABIO delivery — CASV/JXL owns video distribution; BLTV is for lossless masters and format work. The v-decode is not yet exercised by automated tests in this repo, and the `OPFS/bliss/` cache has no eviction cap yet — both noted as open items, not claimed as done.
+
+**BLTV inherits the BLISS acceleration — measured, not assumed.** Because every BLTV frame is encoded/decoded through `bliss-core` (I-frames are bliss RGB; P-frames are bliss over a centred inter-frame delta), the July-2026 BLISS v128-SIMD and band-parallel work speeds BLTV up *for free* — but until now that had never been benchmarked. Two grounded runs (`docs/bltv-accel.json`; harnesses `bltv/examples/bltv_bench.rs` + `bliss-wasm-sandbox/bltv-accel-bench.mjs`):
+
+- **Browser decode (the shipped `BltvDecoder` path), v128 vs scalar, single-thread.** Same `.bltv` bytes decoded by both builds, **byte-identical** output (full FNV checksum), interleaved A/B with start-rotation to cancel thermal drift, median of 21. BLTV whole-video decode runs at **40–47 MP/s on v128 vs 18–22 MP/s scalar — a 2.1–2.2× speedup** across 720p/1080p, all-intra and GOP, lossless and near-lossless. The v128 figure (43–45 MP/s on intra) cross-checks the standalone BLISS decode (~45), confirming the video codec inherits the kernel win intact.
+- **Native encode + decode, band-parallel MT on vs off (AVX2 always on).** With the `parallel` feature (12 threads) the encoder hits **~95–115 MP/s (2.8–3.4× over single-thread)** and the decoder **~120–186 MP/s (2.1–2.9×)** at 1080p/4K. The speedup is bounded by band count (`default_bands` = 4 at 1080p, 8 at 4K), exactly like BLISS — threads past the band count don't help, which is why the app keeps single-thread v128 for the instant-preview path and reserves MT for standalone/batch tools.
+
+---
+
+## 8. The Web Application
+
+The sections above are mostly engine and codec. This one is the product a field scientist actually touches: the gallery, the editor, export, timelapse, and plant/animal ID. A single July-2026 pass (findings 3–48, TDD red→green throughout) rebuilt this layer around per-asset state isolation and bounded memory, so a large batch of edits can't leak or collide. Files live in `web/*.js` and `web/lightbox/*`.
+
+### Per-Asset State Isolation (findings 40, 41, 46, 48)
+
+*Files: `web/asset-state-store.js`, `web/jxl-decode-cache-policy.js`*
+
+Every asset carries its own crop, look and sidecar state keyed on a stable `assetId` (full path + size + mtime → FNV-1a, so two files with the same basename can't collide), instead of edits reading and writing ambient globals. Crop edits are transactional (`beginCropEdit` / `applyCropEdit` / `cancelCropEdit`, angle and original-space flag preserved). A `sourceGeneration` counter bumps on every reprocess and `isStale(tag, state)` rejects a late-arriving decode for a superseded source — so flipping quickly through a gallery can no longer paint a stale image onto the wrong card. Durable-persistence failures surface rather than vanishing.
+
+### Full-Resolution Export with a Privacy Policy (findings 13, 44, 45)
+
+*Files: `web/export-service.js`, `web/exif-serialize.js`*
+
+One `ExportService` entry point for every export path, sourcing from the developed full-resolution JXL — **never** the 1800-px preview. Output is JXL or PNG (the two formats with real encoders; JPEG/TIFF are gated with a clear error rather than a broken file). A metadata policy of **keep / strip-gps / strip-all** is serialized into the EXIF bytes, and the tests prove GPS is genuinely absent under the strip policies by decoding the exported file back. A companion fix prefixes the JXL Exif box with the required TIFF-offset header so the EXIF is actually readable downstream, and the info-panel format label is derived from the EXIF object instead of a hardcoded "ORF (Olympus 12-bit)" string.
+
+### Proxy Intake, "Develop Selected", and One Format Source (findings 10, 14)
+
+*Files: `web/proxy-develop.js`, `web/format-detect.js`*
+
+A proxy-first intake mode renders a fast JPEG-preview pass so a big folder becomes browsable immediately; **"Develop Selected"** then submits only the cards you picked at high priority, jumping the queue ahead of background auto-processing. The upload `accept` filter and the drag-drop filter both draw from a single canonical `format-detect.js` (`acceptExtensions` / `isPipelineInput`), so there is exactly one list of what the pipeline can ingest — and JPEG, previously missing from it, is now included.
+
+### Selected-Asset Timelapse — RAW Stills → CASV (finding 15)
+
+*Files: `web/timelapse-core.js`, `web/timelapse.js`*
+
+Build a time-lapse straight from selected RAW stills (ORF/DNG/CR2), each frame carrying its own look edits, output at a chosen preset (`exact / 2160 / 1440 / 1080 / 720 / 512`). Frames are read through an async generator gated to a **160 MB in-flight budget** (≈ two 20-MP frames), so an arbitrarily long sequence never materializes at once; the run is cancellable, and it hands off to the same `ExportService` contract as everything else. The per-frame look is applied through the 14-slot positional decoder ABI (exposure, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, wb_r, wb_b, texture, clarity).
+
+### AI Plant / Animal ID — Browser and Node, Cleanly Split (finding 16)
+
+*Files: `web/ai-id/{browser-adapter.js,node-adapter.mjs,sources.mjs,sidecar.mjs}`*
+
+The image-source chain that feeds identification is split so the browser adapter uses **zero Node built-ins** (source order: live-buffer → pyramid → master → raw) while the Node adapter keeps `sharp` and the embedded-preview extractor to itself (live-buffer → pyramid → embedded-preview → master → raw, embedded preview gated to a 768-px minimum long edge). `buildSidecarForAsset` wires a stable `assetId` and the same keep/strip-gps/strip-all privacy policy into the export contract, so an identification request and an export agree on identity and on what metadata leaves the device. This is the *foundation* pathway — ordered sources and sidecars — not a bundled classifier.
+
+### Bounded Render / Decode / Derived-Asset Lifetime (findings 11, 12, 29, 43)
+
+*Files: `web/jxl-derived-cache.js`, `web/lightbox/webgl-pipeline.js`*
+
+Decoded full-resolution RGBA buffers no longer accumulate in an unbounded per-card `WeakMap`; they live in an AssetStore-backed **~288 MB LRU** (three 20-MP frames), invalidated explicitly on generation change or card delete. The WebGL pipeline skips `texImage2D` when the framebuffer dimensions are unchanged, and thumbnails are decoded at **1/4 resolution** (`downsample: 4`) instead of decoded full and downscaled on the canvas. Source-text assertions guard against anyone re-introducing a direct `_jxlDecoded` assignment that would bypass the cache.
+
+### Lazy-Load Startup + a Shared, Byte-Admitted Scheduler (findings 47, 3, 9, 39)
+
+*Files: `web/lazy-module.js`, `web/jxl-read-lane.js`, `web/jxl-browser-context.js`, `web/jxl-calibration-propagation.js`*
+
+The page loads lighter: heavy optional modules (perceptual colour, export service, Tauri-parity lightbox, PNG encode) are dynamically imported at their first command boundary via a memoised `makeLazyModule()` (concurrent callers share one promise; a failed load is *not* memoised, so a transient error retries), then advisory-prefetched on idle. Underneath, the private per-file JXL queue was replaced with the shared `jxl-session` scheduler, and file reads pass through a **byte-admission semaphore** (`createReadLane`, capacity = half of the ~1.8 GiB RAW-decode budget) that only calls `file.arrayBuffer()` *after* admission — so a backlog of pending tasks no longer pins every file's bytes in memory at once. Hardware calibration propagates to the pool size and per-worker limits before the first decode. 28/28 scheduler tests green.
 
 ---
 

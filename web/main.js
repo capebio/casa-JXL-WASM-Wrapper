@@ -1683,12 +1683,47 @@ function blissDecodeViaWorker(bytes) {
     });
 }
 
+// Decode only the embedded 1/8-scale BLSP preview. Does NOT transfer bytes so
+// the caller can still pass them to blissDecodeViaWorker for the full decode.
+function blissDecodePreviewViaWorker(bytes) {
+    return new Promise((resolve) => {
+        _initBlissDecodeWorker();
+        const seq = ++_blissDecodeSeq;
+        _blissDecodePending.set(seq, resolve);
+        // No transfer list — bytes stays live on this thread for the subsequent full decode.
+        _blissDecodeWorker.postMessage({ type: 'bliss_decode_preview', seq, bliss: bytes.buffer });
+    });
+}
+
+function _hasBlspPrefix(bytes) {
+    // BLSP = 0x42 0x4C 0x53 0x50
+    return bytes.length >= 4 &&
+        bytes[0] === 0x42 && bytes[1] === 0x4C && bytes[2] === 0x53 && bytes[3] === 0x50;
+}
+
 // Try OPFS BLISS for instant lightbox preview; non-fatal, no-op if card changed.
+// If the stored blob has a BLSP prefix (from bliss_encode_with_preview), paints the
+// 1/8-scale preview immediately while the full decode runs in parallel.
 async function blissOpfsLoad(card, assetId) {
     const bytes = await blissOpfsRead(assetId);
     if (!bytes) return;
     if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
     if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
+
+    // BLSP-first: fire preview decode without transferring so full decode can follow.
+    if (_hasBlspPrefix(bytes)) {
+        blissDecodePreviewViaWorker(bytes).then(prev => {
+            if (!prev) return;
+            if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
+            if (getCardState(card)?._lightbox?.rgb) return; // full decode already painted
+            drawCanvas(lightboxCanvas, prev.w, prev.h, prev.rgb);
+            setPaintedSourceBadge('bliss-preview');
+            lbLoadingBadge.hidden = true;
+            applyStraightenToLightboxCanvas(card);
+            syncZoomToDisplayLong();
+        }).catch(() => {});
+    }
+
     const result = await blissDecodeViaWorker(bytes).catch(() => null);
     if (!result) return;
     if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;

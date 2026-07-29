@@ -24,6 +24,9 @@
     "@casabio/jxl-core": "^0.1.0",
     "@casabio/jxl-wasm": "^0.1.0"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "typescript": "5.5.4"
   }

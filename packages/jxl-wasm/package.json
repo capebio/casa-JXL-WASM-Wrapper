@@ -1,6 +1,7 @@
 {
   "name": "@casabio/jxl-wasm",
   "version": "0.1.0",
+  "description": "Pre-built libjxl WASM bundle and JS facade for the Casabio JXL wrapper",
   "type": "module",
   "exports": {
     ".": {
@@ -21,6 +22,9 @@
     "benchmark:pgo": "node scripts/benchmark-pgo.mjs",
     "manifest": "node scripts/write-manifest.mjs",
     "typecheck": "tsc --noEmit"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dependencies": {}
 }

@@ -78,7 +78,7 @@ async function loadWasm() {
        process_orf_with_options, process_dng_with_options, process_cr2_with_options, process_raw_mosaic_with_options,
        create_orf_denoise_session, create_dng_denoise_session, create_cr2_denoise_session, create_raw_mosaic_denoise_session,
        decode_exr, decode_tiff, decode_jpeg,
-       bliss_encode } = rawWasm);
+       bliss_encode_with_preview } = rawWasm);
 }
 
 // P3-T8 (finding 34): does the loaded wasm expose the DNG deferred-finish binding?
@@ -552,9 +552,9 @@ function processImageFormat(id, bytes, opts, look, route) {
         const bigRgb = applyLookToState(lbState, look);
         // BLISS: encode lightbox-sized RGB8 before transferring bigRgb.
         // Stored in OPFS for cross-session instant preview. ~10-30ms at 1800px.
-        if (typeof bliss_encode === 'function' && lbState.outW % 2 === 0) {
+        if (typeof bliss_encode_with_preview === 'function' && lbState.outW % 2 === 0) {
             try {
-                const blissBytes = bliss_encode(bigRgb, lbState.outW, lbState.outH, 2, 2);
+                const blissBytes = bliss_encode_with_preview(bigRgb, lbState.outW, lbState.outH, 2, 2, 2);
                 self.postMessage(
                     { id, type: WorkerMsg.BLISS_READY, bliss: blissBytes.buffer, width: lbState.outW, height: lbState.outH },
                     [blissBytes.buffer],
@@ -1023,9 +1023,9 @@ self.addEventListener('message', async (ev) => {
         const lbState = liveStateMap.get(id);
         const bigRgb = applyLookToState(lbState, look);
         // BLISS: encode lightbox-sized RGB8 before transferring bigRgb.
-        if (typeof bliss_encode === 'function' && lbState.outW % 2 === 0) {
+        if (typeof bliss_encode_with_preview === 'function' && lbState.outW % 2 === 0) {
             try {
-                const blissBytes = bliss_encode(bigRgb, lbState.outW, lbState.outH, 2, 2);
+                const blissBytes = bliss_encode_with_preview(bigRgb, lbState.outW, lbState.outH, 2, 2, 2);
                 self.postMessage(
                     { id, type: WorkerMsg.BLISS_READY, bliss: blissBytes.buffer, width: lbState.outW, height: lbState.outH },
                     [blissBytes.buffer],

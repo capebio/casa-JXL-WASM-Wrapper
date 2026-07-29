@@ -42,9 +42,17 @@ All 6 tests in `crates/raw-pipeline/tests/parity_corpus.rs` pass:
 | `dng_rgb8_deterministic` | PXL…dng | ✓ bit-exact across two calls |
 | `dng_align_to_rggb_infallible` | PXL…dng | ✓ plain tuple (not Result) confirmed |
 
-Pixel hashes (release, `target-cpu=native`):
-- ORF rgba8 `0x8806822277eac608`
-- DNG rgb8  `0x3c3fb14139efec5c`
+Pixel hashes (release, `target-cpu=native`) — current pins in `tests/parity_corpus.rs`:
+- ORF rgba8 `0xda808882dc6b1e96`
+- DNG rgb8  `0x40c9457b04b0b032`
+
+Lineage (each re-pin author-validated, never adopted silently):
+
+| when | ORF rgba8 | DNG rgb8 | why |
+|---|---|---|---|
+| S1 baseline | `0x8806822277eac608` | `0x3c3fb14139efec5c` | original |
+| 2026-07-08 | `0xfb91a7f35549eaeb` | `0x7a2717d8cdbbe4c2` | tone fix b1ce12ed (`HIGHLIGHT_KNEE` 0.80→0.68) + per-format white-level fix d0a22cc9 |
+| 2026-07-28 | `0xda808882dc6b1e96` | `0x40c9457b04b0b032` | MHC demosaic fix: B-at-R gradient correction restored (the kernel was asymmetric under R/B exchange) + cross-channel gradients scaled by the WB ratios (`MhcGains`). Demosaic-only; no tone or colour math changed. |
 
 ---
 

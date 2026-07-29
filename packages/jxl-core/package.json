@@ -31,6 +31,9 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "typescript": "^5.5.4"
   }
