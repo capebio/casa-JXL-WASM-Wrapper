@@ -1487,9 +1487,7 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
 
             let mut params = pipeline::PipelineParams::default_olympus();
             params.black = OLYMPUS_BLACK_LEVEL;
-            if info.iso.is_some_and(|i| i < 200) {
-                params.baseline_ev = pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
-            }
+            params.baseline_ev = pipeline::orf_baseline_ev(info.iso);
             if let Some(r) = info.wb_r {
                 params.wb_r = r;
             }
@@ -1600,12 +1598,11 @@ fn decode_orf_raw(data: &[u8], output_flags: u32) -> Result<OrfDecoded, JsError>
     // contrast/darkness. 256 is the canonical Olympus 12-bit pedestal — validated on
     // E-M1 Mark III; other bodies share this floor but were not individually checked.
     params.black = OLYMPUS_BLACK_LEVEL;
-    // Extended-LOW ISO (< 200) raws are exposed ~+1 EV hot and pulled back by the
-    // camera; without the pull our render blows highlights and rails green glints.
-    // Native ISO keeps the legacy baseline. See pipeline::ORF_LOW_ISO_BASELINE_EXP_EV.
-    if info.iso.is_some_and(|i| i < 200) {
-        params.baseline_ev = pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
-    }
+    // Per-shot ORF baseline (pipeline::orf_baseline_ev): extended-LOW ISO (< 200)
+    // raws are exposed ~+1 EV hot and get the 0.40 pull (without it our render
+    // blows highlights and rails green glints); native ISO gets the ORF-native
+    // 1.6 (measured vs embedded JPEG); unknown ISO keeps the legacy 1.40.
+    params.baseline_ev = pipeline::orf_baseline_ev(info.iso);
     // Trust camera WB_RBLevels (ImageProcessing 0x0100 / MakerNote 0x1017/1018/1029)
     // unconditionally.  This is the calibration the in-camera JPEG uses, so
     // matching it gives colour fidelity to the embedded preview.  Gray-world
@@ -1722,8 +1719,9 @@ struct FinishOutputs {
 /// here. `orientation` drives the CPU rotate unless `OUT_NO_ORIENT` is set.
 /// Consumes `raw` (freed right after demosaic).
 ///
-/// The `_iso` parameter is kept for ABI stability (callers already pass it)
-/// but is no longer used — ISO-gated hardcoded NR was removed in T6.
+/// `iso` gates the mild always-on chroma-only NR below ISO 1600 (the T6 removal
+/// dropped the hardcoded LUMINANCE NR; base-ISO chroma NR returned 2026-07-29 to
+/// close the "camera looks smoother" gap — see pipeline::ORF_BASE_ISO_CHROMA_NR).
 fn finish_from_raw(
     raw: Vec<u16>,
     w: usize,
@@ -1731,7 +1729,7 @@ fn finish_from_raw(
     mut params: pipeline::PipelineParams,
     look: &LookOverrides,
     orientation: u16,
-    _iso: u32,
+    iso: u32,
     output_flags: u32,
 ) -> Result<FinishOutputs, JsError> {
     // Apply the look FIRST: it can override white balance, and the demosaic needs the final
@@ -1754,6 +1752,14 @@ fn finish_from_raw(
     .map_err(|e| JsError::new(&e))?;
     let demosaic_ms = now_ms() - t;
     drop(raw);
+
+    // Base-ISO chroma-only NR: in-camera JPEGs chroma-NR even at base ISO; below
+    // the (removed) luma-NR threshold our render previously got nothing. Luma is
+    // untouched by construction, so no detail softening. iso == 0 (unknown) is
+    // included — mild chroma smoothing is the safe direction.
+    if iso < 1600 {
+        pipeline::apply_chroma_nr(&mut rgb16, w, h, pipeline::ORF_BASE_ISO_CHROMA_NR);
+    }
 
     let want_full16 = output_flags & OUT_FULL_16 != 0;
     let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
@@ -3505,6 +3511,7 @@ mod tests {
             &cm,
             OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB,
             &LookOverrides::neutral(),
+            None,
         )
         .unwrap();
         assert_eq!((result.width, result.height), (w as u32, h as u32));
@@ -5105,6 +5112,7 @@ fn process_raw_mosaic_impl(
     color_matrix_flat: &[f32],
     output_flags: u32,
     look: &LookOverrides,
+    baseline_ev: Option<f32>,
 ) -> Result<ProcessResult, JsError> {
     validate_raw_mosaic_shape(raw.len(), width, height).map_err(|e| JsError::new(&e))?;
     let w = width as usize;
@@ -5135,6 +5143,13 @@ fn process_raw_mosaic_impl(
         1.0
     };
     params.color_matrix = Some(matrix).into();
+    // Per-source exposure baseline: an ORF reaching this fallback (e.g. a
+    // compression our native decoder rejects) needs the Olympus extended-LOW
+    // ISO pull the native ingest applies (pipeline::ORF_LOW_ISO_BASELINE_EXP_EV).
+    // `None`/non-finite keeps the legacy BASELINE_EXP_EV default.
+    if let Some(b) = baseline_ev.filter(|b| b.is_finite()) {
+        params.baseline_ev = b;
+    }
 
     process_dng_impl(
         DngDecoded {
@@ -5196,6 +5211,7 @@ pub fn process_raw_mosaic_with_flags(
     tint: f32,
     texture: f32,
     clarity: f32,
+    baseline_ev: Option<f32>,
 ) -> Result<ProcessResult, JsError> {
     let look = LookOverrides {
         exposure_ev,
@@ -5226,6 +5242,7 @@ pub fn process_raw_mosaic_with_flags(
         color_matrix_flat,
         output_flags,
         &look,
+        baseline_ev,
     )
 }
 /// T6 noise-aware API for a generic Bayer mosaic (see `process_dng_with_options`).
@@ -5248,12 +5265,13 @@ pub fn process_raw_mosaic_with_options(
     output_flags: u32,
     iso: u32,
     options: JsValue,
+    baseline_ev: Option<f32>,
 ) -> Result<ProcessResult, JsError> {
     let opts = RawProcessOptions::from_js(&options)?;
     if !opts.denoise.enabled {
         return process_raw_mosaic_impl(
             raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b,
-            orientation, color_matrix_flat, output_flags, &opts.look,
+            orientation, color_matrix_flat, output_flags, &opts.look, baseline_ev,
         );
     }
     validate_raw_mosaic_shape(raw_u16.len(), width, height).map_err(|e| JsError::new(&e))?;
@@ -5285,6 +5303,10 @@ pub fn process_raw_mosaic_with_options(
     params.wb_r = if wb_r.is_finite() && wb_r > 0.0 { wb_r.min(8.0) } else { 1.0 };
     params.wb_b = if wb_b.is_finite() && wb_b > 0.0 { wb_b.min(8.0) } else { 1.0 };
     params.color_matrix = Some(matrix).into();
+    // Per-source baseline override, same contract as process_raw_mosaic_impl.
+    if let Some(b) = baseline_ev.filter(|b| b.is_finite()) {
+        params.baseline_ev = b;
+    }
     let mut result = process_dng_impl(
         DngDecoded {
             rgb16: denoised_rgb16,
@@ -5723,6 +5745,7 @@ pub fn create_raw_mosaic_denoise_session(
     color_matrix_flat: &[f32],
     iso: u32,
     options: JsValue,
+    baseline_ev: Option<f32>,
 ) -> Result<DenoiseSession, JsError> {
     RawProcessOptions::from_js(&options)?; // fail-fast validation
     let output_flags = DENOISE_SESSION_FLAGS;
@@ -5752,6 +5775,10 @@ pub fn create_raw_mosaic_denoise_session(
     params.wb_r = if wb_r.is_finite() && wb_r > 0.0 { wb_r.min(8.0) } else { 1.0 };
     params.wb_b = if wb_b.is_finite() && wb_b > 0.0 { wb_b.min(8.0) } else { 1.0 };
     params.color_matrix = Some(matrix).into();
+    // Per-source baseline override, same contract as process_raw_mosaic_impl.
+    if let Some(b) = baseline_ev.filter(|b| b.is_finite()) {
+        params.baseline_ev = b;
+    }
     let dng = DngDecoded {
         rgb16,
         aw: w,

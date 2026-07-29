@@ -143,6 +143,18 @@ function processRawWithFlagsNamed(decoderFn, bytes, flags, opts = RAW_NEUTRAL) {
     );
 }
 
+// Olympus extended-LOW ISO (< 200) raws are exposed ~+1 EV hot and pulled back by
+// the camera; the native ORF ingest applies pipeline::ORF_LOW_ISO_BASELINE_EXP_EV
+// (0.40) instead of the legacy 1.40 baseline. When an ORF reaches the generic
+// mosaic path (LibRaw fallback), the WASM export can't know the source format, so
+// the caller passes the baseline. undefined = keep the legacy default (also the
+// safe fallback when ISO is unknown). Value mirrors the Rust constant.
+const ORF_LOW_ISO_BASELINE_EV = 0.4;
+function mosaicBaselineEv(payload) {
+    return /olympus/i.test(payload?.make || '') && payload?.iso > 0 && payload.iso < 200
+        ? ORF_LOW_ISO_BASELINE_EV : undefined;
+}
+
 function processRawMosaicWithFlagsNamed(payload, flags, opts = RAW_NEUTRAL) {
     const o = { ...RAW_NEUTRAL, ...opts };
     return process_raw_mosaic_with_flags(
@@ -151,6 +163,7 @@ function processRawMosaicWithFlagsNamed(payload, flags, opts = RAW_NEUTRAL) {
         payload.orientation, new Float32Array(payload.colorMatrix || []), flags,
         o.exposureEv, o.contrast, o.highlights, o.shadows, o.whites, o.blacks,
         o.saturation, o.vibrance, o.temp, o.tint, o.texture, o.clarity,
+        mosaicBaselineEv(payload),
     );
 }
 
@@ -931,6 +944,7 @@ self.addEventListener('message', async (ev) => {
                     p.orientation, new Float32Array(p.colorMatrix || []),
                     phase1Flags, p.iso || 0,
                     buildWasmOptions(lookArgs, denoise),
+                    mosaicBaselineEv(p),
                 );
             } else {
                 result = processRawMosaicWithFlagsNamed(librawPayload, phase1Flags, lookArgs);

@@ -392,10 +392,8 @@ impl<'a> StreamingBandSource<OrfRowDecoder<'a>> {
             .ok_or("strip OOB")?;
         let mut params = PipelineParams::default_olympus();
         params.black = 256; // Olympus 12-bit pedestal (matches decode_orf_raw)
-        if info.iso.is_some_and(|i| i < 200) {
-            // Extended-LOW ISO pull, matches decode_orf_raw.
-            params.baseline_ev = crate::pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
-        }
+        // Per-shot ORF baseline (LOW-ISO pull / native 1.6 / legacy), matches decode_orf_raw.
+        params.baseline_ev = crate::pipeline::orf_baseline_ev(info.iso);
         if let Some(r) = info.wb_r {
             params.wb_r = r;
         }

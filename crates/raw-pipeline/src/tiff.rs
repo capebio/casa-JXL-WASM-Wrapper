@@ -1345,10 +1345,43 @@ pub fn decode_orf_rgba8(data: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
         .get(strip_start..strip_end)
         .ok_or_else(|| anyhow!("strip OOB ({strip_start}..{strip_end} > {})", data.len()))?;
     let raw = crate::decompress::decompress(strip, w, h).map_err(|e| anyhow!("{e}"))?;
-    let rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(&raw, w, h, olympus_default_gains()).map_err(|e| anyhow!("{e}"))?;
+    // Mirror the app ingest (`decode_orf_raw` in the wasm crate): black pedestal,
+    // camera WB (gray-world fallback), MakerNote 0x1011 matrix, ISO-gated baseline,
+    // and MHC gains from the FINAL WB. Without these the render is not
+    // app-representative and absolute numbers from harnesses built on it mislead.
     let mut params = crate::pipeline::PipelineParams::default_olympus();
-    if info.iso.is_some_and(|i| i < 200) {
-        params.baseline_ev = crate::pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
+    params.black = 256; // Olympus 12-bit pedestal (app OLYMPUS_BLACK_LEVEL)
+    params.baseline_ev = crate::pipeline::orf_baseline_ev(info.iso);
+    if info.wb_r.is_some() && info.wb_b.is_some() {
+        if let Some(r) = info.wb_r {
+            params.wb_r = r;
+        }
+        if let Some(b) = info.wb_b {
+            params.wb_b = b;
+        }
+    } else {
+        let (ar, ab) = crate::pipeline::auto_wb_rggb(&raw, w, h, params.black);
+        params.wb_r = ar;
+        params.wb_b = ab;
+    }
+    if let Some(m) = info.color_matrix {
+        params.color_matrix = Some(m).into();
+    }
+    let mut rgb16 = crate::demosaic::demosaic_rggb_mhc_gains(
+        &raw,
+        w,
+        h,
+        crate::demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+    )
+    .map_err(|e| anyhow!("{e}"))?;
+    // Base-ISO chroma-only NR, mirroring the app's finish_from_raw gate.
+    if info.iso.unwrap_or(0) < 1600 {
+        crate::pipeline::apply_chroma_nr(
+            &mut rgb16,
+            w,
+            h,
+            crate::pipeline::ORF_BASE_ISO_CHROMA_NR,
+        );
     }
     let rgba8 = crate::pipeline::process_rgba(&rgb16, &params);
     Ok((rgba8, info.width, info.height))

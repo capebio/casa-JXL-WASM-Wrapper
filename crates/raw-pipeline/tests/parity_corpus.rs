@@ -50,7 +50,15 @@ use std::hash::{Hash, Hasher};
 // Validated over the 11-frame Gobabeb corpus, each scored on its own worst-speckle 512²
 // window: green-magenta Nyquist chroma −43% mean, CFA-lattice chroma spread −33% mean,
 // all 11 frames improving on both (bliss/gobabeb-comparison/index.html).
-const ORF_RGBA8_HASH: u64 = 0xda80_8882_dc6b_1e96; // P1110226.ORF → decode_orf_rgba8 (was 0xfb91_a7f3_5549_eaeb; MHC B-at-R + WB-scaled gradients)
+// Re-pinned 2026-07-29 (HANDOFF-orf-baseline items 4 + 2 + 1, one session):
+//   4. decode_orf_rgba8 made app-representative — black=256, camera WB (gray-world
+//      fallback), MakerNote 0x1011 matrix, WB-scaled MHC gains, like decode_orf_raw.
+//   2. native-ISO ORF baseline 1.40 → ORF_BASELINE_EXP_EV (1.6), per-shot via
+//      pipeline::orf_baseline_ev — P1110226 is native-ISO so its render brightened.
+//   1. base-ISO chroma-only NR (apply_chroma_nr @ ORF_BASE_ISO_CHROMA_NR, iso<1600),
+//      matching the app's finish_from_raw.
+// Intentional; DNG pin untouched (CR2/DNG keep BASELINE_EXP_EV, no chroma NR).
+const ORF_RGBA8_HASH: u64 = 0x1cc3_46e7_3c26_d8cb; // P1110226.ORF → decode_orf_rgba8 (was 0xda80_8882_dc6b_1e96; placeholder params + legacy 1.40 + no chroma NR)
 const DNG_RGB8_HASH: u64 = 0x40c9_457b_04b0_b032; //  PXL…dng → process() rgb8 (was 0x7a27_17d8_cdbb_e4c2; same MHC fix)
 // Fixture tier — captured on rustc 1.95.0 from the checked-in mandelbrot assets.
 // tiff8 == exr-display: the EXR is the HDR-linear twin of the same pattern the

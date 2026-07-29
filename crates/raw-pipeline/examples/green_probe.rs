@@ -37,9 +37,7 @@ fn main() -> anyhow::Result<()> {
     // Params exactly as the app's ORF default path sets them.
     let mut params = PipelineParams::default_olympus();
     params.black = 256;
-    if info.iso.is_some_and(|i| i < 200) {
-        params.baseline_ev = pipeline::ORF_LOW_ISO_BASELINE_EXP_EV;
-    }
+    params.baseline_ev = pipeline::orf_baseline_ev(info.iso);
     if let Some(r) = info.wb_r {
         params.wb_r = r;
     }
@@ -50,13 +48,18 @@ fn main() -> anyhow::Result<()> {
         params.color_matrix = Some(m).into();
     }
 
-    let rgb16 = demosaic::demosaic_rggb_mhc_gains(
+    let mut rgb16 = demosaic::demosaic_rggb_mhc_gains(
         &mosaic,
         w,
         h,
         demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Mirror the app's base-ISO chroma-only NR (finish_from_raw, iso < 1600).
+    if info.iso.unwrap_or(0) < 1600 {
+        pipeline::apply_chroma_nr(&mut rgb16, w, h, pipeline::ORF_BASE_ISO_CHROMA_NR);
+    }
 
     let mut rgb8 = vec![0u8; w * h * 3];
     pipeline::process_into(&rgb16, &params, &mut rgb8);

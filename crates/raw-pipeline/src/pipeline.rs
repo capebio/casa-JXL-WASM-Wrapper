@@ -329,10 +329,26 @@ pub const BASELINE_EXP_EV: f32 = 1.40;
 /// the camera's 0.14%) and real green micro-glints railed to saturated green
 /// ("sparkles"). 0.40 lands P2200592 at luma 129.8 vs embedded 130.2, near-white
 /// 0.137% vs 0.136%; the other ISO-100 frames match within −0.4..−2.8 luma.
-/// Native-ISO ORF (≥ 200) keeps [`BASELINE_EXP_EV`]: at 1.40 the ISO-200 frames
-/// sit ~−10 luma vs embedded (P2200500: 123.8 vs 134.1; optimum ≈ 1.6) — a small
-/// pre-existing offset deliberately NOT retuned in the low-ISO fix.
+/// Native-ISO ORF (≥ 200) uses [`ORF_BASELINE_EXP_EV`].
 pub const ORF_LOW_ISO_BASELINE_EXP_EV: f32 = 0.40;
+/// ORF baseline for native ISO (≥ 200). At the legacy 1.40 every ISO 200/400
+/// Gobabeb frame sat −8..−12 luma vs its embedded JPEG; measured optimum on
+/// P2200500 ≈ 1.6 (1.4 → 123.8, 1.6 → 134.7 vs embedded 134.1). CR2/DNG keep
+/// [`BASELINE_EXP_EV`] — this constant is applied only at ORF ingest.
+pub const ORF_BASELINE_EXP_EV: f32 = 1.6;
+
+/// Per-shot ORF exposure baseline — single source of truth for every ORF ingest
+/// (app decode, streaming band source, native helpers, probes): extended-LOW
+/// ISO (< 200) raws are exposed ~+1 EV hot and get the 0.40 pull, native ISO
+/// gets the ORF-native 1.6, and unknown ISO keeps the legacy 1.40 — the safe
+/// direction (never brightens a frame we cannot classify).
+pub fn orf_baseline_ev(iso: Option<u32>) -> f32 {
+    match iso {
+        Some(i) if i < 200 => ORF_LOW_ISO_BASELINE_EXP_EV,
+        Some(_) => ORF_BASELINE_EXP_EV,
+        None => BASELINE_EXP_EV,
+    }
+}
 
 // Luma coeffs (BT.709) hoisted for FMA + ILP in per-pixel apply.
 const LUMA_R: f32 = 0.2126;
@@ -2932,6 +2948,61 @@ pub fn apply_luminance_nr(rgb16: &mut [u16], width: usize, height: usize, streng
             let ov = orig as f32;
             (ov + (blur as f32 - ov) * s).round().clamp(0.0, 65535.0) as u16
         });
+    });
+}
+
+/// Mild always-on chroma-only NR strength for base-ISO ORF (the "camera looks
+/// smoother" gap — in-camera JPEGs chroma-NR even at base ISO, our render did
+/// not). Applied by the app's ORF finish below ISO 1600, where the (T6-removed)
+/// luminance NR never activated. Swept on the 11-frame Gobabeb corpus
+/// (2026-07-29): 0.3 cuts flat-patch chroma sigma −21% and matched-scale
+/// sparkle/MP −23% (P2200592 88→73) with every frame improving or flat;
+/// stronger settings begin SPREADING railed green glints and the sparkle count
+/// U-curves back up (P2200592: 174/MP at 1.0). Keep it mild.
+pub const ORF_BASE_ISO_CHROMA_NR: f32 = 0.3;
+
+/// Chroma-only noise reduction: blends chroma toward a 5-tap Gaussian blur by
+/// `strength` while restoring per-pixel BT.709 linear luma exactly — edges and
+/// texture (luma) are untouched by construction; only colour speckle smooths.
+/// Runs post-demosaic, pre-tone, in the linear domain (like
+/// [`apply_luminance_nr`], which it complements at low ISO).
+/// ponytail: plain gaussian; edge-aware/median chroma suppression is the
+/// upgrade path if the residual P2200610-class glint spread must close further.
+pub fn apply_chroma_nr(rgb16: &mut [u16], width: usize, height: usize, strength: f32) {
+    if strength <= 0.0 {
+        return;
+    }
+    let s = strength.clamp(0.0, 1.0);
+    let kernel = gaussian_kernel_5();
+    BLUR_SCRATCH.with(|scratch| {
+        let (ref mut temp, ref mut blurred, _) = *scratch.borrow_mut();
+        blurred.resize(rgb16.len(), 0u16);
+        blurred.copy_from_slice(rgb16);
+        // Fully blur the copy (identity fold), reusing the parallel machinery.
+        separable_blur_apply(blurred, width, height, &kernel, temp, |_orig, blur| {
+            blur.clamp(0, 65535) as u16
+        });
+        let combine = |px: &mut [u16], bl: &[u16]| {
+            // Luma the blur removed; added back equally so per-pixel luma is exact
+            // (the equal add is pure luma, so blurred chroma is preserved).
+            let dy = LUMA_R * (px[0] as f32 - bl[0] as f32)
+                + LUMA_G * (px[1] as f32 - bl[1] as f32)
+                + LUMA_B * (px[2] as f32 - bl[2] as f32);
+            for c in 0..3 {
+                let o = px[c] as f32;
+                let t = bl[c] as f32 + dy;
+                px[c] = (o + (t - o) * s).round().clamp(0.0, 65535.0) as u16;
+            }
+        };
+        #[cfg(feature = "parallel")]
+        rgb16
+            .par_chunks_exact_mut(3)
+            .zip(blurred.par_chunks_exact(3))
+            .for_each(|(px, bl)| combine(px, bl));
+        #[cfg(not(feature = "parallel"))]
+        for (px, bl) in rgb16.chunks_exact_mut(3).zip(blurred.chunks_exact(3)) {
+            combine(px, bl);
+        }
     });
 }
 
