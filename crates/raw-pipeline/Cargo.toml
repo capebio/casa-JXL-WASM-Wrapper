@@ -65,6 +65,102 @@ required-features = ["jxl-codec"]
 name = "raw_video_decode_par_flip"
 required-features = ["jxl-codec"]
 
+# The targets below import jxl-gated modules (stream_export / casa_video /
+# casabio_encode / jxl_casadecoder / jxl_casaencoder) unconditionally, so they
+# only build when the feature is on. Keeps `--no-default-features` test/example
+# builds green.
+[[test]]
+name = "cr2_stream"
+required-features = ["jxl-codec"]
+
+[[test]]
+name = "dng_stream"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "ae_golden"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "ae2_peak_probe"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "ae6_peak_probe"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "chunked_vs_whole_ab"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "encoder_ab_ffi"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "encoder_ab_rd"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "encoder_ab_sz"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "fable_flip"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "fable_golden"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "fable_video_ab"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "jxl_chunked_pull_order"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "jxl_decode_concurrency"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "jxl_decode_file"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "jxl_encdec_ab"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "jxl_lossless_stream_density"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "jxl_stream_encode_density"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "orf_jxl_batch_concurrent"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "orf_jxl_release_bench"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "orf_jxl_sweep"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "pipeline_section_bench"
+required-features = ["jxl-codec"]
+
+[[example]]
+name = "tile_admission_ab"
+required-features = ["jxl-codec"]
+
 [dev-dependencies]
 jxl-oxide = "0.11"
 # golden-corpus hashing for the casa_video decode harnesses (examples only)

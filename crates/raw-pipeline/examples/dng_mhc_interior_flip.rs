@@ -6,7 +6,7 @@
 //!
 //! Interleaved start-rotated rounds; round 0 dropped; median + %saved. Parity byte-EXACT.
 //! Run: cd crates/raw-pipeline && cargo run --release --no-default-features --example dng_mhc_interior_flip
-use raw_pipeline::demosaic::{demosaic_bayer_mhc, demosaic_bayer_mhc_clamped_ref};
+use raw_pipeline::demosaic::{demosaic_bayer_mhc, demosaic_bayer_mhc_clamped_ref, MhcGains};
 use std::time::Instant;
 
 fn main() {
@@ -21,7 +21,7 @@ fn main() {
         .collect();
 
     let exact = demosaic_bayer_mhc(&raw, w, h, phase).unwrap()
-        == demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
+        == demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, MhcGains::UNITY).unwrap();
 
     let med = |v: &[f64]| {
         let mut x: Vec<f64> = v[1..].to_vec();
@@ -34,7 +34,7 @@ fn main() {
         *sink = sink.wrapping_add(out[out.len() / 2] as u64);
         t.elapsed().as_secs_f64() * 1e3
     };
-    let run_a = || demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase).unwrap();
+    let run_a = || demosaic_bayer_mhc_clamped_ref(&raw, w, h, phase, MhcGains::UNITY).unwrap();
     let run_b = || demosaic_bayer_mhc(&raw, w, h, phase).unwrap();
 
     let rounds = 11usize;
