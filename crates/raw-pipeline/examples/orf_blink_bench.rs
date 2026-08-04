@@ -193,7 +193,31 @@ fn main() {
 
     let mut paths: Vec<std::path::PathBuf> = walk(std::path::Path::new(root));
     paths.sort();
-    paths.truncate(take);
+    // BLINK_ONLY=<stem,stem,...> restricts the run to named frames. The matched
+    // A/B needs the SAME content through two pipelines, and "first N sorted"
+    // silently selects different frames from different directory layouts --
+    // which is exactly how the first version of this comparison confounded
+    // pipeline with content.
+    if let Ok(only) = std::env::var("BLINK_ONLY") {
+        let want: Vec<&str> = only.split(',').map(|s| s.trim()).collect();
+        // PREFIX match, not equality: the same frame is filed as "P2200500.ORF"
+        // in one place and "P2200500 Hermannia boraginiflora.ORF" in another.
+        let hit = |p: &std::path::PathBuf, w: &str| {
+            p.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .starts_with(&w.to_ascii_lowercase())
+        };
+        paths.retain(|p| want.iter().any(|w| hit(p, w)));
+        for w in &want {
+            if !paths.iter().any(|p| hit(p, w)) {
+                println!("MISSING  {w}  -- not found under {root}");
+            }
+        }
+    } else {
+        paths.truncate(take);
+    }
 
     let halic = std::path::Path::new(
         r"C:\Foo\raw-converter\tests\fractal_gen\_compress_probe\codec\HALIC\HALIC_ENCODE_V.0.7.2_ST_FAST_AVX2.exe",
