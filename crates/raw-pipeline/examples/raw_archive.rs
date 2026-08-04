@@ -36,18 +36,17 @@ fn open_raw(
             let raw = raw_pipeline::decompress::decompress(strip, w, h).map_err(|e| format!("{e}"))?;
             Ok((raw, w, h, s..s + n))
         }
-        // RW2/NEF expose no strip range through the current API, so the sidecar
-        // would be the whole file and the archive would be larger than the
-        // original. Refused loudly rather than measured dishonestly.
+        // Both now report the byte range their sensor payload occupies, which is
+        // what an archiver needs to carry everything else verbatim. RW2's comes
+        // from the bit reader's own cursor rather than "offset to EOF", so
+        // trailing metadata is not swallowed into the strip and lost.
         "rw2" | "rwl" => {
             let b = decode_rw2(d)?;
-            let _ = b;
-            Err("RW2: strip range not exposed yet -- see the note in open_raw".into())
+            Ok((b.raw, b.width, b.height, b.strip))
         }
         "nef" | "nrw" => {
             let b = decode_nef(d)?;
-            let _ = b;
-            Err("NEF: strip range not exposed yet -- see the note in open_raw".into())
+            Ok((b.raw, b.width, b.height, b.strip))
         }
         other => Err(format!("no Bayer decoder for .{other}")),
     }
@@ -87,6 +86,33 @@ fn find(h: &[u8], n: &[u8], from: usize) -> Option<usize> {
         return None;
     }
     h[from..].windows(n.len()).position(|w| w == n).map(|p| p + from)
+}
+
+/// **A round-trip proves our codec is self-consistent. It says NOTHING about
+/// whether the sensor was decoded correctly.**
+///
+/// `nikon_coolpix-b700`'s NRW decodes without error and produces noise -- it is
+/// not packed 12-bit despite declaring Compression=1 -- and the first version of
+/// this tool archived it at "12.5% saved, OK". For a benchmark that is a wrong
+/// number; for an ARCHIVER it is storing garbage and discarding the original.
+///
+/// Same test the blink bench uses: mean absolute horizontal difference between
+/// same-colour neighbours. A photograph sits far below the sensor range; noise
+/// sits near a third of it.
+fn looks_like_noise(px: &[u16], w: usize, h: usize, bits: u32) -> Option<f64> {
+    let (mut tot, mut n) = (0u64, 0u64);
+    let mut y = 0usize;
+    while y < h {
+        let row = &px[y * w..(y + 1) * w];
+        for x in 2..w {
+            tot += (row[x] as i32 - row[x - 2] as i32).unsigned_abs() as u64;
+            n += 1;
+        }
+        y += 37;
+    }
+    let mad = tot as f64 / n.max(1) as f64;
+    // A real image is a few percent of full scale between same-colour neighbours.
+    if mad > (1u32 << bits) as f64 / 12.0 { Some(mad) } else { None }
 }
 
 fn walk(root: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -149,6 +175,17 @@ fn main() {
         // The sidecar is the ORIGINAL FILE MINUS the sensor strip and MINUS any
         // full-size preview, in order. Dropped ranges are recorded so a restorer
         // knows a preview existed and where, rather than silently finding none.
+        // Refuse to archive a plane that is not an image, BEFORE anything is
+        // written or any saving is reported.
+        if let Some(mad) = looks_like_noise(&px, w, h, 12) {
+            println!(
+                "{:<26}  SKIP  decoded sensor looks like NOISE (mean |dx| = {mad:.0}) -- the decoder is wrong, archiving it would store garbage",
+                &stem[..stem.len().min(24)]
+            );
+            skipped += 1;
+            continue;
+        }
+
         let keep_prev = std::env::var("ARCHIVE_KEEP_PREVIEW").is_ok();
         let drop: Vec<std::ops::Range<usize>> = if keep_prev {
             Vec::new()

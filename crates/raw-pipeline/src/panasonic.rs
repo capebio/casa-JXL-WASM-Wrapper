@@ -31,6 +31,14 @@ pub struct BayerImage {
     pub wb_b: f32,
     pub make: String,
     pub model: String,
+    /// Byte range of the sensor payload **within the original file**.
+    ///
+    /// An archiver needs this to carry everything else verbatim: without it the
+    /// sidecar would have to be the whole file, and the archive would come out
+    /// LARGER than the original. For RW2 it is the range the bit reader actually
+    /// consumed rather than "offset to EOF", because guessing to EOF would swallow
+    /// any trailing metadata into the strip and silently lose it.
+    pub strip: std::ops::Range<usize>,
 }
 
 // ---- a minimal TIFF/IFD reader ---------------------------------------------
@@ -288,6 +296,13 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
         raw[y * img_w..y * img_w + n].copy_from_slice(&full[s..s + n]);
     }
 
+    // The bit reader's cursor is the honest end of the sensor payload. "Offset to
+    // EOF" would swallow any trailing metadata into the strip and lose it, since
+    // the sidecar is the file MINUS this range. Rounded up to the page the reader
+    // works in, because it consumes whole 0x4000 pages.
+    let consumed = bits_rd.pos.min(d.len() - raw_off);
+    let strip = raw_off..raw_off + consumed;
+
     Ok(BayerImage {
         width: img_w,
         height: img_h,
@@ -300,6 +315,7 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
         wb_b,
         make: tag_str(&t, 0x010f),
         model: tag_str(&t, 0x0110),
+        strip,
     })
 }
 
@@ -537,6 +553,9 @@ fn nikon_compressed(
         wb_b: 1.5,
         make: tag_str(_ifd0, 271),
         model: tag_str(_ifd0, 272),
+        // Nikon declares the compressed strip length outright, so no cursor
+        // arithmetic is needed here.
+        strip: off..off + _len,
     })
 }
 
@@ -624,6 +643,7 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         wb_b: 1.5,
         make: tag_str(&ifd0, 271),
         model: tag_str(&ifd0, 272),
+        strip: off..off + need,
     })
 }
 
