@@ -313,6 +313,233 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
 /// than padded**, and it is checked at runtime below rather than assumed.
 ///
 /// Compressed NEF (259 == 34713) returns an error naming what it needs.
+/// dcraw's `nikon_tree`. The arrays are 32 wide and **zero-padded on purpose**:
+/// the length counts sum to one more than the symbols listed, so the builder
+/// reads a final symbol 0 out of the padding. Transcribing only the printed
+/// symbols overruns the array.
+#[rustfmt::skip]
+const NIKON_TREE: [[u8; 32]; 6] = [
+    // 12-bit lossy
+    [0,1,5,1,1,1,1,1,1,2,0,0,0,0,0,0, 5,4,3,6,2,7,1,0,8,9,11,10,12, 0,0,0],
+    // 12-bit lossy, after the split
+    [0,1,5,1,1,1,1,1,1,2,0,0,0,0,0,0, 0x39,0x5a,0x38,0x27,0x16,5,4,3,2,1,0,11,12,12,0,0],
+    // 12-bit lossless
+    [0,1,4,2,3,1,2,0,0,0,0,0,0,0,0,0, 5,4,6,3,7,2,8,1,9,0,10,11,12, 0,0,0],
+    // 14-bit lossy
+    [0,1,4,3,1,1,1,1,1,2,0,0,0,0,0,0, 5,6,4,7,8,3,9,2,1,0,10,11,12,13,14, 0],
+    // 14-bit lossy, after the split
+    [0,1,5,1,1,1,1,1,1,1,2,0,0,0,0,0, 8,0x5c,0x4b,0x3a,0x29,7,6,5,4,3,2,1,0,13,14, 0],
+    // 14-bit lossless
+    [0,1,4,2,2,3,1,2,0,0,0,0,0,0,0,0, 7,6,8,5,9,4,10,3,11,12,2,0,1,13,14, 0],
+];
+
+/// dcraw `make_decoder_ref`: a flat lookup indexed by the next `max` bits, each
+/// slot holding `len << 8 | symbol`. `count[len]` is `tree[len - 1]`.
+fn make_decoder(tree: &[u8; 32]) -> Vec<u16> {
+    let mut max = 16usize;
+    while max > 0 && tree[max - 1] == 0 {
+        max -= 1;
+    }
+    let mut huff = vec![0u16; 1 + (1 << max)];
+    huff[0] = max as u16;
+    let (mut h, mut src) = (1usize, 16usize);
+    for len in 1..=max {
+        for _ in 0..tree[len - 1] {
+            let sym = tree[src] as u16;
+            src += 1;
+            for _ in 0..(1usize << (max - len)) {
+                if h <= (1 << max) {
+                    huff[h] = ((len as u16) << 8) | sym;
+                    h += 1;
+                }
+            }
+        }
+    }
+    huff
+}
+
+/// MSB-first bit reader over the strip. Unlike `PanaBits` this is a plain
+/// forward reader; Nikon does not page or reverse anything.
+struct NikonBits<'a> {
+    d: &'a [u8],
+    p: usize,
+    buf: u64,
+    vbits: u32,
+}
+
+impl<'a> NikonBits<'a> {
+    fn new(d: &'a [u8]) -> Self {
+        NikonBits { d, p: 0, buf: 0, vbits: 0 }
+    }
+    fn fill(&mut self, n: u32) {
+        while self.vbits < n {
+            let c = *self.d.get(self.p).unwrap_or(&0) as u64;
+            self.p += 1;
+            self.buf = (self.buf << 8) | c;
+            self.vbits += 8;
+        }
+    }
+    fn get(&mut self, nbits: u32) -> u32 {
+        if nbits == 0 {
+            return 0;
+        }
+        self.fill(nbits);
+        let v = ((self.buf >> (self.vbits - nbits)) & ((1u64 << nbits) - 1)) as u32;
+        self.vbits -= nbits;
+        v
+    }
+    fn huff(&mut self, huff: &[u16]) -> u16 {
+        let n = huff[0] as u32;
+        self.fill(n);
+        let c = ((self.buf >> (self.vbits - n)) & ((1u64 << n) - 1)) as usize;
+        let v = huff[1 + c];
+        self.vbits -= (v >> 8) as u32;
+        v & 0xff
+    }
+}
+
+/// Nikon's compressed NEF (259 == 34713): a Huffman-coded DPCM over two
+/// vertical predictors, then a linearisation curve read from MakerNote 0x0096.
+///
+/// Transcribed from dcraw `nikon_load_raw` and validated against ImageMagick
+/// before it was written: r = 0.9408 on `nikon_1-j1_DSC0355.NEF`.
+fn nikon_compressed(
+    d: &[u8],
+    _ifd0: &HashMap<u16, Entry>,
+    w: usize,
+    h: usize,
+    bits: u32,
+    off: usize,
+    _len: usize,
+) -> Result<BayerImage, String> {
+    // The MakerNote carries its OWN TIFF header 10 bytes past the signature and
+    // all of its offsets are relative to that, not to the file.
+    let sig = d
+        .windows(6)
+        .position(|x| x == b"Nikon\0")
+        .ok_or("NEF: no Nikon MakerNote signature")?;
+    let base = sig + 10;
+    if base + 8 > d.len() {
+        return Err("NEF: MakerNote runs past end of file".into());
+    }
+    // NOT read_ifd: that resolves long values against the FILE, while every offset
+    // inside a MakerNote is relative to `base`. Reading 0x0096 through it yields
+    // bytes from an unrelated part of the file.
+    let mo = base + u32le(&d[base + 4..]) as usize;
+    if mo + 2 > d.len() {
+        return Err("NEF: MakerNote IFD past end of file".into());
+    }
+    let n = u16le(&d[mo..]) as usize;
+    if n > 512 || mo + 2 + n * 12 > d.len() {
+        return Err(format!("NEF: MakerNote IFD claims {} entries", n));
+    }
+    let mut meta = 0usize;
+    for i in 0..n {
+        let e = mo + 2 + i * 12;
+        if u16le(&d[e..]) == 0x0096 {
+            let size = type_size(u16le(&d[e + 2..])) * u32le(&d[e + 4..]) as usize;
+            meta = if size <= 4 { e + 8 } else { base + u32le(&d[e + 8..]) as usize };
+        }
+    }
+    if meta == 0 {
+        return Err("NEF: MakerNote has no linearisation table (0x0096)".into());
+    }
+    if meta + 8 > d.len() {
+        return Err("NEF: linearisation table past end of file".into());
+    }
+
+    let (ver0, ver1) = (d[meta], d[meta + 1]);
+    let mut p = meta + 2;
+    if ver0 == 0x49 || ver1 == 0x58 {
+        p += 2110;
+    }
+    let mut tree = if ver0 == 0x46 { 2usize } else { 0 };
+    if bits == 14 {
+        tree += 3;
+    }
+    let rd16 = |o: usize| -> u32 {
+        if o + 2 <= d.len() { u16le(&d[o..]) as u32 } else { 0 }
+    };
+    let mut vpred = [[0i32; 2]; 2];
+    for a in 0..2 {
+        for b in 0..2 {
+            vpred[a][b] = rd16(p) as i32;
+            p += 2;
+        }
+    }
+    let mut max = ((1u32 << bits) & 0x7fff) as usize;
+    let mut curve: Vec<u16> = (0..0x8000u32).map(|i| i as u16).collect();
+    let csize = rd16(p) as usize;
+    p += 2;
+    let step = if csize > 1 { max / (csize - 1) } else { 0 };
+    let mut split = 0usize;
+    if ver0 == 0x44 && ver1 == 0x20 && step > 0 {
+        for i in 0..csize {
+            curve[i * step] = rd16(p) as u16;
+            p += 2;
+        }
+        for i in 0..max {
+            let r = i % step;
+            curve[i] = ((curve[i - r] as usize * (step - r)
+                + curve[i - r + step] as usize * r)
+                / step) as u16;
+        }
+        split = rd16(meta + 562) as usize;
+    } else if ver0 != 0x46 && csize <= 0x4001 {
+        max = csize;
+        for i in 0..csize {
+            curve[i] = rd16(p) as u16;
+            p += 2;
+        }
+    }
+    while max > 2 && curve[max - 2] == curve[max - 1] {
+        max -= 1;
+    }
+
+    if off >= d.len() {
+        return Err("NEF: strip offset past end of file".into());
+    }
+    let mut huff = make_decoder(&NIKON_TREE[tree]);
+    let mut bs = NikonBits::new(&d[off..]);
+    let mut out = vec![0u16; w * h];
+    let mut hpred = [0i32; 2];
+    for row in 0..h {
+        if split != 0 && row == split {
+            huff = make_decoder(&NIKON_TREE[tree + 1]);
+        }
+        for col in 0..w {
+            let i = bs.huff(&huff);
+            let len = (i & 15) as u32;
+            let shl = (i >> 4) as u32;
+            let mut diff = ((((bs.get(len - shl.min(len)) << 1) + 1) << shl) >> 1) as i32;
+            if len > 0 && (diff & (1 << (len - 1))) == 0 {
+                diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
+            }
+            if col < 2 {
+                vpred[row & 1][col] += diff;
+                hpred[col] = vpred[row & 1][col];
+            } else {
+                hpred[col & 1] += diff;
+            }
+            out[row * w + col] = curve[hpred[col & 1].clamp(0, 0x3fff) as usize];
+        }
+    }
+
+    Ok(BayerImage {
+        width: w,
+        height: h,
+        raw: out,
+        cfa_phase: (0, 0),
+        black: 0,
+        white: curve[max - 1],
+        wb_r: 2.0,
+        wb_g: 1.0,
+        wb_b: 1.5,
+        make: tag_str(_ifd0, 271),
+        model: tag_str(_ifd0, 272),
+    })
+}
+
 pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     if d.len() < 8 || &d[0..2] != b"II" {
         return Err("NEF: not a little-endian TIFF".into());
@@ -352,11 +579,7 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     let len = tag_u32(&st, 279).unwrap_or(0) as usize;
 
     if comp == 34713 {
-        return Err(
-            "NEF: compressed (34713) needs the Nikon Huffman decoder and the \
-             linearisation curve from MakerNote 0x0096 — not implemented"
-                .into(),
-        );
+        return nikon_compressed(d, &ifd0, w, h, bits, off, len);
     }
     if comp != 1 {
         return Err(format!("NEF: compression {} is not supported", comp));
@@ -432,6 +655,24 @@ mod tests {
         b.get(1); // prime the page
         assert_eq!(b.buf[0], 0x22, "second read must land at buf[0]");
         assert_eq!(b.buf[LF], 0x11, "first read must land at buf[load_flags]");
+    }
+
+    /// The 12-bit lossy tree's length counts sum to 14 while only 13 symbols are
+    /// printed in dcraw, so the builder takes its last symbol from the array's
+    /// zero padding. Transcribing only the printed symbols overruns; pin the shape.
+    #[test]
+    fn nikon_decoder_uses_the_zero_padding() {
+        let t = &NIKON_TREE[0];
+        let counts: u32 = t[..16].iter().map(|&c| c as u32).sum();
+        assert_eq!(counts, 14, "12-bit lossy tree has 14 codes");
+        let huff = make_decoder(t);
+        // Longest code is 10 bits: the last non-zero count sits at index 9.
+        assert_eq!(huff[0], 10, "table is indexed by 10 bits");
+        assert_eq!(huff.len(), 1 + (1 << 10));
+        // First code is 2 bits -> symbol 5, filling 1 << (10-2) slots.
+        assert_eq!(huff[1], (2 << 8) | 5);
+        assert_eq!(huff[256], (2 << 8) | 5);
+        assert_ne!(huff[257], (2 << 8) | 5, "the run ends after 256 slots");
     }
 
     #[test]
