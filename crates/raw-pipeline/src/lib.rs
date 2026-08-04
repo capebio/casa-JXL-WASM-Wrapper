@@ -19,6 +19,8 @@ pub mod casabio_encode;
 // is the container format layer and compiles in every build.
 pub mod casv_container;
 pub mod cr2;
+/// Panasonic RW2, Leica RWL and uncompressed Nikon NEF/NRW.
+pub mod panasonic;
 pub mod decompress;
 pub mod demosaic;
 // FableBraid: braided-rANS + mod-256-predictor lossless codec (native + wasm).

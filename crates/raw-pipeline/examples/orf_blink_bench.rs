@@ -16,7 +16,7 @@
 //!   cargo run --release --no-default-features --features blink-bench \
 //!     --example orf_blink_bench -- "C:\Foo\raw-converter\tests\raw-pixls" 99
 use blizz::blink::{choose, decode, encode, Opts};
-use raw_pipeline::{cr2, demosaic, dng, pipeline};
+use raw_pipeline::{cr2, demosaic, dng, panasonic, pipeline};
 use std::time::Instant;
 
 /// Decoded frame as three 8-bit planes, which is what blink takes.
@@ -70,6 +70,33 @@ fn render_bayer(
     Some(to_planes(&rgb8, w, h))
 }
 
+/// **Is this an image, or is it noise?**
+///
+/// A wrong CFA phase or a wrong bit unpack does not crash and does not produce
+/// anything obviously broken: it produces a plausible-looking frame with the right
+/// dimensions whose statistics are garbage. Both codecs then struggle on it
+/// equally and the benchmark reports a confident, completely false number -- which
+/// is exactly what happened on the first RW2 and NRW decode here, at a fictional
+/// -25% against HALIC-fast.
+///
+/// Mean absolute horizontal difference on green separates the two cleanly and
+/// costs one strided pass: a demosaiced photograph sits under 12 counts, uniform
+/// noise sits near 85. Measured on the five frames that were wrong: 56 to 72.
+fn looks_like_noise(p: &[Vec<u8>; 3], w: usize, h: usize) -> Option<f64> {
+    let (mut tot, mut n) = (0u64, 0u64);
+    let mut y = 0;
+    while y < h {
+        let row = &p[1][y * w..(y + 1) * w];
+        for x in 1..w {
+            tot += (row[x] as i32 - row[x - 1] as i32).unsigned_abs() as u64;
+            n += 1;
+        }
+        y += 37;
+    }
+    let mad = tot as f64 / n.max(1) as f64;
+    if mad > 12.0 { Some(mad) } else { None }
+}
+
 fn decode_any(path: &std::path::Path) -> Result<Planes, String> {
     let ext = path
         .extension()
@@ -105,6 +132,22 @@ fn decode_any(path: &std::path::Path) -> Result<Planes, String> {
                 &img.raw, img.width, img.height, phase, img.black, img.white, img.wb_r, img.wb_b,
             )
             .ok_or_else(|| "dng: demosaic failed".to_string())
+        }
+        "rw2" | "rwl" => {
+            let img = panasonic::decode_rw2(&data).map_err(|e| format!("rw2: {e}"))?;
+            render_bayer(
+                &img.raw, img.width, img.height, img.cfa_phase, img.black, img.white, img.wb_r,
+                img.wb_b,
+            )
+            .ok_or_else(|| "rw2: demosaic failed".to_string())
+        }
+        "nef" | "nrw" => {
+            let img = panasonic::decode_nef(&data).map_err(|e| format!("nef: {e}"))?;
+            render_bayer(
+                &img.raw, img.width, img.height, img.cfa_phase, img.black, img.white, img.wb_r,
+                img.wb_b,
+            )
+            .ok_or_else(|| "nef: demosaic failed".to_string())
         }
         // NEF, NRW and RW2 are TIFF-based, so the DNG and CR2 readers may well
         // eat them even though nothing names them. Probe rather than assume --
@@ -178,6 +221,31 @@ fn main() {
         let (w, h) = (pl.w, pl.h);
         let n = w * h;
 
+        // Refuse to report a number for a frame that is not an image. A broken
+        // decoder is worse than a missing one: it produces a plausible headline.
+        if let Some(mad) = looks_like_noise(&pl.p, w, h) {
+            println!(
+                "{:<34}  SKIP  decoded output looks like NOISE (mean |dG/dx| = {:.1}, an image is < 12) -- decoder is wrong",
+                &stem[..stem.len().min(32)],
+                mad
+            );
+            skipped += 1;
+            continue;
+        }
+
+        // `looks_like_noise` only proves the output is SMOOTH, not that it is the
+        // RIGHT picture -- a wrong-but-smooth decode is exactly what the Panasonic
+        // page-split bug produced. Set BLINK_DUMP=<dir> to write the decoded frame
+        // so it can be correlated against an independent converter.
+        if let Ok(dir) = std::env::var("BLINK_DUMP") {
+            let mut ppm = format!("P6\n{} {}\n255\n", w, h).into_bytes();
+            ppm.reserve(n * 3);
+            for i in 0..n {
+                ppm.extend_from_slice(&[pl.p[0][i], pl.p[1][i], pl.p[2][i]]);
+            }
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}.ppm")), &ppm);
+        }
+
         let (pred, rct, coder) = choose(&pl.p, w, h);
         let o = Opts::new(coder, pred, rct, false).expect("chooser produced a legal arm");
         let t = Instant::now();
@@ -203,6 +271,10 @@ fn main() {
             let out = tmp.join("h.halic");
             let _ = std::process::Command::new(halic).arg(&ppm).arg(&out).output();
             let len = std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0);
+            if std::env::var_os("BLINKBENCH_KEEP").is_some() {
+                let keep = std::env::temp_dir().join(format!("{stem}.ppm"));
+                std::fs::copy(&ppm, &keep).ok();
+            }
             std::fs::remove_file(&ppm).ok();
             std::fs::remove_file(&out).ok();
             len
