@@ -606,29 +606,81 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     if bits != 12 {
         return Err(format!("NEF: {}-bit uncompressed is not supported", bits));
     }
-    let need = w * h * 12 / 8;
-    if len != need {
-        return Err(format!(
-            "NEF: {}x{} at 12 bits packed needs {} bytes, strip declares {} — not packed",
-            w, h, need, len
-        ));
-    }
-    if off + need > d.len() {
-        return Err("NEF: strip runs past end of file".into());
-    }
+    // **Coolpix NRW has THREE layouts, and the strip length picks between them.**
+    // Keying on the declared byte count rather than a model-string table is both
+    // simpler and what LibRaw's own A1000 branch effectively does.
+    let packed = w * h * 12 / 8;
+    let unpacked = w * h * 2;
+    let model = tag_str(&ifd0, 272);
 
-    // 12-bit big-endian packed: two pixels per three bytes.
-    let src = &d[off..off + need];
-    let mut raw = vec![0u16; w * h];
-    let mut i = 0usize;
-    for px in raw.chunks_exact_mut(2) {
-        let a = src[i] as u16;
-        let b = src[i + 1] as u16;
-        let c = src[i + 2] as u16;
-        px[0] = (a << 4) | (b >> 4);
-        px[1] = ((b & 0x0f) << 8) | c;
-        i += 3;
-    }
+    let raw: Vec<u16> = if len == unpacked {
+        // A1000: not packed at all. Plain 16-bit little-endian words holding
+        // 12-bit values -- our file declares 31 850 496 = 4608*3456*2 exactly,
+        // which is LibRaw's own test for this case (tiff.cpp: data_size ==
+        // raw_width*raw_height*2 -> unpacked_load_raw).
+        if off + unpacked > d.len() {
+            return Err("NEF: strip runs past end of file".into());
+        }
+        d[off..off + unpacked]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    } else if len == packed {
+        if off + packed > d.len() {
+            return Err("NEF: strip runs past end of file".into());
+        }
+        let src = &d[off..off + packed];
+        // **"coolpixmangled": 12-bit MSB-first, but the byte stream is chunked
+        // into 32-bit LITTLE-ENDIAN words.** dcraw spells this `load_flags = 24`,
+        // which makes `packed_load_raw` refill its bit buffer 4 bytes at a time
+        // with byte i at bit 8*i; RawSpeed calls it BitOrder::MSB32.
+        //
+        // This is what the period-4 structure in the raw stream was. Read as
+        // plain packed 12-bit the plane is NOISE: no bit-plane correlates above
+        // r = 0.24 with a reference. Byte-swapping each aligned 4-byte group
+        // first takes correlation against ImageMagick from 0.60 to 0.9532.
+        let mangled = model.starts_with("COOLPIX B")
+            || (model.starts_with("COOLPIX P") && w != 4032);
+        let mut raw = vec![0u16; w * h];
+        if mangled {
+            // The 12-bit fields do not realign per row, so the whole strip is one
+            // pump. Both dcraw and RawSpeed only agree while w*12 is a multiple of
+            // 32; refuse anything else rather than guess which is right.
+            if w % 8 != 0 {
+                return Err(format!(
+                    "NEF: mangled Coolpix layout with width {w} is not 8-aligned"
+                ));
+            }
+            let mut acc: u64 = 0;
+            let mut nbits: u32 = 0;
+            let mut out = 0usize;
+            for chunk in src.chunks_exact(4) {
+                acc = (acc << 32) | u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as u64;
+                nbits += 32;
+                while nbits >= 12 && out < raw.len() {
+                    nbits -= 12;
+                    raw[out] = ((acc >> nbits) & 0xFFF) as u16;
+                    out += 1;
+                }
+            }
+        } else {
+            let mut i = 0usize;
+            for px in raw.chunks_exact_mut(2) {
+                let a = src[i] as u16;
+                let b = src[i + 1] as u16;
+                let c = src[i + 2] as u16;
+                px[0] = (a << 4) | (b >> 4);
+                px[1] = ((b & 0x0f) << 8) | c;
+                i += 3;
+            }
+        }
+        raw
+    } else {
+        return Err(format!(
+            "NEF: {w}x{h} at 12 bits needs {packed} packed or {unpacked} unpacked, strip declares {len}"
+        ));
+    };
+    let need = len;
 
     Ok(BayerImage {
         width: w,
