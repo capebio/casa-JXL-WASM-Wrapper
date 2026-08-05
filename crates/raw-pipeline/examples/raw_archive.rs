@@ -13,7 +13,7 @@
 //!
 //! Run: cargo run --release --no-default-features --features blink-bench \
 //!        --example raw_archive -- <file-or-dir>
-use blizz::bayer::{decode_bayer_archive, encode_bayer_archive};
+use blizz::bayer::{builtin_envelope, decode_bayer_archive, encode_bayer_opts, Options};
 use raw_pipeline::panasonic::{decode_nef, decode_rw2};
 
 /// `(plane, w, h, sensor_strip_range)` — the range is what the sidecar omits.
@@ -152,6 +152,13 @@ fn main() {
         "{:<26}{:>12}{:>12}{:>11}{:>10}{:>10}{:>8}",
         "frame", "original", "archive", "sidecar", "preview", "saved", "verify"
     );
+    let want_lossy = std::env::args().any(|x| x == "--lossy");
+    let k_sigma: f32 = std::env::args()
+        .position(|x| x == "--k")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1.0);
+    let mut wc = 0f64;
     let (mut to, mut ta, mut ts, mut n, mut skipped) = (0u64, 0u64, 0u64, 0usize, 0usize);
     for path in &paths {
         let stem = path.file_stem().unwrap().to_string_lossy().to_string();
@@ -216,7 +223,35 @@ fn main() {
         sidecar.extend_from_slice(&d[at..]);
         let dropped_bytes: usize = drop.iter().map(|r| r.len()).sum();
 
-        let arc = encode_bayer_archive(&px, w, h, 12, 128, &sidecar);
+        // **The archiver knows the camera, so it picks the noise envelope
+        // itself.** Making the operator name it is an invitation to name the
+        // wrong one, and the wrong envelope is a bound that does not hold.
+        let ext = path
+            .extension()
+            .and_then(|x| x.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let cam = match ext.as_str() {
+            "orf" => "olympus",
+            "rw2" => "panasonic",
+            "rwl" => "leica",
+            "nef" | "nrw" => "nikon",
+            _ => "",
+        };
+        let lossy = if want_lossy {
+            match builtin_envelope(cam) {
+                Some(env) => Some((env, k_sigma)),
+                None => {
+                    println!("{:<26}  SKIP  no noise envelope for '{cam}'", &stem[..stem.len().min(24)]);
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let opts = Options { band_rows: 128, lossy: lossy.clone(), ..Default::default() };
+        let arc = encode_bayer_opts(&px, w, h, 12, opts, &sidecar);
 
         // **Verify before reporting a saving.** An archive that has not been read
         // back is a claim, not a result.
@@ -228,11 +263,37 @@ fn main() {
                 continue;
             }
         };
-        let ok = (bw, bh) == (w, h) && back == px && side_back == sidecar;
-        if !ok {
+        // Sidecar and dimensions must ALWAYS match exactly. The samples match
+        // exactly only on the lossless arm; on the lossy arm the check is the
+        // stated bound, because equality there would be vacuous.
+        if (bw, bh) != (w, h) || side_back != sidecar {
             println!("{:<26}  FAIL  round trip differs", &stem[..stem.len().min(24)]);
             skipped += 1;
             continue;
+        }
+        match &lossy {
+            None => {
+                if back != px {
+                    println!("{:<26}  FAIL  samples differ on the lossless arm", &stem[..stem.len().min(24)]);
+                    skipped += 1;
+                    continue;
+                }
+            }
+            Some((env, k)) => {
+                let mut worst = 0f64;
+                for (&o, &g) in px.iter().zip(back.iter()) {
+                    worst = worst.max((g as f64 - o as f64).abs() / env.sigma(o).max(0.5));
+                }
+                if worst > *k as f64 + 1e-6 {
+                    println!(
+                        "{:<26}  FAIL  worst |e|/sigma {worst:.3} exceeds the {k} bound",
+                        &stem[..stem.len().min(24)]
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                wc = wc.max(worst);
+            }
         }
 
         to += d.len() as u64;
@@ -254,15 +315,28 @@ fn main() {
         println!(
             "\nARCHIVED {n} files ({skipped} skipped)\n  original {:.1} MB\n  archive  {:.1} MB\n  \
 sidecar  {:.1} MB ({:.1}% of the originals, carried verbatim)\n  SAVED    {:.1}%  \
--- every sample and every METADATA byte preserved, all round-trips verified.\n  \
+-- {}\n  \
 Full-size previews are DROPPED unless ARCHIVE_KEEP_PREVIEW=1; they are derived \
 data, regenerable from the plane, and keeping them costs ~6 points.",
             to as f64 / 1e6,
             ta as f64 / 1e6,
             ts as f64 / 1e6,
             100.0 * ts as f64 / to as f64,
-            100.0 * (1.0 - ta as f64 / to as f64)
+            100.0 * (1.0 - ta as f64 / to as f64),
+            // **The claim must match the arm.** Saying "every sample preserved"
+            // on the lossy arm is simply false, and it is the sentence anyone
+            // quotes.
+            if want_lossy {
+                "every METADATA byte preserved exactly; SAMPLES are quantised to the sensor noise floor, all round-trips verified and the bound checked"
+            } else {
+                "every sample and every METADATA byte preserved, all round-trips verified"
+            }
         );
+        if want_lossy {
+            println!(
+                "  LOSSY arm, k = {k_sigma} sigma: worst |e|/sigma across the set was {wc:.3}. Every sample is inside the sensor's own noise, and the envelope travels in each archive."
+            );
+        }
     } else {
         println!("\nNo file archived ({skipped} skipped).");
     }
