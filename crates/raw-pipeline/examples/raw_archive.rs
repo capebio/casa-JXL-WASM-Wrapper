@@ -13,7 +13,7 @@
 //!
 //! Run: cargo run --release --no-default-features --features blink-bench \
 //!        --example raw_archive -- <file-or-dir>
-use blizz::bayer::{builtin_envelope, decode_bayer_archive, encode_bayer_opts, Options};
+use blizz::bayer::{calibrate, decode_bayer_archive, decode_bayer_lossy, encode_bayer_opts, Options};
 use raw_pipeline::panasonic::{decode_nef, decode_rw2};
 
 /// `(plane, w, h, sensor_strip_range)` — the range is what the sidecar omits.
@@ -157,7 +157,9 @@ fn main() {
         .position(|x| x == "--k")
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
+        // 0.5 sigma, matching `blkb`. At k=0.5 the largest move is sigma/2,
+        // which adds 0.06 stop of noise to a plane that already has one.
+        .unwrap_or(0.5);
     let mut wc = 0f64;
     let (mut to, mut ta, mut ts, mut n, mut skipped) = (0u64, 0u64, 0u64, 0usize, 0usize);
     for path in &paths {
@@ -223,34 +225,18 @@ fn main() {
         sidecar.extend_from_slice(&d[at..]);
         let dropped_bytes: usize = drop.iter().map(|r| r.len()).sum();
 
-        // **The archiver knows the camera, so it picks the noise envelope
-        // itself.** Making the operator name it is an invitation to name the
-        // wrong one, and the wrong envelope is a bound that does not hold.
-        let ext = path
-            .extension()
-            .and_then(|x| x.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let cam = match ext.as_str() {
-            "orf" => "olympus",
-            "rw2" => "panasonic",
-            "rwl" => "leica",
-            "nef" | "nrw" => "nikon",
-            _ => "",
-        };
-        let lossy = if want_lossy {
-            match builtin_envelope(cam) {
-                Some(env) => Some((env, k_sigma)),
-                None => {
-                    println!("{:<26}  SKIP  no noise envelope for '{cam}'", &stem[..stem.len().min(24)]);
-                    skipped += 1;
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let opts = Options { band_rows: 128, lossy: lossy.clone(), ..Default::default() };
+        // **The noise model is fitted from THIS plane, per CFA phase.** An
+        // earlier version keyed a built-in envelope off the file extension.
+        // That was withdrawn: `a = 1/g` spans 0.16..3.29 across bodies of one
+        // make, so a make-table overstated sigma by up to 9.2x on some files --
+        // and because the same table also supplied the bound being "verified",
+        // nothing could ever detect it. Fitting per file costs a pass and makes
+        // the bound falsifiable.
+        //
+        // A plane that cannot be calibrated is archived LOSSLESS, not skipped:
+        // refusing the quantiser is not refusing the file.
+        let lossy = if want_lossy { calibrate(&px, w, h, k_sigma as f64) } else { None };
+        let opts = Options { band_rows: 128, lossy, ..Default::default() };
         let arc = encode_bayer_opts(&px, w, h, 12, opts, &sidecar);
 
         // **Verify before reporting a saving.** An archive that has not been read
@@ -279,14 +265,32 @@ fn main() {
                     continue;
                 }
             }
-            Some((env, k)) => {
+            Some(_) => {
+                // Against the calibration CARRIED IN THE STREAM, re-read from
+                // the encoded bytes. Checking against the in-memory fit would
+                // re-use the number that chose the step, which proves nothing.
+                let carried = match decode_bayer_lossy(&arc) {
+                    Ok(Some(c)) => c,
+                    _ => {
+                        println!("{:<26}  FAIL  lossy stream carries no calibration", &stem[..stem.len().min(24)]);
+                        skipped += 1;
+                        continue;
+                    }
+                };
+                let k = carried.k();
                 let mut worst = 0f64;
-                for (&o, &g) in px.iter().zip(back.iter()) {
-                    worst = worst.max((g as f64 - o as f64).abs() / env.sigma(o).max(0.5));
+                for (pi, &(ox, oy)) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)].iter().enumerate() {
+                    let Some(ph) = carried.phase[pi] else { continue };
+                    for y in (oy..h).step_by(2) {
+                        for x in (ox..w).step_by(2) {
+                            let (o, g) = (px[y * w + x] as f64, back[y * w + x] as f64);
+                            worst = worst.max((g - o).abs() / (ph.a() * o + ph.c()).max(0.25).sqrt());
+                        }
+                    }
                 }
-                if worst > *k as f64 + 1e-6 {
+                if worst > k + 1e-6 {
                     println!(
-                        "{:<26}  FAIL  worst |e|/sigma {worst:.3} exceeds the {k} bound",
+                        "{:<26}  FAIL  worst |e|/sigma {worst:.4} exceeds the {k} bound",
                         &stem[..stem.len().min(24)]
                     );
                     skipped += 1;
@@ -334,7 +338,7 @@ data, regenerable from the plane, and keeping them costs ~6 points.",
         );
         if want_lossy {
             println!(
-                "  LOSSY arm, k = {k_sigma} sigma: worst |e|/sigma across the set was {wc:.3}. Every sample is inside the sensor's own noise, and the envelope travels in each archive."
+                "  LOSSY arm, k = {k_sigma} sigma: worst |e|/sigma across the set was {wc:.4}, checked against the calibration CARRIED in each stream. Planes whose noise model could not be fitted were archived losslessly."
             );
         }
     } else {
