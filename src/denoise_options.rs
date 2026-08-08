@@ -103,19 +103,22 @@ fn parse_denoise_options(obj: &JsValue) -> Result<DenoiseOptions, JsError> {
                 let n = val
                     .as_f64()
                     .ok_or_else(|| JsError::new("denoise.isoThreshold must be a number"))?;
-                opts.iso_threshold = n as u32;
+                opts.iso_threshold =
+                    crate::require_finite("denoise.isoThreshold", n).map_err(|e| JsError::new(&e))? as u32;
             }
             "noiseThreshold" => {
                 let n = val
                     .as_f64()
                     .ok_or_else(|| JsError::new("denoise.noiseThreshold must be a number"))?;
-                opts.noise_threshold = n as f32;
+                opts.noise_threshold =
+                    crate::require_finite("denoise.noiseThreshold", n).map_err(|e| JsError::new(&e))? as f32;
             }
             "strength" => {
                 let n = val
                     .as_f64()
                     .ok_or_else(|| JsError::new("denoise.strength must be a number"))?;
-                opts.strength = n as f32;
+                opts.strength =
+                    crate::require_finite("denoise.strength", n).map_err(|e| JsError::new(&e))? as f32;
             }
             other => {
                 return Err(JsError::new(&format!(

@@ -1275,6 +1275,33 @@ pub fn estimate_decode_peak_bytes(width: u32, height: u32, output_flags: u32) ->
 /// histogram floor of real E-M1 III files sits here (~256).
 const OLYMPUS_BLACK_LEVEL: u16 = 256;
 
+/// Boundary hardening (K6#1 family): reject non-finite numbers at the JS↔WASM
+/// options parsers. `DenoiseOptions::clamped()` uses `f32::clamp`, which passes
+/// NaN through, and a NaN look param reaches `base + strength*(denoised-base)` /
+/// the tone pipeline — NaN pixels quantise to 0 and the frame goes silently
+/// black. Returns the error as a plain String so the check is unit-testable
+/// natively (JsError construction needs a JS runtime).
+pub(crate) fn require_finite(name: &str, v: f64) -> Result<f64, String> {
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(format!("'{name}' must be a finite number, got {v}"))
+    }
+}
+
+#[cfg(test)]
+mod require_finite_tests {
+    use super::require_finite;
+    #[test]
+    fn finite_passes_nonfinite_rejected() {
+        assert_eq!(require_finite("x", 1.5), Ok(1.5));
+        assert_eq!(require_finite("x", 0.0), Ok(0.0));
+        assert!(require_finite("x", f64::NAN).is_err());
+        assert!(require_finite("x", f64::INFINITY).is_err());
+        assert!(require_finite("x", f64::NEG_INFINITY).is_err());
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LookOverrides {
     wb_r: f32,
@@ -1321,8 +1348,10 @@ impl LookOverrides {
     /// Contract (K6#1): **unknown key → `JsError`** (kills the silent-typo class
     /// that the 14-positional-arg API allowed); **missing key → default** (neutral;
     /// forward-compatible as the look grows). `null`/`undefined` → all-neutral.
-    /// Every recognized value must be a number (NaN is a valid number and is how
-    /// `wbR`/`wbB` request the camera WB).
+    /// Every recognized value must be a **finite** number — a NaN/Infinity (a JS
+    /// `0/0` typo) would otherwise flow into the tone pipeline and produce a
+    /// symptomless black frame. Sole exception: `wbR`/`wbB`, where NaN is the
+    /// documented "use camera WB" sentinel.
     fn from_js(obj: &JsValue) -> Result<LookOverrides, JsError> {
         let mut look = LookOverrides::neutral();
         if obj.is_undefined() || obj.is_null() {
@@ -1342,21 +1371,28 @@ impl LookOverrides {
                     .map(|x| x as f32)
                     .ok_or_else(|| JsError::new(&format!("look param '{k}' must be a number")))
             };
+            // Finite-checked after the f32 cast (an out-of-range f64 casts to
+            // Infinity). wbR/wbB keep bare `num`: NaN is their camera-WB sentinel.
+            let fin = || -> Result<f32, JsError> {
+                let v = num()?;
+                require_finite(&format!("look.{k}"), v as f64).map_err(|e| JsError::new(&e))?;
+                Ok(v)
+            };
             match k.as_str() {
-                "exposureEv" => look.exposure_ev = num()?,
-                "contrast" => look.contrast = num()?,
-                "highlights" => look.highlights = num()?,
-                "shadows" => look.shadows = num()?,
-                "whites" => look.whites = num()?,
-                "blacks" => look.blacks = num()?,
-                "saturation" => look.saturation = num()?,
-                "vibrance" => look.vibrance = num()?,
-                "temp" => look.temp = num()?,
-                "tint" => look.tint = num()?,
+                "exposureEv" => look.exposure_ev = fin()?,
+                "contrast" => look.contrast = fin()?,
+                "highlights" => look.highlights = fin()?,
+                "shadows" => look.shadows = fin()?,
+                "whites" => look.whites = fin()?,
+                "blacks" => look.blacks = fin()?,
+                "saturation" => look.saturation = fin()?,
+                "vibrance" => look.vibrance = fin()?,
+                "temp" => look.temp = fin()?,
+                "tint" => look.tint = fin()?,
                 "wbR" => look.wb_r = num()?,
                 "wbB" => look.wb_b = num()?,
-                "texture" => look.texture = num()?,
-                "clarity" => look.clarity = num()?,
+                "texture" => look.texture = fin()?,
+                "clarity" => look.clarity = fin()?,
                 other => {
                     return Err(JsError::new(&format!(
                         "unknown look param '{other}' (allowed: exposureEv, contrast, \
@@ -5899,6 +5935,21 @@ fn metrics_to_js(m: &Metrics) -> JsValue {
     );
     let _ = js_sys::Reflect::set(&o, &"ssim".into(), &JsValue::from_f64(m.ssim as f64));
     let _ = js_sys::Reflect::set(&o, &"psnr".into(), &JsValue::from_f64(m.psnr as f64));
+    // ChannelMoments come free from the SSIM sums (the flip-measured 38% fusion in
+    // Comparer::all) — serialize them so web/jxl-frame-stats-worker.js can drop its
+    // scalar-JS computeChannelMoments pass (a full pixel traversal per progressive
+    // pass). Shape mirrors computeChannelMoments' return: { mus, vars, ch }.
+    let mus = js_sys::Array::new();
+    let vars = js_sys::Array::new();
+    for c in 0..m.moments.ch.min(3) {
+        mus.push(&JsValue::from_f64(m.moments.mus[c] as f64));
+        vars.push(&JsValue::from_f64(m.moments.vars[c] as f64));
+    }
+    let mo = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&mo, &"mus".into(), &mus);
+    let _ = js_sys::Reflect::set(&mo, &"vars".into(), &vars);
+    let _ = js_sys::Reflect::set(&mo, &"ch".into(), &JsValue::from_f64(m.moments.ch as f64));
+    let _ = js_sys::Reflect::set(&o, &"moments".into(), &mo);
     o.into()
 }
 
@@ -7076,6 +7127,12 @@ pub struct FableDeltaSession {
     inner: raw_pipeline::fable_braid::DeltaDecodeSession,
     last_w: u32,
     last_h: u32,
+    /// RGB8 of the last frame this session returned, retained for
+    /// `decode_delta_resident` so JS never re-uploads the previous frame
+    /// across the boundary every P-frame (a w·h·3 copy at playback rate).
+    /// Seeded by `decode_intra`; cleared by the explicit-`prev` `decode_delta`
+    /// (mixing the two APIs would leave a stale resident copy).
+    last_frame: Option<Vec<u8>>,
 }
 
 #[wasm_bindgen]
@@ -7086,6 +7143,7 @@ impl FableDeltaSession {
             inner: raw_pipeline::fable_braid::DeltaDecodeSession::new(),
             last_w: 0,
             last_h: 0,
+            last_frame: None,
         }
     }
 
@@ -7096,6 +7154,9 @@ impl FableDeltaSession {
             Some((px, w, h)) => {
                 self.last_w = w;
                 self.last_h = h;
+                // Retain a copy so decode_delta_resident can follow immediately
+                // (an in-wasm memcpy per I-frame, i.e. once per GOP).
+                self.last_frame = Some(px.clone());
                 Ok(px)
             }
             None => Err(JsError::new(
@@ -7106,6 +7167,7 @@ impl FableDeltaSession {
 
     /// Decode a temporal-delta fable frame against `prev` (the RGB8 this session
     /// returned for the previous frame). `w`/`h` are the current frame dims.
+    /// Prefer [`Self::decode_delta_resident`], which keeps `prev` wasm-side.
     pub fn decode_delta(
         &mut self,
         bytes: &[u8],
@@ -7113,10 +7175,35 @@ impl FableDeltaSession {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>, JsError> {
+        // Explicit-prev API: drop the resident copy rather than pay a per-P-frame
+        // clone maintaining it. A later decode_delta_resident then errors cleanly
+        // instead of reconstructing against a stale frame.
+        self.last_frame = None;
         match self.inner.decode_delta(bytes, prev, w, h) {
             Some(px) => {
                 self.last_w = w;
                 self.last_h = h;
+                Ok(px)
+            }
+            None => Err(JsError::new(
+                "fable decode_delta failed (corrupt stream or dim mismatch)",
+            )),
+        }
+    }
+
+    /// Decode a temporal-delta fable frame against the **session-resident**
+    /// previous frame (retained from `decode_intra` / the previous call), so the
+    /// caller never round-trips the prior frame across the JS↔WASM boundary.
+    /// Dims are the resident frame's. Errors if no resident frame exists — call
+    /// `decode_intra` first (the explicit-`prev` `decode_delta` clears it).
+    pub fn decode_delta_resident(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+        let (w, h) = (self.last_w, self.last_h);
+        let prev = self.last_frame.as_deref().ok_or_else(|| {
+            JsError::new("no resident previous frame — call decode_intra first")
+        })?;
+        match self.inner.decode_delta(bytes, prev, w, h) {
+            Some(px) => {
+                self.last_frame = Some(px.clone());
                 Ok(px)
             }
             None => Err(JsError::new(
