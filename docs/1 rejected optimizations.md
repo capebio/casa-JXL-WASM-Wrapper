@@ -1890,3 +1890,18 @@ Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tric
   Huffman opts as an upstream PR — no fork to maintain. The reusable A/B bench harness
   (`benchmark/run-jxl-ab-flipflop.mjs` + `crates/raw-pipeline/examples/jxl_encdec_ab.rs`) is already
   on main; only the dead-end fork submodule + fork-specific probes are unique to the archived branch.
+
+---
+
+## Lens-2 Agent 4 item 4.5: dark-frame defective-pixel map (calibrate.rs + profiles.rs + pipeline.rs) — DEFERRED, NOT IMPLEMENTABLE AS A VERIFIED MINIMAL CHANGE (2026-08-08)
+
+**Proposal:** extend `denoise/calibrate.rs` to derive a bad-pixel map from the ≥16 dark frames it already ingests (hot: dark mean > k·σ of plane; dead: 0 across darks), persist per CameraKey in `denoise/profiles.rs`, and apply median-of-Bayer-neighbours substitution on the mosaic before demosaic in `pipeline.rs`.
+
+**Re-verified 2026-08-08 against current main:** still valid — `calibrate()` fits only shot/read coefficients; no defective-pixel logic exists anywhere in the crate. The idea itself is sound astronomy-CCD practice and remains a good candidate.
+
+**Rejected for this session's scope, not on merits:**
+1. **Unvalidatable tonight.** The k·σ hot-pixel threshold and the substitution kernel need real dark-frame corpora to tune; this session's constraints are "no benchmarks, cargo-test verification only" and the repo ships no dark-frame fixtures — any threshold I picked would be a guess baked into a persisted profile format.
+2. **Not minimal.** It is a three-file feature (new profile schema field + migration for existing ProfileDatabase entries + a new mosaic pre-pass in the `pipeline.rs` hot path), against an actively-moving main, with pinned-digest parity tests (`tests/parity_corpus.rs`) that any mosaic pre-pass would drift for calibrated cameras.
+3. **Cross-cutting output change.** Substitution before demosaic alters RAW-path output for every profiled camera — exactly the class of silent whole-corpus drift the golden-ledger tests exist to catch; landing it deserves its own reviewed change with re-pinned goldens, not a rider on a kernel-optimization branch.
+
+**Disposition:** implement as its own feature branch with dark-frame fixtures and re-pinned goldens. Everything else in the Agent 4 handoff (4.1–4.4, 4.6–4.9) was implemented on `lens2-s4-w9d4`.
