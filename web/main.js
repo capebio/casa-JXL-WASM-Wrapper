@@ -1336,10 +1336,12 @@ pool.setLiveHandler((msg) => {
             const sW = msg.nativeW ?? msg.w;
             const sH = msg.nativeH ?? msg.h;
             const ori = msg.orientation ?? 1;
-            drawSensorWithOrientation(lightboxCanvas, msg.rgb, sW, sH, ori);
+            // Orientation-1 paints return their ImageData (TTFP-2 pattern) —
+            // skip the per-slider-tick full-canvas readback on that path.
+            const liveFrame = drawSensorWithOrientation(lightboxCanvas, msg.rgb, sW, sH, ori);
             if (lightboxCanvas.width > 0) {
                 const ctx = lightboxCanvas.getContext('2d');
-                captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+                captureCleanAndApplyLens(liveFrame ?? ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
             }
         }
     }
@@ -1731,10 +1733,9 @@ async function blissOpfsLoad(card, assetId) {
     if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
     if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
     const { rgb, w, h } = result;
-    drawCanvas(lightboxCanvas, w, h, rgb);
-    if (lightboxCanvas.width > 0) {
-        const _ctx = lightboxCanvas.getContext('2d');
-        captureCleanAndApplyLens(_ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+    const blissFrame = drawCanvas(lightboxCanvas, w, h, rgb);
+    if (lightboxCanvas.width > 0 && blissFrame) {
+        captureCleanAndApplyLens(blissFrame);
     }
     setPaintedSourceBadge('bliss');
     lbLoadingBadge.hidden = true;
@@ -2002,7 +2003,14 @@ function drawCanvas(canvas, w, h, rgb) {
     const rgba = (rgb.byteLength === w * h * 4)
         ? (rgb instanceof Uint8ClampedArray ? rgb : new Uint8ClampedArray(rgb.buffer, rgb.byteOffset, rgb.byteLength))
         : rgbToRgba(rgb, w, h);
-    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+    const frame = new ImageData(rgba, w, h);
+    ctx.putImageData(frame, 0, 0);
+    // TTFP-2 pattern: return the ImageData just painted so callers that need a
+    // clean snapshot can skip the full-canvas getImageData readback (the put
+    // covers the whole canvas at (0,0) with opaque pixels, so the readback
+    // would be byte-identical). Consumers of cleanSnapshot are read-only or
+    // deep-copy, so aliasing a caller-retained buffer is safe.
+    return frame;
 }
 
 // Draw a sensor-orientation RGB8 buffer into a canvas, applying the EXIF
@@ -2031,8 +2039,12 @@ function drawSensorWithOrientation(canvas, rgb, sw, sh, orientation) {
     if (!ctx) return;
     const rgba = rgbToRgba(rgb, sw, sh);
     if (cw === 0 && !flipX) {
-        ctx.putImageData(new ImageData(rgba, sw, sh), 0, 0);
-        return;
+        // No GPU transform: the painted ImageData IS the canvas content, so
+        // return it (TTFP-2 pattern) — callers can reuse it as the clean
+        // snapshot without a full-canvas getImageData readback.
+        const frame = new ImageData(rgba, sw, sh);
+        ctx.putImageData(frame, 0, 0);
+        return frame;
     }
     const tmp = document.createElement('canvas');
     tmp.width = sw; tmp.height = sh;
@@ -2044,6 +2056,7 @@ function drawSensorWithOrientation(canvas, rgb, sw, sh, orientation) {
     if (flipX) ctx.scale(-1, 1);
     ctx.drawImage(tmp, -sw / 2, -sh / 2, sw, sh);
     ctx.restore();
+    return null; // pixels were composed on the GPU — no ImageData to hand back
 }
 
 // Draw an RGB8 buffer into canvas with an arbitrary CW rotation (0/90/180/270).
@@ -3411,14 +3424,18 @@ function drawLightboxForCard(card) {
     if (hasFullRgb) {
         const lb = getCardState(card)._lightbox;
         // Phase 2: if sensor-orient pixels with EXIF orientation, draw rotated via GPU.
+        // Non-rotated paints return their ImageData (TTFP-2 pattern) so the
+        // clean snapshot skips the full-canvas readback; rotated paints were
+        // composed on the GPU and still need getImageData.
+        let rawFrame = null;
         if (lb.nativeW && lb.orientation && lb.orientation !== 1) {
-            drawSensorWithOrientation(lightboxCanvas, lb.rgb, lb.nativeW, lb.nativeH, lb.orientation);
+            rawFrame = drawSensorWithOrientation(lightboxCanvas, lb.rgb, lb.nativeW, lb.nativeH, lb.orientation);
         } else {
-            drawCanvas(lightboxCanvas, lb.w, lb.h, lb.rgb);
+            rawFrame = drawCanvas(lightboxCanvas, lb.w, lb.h, lb.rgb);
         }
         if (lightboxCanvas.width > 0) {
             const _ctx = lightboxCanvas.getContext('2d');
-            captureCleanAndApplyLens(_ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+            captureCleanAndApplyLens(rawFrame ?? _ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
         }
         setPaintedSourceBadge('raw');
         lbLoadingBadge.hidden = true;
@@ -5388,9 +5405,14 @@ async function triggerLiveUpdateTauri(look) {
             getCardState(card)._lightbox.h = h;
         }
         const ctx = lightboxCanvas.getContext('2d');
-        ctx.putImageData(new ImageData(rgbToRgbaArr(rgb), w, h), 0, 0);
+        // TTFP-2 pattern: hand the ImageData we just painted straight to the
+        // snapshot instead of reading the identical pixels back (the put fills
+        // the whole canvas at (0,0) with opaque pixels, and the rgba buffer is
+        // freshly allocated per call — no aliasing).
+        const lookFrame = new ImageData(rgbToRgbaArr(rgb), w, h);
+        ctx.putImageData(lookFrame, 0, 0);
         if (lightboxCanvas.width > 0) {
-            captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+            captureCleanAndApplyLens(lookFrame);
         }
         // Real RAW pixels now on screen → update colour-coded badge accordingly,
         // and preserve displayed size if the canvas just got resized.
