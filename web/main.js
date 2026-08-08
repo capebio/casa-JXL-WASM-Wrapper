@@ -1664,11 +1664,13 @@ function _initBlissDecodeWorker() {
     if (_blissDecodeWorker) return;
     _blissDecodeWorker = new Worker('./bliss-worker.js', { type: 'module' });
     _blissDecodeWorker.onmessage = (ev) => {
-        const { seq, rgb, w, h } = ev.data;
+        const { seq, rgb, off, w, h } = ev.data;
         const resolve = _blissDecodePending.get(seq);
         if (resolve) {
             _blissDecodePending.delete(seq);
-            resolve(rgb ? { rgb: new Uint8Array(rgb), w, h } : null);
+            // rgb arrives as the worker's whole decode buffer with `off` pointing
+            // past the 8-byte dims header (zero-copy transfer; no slice(8) copy).
+            resolve(rgb ? { rgb: new Uint8Array(rgb, off || 0), w, h } : null);
         }
     };
     _blissDecodeWorker.postMessage({ type: 'preload' });

@@ -100,6 +100,7 @@ const s = {
 
 let worker = null;
 let frameBuffer = [];    // [{idx, imageData}]
+let seekEpoch = 0;       // bumped on every seek; stale in-flight frames are dropped
 let videoMeta = null;
 let playing = false;
 let currentFrame = 0;
@@ -211,7 +212,7 @@ function rewind() {
   playing = false;
   btnPlay.disabled  = false;
   btnPause.disabled = true;
-  worker.postMessage({ type: 'seek', frame: 0 });
+  worker.postMessage({ type: 'seek', frame: 0, epoch: ++seekEpoch });
 }
 
 btnPlay.addEventListener('click',   startPlayback);
@@ -222,12 +223,13 @@ scrubber.addEventListener('change', () => {
   frameBuffer = [];
   currentFrame = f;
   lastFrameTime = 0;
-  worker.postMessage({ type: 'seek', frame: f });
+  worker.postMessage({ type: 'seek', frame: f, epoch: ++seekEpoch });
 });
 
 async function loadFile(file) {
   if (worker) { worker.terminate(); worker = null; }
   frameBuffer = [];
+  seekEpoch = 0; // fresh worker starts at epoch 0
   playing = false;
   btnPlay.disabled = btnPause.disabled = btnRewind.disabled = true;
 
@@ -247,6 +249,10 @@ async function loadFile(file) {
         btnRewind.disabled  = false;
         break;
       case 'frame':
+        // Stale frame decoded before a seek: drop it and skip the ack (the
+        // worker reset its queue counter on seek; acking here would let it
+        // over-fill the new epoch's queue and flash pre-scrub frames).
+        if (msg.epoch !== undefined && msg.epoch !== seekEpoch) break;
         lastDecFps = msg.decFps;
         frameBuffer.push({ idx: msg.idx, rgb: new Uint8Array(msg.rgb) });
         // Don't ack yet — will ack when consumed in rafLoop

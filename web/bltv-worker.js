@@ -1,9 +1,9 @@
 // BLTV decode worker.
 // Messages from main: { type: 'load', wasmUrl, data: Uint8Array }
-//                     { type: 'seek', frame: number }
+//                     { type: 'seek', frame: number, epoch: number }
 //                     { type: 'pause' } / { type: 'resume' }
 // Messages to main:   { type: 'ready', width, height, frameCount, fpsNum, fpsDen, isLossless, fileSize }
-//                     { type: 'frame', idx: number, rgb: ArrayBuffer }   (rgb is transferred)
+//                     { type: 'frame', idx: number, epoch: number, rgb: ArrayBuffer }   (rgb is transferred)
 //                     { type: 'end' }
 //                     { type: 'error', message }
 
@@ -12,6 +12,10 @@ let paused  = false;
 let frameIdx = 0;
 let decodeCount = 0;
 let decodeStart = 0;
+// Seek generation: frames already decoded before a seek are stamped with the
+// old epoch so the main thread can drop them instead of rendering stale frames
+// after a scrub (and skip their acks against the new epoch's queue counter).
+let epoch = 0;
 
 async function load(wasmUrl, data) {
   try {
@@ -55,7 +59,7 @@ function pump() {
     const idx = frameIdx++;
     decodeCount++;
     const decFps = decodeCount / ((performance.now() - decodeStart) / 1000);
-    self.postMessage({ type: 'frame', idx, rgb: rgb.buffer, decFps }, [rgb.buffer]);
+    self.postMessage({ type: 'frame', idx, epoch, rgb: rgb.buffer, decFps }, [rgb.buffer]);
     queued++;
   }
 }
@@ -75,6 +79,7 @@ self.onmessage = (e) => {
       try {
         decoder.seek(msg.frame);
         frameIdx = msg.frame;
+        if (msg.epoch !== undefined) epoch = msg.epoch;
         queued = 0;
         paused = false;
         decodeCount = 0;
