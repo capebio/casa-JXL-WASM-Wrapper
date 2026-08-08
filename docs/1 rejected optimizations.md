@@ -1890,3 +1890,27 @@ Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tric
   Huffman opts as an upstream PR — no fork to maintain. The reusable A/B bench harness
   (`benchmark/run-jxl-ab-flipflop.mjs` + `crates/raw-pipeline/examples/jxl_encdec_ab.rs`) is already
   on main; only the dead-end fork submodule + fork-specific probes are unique to the archived branch.
+
+## Lens-review handoff Agent 5 re-verification — 2026-08-08 (branch lens2-s5-z9f4)
+
+- **Item 5.1 structural tier: lazy clean-snapshot capture (`invalidateCleanSnapshot()` +
+  deferred `getImageData` on lens activation).** Rejected 2026-08-08. Deferring the capture also
+  defers `setCleanCanvas` and `feedTauriParityBaseline` — the M2 FilterEngine parity panel is fed
+  the clean baseline at paint time today, so its colour sliders would go inert until first lens
+  activation; the change touches all nine paint sites plus the lens active/inactive lifecycle in
+  the middle of an active refactor of main.js. The mechanical tier landed instead (TTFP-2 pattern
+  extended to LIGHTBOX_LIVE, blissOpfsLoad, drawLightboxForCard raw branch, triggerLiveUpdateTauri),
+  which removes the readback on the latency-critical slider path for orientation-1 files with zero
+  behavioural change. Revisit the lazy tier only if profiling shows the remaining GPU-composed
+  sites (rotated/mirrored, JPEG-scaled, straighten) dominate.
+- **Item 5.6, moments half: use `m.moments` from the wasm comparer instead of
+  `computeChannelMoments` in the wcmp branch.** Deferred 2026-08-08 (not landed). It consumes the
+  `mus`/`vars` fields Agent 2 item 2.2 adds to `metrics_to_js` — that change has not landed on
+  main, so there is no API to code against; guessing the field shape would silently fall over at
+  integration. One-line follow-up once 2.2 lands. The zero-copy `input_ptr`/`all_at` half of 5.6
+  IS implemented (with a fallback to the copying `all()` when the wasm memory handle is absent).
+- **Item 5.2, pyramid source: "build sources from the existing OPFS pyramid getters."** Partially
+  rejected 2026-08-08: the main gallery page has no OPFS JXL pyramid store (that is the
+  pyramid-gallery page's architecture); its decoded-RGBA derived cache is main-thread state the
+  live-buffer source already covers. The Identify wiring passes a null pyramid getter with a
+  comment; wire a real getter if/when the main gallery gains an OPFS pyramid.
