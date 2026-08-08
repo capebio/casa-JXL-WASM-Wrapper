@@ -1107,24 +1107,32 @@ const MAGIC: &[u8; 4] = b"FBR1";
 // subtract-green space, including temporal deltas.
 const RCT_SUBTRACT_GREEN: u8 = 1;
 
-fn deinterleave3(rgb: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let mut r = vec![0u8; n];
-    let mut g = vec![0u8; n];
-    let mut b = vec![0u8; n];
+/// Planar split into caller-owned buffers (resized to `n`; reused across
+/// frames by [`DeltaEncodeSession`] — no per-frame plane allocation once warm).
+fn deinterleave3_into(rgb: &[u8], n: usize, r: &mut Vec<u8>, g: &mut Vec<u8>, b: &mut Vec<u8>) {
+    r.clear();
+    r.resize(n, 0);
+    g.clear();
+    g.resize(n, 0);
+    b.clear();
+    b.resize(n, 0);
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        unsafe { kernels_wasm::deinterleave3_simd128(rgb, &mut r, &mut g, &mut b) };
-        return (r, g, b);
+        unsafe { kernels_wasm::deinterleave3_simd128(rgb, r, g, b) };
+        return;
     }
     #[allow(unreachable_code)]
-    {
-        for i in 0..n {
-            r[i] = rgb[3 * i];
-            g[i] = rgb[3 * i + 1];
-            b[i] = rgb[3 * i + 2];
-        }
-        (r, g, b)
+    for i in 0..n {
+        r[i] = rgb[3 * i];
+        g[i] = rgb[3 * i + 1];
+        b[i] = rgb[3 * i + 2];
     }
+}
+
+fn deinterleave3(rgb: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut r, mut g, mut b) = (Vec::new(), Vec::new(), Vec::new());
+    deinterleave3_into(rgb, n, &mut r, &mut g, &mut b);
+    (r, g, b)
 }
 
 /// Scalar reference for the fused RCT-undo interleave (also the wasm path).
@@ -1241,6 +1249,102 @@ pub fn encode_rgb8_delta(cur: &[u8], prev: &[u8], w: u32, h: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Streaming encode session for a chain of frames — the encoder-side twin of
+/// [`DeltaDecodeSession`]. Caches the subtract-green planes of the last
+/// encoded frame, so each P-frame skips re-deriving prev's planes from
+/// interleaved RGB (one deinterleave3, 2n wrapping subs and 3 plane
+/// allocations per frame), and reuses the two predictor-scan scratch buffers
+/// across frames. Payloads are **byte-identical** to the stateless
+/// [`encode_rgb8`] / [`encode_rgb8_delta`]: the cached planes are the exact
+/// values a fresh derivation would produce (mod-256 ring, deterministic
+/// kernels) — pinned by `encode_session_matches_stateless`.
+pub struct DeltaEncodeSession {
+    /// Subtract-green planes (G, R−G, B−G) of the last encoded frame.
+    planes: [Vec<u8>; 3],
+    /// Deinterleave destination for the current frame (ping-pongs with
+    /// `planes` after each encode).
+    spare: [Vec<u8>; 3],
+    scan_ext: PredScan,
+    scan_top: PredScan,
+    /// Dimensions the cached `planes` describe; None until the first encode.
+    dims: Option<(u32, u32)>,
+}
+
+impl Default for DeltaEncodeSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeltaEncodeSession {
+    pub fn new() -> Self {
+        DeltaEncodeSession {
+            planes: [Vec::new(), Vec::new(), Vec::new()],
+            spare: [Vec::new(), Vec::new(), Vec::new()],
+            scan_ext: PredScan::default(),
+            scan_top: PredScan::default(),
+            dims: None,
+        }
+    }
+
+    /// Deinterleave `rgb` into `spare` as subtract-green planes (G, R−G, B−G).
+    fn derive_sg_into_spare(&mut self, rgb: &[u8], n: usize) {
+        let [sg, sr, sb] = &mut self.spare;
+        deinterleave3_into(rgb, n, sr, sg, sb);
+        for i in 0..n {
+            sr[i] = sr[i].wrapping_sub(sg[i]);
+            sb[i] = sb[i].wrapping_sub(sg[i]);
+        }
+    }
+
+    /// Intra encode; output byte-identical to [`encode_rgb8`]. Caches the
+    /// frame's planes as the delta reference for [`Self::encode_delta`].
+    pub fn encode_intra(&mut self, rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let n = w as usize * h as usize;
+        assert_eq!(rgb.len(), n * 3, "rgb size");
+        self.derive_sg_into_spare(rgb, n);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut out = image_header(w, h, 3, RCT_SUBTRACT_GREEN);
+        for i in 0..3 {
+            scan_predictor_into(&self.spare[i], wu, hu, Predictor::Top, &mut self.scan_top);
+            push_plane_from_scan(&mut out, wu, hu, Predictor::Top, &mut self.scan_top);
+        }
+        std::mem::swap(&mut self.planes, &mut self.spare);
+        self.dims = Some((w, h));
+        out
+    }
+
+    /// P-frame encode against the session's cached previous frame; output
+    /// byte-identical to [`encode_rgb8_delta`] with that frame as `prev`.
+    /// Panics when no frame of these dims was encoded first (caller bug —
+    /// same contract style as the stateless size asserts).
+    pub fn encode_delta(&mut self, rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let n = w as usize * h as usize;
+        assert_eq!(rgb.len(), n * 3, "cur size");
+        assert_eq!(
+            self.dims,
+            Some((w, h)),
+            "encode_delta needs a prior same-dims encode"
+        );
+        self.derive_sg_into_spare(rgb, n);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut out = image_header(w, h, 3, RCT_SUBTRACT_GREEN);
+        for i in 0..3 {
+            let ext = Predictor::External(&self.planes[i]);
+            scan_predictor_into(&self.spare[i], wu, hu, ext, &mut self.scan_ext);
+            scan_predictor_into(&self.spare[i], wu, hu, Predictor::Top, &mut self.scan_top);
+            if self.scan_ext.cost_bits <= self.scan_top.cost_bits {
+                push_plane_from_scan(&mut out, wu, hu, ext, &mut self.scan_ext);
+            } else {
+                push_plane_from_scan(&mut out, wu, hu, Predictor::Top, &mut self.scan_top);
+            }
+        }
+        std::mem::swap(&mut self.planes, &mut self.spare);
+        self.dims = Some((w, h));
+        out
+    }
 }
 
 /// True iff every plane of a delta image is External-predicted with all-COPY
@@ -1900,6 +2004,44 @@ mod tests {
                 .expect("mid-chain"),
             frames[1]
         );
+    }
+
+    /// The encode session must emit byte-identical payloads to the stateless
+    /// functions across a mixed chain: intra, deltas, an identity frame, and
+    /// a mid-chain re-key (GOP boundary).
+    #[test]
+    fn encode_session_matches_stateless() {
+        let (w, h) = (61u32, 33u32);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..6u32 {
+            let mut f = photo_like(w as usize, h as usize, 200 + i as u64);
+            if i == 2 {
+                f = frames[1].clone(); // identity frame
+            }
+            frames.push(f);
+        }
+        let mut sess = DeltaEncodeSession::new();
+        assert_eq!(
+            sess.encode_intra(&frames[0], w, h),
+            encode_rgb8(&frames[0], w, h),
+            "intra"
+        );
+        for i in 1..frames.len() {
+            if i == 4 {
+                // mid-chain re-key: intra must also refresh the delta cache
+                assert_eq!(
+                    sess.encode_intra(&frames[i], w, h),
+                    encode_rgb8(&frames[i], w, h),
+                    "re-key frame {i}"
+                );
+            } else {
+                assert_eq!(
+                    sess.encode_delta(&frames[i], w, h),
+                    encode_rgb8_delta(&frames[i], &frames[i - 1], w, h),
+                    "delta frame {i}"
+                );
+            }
+        }
     }
 
     #[test]
