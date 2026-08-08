@@ -7,7 +7,7 @@
 # Build (needs cargo-fuzz + a nightly toolchain with the sanitizer runtime):
 #   cargo install cargo-fuzz
 #   cd crates/raw-pipeline
-#   cargo +nightly fuzz build                 # the 5 pure-Rust parser targets
+#   cargo +nightly fuzz build                 # the 7 pure-Rust parser targets
 #   cargo +nightly fuzz build --features codec # + the CASV/JXTC targets (needs libjxl)
 #   cargo +nightly fuzz run tiff_parse -- -max_total_time=20   # smoke
 #
@@ -74,6 +74,20 @@ bench = false
 [[bin]]
 name = "decompress"
 path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rw2_decode"
+path = "fuzz_targets/rw2_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nef_decode"
+path = "fuzz_targets/nef_decode.rs"
 test = false
 doc = false
 bench = false
