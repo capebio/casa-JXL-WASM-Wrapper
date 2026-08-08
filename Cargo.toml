@@ -35,6 +35,15 @@ c-perceptual = ["raw-pipeline/c-perceptual"]
 # byte-identical output. Use for representative native numbers.
 parallel = ["raw-pipeline/parallel", "dep:rayon"]
 
+# Bench-only wasm exports (demosaic_bench_*, decompress_bench_*, demtone_bench_*,
+# pipeline_bench_*, fstats_* probes, bench_decode_orf). Each unconditional
+# #[wasm_bindgen] export is a DCE root that pins its whole bench-only call graph
+# (scalar demosaic twins, synthetic corpus generators, comparison kernels) into
+# every shipped web/pkg download. OFF for the production pkg; flip ON for the
+# flip-flop/bench pkg builds (tools/demosaic-flipflop.mjs, decompress/frame-stats
+# flipflop harnesses): `wasm-pack build ... -- --features bench-exports`.
+bench-exports = []
+
 # Native bench tool importing jxl-gated modules (jxl_casaencoder / jxl_decode),
 # which vanish on wasm32 — gate it so `cargo check --target wasm32-unknown-unknown`
 # stays green. Natively the target dep enables jxl-codec, so pass

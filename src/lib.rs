@@ -33,12 +33,18 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 // === Lens 22 demosaic SIMD flip-flop (bench-only; driven by tools/demosaic-flipflop.mjs) ===
 // Times are taken in the JS host (wasm32-unknown-unknown has no wall clock); these exports just
 // run one demosaic and return a cheap checksum so wasm-bindgen marshalling is constant.
+// All bench-only exports in this crate are gated behind `--features bench-exports` (2.1):
+// production pkg builds omit them so DCE can strip the bench-only call graphs they pin.
 use std::cell::RefCell;
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static DEMO_BENCH: RefCell<(Vec<u16>, usize, usize)> = const { RefCell::new((Vec::new(), 0, 0)) };
+}
+thread_local! {
     // Scratch buffer for LookRenderer::render() texture/clarity path — avoids Vec::clone on every slider drag.
     static RENDER_SCRATCH: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
+#[cfg(feature = "bench-exports")]
 fn demo_checksum(v: &[u16]) -> u32 {
     v.iter()
         .fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
@@ -135,6 +141,7 @@ impl RawStreamExporter {
         unsafe { std::slice::from_raw_parts(ptr, ysize * stride) }.to_vec()
     }
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_prepare(w: usize, h: usize) {
     let raw: Vec<u16> = (0..w * h)
@@ -142,6 +149,7 @@ pub fn demosaic_bench_prepare(w: usize, h: usize) {
         .collect();
     DEMO_BENCH.with(|b| *b.borrow_mut() = (raw, w, h));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_scalar() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -149,6 +157,7 @@ pub fn demosaic_bench_scalar() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb(&g.0, g.1, g.2).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_simd() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -156,6 +165,7 @@ pub fn demosaic_bench_simd() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_equal() -> bool {
     DEMO_BENCH.with(|b| {
@@ -164,6 +174,7 @@ pub fn demosaic_bench_equal() -> bool {
             == demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap()
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_first_diff() -> i32 {
     DEMO_BENCH.with(|b| {
@@ -179,6 +190,7 @@ pub fn demosaic_bench_first_diff() -> i32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 fn demo_checksum3(r: &[u16], g: &[u16], b: &[u16]) -> u32 {
     let mut c = demo_checksum(r);
     c = c.wrapping_mul(31).wrapping_add(demo_checksum(g));
@@ -186,6 +198,7 @@ fn demo_checksum3(r: &[u16], g: &[u16], b: &[u16]) -> u32 {
     c
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_scalar() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -195,6 +208,7 @@ pub fn demosaic_bench_planar_scalar() -> u32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_simd() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -204,6 +218,7 @@ pub fn demosaic_bench_planar_simd() -> u32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_equal() -> bool {
     DEMO_BENCH.with(|b| {
@@ -213,6 +228,7 @@ pub fn demosaic_bench_planar_equal() -> bool {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_first_diff() -> i32 {
     DEMO_BENCH.with(|b| {
@@ -235,6 +251,7 @@ pub fn demosaic_bench_planar_first_diff() -> i32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_shuffle_simd() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -243,6 +260,7 @@ pub fn demosaic_bench_shuffle_simd() -> u32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_shuffle_equal() -> bool {
     DEMO_BENCH.with(|b| {
@@ -252,6 +270,7 @@ pub fn demosaic_bench_shuffle_equal() -> bool {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_shuffle_first_diff() -> i32 {
     DEMO_BENCH.with(|b| {
@@ -273,15 +292,18 @@ pub fn demosaic_bench_shuffle_first_diff() -> i32 {
 // the measurement the wide-refill wasm deferral (Questions_deferred D-wide-refill) never had.
 // `_equal` is the bit-exact correctness pin. Output buffer is reused so the timed ratio isn't
 // diluted by a per-call alloc (both sides would pay it equally anyway).
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static DECOMP_BENCH: RefCell<(Vec<u8>, usize, usize, Vec<u16>)> =
         const { RefCell::new((Vec::new(), 0, 0, Vec::new())) };
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_prepare(w: usize, h: usize, seed: u32) {
     let payload = decompress::bench_synth_payload(w, h, (seed as u64) ^ 0x9E37_79B9_7F4A_7C15);
     DECOMP_BENCH.with(|b| *b.borrow_mut() = (payload, w, h, vec![0u16; w * h]));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_byteloop() -> u32 {
     DECOMP_BENCH.with(|b| {
@@ -291,6 +313,7 @@ pub fn decompress_bench_byteloop() -> u32 {
         demo_checksum(out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_wide() -> u32 {
     DECOMP_BENCH.with(|b| {
@@ -300,6 +323,7 @@ pub fn decompress_bench_wide() -> u32 {
         demo_checksum(out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_equal() -> bool {
     DECOMP_BENCH.with(|b| {
@@ -319,10 +343,12 @@ pub fn decompress_bench_equal() -> bool {
 // pool engaged (initThreadPool(N)) — quantifying how much of the "990ms" is a threads-off
 // artifact. The par paths are `#[cfg(feature="parallel")]`; a non-parallel pkg-bench build
 // times the ST baseline, the parallel-wasm pkg times MT.
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static DEMTONE_BENCH: RefCell<(Vec<u16>, Vec<u16>, usize, usize, Vec<u8>)> =
         const { RefCell::new((Vec::new(), Vec::new(), 0, 0, Vec::new())) };
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demtone_bench_prepare(w: usize, h: usize) {
     // Deterministic synthetic Bayer mosaic + one MHC demosaic to seed the tone input.
@@ -330,6 +356,7 @@ pub fn demtone_bench_prepare(w: usize, h: usize) {
     let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
     DEMTONE_BENCH.with(|b| *b.borrow_mut() = (raw, rgb16, w, h, vec![0u8; w * h * 3]));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc() -> u32 {
     DEMTONE_BENCH.with(|b| {
@@ -344,6 +371,7 @@ pub fn demtone_bench_mhc() -> u32 {
 // ≥15%-median browser+Node-WASM flipflop gate (.flipflop/tests/mhc-simd128.mjs) from a single
 // pkg. `demtone_bench_mhc_equal` pins that the two are BIT-EXACT before crediting any speed.
 // wasm-only: the forced-interior helpers exist only under target_arch=wasm32.
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc_scalar() -> u32 {
@@ -353,6 +381,7 @@ pub fn demtone_bench_mhc_scalar() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_mhc_scalar_interior(raw, *w, *h).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc_simd128() -> u32 {
@@ -362,6 +391,7 @@ pub fn demtone_bench_mhc_simd128() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_mhc_simd128_interior(raw, *w, *h).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc_equal() -> bool {
@@ -373,6 +403,7 @@ pub fn demtone_bench_mhc_equal() -> bool {
         s == v
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demtone_bench_tone() -> u32 {
     DEMTONE_BENCH.with(|b| {
@@ -388,16 +419,20 @@ pub fn demtone_bench_tone() -> u32 {
 // Sequential (decompress whole → demosaic_rggb_mhc → process_into_auto, both MT via par) vs
 // pipelined (producer decodes strips serially while par_bridge consumers demosaic+tone them,
 // overlapping the parallel demosaic+tone with the serial decode). `_equal` pins byte-identity.
+#[cfg(feature = "bench-exports")]
 struct PipeBench { payload: Vec<u8>, w: usize, h: usize, params: raw_pipeline::pipeline::PipelineParams, out: Vec<u8> }
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static PIPE_BENCH: RefCell<Option<PipeBench>> = const { RefCell::new(None) };
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_prepare(w: usize, h: usize, seed: u32) {
     let payload = decompress::bench_synth_payload(w, h, (seed as u64) ^ 0xA5A5_1234_ABCD_0001);
     let params = raw_pipeline::pipeline::PipelineParams::default_olympus();
     PIPE_BENCH.with(|b| *b.borrow_mut() = Some(PipeBench { payload, w, h, params, out: vec![0u8; w * h * 3] }));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_pipelined() -> u32 {
     PIPE_BENCH.with(|b| {
@@ -408,6 +443,7 @@ pub fn pipeline_bench_pipelined() -> u32 {
         demo_checksum_u8(&pb.out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_sequential() -> u32 {
     PIPE_BENCH.with(|b| {
@@ -420,6 +456,7 @@ pub fn pipeline_bench_sequential() -> u32 {
         demo_checksum_u8(&pb.out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_equal() -> bool {
     PIPE_BENCH.with(|b| {
@@ -436,6 +473,7 @@ pub fn pipeline_bench_equal() -> bool {
         seq == pip
     })
 }
+#[cfg(feature = "bench-exports")]
 fn demo_checksum_u8(v: &[u8]) -> u32 {
     v.iter().fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
 }
@@ -4096,6 +4134,7 @@ pub fn parse_orf_metadata(data: &[u8]) -> Result<OrfMetadata, JsError> {
 
 /// Timing results for the decompress + demosaic stages only.
 /// Skips tonemap, downscale, and orientation — isolates raw decode cost.
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub struct DecodeBench {
     #[wasm_bindgen(readonly)]
@@ -4110,6 +4149,7 @@ pub struct DecodeBench {
 
 /// Benchmark ORF decompress + demosaic without tonemap/downscale/orientation.
 /// Use to measure decoder cost in isolation when tuning WASM flags or algorithms.
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn bench_decode_orf(data: &[u8]) -> Result<DecodeBench, JsError> {
     let info = tiff::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
@@ -6078,6 +6118,7 @@ mod perceptual_parity_ffi {
 // The buffer is filled by the SAME LCG the JS harness uses, so results are byte-comparable.
 // =====================================================================================
 
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static FS_BENCH: RefCell<(Vec<u8>, usize, usize)> = const { RefCell::new((Vec::new(), 0, 0)) };
 }
@@ -6087,6 +6128,7 @@ const FS_FNV_OFFSET: u32 = 0x811c_9dc5;
 
 /// Fill the resident buffer with the same LCG byte stream the JS harness uses:
 ///   s = s*1103515245 + 12345 (wrapping u32); byte = s & 0xff
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_prepare(w: usize, h: usize) {
     let len = w * h * 4;
@@ -6142,6 +6184,7 @@ fn fs_to_js(r: &FsRaw, px: usize) -> JsValue {
 }
 
 /// Exact byte-wise FNV (identical hash + stats to the shipped JS analyzeProgressiveFrame).
+#[cfg(feature = "bench-exports")]
 fn fs_core_scalar(d: &[u8], px: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
@@ -6189,6 +6232,7 @@ fn fs_core_scalar(d: &[u8], px: usize) -> FsRaw {
 /// De-serialized word-hash + 4-pixel-unrolled stats. The hash mixes the whole 32-bit
 /// pixel word with 4 independent lanes (ILP), breaking FNV's serial dependency chain.
 /// Hash identity differs from byte-FNV (migration-allowed); all other stats are identical.
+#[cfg(feature = "bench-exports")]
 fn fs_core_fast(d: &[u8], px: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
@@ -6263,6 +6307,7 @@ fn fs_core_fast(d: &[u8], px: usize) -> FsRaw {
 }
 
 /// Scan the resident buffer with the exact byte-FNV kernel (no per-call copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_scalar() -> JsValue {
     FS_BENCH.with(|b| {
@@ -6273,6 +6318,7 @@ pub fn fstats_scalar() -> JsValue {
 }
 
 /// Scan the resident buffer with the fast word-hash + ILP kernel (no per-call copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_fast() -> JsValue {
     FS_BENCH.with(|b| {
@@ -6284,6 +6330,7 @@ pub fn fstats_fast() -> JsValue {
 
 /// Exact byte-FNV kernel over a buffer passed across the boundary (wasm-bindgen copies
 /// `pixels` into wasm linear memory on every call). Isolates the copy cost vs resident.
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_copy(pixels: &[u8], width: usize, height: usize) -> JsValue {
     let px = width.saturating_mul(height);
@@ -6431,6 +6478,7 @@ fn fs_core_simd(d: &[u8], px: usize) -> FsRaw {
 }
 
 /// Scan the resident buffer with the hand-written v128 kernel (no per-call copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_simd() -> JsValue {
     FS_BENCH.with(|b| {
@@ -6448,6 +6496,7 @@ pub fn fstats_simd() -> JsValue {
 // falls back to the zero-filling scalar path (identical semantics to the JS kernel).
 // -------------------------------------------------------------------------------------
 
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     use core::arch::wasm32::*;
@@ -6559,6 +6608,7 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     }
 }
 
+#[cfg(feature = "bench-exports")]
 #[cfg(not(target_arch = "wasm32"))]
 fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     fs_core_scalar(d, px)
@@ -6671,6 +6721,7 @@ fn fs_core_trunc_word(d: &[u8], px: usize, limit: usize) -> FsRaw {
 
 /// Truncation-safe exact kernel: zero-fills bytes past `limit` (identical to the JS
 /// truncated path). Used when the supplied buffer is shorter than width*height*4.
+#[cfg(feature = "bench-exports")]
 fn fs_core_trunc_exact(d: &[u8], px: usize, limit: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
@@ -6744,6 +6795,7 @@ pub fn frame_stats(pixels: &[u8], width: usize, height: usize) -> JsValue {
 }
 
 /// Bench probe for the production exact-hash SIMD kernel (resident buffer, no copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_simd_exact() -> JsValue {
     FS_BENCH.with(|b| {
