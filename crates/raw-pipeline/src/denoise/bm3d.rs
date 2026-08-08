@@ -753,6 +753,60 @@ mod tests {
         assert_eq!(mirror(11, 10), 8);
     }
 
+    /// The heap top-k + row-wise early-exit block matcher must reproduce the
+    /// original extract-all + sort_unstable + truncate selection EXACTLY
+    /// (same dist bits, same (row, col) order) — including an overhanging
+    /// reference patch at the image edge.
+    #[test]
+    fn block_match_equals_bruteforce_sort() {
+        let (w, h) = (48usize, 40usize);
+        let mut s = 123u32;
+        let img: Vec<f32> = (0..w * h)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s as f32 / u32::MAX as f32
+            })
+            .collect();
+        let mut heap = MatchHeap::with_capacity(GROUP2);
+        for &(rr, rc) in &[(0usize, 0usize), (5, 7), (39, 47), (20, 20)] {
+            let got = block_match(&img, w, h, rr, rc, GROUP1, &mut heap);
+
+            // Brute force: the pre-change algorithm, verbatim accumulation order.
+            let ref_patch = extract_patch(&img, w, h, rr, rc);
+            let row_min = rr.saturating_sub(SEARCH);
+            let row_max = (rr + SEARCH).min(h - PATCH);
+            let col_min = rc.saturating_sub(SEARCH);
+            let col_max = (rc + SEARCH).min(w - PATCH);
+            let mut cand: Vec<(f32, usize, usize)> = Vec::new();
+            for r in row_min..=row_max {
+                for c in col_min..=col_max {
+                    let p = extract_patch(&img, w, h, r, c);
+                    let mut ss = 0f32;
+                    for i in 0..PATCH * PATCH {
+                        let d = ref_patch[i] - p[i];
+                        ss += d * d;
+                    }
+                    cand.push((ss / (PATCH * PATCH) as f32, r, c));
+                }
+            }
+            cand.sort_unstable_by(|a, b| {
+                a.0.to_bits()
+                    .cmp(&b.0.to_bits())
+                    .then(a.1.cmp(&b.1))
+                    .then(a.2.cmp(&b.2))
+            });
+            cand.truncate(GROUP1);
+
+            assert_eq!(got.len(), cand.len(), "ref ({rr},{rc})");
+            for (g, want) in got.iter().zip(cand.iter()) {
+                assert_eq!(g.0.to_bits(), want.0.to_bits(), "ref ({rr},{rc})");
+                assert_eq!((g.1, g.2), (want.1, want.2), "ref ({rr},{rc})");
+            }
+        }
+    }
+
     #[test]
     fn bm3d_flat_field_reduces_noise() {
         let width = 32;
