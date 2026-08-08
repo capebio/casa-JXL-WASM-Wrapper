@@ -111,10 +111,16 @@ pub(crate) struct SessionCore {
     pub(crate) committed: Vec<bool>,
     pub(crate) tiles_x: usize,
     pub(crate) tiles_y: usize,
-    /// Assembled denoised RGB16 (interleaved, width×height×3). Starts as MHC copy
-    /// so uncommitted regions (if finish is forced) degrade to baseline, but
+    /// Assembled denoised RGB16 (interleaved, width×height×3). Allocated lazily on
+    /// the first commit (as an MHC copy, so uncommitted regions degrade to baseline
+    /// if finish is forced) — classical-only sessions never pay the 6n-byte copy.
     /// finish_with_options requires full commit.
     pub(crate) assembled: Vec<u16>,
+    /// Set by the finish paths. A finished session has given away `assembled`
+    /// (learned) or `mhc` (classical); every later pack/commit/finish must fail
+    /// with a clean error instead of indexing an emptied buffer (a WASM trap
+    /// that would poison the worker's whole heap).
+    pub(crate) finished: bool,
 }
 
 impl SessionCore {
@@ -129,7 +135,6 @@ impl SessionCore {
     ) -> Self {
         let tiles_x = tiles_along(width);
         let tiles_y = tiles_along(height);
-        let assembled = mhc.clone();
         SessionCore {
             raw,
             width,
@@ -142,7 +147,8 @@ impl SessionCore {
             committed: vec![false; tiles_x * tiles_y],
             tiles_x,
             tiles_y,
-            assembled,
+            assembled: Vec::new(),
+            finished: false,
         }
     }
 
@@ -180,6 +186,9 @@ impl SessionCore {
 
     /// Pack the `[20, 320, 320]` CHW input tensor for core tile `(tx, ty)`.
     pub(crate) fn pack_input_tile(&self, tx: usize, ty: usize) -> Result<Vec<f32>, String> {
+        if self.finished {
+            return Err("session already finished".to_string());
+        }
         if tx >= self.tiles_x || ty >= self.tiles_y {
             return Err(format!(
                 "tile ({tx},{ty}) out of range ({}×{})",
@@ -241,6 +250,9 @@ impl SessionCore {
         ty: usize,
         residuals: &[f32],
     ) -> Result<(), String> {
+        if self.finished {
+            return Err("session already finished".to_string());
+        }
         if tx >= self.tiles_x || ty >= self.tiles_y {
             return Err(format!(
                 "commit ({tx},{ty}) out of range ({}×{})",
@@ -260,6 +272,12 @@ impl SessionCore {
                 CORE,
                 CORE
             ));
+        }
+
+        // Lazy allocation (first commit): start from the MHC baseline so any
+        // uncommitted region degrades to baseline if finish is ever forced.
+        if self.assembled.is_empty() {
+            self.assembled = self.mhc.clone();
         }
 
         let ox = tx * CORE;
@@ -513,12 +531,20 @@ impl DenoiseSession {
     /// assembled (already normalised) RGB16 becomes the pipeline input, so black
     /// and white are pinned to 0/65535 before the look/tone path runs.
     pub fn finish_with_options(&mut self, options: JsValue) -> Result<ProcessResult, JsError> {
+        // Finish-once (mirrors ProcessResult::finish_full_rgb8's Option::take
+        // pattern): after a finish, `committed` is still all-true but `assembled`
+        // is gone — a second call must be a clean JsError, not an empty-buffer
+        // index panic (unrecoverable WASM trap) in the pipeline.
+        if self.core.finished {
+            return Err(JsError::new("session already finished"));
+        }
         if !self.core.all_committed() {
             return Err(JsError::new(
                 "finish_with_options: not all tiles committed",
             ));
         }
         let opts = RawProcessOptions::from_js(&options)?;
+        self.core.finished = true;
         let assembled = std::mem::take(&mut self.core.assembled);
         let mut decoded = self.shell.rebuild(assembled, &self.core);
         // Assembled RGB is already black-subtracted + white-normalised.
@@ -530,13 +556,21 @@ impl DenoiseSession {
     /// Finish via the classical (model-free) denoiser from Task 5. No tile commits
     /// are required — the raw mosaic and MHC baseline drive the classical path.
     pub fn finish_classical(&mut self, options: JsValue) -> Result<ProcessResult, JsError> {
+        if self.core.finished {
+            return Err(JsError::new("session already finished"));
+        }
         let opts = RawProcessOptions::from_js(&options)?;
         let iso = if self.shell.iso > 0 {
             Some(self.shell.iso)
         } else {
             None
         };
-        let mhc = self.core.mhc.clone();
+        // Move (not clone) the MHC baseline into the consuming denoise call: the
+        // clone was a 6n-byte copy (~144 MB at 24 MP) held alongside raw + mhc +
+        // output. `finished` (set above the take) guards every later pack/commit
+        // from indexing the emptied buffer.
+        self.core.finished = true;
+        let mhc = std::mem::take(&mut self.core.mhc);
         let (tel, denoised_rgb16) = crate::run_denoise_on_rgb16(
             &self.core.raw,
             mhc,
@@ -788,6 +822,29 @@ mod tests {
         assert!(s.is_committed(1, 1));
         assert!(!s.is_committed(0, 0));
         assert!(!s.all_committed());
+    }
+
+    // ── Finished flag / lazy assembled ────────────────────────────────────────
+
+    #[test]
+    fn finished_blocks_pack_and_commit() {
+        let mut s = make_session(300, 300, 0, Some(zero_model()));
+        s.finished = true;
+        assert!(s.pack_input_tile(0, 0).is_err());
+        let z = vec![0.0f32; 12 * 256 * 256];
+        assert!(s.commit_core(0, 0, &z).is_err());
+    }
+
+    #[test]
+    fn assembled_allocates_lazily_on_first_commit() {
+        let mut s = make_session(300, 300, 0, Some(zero_model()));
+        assert!(s.assembled.is_empty(), "no commit yet — no 6n copy");
+        let z = vec![0.0f32; 12 * 256 * 256];
+        s.commit_core(0, 0, &z).unwrap();
+        assert_eq!(s.assembled.len(), s.mhc.len());
+        // Uncommitted regions still degrade to baseline (forced-finish contract).
+        let base = ((299 * 300) + 299) * 3; // bottom-right pixel, tile (1,1) uncommitted
+        assert_eq!(s.assembled[base], s.mhc[base]);
     }
 
     // ── Zero-residual seam-free assembly ──────────────────────────────────────
