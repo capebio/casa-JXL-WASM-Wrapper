@@ -509,8 +509,8 @@ fn encode_plane_from_scan(
     };
 
     let freqs = normalize_freqs(hist);
-    // Pass B: RAW demotion by estimated cost under the global table.
-    let mut syms: Vec<u8> = Vec::with_capacity((h - s.copy_rows) * w);
+    // Pass B: RAW demotion by estimated cost under the global table (modes
+    // only — gathering is deferred so the dense case can skip it).
     let mut raw: Vec<u8> = Vec::new();
     if let Some(fr) = &freqs {
         let mut bits = [0f32; 256];
@@ -528,11 +528,25 @@ fn encode_plane_from_scan(
             if cost > RAW_THRESHOLD_BITS_PER_BYTE * w as f32 {
                 s.modes[y] = MODE_RAW;
                 raw.extend_from_slice(row);
-            } else {
-                syms.extend_from_slice(row);
             }
         }
     }
+    // Dense common case (photo planes: no COPY rows, nothing demoted): the
+    // symbol sequence IS `s.residuals` — no w·h gather copy. Only when some
+    // rows are excluded is a gathered Vec built.
+    let gathered: Vec<u8>;
+    let syms: &[u8] = if s.copy_rows == 0 && raw.is_empty() {
+        &s.residuals
+    } else {
+        let mut v = Vec::with_capacity((h - s.copy_rows) * w - raw.len());
+        for y in 0..h {
+            if s.modes[y] == MODE_RANS {
+                v.extend_from_slice(&s.residuals[y * w..(y + 1) * w]);
+            }
+        }
+        gathered = v;
+        &gathered
+    };
 
     out.extend_from_slice(&s.modes);
     put_u32(out, syms.len() as u32);
@@ -541,7 +555,7 @@ fn encode_plane_from_scan(
         for f in fr {
             out.extend_from_slice(&f.to_le_bytes());
         }
-        let (states, stream, start) = rans_encode(&syms, &fr);
+        let (states, stream, start) = rans_encode(syms, &fr);
         for st in states {
             put_u32(out, st);
         }
@@ -1570,6 +1584,48 @@ mod tests {
             same.len() < 400,
             "all-COPY delta should be near-empty, got {}",
             same.len()
+        );
+    }
+
+    /// FNV-1a over encoded bytes — pins the exact bitstream so encoder
+    /// restructures (dense-path syms, reciprocal rANS, encode session) cannot
+    /// silently change output. Golden values captured from the pre-change
+    /// encoder; every path is covered: dense RANS (photo), COPY rows
+    /// (screen), RAW demotion (noise), External predictor (delta).
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    #[test]
+    fn encoded_bytes_are_pinned() {
+        let a = photo_like(214, 120, 7);
+        let b = screen_like(214, 120);
+        let mut rng = Rng(99);
+        let noise: Vec<u8> = (0..64 * 48 * 3).map(|_| rng.byte()).collect();
+        let mut delta_cur = a.clone();
+        for i in 3000..4200 {
+            delta_cur[i] = delta_cur[i].wrapping_add(13);
+        }
+        let got = [
+            fnv1a(&encode_rgb8(&a, 214, 120)),
+            fnv1a(&encode_rgb8(&b, 214, 120)),
+            fnv1a(&encode_rgb8(&noise, 64, 48)),
+            fnv1a(&encode_rgb8_delta(&delta_cur, &a, 214, 120)),
+        ];
+        assert_eq!(
+            got,
+            [
+                5073181637747379702u64,
+                11829279922270979879,
+                12195226001808192511,
+                10808373075655021652,
+            ],
+            "encoded bytes changed vs the pinned golden bitstream"
         );
     }
 
