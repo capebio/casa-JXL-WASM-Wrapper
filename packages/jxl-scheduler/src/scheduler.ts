@@ -561,7 +561,20 @@ export class Scheduler {
         promotedRecord.pausedOnWorker = record.pausedOnWorker;
         this.workerPausedSession.set(record.pausedOnWorker.id, promotedTo);
       } else if (record.pending !== undefined && promotedRecord !== undefined) {
-        // Transfer queue position if still pending.
+        // Transfer queue position if still pending — but strip the CANCELLED
+        // caller's closures/signal first. (1) Reject the cancelled caller's
+        // acquireSlot promise now (mirror of the non-promotion queued branch
+        // below); otherwise drainQueue's pending.resolve() later looks up the
+        // DELETED old sessionId and resolves the cancelled caller with
+        // workerId -1 — a false success. (2) Drop the cancelled caller's
+        // AbortSignal: at drain time setupSignalAbort(promotedTo, signal) sees
+        // signal.aborted (the normal cancel-via-abort path) and would instantly
+        // cancel the still-wanted promoted session the moment it gets its
+        // worker. The subscriber's own signal was already wired at subscribe.
+        record.pending.reject(new Error("[jxl-scheduler] Session cancelled."));
+        record.pending.resolve = () => {};
+        record.pending.reject = () => {};
+        record.pending.signal = null;
         promotedRecord.state = "queued";
         promotedRecord.pending = record.pending;
         promotedRecord.pending.sessionId = promotedTo;
