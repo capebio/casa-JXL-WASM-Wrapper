@@ -664,3 +664,31 @@ Everything above rests on one method, applied the same way every time:
 - **We drop what we can't verify.** Numbers that couldn't be traced to a commit or a delivered figure were left out, not hedged into the prose. A shorter true list beats a longer impressive one.
 
 The full rejection log lives in `docs/rejected optimizations.md`. The flip-flop harness that produced most of these numbers is the `flipflop` / `flipflopdom` skill.
+
+---
+
+## Identify: the AI-ID chain finally reaches the user (2026-08-08, branch lens2-s5-z9f4)
+
+For roughly two months the browser has been carrying a complete species-recognition
+foundation that no user could reach: a proxy encoder tuned by empirical bake-offs
+(768 px, q80, 4:2:0 — the smallest JPEG that still identifies a plant), a
+`casava-ai/1` sidecar builder wired to the export panel's privacy policy, a
+source-priority chain, and stable asset identity. Every piece was built, tested,
+and dark — `makeBrowserSources()` had zero production callers. The new **🔎 ID**
+button in the lightbox toolbar turns that inert stack into a two-click flow:
+open a photo, press ID, and the browser downloads a right-sized proxy JPEG plus
+a lean metadata sidecar ready to hand to iNaturalist, Gemini, or any external
+identifier — with GPS stripped or kept exactly as the user's export policy says.
+
+The interesting engineering is in what the button does *not* do. The source chain
+tries the cheapest pixels first: the clean lightbox snapshot that is already in
+memory, then — new in this pass — the camera's own embedded JPEG parsed straight
+out of the RAW bytes with a pure-JS stream scanner shared with the Node pipeline
+(the old code skipped this source "because it requires node:fs + sharp"; neither
+is true in a browser that decodes JPEG natively), then the archival JXL master,
+and only as a last resort a RAW re-decode. Even that fallback is triage-tier: it
+requests the 1800 px streaming preview arm instead of a full 20 MP develop,
+several times faster at a fraction of the memory, with the WASM engine loaded on
+the main thread only if that path actually fires. The result is an identify flow
+fast enough to feel instant on ingested assets — and the groundwork for the
+point-camera-at-plant AR loop, whose budget is dominated by exactly this decode.
