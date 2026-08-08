@@ -148,6 +148,49 @@ fn cum_table(freqs: &[u16; 256]) -> [u32; 257] {
     cum
 }
 
+/// Per-symbol encoder entry: the division-free rANS step (ryg's
+/// `RansEncSymbolInit` idea, widened). `q = x / f` is computed as
+/// `(x · rcp) >> 64` with `rcp = ceil(2^64 / f)` — exact for every `x < 2^32`
+/// and `f ≥ 2`: the error term `x·(rcp·f − 2^64)/2^64 < 2^44/2^64` can never
+/// carry `x` across a multiple of `f`. (The classic 31-bit-reciprocal variant
+/// is only exact for `x < 2^31`; our 16-bit renorm lets states reach
+/// `f·2^20 − 1 ≈ 2^32`, where it rounds up at `x ≡ −1 (mod f)` — caught by
+/// `enc_sym_reciprocal_is_exact_division`.) `f == 1` uses `rcp = 2^64 − 1`
+/// (so `q = x − 1`) with the correction folded into `bias`. The encoded state
+/// is IDENTICAL to the divide form by
+/// `((x/f) << PREC) + (x%f) + cum = x + cum + (x/f)·(2^PREC − f)`.
+struct EncSym {
+    /// Renorm bound `f << 20`; 0 for absent symbols (never encoded).
+    x_max: u32,
+    rcp: u64,
+    /// `cum` (f ≥ 2) or `cum + TAB_SIZE − 1` (f == 1).
+    bias: u32,
+    /// `TAB_SIZE − f`.
+    cmpl: u32,
+}
+
+fn enc_sym_table(freqs: &[u16; 256]) -> [EncSym; 256] {
+    let cum = cum_table(freqs);
+    core::array::from_fn(|s| {
+        let f = freqs[s] as u32;
+        if f < 2 {
+            EncSym {
+                x_max: f << 20,
+                rcp: u64::MAX,
+                bias: cum[s] + TAB_SIZE - 1,
+                cmpl: TAB_SIZE - f,
+            }
+        } else {
+            EncSym {
+                x_max: f << 20,
+                rcp: (((1u128 << 64) + f as u128 - 1) / f as u128) as u64,
+                bias: cum[s],
+                cmpl: TAB_SIZE - f,
+            }
+        }
+    })
+}
+
 /// Encode `syms` (forward order, lane = index & 7) into a braided rANS stream.
 /// Returns (states after encoding = decoder's initial states, buffer, start):
 /// the stream (with `RANS_PAD` trailing pad) is `buf[start..]`.
@@ -157,8 +200,12 @@ fn cum_table(freqs: &[u16; 256]) -> [u32; 257] {
 /// one u16): no realloc-and-copy on dense planes, no whole-stream reverse
 /// pass. Byte order per emission is lo,hi — identical to the old
 /// push-hi-lo-then-reverse scheme (little-endian u16s read forward).
+///
+/// The per-symbol state step is division-free (see [`EncSym`]): a hardware
+/// u32 div+mod per symbol was the hottest instruction in the encoder inner
+/// loop (and i32.div_u on wasm). Bitstream unchanged — decoder untouched.
 fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>, usize) {
-    let cum = cum_table(freqs);
+    let esyms = enc_sym_table(freqs);
     let mut x = [RANS_L; LANES];
     let cap = syms.len() * 2 + RANS_PAD;
     // No zero-fill: the pad is written explicitly below and emissions fill
@@ -175,17 +222,17 @@ fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>, usize
     }
     for i in (0..syms.len()).rev() {
         let lane = i & (LANES - 1);
-        let s = syms[i] as usize;
-        let f = freqs[s] as u32;
-        debug_assert!(f > 0);
+        let e = &esyms[syms[i] as usize];
+        debug_assert!(e.x_max > 0, "symbol with zero frequency");
         let xl = &mut x[lane];
-        if *xl >= (f << 20) {
+        if *xl >= e.x_max {
             pos -= 2;
             buf[pos] = *xl as u8;
             buf[pos + 1] = (*xl >> 8) as u8;
             *xl >>= 16;
         }
-        *xl = ((*xl / f) << PREC) + (*xl % f) + cum[s];
+        let q = ((*xl as u128 * e.rcp as u128) >> 64) as u32;
+        *xl = *xl + e.bias + q * e.cmpl;
     }
     (x, buf, pos)
 }
@@ -1486,6 +1533,36 @@ mod tests {
             }
         }
         v
+    }
+
+    /// The reciprocal step must equal the divide form for every legal
+    /// frequency (1..=4095) at every state the encoder can hold
+    /// (post-renorm: x < f << 20). Edges plus randoms; cum is 0 by
+    /// construction so `want` is the raw divide-form step.
+    #[test]
+    fn enc_sym_reciprocal_is_exact_division() {
+        let mut rng = Rng(0x1234);
+        for f in 1u32..=4095 {
+            let mut freqs = [0u16; 256];
+            freqs[7] = f as u16;
+            freqs[8] = (TAB_SIZE - f) as u16;
+            let esyms = enc_sym_table(&freqs);
+            let e = &esyms[7];
+            let hi = (f << 20) - 1;
+            let mut check = |x: u32| {
+                let q = ((x as u128 * e.rcp as u128) >> 64) as u32;
+                let got = x + e.bias + q * e.cmpl;
+                let want = ((x / f) << PREC) + (x % f); // cum[7] == 0
+                assert_eq!(got, want, "f={f} x={x}");
+            };
+            check(1);
+            check(16);
+            check(RANS_L);
+            check(hi);
+            for _ in 0..10 {
+                check(1 + (rng.next() % hi as u64) as u32);
+            }
+        }
     }
 
     #[test]
