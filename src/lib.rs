@@ -3208,17 +3208,28 @@ pub fn apply_look(
 #[wasm_bindgen]
 pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let n = rgb.len() / 3;
-    let mut out = vec![255u8; n * 4];
-    let done = rgb_to_rgba_simd(rgb, &mut out, n);
+    let mut out = vec![0u8; n * 4];
+    rgb_to_rgba_into(rgb, &mut out);
+    out
+}
+
+/// Allocation-free core of [`rgb_to_rgba`]: convert into a caller-provided
+/// buffer (SIMD bulk + scalar tail, every output byte written — alpha included).
+/// Converts `min(rgb.len()/3, out.len()/4)` pixels; returns the count.
+/// Byte-identical output to `rgb_to_rgba` over the converted range.
+pub(crate) fn rgb_to_rgba_into(rgb: &[u8], out: &mut [u8]) -> usize {
+    let n = (rgb.len() / 3).min(out.len() / 4);
+    let done = rgb_to_rgba_simd(rgb, out, n);
     let (mut si, mut di) = (done * 3, done * 4);
     for _ in done..n {
         out[di] = rgb[si];
         out[di + 1] = rgb[si + 1];
         out[di + 2] = rgb[si + 2];
+        out[di + 3] = 255;
         si += 3;
         di += 4;
     }
-    out
+    n
 }
 
 /// Convert interleaved RGB16 → RGBA16 (alpha = 0xFFFF). Returns a `Uint16Array`-compatible
