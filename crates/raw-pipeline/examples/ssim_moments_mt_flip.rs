@@ -112,7 +112,12 @@ fn main() {
         }
 
         let ra = unsafe { ssim_moments_serial(&a, &b, np) };
-        let rb = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
+        // The shipped kernel now returns 4 lanes (alpha kept for the PSNR-from-sums
+        // derivation); this baseline is the verbatim 3-lane pre-change kernel, so
+        // compare the RGB lanes.
+        let rb4 = unsafe { ssim_moments_avx2_cal(&a, &b, np) };
+        let rgb = |x: &[u64; 4]| [x[0], x[1], x[2]];
+        let rb = (rgb(&rb4.0), rgb(&rb4.1), rgb(&rb4.2));
         let parity = ra == rb;
 
         let rounds = 11usize;

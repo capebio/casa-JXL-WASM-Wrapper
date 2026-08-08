@@ -327,16 +327,20 @@ unsafe fn hsum256i_u64(acc: __m256i) -> u64 {
     tmp.iter().map(|&v| v as u32 as u64).sum()
 }
 
-/// Drain lanes {0,4}/{1,5}/{2,6} (R/G/B of 2 pixel-slots; lanes 3,7 = alpha) of an
-/// i32x8 partial into a per-channel u64[3]. Unsigned widen, as in `hsum256i_u64`.
+/// Drain lanes {0,4}/{1,5}/{2,6}/{3,7} (R/G/B/A of 2 pixel-slots) of an i32x8
+/// partial into a per-channel u64[4]. Unsigned widen, as in `hsum256i_u64`.
+/// The alpha lanes were always accumulated in the vector registers; keeping them
+/// (instead of discarding at drain time) lets `Comparer::all()` derive the PSNR
+/// SSD from these sums and skip its whole test+ref traversal.
 #[inline]
-unsafe fn drain8_rgb(v: __m256i, acc: &mut [u64; 3]) {
+unsafe fn drain8_rgba(v: __m256i, acc: &mut [u64; 4]) {
     let mut t = [0i32; 8];
     _mm256_storeu_si256(t.as_mut_ptr() as *mut __m256i, v);
     for k in 0..2 {
         acc[0] += t[k * 4] as u32 as u64;
         acc[1] += t[k * 4 + 1] as u32 as u64;
         acc[2] += t[k * 4 + 2] as u32 as u64;
+        acc[3] += t[k * 4 + 3] as u32 as u64;
     }
 }
 
@@ -351,7 +355,7 @@ pub unsafe fn ssim_moments_avx2_cal(
     a: &[u8],
     b: &[u8],
     np: usize,
-) -> ([u64; 3], [u64; 3], [u64; 3]) {
+) -> ([u64; 4], [u64; 4], [u64; 4]) {
     assert!(
         a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_avx2_cal: a.len() and b.len() must be >= np*4"
@@ -378,9 +382,9 @@ pub unsafe fn ssim_moments_avx2_cal(
                     unsafe { ssim_moments_band_avx2(a, b, p0, p1) }
                 })
                 .reduce(
-                    || ([0u64; 3], [0u64; 3], [0u64; 3]),
+                    || ([0u64; 4], [0u64; 4], [0u64; 4]),
                     |(mut sa, mut saa, mut sab), (xa, xaa, xab)| {
-                        for c in 0..3 {
+                        for c in 0..4 {
                             sa[c] += xa[c];
                             saa[c] += xaa[c];
                             sab[c] += xab[c];
@@ -408,10 +412,10 @@ unsafe fn ssim_moments_band_avx2(
     b: &[u8],
     p0: usize,
     p1: usize,
-) -> ([u64; 3], [u64; 3], [u64; 3]) {
-    let mut sa = [0u64; 3];
-    let mut saa = [0u64; 3];
-    let mut sab = [0u64; 3];
+) -> ([u64; 4], [u64; 4], [u64; 4]) {
+    let mut sa = [0u64; 4];
+    let mut saa = [0u64; 4];
+    let mut sab = [0u64; 4];
     let mut va = _mm256_setzero_si256();
     let mut vaa = _mm256_setzero_si256();
     let mut vab = _mm256_setzero_si256();
@@ -434,21 +438,21 @@ unsafe fn ssim_moments_band_avx2(
         g += 1;
         fc += 1;
         if fc == FLUSH {
-            drain8_rgb(va, &mut sa);
-            drain8_rgb(vaa, &mut saa);
-            drain8_rgb(vab, &mut sab);
+            drain8_rgba(va, &mut sa);
+            drain8_rgba(vaa, &mut saa);
+            drain8_rgba(vab, &mut sab);
             va = _mm256_setzero_si256();
             vaa = _mm256_setzero_si256();
             vab = _mm256_setzero_si256();
             fc = 0;
         }
     }
-    drain8_rgb(va, &mut sa);
-    drain8_rgb(vaa, &mut saa);
-    drain8_rgb(vab, &mut sab);
+    drain8_rgba(va, &mut sa);
+    drain8_rgba(vaa, &mut saa);
+    drain8_rgba(vab, &mut sab);
     let mut j = p * 4;
     while p < p1 {
-        for c in 0..3 {
+        for c in 0..4 {
             let x = a[j + c] as u64;
             let y = b[j + c] as u64;
             sa[c] += x;
@@ -472,9 +476,9 @@ unsafe fn ssim_moments_band_avx2(
 /// uses no AVX2 intrinsics. This is intentional: FMA is also not needed here.
 /// Do not add AVX2 intrinsics without a measured win from the flip-flop bench.
 #[target_feature(enable = "avx2")]
-pub unsafe fn ssim_moments_avx2(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], [u64; 3]) {
+pub unsafe fn ssim_moments_avx2(a: &[u8], b: &[u8], np: usize) -> ([u64; 4], [u64; 4], [u64; 4]) {
     // Length precondition: both buffers must hold np RGBA pixels (np*4 bytes).
-    // The loop reads a[j+c]/b[j+c] with j up to (np-1)*4 and c in 0..3; a short
+    // The loop reads a[j+c]/b[j+c] with j up to (np-1)*4 and c in 0..4; a short
     // buffer would otherwise index-OOB with no descriptive message. No-op for
     // the sized caller.
     assert!(
@@ -485,12 +489,13 @@ pub unsafe fn ssim_moments_avx2(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u6
     // tight scalar loop with u64 accumulators (madd-based SIMD over a deinterleaved
     // temp gave no measured win — see flip-flop). Kept in the avx2 module so the
     // dispatcher has a single call site; correctness == scalar by construction.
-    let mut sa = [0u64; 3];
-    let mut saa = [0u64; 3];
-    let mut sab = [0u64; 3];
+    // 4 lanes (alpha kept) to stay the exact oracle of the widened cal kernel.
+    let mut sa = [0u64; 4];
+    let mut saa = [0u64; 4];
+    let mut sab = [0u64; 4];
     let mut j = 0;
     for _ in 0..np {
-        for c in 0..3 {
+        for c in 0..4 {
             let x = a[j + c] as u64;
             let y = b[j + c] as u64;
             sa[c] += x;
@@ -1128,7 +1133,8 @@ mod reduction_tests {
         let (sb, sbb) = ssim::ref_moments(&b, np, 4);
         let want = ssim::ssim_with_ref(&a, &b, np, 4, &sb, &sbb);
         let (sa, saa, sab) = unsafe { ssim_moments_avx2(&a, &b, np) };
-        let got = ssim::finalize_ssim(&sa, &sb, &saa, &sbb, &sab, np, 3);
+        let rgb = |x: &[u64; 4]| [x[0], x[1], x[2]];
+        let got = ssim::finalize_ssim(&rgb(&sa), &sb, &rgb(&saa), &sbb, &rgb(&sab), np, 3);
         assert!((want - got).abs() < 1e-6, "want={want} got={got}");
     }
 
@@ -1248,6 +1254,7 @@ mod reduction_tests {
         let b: Vec<u8> = (0..np * 4).map(|i| (i * 29 % 255) as u8).collect();
         let (sb, sbb) = ssim::ref_moments(&b, np, 4);
         let (sa, saa, _sab) = unsafe { ssim_moments_avx2_cal(&b, &b, np) };
-        assert_eq!((sb, sbb), (sa, saa));
+        let rgb = |x: &[u64; 4]| [x[0], x[1], x[2]];
+        assert_eq!((sb, sbb), (rgb(&sa), rgb(&saa)));
     }
 }
