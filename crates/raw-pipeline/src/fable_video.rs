@@ -28,10 +28,12 @@ pub enum FableVideoError {
 }
 
 /// Stateful FableBraid CASV **video** encoder. Push RGB8 frames (`w*h*3` interleaved,
-/// top-to-bottom); every `gop`-th frame is an I-frame (`fable_braid::encode_rgb8`), the
-/// rest are P-frames delta-coded against the previous frame
-/// (`fable_braid::encode_rgb8_delta`). [`Self::finish`] returns the v1 `.casv` bytes with
-/// the `CASV_HDR_FABLE_FLAG` header bit set.
+/// top-to-bottom); every `gop`-th frame is an I-frame, the rest are P-frames
+/// delta-coded against the previous frame. Frames go through a
+/// [`fable_braid::DeltaEncodeSession`] — byte-identical payloads to the stateless
+/// `encode_rgb8`/`encode_rgb8_delta`, without re-deriving the previous frame's
+/// subtract-green planes every P-frame. [`Self::finish`] returns the v1 `.casv`
+/// bytes with the `CASV_HDR_FABLE_FLAG` header bit set.
 pub struct FableVideoEncoder {
     width: u32,
     height: u32,
@@ -40,7 +42,7 @@ pub struct FableVideoEncoder {
     gop: usize,
     index: Vec<(u32, u32)>, // (frame flags, payload len) per frame
     data: Vec<u8>,          // concatenated payloads
-    prev: Vec<u8>,          // previous source frame (RGB8) for delta coding
+    sess: fable_braid::DeltaEncodeSession,
     idx: usize,
 }
 
@@ -56,7 +58,7 @@ impl FableVideoEncoder {
             gop: gop_len.max(1) as usize,
             index: Vec::new(),
             data: Vec::new(),
-            prev: Vec::new(),
+            sess: fable_braid::DeltaEncodeSession::new(),
             idx: 0,
         }
     }
@@ -72,19 +74,18 @@ impl FableVideoEncoder {
                 got: cur.len(),
             });
         }
+        // The session retains this frame's subtract-green planes as the delta
+        // reference for the next push (both entry points refresh the cache).
         let (flags, payload) = if self.idx % self.gop == 0 {
-            (0u32, fable_braid::encode_rgb8(cur, self.width, self.height))
+            (0u32, self.sess.encode_intra(cur, self.width, self.height))
         } else {
             (
                 CASV_PFRAME_FLAG,
-                fable_braid::encode_rgb8_delta(cur, &self.prev, self.width, self.height),
+                self.sess.encode_delta(cur, self.width, self.height),
             )
         };
         self.index.push((flags, payload.len() as u32));
         self.data.extend_from_slice(&payload);
-        // Retain this frame as the delta reference for the next push.
-        self.prev.clear();
-        self.prev.extend_from_slice(cur);
         self.idx += 1;
         Ok(())
     }

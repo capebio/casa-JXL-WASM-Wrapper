@@ -2,6 +2,9 @@ import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import { performance } from "node:perf_hooks";
 
+// `bench_decode_orf` is gated behind `--features bench-exports`, which the
+// shipped production pkg does NOT enable. Build the pkg this reads with:
+//   wasm-pack build --target nodejs --out-dir pkg --release -- --features bench-exports
 import initRaw, {
   process_cr2_with_flags,
   process_dng_with_flags,

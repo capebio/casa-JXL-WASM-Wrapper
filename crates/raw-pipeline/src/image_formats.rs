@@ -340,17 +340,20 @@ impl DecodedRgba {
                 }
             }
             16 => {
+                // The output u16 is a pure function of the input sample, so build the
+                // full 65536-entry table once (65 536 powf calls — ~1000× fewer than
+                // per-pixel at 24 MP) with the IDENTICAL f64 expression, +0.5 bias and
+                // clamp16_trunc. Byte-identical by construction; the loop is a lookup.
+                let lut16: Vec<u16> = (0..=u16::MAX)
+                    .map(|v| {
+                        clamp16_trunc(srgb_to_linear_f64(v as f64 / 65535.0) * 65535.0 + 0.5)
+                    })
+                    .collect();
                 for (i, chunk) in out.chunks_exact_mut(6).enumerate() {
                     let s = i * 4;
-                    let r = clamp16_trunc(
-                        srgb_to_linear_f64(self.u16[s] as f64 / 65535.0) * 65535.0 + 0.5,
-                    );
-                    let g = clamp16_trunc(
-                        srgb_to_linear_f64(self.u16[s + 1] as f64 / 65535.0) * 65535.0 + 0.5,
-                    );
-                    let b = clamp16_trunc(
-                        srgb_to_linear_f64(self.u16[s + 2] as f64 / 65535.0) * 65535.0 + 0.5,
-                    );
+                    let r = lut16[self.u16[s] as usize];
+                    let g = lut16[self.u16[s + 1] as usize];
+                    let b = lut16[self.u16[s + 2] as usize];
                     chunk[0..2].copy_from_slice(&r.to_le_bytes());
                     chunk[2..4].copy_from_slice(&g.to_le_bytes());
                     chunk[4..6].copy_from_slice(&b.to_le_bytes());
@@ -359,14 +362,18 @@ impl DecodedRgba {
             _ => {
                 // Mirror the worker's `Float32Array` sRGB→linear LUT: round the
                 // linear value to f32 (as the LUT store does) before scaling.
-                let lut8 = |v: u8| -> f64 {
-                    (srgb_to_linear_f64(v as f64 / 255.0) as f32) as f64
-                };
+                // Precomputed to the final u16 per input byte (the comment above
+                // always promised a LUT; now it is one). Byte-identical.
+                let mut lut8 = [0u16; 256];
+                for (v, out16) in lut8.iter_mut().enumerate() {
+                    let lin = (srgb_to_linear_f64(v as f64 / 255.0) as f32) as f64;
+                    *out16 = clamp16_trunc(lin * 65535.0 + 0.5);
+                }
                 for (i, chunk) in out.chunks_exact_mut(6).enumerate() {
                     let s = i * 4;
-                    let r = clamp16_trunc(lut8(self.u8[s]) * 65535.0 + 0.5);
-                    let g = clamp16_trunc(lut8(self.u8[s + 1]) * 65535.0 + 0.5);
-                    let b = clamp16_trunc(lut8(self.u8[s + 2]) * 65535.0 + 0.5);
+                    let r = lut8[self.u8[s] as usize];
+                    let g = lut8[self.u8[s + 1] as usize];
+                    let b = lut8[self.u8[s + 2] as usize];
                     chunk[0..2].copy_from_slice(&r.to_le_bytes());
                     chunk[2..4].copy_from_slice(&g.to_le_bytes());
                     chunk[4..6].copy_from_slice(&b.to_le_bytes());
@@ -402,32 +409,45 @@ pub fn downscale_linear_rgb16_le_js_parity(
         return src.to_vec();
     }
     let mut out = vec![0u8; dw * dh * 6];
-    let get = |o: usize| u16::from_le_bytes([src[o], src[o + 1]]) as u64;
-    for dy in 0..dh {
+    // Per-destination-row worker: rows are independent (disjoint source spans per
+    // dy, disjoint output rows) and the integer box sums are order-free, so both
+    // the row slicing and the `parallel` split below are byte-exact vs the old
+    // per-byte-indexed serial loop (the JS-parity tests confirm).
+    let fill_row = |dy: usize, orow: &mut [u8]| {
         let sy0 = (dy * sh) / dh;
         let sy1 = ((dy + 1) * sh / dh).max(sy0 + 1);
         for dx in 0..dw {
             let sx0 = (dx * sw) / dw;
             let sx1 = ((dx + 1) * sw / dw).max(sx0 + 1);
-            let (mut rr, mut gg, mut bb, mut n) = (0u64, 0u64, 0u64, 0u64);
+            let (mut rr, mut gg, mut bb) = (0u64, 0u64, 0u64);
             for sy in sy0..sy1 {
-                let mut so = (sy * sw + sx0) * 6;
-                for _sx in sx0..sx1 {
-                    rr += get(so);
-                    gg += get(so + 2);
-                    bb += get(so + 4);
-                    n += 1;
-                    so += 6;
+                // Slice the source span once per row; chunks_exact lets the
+                // compiler drop the per-byte bounds checks of the old `get`.
+                let row = &src[(sy * sw + sx0) * 6..(sy * sw + sx1) * 6];
+                for px in row.chunks_exact(6) {
+                    rr += u16::from_le_bytes([px[0], px[1]]) as u64;
+                    gg += u16::from_le_bytes([px[2], px[3]]) as u64;
+                    bb += u16::from_le_bytes([px[4], px[5]]) as u64;
                 }
             }
-            let o = (dy * dw + dx) * 6;
-            let r = (rr / n) as u16;
-            let g = (gg / n) as u16;
-            let b = (bb / n) as u16;
-            out[o..o + 2].copy_from_slice(&r.to_le_bytes());
-            out[o + 2..o + 4].copy_from_slice(&g.to_le_bytes());
-            out[o + 4..o + 6].copy_from_slice(&b.to_le_bytes());
+            // sy1 > sy0 and sx1 > sx0 by construction, so n >= 1.
+            let n = ((sy1 - sy0) * (sx1 - sx0)) as u64;
+            let o = dx * 6;
+            orow[o..o + 2].copy_from_slice(&((rr / n) as u16).to_le_bytes());
+            orow[o + 2..o + 4].copy_from_slice(&((gg / n) as u16).to_le_bytes());
+            orow[o + 4..o + 6].copy_from_slice(&((bb / n) as u16).to_le_bytes());
         }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(dw * 6)
+            .enumerate()
+            .for_each(|(dy, orow)| fill_row(dy, orow));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (dy, orow) in out.chunks_mut(dw * 6).enumerate() {
+        fill_row(dy, orow);
     }
     out
 }

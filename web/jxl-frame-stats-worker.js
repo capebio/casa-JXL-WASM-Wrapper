@@ -36,11 +36,15 @@ function normaliseFrame(input) {
 // the fallback for no-WASM environments (CSP, locked-down webviews) or load
 // failures. null = untried, false = unavailable, object = loaded module.
 let _wasmMetrics = null;
+let _wasmMemory = null; // WebAssembly.Memory — needed for the zero-copy input_ptr path
 async function ensureWasmMetrics() {
     if (_wasmMetrics !== null) return _wasmMetrics;
     try {
         const mod = await import('./pkg/raw_converter_wasm.js');
-        await mod.default(); // browser worker: init() fetches _bg.wasm via module URL
+        // browser worker: init() fetches _bg.wasm via module URL and returns the
+        // wasm exports object (incl. `memory`), which the zero-copy path writes to.
+        const wasmExports = await mod.default();
+        _wasmMemory = wasmExports?.memory ?? null;
         // Wire the exact-FNV WASM frame-stats kernel (~3.7x over JS) into the shared
         // analyzeProgressiveFrame seam. Independent of PerceptualComparer availability.
         if (typeof mod.frame_stats === 'function') {
@@ -214,7 +218,19 @@ async function handleChartRequest(id, data) {
             const reg = (p.region || (p.x != null || p.y != null ? p : null));
             let rec;
             if (wcmp) {
-                const m = wcmp.all(px);
+                // Zero-copy path: write the test RGBA straight into the comparer's
+                // wasm-heap staging buffer (input_ptr/all_at, src/lib.rs) instead of
+                // copying the full buffer across the FFI on every pass via all().
+                let m;
+                if (_wasmMemory && typeof wcmp.input_ptr === 'function') {
+                    const p = wcmp.input_ptr(px.length);
+                    // Acquire the heap view AFTER input_ptr — growing the staging
+                    // buffer may grow (and detach views of) wasm memory.
+                    new Uint8Array(_wasmMemory.buffer, p, px.length).set(px);
+                    m = wcmp.all_at(px.length);
+                } else {
+                    m = wcmp.all(px);
+                }
                 rec = {
                     index: p.index,
                     psnr: m.psnr,

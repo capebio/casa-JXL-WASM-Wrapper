@@ -5,7 +5,7 @@
 //
 // Build first (from repo root):
 //   $env:RUSTFLAGS="-C target-feature=+simd128"
-//   wasm-pack build --target nodejs --out-dir pkg-bench --release
+//   wasm-pack build --target nodejs --out-dir pkg-bench --release -- --features bench-exports
 //   node tools/demosaic-flipflop.mjs
 import { performance } from "node:perf_hooks";
 

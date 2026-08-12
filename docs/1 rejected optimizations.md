@@ -1985,3 +1985,80 @@ Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tric
   (decodeFullRes, format "rgba8") — the OUT_FULL_16 buffer is not in the export path, so this is
   not "a 16-bit PNG arm in the PNG encoder" but a new 16-bit develop/export pipeline through
   worker messaging, i.e., exactly the deferred packet-3 work with its effort understated.
+
+---
+
+## Lens-2 Agent 4 item 4.5: dark-frame defective-pixel map (calibrate.rs + profiles.rs + pipeline.rs) — DEFERRED, NOT IMPLEMENTABLE AS A VERIFIED MINIMAL CHANGE (2026-08-08)
+
+**Proposal:** extend `denoise/calibrate.rs` to derive a bad-pixel map from the ≥16 dark frames it already ingests (hot: dark mean > k·σ of plane; dead: 0 across darks), persist per CameraKey in `denoise/profiles.rs`, and apply median-of-Bayer-neighbours substitution on the mosaic before demosaic in `pipeline.rs`.
+
+**Re-verified 2026-08-08 against current main:** still valid — `calibrate()` fits only shot/read coefficients; no defective-pixel logic exists anywhere in the crate. The idea itself is sound astronomy-CCD practice and remains a good candidate.
+
+**Rejected for this session's scope, not on merits:**
+1. **Unvalidatable tonight.** The k·σ hot-pixel threshold and the substitution kernel need real dark-frame corpora to tune; this session's constraints are "no benchmarks, cargo-test verification only" and the repo ships no dark-frame fixtures — any threshold I picked would be a guess baked into a persisted profile format.
+2. **Not minimal.** It is a three-file feature (new profile schema field + migration for existing ProfileDatabase entries + a new mosaic pre-pass in the `pipeline.rs` hot path), against an actively-moving main, with pinned-digest parity tests (`tests/parity_corpus.rs`) that any mosaic pre-pass would drift for calibrated cameras.
+3. **Cross-cutting output change.** Substitution before demosaic alters RAW-path output for every profiled camera — exactly the class of silent whole-corpus drift the golden-ledger tests exist to catch; landing it deserves its own reviewed change with re-pinned goldens, not a rider on a kernel-optimization branch.
+
+**Disposition:** implement as its own feature branch with dark-frame fixtures and re-pinned goldens. Everything else in the Agent 4 handoff (4.1–4.4, 4.6–4.9) was implemented on `lens2-s4-w9d4`.
+
+## Agent 1 lens-review re-verify — web/worker.js + worker/pool packages (2026-08-08, branch lens2-s1-k7q3)
+
+Handoff: `docs/outputs/ChatGPT plus Claude Outputs/0 Agent Instructions to Lens Investigating INTEGRATED - 2026-08-08.md`,
+section "Agent 1", re-verified against main @ df3b30b7 (~19 commits after the handoff was written).
+Items 1.1/1.2/1.3/1.5/1.7/1.9 survived re-verification and were implemented on this branch.
+
+- **1.4 "Poisoned wasm instance reused after a RuntimeError — reset `wasmReady = null` so
+  ensureWasm re-instantiates."** Rejected: the fix's core mechanism is invalidated by the shipped
+  pkg. `web/pkg/raw_converter_wasm.js` `__wbg_init` (L3694) and `initSync` (L3674) both start with
+  `if (wasm !== undefined) return wasm;` — the module-level `wasm` binding never resets, and
+  `import()` caches the module namespace, so after a trap the worker CANNOT re-instantiate its own
+  wasm; `wasmReady = null` just re-runs init() and gets the same poisoned instance back. The
+  defect itself (a trapped worker returned to the free pool) is real but the only effective
+  recovery is worker replacement — main.js's pool 'error' handler must respawn instead of
+  shrinking (`this.size - 1`), which is a cross-file edit in Agent 5's primary file (approval
+  unavailable tonight). Implementing only the in-worker state-map clearing would not deliver the
+  claimed benefit and can degrade recoverable-trap cases. Defer as one combined change: pkg
+  rebuilt with a re-init path (or worker self-termination protocol) + main.js respawn.
+- **1.6 "Route RW2/NEF/NRW to the native wasm decoders instead of LibRaw."** Rejected for
+  tonight; the handoff itself marks it as **dependent on Agent 3 item 3.5** (panasonic.rs
+  hostile-dimension guards), and re-verification against current main shows those guards have NOT
+  landed: `crates/raw-pipeline/src/panasonic.rs` still has no `check_dims`/`checked_mul`/200 MP
+  cap (the only clamp is the DPCM pixel clamp at L278) — routing browser input to it now would
+  promote unguarded parsers to a hostile trust boundary. It additionally needs a new
+  `src/lib.rs` wasm export (cross-file, approval required), per-format gating through
+  `tools/colour-verify-corpus.mjs` (out of tonight's no-benchmarks scope), and it changes decode
+  output bytes (LibRaw → native), violating the byte-identical constraint. Revisit once 3.5
+  lands; flip RW2/RWL first, NEF only after MakerNote WB replaces the placeholder.
+- **1.8 "tiled-decode-pool: priority-ordered waiter queue + velocity-driven prefetch wiring."**
+  Rejected for tonight. Re-verified premise: the waiter queue is still plain FIFO
+  (`tiled-decode-pool.ts` L313/L625), the protocol `priority` field is still dead, and
+  `prefetchViewport`/`predictRegion` still have zero production callers (only decode-level.ts
+  itself + its tests). But that same fact defeats a part-1-only implementation: with no prefetch
+  callers, every waiter is the same tier, so a priority queue is pure dead code until part 2 (the
+  pan/zoom velocity wiring in `web/lightbox/pyramid-lightbox.js`) lands — and that is a
+  cross-file edit requiring approval. Implement both halves together in a session that may touch
+  the lightbox file.
+
+## Lens-review handoff Agent 5 re-verification — 2026-08-08 (branch lens2-s5-z9f4)
+
+- **Item 5.1 structural tier: lazy clean-snapshot capture (`invalidateCleanSnapshot()` +
+  deferred `getImageData` on lens activation).** Rejected 2026-08-08. Deferring the capture also
+  defers `setCleanCanvas` and `feedTauriParityBaseline` — the M2 FilterEngine parity panel is fed
+  the clean baseline at paint time today, so its colour sliders would go inert until first lens
+  activation; the change touches all nine paint sites plus the lens active/inactive lifecycle in
+  the middle of an active refactor of main.js. The mechanical tier landed instead (TTFP-2 pattern
+  extended to LIGHTBOX_LIVE, blissOpfsLoad, drawLightboxForCard raw branch, triggerLiveUpdateTauri),
+  which removes the readback on the latency-critical slider path for orientation-1 files with zero
+  behavioural change. Revisit the lazy tier only if profiling shows the remaining GPU-composed
+  sites (rotated/mirrored, JPEG-scaled, straighten) dominate.
+- **Item 5.6, moments half: use `m.moments` from the wasm comparer instead of
+  `computeChannelMoments` in the wcmp branch.** Deferred 2026-08-08 (not landed). It consumes the
+  `mus`/`vars` fields Agent 2 item 2.2 adds to `metrics_to_js` — that change has not landed on
+  main, so there is no API to code against; guessing the field shape would silently fall over at
+  integration. One-line follow-up once 2.2 lands. The zero-copy `input_ptr`/`all_at` half of 5.6
+  IS implemented (with a fallback to the copying `all()` when the wasm memory handle is absent).
+- **Item 5.2, pyramid source: "build sources from the existing OPFS pyramid getters."** Partially
+  rejected 2026-08-08: the main gallery page has no OPFS JXL pyramid store (that is the
+  pyramid-gallery page's architecture); its decoded-RGBA derived cache is main-thread state the
+  live-buffer source already covers. The Identify wiring passes a null pyramid getter with a
+  comment; wire a real getter if/when the main gallery gains an OPFS pyramid.

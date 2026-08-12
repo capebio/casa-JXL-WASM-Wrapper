@@ -13,8 +13,11 @@ self.onmessage = async (ev) => {
         const dv = new DataView(out.buffer, out.byteOffset);
         const w = dv.getUint32(0, true);
         const h = dv.getUint32(4, true);
-        const rgb = out.slice(8).buffer;
-        self.postMessage({ type: 'bliss_decoded', seq, rgb, w, h }, [rgb]);
+        // Transfer the whole wasm-owned copy with an offset past the 8-byte
+        // header instead of slice(8) — that slice duplicated the full lightbox
+        // RGB (~6.5 MB at 1800px) on the instant-preview critical path.
+        const off = out.byteOffset + 8;
+        self.postMessage({ type: 'bliss_decoded', seq, rgb: out.buffer, off, w, h }, [out.buffer]);
     } catch (e) {
         self.postMessage({ type: 'bliss_decoded', seq, rgb: null, error: String(e) });
     }

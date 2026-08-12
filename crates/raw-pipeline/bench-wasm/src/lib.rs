@@ -49,14 +49,15 @@ pub fn bench(a: &[u8], b: &[u8], iters: u32, simd: bool) -> f64 {
 
 // --- SSIM moments ---
 
-/// Independent scalar moments — mirrors `ssim_moments_avx2`'s scalar body.
-fn moments_scalar(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], [u64; 3]) {
-    let mut sa = [0u64; 3];
-    let mut saa = [0u64; 3];
-    let mut sab = [0u64; 3];
+/// Independent scalar moments — mirrors `ssim_moments_avx2`'s scalar body
+/// (4 lanes: the kernels keep the alpha lane for the PSNR-from-sums derivation).
+fn moments_scalar(a: &[u8], b: &[u8], np: usize) -> ([u64; 4], [u64; 4], [u64; 4]) {
+    let mut sa = [0u64; 4];
+    let mut saa = [0u64; 4];
+    let mut sab = [0u64; 4];
     let mut j = 0;
     for _ in 0..np {
-        for c in 0..3 {
+        for c in 0..4 {
             let x = a[j + c] as u64;
             let y = b[j + c] as u64;
             sa[c] += x;
@@ -69,7 +70,7 @@ fn moments_scalar(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], [u64; 3
 }
 
 #[inline]
-fn moments_checksum(m: ([u64; 3], [u64; 3], [u64; 3])) -> f64 {
+fn moments_checksum(m: ([u64; 4], [u64; 4], [u64; 4])) -> f64 {
     let (sa, saa, sab) = m;
     let mut acc = 0u64;
     for v in sa.iter().chain(saa.iter()).chain(sab.iter()) {

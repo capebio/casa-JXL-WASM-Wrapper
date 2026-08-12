@@ -148,6 +148,49 @@ fn cum_table(freqs: &[u16; 256]) -> [u32; 257] {
     cum
 }
 
+/// Per-symbol encoder entry: the division-free rANS step (ryg's
+/// `RansEncSymbolInit` idea, widened). `q = x / f` is computed as
+/// `(x · rcp) >> 64` with `rcp = ceil(2^64 / f)` — exact for every `x < 2^32`
+/// and `f ≥ 2`: the error term `x·(rcp·f − 2^64)/2^64 < 2^44/2^64` can never
+/// carry `x` across a multiple of `f`. (The classic 31-bit-reciprocal variant
+/// is only exact for `x < 2^31`; our 16-bit renorm lets states reach
+/// `f·2^20 − 1 ≈ 2^32`, where it rounds up at `x ≡ −1 (mod f)` — caught by
+/// `enc_sym_reciprocal_is_exact_division`.) `f == 1` uses `rcp = 2^64 − 1`
+/// (so `q = x − 1`) with the correction folded into `bias`. The encoded state
+/// is IDENTICAL to the divide form by
+/// `((x/f) << PREC) + (x%f) + cum = x + cum + (x/f)·(2^PREC − f)`.
+struct EncSym {
+    /// Renorm bound `f << 20`; 0 for absent symbols (never encoded).
+    x_max: u32,
+    rcp: u64,
+    /// `cum` (f ≥ 2) or `cum + TAB_SIZE − 1` (f == 1).
+    bias: u32,
+    /// `TAB_SIZE − f`.
+    cmpl: u32,
+}
+
+fn enc_sym_table(freqs: &[u16; 256]) -> [EncSym; 256] {
+    let cum = cum_table(freqs);
+    core::array::from_fn(|s| {
+        let f = freqs[s] as u32;
+        if f < 2 {
+            EncSym {
+                x_max: f << 20,
+                rcp: u64::MAX,
+                bias: cum[s] + TAB_SIZE - 1,
+                cmpl: TAB_SIZE - f,
+            }
+        } else {
+            EncSym {
+                x_max: f << 20,
+                rcp: (((1u128 << 64) + f as u128 - 1) / f as u128) as u64,
+                bias: cum[s],
+                cmpl: TAB_SIZE - f,
+            }
+        }
+    })
+}
+
 /// Encode `syms` (forward order, lane = index & 7) into a braided rANS stream.
 /// Returns (states after encoding = decoder's initial states, buffer, start):
 /// the stream (with `RANS_PAD` trailing pad) is `buf[start..]`.
@@ -157,8 +200,12 @@ fn cum_table(freqs: &[u16; 256]) -> [u32; 257] {
 /// one u16): no realloc-and-copy on dense planes, no whole-stream reverse
 /// pass. Byte order per emission is lo,hi — identical to the old
 /// push-hi-lo-then-reverse scheme (little-endian u16s read forward).
+///
+/// The per-symbol state step is division-free (see [`EncSym`]): a hardware
+/// u32 div+mod per symbol was the hottest instruction in the encoder inner
+/// loop (and i32.div_u on wasm). Bitstream unchanged — decoder untouched.
 fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>, usize) {
-    let cum = cum_table(freqs);
+    let esyms = enc_sym_table(freqs);
     let mut x = [RANS_L; LANES];
     let cap = syms.len() * 2 + RANS_PAD;
     // No zero-fill: the pad is written explicitly below and emissions fill
@@ -175,17 +222,17 @@ fn rans_encode(syms: &[u8], freqs: &[u16; 256]) -> ([u32; LANES], Vec<u8>, usize
     }
     for i in (0..syms.len()).rev() {
         let lane = i & (LANES - 1);
-        let s = syms[i] as usize;
-        let f = freqs[s] as u32;
-        debug_assert!(f > 0);
+        let e = &esyms[syms[i] as usize];
+        debug_assert!(e.x_max > 0, "symbol with zero frequency");
         let xl = &mut x[lane];
-        if *xl >= (f << 20) {
+        if *xl >= e.x_max {
             pos -= 2;
             buf[pos] = *xl as u8;
             buf[pos + 1] = (*xl >> 8) as u8;
             *xl >>= 16;
         }
-        *xl = ((*xl / f) << PREC) + (*xl % f) + cum[s];
+        let q = ((*xl as u128 * e.rcp as u128) >> 64) as u32;
+        *xl = *xl + e.bias + q * e.cmpl;
     }
     (x, buf, pos)
 }
@@ -509,8 +556,8 @@ fn encode_plane_from_scan(
     };
 
     let freqs = normalize_freqs(hist);
-    // Pass B: RAW demotion by estimated cost under the global table.
-    let mut syms: Vec<u8> = Vec::with_capacity((h - s.copy_rows) * w);
+    // Pass B: RAW demotion by estimated cost under the global table (modes
+    // only — gathering is deferred so the dense case can skip it).
     let mut raw: Vec<u8> = Vec::new();
     if let Some(fr) = &freqs {
         let mut bits = [0f32; 256];
@@ -528,11 +575,25 @@ fn encode_plane_from_scan(
             if cost > RAW_THRESHOLD_BITS_PER_BYTE * w as f32 {
                 s.modes[y] = MODE_RAW;
                 raw.extend_from_slice(row);
-            } else {
-                syms.extend_from_slice(row);
             }
         }
     }
+    // Dense common case (photo planes: no COPY rows, nothing demoted): the
+    // symbol sequence IS `s.residuals` — no w·h gather copy. Only when some
+    // rows are excluded is a gathered Vec built.
+    let gathered: Vec<u8>;
+    let syms: &[u8] = if s.copy_rows == 0 && raw.is_empty() {
+        &s.residuals
+    } else {
+        let mut v = Vec::with_capacity((h - s.copy_rows) * w - raw.len());
+        for y in 0..h {
+            if s.modes[y] == MODE_RANS {
+                v.extend_from_slice(&s.residuals[y * w..(y + 1) * w]);
+            }
+        }
+        gathered = v;
+        &gathered
+    };
 
     out.extend_from_slice(&s.modes);
     put_u32(out, syms.len() as u32);
@@ -541,7 +602,7 @@ fn encode_plane_from_scan(
         for f in fr {
             out.extend_from_slice(&f.to_le_bytes());
         }
-        let (states, stream, start) = rans_encode(&syms, &fr);
+        let (states, stream, start) = rans_encode(syms, &fr);
         for st in states {
             put_u32(out, st);
         }
@@ -1046,24 +1107,32 @@ const MAGIC: &[u8; 4] = b"FBR1";
 // subtract-green space, including temporal deltas.
 const RCT_SUBTRACT_GREEN: u8 = 1;
 
-fn deinterleave3(rgb: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let mut r = vec![0u8; n];
-    let mut g = vec![0u8; n];
-    let mut b = vec![0u8; n];
+/// Planar split into caller-owned buffers (resized to `n`; reused across
+/// frames by [`DeltaEncodeSession`] — no per-frame plane allocation once warm).
+fn deinterleave3_into(rgb: &[u8], n: usize, r: &mut Vec<u8>, g: &mut Vec<u8>, b: &mut Vec<u8>) {
+    r.clear();
+    r.resize(n, 0);
+    g.clear();
+    g.resize(n, 0);
+    b.clear();
+    b.resize(n, 0);
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
     {
-        unsafe { kernels_wasm::deinterleave3_simd128(rgb, &mut r, &mut g, &mut b) };
-        return (r, g, b);
+        unsafe { kernels_wasm::deinterleave3_simd128(rgb, r, g, b) };
+        return;
     }
     #[allow(unreachable_code)]
-    {
-        for i in 0..n {
-            r[i] = rgb[3 * i];
-            g[i] = rgb[3 * i + 1];
-            b[i] = rgb[3 * i + 2];
-        }
-        (r, g, b)
+    for i in 0..n {
+        r[i] = rgb[3 * i];
+        g[i] = rgb[3 * i + 1];
+        b[i] = rgb[3 * i + 2];
     }
+}
+
+fn deinterleave3(rgb: &[u8], n: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (mut r, mut g, mut b) = (Vec::new(), Vec::new(), Vec::new());
+    deinterleave3_into(rgb, n, &mut r, &mut g, &mut b);
+    (r, g, b)
 }
 
 /// Scalar reference for the fused RCT-undo interleave (also the wasm path).
@@ -1180,6 +1249,102 @@ pub fn encode_rgb8_delta(cur: &[u8], prev: &[u8], w: u32, h: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Streaming encode session for a chain of frames — the encoder-side twin of
+/// [`DeltaDecodeSession`]. Caches the subtract-green planes of the last
+/// encoded frame, so each P-frame skips re-deriving prev's planes from
+/// interleaved RGB (one deinterleave3, 2n wrapping subs and 3 plane
+/// allocations per frame), and reuses the two predictor-scan scratch buffers
+/// across frames. Payloads are **byte-identical** to the stateless
+/// [`encode_rgb8`] / [`encode_rgb8_delta`]: the cached planes are the exact
+/// values a fresh derivation would produce (mod-256 ring, deterministic
+/// kernels) — pinned by `encode_session_matches_stateless`.
+pub struct DeltaEncodeSession {
+    /// Subtract-green planes (G, R−G, B−G) of the last encoded frame.
+    planes: [Vec<u8>; 3],
+    /// Deinterleave destination for the current frame (ping-pongs with
+    /// `planes` after each encode).
+    spare: [Vec<u8>; 3],
+    scan_ext: PredScan,
+    scan_top: PredScan,
+    /// Dimensions the cached `planes` describe; None until the first encode.
+    dims: Option<(u32, u32)>,
+}
+
+impl Default for DeltaEncodeSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DeltaEncodeSession {
+    pub fn new() -> Self {
+        DeltaEncodeSession {
+            planes: [Vec::new(), Vec::new(), Vec::new()],
+            spare: [Vec::new(), Vec::new(), Vec::new()],
+            scan_ext: PredScan::default(),
+            scan_top: PredScan::default(),
+            dims: None,
+        }
+    }
+
+    /// Deinterleave `rgb` into `spare` as subtract-green planes (G, R−G, B−G).
+    fn derive_sg_into_spare(&mut self, rgb: &[u8], n: usize) {
+        let [sg, sr, sb] = &mut self.spare;
+        deinterleave3_into(rgb, n, sr, sg, sb);
+        for i in 0..n {
+            sr[i] = sr[i].wrapping_sub(sg[i]);
+            sb[i] = sb[i].wrapping_sub(sg[i]);
+        }
+    }
+
+    /// Intra encode; output byte-identical to [`encode_rgb8`]. Caches the
+    /// frame's planes as the delta reference for [`Self::encode_delta`].
+    pub fn encode_intra(&mut self, rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let n = w as usize * h as usize;
+        assert_eq!(rgb.len(), n * 3, "rgb size");
+        self.derive_sg_into_spare(rgb, n);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut out = image_header(w, h, 3, RCT_SUBTRACT_GREEN);
+        for i in 0..3 {
+            scan_predictor_into(&self.spare[i], wu, hu, Predictor::Top, &mut self.scan_top);
+            push_plane_from_scan(&mut out, wu, hu, Predictor::Top, &mut self.scan_top);
+        }
+        std::mem::swap(&mut self.planes, &mut self.spare);
+        self.dims = Some((w, h));
+        out
+    }
+
+    /// P-frame encode against the session's cached previous frame; output
+    /// byte-identical to [`encode_rgb8_delta`] with that frame as `prev`.
+    /// Panics when no frame of these dims was encoded first (caller bug —
+    /// same contract style as the stateless size asserts).
+    pub fn encode_delta(&mut self, rgb: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let n = w as usize * h as usize;
+        assert_eq!(rgb.len(), n * 3, "cur size");
+        assert_eq!(
+            self.dims,
+            Some((w, h)),
+            "encode_delta needs a prior same-dims encode"
+        );
+        self.derive_sg_into_spare(rgb, n);
+        let (wu, hu) = (w as usize, h as usize);
+        let mut out = image_header(w, h, 3, RCT_SUBTRACT_GREEN);
+        for i in 0..3 {
+            let ext = Predictor::External(&self.planes[i]);
+            scan_predictor_into(&self.spare[i], wu, hu, ext, &mut self.scan_ext);
+            scan_predictor_into(&self.spare[i], wu, hu, Predictor::Top, &mut self.scan_top);
+            if self.scan_ext.cost_bits <= self.scan_top.cost_bits {
+                push_plane_from_scan(&mut out, wu, hu, ext, &mut self.scan_ext);
+            } else {
+                push_plane_from_scan(&mut out, wu, hu, Predictor::Top, &mut self.scan_top);
+            }
+        }
+        std::mem::swap(&mut self.planes, &mut self.spare);
+        self.dims = Some((w, h));
+        out
+    }
 }
 
 /// True iff every plane of a delta image is External-predicted with all-COPY
@@ -1474,6 +1639,36 @@ mod tests {
         v
     }
 
+    /// The reciprocal step must equal the divide form for every legal
+    /// frequency (1..=4095) at every state the encoder can hold
+    /// (post-renorm: x < f << 20). Edges plus randoms; cum is 0 by
+    /// construction so `want` is the raw divide-form step.
+    #[test]
+    fn enc_sym_reciprocal_is_exact_division() {
+        let mut rng = Rng(0x1234);
+        for f in 1u32..=4095 {
+            let mut freqs = [0u16; 256];
+            freqs[7] = f as u16;
+            freqs[8] = (TAB_SIZE - f) as u16;
+            let esyms = enc_sym_table(&freqs);
+            let e = &esyms[7];
+            let hi = (f << 20) - 1;
+            let mut check = |x: u32| {
+                let q = ((x as u128 * e.rcp as u128) >> 64) as u32;
+                let got = x + e.bias + q * e.cmpl;
+                let want = ((x / f) << PREC) + (x % f); // cum[7] == 0
+                assert_eq!(got, want, "f={f} x={x}");
+            };
+            check(1);
+            check(16);
+            check(RANS_L);
+            check(hi);
+            for _ in 0..10 {
+                check(1 + (rng.next() % hi as u64) as u32);
+            }
+        }
+    }
+
     #[test]
     fn rans_roundtrip_skewed() {
         let mut rng = Rng(42);
@@ -1570,6 +1765,48 @@ mod tests {
             same.len() < 400,
             "all-COPY delta should be near-empty, got {}",
             same.len()
+        );
+    }
+
+    /// FNV-1a over encoded bytes — pins the exact bitstream so encoder
+    /// restructures (dense-path syms, reciprocal rANS, encode session) cannot
+    /// silently change output. Golden values captured from the pre-change
+    /// encoder; every path is covered: dense RANS (photo), COPY rows
+    /// (screen), RAW demotion (noise), External predictor (delta).
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    #[test]
+    fn encoded_bytes_are_pinned() {
+        let a = photo_like(214, 120, 7);
+        let b = screen_like(214, 120);
+        let mut rng = Rng(99);
+        let noise: Vec<u8> = (0..64 * 48 * 3).map(|_| rng.byte()).collect();
+        let mut delta_cur = a.clone();
+        for i in 3000..4200 {
+            delta_cur[i] = delta_cur[i].wrapping_add(13);
+        }
+        let got = [
+            fnv1a(&encode_rgb8(&a, 214, 120)),
+            fnv1a(&encode_rgb8(&b, 214, 120)),
+            fnv1a(&encode_rgb8(&noise, 64, 48)),
+            fnv1a(&encode_rgb8_delta(&delta_cur, &a, 214, 120)),
+        ];
+        assert_eq!(
+            got,
+            [
+                5073181637747379702u64,
+                11829279922270979879,
+                12195226001808192511,
+                10808373075655021652,
+            ],
+            "encoded bytes changed vs the pinned golden bitstream"
         );
     }
 
@@ -1767,6 +2004,44 @@ mod tests {
                 .expect("mid-chain"),
             frames[1]
         );
+    }
+
+    /// The encode session must emit byte-identical payloads to the stateless
+    /// functions across a mixed chain: intra, deltas, an identity frame, and
+    /// a mid-chain re-key (GOP boundary).
+    #[test]
+    fn encode_session_matches_stateless() {
+        let (w, h) = (61u32, 33u32);
+        let mut frames: Vec<Vec<u8>> = Vec::new();
+        for i in 0..6u32 {
+            let mut f = photo_like(w as usize, h as usize, 200 + i as u64);
+            if i == 2 {
+                f = frames[1].clone(); // identity frame
+            }
+            frames.push(f);
+        }
+        let mut sess = DeltaEncodeSession::new();
+        assert_eq!(
+            sess.encode_intra(&frames[0], w, h),
+            encode_rgb8(&frames[0], w, h),
+            "intra"
+        );
+        for i in 1..frames.len() {
+            if i == 4 {
+                // mid-chain re-key: intra must also refresh the delta cache
+                assert_eq!(
+                    sess.encode_intra(&frames[i], w, h),
+                    encode_rgb8(&frames[i], w, h),
+                    "re-key frame {i}"
+                );
+            } else {
+                assert_eq!(
+                    sess.encode_delta(&frames[i], w, h),
+                    encode_rgb8_delta(&frames[i], &frames[i - 1], w, h),
+                    "delta frame {i}"
+                );
+            }
+        }
     }
 
     #[test]

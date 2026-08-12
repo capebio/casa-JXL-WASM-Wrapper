@@ -1751,7 +1751,10 @@ pub fn apply_perceptual_constancy(
         sat
     } else {
         let raw_mx = r.max(g).max(b);
-        let mx = raw_mx.max(1.0);
+        // This Layer-5 API operates in the normalized [0, 1.5] domain, so clamping the
+        // denominator to 1.0 forced pixel_sat = (mx - mn) for nearly all real pixels
+        // (raw_mx < 1.0), underestimating saturation. Match apply_tone_math's 1e-6 guard.
+        let mx = raw_mx.max(1e-6);
         let mn = r.min(g).min(b).max(0.0);
         let inv_mx = if raw_mx > 0.0 { 1.0 / mx } else { 0.0 };
         let pixel_sat = ((mx - mn) * inv_mx).clamp(0.0, 1.0);
@@ -1843,7 +1846,9 @@ fn apply_tone_math4(
                 sat
             } else {
                 let raw_mx = r2s[i].max(g2s[i]).max(b2s[i]);
-                let mx = raw_mx.max(1.0);
+                // Align with the scalar apply_tone_math clamp (1e-6, not 1.0) so the
+                // 4-wide lane loop cannot diverge from scalar for near-black values.
+                let mx = raw_mx.max(1e-6);
                 let mn = r2s[i].min(g2s[i]).min(b2s[i]).max(0.0);
                 let inv_mx = if raw_mx > 0.0 { 1.0 / mx } else { 0.0 };
                 let pixel_sat = ((mx - mn) * inv_mx).clamp(0.0, 1.0);

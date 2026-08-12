@@ -1816,13 +1816,14 @@ pub fn encode_casv_fable_streaming(
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (flags, len)
     let mut data: Vec<u8> = Vec::new();
-    // Ping-pong frame buffers (see encode_casv_video_streaming).
     let mut cur: Vec<u8> = Vec::new();
-    let mut prev_src: Vec<u8> = Vec::new();
+    // The session holds the previous frame as cached subtract-green planes
+    // (byte-identical payloads to the stateless encode_rgb8/_delta), so no
+    // prev-source buffer is kept and prev's planes are never re-derived.
+    let mut sess = crate::fable_braid::DeltaEncodeSession::new();
     let mut idx = 0usize;
 
     loop {
-        std::mem::swap(&mut cur, &mut prev_src);
         if !src.next_frame_into(&mut cur) {
             break;
         }
@@ -1834,12 +1835,9 @@ pub fn encode_casv_fable_streaming(
             });
         }
         let (flags, payload) = if idx % gop == 0 {
-            (0u32, crate::fable_braid::encode_rgb8(&cur, width, height))
+            (0u32, sess.encode_intra(&cur, width, height))
         } else {
-            (
-                CASV_PFRAME_FLAG,
-                crate::fable_braid::encode_rgb8_delta(&cur, &prev_src, width, height),
-            )
+            (CASV_PFRAME_FLAG, sess.encode_delta(&cur, width, height))
         };
         index.push((flags, payload.len() as u32));
         data.extend_from_slice(&payload);
@@ -1882,12 +1880,13 @@ pub fn encode_casv_fable_streaming_to_progress<W: std::io::Write>(
 
     let mut index: Vec<(u32, u32)> = Vec::new(); // (rel_offset, len | flags)
     let mut cur: Vec<u8> = Vec::new();
-    let mut prev_src: Vec<u8> = Vec::new();
+    // Session-cached prev planes; payloads byte-identical to the stateless
+    // functions (see encode_casv_fable_streaming).
+    let mut sess = crate::fable_braid::DeltaEncodeSession::new();
     let mut idx = 0usize;
     let mut offset: u64 = 0;
 
     loop {
-        std::mem::swap(&mut cur, &mut prev_src);
         if !src.next_frame_into(&mut cur) {
             break;
         }
@@ -1899,12 +1898,9 @@ pub fn encode_casv_fable_streaming_to_progress<W: std::io::Write>(
             });
         }
         let (flags, payload) = if idx % gop == 0 {
-            (0u32, crate::fable_braid::encode_rgb8(&cur, width, height))
+            (0u32, sess.encode_intra(&cur, width, height))
         } else {
-            (
-                CASV_PFRAME_FLAG,
-                crate::fable_braid::encode_rgb8_delta(&cur, &prev_src, width, height),
-            )
+            (CASV_PFRAME_FLAG, sess.encode_delta(&cur, width, height))
         };
         sink.write_all(&payload).map_err(|_| VideoError::Io)?;
         index.push((offset as u32, (payload.len() as u32) | flags));

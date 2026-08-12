@@ -4,9 +4,10 @@
 //! variance-stabilized (VST applied). After BM3D, apply the inverse VST.
 //!
 //! # Determinism
-//! - Tiles are processed in parallel via Rayon, but output tiles are written
-//!   sequentially (no shared mutable state during parallel phase).
-//! - Within each tile, reference patches are visited in row-major order.
+//! - The image is processed as a single tile (see `bm3d_denoise` — spatial
+//!   tiling produces visible seams); plane-level parallelism lives in the
+//!   caller (`classical.rs`), over disjoint inputs/outputs.
+//! - Reference patches are visited in row-major order.
 //! - Block-matching sorts similar patches by `(distance.to_bits(), row, col)`
 //!   to break float-equality ties deterministically.
 //! - All kernels (DCT, Haar, Kaiser) are purely functional with no shared state.
@@ -103,99 +104,99 @@ fn kaiser2d() -> [f32; PATCH * PATCH] {
 
 // ─── DCT-II (8×8 only) ───────────────────────────────────────────────────────
 
-/// Compute 1D orthonormal DCT-II in-place.
+/// 8×8 orthonormal DCT-II matrix, built once:
+/// `DCT8[k][j] = s(k) * cos(pi*(2j+1)*k/16)`, `s(0)=sqrt(1/8)`, `s(k>0)=sqrt(2/8)`.
 ///
-/// Orthonormal DCT-II ensures that each output coefficient has the same noise
-/// variance as the input, which is required for BM3D hard-threshold to work
-/// with a uniform threshold LAMBDA * sigma.
-///
-/// `DCT[0] = sqrt(1/N) * sum_j x[j]`
-/// `DCT[k] = sqrt(2/N) * sum_j x[j] * cos(pi*(2j+1)*k/(2N))`, k > 0
-fn dct1d(x: &mut [f32]) {
-    let n = x.len();
-    let input: Vec<f32> = x.to_vec();
-    let scale = std::f32::consts::PI / (2.0 * n as f32);
-    let inv_sqrt_n = 1.0 / (n as f32).sqrt();
-    let sqrt_2_over_n = (2.0 / n as f32).sqrt();
-    for k in 0..n {
-        let mut sum = 0.0f32;
-        for j in 0..n {
-            sum += input[j] * ((2 * j + 1) as f32 * k as f32 * scale).cos();
-        }
-        x[k] = if k == 0 { sum * inv_sqrt_n } else { sum * sqrt_2_over_n };
-    }
+/// Orthonormality ensures each output coefficient has the same noise variance
+/// as the input, which is required for BM3D hard-threshold to work with a
+/// uniform threshold LAMBDA * sigma. The old per-call formulation recomputed
+/// the 64 cos() values inside every 1D transform and heap-allocated a temp;
+/// this table folds the scale factors in and makes each 1D transform a 64-MAC
+/// stack-only mat-mul.
+fn dct8_matrix() -> &'static [[f32; PATCH]; PATCH] {
+    static M: std::sync::OnceLock<[[f32; PATCH]; PATCH]> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let scale = std::f32::consts::PI / (2.0 * PATCH as f32);
+        let inv_sqrt_n = 1.0 / (PATCH as f32).sqrt();
+        let sqrt_2_over_n = (2.0 / PATCH as f32).sqrt();
+        core::array::from_fn(|k| {
+            core::array::from_fn(|j| {
+                let s = if k == 0 { inv_sqrt_n } else { sqrt_2_over_n };
+                s * ((2 * j + 1) as f32 * k as f32 * scale).cos()
+            })
+        })
+    })
 }
 
-/// Compute 1D orthonormal inverse DCT-II (= DCT-III) in-place.
-/// Inverse of the orthonormal DCT-II above.
-fn idct1d(x: &mut [f32]) {
-    let n = x.len();
-    let input: Vec<f32> = x.to_vec();
-    let scale = std::f32::consts::PI / (2.0 * n as f32);
-    let inv_sqrt_n = 1.0 / (n as f32).sqrt();
-    let sqrt_2_over_n = (2.0 / n as f32).sqrt();
-    for j in 0..n {
-        // x[0] contributes: input[0] * sqrt(1/N) * sqrt(1/N) = input[0] / N
-        // x[k] contributes: input[k] * sqrt(2/N) * cos(...) * sqrt(2/N) = 2*input[k]*cos(...)/N  (handled by orthonormality)
-        // Actually: IDCT[j] = sum_k w[k] * input[k] * cos(pi*(2j+1)*k/(2N))
-        // where w[0] = sqrt(1/N), w[k>0] = sqrt(2/N)
-        let mut sum = input[0] * inv_sqrt_n;
-        for k in 1..n {
-            sum += input[k] * sqrt_2_over_n * ((2 * j + 1) as f32 * k as f32 * scale).cos();
-        }
-        x[j] = sum;
-    }
+/// 1D orthonormal DCT-II of an 8-point block: `out[k] = Σ_j DCT8[k][j] * x[j]`.
+#[inline]
+fn dct1d8(x: &[f32; PATCH], m: &[[f32; PATCH]; PATCH]) -> [f32; PATCH] {
+    core::array::from_fn(|k| (0..PATCH).map(|j| m[k][j] * x[j]).sum())
+}
+
+/// 1D orthonormal inverse DCT-II (= DCT-III): `out[j] = Σ_k DCT8[k][j] * x[k]`
+/// (the transpose of the forward matrix, by orthonormality).
+#[inline]
+fn idct1d8(x: &[f32; PATCH], m: &[[f32; PATCH]; PATCH]) -> [f32; PATCH] {
+    core::array::from_fn(|j| (0..PATCH).map(|k| m[k][j] * x[k]).sum())
 }
 
 /// Apply 2D DCT-II to a row-major PATCH×PATCH block.
 fn dct2d(block: &mut [f32; PATCH * PATCH]) {
+    let m = dct8_matrix();
     // Row-wise DCT
+    let mut tmp = [0f32; PATCH];
     for r in 0..PATCH {
-        dct1d(&mut block[r * PATCH..(r + 1) * PATCH]);
+        tmp.copy_from_slice(&block[r * PATCH..(r + 1) * PATCH]);
+        block[r * PATCH..(r + 1) * PATCH].copy_from_slice(&dct1d8(&tmp, m));
     }
     // Column-wise DCT
-    let mut col = [0f32; PATCH];
     for c in 0..PATCH {
         for r in 0..PATCH {
-            col[r] = block[r * PATCH + c];
+            tmp[r] = block[r * PATCH + c];
         }
-        dct1d(&mut col);
+        let out = dct1d8(&tmp, m);
         for r in 0..PATCH {
-            block[r * PATCH + c] = col[r];
+            block[r * PATCH + c] = out[r];
         }
     }
 }
 
 /// Apply 2D inverse DCT-II to a row-major PATCH×PATCH block.
 fn idct2d(block: &mut [f32; PATCH * PATCH]) {
+    let m = dct8_matrix();
     // Column-wise IDCT
-    let mut col = [0f32; PATCH];
+    let mut tmp = [0f32; PATCH];
     for c in 0..PATCH {
         for r in 0..PATCH {
-            col[r] = block[r * PATCH + c];
+            tmp[r] = block[r * PATCH + c];
         }
-        idct1d(&mut col);
+        let out = idct1d8(&tmp, m);
         for r in 0..PATCH {
-            block[r * PATCH + c] = col[r];
+            block[r * PATCH + c] = out[r];
         }
     }
     // Row-wise IDCT
     for r in 0..PATCH {
-        idct1d(&mut block[r * PATCH..(r + 1) * PATCH]);
+        tmp.copy_from_slice(&block[r * PATCH..(r + 1) * PATCH]);
+        block[r * PATCH..(r + 1) * PATCH].copy_from_slice(&idct1d8(&tmp, m));
     }
 }
 
 // ─── Haar wavelet (1D, on group stack) ───────────────────────────────────────
 
 /// 1D Haar wavelet forward transform (lifting scheme) on a power-of-2 slice.
+/// Group length is bounded by GROUP2, so the per-level scratch is a fixed stack
+/// array — no heap allocation in this innermost kernel.
 fn haar1d(x: &mut [f32]) {
     let n = x.len();
-    debug_assert!(n >= 2 && n.is_power_of_two());
+    debug_assert!(n >= 2 && n.is_power_of_two() && n <= GROUP2);
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut tmp = [0f32; GROUP2];
     let mut len = n;
     while len > 1 {
         let half = len / 2;
-        let tmp: Vec<f32> = x[..len].to_vec();
+        tmp[..len].copy_from_slice(&x[..len]);
         for i in 0..half {
             let a = tmp[2 * i];
             let b = tmp[2 * i + 1];
@@ -207,18 +208,20 @@ fn haar1d(x: &mut [f32]) {
 }
 
 /// 1D inverse Haar wavelet transform (lifting scheme) on a power-of-2 slice.
+/// Same fixed stack scratch as `haar1d`; `tmp[..half]` is the low band and
+/// `tmp[half..len]` the high band of the previous level.
 fn ihaar1d(x: &mut [f32]) {
     let n = x.len();
-    debug_assert!(n >= 2 && n.is_power_of_two());
+    debug_assert!(n >= 2 && n.is_power_of_two() && n <= GROUP2);
     let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
+    let mut tmp = [0f32; GROUP2];
     let mut len = 2usize;
     while len <= n {
         let half = len / 2;
-        let low: Vec<f32> = x[..half].to_vec();
-        let high: Vec<f32> = x[half..len].to_vec();
+        tmp[..len].copy_from_slice(&x[..len]);
         for i in 0..half {
-            x[2 * i] = (low[i] + high[i]) * inv_sqrt2;
-            x[2 * i + 1] = (low[i] - high[i]) * inv_sqrt2;
+            x[2 * i] = (tmp[i] + tmp[half + i]) * inv_sqrt2;
+            x[2 * i + 1] = (tmp[i] - tmp[half + i]) * inv_sqrt2;
         }
         len *= 2;
     }
@@ -254,7 +257,8 @@ fn transform_group(group: &mut [f32], n_patches: usize) {
     if g_len < 2 {
         return;
     }
-    let mut stack = vec![0f32; g_len];
+    debug_assert!(g_len <= GROUP2);
+    let mut stack = [0f32; GROUP2];
     for coeff in 0..pp {
         for p in 0..n_patches {
             stack[p] = group[p * pp + coeff];
@@ -274,7 +278,8 @@ fn itransform_group(group: &mut [f32], n_patches: usize) {
     let pp = PATCH * PATCH;
     let g_len = next_pow2(n_patches);
     if g_len >= 2 {
-        let mut stack = vec![0f32; g_len];
+        debug_assert!(g_len <= GROUP2);
+        let mut stack = [0f32; GROUP2];
         for coeff in 0..pp {
             for p in 0..n_patches {
                 stack[p] = group[p * pp + coeff];
@@ -330,21 +335,31 @@ fn mirror(i: isize, len: usize) -> usize {
     }
 }
 
-/// Squared L2 distance between two patches, normalized by patch area.
-fn patch_distance(a: &[f32; PATCH * PATCH], b: &[f32; PATCH * PATCH]) -> f32 {
-    let pp = PATCH * PATCH;
-    let mut s = 0f32;
-    for i in 0..pp {
-        let d = a[i] - b[i];
-        s += d * d;
-    }
-    s / pp as f32
-}
-
 // ─── Block matching ───────────────────────────────────────────────────────────
+
+/// Reusable top-k scratch for `block_match` (one per stage loop, not per ref patch).
+type MatchHeap = std::collections::BinaryHeap<(u32, usize, usize)>;
 
 /// Find up to `max_group` similar patches to reference at (ref_row, ref_col).
 /// Sorted by (dist.to_bits(), row, col) for determinism.
+///
+/// Every candidate is INTERIOR by construction (row/col are clamped to
+/// dim − PATCH), so distances are computed directly against image rows — no
+/// mirror() checks, no per-candidate 64-float copy. Only the reference patch
+/// (which can overhang the image) still goes through `extract_patch`.
+///
+/// Determinism/equivalence vs the old sort-everything form:
+/// - the per-candidate distance uses the identical row-major accumulation
+///   order and the identical `s / pp` normalization, so each dist is
+///   bit-identical;
+/// - the max-heap keeps the `max_group` smallest `(dist.to_bits(), row, col)`
+///   keys — keys are unique ((row, col) distinct) so this is exactly the old
+///   sort + truncate set, and the final sort restores the old order;
+/// - the row-wise early exit only skips candidates whose PARTIAL sum already
+///   exceeds the current k-th best distance. Candidates are scanned in
+///   ascending (row, col), so every heap entry precedes the current candidate
+///   in scan order; a final dist ≥ the k-th best therefore always loses the
+///   tie-break and could never have been kept.
 fn block_match(
     img: &[f32],
     width: usize,
@@ -352,32 +367,65 @@ fn block_match(
     ref_row: usize,
     ref_col: usize,
     max_group: usize,
+    heap: &mut MatchHeap,
 ) -> Vec<(f32, usize, usize)> {
     let ref_patch = extract_patch(img, width, height, ref_row, ref_col);
+    let pp = (PATCH * PATCH) as f32;
 
     let row_min = ref_row.saturating_sub(SEARCH);
     let row_max = (ref_row + SEARCH).min(height.saturating_sub(PATCH));
     let col_min = ref_col.saturating_sub(SEARCH);
     let col_max = (ref_col + SEARCH).min(width.saturating_sub(PATCH));
 
-    let mut candidates: Vec<(f32, usize, usize)> = Vec::new();
+    heap.clear();
     for r in row_min..=row_max {
         for c in col_min..=col_max {
-            let p = extract_patch(img, width, height, r, c);
-            let dist = patch_distance(&ref_patch, &p);
-            candidates.push((dist, r, c));
+            // Unnormalized threshold: dist = s/pp, and ×pp is exact (power of 2),
+            // so `s > thr_s` ⇔ the final dist cannot beat the current k-th best.
+            let thr_s = if heap.len() == max_group {
+                f32::from_bits(heap.peek().expect("heap full").0) * pp
+            } else {
+                f32::INFINITY
+            };
+            let mut s = 0f32;
+            let mut skip = false;
+            for pr in 0..PATCH {
+                let base = (r + pr) * width + c;
+                let row = &img[base..base + PATCH];
+                let rref = &ref_patch[pr * PATCH..(pr + 1) * PATCH];
+                for i in 0..PATCH {
+                    let d = rref[i] - row[i];
+                    s += d * d;
+                }
+                if s > thr_s {
+                    skip = true;
+                    break;
+                }
+            }
+            if skip {
+                continue;
+            }
+            let key = ((s / pp).to_bits(), r, c);
+            if heap.len() < max_group {
+                heap.push(key);
+            } else if key < *heap.peek().expect("heap full") {
+                heap.pop();
+                heap.push(key);
+            }
         }
     }
 
+    let mut matches: Vec<(f32, usize, usize)> = heap
+        .drain()
+        .map(|(bits, r, c)| (f32::from_bits(bits), r, c))
+        .collect();
     // Deterministic sort: tie-break by (row, col) position
-    candidates.sort_unstable_by(|a, b| {
+    matches.sort_unstable_by(|a, b| {
         let da = a.0.to_bits();
         let db = b.0.to_bits();
         da.cmp(&db).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2))
     });
-
-    candidates.truncate(max_group);
-    candidates
+    matches
 }
 
 // ─── Stage 1: Hard thresholding ──────────────────────────────────────────────
@@ -392,8 +440,9 @@ fn stage1_ref_patch(
     kaiser: &[f32; PATCH * PATCH],
     num: &mut [f32],
     den: &mut [f32],
+    heap: &mut MatchHeap,
 ) {
-    let matches = block_match(img, width, height, ref_row, ref_col, GROUP1);
+    let matches = block_match(img, width, height, ref_row, ref_col, GROUP1, heap);
     let n_patches = matches.len().max(1);
     let pp = PATCH * PATCH;
 
@@ -457,8 +506,9 @@ fn stage2_ref_patch(
     kaiser: &[f32; PATCH * PATCH],
     num: &mut [f32],
     den: &mut [f32],
+    heap: &mut MatchHeap,
 ) {
-    let matches = block_match(img, width, height, ref_row, ref_col, GROUP2);
+    let matches = block_match(img, width, height, ref_row, ref_col, GROUP2, heap);
     let n_patches = matches.len().max(1);
     let pp = PATCH * PATCH;
 
@@ -528,11 +578,14 @@ fn bm3d_stage1(
     let epsilon = 1e-12f32;
     let mut num: Vec<f32> = img.iter().map(|&v| v * epsilon).collect();
     let mut den = vec![epsilon; n];
+    let mut heap = MatchHeap::with_capacity(GROUP2);
     let mut r = 0;
     while r < height {
         let mut c = 0;
         while c < width {
-            stage1_ref_patch(img, width, height, r, c, sigma, kaiser, &mut num, &mut den);
+            stage1_ref_patch(
+                img, width, height, r, c, sigma, kaiser, &mut num, &mut den, &mut heap,
+            );
             c += REF_STEP;
         }
         r += REF_STEP;
@@ -553,11 +606,14 @@ fn bm3d_stage2(
     let epsilon = 1e-12f32;
     let mut num: Vec<f32> = img.iter().map(|&v| v * epsilon).collect();
     let mut den = vec![epsilon; n];
+    let mut heap = MatchHeap::with_capacity(GROUP2);
     let mut r = 0;
     while r < height {
         let mut c = 0;
         while c < width {
-            stage2_ref_patch(img, stage1, width, height, r, c, sigma, kaiser, &mut num, &mut den);
+            stage2_ref_patch(
+                img, stage1, width, height, r, c, sigma, kaiser, &mut num, &mut den, &mut heap,
+            );
             c += REF_STEP;
         }
         r += REF_STEP;
@@ -695,6 +751,60 @@ mod tests {
         assert_eq!(mirror(-2, 10), 1);
         assert_eq!(mirror(10, 10), 9);
         assert_eq!(mirror(11, 10), 8);
+    }
+
+    /// The heap top-k + row-wise early-exit block matcher must reproduce the
+    /// original extract-all + sort_unstable + truncate selection EXACTLY
+    /// (same dist bits, same (row, col) order) — including an overhanging
+    /// reference patch at the image edge.
+    #[test]
+    fn block_match_equals_bruteforce_sort() {
+        let (w, h) = (48usize, 40usize);
+        let mut s = 123u32;
+        let img: Vec<f32> = (0..w * h)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                s as f32 / u32::MAX as f32
+            })
+            .collect();
+        let mut heap = MatchHeap::with_capacity(GROUP2);
+        for &(rr, rc) in &[(0usize, 0usize), (5, 7), (39, 47), (20, 20)] {
+            let got = block_match(&img, w, h, rr, rc, GROUP1, &mut heap);
+
+            // Brute force: the pre-change algorithm, verbatim accumulation order.
+            let ref_patch = extract_patch(&img, w, h, rr, rc);
+            let row_min = rr.saturating_sub(SEARCH);
+            let row_max = (rr + SEARCH).min(h - PATCH);
+            let col_min = rc.saturating_sub(SEARCH);
+            let col_max = (rc + SEARCH).min(w - PATCH);
+            let mut cand: Vec<(f32, usize, usize)> = Vec::new();
+            for r in row_min..=row_max {
+                for c in col_min..=col_max {
+                    let p = extract_patch(&img, w, h, r, c);
+                    let mut ss = 0f32;
+                    for i in 0..PATCH * PATCH {
+                        let d = ref_patch[i] - p[i];
+                        ss += d * d;
+                    }
+                    cand.push((ss / (PATCH * PATCH) as f32, r, c));
+                }
+            }
+            cand.sort_unstable_by(|a, b| {
+                a.0.to_bits()
+                    .cmp(&b.0.to_bits())
+                    .then(a.1.cmp(&b.1))
+                    .then(a.2.cmp(&b.2))
+            });
+            cand.truncate(GROUP1);
+
+            assert_eq!(got.len(), cand.len(), "ref ({rr},{rc})");
+            for (g, want) in got.iter().zip(cand.iter()) {
+                assert_eq!(g.0.to_bits(), want.0.to_bits(), "ref ({rr},{rc})");
+                assert_eq!((g.1, g.2), (want.1, want.2), "ref ({rr},{rc})");
+            }
+        }
     }
 
     #[test]

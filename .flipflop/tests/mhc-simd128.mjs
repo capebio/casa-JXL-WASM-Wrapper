@@ -16,7 +16,7 @@
 //
 // ── How to run (Node WASM half) ──
 //   1. Build the bench pkg WITH the SIMD kernel wired AND the bench exports present:
-//        wasm-pack build --target nodejs --out-dir pkg --release --features mhc-simd128
+//        wasm-pack build --target nodejs --out-dir pkg --release -- --features mhc-simd128,bench-exports
 //      (The bench exports demtone_bench_mhc_scalar / _simd128 / _equal exist on every build;
 //       `--features mhc-simd128` additionally wires the kernel into the production dispatch.)
 //   2. node --expose-gc .flipflop/flipflop.mjs .flipflop/tests/mhc-simd128.mjs --print
@@ -59,7 +59,7 @@ async function ensureWasm() {
   if (!existsSync(PKG) || !existsSync(WASM)) {
     throw new Error(
       `mhc-simd128: built pkg not found at ${PKG}. Build it first:\n` +
-      `  wasm-pack build --target nodejs --out-dir pkg --release --features mhc-simd128`
+      `  wasm-pack build --target nodejs --out-dir pkg --release -- --features mhc-simd128,bench-exports`
     );
   }
   const mod = await import(PKG);

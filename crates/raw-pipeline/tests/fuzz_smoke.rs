@@ -15,7 +15,7 @@
 //! modules); they compile out of the default no-libjxl run and light up under
 //! `cargo test --features jxl-codec`.
 
-use raw_pipeline::{cr2, decompress, dng, ljpeg, tiff};
+use raw_pipeline::{cr2, decompress, dng, ljpeg, panasonic, tiff};
 use std::path::PathBuf;
 
 // ── corpus + mutation engine ──────────────────────────────────────────────────
@@ -122,6 +122,14 @@ fn run_ljpeg(data: &[u8]) {
     let _ = ljpeg::decode_tile_compact(data, &mut out, w, h);
 }
 
+fn run_rw2(data: &[u8]) {
+    let _ = panasonic::decode_rw2(data);
+}
+
+fn run_nef(data: &[u8]) {
+    let _ = panasonic::decode_nef(data);
+}
+
 fn run_decompress(data: &[u8]) {
     if data.len() < 4 {
         return;
@@ -167,6 +175,20 @@ fn fuzz_smoke_ljpeg_decode() {
 fn fuzz_smoke_decompress() {
     for c in corpus_cases("decompress") {
         run_decompress(&c);
+    }
+}
+
+#[test]
+fn fuzz_smoke_rw2_decode() {
+    for c in corpus_cases("rw2_decode") {
+        run_rw2(&c);
+    }
+}
+
+#[test]
+fn fuzz_smoke_nef_decode() {
+    for c in corpus_cases("nef_decode") {
+        run_nef(&c);
     }
 }
 
