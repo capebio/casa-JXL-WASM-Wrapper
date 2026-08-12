@@ -1890,3 +1890,98 @@ Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tric
   Huffman opts as an upstream PR — no fork to maintain. The reusable A/B bench harness
   (`benchmark/run-jxl-ab-flipflop.mjs` + `crates/raw-pipeline/examples/jxl_encdec_ab.rs`) is already
   on main; only the dead-end fork submodule + fork-specific probes are unique to the archived branch.
+
+## Amalgamated lens sweep — rejected during verification (2026-08-08)
+
+- **Lightbox CPU filter loop: fold shadows/highlights into the color matrix as affine rank-1 updates
+  (web/lightbox/filter-engine.js).** The proposed fold is mathematically wrong for this code.
+  filter-engine.js:150-162 computes luma l ONCE from the matrix output and applies BOTH the shadow
+  lift and the highlight compress from that same pre-lift luma (parallel updates:
+  v'' = (I + (hi−sh)·𝟙Lᵀ)v + sh·𝟙), but the finding prescribes sequential composition
+  M' = (I + hi·𝟙Lᵀ)(I − sh·𝟙Lᵀ)M, which introduces a hi·sh·𝟙Lᵀ cross-term (𝟙Lᵀ𝟙Lᵀ = 𝟙Lᵀ since
+  Lᵀ𝟙 = 1). Whenever both sliders are active the outputs diverge far beyond the claimed ≤1-LSB FP
+  tolerance: at sh=0.5, hi=−0.5, a grey pixel v=0.8 gives 0.5 today vs 0.45 folded — a 13-LSB
+  error, up to ~64 LSB at slider extremes. The repo's parity tests
+  (web/lightbox/tone-math.parity.test.js) would not cover this at a 1-LSB tolerance. The secondary
+  claim is also off: `|0` on a Uint8ClampedArray is not redundant — it floors where clamped
+  assignment rounds, so removing it is a behavior change, not a cleanup. A correct parallel-form
+  fold exists, but the finding as specified would silently change visible output; unsound as written.
+
+- **"BUG: PerceptualGrid ignores sat/vib — saturation/vibrance sliders dead in Perceptual Constancy
+  Mode on WASM" (crates/raw-pipeline/src/pipeline.rs).** Code-level facts check out (grid built once
+  with scale=1.0 at pipeline.rs:701, sat/vib unused in the !c-perceptual pc branch at 1694-1710, no
+  rebuild exists despite the comment) — but the claimed production impact is unreachable, killing
+  the benefit. params.perceptual_constancy is never set true anywhere except the flip-flop test
+  harness (pipeline.rs:4337); PipelineParams defaults it false (pipeline.rs:423); the WASM JS API
+  cannot enable it — LookOverrides (src/lib.rs:1279-1294) has no pc field, no binding key exists,
+  and every PipelineParams construction goes through default_olympus() + apply_look_to_params. The
+  JS lightbox "Perceptual Constancy Mode" surface (constancyParams in
+  jxl-progressive-gallery-lightbox.js) is an unwired stub — jxl-progressive-gallery-frame.js:52-53
+  says "constancy active – future in-place or view transform" and applies nothing. So there are no
+  dead sliders in shipped WASM and no shipped cross-target divergence; the proposed sat-keyed
+  rebuild cache + per-pixel fallback is medium-effort machinery serving a dormant path. Also,
+  rejected-doc PR-2 routes PerceptualGrid/LUT work to the open ToneSimd-LUT plan
+  (docs/superpowers/plans/2026-06-16-tone-simd-lut-gather-jsWasm.md), "not opportunistically". The
+  latent comment-vs-code inconsistency is worth a one-line tracking note for when pc gets wired to
+  JS — not this fix now.
+
+- **"Sub-ms LUT phase: hoist the OnceLock deref out of the pixel loop, const-size the grid,
+  precompute the 8 trilinear weights" (crates/raw-pipeline/src/pipeline.rs).** Three independent
+  grounds. (1) Unreachable benefit: the pc hot loop this optimizes (apply_tone_math's
+  PERCEPTUAL_GRID branch, pipeline.rs:1703) only executes when perceptual_constancy=true, which
+  nothing sets outside the flip-flop harness (pipeline.rs:4337) and which the WASM/JS surface cannot
+  enable (no pc field in LookOverrides, no binding key) — the per-pixel atomic load / runtime index
+  math / redundant lerps are currently paid by nobody in production. (2) Rejected-doc conflict:
+  PR-2 in docs/"1 rejected optimizations.md" (line 628) explicitly defers perceptual-LUT
+  optimization to the open ToneSimd-LUT plan (2026-06-16-tone-simd-lut-gather-jsWasm.md Task 2/3)
+  "with the planned benchmarks, not opportunistically". (3) Technical overclaim: the finding
+  asserts all three restructurings are "output-identical (same arithmetic values)" — false for
+  item 3: replacing the nested trilinear lerp with precomputed 8-corner weights and an 8-term dot
+  product changes f32 rounding/association and is NOT bit-identical. Items 1-2 (hoist deref,
+  const SZ) are genuinely output-identical and mechanically sound — worth folding into the planned
+  ToneSimd-LUT task if/when pc is ever wired, not as a standalone finding.
+
+- **"BLTV playback is forward-only; backward step/reverse play costs O(GOP) re-decode per frame"
+  (web/bltv-worker.js).** The player (web/bltv-player.html) has no frame-back or reverse-play
+  control at all — only play/pause/rewind-to-0/scrub — so the O(GOP)/O(GOP²) cost describes an
+  operation no code performs. This is a new feature with zero consumers, the exact class this log
+  kills repeatedly (FS-R4 "dead code, no caller"; G5-L1 "no current consumer... speculative API").
+  Technically feasible (seek exists in src/bltv_wasm.rs), but there is no demand surface; benefit
+  is speculative.
+
+- **"AI-ID proxy prefers the live lightbox buffer, which carries the user's creative edits"
+  (web/ai-id/browser-adapter.js).** The control already exists: makeBrowserSources takes liveRgba
+  as an optional param (opts.liveRgba ?? null, browser-adapter.js L46) — the caller, who owns
+  edit-state knowledge, simply omits liveRgba for edited assets; a liveIsFaithful boolean adds
+  nothing. Moreover the chain has zero production callers (grep: only browser-adapter.test.mjs
+  imports it), so nothing "degrades silently" today, and the accuracy-degradation premise is
+  unmeasured speculation — the spec's own bake-off found ID robust to q50–q95 and 4:2:0
+  perturbations.
+
+- **"frame_stats has no sharpness lane, so best-frame selection (lucky imaging) is impossible"
+  (crates/raw-pipeline/src/frame_stats.rs).** Dies on the repo's own FS-R4 precedent and on
+  internal inconsistency. Grep confirms native frame_stats::analyze has zero production callers
+  (examples + perceptual/telemetry only; FS-R4 documents the same audit and rejects adding
+  native-only surface as "dead code, no caller"). The finding's named consumers — timelapse triage
+  (web/timelapse.js) and the AI-ID chain — are JS and can only reach the WASM frame_stats kernel,
+  which the finding itself declares frozen (FS-D1 byte contract). The native-only sharpness value
+  would be computed for nobody.
+
+- **"Batch export develops each asset with its own edits — photogrammetry capture sets need one
+  locked look" (web/export-service.js).** Factual premise is accurate (ExportService sources each
+  asset's own developed output; raw_video.rs FixedLook rationale exists verbatim), but the feature
+  serves a use case with no presence anywhere in the product: no photogrammetry workflow, spec,
+  roadmap item, or user demand exists in the repo (grep hits are only lens-taxonomy comments and
+  unrelated docs). Per-asset edits in a stills batch export are the user's intent, not a defect;
+  FixedLook addresses video flicker, a different problem. Speculative feature without a consumer —
+  default-reject applies.
+
+- **"16-bit source pixels exist end-to-end but export flattens to 8-bit; add a 16-bit PNG arm"
+  (web/export-service.js).** Two independent kills. (1) Deliberate recorded deferral, not an
+  oversight: web/png-encode.js states verbatim "8-bit only (the app's developed output is 8-bit
+  RGB/RGBA); 16-bit PNG export is packet-3 scope", tied to the roadmap's packet-3 RGBA16/float
+  decode ABI (2026-07-11-opportunity-04 plan). (2) The proposed mechanism mismatches the actual
+  data flow: ExportService sources the developed full-res JXL and decodes it to 8-bit pixels
+  (decodeFullRes, format "rgba8") — the OUT_FULL_16 buffer is not in the export path, so this is
+  not "a 16-bit PNG arm in the PNG encoder" but a new 16-bit develop/export pipeline through
+  worker messaging, i.e., exactly the deferred packet-3 work with its effort understated.
