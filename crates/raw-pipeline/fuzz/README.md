@@ -7,7 +7,7 @@ converts from hand-found to machine-found.
 
 ## Targets
 
-Nine targets cover all byte parsers:
+Eleven targets cover all byte parsers:
 
 | Target | Parser | Feature gate |
 |--------|--------|--------------|
@@ -16,6 +16,8 @@ Nine targets cover all byte parsers:
 | `dng_decode` | DNG/TIFF IFD + tile/strip parser (`dng::decode_bytes`) | none (pure Rust) |
 | `ljpeg_decode` | Lossless-JPEG marker + entropy decoder (`ljpeg`) | none (pure Rust) |
 | `decompress` | Olympus ORF Huffman/bit-reader (`decompress::decompress`) | none (pure Rust) |
+| `rw2_decode` | Panasonic RW2/Leica RWL DPCM (`panasonic::decode_rw2`) | none (pure Rust) |
+| `nef_decode` | Nikon NEF/NRW layouts + 34713 Huffman (`panasonic::decode_nef`) | none (pure Rust) |
 | `casv_header` | CASV container header (`casa_video::parse_casv_header`) | `codec` |
 | `casv_footer` | CASV frame-index trailer (`casa_video::parse_casv_footer`) | `codec` |
 | `casv_audio_box` | CSAU audio box (`casa_video::parse_casv_audio_box`) | `codec` |
@@ -38,14 +40,14 @@ stays libjxl-free in CI.
 ```sh
 cd crates/raw-pipeline
 
-# Build the five pure-Rust parser targets (no libjxl needed):
+# Build the seven pure-Rust parser targets (no libjxl needed):
 cargo +nightly fuzz build
 
 # Quick smoke (60 s) to confirm the harness compiles and starts:
 cargo +nightly fuzz run tiff_parse -- -max_total_time=60
 
 # 1-hour campaign on all pure-Rust targets (parallelized, 4 libFuzzer jobs each):
-for t in tiff_parse cr2_decode dng_decode ljpeg_decode decompress; do
+for t in tiff_parse cr2_decode dng_decode ljpeg_decode decompress rw2_decode nef_decode; do
   cargo +nightly fuzz run "$t" -- -max_total_time=3600 -jobs=4
 done
 

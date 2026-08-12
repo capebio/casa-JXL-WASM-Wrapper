@@ -299,7 +299,7 @@ jobs:
       # fuzzing campaign — see D3 for where long runs should live.
       - name: 20s smoke per target
         run: |
-          for t in tiff_parse cr2_decode dng_decode ljpeg_decode decompress; do
+          for t in tiff_parse cr2_decode dng_decode ljpeg_decode decompress rw2_decode nef_decode; do
             cargo +nightly fuzz run "$t" -- -max_total_time=20 -runs=200000
           done
 
@@ -321,7 +321,7 @@ jobs:
   # (GitHub Actions caps free-tier hosted runners at 6 h; the -max_total_time value
   # is intentionally larger so self-hosted / larger runners can exploit it fully).
   #
-  # Coverage: the five pure-Rust parser targets that build without libjxl.
+  # Coverage: the seven pure-Rust parser targets that build without libjxl.
   # TODO (Packet 5 Task 4 / --features codec): casv_header, casv_footer,
   #   casv_audio_box, and jxtc_header are currently no-op stubs — they are
   #   listed in the matrix but will not exercise real codec paths until
@@ -342,6 +342,8 @@ jobs:
           - dng_decode
           - ljpeg_decode
           - decompress
+          - rw2_decode
+          - nef_decode
           - casv_header
           - casv_footer
           - casv_audio_box

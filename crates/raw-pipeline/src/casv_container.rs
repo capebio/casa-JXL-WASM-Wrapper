@@ -346,6 +346,11 @@ pub fn write_container_v2(
 /// `entries` is `(flags, len)` per frame (`flags` = `CASV_PFRAME_FLAG` etc.); `header_flags`
 /// carries e.g. `CASV_HDR_FABLE_FLAG`; `write_data` appends the concatenated payloads in one
 /// pass (`total_data_len` sizes the single allocation).
+///
+/// **Panics** when a frame exceeds the v1 256 MiB len cap or the container the 4 GiB
+/// offset cap: past either, the packed `len | flags` / `u32 offset` index silently
+/// corrupts (flag nibble mislabeled, offsets wrapped) and the loss surfaces only at
+/// playback. Callers with frames that big must use [`write_container_v2`].
 pub fn write_container_v1(
     width: u32,
     height: u32,
@@ -369,12 +374,21 @@ pub fn write_container_v1(
     out.extend_from_slice(&fps_den.to_le_bytes());
     out.extend_from_slice(&header_flags.to_le_bytes());
     // Packed 8-byte index: absolute offset + (len with the flag nibble OR'd into the top).
-    let mut offset = data_start;
+    // Offset accumulates in u64 so the 4 GiB check below cannot itself wrap on 32-bit.
+    let mut offset = data_start as u64;
     for &(flags, len) in entries {
+        assert!(
+            len & CASV_V1_FLAG_BITS == 0,
+            "v1 frame len {len} exceeds the 256 MiB cap — use write_container_v2"
+        );
         out.extend_from_slice(&(offset as u32).to_le_bytes());
         out.extend_from_slice(&(len | flags).to_le_bytes());
-        offset += len as usize;
+        offset += len as u64;
     }
+    assert!(
+        offset <= u32::MAX as u64,
+        "v1 container exceeds the 4 GiB offset cap — use write_container_v2"
+    );
     write_data(&mut out);
     out
 }
@@ -533,6 +547,25 @@ mod tests {
         let len = u32::from_le_bytes(e[8..12].try_into().unwrap());
         assert!(off > u32::MAX as u64);
         assert!(len > (1 << 28)); // exceeds the v1 28-bit len field
+    }
+
+    /// A len with the flag nibble set (≥ 2^28) would mislabel the frame type and
+    /// corrupt the stored length — must die loudly at write time, not at playback.
+    #[test]
+    #[should_panic(expected = "256 MiB")]
+    fn v1_len_over_cap_panics() {
+        let entries = [(0u32, CASV_V1_FLAG_BITS)];
+        write_container_v1(1, 1, 1, 30, 1, 0, &entries, 0, |_| {});
+    }
+
+    /// 17 × (256 MiB − 1) frames push the cumulative offset past u32::MAX without
+    /// allocating any payload (write_data is a no-op — only the index math runs).
+    #[test]
+    #[should_panic(expected = "4 GiB")]
+    fn v1_offset_over_cap_panics() {
+        let len = (1u32 << 28) - 1;
+        let entries = [(0u32, len); 17];
+        write_container_v1(1, 1, 17, 30, 1, 0, &entries, 0, |_| {});
     }
 
     #[test]

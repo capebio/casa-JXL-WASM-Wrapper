@@ -270,6 +270,24 @@ fn tag_str(m: &HashMap<u16, Entry>, t: u16) -> String {
         .unwrap_or_default()
 }
 
+/// Hostile-dimension guard, same policy as the CR2/DNG readers (200 MP cap,
+/// checked multiply): these dims come straight from file tags and size both
+/// allocations and decode loops, so reject zero, implausible (> 65535 per
+/// axis) and over-cap values before touching either. On wasm32 `w * h` is a
+/// 32-bit multiply — unchecked it wraps and the undersized vec panics later.
+fn check_dims(w: usize, h: usize, what: &str) -> Result<usize, String> {
+    if w == 0 || h == 0 || w > 65535 || h > 65535 {
+        return Err(format!("{what}: implausible dimensions {w}x{h}"));
+    }
+    let px = w
+        .checked_mul(h)
+        .ok_or_else(|| format!("{what}: {w}x{h} pixel count overflows"))?;
+    if px > 200_000_000 {
+        return Err(format!("{what}: {w}x{h} exceeds the 200 MP cap"));
+    }
+    Ok(px)
+}
+
 // ---- Panasonic RW2 / Leica RWL ---------------------------------------------
 
 /// Panasonic's CFA enum (tag 0x0009) to a red-pixel phase.
@@ -374,6 +392,13 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     let wb_g = tag_u32(&t, 0x0025).unwrap_or(256) as f32 / 256.0;
     let wb_b = tag_u32(&t, 0x0026).unwrap_or(256) as f32 / 256.0;
 
+    check_dims(sensor_w, sensor_h, "RW2 sensor")?;
+    check_dims(img_w, img_h, "RW2 image")?;
+    if left >= sensor_w || top >= sensor_h {
+        return Err(format!(
+            "RW2: crop origin ({left},{top}) outside sensor {sensor_w}x{sensor_h}"
+        ));
+    }
     if bits != 12 {
         return Err(format!("RW2: {}-bit is not supported (only 12)", bits));
     }
@@ -707,6 +732,11 @@ fn nikon_compressed(
             p += 2;
         }
     }
+    // A zero curve-size in the `csize <= 0x4001` branch leaves max == 0, and
+    // `curve[max - 1]` below would underflow-panic on that crafted input.
+    if max == 0 {
+        return Err("NEF: empty linearisation curve".into());
+    }
     while max > 2 && curve[max - 2] == curve[max - 1] {
         max -= 1;
     }
@@ -780,20 +810,21 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         offs.push(e.u32(&sub.val) as usize);
     }
 
-    // Take the SubIFD with the most pixels: the others are previews.
+    // Take the SubIFD with the most pixels: the others are previews. Area in
+    // u64: these are unchecked file tags, and a 32-bit product can wrap.
     //
     // **It must also carry a strip offset.** The D80 has a larger SubIFD with no
     // 273 at all, so choosing purely on pixel count picked a directory that
     // describes no data and failed with "SubIFD has no strip offset" — a
     // confusing way to say "wrong SubIFD".
-    let mut best: Option<(usize, HashMap<u16, Entry>)> = None;
+    let mut best: Option<(u64, HashMap<u16, Entry>)> = None;
     for so in offs {
         if let Ok((st, _)) = read_ifd(d, so, e) {
             if tag_u32(&st, 273).is_none() {
                 continue;
             }
-            let w = tag_u32(&st, 256).unwrap_or(0) as usize;
-            let h = tag_u32(&st, 257).unwrap_or(0) as usize;
+            let w = tag_u32(&st, 256).unwrap_or(0) as u64;
+            let h = tag_u32(&st, 257).unwrap_or(0) as u64;
             if w * h > best.as_ref().map_or(0, |(n, _)| *n) {
                 best = Some((w * h, st));
             }
@@ -808,7 +839,21 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     let off = tag_u32(&st, 273).ok_or("NEF: SubIFD has no strip offset")? as usize;
     let len = tag_u32(&st, 279).unwrap_or(0) as usize;
 
+    check_dims(w, h, "NEF")?;
     if comp == 34713 {
+        // dcraw's trees exist only for 12/14 bits; anything else would shift
+        // out of range building `max` below.
+        if bits != 12 && bits != 14 {
+            return Err(format!(
+                "NEF: compressed with {bits} bits is not supported (only 12/14)"
+            ));
+        }
+        // The strip must be declared and lie inside the file — the bit reader
+        // zero-pads past EOF, so without this a crafted header decodes w*h
+        // symbols out of nothing.
+        if len == 0 || off.checked_add(len).map_or(true, |end| end > d.len()) {
+            return Err("NEF: compressed strip length out of range".into());
+        }
         return nikon_compressed(d, &ifd0, w, h, bits, off, len, e);
     }
     if comp != 1 {
@@ -879,7 +924,9 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         // error and was noise — mean |dx| 5607 against a 1365 threshold. The
         // noise check is the only thing that caught it, which is the argument
         // for having one.
-        if off + unpacked > d.len() {
+        //
+        // checked_add: on wasm32 `off + len` can wrap 32-bit usize and pass.
+        if off.checked_add(unpacked).map_or(true, |end| end > d.len()) {
             return Err("NEF: strip runs past end of file".into());
         }
         d[off..off + unpacked].chunks_exact(2).map(|c| e.u16(c)).collect()
@@ -890,7 +937,7 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         }
         unpack_msb(&d[off..off + packed], bits, w * h)
     } else if len == packed {
-        if off + packed > d.len() {
+        if off.checked_add(packed).map_or(true, |end| end > d.len()) {
             return Err("NEF: strip runs past end of file".into());
         }
         let src = &d[off..off + packed];
@@ -1183,5 +1230,111 @@ mod tests {
     fn rw2_refuses_a_non_rw2() {
         assert!(decode_rw2(b"II\x2a\x00\x08\x00\x00\x00").is_err());
         assert!(decode_rw2(b"MM\x00\x55\x00\x00\x00\x08").is_err());
+    }
+
+    /// Minimal little-endian TIFF: header (`ver`), one IFD at 8 of inline
+    /// SHORT/LONG entries, next-IFD = 0.
+    fn tiny_tiff(ver: u16, entries: &[(u16, u16, u32, u32)]) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(b"II");
+        d.extend_from_slice(&ver.to_le_bytes());
+        d.extend_from_slice(&8u32.to_le_bytes());
+        d.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for &(tag, typ, count, val) in entries {
+            d.extend_from_slice(&tag.to_le_bytes());
+            d.extend_from_slice(&typ.to_le_bytes());
+            d.extend_from_slice(&count.to_le_bytes());
+            d.extend_from_slice(&val.to_le_bytes());
+        }
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d
+    }
+
+    /// Hostile dims must come back as a clean error before any allocation —
+    /// 65535x65535 wraps a wasm32 `w * h` and asks for gigabytes on native.
+    #[test]
+    fn rw2_refuses_hostile_dims() {
+        let d = tiny_tiff(
+            85,
+            &[
+                (0x0002, 3, 1, 0xFFFF), // SensorWidth
+                (0x0003, 3, 1, 0xFFFF), // SensorHeight
+                (0x000a, 3, 1, 12),     // bits
+                (0x002d, 3, 1, 4),      // RawFormat
+                (0x0118, 4, 1, 8),      // raw offset
+            ],
+        );
+        let e = decode_rw2(&d).unwrap_err();
+        assert!(e.contains("200 MP"), "want the cap error, got: {e}");
+        // Zero is just as dead.
+        let z = tiny_tiff(
+            85,
+            &[
+                (0x0002, 3, 1, 0),
+                (0x0003, 3, 1, 100),
+                (0x000a, 3, 1, 12),
+                (0x002d, 3, 1, 4),
+                (0x0118, 4, 1, 8),
+            ],
+        );
+        assert!(decode_rw2(&z).is_err());
+    }
+
+    /// A crop origin outside the sensor previously underflowed
+    /// `sensor_w - left` and panicked.
+    #[test]
+    fn rw2_refuses_crop_origin_outside_sensor() {
+        let d = tiny_tiff(
+            85,
+            &[
+                (0x0002, 3, 1, 16),
+                (0x0003, 3, 1, 16),
+                (0x0005, 3, 1, 100), // CropLeft > SensorWidth
+                (0x000a, 3, 1, 12),
+                (0x002d, 3, 1, 4),
+                (0x0118, 4, 1, 8),
+            ],
+        );
+        let e = decode_rw2(&d).unwrap_err();
+        assert!(e.contains("crop origin"), "want the crop guard, got: {e}");
+    }
+
+    /// NEF with a SubIFD claiming compressed 60000x60000: without the dims cap
+    /// the zero-padding bit reader would decode 3.6e9 symbols from nothing.
+    #[test]
+    fn nef_refuses_hostile_dims() {
+        // IFD0 at 8: one entry (330 → SubIFD offset), next = 0. SubIFD follows.
+        let sub_off: u32 = 8 + 2 + 12 + 4;
+        let mut d = Vec::new();
+        d.extend_from_slice(b"II");
+        d.extend_from_slice(&42u16.to_le_bytes());
+        d.extend_from_slice(&8u32.to_le_bytes());
+        d.extend_from_slice(&1u16.to_le_bytes());
+        for &(tag, typ, count, val) in &[(330u16, 4u16, 1u32, sub_off)] {
+            d.extend_from_slice(&tag.to_le_bytes());
+            d.extend_from_slice(&typ.to_le_bytes());
+            d.extend_from_slice(&count.to_le_bytes());
+            d.extend_from_slice(&val.to_le_bytes());
+        }
+        d.extend_from_slice(&0u32.to_le_bytes());
+        let sub: &[(u16, u16, u32, u32)] = &[
+            (256, 4, 1, 60000),  // width
+            (257, 4, 1, 60000),  // height
+            (258, 3, 1, 12),     // bits
+            (259, 3, 1, 34713),  // compressed
+            (273, 4, 1, 8),      // strip offset
+            (279, 4, 1, 100),    // strip len
+        ];
+        assert_eq!(d.len() as u32, sub_off);
+        d.extend_from_slice(&(sub.len() as u16).to_le_bytes());
+        for &(tag, typ, count, val) in sub {
+            d.extend_from_slice(&tag.to_le_bytes());
+            d.extend_from_slice(&typ.to_le_bytes());
+            d.extend_from_slice(&count.to_le_bytes());
+            d.extend_from_slice(&val.to_le_bytes());
+        }
+        d.extend_from_slice(&0u32.to_le_bytes());
+        let e = decode_nef(&d).unwrap_err();
+        assert!(e.contains("200 MP"), "want the cap error, got: {e}");
     }
 }
