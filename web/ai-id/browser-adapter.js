@@ -11,20 +11,60 @@
 //   buildSidecarForAsset(input) → casava-ai/1 sidecar with privacy policy applied
 
 import { liveBufferSource, pyramidLevelSource, masterDecodeSource, rawDecodeSource } from "./sources.mjs";
+import { findJpegStreams, pickLargestViewable } from "./jpeg-streams.mjs";
 import { buildSidecar } from "./sidecar.mjs";
+
+// ── embeddedPreviewSource (browser) ──────────────────────────────────────────
+//
+// Browser twin of node-adapter.mjs embeddedPreviewSource. The old "requires
+// node:fs + sharp" premise doesn't hold in the browser: the RAW bytes are
+// already in memory (File API / OPFS) and the browser decodes JPEG natively
+// (createImageBitmap). The pure stream scanner is shared via jpeg-streams.mjs.
+//
+// `getRawBytes()` → Uint8Array|null (the whole RAW container bytes);
+// `decodeJpegBytes(bytes)` → {data, width, height} RGBA (browser: see
+// browserDecodeJpeg below; tests: stub). Rejects previews below `minEdge`
+// long-edge (default 768 px — the bake-off floor for reliable ID).
+export function embeddedPreviewSource(getRawBytes, decodeJpegBytes, { minEdge = 768 } = {}) {
+  return {
+    label: "embedded-preview",
+    get: async () => {
+      if (typeof getRawBytes !== "function" || typeof decodeJpegBytes !== "function") return null;
+      const buf = await getRawBytes();
+      if (!buf) return null;
+      const best = pickLargestViewable(findJpegStreams(buf), minEdge);
+      if (!best) return null;
+      const d = await decodeJpegBytes(buf.subarray(best.start, best.end));
+      return { rgba: d.data, w: d.width, h: d.height };
+    },
+  };
+}
+
+/** Browser-native JPEG decode: bytes → RGBA via createImageBitmap + OffscreenCanvas. */
+export async function browserDecodeJpeg(bytes) {
+  const bmp = await createImageBitmap(new Blob([bytes], { type: "image/jpeg" }));
+  try {
+    const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(bmp, 0, 0);
+    const img = ctx.getImageData(0, 0, bmp.width, bmp.height);
+    return { data: img.data, width: img.width, height: img.height };
+  } finally {
+    bmp.close();
+  }
+}
 
 // ── makeBrowserSources ───────────────────────────────────────────────────────
 //
 // Source fallback ORDER (finding 16):
-//   1. live-buffer  — already-decoded pixels in the gallery lightbox
-//   2. pyramid      — JXL pyramid 1024-px level (OPFS / derived cache)
-//   3. master       — sibling .jxl archival master (OPFS / fetch)
-//   4. raw          — full RAW re-decode via WASM (last resort)
+//   1. live-buffer       — already-decoded pixels in the gallery lightbox
+//   2. pyramid           — JXL pyramid 1024-px level (OPFS / derived cache)
+//   3. embedded-preview  — camera's own JPEG inside the RAW bytes (≥768 px)
+//   4. master            — sibling .jxl archival master (OPFS / fetch)
+//   5. raw               — RAW re-decode via WASM (last resort)
 //
-// Note: the browser chain deliberately omits "embedded-preview" (which requires
-// node:fs + sharp to parse the binary RAW container from disk). In the browser
-// the same role is covered by the pyramid level, which is the browser-native
-// low-res source derived at ingest time.
+// The embedded-preview source engages only when getRawBytes/decodeJpegBytes
+// are injected (it yields null otherwise), so existing callers are unchanged.
 
 /**
  * Build the browser AI-ID source chain for one asset.
@@ -38,6 +78,9 @@ import { buildSidecar } from "./sidecar.mjs";
  *   decodeRaw: (path: string) => Promise<{rgb: Uint8Array, width: number, height: number}>,
  *   rgbToRgba: (rgb: Uint8Array) => Uint8Array,
  *   assetPath: string,
+ *   getRawBytes?: () => Promise<Uint8Array|null>,
+ *   decodeJpegBytes?: (bytes: Uint8Array) => Promise<{data: Uint8Array, width: number, height: number}>,
+ *   minEdge?: number,
  * }} opts
  * @returns {Array<{ label: string, get: () => Promise<{rgba: Uint8Array, w: number, h: number}|null> }>}
  */
@@ -45,6 +88,7 @@ export function makeBrowserSources(opts) {
   return [
     liveBufferSource(opts.liveRgba ?? null, opts.liveW ?? 0, opts.liveH ?? 0),
     pyramidLevelSource(opts.getJxlPyramidBytes, opts.decodeJxl),
+    embeddedPreviewSource(opts.getRawBytes, opts.decodeJpegBytes, { minEdge: opts.minEdge ?? 768 }),
     masterDecodeSource(opts.getMasterBytes, opts.decodeJxl),
     rawDecodeSource(opts.assetPath, opts.decodeRaw, opts.rgbToRgba),
   ];

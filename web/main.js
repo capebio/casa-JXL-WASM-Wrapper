@@ -233,6 +233,7 @@ const lbZoomOut = lightbox.querySelector('.lb-zoom-out');
 const lbZoomReset = lightbox.querySelector('.lb-zoom-reset');
 const lbDownloadBtn = lightbox.querySelector('.lb-download-btn');
 const lbArchivalBtn = lightbox.querySelector('.lb-archival-btn');
+const lbIdentifyBtn = lightbox.querySelector('.lb-identify-btn');
 const lbPreviewBadge = lightbox.querySelector('.lb-preview-badge');
 const lbLoadingBadge = lightbox.querySelector('.lb-loading-badge');
 const lbToggleJpegBtn = lightbox.querySelector('.lb-toggle-jpeg');
@@ -1336,10 +1337,12 @@ pool.setLiveHandler((msg) => {
             const sW = msg.nativeW ?? msg.w;
             const sH = msg.nativeH ?? msg.h;
             const ori = msg.orientation ?? 1;
-            drawSensorWithOrientation(lightboxCanvas, msg.rgb, sW, sH, ori);
+            // Orientation-1 paints return their ImageData (TTFP-2 pattern) —
+            // skip the per-slider-tick full-canvas readback on that path.
+            const liveFrame = drawSensorWithOrientation(lightboxCanvas, msg.rgb, sW, sH, ori);
             if (lightboxCanvas.width > 0) {
                 const ctx = lightboxCanvas.getContext('2d');
-                captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+                captureCleanAndApplyLens(liveFrame ?? ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
             }
         }
     }
@@ -1664,11 +1667,13 @@ function _initBlissDecodeWorker() {
     if (_blissDecodeWorker) return;
     _blissDecodeWorker = new Worker('./bliss-worker.js', { type: 'module' });
     _blissDecodeWorker.onmessage = (ev) => {
-        const { seq, rgb, w, h } = ev.data;
+        const { seq, rgb, off, w, h } = ev.data;
         const resolve = _blissDecodePending.get(seq);
         if (resolve) {
             _blissDecodePending.delete(seq);
-            resolve(rgb ? { rgb: new Uint8Array(rgb), w, h } : null);
+            // rgb arrives as the worker's whole decode buffer with `off` pointing
+            // past the 8-byte dims header (zero-copy transfer; no slice(8) copy).
+            resolve(rgb ? { rgb: new Uint8Array(rgb, off || 0), w, h } : null);
         }
     };
     _blissDecodeWorker.postMessage({ type: 'preload' });
@@ -1729,10 +1734,9 @@ async function blissOpfsLoad(card, assetId) {
     if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
     if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
     const { rgb, w, h } = result;
-    drawCanvas(lightboxCanvas, w, h, rgb);
-    if (lightboxCanvas.width > 0) {
-        const _ctx = lightboxCanvas.getContext('2d');
-        captureCleanAndApplyLens(_ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+    const blissFrame = drawCanvas(lightboxCanvas, w, h, rgb);
+    if (lightboxCanvas.width > 0 && blissFrame) {
+        captureCleanAndApplyLens(blissFrame);
     }
     setPaintedSourceBadge('bliss');
     lbLoadingBadge.hidden = true;
@@ -2000,7 +2004,14 @@ function drawCanvas(canvas, w, h, rgb) {
     const rgba = (rgb.byteLength === w * h * 4)
         ? (rgb instanceof Uint8ClampedArray ? rgb : new Uint8ClampedArray(rgb.buffer, rgb.byteOffset, rgb.byteLength))
         : rgbToRgba(rgb, w, h);
-    ctx.putImageData(new ImageData(rgba, w, h), 0, 0);
+    const frame = new ImageData(rgba, w, h);
+    ctx.putImageData(frame, 0, 0);
+    // TTFP-2 pattern: return the ImageData just painted so callers that need a
+    // clean snapshot can skip the full-canvas getImageData readback (the put
+    // covers the whole canvas at (0,0) with opaque pixels, so the readback
+    // would be byte-identical). Consumers of cleanSnapshot are read-only or
+    // deep-copy, so aliasing a caller-retained buffer is safe.
+    return frame;
 }
 
 // Draw a sensor-orientation RGB8 buffer into a canvas, applying the EXIF
@@ -2029,8 +2040,12 @@ function drawSensorWithOrientation(canvas, rgb, sw, sh, orientation) {
     if (!ctx) return;
     const rgba = rgbToRgba(rgb, sw, sh);
     if (cw === 0 && !flipX) {
-        ctx.putImageData(new ImageData(rgba, sw, sh), 0, 0);
-        return;
+        // No GPU transform: the painted ImageData IS the canvas content, so
+        // return it (TTFP-2 pattern) — callers can reuse it as the clean
+        // snapshot without a full-canvas getImageData readback.
+        const frame = new ImageData(rgba, sw, sh);
+        ctx.putImageData(frame, 0, 0);
+        return frame;
     }
     const tmp = document.createElement('canvas');
     tmp.width = sw; tmp.height = sh;
@@ -2042,6 +2057,7 @@ function drawSensorWithOrientation(canvas, rgb, sw, sh, orientation) {
     if (flipX) ctx.scale(-1, 1);
     ctx.drawImage(tmp, -sw / 2, -sh / 2, sw, sh);
     ctx.restore();
+    return null; // pixels were composed on the GPU — no ImageData to hand back
 }
 
 // Draw an RGB8 buffer into canvas with an arbitrary CW rotation (0/90/180/270).
@@ -3409,14 +3425,18 @@ function drawLightboxForCard(card) {
     if (hasFullRgb) {
         const lb = getCardState(card)._lightbox;
         // Phase 2: if sensor-orient pixels with EXIF orientation, draw rotated via GPU.
+        // Non-rotated paints return their ImageData (TTFP-2 pattern) so the
+        // clean snapshot skips the full-canvas readback; rotated paints were
+        // composed on the GPU and still need getImageData.
+        let rawFrame = null;
         if (lb.nativeW && lb.orientation && lb.orientation !== 1) {
-            drawSensorWithOrientation(lightboxCanvas, lb.rgb, lb.nativeW, lb.nativeH, lb.orientation);
+            rawFrame = drawSensorWithOrientation(lightboxCanvas, lb.rgb, lb.nativeW, lb.nativeH, lb.orientation);
         } else {
-            drawCanvas(lightboxCanvas, lb.w, lb.h, lb.rgb);
+            rawFrame = drawCanvas(lightboxCanvas, lb.w, lb.h, lb.rgb);
         }
         if (lightboxCanvas.width > 0) {
             const _ctx = lightboxCanvas.getContext('2d');
-            captureCleanAndApplyLens(_ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+            captureCleanAndApplyLens(rawFrame ?? _ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
         }
         setPaintedSourceBadge('raw');
         lbLoadingBadge.hidden = true;
@@ -4491,6 +4511,186 @@ if (lbArchivalBtn) {
     });
 }
 
+// ── AI-ID "Identify" (finding 16 wiring): build the 768px proxy JPEG +
+// casava-ai/1 sidecar for the current lightbox asset and download both.
+// Source chain (browser-adapter): live clean snapshot → embedded JPEG inside
+// the RAW bytes → archival JXL master → preview-tier RAW re-decode
+// (OUT_LIGHTBOX only — the streaming half-res arm, never a full 20 MP
+// develop; the sub-second capture→proxy→identify budget is dominated by
+// this decode). All modules load lazily on first use.
+let _idWasmReady = null;
+
+// decodeJxl(bytes) for the master source: route through the shared
+// jxl-session scheduler via a transient blob URL.
+function _idDecodeJxlBytes(bytes) {
+    return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(new Blob([bytes], { type: 'image/jxl' }));
+        let settled = false;
+        const done = (fn) => (v) => {
+            if (settled) return;
+            settled = true;
+            URL.revokeObjectURL(url);
+            fn(v);
+        };
+        decodeJxlViaSession(url, (msg) => {
+            if (msg.type === 'decode_error') done(reject)(new Error(msg.error));
+            else if (msg.type === 'jxl_decoded') done(resolve)({ data: msg.rgba, width: msg.w, height: msg.h });
+        }, 'high');
+    });
+}
+
+// encodeJpeg for encodeProxyJpeg: OffscreenCanvas → image/jpeg bytes.
+async function _idEncodeJpeg(rgba, w, h, quality) {
+    const clamped = rgba instanceof Uint8ClampedArray
+        ? rgba
+        : new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+    const canvas = new OffscreenCanvas(w, h);
+    const ctx = canvas.getContext('2d');
+    ctx.putImageData(new ImageData(clamped, w, h), 0, 0);
+    const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: quality / 100 });
+    return new Uint8Array(await blob.arrayBuffer());
+}
+
+// downscaleRgba for encodeProxyJpeg (must be sync): single-step canvas resample.
+function _idDownscaleRgba(rgba, w, h, tw, th) {
+    const clamped = rgba instanceof Uint8ClampedArray
+        ? rgba
+        : new Uint8ClampedArray(rgba.buffer, rgba.byteOffset, rgba.byteLength);
+    const src = new OffscreenCanvas(w, h);
+    src.getContext('2d').putImageData(new ImageData(clamped, w, h), 0, 0);
+    const dst = new OffscreenCanvas(tw, th);
+    const dctx = dst.getContext('2d');
+    dctx.imageSmoothingQuality = 'high';
+    dctx.drawImage(src, 0, 0, w, h, 0, 0, tw, th);
+    return new Uint8Array(dctx.getImageData(0, 0, tw, th).data.buffer);
+}
+
+// Last-resort RAW decode at preview tier (lens item 5.9): OUT_LIGHTBOX only
+// (1800 px ≥ the 768 px proxy target) takes the streaming half-res superpixel
+// arm — several times faster, ~6× lower peak than a full-res develop. WASM
+// initializes on the main thread lazily and only if this path actually fires.
+async function _idDecodeRawPreview(rawBytes, nm) {
+    if (!rawBytes) throw new Error('identify: no RAW bytes in memory for ' + nm);
+    const ext = (nm.toLowerCase().match(/\.([^.]+)$/) || [])[1];
+    const fn = {
+        orf: rawWasm.process_orf_with_flags,
+        dng: rawWasm.process_dng_with_flags,
+        cr2: rawWasm.process_cr2_with_flags,
+    }[ext];
+    if (typeof fn !== 'function') throw new Error('identify: unsupported RAW: ' + nm);
+    await (_idWasmReady ||= rawWasm.default());
+    const OUT_LIGHTBOX = 2; // src/lib.rs output_flags bit: 1800 px RGB16 preview
+    const r = fn(rawBytes, OUT_LIGHTBOX, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+    let w, h, wbR, wbB, renderer;
+    try {
+        w = r.lb_w; h = r.lb_h; wbR = r.wb_r_used; wbB = r.wb_b_used;
+        renderer = r.take_lightbox_renderer();
+    } finally { r.free(); }
+    try {
+        const rgb = renderer.render_look({
+            wbR, wbB, exposureEv: 0, contrast: 0, highlights: 0, shadows: 0,
+            whites: 0, blacks: 0, saturation: 0, vibrance: 0, temp: 0, tint: 0,
+            texture: 0, clarity: 0,
+        });
+        return { rgb, width: w, height: h };
+    } finally { renderer.free(); }
+}
+
+async function _idSha256Hex(bytes) {
+    if (!bytes || !crypto?.subtle) return '';
+    const d = await crypto.subtle.digest('SHA-256', bytes);
+    return Array.from(new Uint8Array(d), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function _idDownload(bytes, filename, mime) {
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+async function identifyCurrentAsset() {
+    const card = cards[lightboxIndex];
+    if (!card) return;
+    const st = getCardState(card);
+    const file = st._file;
+    const name = file?.name || 'asset';
+    const [{ makeBrowserSources, buildSidecarForAsset, browserDecodeJpeg }, { resolveProxy }] =
+        await Promise.all([import('./ai-id/browser-adapter.js'), import('./ai-id/proxy.mjs')]);
+
+    const rawBytes = (file && isRawFilename(name) && typeof file.arrayBuffer === 'function')
+        ? new Uint8Array(await file.arrayBuffer()) : null;
+
+    const sources = makeBrowserSources({
+        liveRgba: cleanSnapshot?.data ?? null,
+        liveW: cleanSnapshot?.width ?? 0,
+        liveH: cleanSnapshot?.height ?? 0,
+        // This page has no OPFS JXL pyramid store (that's the pyramid-gallery
+        // page); decoded RGBA already reaches the chain via the live buffer.
+        getJxlPyramidBytes: async () => null,
+        getRawBytes: async () => rawBytes,
+        decodeJpegBytes: browserDecodeJpeg,
+        getMasterBytes: async () => {
+            const url = st._blobUrl;
+            if (!url) return null;
+            try { return new Uint8Array(await (await fetch(url)).arrayBuffer()); }
+            catch { return null; }
+        },
+        decodeJxl: _idDecodeJxlBytes,
+        decodeRaw: (nm) => _idDecodeRawPreview(rawBytes, nm),
+        rgbToRgba: rgbToRgbaArr,
+        assetPath: name,
+    });
+
+    const proxy = await resolveProxy(sources, {
+        encodeJpeg: _idEncodeJpeg,
+        downscaleRgba: _idDownscaleRgba,
+    });
+
+    // Sidecar: stable asset identity + the export panel's privacy policy.
+    const policyEl = document.getElementById('export-metadata-policy');
+    const metadataPolicy = (policyEl?.value === 'strip-gps' || policyEl?.value === 'strip-all')
+        ? policyEl.value : 'keep';
+    const exif = st._exif || {};
+    const gps = exif.gps;
+    const sidecar = buildSidecarForAsset({
+        assetId: st._assetId || name,
+        filename: name,
+        sha256: await _idSha256Hex(rawBytes),
+        bytes: rawBytes ? rawBytes.byteLength : (file?.size ?? 0),
+        format: (name.toLowerCase().match(/\.([^.]+)$/) || [])[1] || '',
+        width: proxy.w,
+        height: proxy.h,
+        orientationApplied: proxy.source !== 'raw', // raw preview is sensor-orient
+        datetimeExif: exif.datetime || '',
+        decoded: gps
+            ? { has_gps: true, gps_lat: gps.lat, gps_lon: gps.lon, gps_alt: gps.alt ?? 0 }
+            : { has_gps: false, gps_lat: 0, gps_lon: 0, gps_alt: 0 },
+        metadataPolicy,
+    });
+    sidecar.proxy.source = proxy.source; // which chain source produced the proxy
+
+    const stem = stripRawExtension(name);
+    _idDownload(proxy.jpeg, stem + '.id-proxy.jpg', 'image/jpeg');
+    _idDownload(new TextEncoder().encode(JSON.stringify(sidecar, null, 2)),
+                stem + '.ai.json', 'application/json');
+}
+window.identifyCurrentAsset = identifyCurrentAsset;
+if (lbIdentifyBtn) {
+    lbIdentifyBtn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        if (lightboxIndex < 0) return;
+        lbIdentifyBtn.disabled = true;
+        try {
+            await identifyCurrentAsset();
+        } catch (err) {
+            console.error('identify failed:', err);
+        } finally {
+            lbIdentifyBtn.disabled = false;
+        }
+    });
+}
+
 // Straighten slider (Phase 2) — immediate visual feedback using the geometry + render path
 if (lbStraighten) {
     lbStraighten.addEventListener('input', () => {
@@ -5386,9 +5586,14 @@ async function triggerLiveUpdateTauri(look) {
             getCardState(card)._lightbox.h = h;
         }
         const ctx = lightboxCanvas.getContext('2d');
-        ctx.putImageData(new ImageData(rgbToRgbaArr(rgb), w, h), 0, 0);
+        // TTFP-2 pattern: hand the ImageData we just painted straight to the
+        // snapshot instead of reading the identical pixels back (the put fills
+        // the whole canvas at (0,0) with opaque pixels, and the rgba buffer is
+        // freshly allocated per call — no aliasing).
+        const lookFrame = new ImageData(rgbToRgbaArr(rgb), w, h);
+        ctx.putImageData(lookFrame, 0, 0);
         if (lightboxCanvas.width > 0) {
-            captureCleanAndApplyLens(ctx.getImageData(0, 0, lightboxCanvas.width, lightboxCanvas.height));
+            captureCleanAndApplyLens(lookFrame);
         }
         // Real RAW pixels now on screen → update colour-coded badge accordingly,
         // and preserve displayed size if the canvas just got resized.

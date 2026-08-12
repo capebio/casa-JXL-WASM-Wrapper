@@ -139,6 +139,64 @@ test("makeBrowserSources pyramid source returns null when bytes unavailable", as
   assert.equal(await pyr.get(), null);
 });
 
+// ── 4b. embedded-preview source (browser twin of node-adapter's) ─────────────
+
+// Minimal synthetic viewable JPEG (SOI + SOF + EOI) for the pure stream scanner.
+function fakeJpeg(w, h, sof = 0xc0) {
+  return Uint8Array.from([
+    0xff, 0xd8, 0xff, sof, 0x00, 0x11, 0x08,
+    (h >> 8) & 0xff, h & 0xff, (w >> 8) & 0xff, w & 0xff,
+    0x03, 1, 0x11, 0, 2, 0x11, 1, 3, 0x11, 1,
+    0xff, 0xd9,
+  ]);
+}
+
+test("makeBrowserSources places embedded-preview between pyramid and master", async () => {
+  const { makeBrowserSources } = await import("./browser-adapter.js");
+  const sources = makeBrowserSources({
+    liveRgba: null, liveW: 0, liveH: 0,
+    getJxlPyramidBytes: async () => null,
+    getMasterBytes: async () => null,
+    decodeJxl: async () => ({ data: new Uint8Array(4), width: 2, height: 2 }),
+    decodeRaw: async () => ({ rgb: new Uint8Array(4), width: 2, height: 2 }),
+    rgbToRgba: (rgb) => new Uint8Array(4),
+    assetPath: "P001.ORF",
+  });
+  const labels = sources.map((s) => s.label);
+  const pyramidIdx = labels.indexOf("pyramid");
+  const embIdx = labels.indexOf("embedded-preview");
+  const masterIdx = labels.indexOf("master");
+  assert.ok(embIdx !== -1, "sources must include embedded-preview");
+  assert.ok(pyramidIdx < embIdx && embIdx < masterIdx,
+    "embedded-preview must sit between pyramid and master");
+});
+
+test("embeddedPreviewSource decodes the embedded JPEG when >= minEdge", async () => {
+  const { embeddedPreviewSource } = await import("./browser-adapter.js");
+  const src = embeddedPreviewSource(
+    async () => fakeJpeg(1024, 768),
+    async (bytes) => {
+      assert.ok(bytes[0] === 0xff && bytes[1] === 0xd8, "must receive the JPEG stream bytes");
+      return { data: new Uint8Array(1024 * 768 * 4), width: 1024, height: 768 };
+    },
+  );
+  const r = await src.get();
+  assert.ok(r, "must yield pixels");
+  assert.equal(r.w, 1024);
+  assert.equal(r.h, 768);
+});
+
+test("embeddedPreviewSource rejects previews below minEdge and missing injections", async () => {
+  const { embeddedPreviewSource } = await import("./browser-adapter.js");
+  const small = embeddedPreviewSource(
+    async () => fakeJpeg(160, 120), // IFD1-thumb-sized — too small for ID
+    async () => ({ data: new Uint8Array(4), width: 160, height: 120 }),
+  );
+  assert.equal(await small.get(), null, "sub-minEdge preview must be rejected");
+  const uninjected = embeddedPreviewSource(undefined, undefined);
+  assert.equal(await uninjected.get(), null, "source without injections must yield null");
+});
+
 // ── 5. sidecar tied to stable assetId + privacy policy ───────────────────────
 
 test("buildSidecarForAsset applies strip-gps policy: geo is null in output", async () => {

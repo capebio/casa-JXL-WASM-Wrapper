@@ -94,38 +94,65 @@ async function ensureWasm() {
   })();
   return _wasmReady;
 }
-function pickDecoder(mod, name) {
+function pickThumbDecoder(mod, name) {
   switch ((name.toLowerCase().match(/\.([^.]+)$/) || [])[1]) {
-    case 'orf': return mod.process_orf;
-    case 'dng': return mod.process_dng;
-    case 'cr2': return mod.process_cr2;
+    case 'orf': return mod.process_orf_with_flags;
+    case 'dng': return mod.process_dng_with_flags;
+    case 'cr2': return mod.process_cr2_with_flags;
     default: throw new Error('unsupported RAW: ' + name);
   }
 }
-/** Decode a RAW to oriented full-res RGB8 with a neutral look. */
-async function decodeRawRgb(bytes, name) {
+const OUT_THUMB = 4; // src/lib.rs output_flags bit: 360 px RGB16 thumb only
+
+/** Decode a RAW to a thumb-sized (360 px) display RGB8 with a neutral look.
+ *  OUT_THUMB-only skips the full-res demosaic entirely (streaming half-res
+ *  superpixel arm) — roughly an order of magnitude faster and far lower peak
+ *  memory than the full 20 MP decode this replaced, which existed only to be
+ *  nearest-neighbour-sampled down to a 200 px canvas.
+ *  Returned rgb is in SENSOR orientation; drawThumb applies `orientation`. */
+async function decodeRawThumb(bytes, name) {
   const mod = await ensureWasm();
-  const fn = pickDecoder(mod, name);
+  const fn = pickThumbDecoder(mod, name);
   // Positional look args (see src/lib.rs / web/worker.js RAW_NEUTRAL). WB NaN =
   // use each file's metadata white balance (constant for a locked time-lapse).
-  const r = fn(bytes, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+  const r = fn(bytes, OUT_THUMB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+  let w, h, orientation, wbR, wbB, renderer;
   try {
-    return { rgb: r.rgb(), w: r.width, h: r.height };
+    w = r.thumb_w; h = r.thumb_h; orientation = r.orientation;
+    wbR = r.wb_r_used; wbB = r.wb_b_used;
+    renderer = r.take_thumb_renderer();
   } finally { r.free(); }
+  try {
+    const rgb = renderer.render_look({
+      wbR, wbB, exposureEv: 0, contrast: 0, highlights: 0, shadows: 0,
+      whites: 0, blacks: 0, saturation: 0, vibrance: 0, temp: 0, tint: 0,
+      texture: 0, clarity: 0,
+    });
+    return { rgb, w, h, orientation };
+  } finally { renderer.free(); }
 }
 /** Nearest-neighbour downsample straight into a small canvas (no full-size
- *  intermediate canvas for a 20 MP frame). */
-function drawThumb(canvas, rgb, w, h) {
-  const scale = Math.min(1, THUMB_EDGE / Math.max(w, h));
-  const tw = Math.max(1, Math.round(w * scale));
-  const th = Math.max(1, Math.round(h * scale));
+ *  intermediate canvas), applying the EXIF orientation (1..8) while sampling.
+ *  `w`/`h` are the sensor-orientation dims of `rgb`. */
+function drawThumb(canvas, rgb, w, h, orientation = 1) {
+  const ori = (orientation >= 1 && orientation <= 8) ? orientation : 1;
+  const swap = ori >= 5;
+  const fx = ori === 2 || ori === 3 || ori === 7 || ori === 8;
+  const fy = ori === 3 || ori === 4 || ori === 6 || ori === 7;
+  const dispW = swap ? h : w, dispH = swap ? w : h;
+  const scale = Math.min(1, THUMB_EDGE / Math.max(dispW, dispH));
+  const tw = Math.max(1, Math.round(dispW * scale));
+  const th = Math.max(1, Math.round(dispH * scale));
   canvas.width = tw; canvas.height = th;
   const img = new ImageData(tw, th);
   const d = img.data;
   for (let y = 0; y < th; y++) {
-    const sy = Math.min(h - 1, (y / scale) | 0);
+    const dy = Math.min(dispH - 1, (y / scale) | 0);
     for (let x = 0; x < tw; x++) {
-      const sx = Math.min(w - 1, (x / scale) | 0);
+      const dx = Math.min(dispW - 1, (x / scale) | 0);
+      let sx = swap ? dy : dx, sy = swap ? dx : dy;
+      if (fx) sx = w - 1 - sx;
+      if (fy) sy = h - 1 - sy;
       const si = (sy * w + sx) * 3;
       const di = (y * tw + x) * 4;
       d[di] = rgb[si]; d[di + 1] = rgb[si + 1]; d[di + 2] = rgb[si + 2]; d[di + 3] = 255;
@@ -248,9 +275,9 @@ export class TimelapseStudio {
       try {
         const bytes = await this._itemBytes(it);
         if (!bytes) throw new Error('no bytes (native preview needs the Tauri fs plugin)');
-        const { rgb, w, h } = await decodeRawRgb(bytes, it.name);
+        const { rgb, w, h, orientation } = await decodeRawThumb(bytes, it.name);
         const canvas = document.createElement('canvas');
-        drawThumb(canvas, rgb, w, h);
+        drawThumb(canvas, rgb, w, h, orientation);
         const ph = it._tile?.querySelector('.ph');
         if (ph) ph.replaceWith(canvas);
       } catch (e) {
@@ -394,56 +421,54 @@ export class TimelapseStudio {
       const fpsDen = form.fpsDen;
       const gop = form.gop;
 
-      // Collect frames sequentially (not all-at-once), applying per-asset edits.
+      // Stream: decode one frame, push it to the encoder, drop the RGB — the
+      // pattern timelapse-core.js encodeFableTimelapse already uses. Buffering
+      // every decoded frame first held N×~60 MB (a 100-frame 20 MP timelapse
+      // ≈ 6 GB → guaranteed tab crash); streaming peaks at ~1 frame.
       // The generator yields one { assetId, name, bytes, look } at a time.
-      const frameBuf = [];
-      for await (const frame of buildSequentialFrames(selectedItems, readBytes, {
-        isCancelled: tok.isCancelled,
-        maxBytesInFlight: BUDGET_BYTES,
-      })) {
-        if (tok.isCancelled()) break;
-        // Apply per-asset look edits via the look → decode-args mapping.
-        const lookArgs = applyLookToDecodeArgs(frame.look || {});
-        // For FableBraid (lossless), we decode with the per-asset look then push
-        // to the encoder. Re-use the existing pickDecoder/decodeRawRgb path, but
-        // pass the look args so edits are baked into the lossless frame.
-        const fn = (() => {
-          switch ((frame.name.toLowerCase().match(/\.([^.]+)$/) || [])[1]) {
-            case 'orf': return mod.process_orf;
-            case 'dng': return mod.process_dng;
-            case 'cr2': return mod.process_cr2;
-            default: throw new Error('unsupported RAW: ' + frame.name);
-          }
-        })();
-        const r = fn(frame.bytes, ...lookArgs);
-        // Read width/height BEFORE freeing: the WASM getters dereference the
-        // ProcessResult pointer, so touching r.width/r.height after r.free()
-        // reads freed memory and throws. Mirror decodeRawNeutralRgb: read all
-        // fields inside the try, then free.
-        let w, h, rgb;
-        try { w = r.width; h = r.height; rgb = r.take_rgb(); } finally { r.free(); }
-        frameBuf.push({ rgb, w, h, name: frame.name });
-        encodedCount++;
-        this._progress({ stage: 'decoding', done: encodedCount, total: selectedItems.length });
-      }
-
-      if (tok.isCancelled()) {
-        this._status('Encode cancelled.');
-        this.el.progressWrap.hidden = true;
-        return;
-      }
-
-      if (!frameBuf.length) throw new Error('no frames could be read');
-
-      // Encode via FableVideoEncoder — sequential push of decoded RGB frames.
-      const { w, h } = frameBuf[0];
-      let enc = new mod.FableVideoEncoder(w, h, fpsNum, fpsDen, gop);
+      let enc = null;
       try {
-        for (let i = 0; i < frameBuf.length; i++) {
-          const f = frameBuf[i];
-          enc.push_rgb8(f.rgb);
-          this._progress({ stage: 'encoding', done: i + 1, total: frameBuf.length });
+        for await (const frame of buildSequentialFrames(selectedItems, readBytes, {
+          isCancelled: tok.isCancelled,
+          maxBytesInFlight: BUDGET_BYTES,
+        })) {
+          if (tok.isCancelled()) break;
+          // Apply per-asset look edits via the look → decode-args mapping.
+          const lookArgs = applyLookToDecodeArgs(frame.look || {});
+          // For FableBraid (lossless), we decode with the per-asset look then push
+          // to the encoder, passing the look args so edits are baked into the
+          // lossless frame. (Thumbnails use the cheaper OUT_THUMB decodeRawThumb.)
+          const fn = (() => {
+            switch ((frame.name.toLowerCase().match(/\.([^.]+)$/) || [])[1]) {
+              case 'orf': return mod.process_orf;
+              case 'dng': return mod.process_dng;
+              case 'cr2': return mod.process_cr2;
+              default: throw new Error('unsupported RAW: ' + frame.name);
+            }
+          })();
+          const r = fn(frame.bytes, ...lookArgs);
+          // Read width/height BEFORE freeing: the WASM getters dereference the
+          // ProcessResult pointer, so touching r.width/r.height after r.free()
+          // reads freed memory and throws. Mirror decodeRawNeutralRgb: read all
+          // fields inside the try, then free.
+          let w, h, rgb;
+          try { w = r.width; h = r.height; rgb = r.take_rgb(); } finally { r.free(); }
+          // Dims are known at the first frame; encoder push order is identical
+          // to the old buffer-then-encode loop, so the .casv bytes are unchanged.
+          if (!enc) enc = new mod.FableVideoEncoder(w, h, fpsNum, fpsDen, gop);
+          enc.push_rgb8(rgb); // rgb is never retained
+          encodedCount++;
+          this._progress({ stage: 'encoding', done: encodedCount, total: selectedItems.length });
         }
+
+        if (tok.isCancelled()) {
+          this._status('Encode cancelled.');
+          this.el.progressWrap.hidden = true;
+          return;
+        }
+
+        if (!encodedCount) throw new Error('no frames could be read');
+
         encResult = enc.finish();
         enc = null;
       } finally {
@@ -454,8 +479,8 @@ export class TimelapseStudio {
       this._downloadCasv(encResult, name);
       this.lastOutput = name;
       const mb = (encResult.length / 1e6).toFixed(1);
-      this._status(`Encoded ${frameBuf.length} frames → ${name} (${mb} MB, lossless FableBraid)`);
-      this._progress({ stage: 'done', done: frameBuf.length, total: frameBuf.length });
+      this._status(`Encoded ${encodedCount} frames → ${name} (${mb} MB, lossless FableBraid)`);
+      this._progress({ stage: 'done', done: encodedCount, total: encodedCount });
       // Best-effort preview in the embedded player.
       try {
         const lb = await this._ensurePlayer();
