@@ -1,6 +1,6 @@
-//! Panasonic RW2 and Leica RWL, and uncompressed Nikon NRW/NEF.
+//! Panasonic RW2 and Leica RWL, and Nikon NEF/NRW.
 //!
-//! Three formats that this pipeline previously had no reader for, sharing a file
+//! Formats that this pipeline previously had no reader for, sharing a file
 //! because they share a shape: a TIFF-ish container holding a single Bayer plane
 //! that needs unpacking rather than decompressing. Everything here produces the
 //! same `(raw: Vec<u16>, cfa_phase, black, white, wb)` the CR2 and DNG readers
@@ -10,10 +10,26 @@
 //! confirmed on `leica_c-typ112`, which carries the identical tag set at TIFF
 //! version 85.
 //!
-//! Not here, deliberately: Nikon's *compressed* NEF (tag 259 = 34713) needs a
-//! Huffman decoder plus the linearisation curve from MakerNote 0x0096, and Canon
-//! CRW and CR3 are different containers entirely — CR3 wraps CRX, a wavelet
-//! codec. Those stay with LibRaw.
+//! # Nikon coverage, and a correction
+//!
+//! This header used to say compressed NEF was "not here, deliberately… stays
+//! with LibRaw". **That went stale and then misled a reader into planning a
+//! decoder that already existed.** Nikon's compressed NEF (259 == 34713) IS
+//! implemented below — Huffman-coded DPCM over two vertical predictors plus the
+//! linearisation curve from MakerNote 0x0096 — and lossless, lossy-type-2 and
+//! the Z-body modes all decode.
+//!
+//! What was actually missing until 2026-08-12 was **byte order**: Nikon's DSLR
+//! line writes big-endian TIFF and this reader accepted only `II`, so it refused
+//! every D-series body whatever its compression. Measured against a 34-file
+//! fixture set (`raw-converter/tests/NEF Raws/`), that one gate accounted for 19
+//! of 34 failures — far more than any compression mode.
+//!
+//! Still out: **CR3** (wraps CRX, a wavelet codec) and **CRW** (CIFF, not TIFF).
+//! Also unsupported here: Nikon's high-efficiency modes on the newest Z bodies
+//! and D810 small-raw, whose 0x0096 table is not where this looks for it, the
+//! D80's 16-bit SubIFD, and COOLSCAN scanner NEFs at 8- and 16-bit
+//! uncompressed.
 
 use std::collections::HashMap;
 
@@ -47,11 +63,61 @@ pub struct BayerImage {
 // 42. Panasonic uses version 85 with a private tag set, so this reads the raw IFD
 // structure and lets each format name its own tags.
 
+/// Byte order of a TIFF-ish structure.
+///
+/// **Not a formality: Nikon's DSLRs write big-endian.** Every classic body —
+/// D1H, D1X, D2H, D2Hs, D3, D3S, D70, D70s, D100, D300, D300S — opens `MM`,
+/// while the mirrorless Z line and the Nikon 1 series open `II`. A reader that
+/// assumes little-endian refuses the entire DSLR range regardless of how its
+/// sensor data is compressed, which is a far larger gap than any one
+/// compression mode.
+///
+/// A file's order is not global, either: a Nikon MakerNote carries its own TIFF
+/// header and may disagree with the file that contains it, so the order travels
+/// with the structure rather than being read once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum End {
+    Le,
+    Be,
+}
+
+impl End {
+    /// Read a byte-order marker. `None` when it is neither `II` nor `MM`.
+    fn of(b: &[u8]) -> Option<End> {
+        match b.first().zip(b.get(1)) {
+            Some((0x49, 0x49)) => Some(End::Le),
+            Some((0x4d, 0x4d)) => Some(End::Be),
+            _ => None,
+        }
+    }
+
+    fn u16(self, b: &[u8]) -> u16 {
+        let v = [b[0], b[1]];
+        match self {
+            End::Le => u16::from_le_bytes(v),
+            End::Be => u16::from_be_bytes(v),
+        }
+    }
+
+    fn u32(self, b: &[u8]) -> u32 {
+        let v = [b[0], b[1], b[2], b[3]];
+        match self {
+            End::Le => u32::from_le_bytes(v),
+            End::Be => u32::from_be_bytes(v),
+        }
+    }
+}
+
 struct Entry {
     typ: u16,
     count: u32,
     /// Inline bytes when the value fits in four, otherwise the bytes at the offset.
     val: Vec<u8>,
+    /// The order the containing IFD was read in.
+    ///
+    /// Carried per entry so that `tag_u32` needs no extra argument — which is
+    /// what keeps the twenty-odd RW2 tag reads below untouched by this.
+    end: End,
 }
 
 fn u16le(b: &[u8]) -> u16 {
@@ -71,48 +137,53 @@ fn type_size(t: u16) -> usize {
     }
 }
 
-/// Read one little-endian IFD. Returns the tags and the next-IFD offset.
-fn read_ifd(d: &[u8], off: usize) -> Result<(HashMap<u16, Entry>, usize), String> {
+/// Read one IFD in the given byte order. Returns the tags and the next-IFD
+/// offset.
+fn read_ifd(d: &[u8], off: usize, end: End) -> Result<(HashMap<u16, Entry>, usize), String> {
     if off + 2 > d.len() {
         return Err("IFD offset past end of file".into());
     }
-    let n = u16le(&d[off..]) as usize;
+    let n = end.u16(&d[off..]) as usize;
     // A real IFD is tens of entries. A four-digit count means the offset is wrong,
     // and following it would read the file as a tag table.
     if n > 512 {
         return Err(format!("IFD at {} claims {} entries", off, n));
     }
-    let end = off + 2 + n * 12;
-    if end + 4 > d.len() {
+    let ifd_end = off + 2 + n * 12;
+    if ifd_end + 4 > d.len() {
         return Err("IFD runs past end of file".into());
     }
     let mut map = HashMap::with_capacity(n);
     for i in 0..n {
         let p = off + 2 + i * 12;
-        let tag = u16le(&d[p..]);
-        let typ = u16le(&d[p + 2..]);
-        let count = u32le(&d[p + 4..]);
+        let tag = end.u16(&d[p..]);
+        let typ = end.u16(&d[p + 2..]);
+        let count = end.u32(&d[p + 4..]);
         let size = type_size(typ).saturating_mul(count as usize);
         let val = if size <= 4 {
+            // **Big-endian inline values are LEFT-justified in the four-byte
+            // field**, so a SHORT sits in the first two bytes on both orders and
+            // slicing `size` from the start is right either way. This is the one
+            // place the two layouts differ in a way that is easy to get wrong.
             d[p + 8..p + 8 + size.min(4)].to_vec()
         } else {
-            let vo = u32le(&d[p + 8..]) as usize;
+            let vo = end.u32(&d[p + 8..]) as usize;
             if vo.saturating_add(size) > d.len() {
                 Vec::new() // out of range: keep the tag, drop the value
             } else {
                 d[vo..vo + size].to_vec()
             }
         };
-        map.insert(tag, Entry { typ, count, val });
+        map.insert(tag, Entry { typ, count, val, end });
     }
-    Ok((map, u32le(&d[end..]) as usize))
+    Ok((map, end.u32(&d[ifd_end..]) as usize))
 }
 
 fn tag_u32(m: &HashMap<u16, Entry>, t: u16) -> Option<u32> {
     let e = m.get(&t)?;
     match e.typ {
-        3 if e.val.len() >= 2 => Some(u16le(&e.val) as u32),
-        4 if e.val.len() >= 4 => Some(u32le(&e.val)),
+        3 if e.val.len() >= 2 => Some(e.end.u16(&e.val) as u32),
+        4 if e.val.len() >= 4 => Some(e.end.u32(&e.val)),
         _ => None,
     }
 }
@@ -208,7 +279,8 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     if ver != 85 {
         return Err(format!("TIFF version {}, expected 85 for RW2/RWL", ver));
     }
-    let (t, _) = read_ifd(d, u32le(&d[4..]) as usize)?;
+    // RW2/RWL is little-endian by its own magic check above; no detection here.
+    let (t, _) = read_ifd(d, u32le(&d[4..]) as usize, End::Le)?;
 
     let sensor_w = tag_u32(&t, 0x0002).ok_or("RW2: no SensorWidth")? as usize;
     let sensor_h = tag_u32(&t, 0x0003).ok_or("RW2: no SensorHeight")? as usize;
@@ -441,20 +513,25 @@ fn nikon_compressed(
     // NOT read_ifd: that resolves long values against the FILE, while every offset
     // inside a MakerNote is relative to `base`. Reading 0x0096 through it yields
     // bytes from an unrelated part of the file.
-    let mo = base + u32le(&d[base + 4..]) as usize;
+    // **The MakerNote's own byte order, which may disagree with the file's.**
+    // It carries a complete TIFF header at `base`, so the marker is read from
+    // there rather than inherited — a D3 is `MM` in both, but the two are
+    // independent by construction and nothing forces them to agree.
+    let me = End::of(&d[base..]).ok_or("NEF: MakerNote has no II/MM byte-order mark")?;
+    let mo = base + me.u32(&d[base + 4..]) as usize;
     if mo + 2 > d.len() {
         return Err("NEF: MakerNote IFD past end of file".into());
     }
-    let n = u16le(&d[mo..]) as usize;
+    let n = me.u16(&d[mo..]) as usize;
     if n > 512 || mo + 2 + n * 12 > d.len() {
         return Err(format!("NEF: MakerNote IFD claims {} entries", n));
     }
     let mut meta = 0usize;
     for i in 0..n {
         let e = mo + 2 + i * 12;
-        if u16le(&d[e..]) == 0x0096 {
-            let size = type_size(u16le(&d[e + 2..])) * u32le(&d[e + 4..]) as usize;
-            meta = if size <= 4 { e + 8 } else { base + u32le(&d[e + 8..]) as usize };
+        if me.u16(&d[e..]) == 0x0096 {
+            let size = type_size(me.u16(&d[e + 2..])) * me.u32(&d[e + 4..]) as usize;
+            meta = if size <= 4 { e + 8 } else { base + me.u32(&d[e + 8..]) as usize };
         }
     }
     if meta == 0 {
@@ -473,8 +550,10 @@ fn nikon_compressed(
     if bits == 14 {
         tree += 3;
     }
+    // The linearisation table and the vertical predictors live inside the
+    // MakerNote, so they are read in ITS order, not the file's.
     let rd16 = |o: usize| -> u32 {
-        if o + 2 <= d.len() { u16le(&d[o..]) as u32 } else { 0 }
+        if o + 2 <= d.len() { me.u16(&d[o..]) as u32 } else { 0 }
     };
     let mut vpred = [[0i32; 2]; 2];
     for a in 0..2 {
@@ -560,27 +639,31 @@ fn nikon_compressed(
 }
 
 pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
-    if d.len() < 8 || &d[0..2] != b"II" {
-        return Err("NEF: not a little-endian TIFF".into());
+    if d.len() < 8 {
+        return Err("NEF: too small to be a TIFF".into());
     }
-    let (ifd0, _) = read_ifd(d, u32le(&d[4..]) as usize)?;
+    // **Both orders, because Nikon uses both.** The DSLR line writes `MM` and
+    // the Z / Nikon 1 line writes `II`; refusing big-endian here refused every
+    // classic body outright, whatever its compression.
+    let e = End::of(&d[0..2]).ok_or("NEF: not a TIFF (no II/MM byte-order mark)")?;
+    let (ifd0, _) = read_ifd(d, e.u32(&d[4..]) as usize, e)?;
 
     // The raw plane lives in a SubIFD, never in IFD0 — IFD0 is a thumbnail.
     let sub = ifd0.get(&330).ok_or("NEF: no SubIFDs")?;
     let mut offs = Vec::new();
     for k in 0..sub.count as usize {
         if (k + 1) * 4 <= sub.val.len() {
-            offs.push(u32le(&sub.val[k * 4..]) as usize);
+            offs.push(e.u32(&sub.val[k * 4..]) as usize);
         }
     }
     if offs.is_empty() && sub.val.len() >= 4 {
-        offs.push(u32le(&sub.val) as usize);
+        offs.push(e.u32(&sub.val) as usize);
     }
 
     // Take the SubIFD with the most pixels: the others are previews.
     let mut best: Option<(usize, HashMap<u16, Entry>)> = None;
     for so in offs {
-        if let Ok((st, _)) = read_ifd(d, so) {
+        if let Ok((st, _)) = read_ifd(d, so, e) {
             let w = tag_u32(&st, 256).unwrap_or(0) as usize;
             let h = tag_u32(&st, 257).unwrap_or(0) as usize;
             if w * h > best.as_ref().map_or(0, |(n, _)| *n) {
@@ -703,6 +786,61 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
 mod tests {
     use super::*;
 
+    /// `End` is the whole of the big-endian fix, so pin it without needing a
+    /// file. `II`/`MM` are the only legal markers and everything else must be a
+    /// refusal rather than a default, because defaulting to little-endian is
+    /// precisely the bug this replaced.
+    #[test]
+    fn byte_order_marks_decide_the_order() {
+        assert_eq!(End::of(b"II*\0"), Some(End::Le));
+        assert_eq!(End::of(b"MM\0*"), Some(End::Be));
+        assert_eq!(End::of(b"XX"), None, "an unknown mark must not default");
+        assert_eq!(End::of(b"I"), None, "a truncated mark must not panic");
+        assert_eq!(End::of(b""), None);
+
+        let b = [0x12u8, 0x34, 0x56, 0x78];
+        assert_eq!(End::Le.u16(&b), 0x3412);
+        assert_eq!(End::Be.u16(&b), 0x1234);
+        assert_eq!(End::Le.u32(&b), 0x7856_3412);
+        assert_eq!(End::Be.u32(&b), 0x1234_5678);
+    }
+
+    /// **A big-endian NEF must decode.** Nikon's DSLR line writes `MM`, and this
+    /// reader used to refuse it outright — which cost every D-series body
+    /// regardless of compression, 19 of 34 files in the fixture set.
+    ///
+    /// Skips when the corpus is absent: it lives outside the repo, and a test
+    /// that fails on a clean checkout teaches people to ignore failures.
+    #[test]
+    fn a_big_endian_nef_decodes() {
+        const F: &str = r"C:\Foo\raw-converter\tests\NEF Raws\14bit-lossless__D3.NEF";
+        let Ok(d) = std::fs::read(F) else {
+            eprintln!("skipped: {F} not present");
+            return;
+        };
+        assert_eq!(&d[0..2], b"MM", "fixture must be the big-endian case");
+
+        let b = decode_nef(&d).expect("a big-endian NEF must decode");
+        assert_eq!((b.width, b.height), (4288, 2844));
+        assert_eq!(b.raw.len(), b.width * b.height);
+        assert!(b.model.contains("D3"), "model: {:?}", b.model);
+        assert!(!b.strip.is_empty() && b.strip.end <= d.len());
+
+        // Decoding without error is not the same as decoding correctly. A
+        // photograph sits a few percent of full scale between same-colour
+        // neighbours; byte-swapped samples would sit near a third of it.
+        let (mut tot, mut n) = (0u64, 0u64);
+        for y in (0..b.height).step_by(37) {
+            let row = &b.raw[y * b.width..(y + 1) * b.width];
+            for x in 2..b.width {
+                tot += (row[x] as i32 - row[x - 2] as i32).unsigned_abs() as u64;
+                n += 1;
+            }
+        }
+        let mad = tot as f64 / n as f64;
+        assert!(mad < 16384.0 / 12.0, "decoded plane looks like noise (mad {mad:.0})");
+    }
+
     /// The bit reader's page walk is the part most likely to be wrong, so pin the
     /// arithmetic rather than only the end-to-end result.
     #[test]
@@ -751,7 +889,7 @@ mod tests {
     fn read_ifd_refuses_a_nonsense_entry_count() {
         // 0xFFFF entries at offset 0 -- the shape a corrupt or misread offset takes.
         let d = vec![0xffu8; 64];
-        assert!(read_ifd(&d, 0).is_err());
+        assert!(read_ifd(&d, 0, End::Le).is_err());
     }
 
     #[test]
