@@ -264,17 +264,21 @@ pub fn box_blur_wasm(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     dst
 }
 
-/// Drain lanes 0/1/2 (R,G,B; lane 3 = alpha, discarded) of an i32x4 partial into a
-/// u64[3] accumulator. Unsigned `as u32 as u64` widen for the same reason as ssd.
+/// Drain lanes 0/1/2/3 (R,G,B,A) of an i32x4 partial into a u64[4] accumulator.
+/// The alpha lane was always accumulated in the vector register; keeping it
+/// (instead of discarding at drain time) lets `Comparer::all()` derive the PSNR
+/// SSD from these sums and skip its whole test+ref traversal.
+/// Unsigned `as u32 as u64` widen for the same reason as ssd.
 #[inline]
-fn drain3(v: v128, acc: &mut [u64; 3]) {
+fn drain4(v: v128, acc: &mut [u64; 4]) {
     acc[0] += i32x4_extract_lane::<0>(v) as u32 as u64;
     acc[1] += i32x4_extract_lane::<1>(v) as u32 as u64;
     acc[2] += i32x4_extract_lane::<2>(v) as u32 as u64;
+    acc[3] += i32x4_extract_lane::<3>(v) as u32 as u64;
 }
 
 /// wasm v128 SSIM moment accumulation over RGBA test+ref. Returns per-channel
-/// (sa, saa, sab) for c in 0..3 — same contract as `avx2::ssim_moments_avx2`.
+/// (sa, saa, sab) for c in 0..4 (RGBA) — same contract as `avx2::ssim_moments_avx2`.
 ///
 /// Strategy: channel-as-lane. Each pixel's [R,G,B,A] occupies one i32x4, so the
 /// three independent products (a, a*a, a*b) are computed for all channels in one
@@ -282,16 +286,16 @@ fn drain3(v: v128, acc: &mut [u64; 3]) {
 /// wash). i32x4 partials drain to u64 every FLUSH pixels before saa/sab (≤255² per
 /// pixel) can overflow i32. NOTE: x86 keeps the scalar moments — this v128 path is
 /// only worth selecting if the wasm bench shows a real win (see bench-wasm).
-pub fn ssim_moments_wasm(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], [u64; 3]) {
+pub fn ssim_moments_wasm(a: &[u8], b: &[u8], np: usize) -> ([u64; 4], [u64; 4], [u64; 4]) {
     // assert! (not debug_assert!) to match ssim_moments_avx2 — a short buffer would
     // OOB the v128_load32_zero in a release WASM build (silent UB).
     assert!(
         a.len() / 4 >= np && b.len() / 4 >= np,
         "ssim_moments_wasm: a.len() and b.len() must be >= np*4"
     );
-    let mut sa = [0u64; 3];
-    let mut saa = [0u64; 3];
-    let mut sab = [0u64; 3];
+    let mut sa = [0u64; 4];
+    let mut saa = [0u64; 4];
+    let mut sab = [0u64; 4];
     let mut va = i32x4_splat(0);
     let mut vaa = i32x4_splat(0);
     let mut vab = i32x4_splat(0);
@@ -317,9 +321,9 @@ pub fn ssim_moments_wasm(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], 
             p += 1;
             fc += 1;
             if fc == FLUSH {
-                drain3(va, &mut sa);
-                drain3(vaa, &mut saa);
-                drain3(vab, &mut sab);
+                drain4(va, &mut sa);
+                drain4(vaa, &mut saa);
+                drain4(vab, &mut sab);
                 va = i32x4_splat(0);
                 vaa = i32x4_splat(0);
                 vab = i32x4_splat(0);
@@ -327,9 +331,9 @@ pub fn ssim_moments_wasm(a: &[u8], b: &[u8], np: usize) -> ([u64; 3], [u64; 3], 
             }
         }
     }
-    drain3(va, &mut sa);
-    drain3(vaa, &mut saa);
-    drain3(vab, &mut sab);
+    drain4(va, &mut sa);
+    drain4(vaa, &mut saa);
+    drain4(vab, &mut sab);
     (sa, saa, sab)
 }
 

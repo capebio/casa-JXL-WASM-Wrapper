@@ -127,38 +127,39 @@ fn denoise_rgb_ycocg(
     let sigma_y = sigma_y.clamp(1e-6, 0.5);
     let sigma_co = sigma_co.clamp(1e-6, 0.5);
 
-    // VST + BM3D on Y channel
-    let y_vst: Vec<f32> = y_plane
-        .iter()
-        .map(|&v| gat_forward(v, g_coeff.shot, g_coeff.read))
-        .collect();
-    let y_bm3d = bm3d_denoise(&y_vst, width, height, sigma_y);
-    let y_denoised: Vec<f32> = y_bm3d
-        .iter()
-        .map(|&z| gat_inverse_exact(z, g_coeff.shot, g_coeff.read))
-        .collect();
-
-    // VST + BM3D on Co channel (chroma — offset to positive domain)
-    let co_vst: Vec<f32> = co_plane
-        .iter()
-        .map(|&v| gat_forward(v + 0.5, chroma_shot, chroma_read))
-        .collect();
-    let co_bm3d = bm3d_denoise(&co_vst, width, height, sigma_co);
-    let co_denoised: Vec<f32> = co_bm3d
-        .iter()
-        .map(|&z| gat_inverse_exact(z, chroma_shot, chroma_read) - 0.5)
-        .collect();
-
-    // VST + BM3D on Cg channel
-    let cg_vst: Vec<f32> = cg_plane
-        .iter()
-        .map(|&v| gat_forward(v + 0.5, chroma_shot, chroma_read))
-        .collect();
-    let cg_bm3d = bm3d_denoise(&cg_vst, width, height, sigma_co);
-    let cg_denoised: Vec<f32> = cg_bm3d
-        .iter()
-        .map(|&z| gat_inverse_exact(z, chroma_shot, chroma_read) - 0.5)
-        .collect();
+    // VST + BM3D per channel. The three plane runs are independent (disjoint
+    // inputs and outputs, purely functional kernels), so under the `parallel`
+    // feature they run concurrently via rayon::join — deterministic, byte-exact
+    // vs the serial order (same per-plane arithmetic, no shared state).
+    let run_y = || -> Vec<f32> {
+        let y_vst: Vec<f32> = y_plane
+            .iter()
+            .map(|&v| gat_forward(v, g_coeff.shot, g_coeff.read))
+            .collect();
+        let y_bm3d = bm3d_denoise(&y_vst, width, height, sigma_y);
+        y_bm3d
+            .iter()
+            .map(|&z| gat_inverse_exact(z, g_coeff.shot, g_coeff.read))
+            .collect()
+    };
+    // Chroma channels (offset to positive domain).
+    let run_chroma = |plane: &[f32]| -> Vec<f32> {
+        let vst: Vec<f32> = plane
+            .iter()
+            .map(|&v| gat_forward(v + 0.5, chroma_shot, chroma_read))
+            .collect();
+        let bm3d = bm3d_denoise(&vst, width, height, sigma_co);
+        bm3d.iter()
+            .map(|&z| gat_inverse_exact(z, chroma_shot, chroma_read) - 0.5)
+            .collect()
+    };
+    #[cfg(feature = "parallel")]
+    let (y_denoised, (co_denoised, cg_denoised)) = rayon::join(run_y, || {
+        rayon::join(|| run_chroma(&co_plane), || run_chroma(&cg_plane))
+    });
+    #[cfg(not(feature = "parallel"))]
+    let (y_denoised, co_denoised, cg_denoised) =
+        (run_y(), run_chroma(&co_plane), run_chroma(&cg_plane));
 
     // Convert YCoCg back to interleaved RGB f32
     let mut rgb_f32 = vec![0f32; n * 3];
@@ -228,15 +229,11 @@ fn denoise_cfa(
         }
     }
 
-    // VST + BM3D per plane, inverse VST
-    let mut denoised_planes: [Vec<f32>; 4] = [
-        vec![0f32; n_plane],
-        vec![0f32; n_plane],
-        vec![0f32; n_plane],
-        vec![0f32; n_plane],
-    ];
-
-    for plane_idx in 0..4usize {
+    // VST + BM3D per plane, inverse VST. The 4 half-res CFA plane runs are
+    // independent (disjoint inputs/outputs), so under the `parallel` feature
+    // they run concurrently via nested rayon::join — deterministic, byte-exact
+    // vs the serial loop.
+    let denoise_plane = |plane_idx: usize| -> Vec<f32> {
         let coeff = model.planes[plane_idx];
         let shot = coeff.shot;
         let read = coeff.read;
@@ -252,11 +249,26 @@ fn denoise_cfa(
             / (x_op + c_vst).max(1e-12).sqrt();
         let sigma_vst = sigma_vst.clamp(1e-6, 0.5);
         let denoised_vst = bm3d_denoise(&vst, hw, hh, sigma_vst);
-        denoised_planes[plane_idx] = denoised_vst
+        denoised_vst
             .iter()
             .map(|&z| gat_inverse_exact(z, shot, read).clamp(0.0, 1.0))
-            .collect();
-    }
+            .collect()
+    };
+    #[cfg(feature = "parallel")]
+    let denoised_planes: [Vec<f32>; 4] = {
+        let ((p0, p1), (p2, p3)) = rayon::join(
+            || rayon::join(|| denoise_plane(0), || denoise_plane(1)),
+            || rayon::join(|| denoise_plane(2), || denoise_plane(3)),
+        );
+        [p0, p1, p2, p3]
+    };
+    #[cfg(not(feature = "parallel"))]
+    let denoised_planes: [Vec<f32>; 4] = [
+        denoise_plane(0),
+        denoise_plane(1),
+        denoise_plane(2),
+        denoise_plane(3),
+    ];
 
     // Re-interleave into raw u16
     let mut out = raw.to_vec();

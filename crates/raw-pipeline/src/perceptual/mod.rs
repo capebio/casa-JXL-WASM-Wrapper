@@ -103,8 +103,10 @@ pub mod parity {
 
     // ---- ssim_moments (per-channel Σx, Σx², Σxy over RGBA → 9 sums) ----
     pub fn ssim_moments_simd(a: &[u8], b: &[u8], np: usize) -> Vec<f64> {
+        // The kernel now returns 4 lanes (alpha kept for the PSNR-from-sums
+        // derivation); the parity harness contract stays RGB-only — truncate.
         let (sa, saa, sab) = simd::wasm::ssim_moments_wasm(a, b, np);
-        flat9(sa, saa, sab)
+        flat9(rgb3(&sa), rgb3(&saa), rgb3(&sab))
     }
     pub fn ssim_moments_scalar(a: &[u8], b: &[u8], np: usize) -> Vec<f64> {
         let (sa, saa, sab) = ssim::ssim_sums(a, b, np, 4);
@@ -201,9 +203,11 @@ pub struct Comparer {
     backend: Backend,
     levels: Vec<Level>,
     ref_rgba: Vec<u8>,
-    // SSIM reference autos (per channel, RGBA stride 4)
-    ssim_sb: [u64; 3],
-    ssim_sbb: [u64; 3],
+    // SSIM reference autos (per channel, RGBA stride 4). 4 lanes: SSIM reads
+    // R/G/B; the alpha lane feeds the PSNR-from-sums derivation in `all()`
+    // (SIMD backends only — the scalar arm leaves lane 3 at 0 and never reads it).
+    ssim_sb: [u64; 4],
+    ssim_sbb: [u64; 4],
     // reusable test-side scratch
     tx: Vec<f32>,
     ty: Vec<f32>,
@@ -428,11 +432,13 @@ impl Comparer {
         self.ssim_test_sums(test).0
     }
 
-    /// SSIM score plus the per-channel test sums `sa=Σx`, `saa=Σx²` that every backend
-    /// already accumulates en route to `finalize_ssim`. `all()` reuses `sa`/`saa` to
-    /// derive `channel_moments` without a second pass over the test buffer.
+    /// SSIM score plus the per-channel test sums `sa=Σx`, `saa=Σx²`, `sab=Σxy` that
+    /// every backend already accumulates en route to `finalize_ssim`. `all()` reuses
+    /// `sa`/`saa` to derive `channel_moments` and — on SIMD backends, whose kernels
+    /// keep the alpha lane — `saa`/`sab` (with the ref autos) to derive PSNR, without
+    /// a second pass over the test buffer. The scalar arm leaves the alpha lanes 0.
     /// Caller must ensure `test.len() == self.n * 4` (the public `ssim`/`all` guard it).
-    fn ssim_test_sums(&self, test: &[u8]) -> (f32, [u64; 3], [u64; 3]) {
+    fn ssim_test_sums(&self, test: &[u8]) -> (f32, [u64; 4], [u64; 4], [u64; 4]) {
         match self.backend {
             #[cfg(target_arch = "x86_64")]
             // Channel-as-lane SIMD moments (8-wide, 2 px/iter). flip-measured 1.33–1.51×
@@ -442,11 +448,16 @@ impl Comparer {
             Backend::Avx2Strict | Backend::Avx2Rsqrt => {
                 let (sa, saa, sab) =
                     unsafe { simd::avx2::ssim_moments_avx2_cal(test, &self.ref_rgba, self.n) };
-                (
-                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
-                    sa,
-                    saa,
-                )
+                let s = ssim::finalize_ssim(
+                    &rgb3(&sa),
+                    &rgb3(&self.ssim_sb),
+                    &rgb3(&saa),
+                    &rgb3(&self.ssim_sbb),
+                    &rgb3(&sab),
+                    self.n,
+                    3,
+                );
+                (s, sa, saa, sab)
             }
             #[cfg(target_arch = "x86_64")]
             // Server option: channel-as-lane SIMD moments (16-wide, 4 px/iter). The
@@ -456,29 +467,44 @@ impl Comparer {
             Backend::Avx512Strict | Backend::Avx512Rsqrt => {
                 let (sa, saa, sab) =
                     unsafe { simd::avx512::ssim_moments_avx512(test, &self.ref_rgba, self.n) };
-                (
-                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
-                    sa,
-                    saa,
-                )
+                let s = ssim::finalize_ssim(
+                    &rgb3(&sa),
+                    &rgb3(&self.ssim_sb),
+                    &rgb3(&saa),
+                    &rgb3(&self.ssim_sbb),
+                    &rgb3(&sab),
+                    self.n,
+                    3,
+                );
+                (s, sa, saa, sab)
             }
             #[cfg(target_arch = "wasm32")]
             // wasm v128 channel-as-lane moments — bench-measured 3.73× over scalar.
             Backend::WasmSimd => {
                 let (sa, saa, sab) = simd::wasm::ssim_moments_wasm(test, &self.ref_rgba, self.n);
-                (
-                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
-                    sa,
-                    saa,
-                )
+                let s = ssim::finalize_ssim(
+                    &rgb3(&sa),
+                    &rgb3(&self.ssim_sb),
+                    &rgb3(&saa),
+                    &rgb3(&self.ssim_sbb),
+                    &rgb3(&sab),
+                    self.n,
+                    3,
+                );
+                (s, sa, saa, sab)
             }
             _ => {
                 let (sa, saa, sab) = ssim::ssim_sums(test, &self.ref_rgba, self.n, 4);
-                (
-                    ssim::finalize_ssim(&sa, &self.ssim_sb, &saa, &self.ssim_sbb, &sab, self.n, 3),
-                    sa,
-                    saa,
-                )
+                let s = ssim::finalize_ssim(
+                    &sa,
+                    &rgb3(&self.ssim_sb),
+                    &saa,
+                    &rgb3(&self.ssim_sbb),
+                    &sab,
+                    self.n,
+                    3,
+                );
+                (s, pad4(&sa), pad4(&saa), pad4(&sab))
             }
         }
     }
@@ -553,23 +579,43 @@ impl Comparer {
         }
     }
 
-    /// All three metrics. Scalar version calls each path; the SIMD override in a
-    /// later task fuses the deinterleave.
+    /// All three metrics. Scalar version calls each path; the SIMD backends derive
+    /// PSNR from the SSIM sums and skip the whole SSD pass.
     pub fn all(&mut self, test: &[u8]) -> Metrics {
         let butteraugli = self.butteraugli(test);
-        let psnr = self.psnr(test);
         // Fuse SSIM and channel_moments: the SSIM pass already accumulates the test
         // sums sa=Σx, saa=Σx² per channel, and mus/vars are exactly sa/n and
         // saa/n-mu². Deriving them here (bit-identical to channel_moments) removes a
         // full strided pass over the test buffer — flip-measured 38% off the
         // SSIM+moments work @24MP (examples/ssim_all_reuse_flip.rs, parity exact).
         // A short buffer makes the metric calls return NaN; guard moments the same way.
-        let (ssim, moments) = if test.len() == self.n * 4 {
-            let (s, sa, saa) = self.ssim_test_sums(test);
-            let (mus, vars, ch) = ssim::moments_from_sums(&sa, &saa, self.n, 3);
-            (s, ChannelMoments { mus, vars, ch })
+        let (ssim, psnr, moments) = if test.len() == self.n * 4 {
+            let (s, sa, saa, sab) = self.ssim_test_sums(test);
+            let (mus, vars, ch) = ssim::moments_from_sums(&rgb3(&sa), &rgb3(&saa), self.n, 3);
+            // Same trick, extended to PSNR: per channel SSD_c = Σa² + Σb² − 2Σab
+            // (integer-exact in u64; a²+b² ≥ 2ab so no underflow), summed over all
+            // 4 RGBA lanes — the exact u64 ssd_avx2/ssd_wasm computes over the flat
+            // buffer, so the derived PSNR is BIT-IDENTICAL to self.psnr(test) while
+            // deleting one full test+ref traversal. The SIMD moment kernels keep
+            // their alpha lanes for precisely this; the scalar backend leaves them
+            // 0, so it keeps calling the standalone psnr() unchanged.
+            let psnr = if matches!(self.backend, Backend::Scalar) {
+                self.psnr(test)
+            } else {
+                let mut sum_sq = 0u64;
+                for c in 0..4 {
+                    sum_sq += saa[c] + self.ssim_sbb[c] - 2 * sab[c];
+                }
+                if sum_sq == 0 {
+                    f32::INFINITY
+                } else {
+                    let mse = sum_sq as f64 / test.len() as f64;
+                    (10.0 * (255.0f64 * 255.0 / mse).log10()) as f32
+                }
+            };
+            (s, psnr, ChannelMoments { mus, vars, ch })
         } else {
-            (f32::NAN, ChannelMoments::default())
+            (f32::NAN, self.psnr(test), ChannelMoments::default())
         };
         Metrics {
             butteraugli,
@@ -726,13 +772,28 @@ fn convert_xyb_one(
     }
 }
 
+/// First three (RGB) lanes of a 4-lane sum — the shape `finalize_ssim` /
+/// `moments_from_sums` consume (three u64 copies, free).
+#[inline]
+fn rgb3(x: &[u64; 4]) -> [u64; 3] {
+    [x[0], x[1], x[2]]
+}
+
+/// Pad a 3-lane (RGB) sum to 4 lanes with alpha = 0. Scalar-backend arms only —
+/// the scalar backend never reads lane 3 (its PSNR stays the standalone pass).
+#[inline]
+fn pad4(x: &[u64; 3]) -> [u64; 4] {
+    [x[0], x[1], x[2], 0]
+}
+
 /// Reference per-channel moments (Σy, Σy²) over RGBA, dispatched by backend.
 /// The channel-as-lane SSIM kernel already computes exactly this: for `(b, b)`
 /// its `sa = Σy`, `saa = Σy²` (and `sab = Σy·y = Σy²`, discarded), so
 /// `(sa, saa) == (sb, sbb)` — INTEGER-EXACT, no output change. Reuses the
-/// flip-proven kernel instead of the scalar pass; stride 4 (RGBA), 3 channels.
+/// flip-proven kernel instead of the scalar pass; stride 4 (RGBA), 4 lanes
+/// (alpha feeds the PSNR-from-sums derivation in `all()`).
 /// Reference-build-only (Comparer::new).
-fn ref_moments_dispatch(backend: Backend, b: &[u8], np: usize) -> ([u64; 3], [u64; 3]) {
+fn ref_moments_dispatch(backend: Backend, b: &[u8], np: usize) -> ([u64; 4], [u64; 4]) {
     match backend {
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2Strict | Backend::Avx2Rsqrt => {
@@ -744,7 +805,17 @@ fn ref_moments_dispatch(backend: Backend, b: &[u8], np: usize) -> ([u64; 3], [u6
             let (sa, saa, _sab) = unsafe { simd::avx512::ssim_moments_avx512(b, b, np) };
             (sa, saa)
         }
-        _ => ssim::ref_moments(b, np, 4),
+        // wasm v128: same channel-as-lane reuse. REQUIRED for all()'s derived PSNR
+        // on the WasmSimd backend — its alpha autos must be real, not padded zeros.
+        #[cfg(target_arch = "wasm32")]
+        Backend::WasmSimd => {
+            let (sa, saa, _sab) = simd::wasm::ssim_moments_wasm(b, b, np);
+            (sa, saa)
+        }
+        _ => {
+            let (sb, sbb) = ssim::ref_moments(b, np, 4);
+            (pad4(&sb), pad4(&sbb))
+        }
     }
 }
 
@@ -999,6 +1070,36 @@ mod tests {
                 "2×4 butteraugli must be finite, got {score}"
             );
         }
+    }
+
+    /// The PSNR that all() derives from the SSIM sums (SSD_c = Σa²+Σb²−2Σab over
+    /// all 4 RGBA lanes) must be BIT-IDENTICAL to the standalone ssd-pass psnr() —
+    /// including when the alpha channel differs between test and ref, and in the
+    /// identical-buffer INFINITY case. On a scalar-only machine both paths are the
+    /// same call and this passes trivially.
+    #[test]
+    fn all_derived_psnr_bit_identical_to_standalone() {
+        let (w, h) = (33, 17); // odd pixel count → exercises the kernels' scalar tails
+        let np = w * h;
+        let img: Vec<u8> = (0..np * 4).map(|i| (i * 31 % 251) as u8).collect();
+        // Perturb ALL four channels, alpha included — the derived SSD must cover it.
+        let noisy: Vec<u8> = img
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| p.wrapping_add(((i * 7) % 13) as u8))
+            .collect();
+        let mut cmp = Comparer::new(img.clone(), w, h, Opts::default());
+        let m = cmp.all(&noisy);
+        let ps = cmp.psnr(&noisy);
+        assert_eq!(
+            m.psnr.to_bits(),
+            ps.to_bits(),
+            "derived psnr {} != standalone {}",
+            m.psnr,
+            ps
+        );
+        let mi = cmp.all(&img);
+        assert_eq!(mi.psnr, f32::INFINITY, "identical buffers must stay INFINITY");
     }
 
     /// Parity guard: all() must produce the same values as the three individual calls
