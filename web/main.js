@@ -1714,6 +1714,11 @@ async function blissOpfsLoad(card, assetId) {
     if (!bytes) return;
     if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
     if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
+    // The stored blob holds SENSOR-orientation pixels (the worker encodes from
+    // the un-rotated LookRenderer buffer), so both paints below go through the
+    // GPU-rotate draw. The EXIF tag is not in the blob — it comes from the
+    // card, already populated by the embedded-thumb decode that precedes this.
+    const ori = getCardState(card)?._thumbOrientation ?? 1;
 
     // BLSP-first: fire preview decode without transferring so full decode can follow.
     if (_hasBlspPrefix(bytes)) {
@@ -1721,7 +1726,7 @@ async function blissOpfsLoad(card, assetId) {
             if (!prev) return;
             if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
             if (getCardState(card)?._lightbox?.rgb) return; // full decode already painted
-            drawCanvas(lightboxCanvas, prev.w, prev.h, prev.rgb);
+            drawSensorWithOrientation(lightboxCanvas, prev.rgb, prev.w, prev.h, ori);
             setPaintedSourceBadge('bliss-preview');
             lbLoadingBadge.hidden = true;
             applyStraightenToLightboxCanvas(card);
@@ -1734,7 +1739,7 @@ async function blissOpfsLoad(card, assetId) {
     if (lightboxIndex < 0 || cards[lightboxIndex] !== card) return;
     if (getCardState(card)?._lightbox?.rgb) { drawLightboxForCard(card); return; }
     const { rgb, w, h } = result;
-    const blissFrame = drawCanvas(lightboxCanvas, w, h, rgb);
+    const blissFrame = drawSensorWithOrientation(lightboxCanvas, rgb, w, h, ori);
     if (lightboxCanvas.width > 0 && blissFrame) {
         captureCleanAndApplyLens(blissFrame);
     }
