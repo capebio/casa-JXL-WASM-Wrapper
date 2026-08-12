@@ -54,7 +54,7 @@ for (const __k of ['log', 'warn', 'error']) {
 
 let init, rawWasm;
 // A3: rgb_to_rgba removed — send RGB8 directly to JXL worker (saves ~250ms + 25% transfer)
-let process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8;
+let process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8;
 // K6#1: named-field look API (preferred over the positional *_with_flags forms).
 let process_orf_with_look, process_dng_with_look, process_cr2_with_look;
 // Task 7: options API — carries {look, denoise} so the RAW pipeline can apply
@@ -73,7 +73,7 @@ async function loadWasm() {
     }
     rawWasm = await import('./pkg/raw_converter_wasm.js');
     init = rawWasm.default;
-    ({ process_orf, process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8,
+    ({ process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, LookRenderer, rotate_rgb8,
        process_orf_with_look, process_dng_with_look, process_cr2_with_look,
        process_orf_with_options, process_dng_with_options, process_cr2_with_options, process_raw_mosaic_with_options,
        create_orf_denoise_session, create_dng_denoise_session, create_cr2_denoise_session, create_raw_mosaic_denoise_session,
@@ -596,7 +596,10 @@ function processImageFormat(id, bytes, opts, look, route) {
         } finally {
             fullRenderer.free();
         }
-        const rgbBuf = fullRgb.buffer.slice(fullRgb.byteOffset, fullRgb.byteOffset + fullRgb.byteLength);
+        // P0 (a44e6a96) twin: render_look returns an OWNED Uint8Array (byteOffset 0,
+        // spanning its whole buffer — pkg binding does getArrayU8FromWasm0(...).slice()),
+        // so re-slicing here was a redundant full-frame memcpy. Transfer directly.
+        const rgbBuf = fullRgb.buffer;
         fullRgb = null;
         self.postMessage(
             { id, type: WorkerMsg.ENCODE_REQUEST, pixels: rgbBuf, format: 'rgb8', width: w, height: h,
@@ -748,6 +751,12 @@ self.addEventListener('message', async (ev) => {
         cancelledTasks.delete(id);
         return;
     }
+    // Declared OUTSIDE the try so the finally below can free the wasm-side
+    // ProcessResult on every exit (monolithic, split, cancel, throw). Previously
+    // only the cancel checkpoint and the split path freed it: every monolithic
+    // decode leaked one ProcessResult, and a throw between the split phases
+    // permanently leaked the retained raw mosaic (~2·W·H bytes) in WASM memory.
+    let result = null;
     try {
         await ensureWasm();
 
@@ -899,7 +908,6 @@ self.addEventListener('message', async (ev) => {
         const phase1Flags = canSplit
             ? (OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW)
             : (OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT);
-        let result;
         // Task 11: learned denoise metadata, surfaced in phaseMs diagnostics.
         let learnedDenoiseBackend = null, learnedModelVersion = null, learnedDenoiseMs = 0;
         if (nativeRaw) {
@@ -955,8 +963,7 @@ self.addEventListener('message', async (ev) => {
         // decode result and emit nothing further (no renderer state cached yet).
         if (cancelledTasks.has(id)) {
             cancelledTasks.delete(id);
-            result.free();
-            return;
+            return; // the finally below frees `result`
         }
         // OUT_NO_ORIENT: result.width/height are sensor dims (pre-rotation).
         let w = result.width;
@@ -1037,11 +1044,17 @@ self.addEventListener('message', async (ev) => {
         const lbState = liveStateMap.get(id);
         const bigRgb = applyLookToState(lbState, look);
         // BLISS: encode lightbox-sized RGB8 before transferring bigRgb.
-        if (typeof bliss_encode_with_preview === 'function' && lbState.outW % 2 === 0) {
+        // bigRgb is SENSOR-orient with nativeW×nativeH dims (the LookRenderer is
+        // built with apply_rotation=false), so the encode MUST use the buffer
+        // dims: with the display dims (outW/outH), EXIF 6/8 files swap the row
+        // stride and the blob is silently scrambled — then persisted to OPFS.
+        // orientation travels with the message so the OPFS paint path can rotate
+        // at draw time (main.js side: deferred cross-file edit).
+        if (typeof bliss_encode_with_preview === 'function' && lbState.nativeW % 2 === 0) {
             try {
-                const blissBytes = bliss_encode_with_preview(bigRgb, lbState.outW, lbState.outH, 2, 2, 2);
+                const blissBytes = bliss_encode_with_preview(bigRgb, lbState.nativeW, lbState.nativeH, 2, 2, 2);
                 self.postMessage(
-                    { id, type: WorkerMsg.BLISS_READY, bliss: blissBytes.buffer, width: lbState.outW, height: lbState.outH },
+                    { id, type: WorkerMsg.BLISS_READY, bliss: blissBytes.buffer, width: lbState.nativeW, height: lbState.nativeH, orientation: lbState.orientation },
                     [blissBytes.buffer],
                 );
             } catch { /* non-fatal */ }
@@ -1069,7 +1082,7 @@ self.addEventListener('message', async (ev) => {
         let fullRgb, encW, encH, encTimings;
         if (canSplit) {
             const p2T0 = performance.now();
-            try {
+            {
                 // Same 14 look args, same order, as the phase-1 decoder. ORF finishes
                 // via finish_full_rgb8 (RGGB demosaic); DNG/CR2 via finish_dng_full_rgb8
                 // (CFA-phase demosaic + BaselineExposure fold). Both reuse the retained
@@ -1104,10 +1117,9 @@ self.addEventListener('message', async (ev) => {
                     },
                 };
                 fullRgb = result.take_rgb();
-            } finally {
-                // Always free the ProcessResult shell, even if finish_full_rgb8 throws
-                // (the retained raw is already freed inside the finish on its error path).
-                result.free();
+                // The ProcessResult shell is freed by the outer finally, even if
+                // finish_full_rgb8 throws (the retained raw is already freed inside
+                // the finish on its error path).
             }
         } else {
             encW = w;
@@ -1148,5 +1160,13 @@ self.addEventListener('message', async (ev) => {
             type: WorkerMsg.ERROR,
             error: (err && (err.message || String(err))) || 'unknown error',
         });
+    } finally {
+        // Single free site for the wasm-side ProcessResult (leak fix): taken
+        // buffers/renderers were already moved out, so this only reclaims the
+        // shell + any retained raw mosaic on the split path's error exits.
+        if (result) {
+            try { result.free(); } catch { /* already freed */ }
+            result = null;
+        }
     }
 });

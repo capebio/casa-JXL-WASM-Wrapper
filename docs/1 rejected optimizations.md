@@ -1905,3 +1905,41 @@ Huffman→predictor dependency chain, which defeats the usual parallel/SIMD tric
 3. **Cross-cutting output change.** Substitution before demosaic alters RAW-path output for every profiled camera — exactly the class of silent whole-corpus drift the golden-ledger tests exist to catch; landing it deserves its own reviewed change with re-pinned goldens, not a rider on a kernel-optimization branch.
 
 **Disposition:** implement as its own feature branch with dark-frame fixtures and re-pinned goldens. Everything else in the Agent 4 handoff (4.1–4.4, 4.6–4.9) was implemented on `lens2-s4-w9d4`.
+
+## Agent 1 lens-review re-verify — web/worker.js + worker/pool packages (2026-08-08, branch lens2-s1-k7q3)
+
+Handoff: `docs/outputs/ChatGPT plus Claude Outputs/0 Agent Instructions to Lens Investigating INTEGRATED - 2026-08-08.md`,
+section "Agent 1", re-verified against main @ df3b30b7 (~19 commits after the handoff was written).
+Items 1.1/1.2/1.3/1.5/1.7/1.9 survived re-verification and were implemented on this branch.
+
+- **1.4 "Poisoned wasm instance reused after a RuntimeError — reset `wasmReady = null` so
+  ensureWasm re-instantiates."** Rejected: the fix's core mechanism is invalidated by the shipped
+  pkg. `web/pkg/raw_converter_wasm.js` `__wbg_init` (L3694) and `initSync` (L3674) both start with
+  `if (wasm !== undefined) return wasm;` — the module-level `wasm` binding never resets, and
+  `import()` caches the module namespace, so after a trap the worker CANNOT re-instantiate its own
+  wasm; `wasmReady = null` just re-runs init() and gets the same poisoned instance back. The
+  defect itself (a trapped worker returned to the free pool) is real but the only effective
+  recovery is worker replacement — main.js's pool 'error' handler must respawn instead of
+  shrinking (`this.size - 1`), which is a cross-file edit in Agent 5's primary file (approval
+  unavailable tonight). Implementing only the in-worker state-map clearing would not deliver the
+  claimed benefit and can degrade recoverable-trap cases. Defer as one combined change: pkg
+  rebuilt with a re-init path (or worker self-termination protocol) + main.js respawn.
+- **1.6 "Route RW2/NEF/NRW to the native wasm decoders instead of LibRaw."** Rejected for
+  tonight; the handoff itself marks it as **dependent on Agent 3 item 3.5** (panasonic.rs
+  hostile-dimension guards), and re-verification against current main shows those guards have NOT
+  landed: `crates/raw-pipeline/src/panasonic.rs` still has no `check_dims`/`checked_mul`/200 MP
+  cap (the only clamp is the DPCM pixel clamp at L278) — routing browser input to it now would
+  promote unguarded parsers to a hostile trust boundary. It additionally needs a new
+  `src/lib.rs` wasm export (cross-file, approval required), per-format gating through
+  `tools/colour-verify-corpus.mjs` (out of tonight's no-benchmarks scope), and it changes decode
+  output bytes (LibRaw → native), violating the byte-identical constraint. Revisit once 3.5
+  lands; flip RW2/RWL first, NEF only after MakerNote WB replaces the placeholder.
+- **1.8 "tiled-decode-pool: priority-ordered waiter queue + velocity-driven prefetch wiring."**
+  Rejected for tonight. Re-verified premise: the waiter queue is still plain FIFO
+  (`tiled-decode-pool.ts` L313/L625), the protocol `priority` field is still dead, and
+  `prefetchViewport`/`predictRegion` still have zero production callers (only decode-level.ts
+  itself + its tests). But that same fact defeats a part-1-only implementation: with no prefetch
+  callers, every waiter is the same tier, so a priority queue is pure dead code until part 2 (the
+  pan/zoom velocity wiring in `web/lightbox/pyramid-lightbox.js`) lands — and that is a
+  cross-file edit requiring approval. Implement both halves together in a session that may touch
+  the lightbox file.

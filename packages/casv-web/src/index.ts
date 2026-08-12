@@ -401,11 +401,12 @@ export async function* playCasv(
 
 /** Expand tightly-packed RGB8 into a preallocated RGBA8 buffer (alpha = 255). */
 function rgb8ToRgba(rgb: Uint8Array, pixels: number, out: Uint8Array): void {
-  for (let i = 0; i < pixels; i++) {
-    out[i * 4] = rgb[i * 3]!;
-    out[i * 4 + 1] = rgb[i * 3 + 1]!;
-    out[i * 4 + 2] = rgb[i * 3 + 2]!;
-    out[i * 4 + 3] = 255;
+  // One packed little-endian 0xFFBBGGRR store per pixel (~4x fewer stores) —
+  // the measured idiom from web/main.js rgbToRgba. `out` is preallocated at
+  // offset 0 by the only caller; byteOffset is honoured anyway for safety.
+  const out32 = new Uint32Array(out.buffer, out.byteOffset, pixels);
+  for (let i = 0, p = 0; i < pixels; i++, p += 3) {
+    out32[i] = rgb[p]! | (rgb[p + 1]! << 8) | (rgb[p + 2]! << 16) | 0xff000000;
   }
 }
 
