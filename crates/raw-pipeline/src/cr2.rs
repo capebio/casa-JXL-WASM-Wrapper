@@ -777,9 +777,26 @@ pub fn reassemble_slices_scatter(
     raster
 }
 
-/// Locate the raw LJPEG strip and its output geometry (bench/parity tooling
-/// only — mirrors the strip/SOF3 walk in decode_impl without decoding).
+/// Locate the raw LJPEG strip and its output geometry — mirrors the strip/SOF3
+/// walk in decode_impl without decoding.
 /// Returns (strip_offset, strip_len, stride_pixels = sof_w*ncomp, rows = sof_h).
+///
+/// **NOT bench tooling any more, whatever `#[doc(hidden)]` suggests.** The
+/// sibling `blizz` tree's `src/ingest.rs` calls this to build a BLKB archive of
+/// a CR2: it needs the byte range of the sensor payload so everything OUTSIDE
+/// it — maker notes, GPS, thumbnails — can be carried through verbatim as the
+/// archive's sidecar. This is the only function here that reports where the
+/// payload lives, so there is no other way to do it.
+///
+/// It stays `#[doc(hidden)]` because it is not a shape this crate wants to
+/// promise the world. But **changing or removing it breaks camera RAW ingest in
+/// another repository**, which will not show up in this crate's tests. If you
+/// need to change it, say so — `blizz`'s documented fallback is to go back to
+/// *refusing* CR2 rather than quietly writing an archive with an empty sidecar,
+/// and someone has to make that call deliberately.
+///
+/// `blizz_ingest_api_pins` at the bottom of this file fails if the signature
+/// moves, so the break is loud and local instead of silent and remote.
 #[doc(hidden)]
 pub fn ljpeg_strip_geometry(data: &[u8]) -> Result<(usize, usize, usize, usize)> {
     if data.len() < 16 {

@@ -113,8 +113,22 @@ pub fn decode(path: &std::path::Path) -> Result<DngImage> {
 }
 
 /// Byte ranges of each LJPEG-compressed tile (compression=7) within `data`.
-/// Exposed for A/B benchmarking the LJPEG decoder in isolation; not part of the
-/// stable API.
+///
+/// **Two callers, and the second one is not a benchmark.** It was exposed for
+/// A/B benchmarking the LJPEG decoder in isolation, and the sibling `blizz`
+/// tree's `src/ingest.rs` now also calls it to build a BLKB archive of a DNG:
+/// it needs the byte ranges of the sensor payload so everything outside them —
+/// maker notes, GPS, thumbnails — rides along verbatim in the archive's
+/// sidecar. Nothing else here reports where the payload lives.
+///
+/// Still not part of the stable API, and still `#[doc(hidden)]`. But
+/// **changing or removing it breaks camera RAW ingest in another repository**,
+/// invisibly to this crate's tests. `blizz`'s documented fallback is to go back
+/// to *refusing* DNG rather than writing an archive with an empty sidecar; that
+/// is a decision to take deliberately, not a consequence to discover.
+///
+/// `blizz_ingest_api_pins` at the bottom of this file fails if the signature
+/// moves.
 #[doc(hidden)]
 pub fn ljpeg_tile_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
     let (_state, raw, _le) = load_dng(data)?;
