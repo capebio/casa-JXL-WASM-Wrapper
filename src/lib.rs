@@ -33,12 +33,18 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 // === Lens 22 demosaic SIMD flip-flop (bench-only; driven by tools/demosaic-flipflop.mjs) ===
 // Times are taken in the JS host (wasm32-unknown-unknown has no wall clock); these exports just
 // run one demosaic and return a cheap checksum so wasm-bindgen marshalling is constant.
+// All bench-only exports in this crate are gated behind `--features bench-exports` (2.1):
+// production pkg builds omit them so DCE can strip the bench-only call graphs they pin.
 use std::cell::RefCell;
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static DEMO_BENCH: RefCell<(Vec<u16>, usize, usize)> = const { RefCell::new((Vec::new(), 0, 0)) };
+}
+thread_local! {
     // Scratch buffer for LookRenderer::render() texture/clarity path — avoids Vec::clone on every slider drag.
     static RENDER_SCRATCH: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
+#[cfg(feature = "bench-exports")]
 fn demo_checksum(v: &[u16]) -> u32 {
     v.iter()
         .fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
@@ -135,6 +141,7 @@ impl RawStreamExporter {
         unsafe { std::slice::from_raw_parts(ptr, ysize * stride) }.to_vec()
     }
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_prepare(w: usize, h: usize) {
     let raw: Vec<u16> = (0..w * h)
@@ -142,6 +149,7 @@ pub fn demosaic_bench_prepare(w: usize, h: usize) {
         .collect();
     DEMO_BENCH.with(|b| *b.borrow_mut() = (raw, w, h));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_scalar() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -149,6 +157,7 @@ pub fn demosaic_bench_scalar() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb(&g.0, g.1, g.2).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_simd() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -156,6 +165,7 @@ pub fn demosaic_bench_simd() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_equal() -> bool {
     DEMO_BENCH.with(|b| {
@@ -164,6 +174,7 @@ pub fn demosaic_bench_equal() -> bool {
             == demosaic::demosaic_rggb_simd(&g.0, g.1, g.2).unwrap()
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_first_diff() -> i32 {
     DEMO_BENCH.with(|b| {
@@ -179,6 +190,7 @@ pub fn demosaic_bench_first_diff() -> i32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 fn demo_checksum3(r: &[u16], g: &[u16], b: &[u16]) -> u32 {
     let mut c = demo_checksum(r);
     c = c.wrapping_mul(31).wrapping_add(demo_checksum(g));
@@ -186,6 +198,7 @@ fn demo_checksum3(r: &[u16], g: &[u16], b: &[u16]) -> u32 {
     c
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_scalar() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -195,6 +208,7 @@ pub fn demosaic_bench_planar_scalar() -> u32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_simd() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -204,6 +218,7 @@ pub fn demosaic_bench_planar_simd() -> u32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_equal() -> bool {
     DEMO_BENCH.with(|b| {
@@ -213,6 +228,7 @@ pub fn demosaic_bench_planar_equal() -> bool {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_planar_first_diff() -> i32 {
     DEMO_BENCH.with(|b| {
@@ -235,6 +251,7 @@ pub fn demosaic_bench_planar_first_diff() -> i32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_shuffle_simd() -> u32 {
     DEMO_BENCH.with(|b| {
@@ -243,6 +260,7 @@ pub fn demosaic_bench_shuffle_simd() -> u32 {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_shuffle_equal() -> bool {
     DEMO_BENCH.with(|b| {
@@ -252,6 +270,7 @@ pub fn demosaic_bench_shuffle_equal() -> bool {
     })
 }
 
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demosaic_bench_shuffle_first_diff() -> i32 {
     DEMO_BENCH.with(|b| {
@@ -273,15 +292,18 @@ pub fn demosaic_bench_shuffle_first_diff() -> i32 {
 // the measurement the wide-refill wasm deferral (Questions_deferred D-wide-refill) never had.
 // `_equal` is the bit-exact correctness pin. Output buffer is reused so the timed ratio isn't
 // diluted by a per-call alloc (both sides would pay it equally anyway).
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static DECOMP_BENCH: RefCell<(Vec<u8>, usize, usize, Vec<u16>)> =
         const { RefCell::new((Vec::new(), 0, 0, Vec::new())) };
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_prepare(w: usize, h: usize, seed: u32) {
     let payload = decompress::bench_synth_payload(w, h, (seed as u64) ^ 0x9E37_79B9_7F4A_7C15);
     DECOMP_BENCH.with(|b| *b.borrow_mut() = (payload, w, h, vec![0u16; w * h]));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_byteloop() -> u32 {
     DECOMP_BENCH.with(|b| {
@@ -291,6 +313,7 @@ pub fn decompress_bench_byteloop() -> u32 {
         demo_checksum(out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_wide() -> u32 {
     DECOMP_BENCH.with(|b| {
@@ -300,6 +323,7 @@ pub fn decompress_bench_wide() -> u32 {
         demo_checksum(out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn decompress_bench_equal() -> bool {
     DECOMP_BENCH.with(|b| {
@@ -319,10 +343,12 @@ pub fn decompress_bench_equal() -> bool {
 // pool engaged (initThreadPool(N)) — quantifying how much of the "990ms" is a threads-off
 // artifact. The par paths are `#[cfg(feature="parallel")]`; a non-parallel pkg-bench build
 // times the ST baseline, the parallel-wasm pkg times MT.
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static DEMTONE_BENCH: RefCell<(Vec<u16>, Vec<u16>, usize, usize, Vec<u8>)> =
         const { RefCell::new((Vec::new(), Vec::new(), 0, 0, Vec::new())) };
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demtone_bench_prepare(w: usize, h: usize) {
     // Deterministic synthetic Bayer mosaic + one MHC demosaic to seed the tone input.
@@ -330,6 +356,7 @@ pub fn demtone_bench_prepare(w: usize, h: usize) {
     let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
     DEMTONE_BENCH.with(|b| *b.borrow_mut() = (raw, rgb16, w, h, vec![0u8; w * h * 3]));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc() -> u32 {
     DEMTONE_BENCH.with(|b| {
@@ -344,6 +371,7 @@ pub fn demtone_bench_mhc() -> u32 {
 // ≥15%-median browser+Node-WASM flipflop gate (.flipflop/tests/mhc-simd128.mjs) from a single
 // pkg. `demtone_bench_mhc_equal` pins that the two are BIT-EXACT before crediting any speed.
 // wasm-only: the forced-interior helpers exist only under target_arch=wasm32.
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc_scalar() -> u32 {
@@ -353,6 +381,7 @@ pub fn demtone_bench_mhc_scalar() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_mhc_scalar_interior(raw, *w, *h).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc_simd128() -> u32 {
@@ -362,6 +391,7 @@ pub fn demtone_bench_mhc_simd128() -> u32 {
         demo_checksum(&demosaic::demosaic_rggb_mhc_simd128_interior(raw, *w, *h).unwrap())
     })
 }
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn demtone_bench_mhc_equal() -> bool {
@@ -373,6 +403,7 @@ pub fn demtone_bench_mhc_equal() -> bool {
         s == v
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn demtone_bench_tone() -> u32 {
     DEMTONE_BENCH.with(|b| {
@@ -388,16 +419,20 @@ pub fn demtone_bench_tone() -> u32 {
 // Sequential (decompress whole → demosaic_rggb_mhc → process_into_auto, both MT via par) vs
 // pipelined (producer decodes strips serially while par_bridge consumers demosaic+tone them,
 // overlapping the parallel demosaic+tone with the serial decode). `_equal` pins byte-identity.
+#[cfg(feature = "bench-exports")]
 struct PipeBench { payload: Vec<u8>, w: usize, h: usize, params: raw_pipeline::pipeline::PipelineParams, out: Vec<u8> }
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static PIPE_BENCH: RefCell<Option<PipeBench>> = const { RefCell::new(None) };
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_prepare(w: usize, h: usize, seed: u32) {
     let payload = decompress::bench_synth_payload(w, h, (seed as u64) ^ 0xA5A5_1234_ABCD_0001);
     let params = raw_pipeline::pipeline::PipelineParams::default_olympus();
     PIPE_BENCH.with(|b| *b.borrow_mut() = Some(PipeBench { payload, w, h, params, out: vec![0u8; w * h * 3] }));
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_pipelined() -> u32 {
     PIPE_BENCH.with(|b| {
@@ -408,6 +443,7 @@ pub fn pipeline_bench_pipelined() -> u32 {
         demo_checksum_u8(&pb.out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_sequential() -> u32 {
     PIPE_BENCH.with(|b| {
@@ -420,6 +456,7 @@ pub fn pipeline_bench_sequential() -> u32 {
         demo_checksum_u8(&pb.out)
     })
 }
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn pipeline_bench_equal() -> bool {
     PIPE_BENCH.with(|b| {
@@ -436,6 +473,7 @@ pub fn pipeline_bench_equal() -> bool {
         seq == pip
     })
 }
+#[cfg(feature = "bench-exports")]
 fn demo_checksum_u8(v: &[u8]) -> u32 {
     v.iter().fold(0u32, |a, &x| a.wrapping_mul(31).wrapping_add(x as u32))
 }
@@ -1275,6 +1313,33 @@ pub fn estimate_decode_peak_bytes(width: u32, height: u32, output_flags: u32) ->
 /// histogram floor of real E-M1 III files sits here (~256).
 const OLYMPUS_BLACK_LEVEL: u16 = 256;
 
+/// Boundary hardening (K6#1 family): reject non-finite numbers at the JS↔WASM
+/// options parsers. `DenoiseOptions::clamped()` uses `f32::clamp`, which passes
+/// NaN through, and a NaN look param reaches `base + strength*(denoised-base)` /
+/// the tone pipeline — NaN pixels quantise to 0 and the frame goes silently
+/// black. Returns the error as a plain String so the check is unit-testable
+/// natively (JsError construction needs a JS runtime).
+pub(crate) fn require_finite(name: &str, v: f64) -> Result<f64, String> {
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(format!("'{name}' must be a finite number, got {v}"))
+    }
+}
+
+#[cfg(test)]
+mod require_finite_tests {
+    use super::require_finite;
+    #[test]
+    fn finite_passes_nonfinite_rejected() {
+        assert_eq!(require_finite("x", 1.5), Ok(1.5));
+        assert_eq!(require_finite("x", 0.0), Ok(0.0));
+        assert!(require_finite("x", f64::NAN).is_err());
+        assert!(require_finite("x", f64::INFINITY).is_err());
+        assert!(require_finite("x", f64::NEG_INFINITY).is_err());
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LookOverrides {
     wb_r: f32,
@@ -1321,8 +1386,10 @@ impl LookOverrides {
     /// Contract (K6#1): **unknown key → `JsError`** (kills the silent-typo class
     /// that the 14-positional-arg API allowed); **missing key → default** (neutral;
     /// forward-compatible as the look grows). `null`/`undefined` → all-neutral.
-    /// Every recognized value must be a number (NaN is a valid number and is how
-    /// `wbR`/`wbB` request the camera WB).
+    /// Every recognized value must be a **finite** number — a NaN/Infinity (a JS
+    /// `0/0` typo) would otherwise flow into the tone pipeline and produce a
+    /// symptomless black frame. Sole exception: `wbR`/`wbB`, where NaN is the
+    /// documented "use camera WB" sentinel.
     fn from_js(obj: &JsValue) -> Result<LookOverrides, JsError> {
         let mut look = LookOverrides::neutral();
         if obj.is_undefined() || obj.is_null() {
@@ -1342,21 +1409,28 @@ impl LookOverrides {
                     .map(|x| x as f32)
                     .ok_or_else(|| JsError::new(&format!("look param '{k}' must be a number")))
             };
+            // Finite-checked after the f32 cast (an out-of-range f64 casts to
+            // Infinity). wbR/wbB keep bare `num`: NaN is their camera-WB sentinel.
+            let fin = || -> Result<f32, JsError> {
+                let v = num()?;
+                require_finite(&format!("look.{k}"), v as f64).map_err(|e| JsError::new(&e))?;
+                Ok(v)
+            };
             match k.as_str() {
-                "exposureEv" => look.exposure_ev = num()?,
-                "contrast" => look.contrast = num()?,
-                "highlights" => look.highlights = num()?,
-                "shadows" => look.shadows = num()?,
-                "whites" => look.whites = num()?,
-                "blacks" => look.blacks = num()?,
-                "saturation" => look.saturation = num()?,
-                "vibrance" => look.vibrance = num()?,
-                "temp" => look.temp = num()?,
-                "tint" => look.tint = num()?,
+                "exposureEv" => look.exposure_ev = fin()?,
+                "contrast" => look.contrast = fin()?,
+                "highlights" => look.highlights = fin()?,
+                "shadows" => look.shadows = fin()?,
+                "whites" => look.whites = fin()?,
+                "blacks" => look.blacks = fin()?,
+                "saturation" => look.saturation = fin()?,
+                "vibrance" => look.vibrance = fin()?,
+                "temp" => look.temp = fin()?,
+                "tint" => look.tint = fin()?,
                 "wbR" => look.wb_r = num()?,
                 "wbB" => look.wb_b = num()?,
-                "texture" => look.texture = num()?,
-                "clarity" => look.clarity = num()?,
+                "texture" => look.texture = fin()?,
+                "clarity" => look.clarity = fin()?,
                 other => {
                     return Err(JsError::new(&format!(
                         "unknown look param '{other}' (allowed: exposureEv, contrast, \
@@ -3172,17 +3246,28 @@ pub fn apply_look(
 #[wasm_bindgen]
 pub fn rgb_to_rgba(rgb: &[u8]) -> Vec<u8> {
     let n = rgb.len() / 3;
-    let mut out = vec![255u8; n * 4];
-    let done = rgb_to_rgba_simd(rgb, &mut out, n);
+    let mut out = vec![0u8; n * 4];
+    rgb_to_rgba_into(rgb, &mut out);
+    out
+}
+
+/// Allocation-free core of [`rgb_to_rgba`]: convert into a caller-provided
+/// buffer (SIMD bulk + scalar tail, every output byte written — alpha included).
+/// Converts `min(rgb.len()/3, out.len()/4)` pixels; returns the count.
+/// Byte-identical output to `rgb_to_rgba` over the converted range.
+pub(crate) fn rgb_to_rgba_into(rgb: &[u8], out: &mut [u8]) -> usize {
+    let n = (rgb.len() / 3).min(out.len() / 4);
+    let done = rgb_to_rgba_simd(rgb, out, n);
     let (mut si, mut di) = (done * 3, done * 4);
     for _ in done..n {
         out[di] = rgb[si];
         out[di + 1] = rgb[si + 1];
         out[di + 2] = rgb[si + 2];
+        out[di + 3] = 255;
         si += 3;
         di += 4;
     }
-    out
+    n
 }
 
 /// Convert interleaved RGB16 → RGBA16 (alpha = 0xFFFF). Returns a `Uint16Array`-compatible
@@ -4049,6 +4134,7 @@ pub fn parse_orf_metadata(data: &[u8]) -> Result<OrfMetadata, JsError> {
 
 /// Timing results for the decompress + demosaic stages only.
 /// Skips tonemap, downscale, and orientation — isolates raw decode cost.
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub struct DecodeBench {
     #[wasm_bindgen(readonly)]
@@ -4063,6 +4149,7 @@ pub struct DecodeBench {
 
 /// Benchmark ORF decompress + demosaic without tonemap/downscale/orientation.
 /// Use to measure decoder cost in isolation when tuning WASM flags or algorithms.
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn bench_decode_orf(data: &[u8]) -> Result<DecodeBench, JsError> {
     let info = tiff::parse(data).map_err(|e| JsError::new(&e.to_string()))?;
@@ -5899,6 +5986,21 @@ fn metrics_to_js(m: &Metrics) -> JsValue {
     );
     let _ = js_sys::Reflect::set(&o, &"ssim".into(), &JsValue::from_f64(m.ssim as f64));
     let _ = js_sys::Reflect::set(&o, &"psnr".into(), &JsValue::from_f64(m.psnr as f64));
+    // ChannelMoments come free from the SSIM sums (the flip-measured 38% fusion in
+    // Comparer::all) — serialize them so web/jxl-frame-stats-worker.js can drop its
+    // scalar-JS computeChannelMoments pass (a full pixel traversal per progressive
+    // pass). Shape mirrors computeChannelMoments' return: { mus, vars, ch }.
+    let mus = js_sys::Array::new();
+    let vars = js_sys::Array::new();
+    for c in 0..m.moments.ch.min(3) {
+        mus.push(&JsValue::from_f64(m.moments.mus[c] as f64));
+        vars.push(&JsValue::from_f64(m.moments.vars[c] as f64));
+    }
+    let mo = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&mo, &"mus".into(), &mus);
+    let _ = js_sys::Reflect::set(&mo, &"vars".into(), &vars);
+    let _ = js_sys::Reflect::set(&mo, &"ch".into(), &JsValue::from_f64(m.moments.ch as f64));
+    let _ = js_sys::Reflect::set(&o, &"moments".into(), &mo);
     o.into()
 }
 
@@ -6016,6 +6118,7 @@ mod perceptual_parity_ffi {
 // The buffer is filled by the SAME LCG the JS harness uses, so results are byte-comparable.
 // =====================================================================================
 
+#[cfg(feature = "bench-exports")]
 thread_local! {
     static FS_BENCH: RefCell<(Vec<u8>, usize, usize)> = const { RefCell::new((Vec::new(), 0, 0)) };
 }
@@ -6025,6 +6128,7 @@ const FS_FNV_OFFSET: u32 = 0x811c_9dc5;
 
 /// Fill the resident buffer with the same LCG byte stream the JS harness uses:
 ///   s = s*1103515245 + 12345 (wrapping u32); byte = s & 0xff
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_prepare(w: usize, h: usize) {
     let len = w * h * 4;
@@ -6080,6 +6184,7 @@ fn fs_to_js(r: &FsRaw, px: usize) -> JsValue {
 }
 
 /// Exact byte-wise FNV (identical hash + stats to the shipped JS analyzeProgressiveFrame).
+#[cfg(feature = "bench-exports")]
 fn fs_core_scalar(d: &[u8], px: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
@@ -6127,6 +6232,7 @@ fn fs_core_scalar(d: &[u8], px: usize) -> FsRaw {
 /// De-serialized word-hash + 4-pixel-unrolled stats. The hash mixes the whole 32-bit
 /// pixel word with 4 independent lanes (ILP), breaking FNV's serial dependency chain.
 /// Hash identity differs from byte-FNV (migration-allowed); all other stats are identical.
+#[cfg(feature = "bench-exports")]
 fn fs_core_fast(d: &[u8], px: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
@@ -6201,6 +6307,7 @@ fn fs_core_fast(d: &[u8], px: usize) -> FsRaw {
 }
 
 /// Scan the resident buffer with the exact byte-FNV kernel (no per-call copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_scalar() -> JsValue {
     FS_BENCH.with(|b| {
@@ -6211,6 +6318,7 @@ pub fn fstats_scalar() -> JsValue {
 }
 
 /// Scan the resident buffer with the fast word-hash + ILP kernel (no per-call copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_fast() -> JsValue {
     FS_BENCH.with(|b| {
@@ -6222,6 +6330,7 @@ pub fn fstats_fast() -> JsValue {
 
 /// Exact byte-FNV kernel over a buffer passed across the boundary (wasm-bindgen copies
 /// `pixels` into wasm linear memory on every call). Isolates the copy cost vs resident.
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_copy(pixels: &[u8], width: usize, height: usize) -> JsValue {
     let px = width.saturating_mul(height);
@@ -6369,6 +6478,7 @@ fn fs_core_simd(d: &[u8], px: usize) -> FsRaw {
 }
 
 /// Scan the resident buffer with the hand-written v128 kernel (no per-call copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_simd() -> JsValue {
     FS_BENCH.with(|b| {
@@ -6386,6 +6496,7 @@ pub fn fstats_simd() -> JsValue {
 // falls back to the zero-filling scalar path (identical semantics to the JS kernel).
 // -------------------------------------------------------------------------------------
 
+#[cfg(feature = "bench-exports")]
 #[cfg(target_arch = "wasm32")]
 fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     use core::arch::wasm32::*;
@@ -6497,6 +6608,7 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     }
 }
 
+#[cfg(feature = "bench-exports")]
 #[cfg(not(target_arch = "wasm32"))]
 fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
     fs_core_scalar(d, px)
@@ -6609,6 +6721,7 @@ fn fs_core_trunc_word(d: &[u8], px: usize, limit: usize) -> FsRaw {
 
 /// Truncation-safe exact kernel: zero-fills bytes past `limit` (identical to the JS
 /// truncated path). Used when the supplied buffer is shorter than width*height*4.
+#[cfg(feature = "bench-exports")]
 fn fs_core_trunc_exact(d: &[u8], px: usize, limit: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);
@@ -6682,6 +6795,7 @@ pub fn frame_stats(pixels: &[u8], width: usize, height: usize) -> JsValue {
 }
 
 /// Bench probe for the production exact-hash SIMD kernel (resident buffer, no copy).
+#[cfg(feature = "bench-exports")]
 #[wasm_bindgen]
 pub fn fstats_simd_exact() -> JsValue {
     FS_BENCH.with(|b| {
@@ -7076,6 +7190,12 @@ pub struct FableDeltaSession {
     inner: raw_pipeline::fable_braid::DeltaDecodeSession,
     last_w: u32,
     last_h: u32,
+    /// RGB8 of the last frame this session returned, retained for
+    /// `decode_delta_resident` so JS never re-uploads the previous frame
+    /// across the boundary every P-frame (a w·h·3 copy at playback rate).
+    /// Seeded by `decode_intra`; cleared by the explicit-`prev` `decode_delta`
+    /// (mixing the two APIs would leave a stale resident copy).
+    last_frame: Option<Vec<u8>>,
 }
 
 #[wasm_bindgen]
@@ -7086,6 +7206,7 @@ impl FableDeltaSession {
             inner: raw_pipeline::fable_braid::DeltaDecodeSession::new(),
             last_w: 0,
             last_h: 0,
+            last_frame: None,
         }
     }
 
@@ -7096,6 +7217,9 @@ impl FableDeltaSession {
             Some((px, w, h)) => {
                 self.last_w = w;
                 self.last_h = h;
+                // Retain a copy so decode_delta_resident can follow immediately
+                // (an in-wasm memcpy per I-frame, i.e. once per GOP).
+                self.last_frame = Some(px.clone());
                 Ok(px)
             }
             None => Err(JsError::new(
@@ -7106,6 +7230,7 @@ impl FableDeltaSession {
 
     /// Decode a temporal-delta fable frame against `prev` (the RGB8 this session
     /// returned for the previous frame). `w`/`h` are the current frame dims.
+    /// Prefer [`Self::decode_delta_resident`], which keeps `prev` wasm-side.
     pub fn decode_delta(
         &mut self,
         bytes: &[u8],
@@ -7113,10 +7238,35 @@ impl FableDeltaSession {
         w: u32,
         h: u32,
     ) -> Result<Vec<u8>, JsError> {
+        // Explicit-prev API: drop the resident copy rather than pay a per-P-frame
+        // clone maintaining it. A later decode_delta_resident then errors cleanly
+        // instead of reconstructing against a stale frame.
+        self.last_frame = None;
         match self.inner.decode_delta(bytes, prev, w, h) {
             Some(px) => {
                 self.last_w = w;
                 self.last_h = h;
+                Ok(px)
+            }
+            None => Err(JsError::new(
+                "fable decode_delta failed (corrupt stream or dim mismatch)",
+            )),
+        }
+    }
+
+    /// Decode a temporal-delta fable frame against the **session-resident**
+    /// previous frame (retained from `decode_intra` / the previous call), so the
+    /// caller never round-trips the prior frame across the JS↔WASM boundary.
+    /// Dims are the resident frame's. Errors if no resident frame exists — call
+    /// `decode_intra` first (the explicit-`prev` `decode_delta` clears it).
+    pub fn decode_delta_resident(&mut self, bytes: &[u8]) -> Result<Vec<u8>, JsError> {
+        let (w, h) = (self.last_w, self.last_h);
+        let prev = self.last_frame.as_deref().ok_or_else(|| {
+            JsError::new("no resident previous frame — call decode_intra first")
+        })?;
+        match self.inner.decode_delta(bytes, prev, w, h) {
+            Some(px) => {
+                self.last_frame = Some(px.clone());
                 Ok(px)
             }
             None => Err(JsError::new(
