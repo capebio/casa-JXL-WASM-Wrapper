@@ -25,11 +25,24 @@
 //! fixture set (`raw-converter/tests/NEF Raws/`), that one gate accounted for 19
 //! of 34 failures — far more than any compression mode.
 //!
-//! Still out: **CR3** (wraps CRX, a wavelet codec) and **CRW** (CIFF, not TIFF).
-//! Also unsupported here: Nikon's high-efficiency modes on the newest Z bodies
-//! and D810 small-raw, whose 0x0096 table is not where this looks for it, the
-//! D80's 16-bit SubIFD, and COOLSCAN scanner NEFs at 8- and 16-bit
-//! uncompressed.
+//! Two more layout facts the fixtures settled, both of which produce a plane
+//! that decodes without error and is WRONG if guessed at:
+//!
+//! - **Two bytes a pixel means words, not packed bits, at any declared depth.**
+//!   14-bit uncompressed measures exactly 2.000 B/px on the D3, D300 and D3S.
+//!   Read as packed 14-bit it is noise.
+//! - **The sensor is split across strips.** A D1H uses 407 of them; reading
+//!   only `StripOffsets[0]` gives a 60 kB buffer where four megabytes are
+//!   needed. Strips are checked for contiguity rather than assumed, so the
+//!   reported payload range cannot silently swallow bytes lying between them.
+//!
+//! Still out: **CR3** (wraps CRX, a wavelet codec) and **CRW** (CIFF, not
+//! TIFF). Within NEF: Nikon's high-efficiency modes on the newest Z bodies and
+//! D810 small-raw, whose 0x0096 table is not where this looks; the D1X's
+//! signature-less MakerNote; the D100; and lossless-JPEG NEF (compression 7),
+//! for which `ljpeg.rs` already holds the decoder and only the dispatch is
+//! missing. COOLSCAN scanner NEFs are refused on purpose -- they are RGB, not
+//! a CFA plane.
 
 use std::collections::HashMap;
 
@@ -186,6 +199,54 @@ fn tag_u32(m: &HashMap<u16, Entry>, t: u16) -> Option<u32> {
         4 if e.val.len() >= 4 => Some(e.end.u32(&e.val)),
         _ => None,
     }
+}
+
+/// Every value of a tag, not just the first.
+///
+/// `tag_u32` returns element zero, which is right for a scalar and silently
+/// wrong for `StripOffsets`/`StripByteCounts`: a D1H splits its sensor across
+/// many strips, and reading one of them yields a 60 kB buffer where four
+/// megabytes were needed.
+fn tag_u32s(m: &HashMap<u16, Entry>, t: u16) -> Vec<u32> {
+    let Some(e) = m.get(&t) else { return Vec::new() };
+    let step = type_size(e.typ);
+    if step == 0 {
+        return Vec::new();
+    }
+    e.val
+        .chunks_exact(step)
+        .take(e.count as usize)
+        .filter_map(|c| match e.typ {
+            3 => Some(e.end.u16(c) as u32),
+            4 => Some(e.end.u32(c)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Unpack `bits`-wide samples, MSB-first, from a byte stream.
+///
+/// One pump for 8, 12, 14 and 16 bits rather than a branch per depth. The 12-bit
+/// case is the three-bytes-to-two-pixels loop this replaces, and produces
+/// identical output — the fixtures are what prove that, since a subtly wrong
+/// unpacker still yields a plausible-looking image.
+fn unpack_msb(src: &[u8], bits: u32, n: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(n);
+    let mask = (1u64 << bits) - 1;
+    let (mut acc, mut have) = (0u64, 0u32);
+    for &b in src {
+        acc = (acc << 8) | b as u64;
+        have += 8;
+        while have >= bits && out.len() < n {
+            have -= bits;
+            out.push(((acc >> have) & mask) as u16);
+        }
+        if out.len() == n {
+            break;
+        }
+    }
+    out.resize(n, 0);
+    out
 }
 
 fn tag_str(m: &HashMap<u16, Entry>, t: u16) -> String {
@@ -661,9 +722,17 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     }
 
     // Take the SubIFD with the most pixels: the others are previews.
+    //
+    // **It must also carry a strip offset.** The D80 has a larger SubIFD with no
+    // 273 at all, so choosing purely on pixel count picked a directory that
+    // describes no data and failed with "SubIFD has no strip offset" — a
+    // confusing way to say "wrong SubIFD".
     let mut best: Option<(usize, HashMap<u16, Entry>)> = None;
     for so in offs {
         if let Ok((st, _)) = read_ifd(d, so, e) {
+            if tag_u32(&st, 273).is_none() {
+                continue;
+            }
             let w = tag_u32(&st, 256).unwrap_or(0) as usize;
             let h = tag_u32(&st, 257).unwrap_or(0) as usize;
             if w * h > best.as_ref().map_or(0, |(n, _)| *n) {
@@ -671,7 +740,7 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
             }
         }
     }
-    let (_, st) = best.ok_or("NEF: no usable SubIFD")?;
+    let (_, st) = best.ok_or("NEF: no SubIFD carries sensor data")?;
 
     let w = tag_u32(&st, 256).ok_or("NEF: SubIFD has no width")? as usize;
     let h = tag_u32(&st, 257).ok_or("NEF: SubIFD has no height")? as usize;
@@ -686,28 +755,81 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     if comp != 1 {
         return Err(format!("NEF: compression {} is not supported", comp));
     }
-    if bits != 12 {
+    if !matches!(bits, 8 | 12 | 14 | 16) {
         return Err(format!("NEF: {}-bit uncompressed is not supported", bits));
     }
+    // A scanner NEF can be RGB rather than CFA. Refusing is the honest answer:
+    // this returns a Bayer plane, and handing three interleaved channels to a
+    // Bayer consumer produces a picture that is wrong in a way nothing
+    // downstream can detect.
+    if let Some(spp) = tag_u32(&st, 277) {
+        if spp != 1 {
+            return Err(format!(
+                "NEF: {spp} samples per pixel — this is an RGB image, not a CFA sensor plane"
+            ));
+        }
+    }
+
+    // **Strips, plural.** The classic DSLRs split the sensor across many, and
+    // reading only the first gave a buffer two orders of magnitude short.
+    let s_offs = tag_u32s(&st, 273);
+    let s_lens = tag_u32s(&st, 279);
+    let (off, len, strip_span) = if s_offs.len() > 1 {
+        if s_lens.len() != s_offs.len() {
+            return Err(format!(
+                "NEF: {} strip offsets but {} byte counts",
+                s_offs.len(),
+                s_lens.len()
+            ));
+        }
+        // Contiguity is checked rather than assumed. If the strips had gaps, the
+        // span below would swallow the bytes between them into the sensor
+        // payload, and an archiver using that range would silently drop whatever
+        // lived there.
+        let mut at = s_offs[0] as usize;
+        for (o, l) in s_offs.iter().zip(&s_lens) {
+            if *o as usize != at {
+                return Err(format!(
+                    "NEF: strips are not contiguous (expected {at}, found {o}) — refusing rather \
+                     than guessing which bytes are sensor data"
+                ));
+            }
+            at += *l as usize;
+        }
+        let total: usize = s_lens.iter().map(|l| *l as usize).sum();
+        (s_offs[0] as usize, total, s_offs[0] as usize..at)
+    } else {
+        (off, len, off..off + len)
+    };
     // **Coolpix NRW has THREE layouts, and the strip length picks between them.**
     // Keying on the declared byte count rather than a model-string table is both
     // simpler and what LibRaw's own A1000 branch effectively does.
-    let packed = w * h * 12 / 8;
+    let packed = w * h * bits as usize / 8;
     let unpacked = w * h * 2;
     let model = tag_str(&ifd0, 272);
 
     let raw: Vec<u16> = if len == unpacked {
-        // A1000: not packed at all. Plain 16-bit little-endian words holding
-        // 12-bit values -- our file declares 31 850 496 = 4608*3456*2 exactly,
-        // which is LibRaw's own test for this case (tiff.cpp: data_size ==
-        // raw_width*raw_height*2 -> unpacked_load_raw).
+        // **Two bytes a pixel means words, not packed bits — at ANY declared
+        // depth.** LibRaw's own test (tiff.cpp: `data_size == raw_width *
+        // raw_height * 2 -> unpacked_load_raw`), and it is the rule for far more
+        // than the Coolpix A1000 it was first written for: **14-bit
+        // uncompressed NEF measures exactly 2.000 B/px** on the D3, D300 and
+        // D3S, so the samples are 14-bit values sitting in 16-bit words.
+        //
+        // Treating those as packed 14-bit produced a plane that decoded without
+        // error and was noise — mean |dx| 5607 against a 1365 threshold. The
+        // noise check is the only thing that caught it, which is the argument
+        // for having one.
         if off + unpacked > d.len() {
             return Err("NEF: strip runs past end of file".into());
         }
-        d[off..off + unpacked]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect()
+        d[off..off + unpacked].chunks_exact(2).map(|c| e.u16(c)).collect()
+    } else if len == packed && bits != 12 {
+        // Genuinely packed at a depth with no exotic layout: one MSB-first pump.
+        if off + packed > d.len() {
+            return Err("NEF: strip runs past end of file".into());
+        }
+        unpack_msb(&d[off..off + packed], bits, w * h)
     } else if len == packed {
         if off + packed > d.len() {
             return Err("NEF: strip runs past end of file".into());
@@ -760,10 +882,9 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         raw
     } else {
         return Err(format!(
-            "NEF: {w}x{h} at 12 bits needs {packed} packed or {unpacked} unpacked, strip declares {len}"
+            "NEF: {w}x{h} at {bits} bits needs {packed} packed or {unpacked} unpacked, strip              declares {len}"
         ));
     };
-    let need = len;
 
     Ok(BayerImage {
         width: w,
@@ -772,13 +893,14 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         // Nikon Bayer is RGGB on every model in this corpus.
         cfa_phase: (0, 0),
         black: 0,
-        white: (1u16 << bits) - 1,
+        // `1u16 << 16` overflows; the widest legal white is u16::MAX.
+        white: ((1u32 << bits) - 1).min(u16::MAX as u32) as u16,
         wb_r: 2.0,
         wb_g: 1.0,
         wb_b: 1.5,
         make: tag_str(&ifd0, 271),
         model: tag_str(&ifd0, 272),
-        strip: off..off + need,
+        strip: strip_span,
     })
 }
 
@@ -803,6 +925,72 @@ mod tests {
         assert_eq!(End::Be.u16(&b), 0x1234);
         assert_eq!(End::Le.u32(&b), 0x7856_3412);
         assert_eq!(End::Be.u32(&b), 0x1234_5678);
+    }
+
+    /// The MSB-first pump must agree with the hand-rolled 12-bit loop it
+    /// generalises, or every 12-bit file silently changes.
+    #[test]
+    fn unpack_msb_matches_the_three_byte_twelve_bit_loop() {
+        let src: Vec<u8> = (0..=255u8).cycle().take(300).collect();
+        let n = src.len() / 3 * 2;
+        let mut want = vec![0u16; n];
+        let mut i = 0;
+        for px in want.chunks_exact_mut(2) {
+            px[0] = ((src[i] as u16) << 4) | (src[i + 1] as u16 >> 4);
+            px[1] = ((src[i + 1] as u16 & 0x0f) << 8) | src[i + 2] as u16;
+            i += 3;
+        }
+        assert_eq!(unpack_msb(&src, 12, n), want);
+
+        // And the trivial depths, where packing is identity.
+        assert_eq!(unpack_msb(&[1, 2, 3], 8, 3), vec![1, 2, 3]);
+        // Short input pads rather than panicking: lengths are file-controlled.
+        // One byte is eight bits and never completes a 12-bit sample, so the
+        // whole plane is the pad -- not a truncated first pixel.
+        assert_eq!(unpack_msb(&[0xff], 12, 3), vec![0, 0, 0]);
+        assert_eq!(unpack_msb(&[0xff, 0xf0], 12, 3), vec![0xfff, 0, 0]);
+    }
+
+    /// **14-bit uncompressed is words, not packed bits.** Measured at exactly
+    /// 2.000 B/px on the D3, D300 and D3S. Reading it as packed 14-bit decodes
+    /// without error and yields noise, so this asserts the plane looks like a
+    /// photograph rather than merely that it decoded.
+    #[test]
+    fn fourteen_bit_uncompressed_is_words() {
+        const F: &str = r"C:\Foo\raw-converter\tests\NEF Raws\14bit-uncompressed__D3.NEF";
+        let Ok(d) = std::fs::read(F) else {
+            eprintln!("skipped: {F} not present");
+            return;
+        };
+        let b = decode_nef(&d).expect("14-bit uncompressed must decode");
+        assert_eq!((b.width, b.height), (4288, 2844));
+        let (mut tot, mut n) = (0u64, 0u64);
+        for y in (0..b.height).step_by(37) {
+            let row = &b.raw[y * b.width..(y + 1) * b.width];
+            for x in 2..b.width {
+                tot += (row[x] as i32 - row[x - 2] as i32).unsigned_abs() as u64;
+                n += 1;
+            }
+        }
+        let mad = tot as f64 / n as f64;
+        assert!(mad < 16384.0 / 12.0, "packed-bit misread would land here (mad {mad:.0})");
+    }
+
+    /// **The D1H splits its sensor across 407 strips.** Reading only the first
+    /// gave a 60 kB buffer where four megabytes were needed.
+    #[test]
+    fn a_multi_strip_nef_gathers_every_strip() {
+        const F: &str = r"C:\Foo\raw-converter\tests\NEF Raws\12bit-uncompressed__D1H.NEF";
+        let Ok(d) = std::fs::read(F) else {
+            eprintln!("skipped: {F} not present");
+            return;
+        };
+        let b = decode_nef(&d).expect("a multi-strip NEF must decode");
+        assert_eq!(b.raw.len(), b.width * b.height, "every strip must be gathered");
+        assert!(
+            b.strip.len() >= b.width * b.height * 12 / 8,
+            "the reported payload must span all strips, not one"
+        );
     }
 
     /// **A big-endian NEF must decode.** Nikon's DSLR line writes `MM`, and this
