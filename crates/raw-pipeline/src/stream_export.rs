@@ -96,13 +96,33 @@ mod tests {
     use crate::jxl_casaencoder::encode_chunked_rgb8;
     use crate::{decompress, demosaic, pipeline};
 
+    /// Whole-frame reference demosaic, using the same WB-scaled gains the streaming
+    /// band path applies (stream_band.rs). The no-gains `demosaic_rggb_mhc` entry
+    /// point is `MhcGains::UNITY`, correct only for an already-white-balanced
+    /// mosaic — comparing the stream against it measures the WB scaling rather than
+    /// the streaming.
+    fn whole_reference_rgb16(
+        raw: &[u16],
+        w: usize,
+        h: usize,
+        params: &pipeline::PipelineParams,
+    ) -> Vec<u16> {
+        demosaic::demosaic_rggb_mhc_gains(
+            raw,
+            w,
+            h,
+            demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn streaming_export_bytes_equal_whole() {
         for (w, h) in [(64usize, 96usize), (300, 520)] {
             let strip = decompress::tests_synth_payload(w, h, 0x7A5);
             let params = pipeline::PipelineParams::default_olympus();
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let rgb16 = whole_reference_rgb16(&raw, w, h, &params);
             let mut rgb8 = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
             let whole = encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();
@@ -129,7 +149,7 @@ mod tests {
             let strip = decompress::tests_synth_payload(w, h, 0x7A5);
             let params = pipeline::PipelineParams::default_olympus();
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let rgb16 = whole_reference_rgb16(&raw, w, h, &params);
             let mut rgb8 = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
             let mut enc =
@@ -164,7 +184,7 @@ mod tests {
             let nr = 0.3f32;
 
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let mut rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            let mut rgb16 = whole_reference_rgb16(&raw, w, h, &params);
             pipeline::apply_luminance_nr(&mut rgb16, w, h, nr);
             pipeline::apply_unsharp_masks(&mut rgb16, w, h, &params);
             let mut rgb8 = vec![0u8; w * h * 3];

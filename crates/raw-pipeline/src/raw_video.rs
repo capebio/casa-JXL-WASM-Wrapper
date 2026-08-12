@@ -561,7 +561,17 @@ mod tests {
             let strip = decompress::tests_synth_payload(w, h, 0x51);
             let params = pipeline::PipelineParams::default_olympus();
             let raw = decompress::decompress(&strip, w, h).unwrap();
-            let rgb16 = demosaic::demosaic_rggb_mhc(&raw, w, h).unwrap();
+            // Same WB-scaled gains the streaming band path demosaics with
+            // (stream_band.rs). The no-gains entry point is MhcGains::UNITY, which
+            // only matches an already-white-balanced mosaic — comparing against it
+            // measures the WB scaling, not the drain.
+            let rgb16 = demosaic::demosaic_rggb_mhc_gains(
+                &raw,
+                w,
+                h,
+                demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+            )
+            .unwrap();
             let mut want = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut want);
 
