@@ -134,7 +134,7 @@ window.__meta = async (path) => {
     try {
       await raw.open(bytes, { outputBps:16, useCameraWb:true });
       const m = await raw.metadata(true); const c = m.color_data || {};
-      return { keys: Object.keys(c), black:c.black, cblack:c.cblack, maximum:c.maximum, data_maximum:c.data_maximum, iso:m.iso_speed ?? m.other?.iso_speed, cam_mul:c.cam_mul, pre_mul:c.pre_mul, cam_xyz:c.cam_xyz && c.cam_xyz.flat ? c.cam_xyz.flat() : c.cam_xyz, filters:m.filters, cdesc:m.cdesc, make:m.camera_make, model:m.camera_model };
+      return { keys: Object.keys(c), rgb_cam:c.rgb_cam && c.rgb_cam.flat ? c.rgb_cam.flat() : c.rgb_cam, cmatrix:c.cmatrix && c.cmatrix.flat ? c.cmatrix.flat() : c.cmatrix, black:c.black, cblack:c.cblack, maximum:c.maximum, data_maximum:c.data_maximum, iso:m.iso_speed ?? m.other?.iso_speed, cam_mul:c.cam_mul, pre_mul:c.pre_mul, cam_xyz:c.cam_xyz && c.cam_xyz.flat ? c.cam_xyz.flat() : c.cam_xyz, filters:m.filters, cdesc:m.cdesc, make:m.camera_make, model:m.camera_model };
     } finally { if (raw.dispose) raw.dispose(); }
   } catch(e){ return { err: String(e && (e.message||e)).slice(0,120) }; }
 };
