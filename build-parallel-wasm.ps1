@@ -130,6 +130,21 @@ function Invoke-Bindgen([string]$wasmBindgen, [string]$wasmIn, [string]$outDir) 
             }
         }
     }
+
+    # wasm-bindgen-rayon emits `await import('../../..')`, which relies on Node-style
+    # directory/package resolution. Browsers do not do that: the worker requests
+    # `<outdir>/` and any static host (dev server, Vercel) answers 404, so every rayon
+    # worker dies on "Failed to fetch dynamically imported module", initThreadPool times
+    # out, and the pool silently degrades to single-threaded. Point it at the real file.
+    Get-ChildItem -Path (Join-Path $outDir "snippets") -Recurse -Filter "workerHelpers.js" -ErrorAction SilentlyContinue | ForEach-Object {
+        $f = $_.FullName
+        $raw = Get-Content $f -Raw -ErrorAction SilentlyContinue
+        if ($raw -and $raw.Contains("import('../../..')")) {
+            Write-Host "  patching $f: directory import -> raw_converter_wasm.js"
+            Set-Content -Path $f -NoNewline -Value `
+                $raw.Replace("import('../../..')", "import('../../../raw_converter_wasm.js')")
+        }
+    }
 }
 
 function Invoke-WasmOpt([string]$wasmOptBin, [string]$wasmOut) {
