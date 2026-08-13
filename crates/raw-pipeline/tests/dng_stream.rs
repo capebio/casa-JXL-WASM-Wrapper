@@ -51,13 +51,19 @@ fn dng_export_bytes_equal_whole() {
     let img = dng::decode_bytes(&data).expect("decode");
     let (w, h) = (img.width, img.height);
     let phase = dng::cfa_phase(img.cfa);
-    let rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase).expect("demosaic");
+    // Params first: the demosaic needs the WB ratios. StreamingBandSource::from_dng_bytes
+    // builds exactly these fields and then demosaics with MhcGains::from_wb, so the
+    // reference must too — the no-gains entry point is MhcGains::UNITY, correct only for
+    // an already-white-balanced mosaic, and this mosaic is white-balanced later in tone.
     let mut params = pipeline::PipelineParams::default_olympus();
     params.black = img.black;
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
     params.color_matrix = img.color_matrix.into();
+    let gains = demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b);
+    let rgb16 =
+        demosaic::demosaic_bayer_mhc_gains(&img.raw, w, h, phase, gains).expect("demosaic");
     let mut rgb8 = vec![0u8; w * h * 3];
     pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
     let whole = jxl_casaencoder::encode_chunked_rgb8(&rgb8, w as u32, h as u32, 1.0, 3).unwrap();

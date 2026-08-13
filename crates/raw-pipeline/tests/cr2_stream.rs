@@ -62,13 +62,19 @@ fn stream_raw_rows(data: &[u8]) -> (usize, usize, Vec<u16>) {
 fn batch_rgb8(data: &[u8]) -> (usize, usize, Vec<u8>) {
     let img = cr2::decode_bytes(data).expect("decode_bytes");
     let (w, h) = (img.width, img.height);
-    let rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, img.cfa_phase).expect("demosaic");
+    // Params first: the demosaic needs the WB ratios. StreamingBandSource::from_cr2_bytes
+    // builds exactly these fields and then demosaics with MhcGains::from_wb, so the
+    // reference must too — the no-gains entry point is MhcGains::UNITY, correct only for
+    // an already-white-balanced mosaic, and this mosaic is white-balanced later in tone.
     let mut params = pipeline::PipelineParams::default_olympus();
     params.black = img.black;
     params.white = img.white;
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
     params.color_matrix = img.color_matrix.into();
+    let gains = demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b);
+    let rgb16 = demosaic::demosaic_bayer_mhc_gains(&img.raw, w, h, img.cfa_phase, gains)
+        .expect("demosaic");
     let mut rgb8 = vec![0u8; w * h * 3];
     pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
     (w, h, rgb8)
