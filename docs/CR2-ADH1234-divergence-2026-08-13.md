@@ -64,14 +64,54 @@ is proportional to how far the scene sits from neutral. The daylight frames are 
 1.09 vs 1.64). It also fits `Closer to camera JPEG: ours 0, LibRaw 4` on the CR2 slice
 while DNG scores ours 9 / LibRaw 1 — DNG takes its matrix down a different path.
 
-Not fixed here: correcting it changes the colour of every CR2 render, so it wants the
-embedded-JPEG census over the full Canon corpus (the method used in
-`examples/cr2_gains_census.rs`), not a change validated by one file. Check
-`cr2.rs`'s matrix resolver ("Finding 52": per-model table plus Canon-generic fallback) and
-whether the consumer expects sRGB.
+## Confirmed by measurement, and the fix is already half-written
 
-`ADH 1570.CR2` is a second high-ISO sample if another tungsten case is wanted; it was not
-in the 4-file slice above.
+`examples/cr2_matrix_probe.rs` renders each Canon file twice — once with the matrix the
+pipeline resolves today, once with the matrix derived dcraw's way from LibRaw's `cam_xyz`
+— and scores both against the file's own embedded JPEG (same `|dR/G| + |dB/G|` distance
+the browser harness uses):
+
+```
+11 files: ours closer on 2, dcraw rgb_cam closer on 9
+  mean distance to camera JPEG:  ours 0.183   dcraw rgb_cam 0.045
+  ADH 1234 (the diverger):       ours 0.595   dcraw rgb_cam 0.029
+```
+
+The two files where ours wins are near-neutral scenes decided by <0.02. So the structural
+argument holds numerically: the matrix is the cause, and the correct one is ~4x closer to
+what the camera itself produced.
+
+**Where it comes from.** `cr2.rs::resolved_color_matrix` prefers a per-model matrix and
+falls back to `CANON_CAM_TO_SRGB`. The per-model path (`canon_color_matrix`) already does
+the right derivation — invert the published XYZ->cam, then `XYZ_D50_TO_SRGB` — but it is
+**disabled**: `canon_cam_xyz` returns `None` unconditionally, so *every* Canon body gets
+the fallback. That fallback is documented as "camera->sRGB (dcraw/LibRaw coefficients)"
+but is all-positive, which no camera->sRGB matrix is.
+
+**Why it was deferred, and why that reason no longer blocks.** The disabling comment says
+the adobe matrices "assume un-WB-normalised camera values" and that CasaWASM applies WB
+before the matrix, so proper use "requires scene-relative WB correction derived from the
+matrix's implied D65 neutral — a non-trivial change deferred". dcraw's derivation already
+contains that correction: it builds `cam_rgb = cam_xyz . xyz_rgb`, **normalises each row to
+unit sum** (that normalisation is literally where dcraw's `pre_mul` comes from, i.e. the
+implied neutral), and only then inverts to get `rgb_cam`. A row-normalised-then-inverted
+matrix maps camera neutral to sRGB neutral by construction, which is why it composes
+correctly with the WB-first pre-LUT — as the numbers above show empirically.
+
+So the deferred "non-trivial change" is: normalise rows before inverting. See
+`derive_rgb_cam` in the probe for the exact 20 lines.
+
+**Still to do before shipping it:**
+
+1. Restore a per-model `cam_xyz` table (`canon_cam_xyz` is stubbed to `None`); the probe
+   hardcodes the EOS M5 coefficients. Note the `_MG_*` files are a different body and still
+   scored better under the M5-derived matrix, which is suggestive but not a substitute for
+   per-body data.
+2. Re-pin whatever CR2 goldens move, and re-run the census — it changes every Canon render.
+3. Mirror the value in `src/lib.rs::CANON_CAM_TO_SRGB`, which finding 52 requires to stay
+   byte-identical across the FFI boundary.
+
+`ADH 1570.CR2` is a second high-ISO sample if another tungsten case is wanted.
 
 ## Reproduce
 
