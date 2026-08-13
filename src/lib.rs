@@ -3672,7 +3672,16 @@ mod tests {
         look: &LookOverrides,
         baseline: f32,
     ) -> Vec<u8> {
-        let rgb16 = demosaic::demosaic_bayer_mhc(raw, w, h, phase).unwrap();
+        // Gains from the CAMERA WB, before the look's WB override — process_dng_impl
+        // demosaics with img.wb_r/img.wb_b and applies the override afterwards.
+        let rgb16 = demosaic::demosaic_bayer_mhc_gains(
+            raw,
+            w,
+            h,
+            phase,
+            mhc_gains_for_wb(base_params.wb_r, base_params.wb_b),
+        )
+        .unwrap();
         let mut params = base_params.clone();
         if look.wb_r.is_finite() && look.wb_r > 0.0 {
             params.wb_r = look.wb_r.min(8.0);
@@ -4510,8 +4519,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         raw_pipeline::dng::Cfa::Gbrg => ((1, 0), 2),
         raw_pipeline::dng::Cfa::Bggr => ((1, 1), 3),
     };
-    let rgb16 = demosaic::demosaic_bayer_mhc(&img.raw, w, h, phase)
-        .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
+    let rgb16 =
+        demosaic::demosaic_bayer_mhc_gains(&img.raw, w, h, phase, mhc_gains_for_wb(img.wb_r, img.wb_b))
+            .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
     let demosaic_ms = now_ms() - t;
     let aw = w;
     let ah = h;
@@ -5126,6 +5136,41 @@ fn cfa_phase_from_code(code: u32) -> Result<(u8, u8), JsError> {
     }
 }
 
+/// Clamp a caller-supplied white-balance multiplier to the range the tone stage uses.
+/// Non-finite / non-positive means "no camera WB" and falls back to grey 1.0 — the same
+/// rule `process_raw_mosaic_impl` applies when building `PipelineParams`.
+fn sanitize_wb(v: f32) -> f32 {
+    if v.is_finite() && v > 0.0 {
+        v.min(8.0)
+    } else {
+        1.0
+    }
+}
+
+/// MHC demosaic gains for a mosaic that has NOT yet been white-balanced.
+///
+/// The MHC cross-channel gradient corrections are derived assuming comparable channel
+/// levels; on a raw CFA plane R/B sit ~1.9x hot and G ~0.5x cold relative to the balanced
+/// image, which locks green speckle to the CFA lattice (d8579328). `tiff.rs` (ORF),
+/// `dng.rs` and `stream_band.rs` all scale the correction terms by the WB ratios the tone
+/// stage will later apply; these WASM entry points did not, so the browser rendered CR2 and
+/// DNG with `MhcGains::UNITY` while the native and streaming paths did not agree with it.
+///
+/// Measured on the 11-file CR2 corpus against each file's embedded camera JPEG
+/// (`examples/cr2_gains_census.rs`): lattice sparkle 0.47 -> 0.00 per MP at full
+/// resolution, never rising on any file, with mean |delta luma| vs the camera unchanged
+/// (7.36 -> 7.35).
+///
+/// `wb_g` is not carried per-file — every params builder here leaves it at the
+/// `default_olympus` value, so the gains are built from that same source.
+fn mhc_gains_for_wb(wb_r: f32, wb_b: f32) -> demosaic::MhcGains {
+    demosaic::MhcGains::from_wb(
+        sanitize_wb(wb_r),
+        pipeline::PipelineParams::default_olympus().wb_g,
+        sanitize_wb(wb_b),
+    )
+}
+
 fn matrix_from_flat_or_identity(color_matrix_flat: &[f32]) -> ([[f32; 3]; 3], [f32; 9]) {
     if color_matrix_flat.len() == 9 && color_matrix_flat.iter().all(|v| v.is_finite()) {
         let flat = [
@@ -5206,7 +5251,7 @@ fn process_raw_mosaic_impl(
     let h = height as usize;
     let phase = cfa_phase_from_code(cfa_phase)?;
     let t = now_ms();
-    let rgb16 = demosaic::demosaic_bayer_mhc(raw, w, h, phase)
+    let rgb16 = demosaic::demosaic_bayer_mhc_gains(raw, w, h, phase, mhc_gains_for_wb(wb_r, wb_b))
         .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
     let demosaic_ms = now_ms() - t;
 
@@ -5367,8 +5412,9 @@ pub fn process_raw_mosaic_with_options(
     let phase = cfa_phase_from_code(cfa_phase)?;
     // Demosaic to get MHC rgb16 baseline.
     let t_dem = now_ms();
-    let rgb16 = demosaic::demosaic_bayer_mhc(raw_u16, w, h, phase)
-        .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
+    let rgb16 =
+        demosaic::demosaic_bayer_mhc_gains(raw_u16, w, h, phase, mhc_gains_for_wb(wb_r, wb_b))
+            .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
     let demosaic_ms = now_ms() - t_dem;
     // Build noise metadata from caller-supplied black/white.
     let b = black.min(u16::MAX as u32) as f32;
@@ -5486,7 +5532,13 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     // geometric center).  demosaic_bayer_mhc accepts an explicit phase so
     // the demosaicer assigns R/G/B correctly regardless of crop origin.
     let t = now_ms();
-    let mut rgb16 = demosaic::demosaic_bayer_mhc(&cr2.raw, w, h, cr2.cfa_phase)
+    let mut rgb16 = demosaic::demosaic_bayer_mhc_gains(
+        &cr2.raw,
+        w,
+        h,
+        cr2.cfa_phase,
+        mhc_gains_for_wb(cr2.wb_r, cr2.wb_b),
+    )
         .map_err(|e| JsError::new(&format!("CR2 demosaic: {}", e)))?;
     let demosaic_ms = now_ms() - t;
 
@@ -5840,8 +5892,9 @@ pub fn create_raw_mosaic_denoise_session(
     let w = width as usize;
     let h = height as usize;
     let phase = cfa_phase_from_code(cfa_phase)?;
-    let rgb16 = demosaic::demosaic_bayer_mhc(raw_u16, w, h, phase)
-        .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
+    let rgb16 =
+        demosaic::demosaic_bayer_mhc_gains(raw_u16, w, h, phase, mhc_gains_for_wb(wb_r, wb_b))
+            .map_err(|e| JsError::new(&format!("raw mosaic demosaic: {e}")))?;
     let b = black.min(u16::MAX as u32) as f32;
     let wh = white.min(u16::MAX as u32) as f32;
     let noise_metadata = RawNoiseMetadata {
