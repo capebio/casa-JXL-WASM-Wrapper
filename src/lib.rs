@@ -5539,7 +5539,7 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
         cr2.cfa_phase,
         mhc_gains_for_wb(cr2.wb_r, cr2.wb_b),
     )
-        .map_err(|e| JsError::new(&format!("CR2 demosaic: {}", e)))?;
+    .map_err(|e| JsError::new(&format!("CR2 demosaic: {}", e)))?;
     let demosaic_ms = now_ms() - t;
 
     let mut params = pipeline::PipelineParams::default_olympus();

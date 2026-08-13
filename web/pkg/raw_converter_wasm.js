@@ -1,4 +1,6 @@
 /* @ts-self-types="./raw_converter_wasm.d.ts" */
+import { startWorkers } from './snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.js';
+
 
 /**
  * WASM-facing BLTV decoder.  Load the full .bltv byte stream once, then call
@@ -30,6 +32,26 @@ export class BltvDecoder {
             wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         }
         return v1;
+    }
+    /**
+     * Decode the next frame as RGBA8 (alpha = 255) **into** the caller's
+     * `Uint8Array`, which must be exactly `width()*height()*4` bytes. Returns
+     * `true` with `out` filled, or `false` at end of stream (`out` untouched).
+     *
+     * Buffer flow is reversed vs `decode_next_frame`: JS keeps a pooled
+     * ArrayBuffer and no per-frame `Uint8Array`/RGBA buffer is allocated on
+     * either side — RGB→RGBA runs on the SIMD shuffle kernel wasm-side and
+     * `out` is filled with a single JS-side copy (`Uint8Array.set`), replacing
+     * the per-pixel main-thread JS loop in bltv-player.html.
+     * @param {Uint8Array} out
+     * @returns {boolean}
+     */
+    decode_next_into(out) {
+        const ret = wasm.bltvdecoder_decode_next_into(this.__wbg_ptr, out);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
     }
     /**
      * @returns {number}
@@ -100,58 +122,6 @@ export class BltvDecoder {
     }
 }
 if (Symbol.dispose) BltvDecoder.prototype[Symbol.dispose] = BltvDecoder.prototype.free;
-
-/**
- * Timing results for the decompress + demosaic stages only.
- * Skips tonemap, downscale, and orientation — isolates raw decode cost.
- */
-export class DecodeBench {
-    static __wrap(ptr) {
-        const obj = Object.create(DecodeBench.prototype);
-        obj.__wbg_ptr = ptr;
-        DecodeBenchFinalization.register(obj, obj.__wbg_ptr, obj);
-        return obj;
-    }
-    __destroy_into_raw() {
-        const ptr = this.__wbg_ptr;
-        this.__wbg_ptr = 0;
-        DecodeBenchFinalization.unregister(this);
-        return ptr;
-    }
-    free() {
-        const ptr = this.__destroy_into_raw();
-        wasm.__wbg_decodebench_free(ptr, 0);
-    }
-    /**
-     * @returns {number}
-     */
-    get decompress_ms() {
-        const ret = wasm.__wbg_get_decodebench_decompress_ms(this.__wbg_ptr);
-        return ret;
-    }
-    /**
-     * @returns {number}
-     */
-    get demosaic_ms() {
-        const ret = wasm.__wbg_get_decodebench_demosaic_ms(this.__wbg_ptr);
-        return ret;
-    }
-    /**
-     * @returns {number}
-     */
-    get height() {
-        const ret = wasm.__wbg_get_decodebench_height(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * @returns {number}
-     */
-    get width() {
-        const ret = wasm.__wbg_get_decodebench_width(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-}
-if (Symbol.dispose) DecodeBench.prototype[Symbol.dispose] = DecodeBench.prototype.free;
 
 /**
  * S3 preflight: project the peak / retained working-set of a RAW decode from
@@ -465,6 +435,7 @@ export class FableDeltaSession {
     /**
      * Decode a temporal-delta fable frame against `prev` (the RGB8 this session
      * returned for the previous frame). `w`/`h` are the current frame dims.
+     * Prefer [`Self::decode_delta_resident`], which keeps `prev` wasm-side.
      * @param {Uint8Array} bytes
      * @param {Uint8Array} prev
      * @param {number} w
@@ -483,6 +454,26 @@ export class FableDeltaSession {
         var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
         wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
         return v3;
+    }
+    /**
+     * Decode a temporal-delta fable frame against the **session-resident**
+     * previous frame (retained from `decode_intra` / the previous call), so the
+     * caller never round-trips the prior frame across the JS↔WASM boundary.
+     * Dims are the resident frame's. Errors if no resident frame exists — call
+     * `decode_intra` first (the explicit-`prev` `decode_delta` clears it).
+     * @param {Uint8Array} bytes
+     * @returns {Uint8Array}
+     */
+    decode_delta_resident(bytes) {
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.fabledeltasession_decode_delta_resident(this.__wbg_ptr, ptr0, len0);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+        return v2;
     }
     /**
      * Decode an intra (keyframe) fable frame; caches its planes for subsequent
@@ -679,14 +670,15 @@ export class LookRenderer {
      * @param {boolean} apply_rotation
      * @param {number} black
      * @param {number} white
+     * @param {number | null} [baseline_ev]
      * @returns {LookRenderer}
      */
-    static new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, apply_rotation, black, white) {
+    static new_with_options(rgb16_bytes, width, height, orientation, color_matrix_flat, apply_rotation, black, white, baseline_ev) {
         const ptr0 = passArray8ToWasm0(rgb16_bytes, wasm.__wbindgen_malloc);
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.lookrenderer_new_with_options(ptr0, len0, width, height, orientation, ptr1, len1, apply_rotation, black, white);
+        const ret = wasm.lookrenderer_new_with_options(ptr0, len0, width, height, orientation, ptr1, len1, apply_rotation, black, white, isLikeNone(baseline_ev) ? Number.MAX_SAFE_INTEGER : Math.fround(baseline_ev));
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -990,6 +982,18 @@ export class ProcessResult {
     free() {
         const ptr = this.__destroy_into_raw();
         wasm.__wbg_processresult_free(ptr, 0);
+    }
+    /**
+     * Exposure baseline (EV) the pipeline rendered with (per-shot: ORF at
+     * extended-LOW ISO 0.40, everything else legacy 1.40 — see
+     * `pipeline::ORF_LOW_ISO_BASELINE_EXP_EV`). A live LookRenderer built outside
+     * the take_*_renderer seams must be given this same value or the first
+     * slider touch jumps the preview ±1 EV.
+     * @returns {number}
+     */
+    get baseline_ev_used() {
+        const ret = wasm.__wbg_get_processresult_baseline_ev_used(this.__wbg_ptr);
+        return ret;
     }
     /**
      * Black pedestal subtracted by the pipeline (per-format). The live
@@ -1860,14 +1864,15 @@ if (Symbol.dispose) RotateResult.prototype[Symbol.dispose] = RotateResult.protot
  * @param {number} tint
  * @param {number} texture
  * @param {number} clarity
+ * @param {number | null} [baseline_ev]
  * @returns {Uint8Array}
  */
-export function apply_look(rgb16_src, width, height, orientation, wb_r, wb_b, color_matrix_flat, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity) {
+export function apply_look(rgb16_src, width, height, orientation, wb_r, wb_b, color_matrix_flat, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity, baseline_ev) {
     const ptr0 = passArray16ToWasm0(rgb16_src, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.apply_look(ptr0, len0, width, height, orientation, wb_r, wb_b, ptr1, len1, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity);
+    const ret = wasm.apply_look(ptr0, len0, width, height, orientation, wb_r, wb_b, ptr1, len1, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity, isLikeNone(baseline_ev) ? Number.MAX_SAFE_INTEGER : Math.fround(baseline_ev));
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -1877,27 +1882,12 @@ export function apply_look(rgb16_src, width, height, orientation, wb_r, wb_b, co
 }
 
 /**
- * Benchmark ORF decompress + demosaic without tonemap/downscale/orientation.
- * Use to measure decoder cost in isolation when tuning WASM flags or algorithms.
- * @param {Uint8Array} data
- * @returns {DecodeBench}
- */
-export function bench_decode_orf(data) {
-    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.bench_decode_orf(ptr0, len0);
-    if (ret[2]) {
-        throw takeFromExternrefTable0(ret[1]);
-    }
-    return DecodeBench.__wrap(ret[0]);
-}
-
-/**
  * Decode BLISS bytes → RGB24.  Returns a flat `Uint8Array` [r,g,b, r,g,b, …].
  * Dimensions are prepended as two little-endian u32s (8 bytes total) so the
  * caller can read width and height without a separate call.
  *
  * Layout: [width u32 LE][height u32 LE][rgb bytes…]
+ * Also accepts BLSP-prefixed blobs (skips the preview, decodes the full layer).
  * @param {Uint8Array} data
  * @returns {Uint8Array}
  */
@@ -1914,8 +1904,29 @@ export function bliss_decode(data) {
 }
 
 /**
+ * Decode only the embedded 1/8-scale preview from a BLSP-prefixed blob.
+ * Returns [width u32 LE][height u32 LE][rgb bytes…] — same layout as `bliss_decode`.
+ * Typically 10–50× faster than a full decode; data must start with the BLSP magic.
+ * Errors with "BadMagic: …" if the blob lacks a BLSP prefix.
+ * @param {Uint8Array} data
+ * @returns {Uint8Array}
+ */
+export function bliss_decode_preview(data) {
+    const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.bliss_decode_preview(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * Encode an even-width RGB24 buffer as BLISS bytes.
  * q_y=1, q_c=1 → lossless.  q_y=2, q_c=2 → near-lossless (good for display cache).
+ * Also accepts BLSP-prefixed blobs on decode side (transparent).
  * @param {Uint8Array} rgb
  * @param {number} w
  * @param {number} h
@@ -1927,6 +1938,85 @@ export function bliss_encode(rgb, w, h, q_y, q_c) {
     const ptr0 = passArray8ToWasm0(rgb, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.bliss_encode(ptr0, len0, w, h, q_y, q_c);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Encode with NEAR in-loop near-lossless (hard per-channel error bounds).
+ * delta_y / delta_c control max luma / chroma error (1 = lossless, 2 = very tight, …).
+ * Decoded by the ordinary `bliss_decode`.
+ * @param {Uint8Array} rgb
+ * @param {number} w
+ * @param {number} h
+ * @param {number} delta_y
+ * @param {number} delta_c
+ * @returns {Uint8Array}
+ */
+export function bliss_encode_near(rgb, w, h, delta_y, delta_c) {
+    const ptr0 = passArray8ToWasm0(rgb, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.bliss_encode_near(ptr0, len0, w, h, delta_y, delta_c);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * Encode with per-gradient-context NEAR delta tables (4 luma + 4 chroma contexts).
+ * dys / dcs must each be a Uint8Array of length 4.
+ * Context 0 = flat, 1 = low gradient, 2 = mid, 3 = high — tighter deltas where edges matter.
+ * @param {Uint8Array} rgb
+ * @param {number} w
+ * @param {number} h
+ * @param {Uint8Array} dys
+ * @param {Uint8Array} dcs
+ * @returns {Uint8Array}
+ */
+export function bliss_encode_near_ctx(rgb, w, h, dys, dcs) {
+    const ptr0 = passArray8ToWasm0(rgb, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArray8ToWasm0(dys, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArray8ToWasm0(dcs, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.bliss_encode_near_ctx(ptr0, len0, w, h, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * Encode RGB24 with an embedded 1/8-scale NEAR preview prefix (BLSP layout).
+ *
+ * The returned blob starts with BLSP magic:
+ *   `[BLSP][u32 preview_len][preview BLSR][full BLSR]`
+ *
+ * `bliss_decode_preview` extracts the ~10–50× faster thumbnail.
+ * `bliss_decode` skips the prefix and decodes the full layer transparently.
+ * q_y=1, q_c=1 → lossless full layer; otherwise near-lossless. preview_delta=2 is a good default.
+ * @param {Uint8Array} rgb
+ * @param {number} w
+ * @param {number} h
+ * @param {number} q_y
+ * @param {number} q_c
+ * @param {number} preview_delta
+ * @returns {Uint8Array}
+ */
+export function bliss_encode_with_preview(rgb, w, h, q_y, q_c, preview_delta) {
+    const ptr0 = passArray8ToWasm0(rgb, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.bliss_encode_with_preview(ptr0, len0, w, h, q_y, q_c, preview_delta);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
@@ -1998,14 +2088,15 @@ export function create_orf_denoise_session(data, options) {
  * @param {Float32Array} color_matrix_flat
  * @param {number} iso
  * @param {any} options
+ * @param {number | null} [baseline_ev]
  * @returns {DenoiseSession}
  */
-export function create_raw_mosaic_denoise_session(raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, iso, options) {
+export function create_raw_mosaic_denoise_session(raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, iso, options, baseline_ev) {
     const ptr0 = passArray16ToWasm0(raw_u16, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.create_raw_mosaic_denoise_session(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, iso, options);
+    const ret = wasm.create_raw_mosaic_denoise_session(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, iso, options, isLikeNone(baseline_ev) ? Number.MAX_SAFE_INTEGER : Math.fround(baseline_ev));
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -2062,183 +2153,6 @@ export function decode_tiff(bytes) {
         throw takeFromExternrefTable0(ret[1]);
     }
     return DecodedImage.__wrap(ret[0]);
-}
-
-/**
- * @returns {number}
- */
-export function decompress_bench_byteloop() {
-    const ret = wasm.decompress_bench_byteloop();
-    return ret >>> 0;
-}
-
-/**
- * @returns {boolean}
- */
-export function decompress_bench_equal() {
-    const ret = wasm.decompress_bench_equal();
-    return ret !== 0;
-}
-
-/**
- * @param {number} w
- * @param {number} h
- * @param {number} seed
- */
-export function decompress_bench_prepare(w, h, seed) {
-    wasm.decompress_bench_prepare(w, h, seed);
-}
-
-/**
- * @returns {number}
- */
-export function decompress_bench_wide() {
-    const ret = wasm.decompress_bench_wide();
-    return ret >>> 0;
-}
-
-/**
- * @returns {boolean}
- */
-export function demosaic_bench_equal() {
-    const ret = wasm.demosaic_bench_equal();
-    return ret !== 0;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_first_diff() {
-    const ret = wasm.demosaic_bench_first_diff();
-    return ret;
-}
-
-/**
- * @returns {boolean}
- */
-export function demosaic_bench_planar_equal() {
-    const ret = wasm.demosaic_bench_planar_equal();
-    return ret !== 0;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_planar_first_diff() {
-    const ret = wasm.demosaic_bench_planar_first_diff();
-    return ret;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_planar_scalar() {
-    const ret = wasm.demosaic_bench_planar_scalar();
-    return ret >>> 0;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_planar_simd() {
-    const ret = wasm.demosaic_bench_planar_simd();
-    return ret >>> 0;
-}
-
-/**
- * @param {number} w
- * @param {number} h
- */
-export function demosaic_bench_prepare(w, h) {
-    wasm.demosaic_bench_prepare(w, h);
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_scalar() {
-    const ret = wasm.demosaic_bench_scalar();
-    return ret >>> 0;
-}
-
-/**
- * @returns {boolean}
- */
-export function demosaic_bench_shuffle_equal() {
-    const ret = wasm.demosaic_bench_shuffle_equal();
-    return ret !== 0;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_shuffle_first_diff() {
-    const ret = wasm.demosaic_bench_shuffle_first_diff();
-    return ret;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_shuffle_simd() {
-    const ret = wasm.demosaic_bench_shuffle_simd();
-    return ret >>> 0;
-}
-
-/**
- * @returns {number}
- */
-export function demosaic_bench_simd() {
-    const ret = wasm.demosaic_bench_simd();
-    return ret >>> 0;
-}
-
-/**
- * @returns {number}
- */
-export function demtone_bench_mhc() {
-    const ret = wasm.demtone_bench_mhc();
-    return ret >>> 0;
-}
-
-/**
- * @returns {boolean}
- */
-export function demtone_bench_mhc_equal() {
-    const ret = wasm.demtone_bench_mhc_equal();
-    return ret !== 0;
-}
-
-/**
- * @returns {number}
- */
-export function demtone_bench_mhc_scalar() {
-    const ret = wasm.demtone_bench_mhc_scalar();
-    return ret >>> 0;
-}
-
-/**
- * @returns {number}
- */
-export function demtone_bench_mhc_simd128() {
-    const ret = wasm.demtone_bench_mhc_simd128();
-    return ret >>> 0;
-}
-
-/**
- * @param {number} w
- * @param {number} h
- */
-export function demtone_bench_prepare(w, h) {
-    wasm.demtone_bench_prepare(w, h);
-}
-
-/**
- * @returns {number}
- */
-export function demtone_bench_tone() {
-    const ret = wasm.demtone_bench_tone();
-    return ret >>> 0;
 }
 
 /**
@@ -2434,63 +2348,11 @@ export function frame_stats(pixels, width, height) {
 }
 
 /**
- * Exact byte-FNV kernel over a buffer passed across the boundary (wasm-bindgen copies
- * `pixels` into wasm linear memory on every call). Isolates the copy cost vs resident.
- * @param {Uint8Array} pixels
- * @param {number} width
- * @param {number} height
- * @returns {any}
+ * @param {number} num_threads
+ * @returns {Promise<any>}
  */
-export function fstats_copy(pixels, width, height) {
-    const ptr0 = passArray8ToWasm0(pixels, wasm.__wbindgen_malloc);
-    const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.fstats_copy(ptr0, len0, width, height);
-    return ret;
-}
-
-/**
- * Scan the resident buffer with the fast word-hash + ILP kernel (no per-call copy).
- * @returns {any}
- */
-export function fstats_fast() {
-    const ret = wasm.fstats_fast();
-    return ret;
-}
-
-/**
- * Fill the resident buffer with the same LCG byte stream the JS harness uses:
- *   s = s*1103515245 + 12345 (wrapping u32); byte = s & 0xff
- * @param {number} w
- * @param {number} h
- */
-export function fstats_prepare(w, h) {
-    wasm.fstats_prepare(w, h);
-}
-
-/**
- * Scan the resident buffer with the exact byte-FNV kernel (no per-call copy).
- * @returns {any}
- */
-export function fstats_scalar() {
-    const ret = wasm.fstats_scalar();
-    return ret;
-}
-
-/**
- * Scan the resident buffer with the hand-written v128 kernel (no per-call copy).
- * @returns {any}
- */
-export function fstats_simd() {
-    const ret = wasm.fstats_simd();
-    return ret;
-}
-
-/**
- * Bench probe for the production exact-hash SIMD kernel (resident buffer, no copy).
- * @returns {any}
- */
-export function fstats_simd_exact() {
-    const ret = wasm.fstats_simd_exact();
+export function initThreadPool(num_threads) {
+    const ret = wasm.initThreadPool(num_threads);
     return ret;
 }
 
@@ -2730,39 +2592,6 @@ export function perc_xyb_simd(px, n) {
     var v2 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
     return v2;
-}
-
-/**
- * @returns {boolean}
- */
-export function pipeline_bench_equal() {
-    const ret = wasm.pipeline_bench_equal();
-    return ret !== 0;
-}
-
-/**
- * @returns {number}
- */
-export function pipeline_bench_pipelined() {
-    const ret = wasm.pipeline_bench_pipelined();
-    return ret >>> 0;
-}
-
-/**
- * @param {number} w
- * @param {number} h
- * @param {number} seed
- */
-export function pipeline_bench_prepare(w, h, seed) {
-    wasm.pipeline_bench_prepare(w, h, seed);
-}
-
-/**
- * @returns {number}
- */
-export function pipeline_bench_sequential() {
-    const ret = wasm.pipeline_bench_sequential();
-    return ret >>> 0;
 }
 
 /**
@@ -3123,14 +2952,15 @@ export function process_orf_with_options(data, output_flags, options) {
  * @param {number} tint
  * @param {number} texture
  * @param {number} clarity
+ * @param {number | null} [baseline_ev]
  * @returns {ProcessResult}
  */
-export function process_raw_mosaic_with_flags(raw, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity) {
+export function process_raw_mosaic_with_flags(raw, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity, baseline_ev) {
     const ptr0 = passArray16ToWasm0(raw, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.process_raw_mosaic_with_flags(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity);
+    const ret = wasm.process_raw_mosaic_with_flags(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, exposure_ev, contrast, highlights, shadows, whites, blacks, saturation, vibrance, temp, tint, texture, clarity, isLikeNone(baseline_ev) ? Number.MAX_SAFE_INTEGER : Math.fround(baseline_ev));
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -3155,14 +2985,15 @@ export function process_raw_mosaic_with_flags(raw, width, height, cfa_phase, bla
  * @param {number} output_flags
  * @param {number} iso
  * @param {any} options
+ * @param {number | null} [baseline_ev]
  * @returns {ProcessResult}
  */
-export function process_raw_mosaic_with_options(raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, output_flags, iso, options) {
+export function process_raw_mosaic_with_options(raw_u16, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, color_matrix_flat, output_flags, iso, options, baseline_ev) {
     const ptr0 = passArray16ToWasm0(raw_u16, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passArrayF32ToWasm0(color_matrix_flat, wasm.__wbindgen_malloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.process_raw_mosaic_with_options(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, iso, options);
+    const ret = wasm.process_raw_mosaic_with_options(ptr0, len0, width, height, cfa_phase, black, white, wb_r, wb_b, orientation, ptr1, len1, output_flags, iso, options, isLikeNone(baseline_ev) ? Number.MAX_SAFE_INTEGER : Math.fround(baseline_ev));
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }
@@ -3253,7 +3084,51 @@ export function rotate_rgb8(src, width, height, turns) {
     }
     return RotateResult.__wrap(ret[0]);
 }
-function __wbg_get_imports() {
+
+export class wbg_rayon_PoolBuilder {
+    static __wrap(ptr) {
+        const obj = Object.create(wbg_rayon_PoolBuilder.prototype);
+        obj.__wbg_ptr = ptr;
+        wbg_rayon_PoolBuilderFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        wbg_rayon_PoolBuilderFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_wbg_rayon_poolbuilder_free(ptr, 0);
+    }
+    build() {
+        wasm.wbg_rayon_poolbuilder_build(this.__wbg_ptr);
+    }
+    /**
+     * @returns {number}
+     */
+    numThreads() {
+        const ret = wasm.wbg_rayon_poolbuilder_numThreads(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    receiver() {
+        const ret = wasm.wbg_rayon_poolbuilder_receiver(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) wbg_rayon_PoolBuilder.prototype[Symbol.dispose] = wbg_rayon_PoolBuilder.prototype.free;
+
+/**
+ * @param {number} receiver
+ */
+export function wbg_rayon_start_worker(receiver) {
+    wasm.wbg_rayon_start_worker(receiver);
+}
+function __wbg_get_imports(memory) {
     const import0 = {
         __proto__: null,
         __wbg_Error_bce6d499ff0a4aff: function(arg0, arg1) {
@@ -3271,6 +3146,14 @@ function __wbg_get_imports() {
         },
         __wbg___wbindgen_is_undefined_35bb9f4c7fd651d5: function(arg0) {
             const ret = arg0 === undefined;
+            return ret;
+        },
+        __wbg___wbindgen_memory_9544558992fc5400: function() {
+            const ret = wasm.memory;
+            return ret;
+        },
+        __wbg___wbindgen_module_598c7f098f85bbd9: function() {
+            const ret = wasmModule;
             return ret;
         },
         __wbg___wbindgen_number_get_f73a1244370fcc2c: function(arg0, arg1) {
@@ -3336,8 +3219,16 @@ function __wbg_get_imports() {
             const ret = arg0.length;
             return ret;
         },
+        __wbg_length_56fcd3e2b7e0299d: function(arg0) {
+            const ret = arg0.length;
+            return ret;
+        },
         __wbg_new_02d162bc6cf02f60: function() {
             const ret = new Object();
+            return ret;
+        },
+        __wbg_new_310879b66b6e95e1: function() {
+            const ret = new Array();
             return ret;
         },
         __wbg_now_3cd905700d21a70b: function(arg0) {
@@ -3356,10 +3247,21 @@ function __wbg_get_imports() {
             const ret = arg0.performance;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
         },
+        __wbg_push_b77c476b01548d0a: function(arg0, arg1) {
+            const ret = arg0.push(arg1);
+            return ret;
+        },
+        __wbg_set_24d0fa9e104112f9: function(arg0, arg1, arg2) {
+            arg0.set(getArrayU8FromWasm0(arg1, arg2));
+        },
         __wbg_set_a0e911be3da02782: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = Reflect.set(arg0, arg1, arg2);
             return ret;
         }, arguments); },
+        __wbg_startWorkers_8b582d57e92bd2d4: function(arg0, arg1, arg2) {
+            const ret = startWorkers(arg0, arg1, wbg_rayon_PoolBuilder.__wrap(arg2));
+            return ret;
+        },
         __wbg_static_accessor_GLOBAL_THIS_02344c9b09eb08a9: function() {
             const ret = typeof globalThis === 'undefined' ? null : globalThis;
             return isLikeNone(ret) ? 0 : addToExternrefTable0(ret);
@@ -3395,6 +3297,7 @@ function __wbg_get_imports() {
             table.set(offset + 2, true);
             table.set(offset + 3, false);
         },
+        memory: memory || new WebAssembly.Memory({initial:22,maximum:32768,shared:true}),
     };
     return {
         __proto__: null,
@@ -3405,9 +3308,6 @@ function __wbg_get_imports() {
 const BltvDecoderFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_bltvdecoder_free(ptr, 1));
-const DecodeBenchFinalization = (typeof FinalizationRegistry === 'undefined')
-    ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_decodebench_free(ptr, 1));
 const DecodePeakEstimateFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_decodepeakestimate_free(ptr, 1));
@@ -3444,6 +3344,9 @@ const ResidentDevelopedFinalization = (typeof FinalizationRegistry === 'undefine
 const RotateResultFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_rotateresult_free(ptr, 1));
+const wbg_rayon_PoolBuilderFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_wbg_rayon_poolbuilder_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();
@@ -3473,7 +3376,7 @@ function getArrayU8FromWasm0(ptr, len) {
 
 let cachedDataViewMemory0 = null;
 function getDataViewMemory0() {
-    if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer.detached === true || (cachedDataViewMemory0.buffer.detached === undefined && cachedDataViewMemory0.buffer !== wasm.memory.buffer)) {
+    if (cachedDataViewMemory0 === null || cachedDataViewMemory0.buffer !== wasm.memory.buffer) {
         cachedDataViewMemory0 = new DataView(wasm.memory.buffer);
     }
     return cachedDataViewMemory0;
@@ -3481,7 +3384,7 @@ function getDataViewMemory0() {
 
 let cachedFloat32ArrayMemory0 = null;
 function getFloat32ArrayMemory0() {
-    if (cachedFloat32ArrayMemory0 === null || cachedFloat32ArrayMemory0.byteLength === 0) {
+    if (cachedFloat32ArrayMemory0 === null || cachedFloat32ArrayMemory0.buffer !== wasm.memory.buffer) {
         cachedFloat32ArrayMemory0 = new Float32Array(wasm.memory.buffer);
     }
     return cachedFloat32ArrayMemory0;
@@ -3489,7 +3392,7 @@ function getFloat32ArrayMemory0() {
 
 let cachedFloat64ArrayMemory0 = null;
 function getFloat64ArrayMemory0() {
-    if (cachedFloat64ArrayMemory0 === null || cachedFloat64ArrayMemory0.byteLength === 0) {
+    if (cachedFloat64ArrayMemory0 === null || cachedFloat64ArrayMemory0.buffer !== wasm.memory.buffer) {
         cachedFloat64ArrayMemory0 = new Float64Array(wasm.memory.buffer);
     }
     return cachedFloat64ArrayMemory0;
@@ -3501,7 +3404,7 @@ function getStringFromWasm0(ptr, len) {
 
 let cachedUint16ArrayMemory0 = null;
 function getUint16ArrayMemory0() {
-    if (cachedUint16ArrayMemory0 === null || cachedUint16ArrayMemory0.byteLength === 0) {
+    if (cachedUint16ArrayMemory0 === null || cachedUint16ArrayMemory0.buffer !== wasm.memory.buffer) {
         cachedUint16ArrayMemory0 = new Uint16Array(wasm.memory.buffer);
     }
     return cachedUint16ArrayMemory0;
@@ -3509,7 +3412,7 @@ function getUint16ArrayMemory0() {
 
 let cachedUint8ArrayMemory0 = null;
 function getUint8ArrayMemory0() {
-    if (cachedUint8ArrayMemory0 === null || cachedUint8ArrayMemory0.byteLength === 0) {
+    if (cachedUint8ArrayMemory0 === null || cachedUint8ArrayMemory0.buffer !== wasm.memory.buffer) {
         cachedUint8ArrayMemory0 = new Uint8Array(wasm.memory.buffer);
     }
     return cachedUint8ArrayMemory0;
@@ -3592,8 +3495,9 @@ function takeFromExternrefTable0(idx) {
     return value;
 }
 
-let cachedTextDecoder = new TextDecoder('utf-8', { ignoreBOM: true, fatal: true });
-cachedTextDecoder.decode();
+let cachedTextDecoder = (typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8', { ignoreBOM: true, fatal: true }) : undefined);
+if (cachedTextDecoder) cachedTextDecoder.decode();
+
 const MAX_SAFARI_DECODE_BYTES = 2146435072;
 let numBytesDecoded = 0;
 function decodeText(ptr, len) {
@@ -3603,12 +3507,12 @@ function decodeText(ptr, len) {
         cachedTextDecoder.decode();
         numBytesDecoded = len;
     }
-    return cachedTextDecoder.decode(getUint8ArrayMemory0().subarray(ptr, ptr + len));
+    return cachedTextDecoder.decode(getUint8ArrayMemory0().slice(ptr, ptr + len));
 }
 
-const cachedTextEncoder = new TextEncoder();
+const cachedTextEncoder = (typeof TextEncoder !== 'undefined' ? new TextEncoder() : undefined);
 
-if (!('encodeInto' in cachedTextEncoder)) {
+if (cachedTextEncoder) {
     cachedTextEncoder.encodeInto = function (arg, view) {
         const buf = cachedTextEncoder.encode(arg);
         view.set(buf);
@@ -3622,7 +3526,7 @@ if (!('encodeInto' in cachedTextEncoder)) {
 let WASM_VECTOR_LEN = 0;
 
 let wasmModule, wasmInstance, wasm;
-function __wbg_finalize_init(instance, module) {
+function __wbg_finalize_init(instance, module, thread_stack_size) {
     wasmInstance = instance;
     wasm = instance.exports;
     wasmModule = module;
@@ -3631,7 +3535,11 @@ function __wbg_finalize_init(instance, module) {
     cachedFloat64ArrayMemory0 = null;
     cachedUint16ArrayMemory0 = null;
     cachedUint8ArrayMemory0 = null;
-    wasm.__wbindgen_start();
+    if (typeof thread_stack_size !== 'undefined' && (typeof thread_stack_size !== 'number' || thread_stack_size === 0 || thread_stack_size % 65536 !== 0)) {
+        throw new Error('invalid stack size');
+    }
+
+    wasm.__wbindgen_start(thread_stack_size);
     return wasm;
 }
 
@@ -3670,33 +3578,33 @@ async function __wbg_load(module, imports) {
     }
 }
 
-function initSync(module) {
+function initSync(module, memory) {
     if (wasm !== undefined) return wasm;
 
-
+    let thread_stack_size
     if (module !== undefined) {
         if (Object.getPrototypeOf(module) === Object.prototype) {
-            ({module} = module)
+            ({module, memory, thread_stack_size} = module)
         } else {
             console.warn('using deprecated parameters for `initSync()`; pass a single object instead')
         }
     }
 
-    const imports = __wbg_get_imports();
+    const imports = __wbg_get_imports(memory);
     if (!(module instanceof WebAssembly.Module)) {
         module = new WebAssembly.Module(module);
     }
     const instance = new WebAssembly.Instance(module, imports);
-    return __wbg_finalize_init(instance, module);
+    return __wbg_finalize_init(instance, module, thread_stack_size);
 }
 
-async function __wbg_init(module_or_path) {
+async function __wbg_init(module_or_path, memory) {
     if (wasm !== undefined) return wasm;
 
-
+    let thread_stack_size
     if (module_or_path !== undefined) {
         if (Object.getPrototypeOf(module_or_path) === Object.prototype) {
-            ({module_or_path} = module_or_path)
+            ({module_or_path, memory, thread_stack_size} = module_or_path)
         } else {
             console.warn('using deprecated parameters for the initialization function; pass a single object instead')
         }
@@ -3705,7 +3613,7 @@ async function __wbg_init(module_or_path) {
     if (module_or_path === undefined) {
         module_or_path = new URL('raw_converter_wasm_bg.wasm', import.meta.url);
     }
-    const imports = __wbg_get_imports();
+    const imports = __wbg_get_imports(memory);
 
     if (typeof module_or_path === 'string' || (typeof Request === 'function' && module_or_path instanceof Request) || (typeof URL === 'function' && module_or_path instanceof URL)) {
         module_or_path = fetch(module_or_path);
@@ -3713,7 +3621,7 @@ async function __wbg_init(module_or_path) {
 
     const { instance, module } = await __wbg_load(await module_or_path, imports);
 
-    return __wbg_finalize_init(instance, module);
+    return __wbg_finalize_init(instance, module, thread_stack_size);
 }
 
 export { initSync, __wbg_init as default };
