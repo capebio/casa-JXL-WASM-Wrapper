@@ -57,12 +57,6 @@ if (typeof self !== 'undefined' && typeof self.addEventListener === 'function') 
     // OTOH, even though it can't be inlined, it should be still reasonably
     // cheap since the requested file is already in cache (it was loaded by
     // the main thread).
-    // Explicit filename, not the '../../..' directory specifier wasm-bindgen-rayon
-    // emits. That form relies on Node-style directory/package resolution, which
-    // browsers do not perform: it requests `/web/pkg/` and any static host (the dev
-    // server and Vercel alike) answers 404. Every rayon worker then died on
-    // "Failed to fetch dynamically imported module", initThreadPool timed out, and
-    // the pool silently fell back to single-threaded.
     const pkg = await import('../../../raw_converter_wasm.js');
     await pkg.default(init);
     postMessage({ type: 'wasm_bindgen_worker_ready' });

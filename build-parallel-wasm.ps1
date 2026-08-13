@@ -140,7 +140,7 @@ function Invoke-Bindgen([string]$wasmBindgen, [string]$wasmIn, [string]$outDir) 
         $f = $_.FullName
         $raw = Get-Content $f -Raw -ErrorAction SilentlyContinue
         if ($raw -and $raw.Contains("import('../../..')")) {
-            Write-Host "  patching $f: directory import -> raw_converter_wasm.js"
+            Write-Host "  patching ${f} - directory import -> raw_converter_wasm.js"
             Set-Content -Path $f -NoNewline -Value `
                 $raw.Replace("import('../../..')", "import('../../../raw_converter_wasm.js')")
         }
@@ -225,6 +225,22 @@ try {
     $pkgHash = (Get-FileHash $wasmOut -Algorithm SHA256).Hash
     $webHash = (Get-FileHash (Join-Path $webPkgDir "raw_converter_wasm_bg.wasm") -Algorithm SHA256).Hash
     if ($pkgHash -ne $webHash) { throw "pkg and web/pkg wasm hashes diverged after copy" }
+
+    # web/pkg carries a wasm-pack-generated .gitignore containing `*`, so everything in it is
+    # ignored and the tracked files were force-added. A build that emits a NEW file therefore
+    # leaves it untracked, and it silently never deploys — which is exactly how the rayon
+    # worker snippet and a stale build-manifest went unnoticed. Name them; do not fail the
+    # build, since some outputs are genuinely not meant to ship.
+    $untracked = & git -C $repoRoot ls-files --others --exclude-standard --ignored -- web/pkg 2>$null
+    if ($LASTEXITCODE -eq 0 -and $untracked) {
+        $tracked = & git -C $repoRoot ls-files -- web/pkg
+        $missing = $untracked | Where-Object { $tracked -notcontains $_ }
+        if ($missing) {
+            Write-Warning "web/pkg files NOT tracked by git - they will not deploy:"
+            $missing | ForEach-Object { Write-Warning "    $_" }
+            Write-Warning "  add with: git add -f <path>"
+        }
+    }
 
     Write-Host "=== done ===" -ForegroundColor Green
     Write-Host "Outputs: $pkgDir and $webPkgDir"
