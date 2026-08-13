@@ -32,21 +32,35 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 struct Counting;
 static CUR: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
-/// Largest single live-allocation size seen while `WATCH_MIN` is armed (> 0). Lets a
-/// test detect whether a specific big buffer (e.g. a whole cropped mosaic) is still
-/// being allocated, independent of unrelated transient scratch.
-static WATCH_MIN: AtomicUsize = AtomicUsize::new(0);
-static BIG_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Big-allocation watch, **per thread**. Lets a test detect whether a specific big
+/// buffer (e.g. a whole cropped mosaic) is still being allocated, independent of
+/// unrelated transient scratch.
+///
+/// Thread-local, not global: the two `cr2_*_peak_alloc` tests each arm the watch and
+/// each allocate a ~48 MB mosaic, so with a process-wide counter the harness's default
+/// parallelism made each one count the other's allocation and see 2 where it required 1.
+/// That is a property of the measurement, not of `cr2_row_source` — it reproduced only
+/// when the tests ran together, and each passed alone. Attributing counts to the arming
+/// thread keeps the probe sound without serialising the binary.
+///
+/// `const`-initialised `Cell`s: TLS access inside a `GlobalAlloc` must not allocate or
+/// recurse, and `try_with` keeps it safe during thread-local destruction.
+thread_local! {
+    static WATCH_MIN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BIG_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         let p = System.alloc(l);
         if !p.is_null() {
             let c = CUR.fetch_add(l.size(), Ordering::Relaxed) + l.size();
             PEAK.fetch_max(c, Ordering::Relaxed);
-            let wm = WATCH_MIN.load(Ordering::Relaxed);
-            if wm != 0 && l.size() >= wm {
-                BIG_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
+            let _ = WATCH_MIN.try_with(|w| {
+                let wm = w.get();
+                if wm != 0 && l.size() >= wm {
+                    let _ = BIG_COUNT.try_with(|b| b.set(b.get() + 1));
+                }
+            });
         }
         p
     }
@@ -532,11 +546,11 @@ fn cr2_peak_alloc_no_full_crop(name: &str) {
 
     let base = CUR.load(Ordering::Relaxed);
     PEAK.store(base, Ordering::Relaxed);
-    BIG_COUNT.store(0, Ordering::Relaxed);
-    WATCH_MIN.store(watch, Ordering::Relaxed);
+    BIG_COUNT.with(|b| b.set(0));
+    WATCH_MIN.with(|w| w.set(watch));
     let src = cr2::cr2_row_source(&data).expect("cr2_row_source");
-    WATCH_MIN.store(0, Ordering::Relaxed);
-    let big = BIG_COUNT.load(Ordering::Relaxed);
+    WATCH_MIN.with(|w| w.set(0));
+    let big = BIG_COUNT.with(|b| b.get());
     let peak_delta = PEAK.load(Ordering::Relaxed) - base;
     std::hint::black_box(&src);
 
