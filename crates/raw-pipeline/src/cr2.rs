@@ -356,16 +356,54 @@ fn parse_ljpeg_sof(data: &[u8], strip_off: usize, strip_len: usize) -> Option<(u
 
 /// dcraw/libraw-style camera characterisation matrices (XYZ -> camera RGB, scaled *10000).
 ///
-/// DISABLED: direct use of adobe_coeff XYZ→cam matrices in CasaWASM's WB-first pipeline
-/// produces severely imbalanced output. The matrices assume un-WB-normalised camera values;
-/// CasaWASM's pre-LUT applies WB gain before the matrix, causing channel collapse (e.g. G→0
-/// on the 550D with r_mult≈2.2). Proper use requires scene-relative WB correction derived
-/// from the matrix's implied D65 neutral — a non-trivial change deferred for a dedicated fix.
-/// Until then, all bodies fall through to the generic CANON_CAM_TO_SRGB fallback.
-#[allow(dead_code)]
-fn canon_cam_xyz(_model: &str) -> Option<[i32; 9]> {
+/// These were previously disabled: "direct use of adobe_coeff XYZ→cam matrices in CasaWASM's
+/// WB-first pipeline produces severely imbalanced output ... causing channel collapse (e.g.
+/// G→0 on the 550D with r_mult≈2.2). Proper use requires scene-relative WB correction derived
+/// from the matrix's implied D65 neutral — a non-trivial change deferred".
+///
+/// That correction is dcraw's own normalisation step, and it is now applied in
+/// [`canon_color_matrix`]: normalise each row of `cam_xyz · xyz_rgb` to unit sum (this is
+/// where dcraw's `pre_mul` comes from — the matrix's implied neutral) BEFORE inverting. The
+/// result maps camera neutral to sRGB neutral by construction, which is what makes it safe
+/// to apply after the WB-first pre-LUT. The 550D is measured below and does not collapse.
+///
+/// Measured against each file's embedded camera JPEG on the 11-file Canon corpus
+/// (`examples/cr2_matrix_probe.rs`): mean channel-ratio distance 0.183 → 0.042, closer on
+/// 9 of 11 (the 2 exceptions are near-neutral frames decided by < 0.02). Bodies NOT listed
+/// here keep the previous [`CANON_CAM_TO_SRGB`] fallback — this changes only what was
+/// measured.
+///
+/// **Model strings are the raw EXIF value, and one body ships under several.** LibRaw
+/// normalises the 550D / Kiss X4 / Rebel T2i to a single name; we do not, so every alias
+/// needs its own row or the lookup silently misses (our corpus reports "Canon EOS Kiss X4"
+/// for files LibRaw calls "EOS 550D").
+fn canon_cam_xyz(model: &str) -> Option<[i32; 9]> {
+    const M5: [i32; 9] = [8532, -701, -1167, -4095, 11879, 2508, -797, 2424, 7010];
+    const D550: [i32; 9] = [6941, -1164, -857, -3825, 11597, 2534, -416, 1540, 6039];
+    let m = model.trim();
+    let eq = |needle: &str| m.eq_ignore_ascii_case(needle);
+    if eq("Canon EOS M5") || eq("EOS M5") {
+        return Some(M5);
+    }
+    if eq("Canon EOS 550D")
+        || eq("EOS 550D")
+        || eq("Canon EOS Kiss X4")
+        || eq("EOS Kiss X4")
+        || eq("Canon EOS Rebel T2i")
+        || eq("EOS Rebel T2i")
+    {
+        return Some(D550);
+    }
     None
 }
+
+/// sRGB (D65) primaries → XYZ. dcraw's `xyz_rgb`, used to turn a published XYZ→cam matrix
+/// into the camera→sRGB matrix actually applied to pixels.
+const XYZ_RGB: [[f32; 3]; 3] = [
+    [0.412453, 0.357580, 0.180423],
+    [0.212671, 0.715160, 0.072169],
+    [0.019334, 0.119193, 0.950227],
+];
 
 /// Camera->sRGB matrix for a Canon body, or None (→ pipeline uses the generic CAM_TO_SRGB
 /// fallback). Mirrors the DNG path (dng::choose_camera_to_srgb_matrix): treat the published
@@ -398,8 +436,28 @@ fn canon_color_matrix(make: &str, model: &str) -> Option<[[f32; 3]; 3]> {
             raw[8] as f32 / 10000.0,
         ],
     ];
-    let cam_to_xyz = crate::dng::invert3x3(cam_xyz)?;
-    Some(crate::dng::mul3x3(crate::dng::XYZ_D50_TO_SRGB, cam_to_xyz))
+    // dcraw's `cam_xyz_coeff`, including the normalisation that the previous deferral was
+    // waiting on. cam_rgb = cam_xyz · xyz_rgb describes the camera in terms of the sRGB
+    // primaries; dividing each row by its own sum is exactly "the matrix's implied D65
+    // neutral" (dcraw derives pre_mul from these sums). Inverting the normalised form gives
+    // a camera→sRGB matrix whose rows sum to 1, so camera neutral maps to sRGB neutral and
+    // it composes with the WB-first pre-LUT instead of fighting it.
+    let mut cam_rgb = [[0.0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            cam_rgb[i][j] = (0..3).map(|k| cam_xyz[i][k] * XYZ_RGB[k][j]).sum();
+        }
+    }
+    for row in cam_rgb.iter_mut() {
+        let s: f32 = row.iter().sum();
+        if s.abs() < 1e-6 {
+            return None; // degenerate table entry — fall back rather than divide by ~0
+        }
+        for v in row.iter_mut() {
+            *v /= s;
+        }
+    }
+    crate::dng::invert3x3(cam_rgb)
 }
 
 /// Generic Canon EOS camera→sRGB matrix (dcraw/LibRaw coefficients).
@@ -2459,44 +2517,75 @@ mod tests {
 
     #[test]
     fn canon_make_check_case_variants() {
-        // Same behavior for all case variants; still None while canon_cam_xyz is disabled.
-        assert!(canon_color_matrix("CANON", "Canon EOS 550D").is_none());
-        assert!(canon_color_matrix("canon inc.", "Canon EOS 550D").is_none());
+        // The make check is case-insensitive and substring-based: a known body resolves
+        // under any spelling of the make.
+        assert!(canon_color_matrix("CANON", "Canon EOS 550D").is_some());
+        assert!(canon_color_matrix("canon inc.", "Canon EOS 550D").is_some());
+        // Non-Canon make → None even for a model string we would otherwise know.
+        assert!(canon_color_matrix("Nikon", "Canon EOS 550D").is_none());
         assert!(canon_color_matrix("Nikon", "D850").is_none());
         assert!(canon_color_matrix("Cano", "trunc").is_none()); // shorter than needle
     }
 
     #[test]
-    fn canon_color_matrix_disabled_until_neutral_correction_implemented() {
-        // Per-model matrices are temporarily disabled: direct adobe_coeff use in
-        // CasaWASM's WB-first pipeline produces channel collapse (see canon_cam_xyz comment).
-        // All bodies fall through to the generic CANON_CAM_TO_SRGB fallback.
-        for model in [
-            "Canon EOS 550D",
-            "Canon EOS Kiss X4",
-            "Canon EOS M5",
-            "Canon EOS 9999X",
-        ] {
+    fn canon_color_matrix_is_neutral_preserving_and_saturating() {
+        // The two properties that make the per-model matrix safe in a WB-first pipeline.
+        // Row sums of 1 are what the deferral was waiting for: they come from normalising
+        // cam_xyz·xyz_rgb before inverting, and they are why camera neutral maps to sRGB
+        // neutral instead of collapsing a channel. Negative off-diagonals are what
+        // distinguishes a real camera->sRGB matrix from the all-positive generic that
+        // silently desaturated every Canon render.
+        for model in ["Canon EOS 550D", "Canon EOS Kiss X4", "Canon EOS M5"] {
+            let m = canon_color_matrix("Canon", model)
+                .unwrap_or_else(|| panic!("expected a per-model matrix for {model}"));
+            for (i, row) in m.iter().enumerate() {
+                let s: f32 = row.iter().sum();
+                assert!(
+                    (s - 1.0).abs() < 1e-3,
+                    "{model} row {i} sums to {s}, not 1 — grey would not stay grey"
+                );
+            }
             assert!(
-                canon_color_matrix("Canon", model).is_none(),
-                "expected None for {model}"
+                m.iter().flatten().any(|v| *v < -0.05),
+                "{model} matrix is all-positive — that is a camera->XYZ shape, which desaturates"
             );
         }
+        // The 550D's regional names are the same body and must agree exactly; LibRaw
+        // normalises them, we do not, so each alias is a separate table row.
+        assert_eq!(
+            canon_color_matrix("Canon", "Canon EOS 550D"),
+            canon_color_matrix("Canon", "Canon EOS Kiss X4")
+        );
+        assert_eq!(
+            canon_color_matrix("Canon", "Canon EOS 550D"),
+            canon_color_matrix("Canon", "Canon EOS Rebel T2i")
+        );
+        // Unlisted body → None, so it keeps the generic fallback (we only changed what
+        // was measured against the corpus).
+        assert!(canon_color_matrix("Canon", "Canon EOS 9999X").is_none());
         assert!(canon_color_matrix("OM Digital Solutions", "OM-5").is_none());
     }
 
     #[test]
     fn resolved_color_matrix_is_canon_generic_fallback() {
-        // Finding 52: while the per-model table is disabled, every Canon body must
-        // still resolve to the CONCRETE Canon-generic matrix (never None), so preview
-        // and final consume the same matrix instead of diverging (Olympus vs Canon).
-        for model in ["Canon EOS 550D", "Canon EOS M5", "Canon EOS 9999X"] {
-            assert_eq!(
-                resolved_color_matrix("Canon", model),
+        // Finding 52: every Canon body must resolve to a CONCRETE matrix (never None), so
+        // preview and final consume the same one instead of diverging (Olympus vs Canon).
+        // A listed body now gets its per-model matrix; an unlisted one still gets the
+        // generic, which is what keeps this change scoped to what was measured.
+        for model in ["Canon EOS 550D", "Canon EOS M5"] {
+            let resolved = resolved_color_matrix("Canon", model);
+            assert_eq!(resolved, canon_color_matrix("Canon", model));
+            assert_ne!(
+                resolved,
                 Some(CANON_CAM_TO_SRGB),
-                "Canon body {model} must resolve to the Canon generic, not None"
+                "{model} is in the per-model table and must not fall back to the generic"
             );
         }
+        assert_eq!(
+            resolved_color_matrix("Canon", "Canon EOS 9999X"),
+            Some(CANON_CAM_TO_SRGB),
+            "an unlisted Canon body must still resolve to the generic, not None"
+        );
         // Case-insensitive make match.
         assert_eq!(resolved_color_matrix("CANON", "x"), Some(CANON_CAM_TO_SRGB));
         // Non-Canon → None (caller keeps its generic pipeline fallback).

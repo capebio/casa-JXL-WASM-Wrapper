@@ -1,7 +1,8 @@
-# CR2 `ADH 1234` colour divergence — metadata cleared, cause is downstream (2026-08-13)
+# CR2 `ADH 1234` colour divergence — the matrix was camera→XYZ used as camera→sRGB (2026-08-13)
 
-Open. Not a regression: predates the lens-2 merge and the WB-scaled MHC gains work.
-Recorded so the next person does not re-derive the two checks that are already done.
+**FIXED for the two bodies in the corpus** (EOS M5, EOS 550D/Kiss X4/Rebel T2i). Bodies
+outside the table keep the previous generic fallback and are still affected — see "Not done"
+at the end. Not a regression: predates the lens-2 merge and the WB-scaled MHC gains work.
 
 ## Symptom
 
@@ -101,15 +102,44 @@ correctly with the WB-first pre-LUT — as the numbers above show empirically.
 So the deferred "non-trivial change" is: normalise rows before inverting. See
 `derive_rgb_cam` in the probe for the exact 20 lines.
 
-**Still to do before shipping it:**
+## What was implemented
 
-1. Restore a per-model `cam_xyz` table (`canon_cam_xyz` is stubbed to `None`); the probe
-   hardcodes the EOS M5 coefficients. Note the `_MG_*` files are a different body and still
-   scored better under the M5-derived matrix, which is suggestive but not a substitute for
-   per-body data.
-2. Re-pin whatever CR2 goldens move, and re-run the census — it changes every Canon render.
-3. Mirror the value in `src/lib.rs::CANON_CAM_TO_SRGB`, which finding 52 requires to stay
-   byte-identical across the FFI boundary.
+`canon_cam_xyz` now returns per-model coefficients for the two bodies in the corpus, and
+`canon_color_matrix` derives the matrix dcraw's way (normalise rows of `cam_xyz · xyz_rgb`
+to unit sum, then invert). Re-running the probe with the shipped resolver:
+
+```
+11 files: mean distance to camera JPEG 0.183 -> 0.042, closer on 9 of 11
+```
+
+The shipped arm and the derived arm are now identical per file, as they should be.
+
+The **EOS 550D is the body the old comment named** as the channel-collapse counterexample
+(`G→0 with r_mult≈2.2`). Its files improve 0.260→0.055, 0.106→0.020, 0.131→0.033, and no
+channel collapses — the objection is answered on its own evidence, because the row
+normalisation supplies exactly the neutral correction it said was missing.
+
+Two things worth knowing for anyone extending the table:
+
+- **One body, several names.** Our decoder reports the raw EXIF model, so the corpus says
+  `Canon EOS Kiss X4` where LibRaw says `EOS 550D`. LibRaw normalises; we do not. Each
+  regional alias (550D / Kiss X4 / Rebel T2i) needs its own row or the lookup silently
+  misses and the body quietly keeps the wrong matrix.
+- **The tests now pin the two properties that make it safe**, not the numbers: every row
+  sums to 1 (grey stays grey — this is the neutral preservation), and at least one
+  off-diagonal is negative (a real camera→sRGB matrix, not an all-positive averaging one).
+
+`src/lib.rs` needed no change: it already routes through `cr2::resolved_color_matrix`, so
+finding 52's "byte-identical across the FFI boundary" requirement holds automatically.
+
+## Not done
+
+Canon bodies outside the table still get `CANON_CAM_TO_SRGB`, the all-positive generic, and
+so are still desaturated. Fixing them means extending `canon_cam_xyz` with that body's
+adobe coefficients — read them out with `META=1 node tools/colour-verify-corpus.mjs`, which
+prints LibRaw's `cam_xyz` per file — and re-running `cr2_matrix_probe` on samples from it.
+The generic fallback itself is likely the same XYZ-shaped mistake, but no corpus file
+exercises it, so it was left alone rather than changed blind.
 
 `ADH 1570.CR2` is a second high-ISO sample if another tungsten case is wanted.
 

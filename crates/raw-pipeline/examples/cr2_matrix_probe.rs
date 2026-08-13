@@ -23,14 +23,59 @@ const XYZ_RGB: [[f64; 3]; 3] = [
     [0.019334, 0.119193, 0.950227],
 ];
 
-/// LibRaw's `cam_xyz` for the Canon EOS M5, read out of the corpus via
-/// `META=1 node tools/colour-verify-corpus.mjs` (it comes from LibRaw's built-in
-/// Adobe-coefficient table, not from the file).
-const CAM_XYZ_EOS_M5: [[f64; 3]; 3] = [
-    [0.8532, -0.0701, -0.1167],
-    [-0.4095, 1.1879, 0.2508],
-    [-0.0797, 0.2424, 0.7010],
+/// LibRaw's `cam_xyz` per body, read out of the corpus via
+/// `META=1 node tools/colour-verify-corpus.mjs` (they come from LibRaw's built-in
+/// Adobe-coefficient table, not from the files).
+///
+/// The 550D matters: the comment that disabled `canon_cam_xyz` in `cr2.rs` cites it by
+/// name as the body where adobe coefficients "cause channel collapse (G->0 with
+/// r_mult~2.2)". If dcraw's normalise-then-invert derivation renders it correctly, that
+/// objection is answered on its own counterexample.
+const CAM_XYZ: &[(&str, [[f64; 3]; 3])] = &[
+    (
+        "EOS M5",
+        [
+            [0.8532, -0.0701, -0.1167],
+            [-0.4095, 1.1879, 0.2508],
+            [-0.0797, 0.2424, 0.7010],
+        ],
+    ),
+    (
+        "EOS 550D",
+        [
+            [0.6941, -0.1164, -0.0857],
+            [-0.3825, 1.1597, 0.2534],
+            [-0.0416, 0.1540, 0.6039],
+        ],
+    ),
+    // Same body, other regional names. LibRaw normalises these to "EOS 550D"; our decoder
+    // reports the EXIF string verbatim, so a table keyed on the raw model would silently
+    // miss two of the three names this camera ships under. Any real per-model table needs
+    // the same aliasing.
+    (
+        "EOS Kiss X4",
+        [
+            [0.6941, -0.1164, -0.0857],
+            [-0.3825, 1.1597, 0.2534],
+            [-0.0416, 0.1540, 0.6039],
+        ],
+    ),
+    (
+        "EOS Rebel T2i",
+        [
+            [0.6941, -0.1164, -0.0857],
+            [-0.3825, 1.1597, 0.2534],
+            [-0.0416, 0.1540, 0.6039],
+        ],
+    ),
 ];
+
+fn cam_xyz_for(model: &str) -> Option<[[f64; 3]; 3]> {
+    CAM_XYZ
+        .iter()
+        .find(|(m, _)| model.eq_ignore_ascii_case(m) || model.to_ascii_lowercase().contains(&m.to_ascii_lowercase()))
+        .map(|(_, m)| *m)
+}
 
 /// dcraw's `cam_xyz_coeff`: cam_rgb = cam_xyz . xyz_rgb, rows normalised to unit sum
 /// (that normalisation is where dcraw's `pre_mul` comes from), then inverted to give
@@ -142,21 +187,23 @@ fn main() {
     }
     files.sort();
 
-    let (cam_rgb, rgb_cam) = derive_rgb_cam(CAM_XYZ_EOS_M5);
-    println!("EOS M5 matrices");
-    println!("  cam_rgb (camera-from-sRGB, row-normalised, what an all-positive matrix looks like):");
-    for r in &cam_rgb {
-        println!("    {:8.4} {:8.4} {:8.4}", r[0], r[1], r[2]);
-    }
-    println!("  rgb_cam (camera->sRGB, dcraw-derived = inverse of the above):");
-    for r in &rgb_cam {
-        println!("    {:8.4} {:8.4} {:8.4}", r[0], r[1], r[2]);
+    for (model, cam_xyz) in CAM_XYZ {
+        let (cam_rgb, rgb_cam) = derive_rgb_cam(*cam_xyz);
+        println!("{model}");
+        println!("  cam_rgb (camera-from-sRGB, row-normalised — the all-positive shape):");
+        for r in &cam_rgb {
+            println!("    {:8.4} {:8.4} {:8.4}", r[0], r[1], r[2]);
+        }
+        println!("  rgb_cam (camera->sRGB, dcraw-derived = inverse of the above):");
+        for r in &rgb_cam {
+            println!("    {:8.4} {:8.4} {:8.4}", r[0], r[1], r[2]);
+        }
     }
     if let Some(f) = files.first() {
         if let Ok(d) = fs::read(f) {
             if let Ok(img) = cr2::decode_bytes(&d) {
                 let m: pipeline::ColorMatrix = img.color_matrix.into();
-                println!("  ours (as resolved by cr2.rs today):");
+                println!("ours (the one generic fallback every Canon body gets today):");
                 for r in m.as_matrix() {
                     println!("    {:8.4} {:8.4} {:8.4}", r[0], r[1], r[2]);
                 }
@@ -183,6 +230,15 @@ fn main() {
             ergb[i * 3 + 2] = emb.u8[i * 4 + 2];
         }
         let (erg, ebg) = ratios(&ergb);
+
+        // Per-body coefficients, so the 550D is tested against its own matrix rather than
+        // the M5's — otherwise the comparison would be measuring the wrong thing.
+        let model = cr2::decode_bytes(&data).map(|i| i.model.clone()).unwrap_or_default();
+        let Some(cam_xyz) = cam_xyz_for(&model) else {
+            println!("{name:<16} (no cam_xyz for model {model:?} — skipped)");
+            continue;
+        };
+        let (_, rgb_cam) = derive_rgb_cam(cam_xyz);
 
         let Some((w, h, a)) = render(&data, None) else { continue };
         let Some((_, _, b)) = render(&data, Some(to_f32(rgb_cam))) else { continue };
