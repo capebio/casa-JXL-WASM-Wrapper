@@ -1,8 +1,8 @@
 {
+  "wasmBytes": 2199854,
   "rustc": "rustc 1.98.0-nightly (14210df0e 2026-05-31)",
+  "builtAt": "2026-08-13T15:07:44.8361784+02:00",
   "rustflags": "-C target-feature=+simd128,+atomics,+bulk-memory,+mutable-globals -C link-arg=--shared-memory -C link-arg=--max-memory=2147483648 -C link-arg=--import-memory -C link-arg=--export=__heap_base -C link-arg=--export=__tls_base -C link-arg=--export=__tls_size -C link-arg=--export=__tls_align -C link-arg=--export=__wasm_init_tls",
-  "wasmBytes": 2195303,
   "features": "parallel-wasm",
-  "builtAt": "2026-08-13T14:08:43.3493965+02:00",
-  "sha256": "2029987e8bd60c9bbe7a202b492234b1b574abcb10747ff408abd5afc09e4b4f"
+  "sha256": "b34a64d8e0675d08cacf5e9b6eed10f8819ab5996af1236af137be381edf4e46"
 }
