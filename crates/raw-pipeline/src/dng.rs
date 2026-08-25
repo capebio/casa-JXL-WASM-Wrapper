@@ -1112,6 +1112,13 @@ fn decode_deflate(
 /// JPEG XL-compressed DNG (compression 52546, DNG 1.7): each tile/strip is an
 /// independent JXL codestream. Decoded via the BSD-clean own-FFI decoder
 /// (`jxl_casadecoder`); Gray for 1 sample/pixel, Rgb for Linear DNG (cps=3).
+///
+/// Caveat: libjxl's UINT16 output is full-range, so a codestream whose
+/// declared bit depth is below 16 comes back scaled by 65535/(2^bits-1) —
+/// not the stored codes. Every real 52546 file examined (Adobe SDK samples,
+/// iPhone per rawspeed#971) declares a 16-bit codestream even when
+/// BitsPerSample says 10, so this is currently theoretical; revisit if a
+/// sub-16-bit codestream shows up.
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn decode_jxl(
     data: &[u8],
