@@ -21,7 +21,7 @@ fn main() {
             }
             Err(e) => println!("{a}: DECODE FAIL {e:#}"),
         }
-        match raw_pipeline::dng::ljpeg_tile_ranges(&bytes) {
+        match raw_pipeline::dng::payload_ranges(&bytes) {
             Ok(r) => {
                 let lo = r.iter().map(|x| x.0).min().unwrap_or(0);
                 let hi = r.iter().map(|x| x.1).max().unwrap_or(0);

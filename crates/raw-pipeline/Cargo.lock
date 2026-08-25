@@ -686,6 +686,7 @@ dependencies = [
  "image",
  "jxl-ffi",
  "jxl-oxide",
+ "miniz_oxide",
  "rayon",
  "serde",
  "serde_json",

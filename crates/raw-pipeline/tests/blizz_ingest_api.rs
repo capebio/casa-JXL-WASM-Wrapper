@@ -57,7 +57,16 @@ fn blizz_ingest_api_pins() {
     // One (offset, len) per LJPEG tile — the payload extents.
     let _dng_tiles: fn(&[u8]) -> anyhow::Result<Vec<(usize, usize)>> =
         raw_pipeline::dng::ljpeg_tile_ranges;
+    // Every-compression payload extents (tag arithmetic; what ingest now calls).
+    let _dng_ranges: fn(&[u8]) -> anyhow::Result<Vec<(usize, usize)>> =
+        raw_pipeline::dng::payload_ranges;
     let _phase: fn(raw_pipeline::dng::Cfa) -> (u8, u8) = raw_pipeline::dng::cfa_phase;
+
+    // `blizz` refuses Linear DNG (ProRAW) by this field; removing it would make
+    // ingest silently archive one channel of three.
+    fn _uses_spp(img: &raw_pipeline::dng::DngImage) -> usize {
+        img.samples_per_pixel
+    }
 
     // --- RW2 / RWL / NEF -------------------------------------------------
     // These hand back the payload range directly, on `BayerImage::strip`.

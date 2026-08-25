@@ -157,6 +157,38 @@ pub fn ljpeg_tile_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
     Ok(ranges)
 }
 
+/// Byte ranges of the sensor payload within `data`, for EVERY compression the
+/// walker accepts (1 uncompressed, 7 LJPEG, 8 deflate, 52546 JPEG XL) — tiles
+/// or strips. This is pure tag arithmetic (offsets + byte counts); no decoding.
+///
+/// The archive use case (`blizz` ingest): everything outside these ranges rides
+/// along verbatim in the archive's sidecar. A lossy DNG (34892) is refused with
+/// the reason via the walker's named error rather than located and archived.
+///
+/// Sibling of [`ljpeg_tile_ranges`], which stays pinned to compression 7 for
+/// its existing callers.
+pub fn payload_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
+    let (_state, raw, _le) = load_dng(data)?;
+    let (offsets, counts) = if !raw.tile_offsets.is_empty() {
+        (&raw.tile_offsets, &raw.tile_byte_counts)
+    } else {
+        (&raw.strip_offsets, &raw.strip_byte_counts)
+    };
+    if offsets.len() != counts.len() {
+        bail!("DNG: offset/byte-count length mismatch");
+    }
+    let mut ranges = Vec::with_capacity(offsets.len());
+    for (o, c) in offsets.iter().zip(counts.iter()) {
+        let off = *o as usize;
+        let end = off
+            .checked_add(*c as usize)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| anyhow!("payload range OOB"))?;
+        ranges.push((off, end));
+    }
+    Ok(ranges)
+}
+
 pub fn decode_bytes(data: &[u8]) -> Result<DngImage> {
     decode_bytes_inner(data, false)
 }
@@ -220,6 +252,13 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         1 => decode_uncompressed(data, &raw, width, height, le, &mut out)?,
         7 if use_blit => decode_tiles_blit(data, &raw, width, height, cps, &mut out)?,
         7 => decode_tiles(data, &raw, width, height, cps, &mut out)?,
+        8 => decode_deflate(data, &raw, width, height, le, &mut out)?,
+        #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+        52546 => decode_jxl(data, &raw, width, height, cps, &mut out)?,
+        #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]
+        52546 => bail!(
+            "DNG compression 52546 (JPEG XL) needs the jxl-codec feature (native builds only)"
+        ),
         c => bail!("DNG compression {c} not supported"),
     }
 
@@ -964,6 +1003,243 @@ fn decode_uncompressed_band(
     }
 }
 
+/// Deflate-compressed DNG (compression 8): each strip/tile is an independent
+/// zlib stream of 16-bit samples in file byte order. Single-sample (Bayer or
+/// gray) only; TIFF Predictor other than 1 (none) is refused by number — DNG
+/// uses predictor 2/3 with deflate only for floating-point data, which is out
+/// of scope here.
+fn decode_deflate(
+    data: &[u8],
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    le: bool,
+    out: &mut [u16],
+) -> Result<()> {
+    if raw.samples_per_pixel.max(1) != 1 {
+        bail!(
+            "deflate DNG: SamplesPerPixel {} not supported (single-sample only)",
+            raw.samples_per_pixel
+        );
+    }
+    if let Some(p) = raw.predictor {
+        if p != 1 {
+            bail!("deflate DNG: Predictor {p} not supported (only 1 = none)");
+        }
+    }
+    let layout = uncompressed_layout(raw, width, height)?;
+    let mut band_first = 0usize;
+    while band_first < height {
+        let rows = layout.band_rows(band_first, height);
+        match layout {
+            UncompressedLayout::Strips { rows_per_strip } => {
+                let idx = band_first / rows_per_strip;
+                if idx >= raw.strip_offsets.len() || idx >= raw.strip_byte_counts.len() {
+                    bail!("deflate DNG: strip {idx} index out of range");
+                }
+                let off = raw.strip_offsets[idx] as usize;
+                let bc = raw.strip_byte_counts[idx] as usize;
+                let end = off
+                    .checked_add(bc)
+                    .filter(|&e| e <= data.len())
+                    .ok_or_else(|| anyhow!("deflate DNG: strip {idx} OOB"))?;
+                let need = rows * width * 2;
+                let bytes =
+                    miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&data[off..end], need)
+                        .map_err(|e| anyhow!("deflate DNG: strip {idx} inflate: {e:?}"))?;
+                if bytes.len() < need {
+                    bail!(
+                        "deflate DNG: strip {idx} short: {} bytes for {} rows",
+                        bytes.len(),
+                        rows
+                    );
+                }
+                let base = band_first * width;
+                for r in 0..rows {
+                    fill_u16_row(
+                        &mut out[base + r * width..base + (r + 1) * width],
+                        &bytes[r * width * 2..(r + 1) * width * 2],
+                        le,
+                    );
+                }
+            }
+            UncompressedLayout::Tiled { tw, tl, coltiles } => {
+                let tr = band_first / tl;
+                for tc in 0..coltiles {
+                    let idx = tr * coltiles + tc;
+                    if idx >= raw.tile_offsets.len() || idx >= raw.tile_byte_counts.len() {
+                        bail!("deflate DNG: tile {idx} index out of range");
+                    }
+                    let off = raw.tile_offsets[idx] as usize;
+                    let bc = raw.tile_byte_counts[idx] as usize;
+                    let end = off
+                        .checked_add(bc)
+                        .filter(|&e| e <= data.len())
+                        .ok_or_else(|| anyhow!("deflate DNG: tile {idx} OOB"))?;
+                    let need = tl * tw * 2; // tiles are padded to full tile size
+                    let bytes = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(
+                        &data[off..end],
+                        need,
+                    )
+                    .map_err(|e| anyhow!("deflate DNG: tile {idx} inflate: {e:?}"))?;
+                    if bytes.len() < need {
+                        bail!("deflate DNG: tile {idx} short: {} bytes", bytes.len());
+                    }
+                    let col_start = tc * tw;
+                    let cw = ((tc + 1) * tw).min(width) - col_start;
+                    for r in 0..rows {
+                        let dst = (band_first + r) * width + col_start;
+                        fill_u16_row(
+                            &mut out[dst..dst + cw],
+                            &bytes[r * tw * 2..r * tw * 2 + cw * 2],
+                            le,
+                        );
+                    }
+                }
+            }
+        }
+        band_first += rows;
+    }
+    Ok(())
+}
+
+/// JPEG XL-compressed DNG (compression 52546, DNG 1.7): each tile/strip is an
+/// independent JXL codestream. Decoded via the BSD-clean own-FFI decoder
+/// (`jxl_casadecoder`); Gray for 1 sample/pixel, Rgb for Linear DNG (cps=3).
+#[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+fn decode_jxl(
+    data: &[u8],
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    cps: usize,
+    out: &mut [u16],
+) -> Result<()> {
+    use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
+    let ch = match cps {
+        1 => Channels::Gray,
+        3 => Channels::Rgb,
+        c => bail!("JXL DNG: SamplesPerPixel {c} not supported"),
+    };
+    // Segment geometry: tiles when present, else strips (a strip = a full-width
+    // band). Reuses the same offset arrays either way.
+    struct Seg {
+        off: usize,
+        end: usize,
+        col_start: usize,
+        row_start: usize,
+        active_w: usize,
+        active_h: usize,
+    }
+    let mut segs = Vec::new();
+    if !raw.tile_offsets.is_empty() {
+        let tw = raw.tile_width.ok_or_else(|| anyhow!("missing TileWidth"))? as usize;
+        let tl = raw
+            .tile_length
+            .ok_or_else(|| anyhow!("missing TileLength"))? as usize;
+        if tw == 0 || tl == 0 {
+            bail!("JXL DNG: zero TileWidth/TileLength");
+        }
+        let coltiles = width.div_ceil(tw);
+        let rowtiles = height.div_ceil(tl);
+        let expected = coltiles
+            .checked_mul(rowtiles)
+            .ok_or_else(|| anyhow!("JXL DNG: tile grid overflow"))?;
+        if raw.tile_offsets.len() != expected || raw.tile_byte_counts.len() != expected {
+            bail!("JXL DNG: tile count mismatch");
+        }
+        for idx in 0..expected {
+            let (tr, tc) = (idx / coltiles, idx % coltiles);
+            let off = raw.tile_offsets[idx] as usize;
+            let end = off
+                .checked_add(raw.tile_byte_counts[idx] as usize)
+                .filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow!("JXL DNG: tile {idx} OOB"))?;
+            let col_start = tc * tw;
+            let row_start = tr * tl;
+            segs.push(Seg {
+                off,
+                end,
+                col_start,
+                row_start,
+                active_w: ((tc + 1) * tw).min(width) - col_start,
+                active_h: ((tr + 1) * tl).min(height) - row_start,
+            });
+        }
+    } else {
+        let rows_per_strip = raw.rows_per_strip.unwrap_or(height as u32).max(1) as usize;
+        if raw.strip_offsets.len() != raw.strip_byte_counts.len() {
+            bail!("JXL DNG: strip count mismatch");
+        }
+        for (idx, (o, c)) in raw
+            .strip_offsets
+            .iter()
+            .zip(raw.strip_byte_counts.iter())
+            .enumerate()
+        {
+            let off = *o as usize;
+            let end = off
+                .checked_add(*c as usize)
+                .filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow!("JXL DNG: strip {idx} OOB"))?;
+            let row_start = idx * rows_per_strip;
+            if row_start >= height {
+                bail!("JXL DNG: strip {idx} beyond image");
+            }
+            segs.push(Seg {
+                off,
+                end,
+                col_start: 0,
+                row_start,
+                active_w: width,
+                active_h: (row_start + rows_per_strip).min(height) - row_start,
+            });
+        }
+    }
+
+    // Decode each segment (parallel when available — one Decoder per task) into
+    // a compact buffer, then blit its active rect. Correctness path; segment
+    // decode dominates, the serial blit is a memcpy.
+    let decode_seg = |seg: &Seg| -> Result<(Vec<u16>, u32, u32)> {
+        let mut dec = Decoder::new(DecodeOptions::default())
+            .ok_or_else(|| anyhow!("JXL DNG: decoder init failed"))?;
+        let mut buf: Vec<u16> = Vec::new();
+        let (dw, dh, _meta) = dec
+            .decode_into_dims::<u16>(&data[seg.off..seg.end], ch, &mut buf)
+            .map_err(|e| anyhow!("JXL DNG: segment decode: {e}"))?;
+        Ok((buf, dw, dh))
+    };
+    #[cfg(feature = "parallel")]
+    let decoded: Vec<(Vec<u16>, u32, u32)> = segs
+        .par_iter()
+        .map(decode_seg)
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(not(feature = "parallel"))]
+    let decoded: Vec<(Vec<u16>, u32, u32)> =
+        segs.iter().map(decode_seg).collect::<Result<Vec<_>>>()?;
+
+    for (seg, (buf, dw, dh)) in segs.iter().zip(decoded.iter()) {
+        let dw = *dw as usize;
+        let dh = *dh as usize;
+        // A tile codestream may carry the full padded tile; the active rect must
+        // fit inside what actually decoded.
+        if dw < seg.active_w || dh < seg.active_h {
+            bail!(
+                "JXL DNG: segment decoded {dw}x{dh}, smaller than active {}x{}",
+                seg.active_w,
+                seg.active_h
+            );
+        }
+        for r in 0..seg.active_h {
+            let src = r * dw * cps;
+            let dst = ((seg.row_start + r) * width + seg.col_start) * cps;
+            out[dst..dst + seg.active_w * cps]
+                .copy_from_slice(&buf[src..src + seg.active_w * cps]);
+        }
+    }
+    Ok(())
+}
+
 fn decode_uncompressed(
     data: &[u8],
     raw: &RawIfd,
@@ -1100,10 +1376,24 @@ fn load_dng(data: &[u8]) -> Result<(WalkState, RawIfd, bool)> {
             }
         }
     }
-    let raw = state
-        .raw_ifd
-        .take()
-        .ok_or_else(|| anyhow!("no raw SubIFD found"))?;
+    let raw = state.raw_ifd.take().ok_or_else(|| {
+        if state.refused_compressions.is_empty() {
+            anyhow!("no raw SubIFD found")
+        } else {
+            let named: Vec<String> = state
+                .refused_compressions
+                .iter()
+                .map(|&c| match c {
+                    34892 => "34892 (lossy JPEG — refused by design)".to_string(),
+                    c => c.to_string(),
+                })
+                .collect();
+            anyhow!(
+                "no supported raw SubIFD found (refused compression: {})",
+                named.join(", ")
+            )
+        }
+    })?;
     Ok((state, raw, le))
 }
 
@@ -1121,6 +1411,8 @@ struct RawIfd {
     tile_byte_counts: Vec<u32>,
     tile_width: Option<u32>,
     tile_length: Option<u32>,
+    /// TIFF Predictor (tag 0x013D) — relevant to deflate (compression 8) strips.
+    predictor: Option<u32>,
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
@@ -1143,6 +1435,9 @@ struct WalkState {
     exif: crate::tiff::ExifGps,
     /// Accumulated noise-related DNG tags; converted to `RawNoiseMetadata` after the walk.
     noise_tags: NoiseTagAccumulator,
+    /// Compression numbers of full-res image IFDs refused ONLY for their
+    /// compression, so the no-raw-IFD error can say why (34892 = lossy JPEG).
+    refused_compressions: Vec<u32>,
 }
 
 /// Read the first value of a signed-rational (SRATIONAL, type 10) tag as f32; falls back
@@ -1176,6 +1471,13 @@ fn first_srational_f32(
     }
 }
 
+/// Compressions the decode paths below can actually read: 1 = uncompressed,
+/// 7 = lossless JPEG, 8 = deflate, 52546 = JPEG XL (DNG 1.7; decode needs the
+/// `jxl-codec` feature but the payload is still locatable without it).
+fn compression_supported(c: u32) -> bool {
+    matches!(c, 1 | 7 | 8 | 52546)
+}
+
 fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
     let has_storage = (!ifd.tile_offsets.is_empty() && !ifd.tile_byte_counts.is_empty())
         || (!ifd.strip_offsets.is_empty() && !ifd.strip_byte_counts.is_empty());
@@ -1186,7 +1488,7 @@ fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
         && ifd.height > 0
         && has_storage
         && !is_subsampled
-        && (ifd.compression == 7 || ifd.compression == 1)
+        && compression_supported(ifd.compression)
 }
 
 fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
@@ -1240,6 +1542,9 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 0x0117 => {
                     ifd.strip_byte_counts = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0x013D => {
+                    ifd.predictor = first_u32(data, dtype, cnt, val, inline_pos, le);
                 }
                 0x0142 => {
                     ifd.tile_width = first_u32(data, dtype, cnt, val, inline_pos, le);
@@ -1467,6 +1772,15 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
             if replace {
                 state.raw_ifd = Some(ifd);
             }
+        } else if has_image_dims
+            && ifd.width > 0
+            && ifd.height > 0
+            && (new_subfile_type & 1) == 0
+            && !compression_supported(ifd.compression)
+        {
+            // A full-res image IFD refused only for its compression: remember the
+            // number so "no raw SubIFD found" can name WHY (e.g. an all-lossy DNG).
+            state.refused_compressions.push(ifd.compression);
         }
 
         for s in subs {
@@ -1854,6 +2168,154 @@ fn read_u32(data: &[u8], off: usize, le: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal little-endian TIFF builder for synthesized DNG tests: one IFD0
+    /// with the given entries (tag, type, count, value-or-offset), then payload
+    /// bytes appended by the caller at known offsets. Entries must be sorted by
+    /// tag (TIFF requirement the walker may rely on).
+    fn build_tiff_le(entries: &[(u16, u16, u32, u32)], payload: &[u8]) -> Vec<u8> {
+        let mut d = vec![0x49, 0x49, 0x2A, 0x00, 8, 0, 0, 0]; // header, IFD0 @ 8
+        d.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for &(tag, typ, cnt, val) in entries {
+            d.extend_from_slice(&tag.to_le_bytes());
+            d.extend_from_slice(&typ.to_le_bytes());
+            d.extend_from_slice(&cnt.to_le_bytes());
+            d.extend_from_slice(&val.to_le_bytes());
+        }
+        d.extend_from_slice(&0u32.to_le_bytes()); // next-IFD = none
+        d.extend_from_slice(payload);
+        d
+    }
+
+    /// Header + IFD size for `n` entries — the offset where payload lands.
+    fn payload_off(n: usize) -> u32 {
+        (8 + 2 + n * 12 + 4) as u32
+    }
+
+    /// A 4x4 single-sample 16-bit DNG with the given compression and one strip
+    /// whose payload is `strip` — enough shape for decode + range tests.
+    fn synth_dng_1strip(compression: u16, strip: &[u8]) -> (Vec<u8>, u32) {
+        let n = 8;
+        let off = payload_off(n);
+        let entries = [
+            (0x00FE_u16, 4_u16, 1_u32, 0_u32),          // NewSubfileType: full-res
+            (0x0100, 4, 1, 4),                          // width
+            (0x0101, 4, 1, 4),                          // height
+            (0x0102, 3, 1, 16),                         // bits per sample
+            (0x0103, 3, 1, compression as u32),         // compression
+            (0x0111, 4, 1, off),                        // strip offset
+            (0x0116, 4, 1, 4),                          // rows per strip
+            (0x0117, 4, 1, strip.len() as u32),         // strip byte count
+        ];
+        (build_tiff_le(&entries, strip), off)
+    }
+
+    /// JPEG XL DNG (compression 52546): the strip payload is a JXL codestream
+    /// from our own encoder; decode must hand back the identical u16 samples.
+    /// Gray (Bayer-shaped) and RGB (Linear-DNG-shaped) both covered.
+    #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+    #[test]
+    fn jxl_dng_round_trips_gray_and_rgb() {
+        use crate::jxl_casaencoder::{EncodeOptions, Encoder, Frame};
+        for cps in [1usize, 3] {
+            let samples: Vec<u16> = (0..16 * cps as u16).map(|v| v.wrapping_mul(2731)).collect();
+            let mut enc = Encoder::new(EncodeOptions::lossless()).expect("encoder");
+            let frame = if cps == 1 {
+                Frame::gray(&samples, 4, 4)
+            } else {
+                Frame::rgb(&samples, 4, 4)
+            };
+            let jxl = enc.encode(&frame).expect("encode");
+            let n = 9;
+            let off = payload_off(n);
+            let entries = [
+                (0x00FE_u16, 4_u16, 1_u32, 0_u32),
+                (0x0100, 4, 1, 4),
+                (0x0101, 4, 1, 4),
+                (0x0102, 3, 1, 16),
+                (0x0103, 3, 1, 52546),
+                (0x0111, 4, 1, off),
+                (0x0115, 3, 1, cps as u32), // SamplesPerPixel
+                (0x0116, 4, 1, 4),
+                (0x0117, 4, 1, jxl.len() as u32),
+            ];
+            let dng = build_tiff_le(&entries, &jxl);
+            let img = decode_bytes(&dng).expect("jxl dng decode");
+            assert_eq!(img.samples_per_pixel, cps);
+            assert_eq!(img.raw, samples, "cps={cps}");
+            let r = payload_ranges(&dng).expect("ranges");
+            assert_eq!(r, vec![(off as usize, off as usize + jxl.len())]);
+        }
+    }
+
+    #[test]
+    fn deflate_dng_round_trips_known_samples() {
+        let samples: Vec<u16> = (0u16..16).map(|v| v * 1000).collect();
+        let mut raw_bytes = Vec::new();
+        for v in &samples {
+            raw_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let strip = miniz_oxide::deflate::compress_to_vec_zlib(&raw_bytes, 6);
+        let (dng, off) = synth_dng_1strip(8, &strip);
+        let img = decode_bytes(&dng).expect("deflate decode");
+        assert_eq!(img.width, 4);
+        assert_eq!(img.height, 4);
+        assert_eq!(img.samples_per_pixel, 1);
+        assert_eq!(img.raw, samples);
+        // payload_ranges: exactly the strip
+        let r = payload_ranges(&dng).expect("ranges");
+        assert_eq!(r, vec![(off as usize, off as usize + strip.len())]);
+    }
+
+    #[test]
+    fn deflate_dng_truncated_stream_errors() {
+        let raw_bytes = vec![0u8; 32];
+        let mut strip = miniz_oxide::deflate::compress_to_vec_zlib(&raw_bytes, 6);
+        strip.truncate(strip.len() / 2);
+        let (dng, _) = synth_dng_1strip(8, &strip);
+        let e = decode_bytes(&dng).err().expect("expected error").to_string();
+        assert!(e.contains("deflate DNG"), "got: {e}");
+    }
+
+    #[test]
+    fn payload_ranges_covers_uncompressed_strips() {
+        let mut raw_bytes = Vec::new();
+        for v in 0u16..16 {
+            raw_bytes.extend_from_slice(&(v * 3).to_le_bytes());
+        }
+        let (dng, off) = synth_dng_1strip(1, &raw_bytes);
+        // Tag arithmetic only — comp 1 decodes AND locates.
+        let img = decode_bytes(&dng).expect("uncompressed decode");
+        assert_eq!(img.raw.len(), 16);
+        let r = payload_ranges(&dng).expect("ranges");
+        assert_eq!(r, vec![(off as usize, off as usize + raw_bytes.len())]);
+        // The pinned comp-7-only sibling refuses by design.
+        assert!(ljpeg_tile_ranges(&dng)
+            .unwrap_err()
+            .to_string()
+            .contains("not LJPEG-compressed"));
+    }
+
+    #[test]
+    fn lossy_dng_refused_with_reason() {
+        let (dng, _) = synth_dng_1strip(34892, &[0u8; 64]);
+        for e in [
+            decode_bytes(&dng).err().expect("expected error").to_string(),
+            payload_ranges(&dng).unwrap_err().to_string(),
+        ] {
+            assert!(
+                e.contains("34892") && e.contains("lossy"),
+                "refusal must name lossy JPEG by number, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_compression_refused_by_number() {
+        let (dng, _) = synth_dng_1strip(9, &[0u8; 64]);
+        let e = decode_bytes(&dng).err().expect("expected error").to_string();
+        assert!(e.contains('9'), "got: {e}");
+    }
 
     #[test]
     fn read_ascii_oob_inline_and_pointer_return_empty() {

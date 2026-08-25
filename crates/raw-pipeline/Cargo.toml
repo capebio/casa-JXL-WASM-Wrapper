@@ -34,6 +34,9 @@ rayon = { version = "1", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp", "exr"] }
 thiserror = "1"
 anyhow = "1"
+# Deflate-compressed DNG (compression 8). Already in the tree via image/png —
+# same 0.8 line the lockfile pins, so an offline build resolves from cache.
+miniz_oxide = "0.8"
 
 # BSD-clean own FFI (bindgen over external/libjxl headers). Native only — WASM
 # builds keep default-features = false and the JXL path stays on web/pkg + bridge.cpp.
