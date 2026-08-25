@@ -582,7 +582,11 @@ impl LjpegPlan {
             }
         }
 
-        if sos.predictor != 1 {
+        // T.81 Annex H predictors 1..=7. 0 is "no prediction" (differential mode
+        // only, which SOF3 baseline lossless does not use) and 8+ is out of range.
+        // Predictor 1 (left) runs the specialized kernels below; 2..=7 (Apple
+        // ProRAW tiles use 7) route to the prev-row generic kernel in `execute`.
+        if sos.predictor == 0 || sos.predictor > 7 {
             bail!("ljpeg: predictor {} not supported", sos.predictor);
         }
         if sof.precision < 2 || sof.precision > 16 {
@@ -718,6 +722,19 @@ fn execute<const COLLECT_STATS: bool>(
     out_rows: usize,
 ) -> Result<LjpegStats> {
     geometry_check(plan, out, base, stride_pixels, out_pixel_cols, out_rows)?;
+    // The specialized kernels below hard-code predictor 1 (left) state; any other
+    // predictor takes the prev-row generic kernel, which handles all of 1..=7.
+    if plan.predictor != 1 {
+        return decode_generic_pred::<COLLECT_STATS>(
+            plan,
+            src,
+            out,
+            base,
+            stride_pixels,
+            out_pixel_cols,
+            out_rows,
+        );
+    }
     match (plan.components, plan.precision) {
         (1, 12) => decode_c1::<12, COLLECT_STATS>(
             plan,
@@ -1435,6 +1452,142 @@ fn decode_generic<const COLLECT_STATS: bool>(
     })
 }
 
+/// Generic kernel for predictors 2..=7 (T.81 Annex H.1.2.1). Unlike predictor 1
+/// (left only), these need the full previous row per component (Rb = above,
+/// Rc = above-left), so this kernel keeps a `cps * sof_w` reconstruction row.
+///
+/// Row/column edge rules per H.1.2.2: the very first sample predicts from
+/// `2^(P - Pt - 1)`; the rest of row 0 predicts from Ra (left) regardless of the
+/// selector; column 0 of later rows predicts from Rb (above); everywhere else
+/// the selected predictor applies. Apple ProRAW tiles are cps=3, predictor 7.
+fn decode_generic_pred<const COLLECT_STATS: bool>(
+    plan: &LjpegPlan,
+    src: &[u8],
+    out: &mut [u16],
+    base: usize,
+    stride_pixels: usize,
+    out_pixel_cols: usize,
+    out_rows: usize,
+) -> Result<LjpegStats> {
+    let cps = plan.components;
+    let sof_w = plan.width;
+    let sof_h = plan.height;
+    let precision = plan.precision;
+    let point_transform = plan.point_transform;
+    let predictor_sel = plan.predictor;
+    let base_pred = 1i32 << (precision - point_transform - 1);
+    let mut br = BitReader::<COLLECT_STATS>::new(plan.entropy(src));
+
+    let table0 = plan.tables[0]
+        .as_deref()
+        .expect("generic_pred: table[0] resolved in prepare");
+    let mut comp_tables: [&HuffTable; MAX_COMPONENTS] = [table0; MAX_COMPONENTS];
+    for c in 1..cps {
+        comp_tables[c] = plan.tables[c]
+            .as_deref()
+            .expect("generic_pred: table resolved in prepare");
+    }
+
+    // Previous reconstructed row, interleaved like the output (comp-major within
+    // a column): prev[col * cps + comp]. One heap row per tile; the tile decode
+    // itself is thousands of times that work.
+    let mut prev: Vec<i32> = vec![0; sof_w * cps];
+
+    let mut total_symbols = 0u64;
+    let mut fast8_hits = 0u64;
+    let mut slow_huffman_hits = 0u64;
+    let mut get_bits_calls = 0u64;
+    let mut get_bits_total_bits = 0u64;
+    let mut category_hist = [0u64; 17];
+
+    for row in 0..sof_h {
+        let row_base = base + row * stride_pixels;
+        let emit_row = row < out_rows;
+        let first_row = row == 0;
+        let mut left = [0i32; MAX_COMPONENTS];
+        // Rc per component = previous row's value at the PREVIOUS column. Held
+        // separately because `prev[raw_col]` is overwritten with this row's value
+        // as each column completes: the value being overwritten is exactly the
+        // next column's Rc, so it is saved into `rc_hold` at overwrite time.
+        let mut rc_hold = [0i32; MAX_COMPONENTS];
+        for col in 0..sof_w {
+            let first_col = col == 0;
+            let mut raw_col = col * cps;
+            for comp in 0..cps {
+                let rb = prev[raw_col];
+                let predictor = if first_row {
+                    if first_col {
+                        base_pred
+                    } else {
+                        left[comp] // Ra: row 0 always predicts left
+                    }
+                } else if first_col {
+                    rb // Rb: column 0 predicts from above
+                } else {
+                    let ra = left[comp];
+                    let rc = rc_hold[comp];
+                    match predictor_sel {
+                        1 => ra,
+                        2 => rb,
+                        3 => rc,
+                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                        _ => ra.wrapping_add(rb) >> 1, // 7; prepare bounds selector to 1..=7
+                    }
+                };
+
+                let table = comp_tables[comp];
+                let t = next_category::<COLLECT_STATS>(
+                    &mut br,
+                    table,
+                    &mut fast8_hits,
+                    &mut slow_huffman_hits,
+                    &mut total_symbols,
+                    &mut category_hist,
+                )?;
+                let diff = decode_diff::<COLLECT_STATS>(
+                    &mut br,
+                    t,
+                    &mut get_bits_calls,
+                    &mut get_bits_total_bits,
+                )?;
+
+                let val = predictor.wrapping_add(diff);
+                left[comp] = val;
+                rc_hold[comp] = rb; // this column's above becomes next column's above-left
+                prev[raw_col] = val;
+
+                if emit_row && raw_col < out_pixel_cols {
+                    // SAFETY: geometry_check validated the max index (same model
+                    // as decode_generic).
+                    unsafe {
+                        *out.get_unchecked_mut(row_base + raw_col) =
+                            ((val << point_transform) & 0xFFFF) as u16;
+                    }
+                }
+                raw_col += 1;
+            }
+        }
+    }
+
+    Ok(LjpegStats {
+        sof_w: sof_w as u32,
+        sof_h: sof_h as u32,
+        cps: cps as u8,
+        precision,
+        total_symbols,
+        fill_calls: br.fill_calls,
+        bulk_fill_hits: br.bulk_hits,
+        slow_fill_hits: br.slow_hits,
+        fast8_hits,
+        slow_huffman_hits,
+        get_bits_calls,
+        get_bits_total_bits,
+        category_hist,
+    })
+}
+
 pub fn decode_tile(
     src: &[u8],
     out: &mut [u16],
@@ -1582,6 +1735,216 @@ pub fn probe_tile(src: &[u8]) -> Result<TileInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-only LJPEG (SOF3) encoder: interleaved `samples` (`raw_col = col*cps
+    /// + comp`), any predictor 1..=7. One shared DHT with all 17 categories at
+    /// code length 5 (Kraft-valid: 17 of 32). Mirrors the decoder's predictor
+    /// edge rules (H.1.2.2). Its own correctness is anchored by the pred-1
+    /// round-trip below, which decodes through the long-proven specialized
+    /// kernels — only then is it trusted to exercise predictors 2..=7.
+    fn encode_sof3(
+        samples: &[u16],
+        w: usize,
+        h: usize,
+        cps: usize,
+        precision: u8,
+        predictor: u8,
+    ) -> Vec<u8> {
+        assert_eq!(samples.len(), w * h * cps);
+        let mut out = vec![0xFF, 0xD8]; // SOI
+        // SOF3
+        out.extend_from_slice(&[0xFF, 0xC3]);
+        let sof_len = 8 + 3 * cps as u16;
+        out.extend_from_slice(&sof_len.to_be_bytes());
+        out.push(precision);
+        out.extend_from_slice(&(h as u16).to_be_bytes());
+        out.extend_from_slice(&(w as u16).to_be_bytes());
+        out.push(cps as u8);
+        for c in 0..cps {
+            out.extend_from_slice(&[c as u8 + 1, 0x11, 0x00]);
+        }
+        // DHT: table 0, categories 0..=precision all at length 5 (prepare
+        // rejects any table symbol above the SOF precision, so the table must
+        // not carry more).
+        let nsym = precision as u16 + 1;
+        out.extend_from_slice(&[0xFF, 0xC4]);
+        out.extend_from_slice(&(2u16 + 1 + 16 + nsym).to_be_bytes());
+        out.push(0x00);
+        let mut bits = [0u8; 16];
+        bits[4] = nsym as u8; // all codes at length 5 (≤ 17 of 32, Kraft-valid)
+        out.extend_from_slice(&bits);
+        out.extend(0u8..=precision);
+        // SOS
+        out.extend_from_slice(&[0xFF, 0xDA]);
+        out.extend_from_slice(&(6u16 + 2 * cps as u16).to_be_bytes());
+        out.push(cps as u8);
+        for c in 0..cps {
+            out.extend_from_slice(&[c as u8 + 1, 0x00]);
+        }
+        out.extend_from_slice(&[predictor, 0x00, 0x00]); // Ss=pred, Se, Ah/Al(Pt=0)
+
+        // Entropy: canonical codes — all length 5, category t gets code t.
+        struct BitW {
+            buf: u32,
+            n: u32,
+            out: Vec<u8>,
+        }
+        impl BitW {
+            fn put(&mut self, val: u32, n: u32) {
+                self.buf = (self.buf << n) | (val & ((1u32 << n) - 1));
+                self.n += n;
+                while self.n >= 8 {
+                    let byte = ((self.buf >> (self.n - 8)) & 0xFF) as u8;
+                    self.out.push(byte);
+                    if byte == 0xFF {
+                        self.out.push(0x00); // byte stuffing
+                    }
+                    self.n -= 8;
+                }
+            }
+        }
+        let mut bw = BitW {
+            buf: 0,
+            n: 0,
+            out: Vec::new(),
+        };
+        let base_pred = 1i32 << (precision - 1);
+        let mut prev: Vec<i32> = vec![0; w * cps];
+        for row in 0..h {
+            let mut left = vec![0i32; cps];
+            let mut rc_hold = vec![0i32; cps];
+            for col in 0..w {
+                for comp in 0..cps {
+                    let raw_col = col * cps + comp;
+                    let rb = prev[raw_col];
+                    let pred = if row == 0 {
+                        if col == 0 {
+                            base_pred
+                        } else {
+                            left[comp]
+                        }
+                    } else if col == 0 {
+                        rb
+                    } else {
+                        let ra = left[comp];
+                        let rc = rc_hold[comp];
+                        match predictor {
+                            1 => ra,
+                            2 => rb,
+                            3 => rc,
+                            4 => ra + rb - rc,
+                            5 => ra + ((rb - rc) >> 1),
+                            6 => rb + ((ra - rc) >> 1),
+                            _ => (ra + rb) >> 1,
+                        }
+                    };
+                    let val = samples[row * w * cps + raw_col] as i32;
+                    // H.1.2.1: differences are taken modulo 2^16 — reduce to the
+                    // i16 representative so predictors that wander out of
+                    // [0, 2^P) (e.g. 4 at ra+rb−rc) still yield an encodable
+                    // category. The decoder wraps + masks identically.
+                    let diff = (val.wrapping_sub(pred) as i16) as i32;
+                    left[comp] = val;
+                    rc_hold[comp] = rb;
+                    prev[raw_col] = val;
+                    if diff == -32768 {
+                        // T.81 Annex H: category 16 carries no magnitude bits
+                        // (only reachable at precision 16).
+                        bw.put(16, 5);
+                    } else {
+                        // category + magnitude bits (extend inverse)
+                        let t = 32 - (diff.unsigned_abs()).leading_zeros();
+                        bw.put(t, 5);
+                        if t > 0 {
+                            let mag = if diff < 0 {
+                                (diff - 1) & ((1i32 << t) - 1)
+                            } else {
+                                diff
+                            };
+                            bw.put(mag as u32, t);
+                        }
+                    }
+                }
+            }
+        }
+        if bw.n > 0 {
+            let pad = 8 - bw.n;
+            bw.put((1u32 << pad) - 1, pad); // 1-pad final byte
+        }
+        out.extend_from_slice(&bw.out);
+        out.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        out
+    }
+
+    /// Deterministic pseudo-random samples (xorshift; no rand dep).
+    fn prand_samples(n: usize, precision: u8, seed: u32) -> Vec<u16> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                (s & ((1u32 << precision) - 1)) as u16
+            })
+            .collect()
+    }
+
+    /// Anchor: the test encoder at predictor 1 must decode bit-exactly through
+    /// the existing specialized kernels (which never changed). This validates
+    /// the ENCODER, so the predictor 2..=7 round-trips below test the new
+    /// generic_pred kernel and not two mirrored bugs.
+    #[test]
+    fn ljpeg_test_encoder_pred1_matches_specialized_kernels() {
+        for &(cps, precision) in &[(1usize, 12u8), (2, 12), (3, 12), (1, 16), (4, 14)] {
+            let (w, h) = (7usize, 5usize);
+            let samples = prand_samples(w * h * cps, precision, 0xC0FFEE);
+            let jpg = encode_sof3(&samples, w, h, cps, precision, 1);
+            let mut out = vec![0u16; w * h * cps];
+            decode_tile(&jpg, &mut out, 0, w * cps, w * cps, h)
+                .unwrap_or_else(|e| panic!("cps={cps} prec={precision}: {e:#}"));
+            assert_eq!(out, samples, "cps={cps} prec={precision}");
+        }
+    }
+
+    /// Round-trip every predictor 2..=7 through the new prev-row kernel, at the
+    /// component counts that matter (1 = Bayer, 3 = ProRAW LinearRaw).
+    ///
+    /// Samples are confined to [2^(P-2), 2^(P-1)) so every predictor formula —
+    /// including 4/5/6, which can wander outside [0, 2^P) on full-range data —
+    /// stays in range and every diff has category ≤ P. (Out-of-range predictor
+    /// state is mod-2^16 territory the test encoder does not model for the
+    /// shift predictors; real encoders keep state in range the same way.)
+    #[test]
+    fn ljpeg_predictors_2_through_7_round_trip() {
+        for pred in 2u8..=7 {
+            for &cps in &[1usize, 3] {
+                let (w, h, precision) = (9usize, 6usize, 12u8);
+                let a = 1u16 << (precision - 2);
+                let samples: Vec<u16> = prand_samples(w * h * cps, precision, 0xBEEF + pred as u32)
+                    .into_iter()
+                    .map(|v| a + (v & (a - 1)))
+                    .collect();
+                let jpg = encode_sof3(&samples, w, h, cps, precision, pred);
+                let mut out = vec![0u16; w * h * cps];
+                decode_tile(&jpg, &mut out, 0, w * cps, w * cps, h)
+                    .unwrap_or_else(|e| panic!("pred={pred} cps={cps}: {e:#}"));
+                assert_eq!(out, samples, "pred={pred} cps={cps}");
+            }
+        }
+    }
+
+    /// Predictor 7 — the production case (Apple ProRAW) — additionally at full
+    /// 12-bit range: (Ra+Rb)>>1 of in-range values is always in range, so
+    /// full-range data is exact here.
+    #[test]
+    fn ljpeg_predictor_7_full_range_round_trip() {
+        let (w, h, cps, precision) = (11usize, 7usize, 3usize, 12u8);
+        let samples = prand_samples(w * h * cps, precision, 0xA55A);
+        let jpg = encode_sof3(&samples, w, h, cps, precision, 7);
+        let mut out = vec![0u16; w * h * cps];
+        decode_tile(&jpg, &mut out, 0, w * cps, w * cps, h).unwrap();
+        assert_eq!(out, samples);
+    }
 
     // Hand-built minimal SOF3: SOI + SOF3(1comp,2x2,prec=8) + DHT (codes for t=0,1,2,5 at len3) + SOS(Pt=0,pred=1) + entropy for pixels [100,101,102,103] around base=128.
     fn make_minimal_sof3() -> Vec<u8> {
@@ -1770,17 +2133,17 @@ mod tests {
 
     #[test]
     fn ljpeg_predictor_unsupported_still_bails() {
-        // L12 not implemented (unwarranted for Olympus-primary corpus; current bail is acceptable hygiene)
-        // Use a fresh src with predictor=7 (no mutation of shared helper needed)
+        // Predictors 1..=7 are all implemented now (ProRAW uses 7); 0 means
+        // "no prediction" (differential-mode only) and stays refused by number.
         let src_bad = vec![
             0xFF, 0xD8, 0xFF, 0xC3, 0x00, 0x0B, 0x08, 0x00, 0x02, 0x00, 0x02, 0x01, 0x01, 0x11,
-            0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x07, 0x00, 0x00, // predictor=7
+            0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, // predictor=0
         ];
         let mut out = vec![0u16; 4];
         let e = decode_tile(&src_bad, &mut out, 0, 2, 2, 2).unwrap_err();
         let msg = e.to_string();
         assert!(
-            msg.contains("ljpeg: predictor 7 not supported"),
+            msg.contains("ljpeg: predictor 0 not supported"),
             "got: {}",
             msg
         );

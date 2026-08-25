@@ -4494,6 +4494,14 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         .map_err(|e| JsError::new(&format!("DNG decode: {}", e)))?;
     let decode_ms = now_ms() - t;
 
+    // This path demosaics; a Linear DNG (ProRAW, samples_per_pixel=3) is already
+    // demosaiced and its interleaved raw would be misread as a mosaic here.
+    if img.samples_per_pixel != 1 {
+        return Err(JsError::new(
+            "DNG: linear RGB DNG (e.g. Apple ProRAW) is not supported in this render path yet",
+        ));
+    }
+
     let w = img.width;
     let h = img.height;
     if w == 0 || h == 0 {

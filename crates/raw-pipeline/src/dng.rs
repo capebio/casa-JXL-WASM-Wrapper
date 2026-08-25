@@ -51,7 +51,14 @@ pub enum Cfa {
 pub struct DngImage {
     pub width: usize,
     pub height: usize,
+    /// `samples_per_pixel == 1`: one `u16` per photosite (Bayer mosaic).
+    /// `samples_per_pixel == 3`: interleaved RGB (`raw[(y*width + x)*3 + c]`) —
+    /// a Linear DNG (PhotometricInterpretation 34892), e.g. Apple ProRAW. The
+    /// values are the STORED codes; any LinearizationTable is NOT applied.
     pub raw: Vec<u16>,
+    /// Interleaved sample count per pixel (1 = Bayer mosaic, 3 = linear RGB).
+    pub samples_per_pixel: usize,
+    /// Meaningless (left at the Rggb default) when `samples_per_pixel == 3`.
     pub cfa: Cfa,
     pub black: u16,
     pub white: u16,
@@ -190,7 +197,12 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         None => Cfa::Rggb,
     };
 
-    let mut out = vec![0u16; width * height];
+    // 1 sample/pixel = Bayer mosaic; 3 = Linear DNG (interleaved RGB — Apple
+    // ProRAW). Anything else is refused by number rather than mis-decoded.
+    if cps != 1 && cps != 3 {
+        bail!("DNG: SamplesPerPixel {cps} not supported (1 = Bayer, 3 = linear RGB)");
+    }
+    let mut out = vec![0u16; width * height * cps];
 
     // Guard: decode_uncompressed assumes 1 sample/pixel (one u16 per mosaic cell).
     // A multi-sample uncompressed DNG (e.g. linear/demosaiced RGB, cps>1) would be
@@ -237,6 +249,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         width,
         height,
         raw: out,
+        samples_per_pixel: cps,
         cfa,
         black,
         white,
@@ -481,6 +494,7 @@ impl crate::decompress::RawRowSource for DngRowSource<'_> {
                     &self.raw,
                     w,
                     h,
+                    1, // DngRowSource::new rejects cps != 1
                     self.tw,
                     self.tl,
                     self.coltiles,
@@ -536,6 +550,7 @@ fn decode_band_into(
     raw: &RawIfd,
     width: usize,
     height: usize,
+    cps: usize,
     tw: usize,
     tl: usize,
     coltiles: usize,
@@ -558,8 +573,18 @@ fn decode_band_into(
         let col_start = tc * tw;
         let col_end = ((tc + 1) * tw).min(width);
         let active_w = col_end - col_start;
-        ljpeg::decode_tile(src, band, col_start, width, active_w, active_h)
-            .with_context(|| format!("tile r={tr} c={tc}"))?;
+        // All geometry below is in raw SAMPLE units (pixel * cps): for cps=1
+        // this is exactly the old math; for cps=3 (Linear DNG) each pixel is
+        // three interleaved samples.
+        ljpeg::decode_tile(
+            src,
+            band,
+            col_start * cps,
+            width * cps,
+            active_w * cps,
+            active_h,
+        )
+        .with_context(|| format!("tile r={tr} c={tc}"))?;
     }
     Ok(())
 }
@@ -608,19 +633,17 @@ fn decode_tiles(
             raw.tile_byte_counts.len()
         );
     }
-    let _ = cps; // implied by SOF
-
     // One row-tile band (tr) decoded into its slice of `out`. `band` covers rows
-    // [tr*tl, row_end) at full `width` stride, so a tile at column tc writes its active
-    // sub-rect at base = col_start (row 0 of the band), stride = width.
+    // [tr*tl, row_end) at full `width*cps` sample stride, so a tile at column tc
+    // writes its active sub-rect at base = col_start*cps (row 0 of the band).
     let decode_band = |tr: usize, band: &mut [u16]| -> Result<()> {
-        decode_band_into(data, raw, width, height, tw, tl, coltiles, tr, band)
+        decode_band_into(data, raw, width, height, cps, tw, tl, coltiles, tr, band)
     };
 
-    // par_chunks_mut(tl*width) yields exactly `rowtiles` disjoint bands (the last shorter
-    // when height isn't a multiple of tl); tl*width ≤ height*width ≤ 200 MP (caller guard)
-    // so it cannot overflow usize on wasm32.
-    let band_stride = tl * width;
+    // par_chunks_mut(tl*width*cps) yields exactly `rowtiles` disjoint bands (the last
+    // shorter when height isn't a multiple of tl); tl*width*cps ≤ 3*height*width ≤
+    // 600 M samples (caller guard) so it cannot overflow usize on wasm32.
+    let band_stride = tl * width * cps;
     #[cfg(feature = "parallel")]
     {
         out.par_chunks_mut(band_stride)
@@ -672,8 +695,6 @@ fn decode_tiles_blit(
             raw.tile_byte_counts.len()
         );
     }
-
-    let _ = cps; // implied by SOF
 
     // X1: full per-tile parallel (enabled by L13). Use probe + decode_tile_compact so each
     // task owns a small disjoint compact buffer (no shared &mut stride borrow). Collect then
@@ -738,9 +759,10 @@ fn decode_tiles_blit(
     #[cfg(not(feature = "parallel"))]
     let tiles: Vec<DecodedTile> = (0..expected).map(decode_one).collect::<Result<Vec<_>>>()?;
 
-    // Serial blit of active rects (disjoint; cheap vs decode work).
+    // Serial blit of active rects (disjoint; cheap vs decode work). All widths
+    // and column offsets below are in raw SAMPLE units (pixel * cps).
     for td in tiles {
-        let aw = td.active_w.min(td.buf_w);
+        let aw = (td.active_w * cps).min(td.buf_w);
         // Clamp active_h by the SOF-declared tile height: a tile whose LJPEG SOF
         // reports fewer rows than active_h would cause an OOB read into td.buf
         // (DNG-002 / ERR-005).
@@ -752,6 +774,7 @@ fn decode_tiles_blit(
             let dst_base = (td.row_start + r)
                 .checked_mul(width)
                 .and_then(|v| v.checked_add(td.col_start))
+                .and_then(|v| v.checked_mul(cps))
                 .ok_or_else(|| anyhow!("tile blit dst overflow"))?;
             let dst = out
                 .get_mut(dst_base..dst_base + aw)
@@ -2143,7 +2166,12 @@ pub(crate) fn decode_bytes_demosaiced_impl(
     if (width as u64).saturating_mul(height as u64) > 200_000_000 {
         bail!("DNG: implausible dimensions {width}×{height}");
     }
-    let _cps = raw.samples_per_pixel.max(1) as usize;
+    // This path demosaics a Bayer mosaic; a Linear DNG (cps=3, e.g. ProRAW) is
+    // already demosaiced by the camera — decode it via `decode_bytes` instead.
+    let cps = raw.samples_per_pixel.max(1) as usize;
+    if cps != 1 {
+        bail!("DNG: demosaic path needs a Bayer mosaic (SamplesPerPixel={cps}); use decode_bytes");
+    }
     let cfa = match raw.cfa_pattern {
         Some(p) => match p {
             [0, 1, 1, 2] => Cfa::Rggb,
