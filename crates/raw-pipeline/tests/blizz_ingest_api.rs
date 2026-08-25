@@ -67,6 +67,10 @@ fn blizz_ingest_api_pins() {
     fn _uses_spp(img: &raw_pipeline::dng::DngImage) -> usize {
         img.samples_per_pixel
     }
+    // `blizz` refuses lossy JPEG XL (JXLDistance > 0) by this field.
+    fn _uses_jxl_distance(img: &raw_pipeline::dng::DngImage) -> Option<f32> {
+        img.jxl_distance
+    }
 
     // --- RW2 / RWL / NEF -------------------------------------------------
     // These hand back the payload range directly, on `BayerImage::strip`.

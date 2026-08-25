@@ -58,6 +58,11 @@ pub struct DngImage {
     pub raw: Vec<u16>,
     /// Interleaved sample count per pixel (1 = Bayer mosaic, 3 = linear RGB).
     pub samples_per_pixel: usize,
+    /// DNG 1.7 JXLDistance (tag 52547) from the raw IFD: `Some(0.0)` =
+    /// lossless JPEG XL, `Some(>0)` = lossy, `None` = tag absent (non-JXL
+    /// files, or a writer that omitted it). An archiver that refuses lossy
+    /// sources should treat `Some(d) if d > 0` as lossy.
+    pub jxl_distance: Option<f32>,
     /// Meaningless (left at the Rggb default) when `samples_per_pixel == 3`.
     pub cfa: Cfa,
     pub black: u16,
@@ -289,6 +294,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         height,
         raw: out,
         samples_per_pixel: cps,
+        jxl_distance: raw.jxl_distance,
         cfa,
         black,
         white,
@@ -1413,6 +1419,9 @@ struct RawIfd {
     tile_length: Option<u32>,
     /// TIFF Predictor (tag 0x013D) — relevant to deflate (compression 8) strips.
     predictor: Option<u32>,
+    /// DNG 1.7 JXLDistance (tag 52547): 0.0 = lossless JPEG XL, > 0 = lossy.
+    /// Absent on non-JXL files and on writers that omit it.
+    jxl_distance: Option<f32>,
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
@@ -1545,6 +1554,11 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 0x013D => {
                     ifd.predictor = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0xCD43 => {
+                    // JXLDistance (52547, DNG 1.7). SHORT in Adobe's own samples
+                    // despite the spec's float; first_f32 reads either.
+                    ifd.jxl_distance = first_f32(data, dtype, cnt, val, inline_pos, le);
                 }
                 0x0142 => {
                     ifd.tile_width = first_u32(data, dtype, cnt, val, inline_pos, le);
