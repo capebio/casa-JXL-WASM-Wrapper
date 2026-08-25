@@ -102,6 +102,11 @@ pub struct DecodedMeta {
     /// Stream's stored precision (informational; output precision is `S`).
     pub bits_per_sample: u32,
     pub num_extra_channels: u32,
+    /// `true` when the codestream is XYB-encoded (VarDCT / lossy). `false` =
+    /// `uses_original_profile`, i.e. a (potentially) lossless modular stream.
+    /// This is the CODESTREAM's own word on lossiness — more trustworthy than
+    /// any container metadata beside it.
+    pub xyb_encoded: bool,
 }
 
 /// A planar extra channel read back from the stream (depth/thermal/spectral/
@@ -601,6 +606,7 @@ impl Decoder {
                     has_alpha: bi.alpha_bits > 0,
                     bits_per_sample: bi.bits_per_sample,
                     num_extra_channels: bi.num_extra_channels,
+                    xyb_encoded: bi.uses_original_profile == 0,
                 });
             } else if status == S_SUCCESS {
                 // Stream ended before basic info surfaced — malformed header.
@@ -705,6 +711,7 @@ impl Decoder {
                     has_alpha: bi.alpha_bits > 0,
                     bits_per_sample: bi.bits_per_sample,
                     num_extra_channels: bi.num_extra_channels,
+                    xyb_encoded: bi.uses_original_profile == 0,
                 };
                 // Decompression-bomb guard: refuse BEFORE any large allocation.
                 let pixels = w as u64 * h as u64;
@@ -857,6 +864,7 @@ impl Decoder {
                     has_alpha: bi.alpha_bits > 0,
                     bits_per_sample: bi.bits_per_sample,
                     num_extra_channels: bi.num_extra_channels,
+                    xyb_encoded: bi.uses_original_profile == 0,
                 };
                 let pixels = w as u64 * h as u64;
                 let out_bytes = pixels

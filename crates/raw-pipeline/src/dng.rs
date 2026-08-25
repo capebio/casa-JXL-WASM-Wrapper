@@ -58,11 +58,16 @@ pub struct DngImage {
     pub raw: Vec<u16>,
     /// Interleaved sample count per pixel (1 = Bayer mosaic, 3 = linear RGB).
     pub samples_per_pixel: usize,
-    /// DNG 1.7 JXLDistance (tag 52547) from the raw IFD: `Some(0.0)` =
+    /// DNG 1.7 JXLDistance (tag 0xCD49) from the raw IFD: `Some(0.0)` =
     /// lossless JPEG XL, `Some(>0)` = lossy, `None` = tag absent (non-JXL
-    /// files, or a writer that omitted it). An archiver that refuses lossy
-    /// sources should treat `Some(d) if d > 0` as lossy.
+    /// files, or a writer that omitted it — most real files omit it).
     pub jxl_distance: Option<f32>,
+    /// The JXL CODESTREAM's own word on lossiness: `Some(true)` = XYB-encoded
+    /// (lossy), `Some(false)` = modular/`uses_original_profile` (the lossless
+    /// mode), `None` = not JPEG XL-compressed. An archiver that refuses lossy
+    /// sources should trust this over [`Self::jxl_distance`], which most
+    /// writers omit.
+    pub jxl_lossy: Option<bool>,
     /// Meaningless (left at the Rggb default) when `samples_per_pixel == 3`.
     pub cfa: Cfa,
     pub black: u16,
@@ -253,18 +258,34 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
             cps
         );
     }
+    // `mut` is only exercised by the jxl-codec arm below.
+    #[allow(unused_mut)]
+    let mut jxl_lossy: Option<bool> = None;
     match raw.compression {
         1 => decode_uncompressed(data, &raw, width, height, le, &mut out)?,
         7 if use_blit => decode_tiles_blit(data, &raw, width, height, cps, &mut out)?,
         7 => decode_tiles(data, &raw, width, height, cps, &mut out)?,
         8 => decode_deflate(data, &raw, width, height, le, &mut out)?,
         #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
-        52546 => decode_jxl(data, &raw, width, height, cps, &mut out)?,
+        52546 => jxl_lossy = Some(decode_jxl(data, &raw, width, height, cps, &mut out)?),
         #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]
         52546 => bail!(
             "DNG compression 52546 (JPEG XL) needs the jxl-codec feature (native builds only)"
         ),
         c => bail!("DNG compression {c} not supported"),
+    }
+
+    // DNG RowInterleaveFactor / ColumnInterleaveFactor: the stored image is
+    // R×C stacked color-plane fields (each compresses far better than the raw
+    // mosaic under JXL); reorder to the true mosaic. Whole pixels move — all
+    // `cps` samples together.
+    let ri = raw.row_interleave.unwrap_or(1).max(1) as usize;
+    let ci = raw.column_interleave.unwrap_or(1).max(1) as usize;
+    if ri > 1 || ci > 1 {
+        if ri > height || ci > width {
+            bail!("DNG: interleave factors {ri}x{ci} exceed the image dimensions");
+        }
+        deinterleave_fields(&mut out, width, height, cps, ri, ci);
     }
 
     let wb_r_neutral = state.as_shot_neutral.map(|n| n[0]).unwrap_or(1.0);
@@ -295,6 +316,7 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         raw: out,
         samples_per_pixel: cps,
         jxl_distance: raw.jxl_distance,
+        jxl_lossy,
         cfa,
         black,
         white,
@@ -1009,6 +1031,44 @@ fn decode_uncompressed_band(
     }
 }
 
+/// Stored-index → final-index map for one axis of the DNG interleave
+/// (RowInterleaveFactor 0xC71F / ColumnInterleaveFactor 0xCD43), dng_sdk
+/// remainder rule: field `f` holds `ceil((total-f)/factor)` entries, stored
+/// as consecutive runs field 0 first; entry `within` of field `f` lands at
+/// final index `within*factor + f`. Bijective for every `total`/`factor`.
+fn interleave_field_map(total: usize, factor: usize) -> Vec<u32> {
+    let mut map = vec![0u32; total];
+    let mut acc = 0usize;
+    for f in 0..factor {
+        let extent = (total - f).div_ceil(factor);
+        for within in 0..extent {
+            map[acc + within] = (within * factor + f) as u32;
+        }
+        acc += extent;
+    }
+    debug_assert_eq!(acc, total);
+    map
+}
+
+/// Reorder `out` (stored field order) into the final mosaic, whole pixels
+/// (`cps` samples) at a time. One pass through a scratch plane; the scratch is
+/// the cost of not doing an in-place cycle walk nobody needs yet.
+fn deinterleave_fields(out: &mut [u16], w: usize, h: usize, cps: usize, ri: usize, ci: usize) {
+    let rows = interleave_field_map(h, ri);
+    let cols = interleave_field_map(w, ci);
+    let mut dst = vec![0u16; out.len()];
+    for y in 0..h {
+        let fy = rows[y] as usize;
+        for x in 0..w {
+            let fx = cols[x] as usize;
+            let s = (y * w + x) * cps;
+            let d = (fy * w + fx) * cps;
+            dst[d..d + cps].copy_from_slice(&out[s..s + cps]);
+        }
+    }
+    out.copy_from_slice(&dst);
+}
+
 /// Deflate-compressed DNG (compression 8): each strip/tile is an independent
 /// zlib stream of 16-bit samples in file byte order. Single-sample (Bayer or
 /// gray) only; TIFF Predictor other than 1 (none) is refused by number — DNG
@@ -1119,6 +1179,9 @@ fn decode_deflate(
 /// iPhone per rawspeed#971) declares a 16-bit codestream even when
 /// BitsPerSample says 10, so this is currently theoretical; revisit if a
 /// sub-16-bit codestream shows up.
+/// Returns whether any segment's codestream is XYB-encoded (lossy) — the
+/// codestream's own word, carried up so an archiver can refuse lossy sources
+/// even when the container omits JXLDistance.
 #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
 fn decode_jxl(
     data: &[u8],
@@ -1127,7 +1190,7 @@ fn decode_jxl(
     height: usize,
     cps: usize,
     out: &mut [u16],
-) -> Result<()> {
+) -> Result<bool> {
     use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
     let ch = match cps {
         1 => Channels::Gray,
@@ -1213,25 +1276,26 @@ fn decode_jxl(
     // Decode each segment (parallel when available — one Decoder per task) into
     // a compact buffer, then blit its active rect. Correctness path; segment
     // decode dominates, the serial blit is a memcpy.
-    let decode_seg = |seg: &Seg| -> Result<(Vec<u16>, u32, u32)> {
+    let decode_seg = |seg: &Seg| -> Result<(Vec<u16>, u32, u32, bool)> {
         let mut dec = Decoder::new(DecodeOptions::default())
             .ok_or_else(|| anyhow!("JXL DNG: decoder init failed"))?;
         let mut buf: Vec<u16> = Vec::new();
-        let (dw, dh, _meta) = dec
+        let (dw, dh, meta) = dec
             .decode_into_dims::<u16>(&data[seg.off..seg.end], ch, &mut buf)
             .map_err(|e| anyhow!("JXL DNG: segment decode: {e}"))?;
-        Ok((buf, dw, dh))
+        Ok((buf, dw, dh, meta.xyb_encoded))
     };
     #[cfg(feature = "parallel")]
-    let decoded: Vec<(Vec<u16>, u32, u32)> = segs
+    let decoded: Vec<(Vec<u16>, u32, u32, bool)> = segs
         .par_iter()
         .map(decode_seg)
         .collect::<Result<Vec<_>>>()?;
     #[cfg(not(feature = "parallel"))]
-    let decoded: Vec<(Vec<u16>, u32, u32)> =
+    let decoded: Vec<(Vec<u16>, u32, u32, bool)> =
         segs.iter().map(decode_seg).collect::<Result<Vec<_>>>()?;
+    let any_xyb = decoded.iter().any(|d| d.3);
 
-    for (seg, (buf, dw, dh)) in segs.iter().zip(decoded.iter()) {
+    for (seg, (buf, dw, dh, _xyb)) in segs.iter().zip(decoded.iter()) {
         let dw = *dw as usize;
         let dh = *dh as usize;
         // A tile codestream may carry the full padded tile; the active rect must
@@ -1250,7 +1314,7 @@ fn decode_jxl(
                 .copy_from_slice(&buf[src..src + seg.active_w * cps]);
         }
     }
-    Ok(())
+    Ok(any_xyb)
 }
 
 fn decode_uncompressed(
@@ -1426,9 +1490,15 @@ struct RawIfd {
     tile_length: Option<u32>,
     /// TIFF Predictor (tag 0x013D) — relevant to deflate (compression 8) strips.
     predictor: Option<u32>,
-    /// DNG 1.7 JXLDistance (tag 52547): 0.0 = lossless JPEG XL, > 0 = lossy.
-    /// Absent on non-JXL files and on writers that omit it.
+    /// DNG 1.7 JXLDistance (tag 0xCD49, FLOAT): 0.0 = lossless JPEG XL, > 0 =
+    /// lossy. Absent on non-JXL files and on writers that omit it. (0xCD43 was
+    /// once misread as this tag; it is ColumnInterleaveFactor.)
     jxl_distance: Option<f32>,
+    /// DNG RowInterleaveFactor (0xC71F) / ColumnInterleaveFactor (0xCD43):
+    /// the mosaic is stored as R×C stacked color-plane fields and must be
+    /// de-interleaved after decompression (dng_sdk remainder rule).
+    row_interleave: Option<u32>,
+    column_interleave: Option<u32>,
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
@@ -1562,9 +1632,14 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 0x013D => {
                     ifd.predictor = first_u32(data, dtype, cnt, val, inline_pos, le);
                 }
+                0xC71F => {
+                    ifd.row_interleave = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
                 0xCD43 => {
-                    // JXLDistance (52547, DNG 1.7). SHORT in Adobe's own samples
-                    // despite the spec's float; first_f32 reads either.
+                    ifd.column_interleave = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0xCD49 => {
+                    // JXLDistance (DNG 1.7, FLOAT).
                     ifd.jxl_distance = first_f32(data, dtype, cnt, val, inline_pos, le);
                 }
                 0x0142 => {
@@ -1866,6 +1941,13 @@ fn first_f32(
         1 | 6 => data.get(p).map(|&b| b as f32),
         3 => Some(read_u16(data, p, le) as f32),
         4 => Some(read_u32(data, p, le) as f32),
+        11 => {
+            // FLOAT — e.g. JXLDistance (0xCD49, DNG 1.7).
+            if p.checked_add(4).map_or(true, |e| e > data.len()) {
+                return None;
+            }
+            Some(f32::from_bits(read_u32(data, p, le)))
+        }
         5 => {
             let num = read_u32(data, p, le) as f32;
             let den = read_u32(data, p + 4, le) as f32;
@@ -2267,6 +2349,63 @@ mod tests {
             let r = payload_ranges(&dng).expect("ranges");
             assert_eq!(r, vec![(off as usize, off as usize + jxl.len())]);
         }
+    }
+
+    /// The dng_sdk remainder rule, worked by hand: field f holds
+    /// ceil((N−f)/F) entries, stored consecutively, entry `within` of field f
+    /// lands at final `within*F + f`.
+    #[test]
+    fn interleave_field_map_matches_the_worked_examples() {
+        assert_eq!(interleave_field_map(5, 2), vec![0, 2, 4, 1, 3]);
+        assert_eq!(interleave_field_map(6, 3), vec![0, 3, 1, 4, 2, 5]);
+        assert_eq!(interleave_field_map(4, 1), vec![0, 1, 2, 3]);
+        assert_eq!(interleave_field_map(7, 4), vec![0, 4, 1, 5, 2, 6, 3]);
+        // Bijection at awkward sizes.
+        for (n, f) in [(1usize, 2usize), (2, 2), (9, 2), (10, 4), (11, 3)] {
+            let mut seen = vec![false; n];
+            for v in interleave_field_map(n, f) {
+                assert!(!seen[v as usize], "N={n} F={f}: {v} hit twice");
+                seen[v as usize] = true;
+            }
+        }
+    }
+
+    /// A 4x4 uncompressed DNG whose strip is stored 2x2 FIELD-interleaved
+    /// (RowInterleaveFactor/ColumnInterleaveFactor = 2, the DNG 1.7 JXL-CFA
+    /// layout): decode must hand back the de-interleaved mosaic.
+    #[test]
+    fn interleaved_dng_is_deinterleaved_on_decode() {
+        let final_plane: Vec<u16> = (0u16..16).map(|v| v * 100).collect();
+        // Store it field-interleaved: stored[s] lands at final[rowmap x colmap].
+        let (rm, cm) = (interleave_field_map(4, 2), interleave_field_map(4, 2));
+        let mut stored = vec![0u16; 16];
+        for y in 0..4 {
+            for x in 0..4 {
+                stored[y * 4 + x] = final_plane[rm[y] as usize * 4 + cm[x] as usize];
+            }
+        }
+        let mut strip = Vec::new();
+        for v in &stored {
+            strip.extend_from_slice(&v.to_le_bytes());
+        }
+        let n = 10;
+        let off = payload_off(n);
+        let entries = [
+            (0x00FE_u16, 4_u16, 1_u32, 0_u32),
+            (0x0100, 4, 1, 4),
+            (0x0101, 4, 1, 4),
+            (0x0102, 3, 1, 16),
+            (0x0103, 3, 1, 1), // uncompressed
+            (0x0111, 4, 1, off),
+            (0x0116, 4, 1, 4),
+            (0x0117, 4, 1, strip.len() as u32),
+            (0xC71F, 3, 1, 2), // RowInterleaveFactor
+            (0xCD43, 3, 1, 2), // ColumnInterleaveFactor
+        ];
+        let dng = build_tiff_le(&entries, &strip);
+        let img = decode_bytes(&dng).expect("decode");
+        assert_eq!(img.raw, final_plane, "decode must de-interleave the fields");
+        assert_eq!(img.jxl_lossy, None, "not a JXL stream");
     }
 
     #[test]
