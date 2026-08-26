@@ -72,49 +72,135 @@ fn main() {
     };
 
     // ── The DNG color pipeline, driven by what the file carries ──────────
-    //
-    // WB sanity first: some Linear DNGs (Adobe SDK re-encodes, iPhone 17
-    // ProRAW) store already-balanced channels while still carrying a
-    // non-unity AsShotNeutral; multiplying red by 2.8 on balanced data
-    // renders pink. Gray-world gate: WB only if it moves means toward equal.
-    let mut mean = [0f64; 3];
-    for p in rgb.chunks_exact(3) {
-        mean[0] += p[0] as f64;
-        mean[1] += p[1] as f64;
-        mean[2] += p[2] as f64;
-    }
-    let spread = |m: &[f64; 3]| -> f64 {
-        let hi = m.iter().cloned().fold(f64::MIN, f64::max);
-        let lo = m.iter().cloned().fold(f64::MAX, f64::min).max(1e-9);
-        hi / lo
-    };
-    let wb_mean = [mean[0] * img.wb_r as f64, mean[1], mean[2] * img.wb_b as f64];
-    let wb_helps = spread(&wb_mean) < spread(&mean);
-    if wb_helps {
-        for p in rgb.chunks_exact_mut(3) {
-            p[0] *= img.wb_r;
-            p[2] *= img.wb_b;
+
+    // 3x3 helpers for the Bradford path below.
+    fn mul33(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+        let mut o = [[0f32; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                o[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+            }
         }
+        o
     }
-    // Matrix semantics differ by which tag built it (dng.rs
-    // choose_camera_to_srgb_matrix):
-    //  * ForwardMatrix present → color_matrix = XYZ2SRGB·FM, which maps
-    //    WHITE-BALANCED camera to sRGB — apply after the WB above (or to
-    //    already-balanced data when the gate skipped WB).
-    //  * ColorMatrix⁻¹ fallback → maps UNBALANCED camera to sRGB (the balance
-    //    lives inside ColorMatrix) — apply only when we did NOT balance;
-    //    applying it after WB double-counts (measured: solid magenta).
-    // Empirically (iPhone 12 magenta, iPhone 17 magenta): the ColorMatrix⁻¹
-    // fallback is never safe in this quick-look, balanced input or not — the
-    // proper CM-only path needs chromatic adaptation this tool doesn't do.
-    // The ForwardMatrix path is the one with clean semantics; use only it.
-    let apply_matrix = img.forward_matrix.is_some();
-    if apply_matrix {
-        if let Some(m) = img.color_matrix {
+    fn inv33(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let d = 1.0 / det;
+        Some([
+            [
+                (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * d,
+                (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * d,
+                (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * d,
+            ],
+            [
+                (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * d,
+                (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * d,
+                (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * d,
+            ],
+            [
+                (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * d,
+                (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * d,
+                (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * d,
+            ],
+        ])
+    }
+    fn mulv(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+        [
+            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        ]
+    }
+    // Constants: XYZ(D50)→sRGB (same values dng.rs carries) and Bradford.
+    const XYZ_D50_TO_SRGB: [[f32; 3]; 3] = [
+        [3.133_856_1, -1.616_866_7, -0.490_614_6],
+        [-0.978_768_4, 1.916_141_5, 0.033_454_0],
+        [0.071_945_3, -0.228_991_4, 1.405_242_7],
+    ];
+    const BRADFORD: [[f32; 3]; 3] = [
+        [0.8951, 0.2664, -0.1614],
+        [-0.7502, 1.7135, 0.0367],
+        [0.0389, -0.0685, 1.0296],
+    ];
+    const D50_WHITE: [f32; 3] = [0.9642, 1.0, 0.8249];
+
+    // The Bradford-adapted ColorMatrix path, for files WITHOUT a ForwardMatrix
+    // (Apple). dng.rs fused color_matrix = XYZ2SRGB · CM⁻¹, so CM⁻¹ recovers as
+    // XYZ2SRGB⁻¹ · fused. The scene white in camera space is AsShotNeutral
+    // (reconstructed from the green-normalized wb multipliers); its XYZ under
+    // the scene illuminant is CM⁻¹·n, Bradford-adapted to D50, then to sRGB —
+    // by construction the camera neutral maps to sRGB (1,1,1), so this path
+    // needs (and must not have) separate WB multipliers. This replaces the
+    // earlier "CM path is never safe" bail-out, whose magenta was exactly the
+    // missing adaptation.
+    let cm_bradford: Option<[[f32; 3]; 3]> = if img.forward_matrix.is_none() {
+        img.color_matrix.and_then(|fused| {
+            let cam2xyz_scene = mul33(inv33(XYZ_D50_TO_SRGB)?, fused);
+            let n = [1.0 / img.wb_r.max(1e-6), 1.0, 1.0 / img.wb_b.max(1e-6)];
+            let white_scene = mulv(cam2xyz_scene, n);
+            if white_scene.iter().any(|&v| !(v > 0.0)) {
+                return None;
+            }
+            let cone_scene = mulv(BRADFORD, white_scene);
+            let cone_d50 = mulv(BRADFORD, D50_WHITE);
+            if cone_scene.iter().any(|&v| v.abs() < 1e-6) {
+                return None;
+            }
+            let mut diag = [[0f32; 3]; 3];
+            for i in 0..3 {
+                diag[i][i] = cone_d50[i] / cone_scene[i];
+            }
+            let adapt = mul33(inv33(BRADFORD)?, mul33(diag, BRADFORD));
+            Some(mul33(XYZ_D50_TO_SRGB, mul33(adapt, cam2xyz_scene)))
+        })
+    } else {
+        None
+    };
+
+    if let Some(m) = cm_bradford {
+        // Whole transform in one matrix, applied to UNBALANCED camera RGB.
+        for p in rgb.chunks_exact_mut(3) {
+            let (r, g, b) = (p[0], p[1], p[2]);
+            for c in 0..3 {
+                p[c] = (m[c][0] * r + m[c][1] * g + m[c][2] * b).max(0.0);
+            }
+        }
+    } else {
+        // WB sanity: some Linear DNGs (Adobe SDK re-encodes) store
+        // already-balanced channels while still carrying a non-unity
+        // AsShotNeutral; multiplying red by 2.8 on balanced data renders pink.
+        // Gray-world gate: WB only if it moves the channel means toward equal.
+        let mut mean = [0f64; 3];
+        for p in rgb.chunks_exact(3) {
+            mean[0] += p[0] as f64;
+            mean[1] += p[1] as f64;
+            mean[2] += p[2] as f64;
+        }
+        let spread = |m: &[f64; 3]| -> f64 {
+            let hi = m.iter().cloned().fold(f64::MIN, f64::max);
+            let lo = m.iter().cloned().fold(f64::MAX, f64::min).max(1e-9);
+            hi / lo
+        };
+        let wb_mean = [mean[0] * img.wb_r as f64, mean[1], mean[2] * img.wb_b as f64];
+        if spread(&wb_mean) < spread(&mean) {
             for p in rgb.chunks_exact_mut(3) {
-                let (r, g, b) = (p[0], p[1], p[2]);
-                for c in 0..3 {
-                    p[c] = (m[c][0] * r + m[c][1] * g + m[c][2] * b).max(0.0);
+                p[0] *= img.wb_r;
+                p[2] *= img.wb_b;
+            }
+        }
+        // ForwardMatrix path: fused = XYZ2SRGB·FM expects white-balanced input.
+        if img.forward_matrix.is_some() {
+            if let Some(m) = img.color_matrix {
+                for p in rgb.chunks_exact_mut(3) {
+                    let (r, g, b) = (p[0], p[1], p[2]);
+                    for c in 0..3 {
+                        p[c] = (m[c][0] * r + m[c][1] * g + m[c][2] * b).max(0.0);
+                    }
                 }
             }
         }
@@ -199,11 +285,17 @@ fn main() {
             );
         }
     }
-    // Re-anchor exposure AFTER the gain map: the reference pipeline follows
-    // PGTM with an exposure ramp (shoulder included), so its lifts don't clip;
-    // this quick-look re-derives the highlight anchor on the gained data
-    // instead, letting the map act as local contrast rather than global blow-out.
-    let scale = if img.profile_gain_table_map.is_some() { anchor(&rgb) } else { scale };
+    // Exposure after the gain map. Apple (PGTM) path: the file's OWN key —
+    // v/WhiteLevel × 2^BaselineExposure — with an extended-Reinhard shoulder
+    // whose white point is the max representable post-exposure value, standing
+    // in for the reference pipeline's exposure ramp (which is why Apple's
+    // lifts never clip). Everything else keeps the percentile anchor.
+    let (scale, shoulder_wp) = if img.profile_gain_table_map.is_some() {
+        let bev = (2f32).powf(img.baseline_exposure);
+        (bev / (img.white as f32).max(1.0), Some(bev.max(1.001)))
+    } else {
+        (scale, None)
+    };
 
     // The profile's own tone curve (linear→linear control points), when the
     // file carries one; sampled by piecewise-linear interpolation.
@@ -253,7 +345,12 @@ fn main() {
             }
             let n = (s * s) as f32;
             let q = |v: f32| -> u8 {
-                let lin = tone((v / n * scale).clamp(0.0, 1.0));
+                let mut e = (v / n * scale).max(0.0);
+                if let Some(wp) = shoulder_wp {
+                    // Extended Reinhard: maps [0, wp] → [0, 1], soft knee.
+                    e = e * (1.0 + e / (wp * wp)) / (1.0 + e);
+                }
+                let lin = tone(e.clamp(0.0, 1.0));
                 let g = lin.clamp(0.0, 1.0).powf(1.0 / 2.2);
                 // When the file supplied no tone curve, a mild s-curve toward
                 // the camera-preview look; the profile curve replaces it.
