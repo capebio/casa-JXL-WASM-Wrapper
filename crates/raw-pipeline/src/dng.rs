@@ -40,6 +40,66 @@ pub fn reset_decode_count() {
     DECODE_COUNT.store(0, Ordering::Relaxed);
 }
 
+/// DNG 1.6 ProfileGainTableMap (tag 0xCD2D): a spatial grid of tone TABLES —
+/// at each of `points_v × points_h` grid positions sits a `num_table_points`
+/// gain table indexed by a weighted input level. Per the dng_sdk reference
+/// (RefBaselineProfileGainTableMap): for each pixel of the ACTIVE image in
+/// normalized coordinates, `weight = w·[r, g, b, min(rgb), max(rgb)]` clamped
+/// to [0,1], and the gain — trilinear across (row, col, weight·num_table_points)
+/// — multiplies all three channels of the linear RGB, before the tone curve.
+/// This is Apple ProRAW's local tone map. Version-1 layout only (f32 gains,
+/// gamma 1); ProfileGainTableMap2's extra types are not parsed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GainTableMap {
+    pub points_v: u32,
+    pub points_h: u32,
+    /// Normalized-coordinate spacing/origin of the grid over the active image.
+    pub spacing_v: f64,
+    pub spacing_h: f64,
+    pub origin_v: f64,
+    pub origin_h: f64,
+    pub num_table_points: u32,
+    pub map_input_weights: [f32; 5],
+    /// `points_v * points_h * num_table_points` gains, row-major, table-minor.
+    pub gains: Vec<f32>,
+}
+
+/// Parse a v1 ProfileGainTableMap blob (values in the FILE's byte order).
+fn parse_gain_table_map(d: &[u8], le: bool) -> Option<GainTableMap> {
+    if d.len() < 64 {
+        return None;
+    }
+    let u32_at = |o: usize| read_u32(d, o, le);
+    let f64_at = |o: usize| {
+        let (hi, lo) = if le { (u32_at(o + 4), u32_at(o)) } else { (u32_at(o), u32_at(o + 4)) };
+        f64::from_bits(((hi as u64) << 32) | lo as u64)
+    };
+    let points_v = u32_at(0);
+    let points_h = u32_at(4);
+    let num_table_points = u32_at(40);
+    let n = (points_v as usize)
+        .checked_mul(points_h as usize)?
+        .checked_mul(num_table_points as usize)?;
+    if points_v == 0 || points_h == 0 || num_table_points == 0 || d.len() != 64 + n * 4 {
+        return None; // not the v1 f32 layout (or a hostile size)
+    }
+    let mut weights = [0f32; 5];
+    for (i, w) in weights.iter_mut().enumerate() {
+        *w = f32::from_bits(u32_at(44 + 4 * i));
+    }
+    Some(GainTableMap {
+        points_v,
+        points_h,
+        spacing_v: f64_at(8),
+        spacing_h: f64_at(16),
+        origin_v: f64_at(24),
+        origin_h: f64_at(32),
+        num_table_points,
+        map_input_weights: weights,
+        gains: (0..n).map(|i| f32::from_bits(u32_at(64 + 4 * i))).collect(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cfa {
     Rggb,
@@ -83,6 +143,29 @@ pub struct DngImage {
     /// exposure baseline. 0.0 when the tag is absent.
     pub baseline_exposure: f32,
     pub color_matrix: Option<[[f32; 3]; 3]>,
+    /// ForwardMatrix2/1 verbatim when the file carries one. Semantics matter to
+    /// a renderer: `color_matrix` built FROM a ForwardMatrix expects
+    /// WHITE-BALANCED camera data (FM maps balanced camera → XYZ D50), while
+    /// the ColorMatrix⁻¹ fallback expects UNBALANCED data (white balance lives
+    /// inside ColorMatrix). `Some` here tells the consumer which contract
+    /// `color_matrix` follows.
+    pub forward_matrix: Option<[[f32; 3]; 3]>,
+    /// DNG ProfileToneCurve (0xC6FC): interleaved (x, y) control points in
+    /// [0,1], empty when absent. The tone curve the profile intends on top of
+    /// the linear rendition.
+    pub profile_tone_curve: Vec<f32>,
+    /// DNG ActiveArea (0xC68D) as [top, left, bottom, right] in plane
+    /// coordinates, when present: pixels outside it are masked/padding and a
+    /// viewer should crop to it. `None` = whole plane is active.
+    pub active_area: Option<[u32; 4]>,
+    /// DNG 1.6 ProfileGainTableMap (0xCD2D) from the raw IFD — Apple ProRAW's
+    /// local tone map ("the Apple look"). See [`GainTableMap`].
+    pub profile_gain_table_map: Option<GainTableMap>,
+    /// LinearizationTable (0xC618) from the raw IFD, empty when absent.
+    /// `raw` holds the STORED codes; true linear values are
+    /// `linearization_table[code]` (Apple ProRAW: 12-bit codes → 16-bit
+    /// linear), and `white`/the PGTM weight scale live in THAT domain.
+    pub linearization_table: Vec<u16>,
     pub make: String,
     pub model: String,
     pub orientation: u16,
@@ -327,6 +410,16 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         iso: state.iso,
         baseline_exposure: state.baseline_exposure.unwrap_or(0.0),
         color_matrix,
+        forward_matrix: state.forward_matrix_2.or(state.forward_matrix_1),
+        profile_tone_curve: state.profile_tone_curve.clone(),
+        active_area: raw.active_area,
+        profile_gain_table_map: raw
+            .pgtm_range
+            .and_then(|(off, len)| {
+                off.checked_add(len).filter(|&e| e <= data.len()).map(|e| &data[off..e])
+            })
+            .and_then(|blob| parse_gain_table_map(blob, le)),
+        linearization_table: raw.linearization.clone(),
         make: state.make,
         model: state.model,
         orientation: state.orientation.unwrap_or(1),
@@ -1499,6 +1592,12 @@ struct RawIfd {
     /// de-interleaved after decompression (dng_sdk remainder rule).
     row_interleave: Option<u32>,
     column_interleave: Option<u32>,
+    /// ActiveArea (0xC68D): [top, left, bottom, right].
+    active_area: Option<[u32; 4]>,
+    /// ProfileGainTableMap (0xCD2D) blob extent in the file: (offset, len).
+    pgtm_range: Option<(usize, usize)>,
+    /// LinearizationTable (0xC618): stored code → linear value.
+    linearization: Vec<u16>,
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
@@ -1513,6 +1612,8 @@ struct WalkState {
     color_matrix_2: Option<[[f32; 3]; 3]>,
     forward_matrix_1: Option<[[f32; 3]; 3]>,
     forward_matrix_2: Option<[[f32; 3]; 3]>,
+    /// ProfileToneCurve (0xC6FC): interleaved (x, y) pairs, empty when absent.
+    profile_tone_curve: Vec<f32>,
     iso: Option<u32>,
     baseline_exposure: Option<f32>,
     make: String,
@@ -1632,11 +1733,34 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 0x013D => {
                     ifd.predictor = first_u32(data, dtype, cnt, val, inline_pos, le);
                 }
+                0xC68D => {
+                    let a = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                    if a.len() == 4 {
+                        ifd.active_area = Some([a[0], a[1], a[2], a[3]]);
+                    }
+                }
                 0xC71F => {
                     ifd.row_interleave = first_u32(data, dtype, cnt, val, inline_pos, le);
                 }
                 0xCD43 => {
                     ifd.column_interleave = first_u32(data, dtype, cnt, val, inline_pos, le);
+                }
+                0xC618 => {
+                    // LinearizationTable: SHORT array, stored code → linear.
+                    if dtype == 3 && (2..=65536).contains(&cnt) {
+                        let p = val as usize;
+                        let need = cnt as usize * 2;
+                        if p.checked_add(need).map_or(false, |e| e <= data.len()) {
+                            ifd.linearization =
+                                (0..cnt as usize).map(|i| read_u16(data, p + 2 * i, le)).collect();
+                        }
+                    }
+                }
+                0xCD2D => {
+                    // ProfileGainTableMap: UNDEFINED blob, parsed after the walk.
+                    if dtype == 7 && cnt > 4 {
+                        ifd.pgtm_range = Some((val as usize, cnt as usize));
+                    }
                 }
                 0xCD49 => {
                     // JXLDistance (DNG 1.7, FLOAT).
@@ -1773,6 +1897,18 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 TAG_FORWARD_MATRIX_2 => {
                     state.forward_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                0xC6FC => {
+                    // ProfileToneCurve: FLOAT array of interleaved (x, y) pairs.
+                    if dtype == 11 && cnt >= 4 && cnt % 2 == 0 && cnt <= 4096 {
+                        let p = val as usize;
+                        let need = cnt as usize * 4;
+                        if p.checked_add(need).map_or(false, |e| e <= data.len()) {
+                            state.profile_tone_curve = (0..cnt as usize)
+                                .map(|i| f32::from_bits(read_u32(data, p + 4 * i, le)))
+                                .collect();
+                        }
+                    }
                 }
                 // ── Additional noise-metadata tags ────────────────────────────
                 // (TAG_BLACK_LEVEL=0xC61A and TAG_WHITE_LEVEL=0xC61D are handled
