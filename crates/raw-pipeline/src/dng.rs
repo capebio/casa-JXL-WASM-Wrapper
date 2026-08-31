@@ -1557,6 +1557,41 @@ fn load_dng(data: &[u8]) -> Result<(WalkState, RawIfd, bool)> {
             }
         }
     }
+    // Same gap, other direction: files with a real AsShotNeutral (so the WB
+    // gray-point is already right) but no ForwardMatrix at all — the render
+    // matrix still needs the CCT blend, just has to work backwards from the
+    // neutral to find which white xy it implies first (`neutral_to_xy`,
+    // Adobe's iterative `NeutralToXY`) before `find_xyz_to_camera` can weigh
+    // ColorMatrix1/2 by it. Confirmed this isn't theoretical: iPhone/ProRAW
+    // and GoPro GPR files in this shape have ColorMatrix1 vs ColorMatrix2
+    // entries differing by up to 0.34 — the same magnitude as the
+    // AsShotWhiteXY gap above, just masked because the WB itself is fine so
+    // nothing downstream of it (LibRaw's cam_mul, the gallery's tint metric)
+    // was in a position to catch a wrong RENDER matrix. Only fires when
+    // there's no forward matrix — a file with one already renders through
+    // choose_camera_to_srgb_matrix's ForwardMatrix2 path.
+    if state.resolved_color_matrix.is_none()
+        && state.forward_matrix_1.is_none()
+        && state.forward_matrix_2.is_none()
+    {
+        if let (Some(neutral), Some(cm1), Some(cm2)) =
+            (state.as_shot_neutral, state.color_matrix_1, state.color_matrix_2)
+        {
+            let t1 = state.calibration_illuminant_1.map(illuminant_to_temperature).unwrap_or(0.0);
+            let t2 = state.calibration_illuminant_2.map(illuminant_to_temperature).unwrap_or(0.0);
+            if t1 > 0.0 && t2 > 0.0 && (t1 - t2).abs() > 1e-6 {
+                let (t_lo, t_hi, cm_lo, cm_hi) =
+                    if t1 <= t2 { (t1, t2, cm1, cm2) } else { (t2, t1, cm2, cm1) };
+                if let Some((x, y)) = neutral_to_xy(neutral, t_lo, t_hi, cm_lo, cm_hi) {
+                    let (color_matrix, _) =
+                        find_xyz_to_camera(x, y, t_lo, t_hi, cm_lo, cm_hi, None, None);
+                    if let Some(camera_to_xyz) = invert3x3(color_matrix) {
+                        state.resolved_color_matrix = Some(mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz));
+                    }
+                }
+            }
+        }
+    }
     let raw = state.raw_ifd.take().ok_or_else(|| {
         if state.refused_compressions.is_empty() {
             anyhow!("no raw SubIFD found")
@@ -2546,7 +2581,7 @@ fn resolve_from_white_xy(
     if y <= 1e-6 {
         return None;
     }
-    let xyz = [(x / y) as f32, 1.0f32, ((1.0 - x - y) / y) as f32];
+    let xyz = xy_to_xyz(x, y);
 
     let (color_matrix, forward_matrix) = match (cm1, cm2) {
         (Some(a), Some(b)) => {
@@ -2584,6 +2619,70 @@ fn resolve_from_white_xy(
     };
 
     Some(([r, g, b], render_matrix))
+}
+
+/// CIE xy → XYZ (Y = 1 reference white) — the same `[x/y, 1, (1-x-y)/y]`
+/// `resolve_from_white_xy` computes inline; factored out because
+/// `neutral_to_xy`'s round-trip test needs the forward direction too.
+fn xy_to_xyz(x: f64, y: f64) -> [f32; 3] {
+    [(x / y) as f32, 1.0, ((1.0 - x - y) / y) as f32]
+}
+
+/// CIE XYZ → xy. Inverse of the above. `None` when X+Y+Z is degenerate (an
+/// all-zero neutral, or a singular color matrix from a pathological
+/// calibration).
+fn xyz_to_xy(xyz: [f32; 3]) -> Option<(f64, f64)> {
+    let (x, y, z) = (xyz[0] as f64, xyz[1] as f64, xyz[2] as f64);
+    let sum = x + y + z;
+    if sum.abs() < 1e-9 {
+        return None;
+    }
+    Some((x / sum, y / sum))
+}
+
+/// Given a real, tag-provided `AsShotNeutral` (camera-space) and a
+/// temperature-ordered ColorMatrix pair (`t_lo <= t_hi`, `cm_lo` calibrated
+/// at `t_lo`), find which CIE xy white point produced it — the direction
+/// `resolve_from_white_xy` runs, inverted. Port of
+/// `dng_color_spec::NeutralToXY` (`dng_color_spec.cpp`,
+/// github.com/aizvorski/dng_sdk): the matrix that converts the camera-space
+/// neutral back to XYZ depends on the CCT-blended ColorMatrix, which itself
+/// depends on the very white point being solved for — a fixed point, seeded
+/// at D50 and refined until it stops moving (or Adobe's own 30-pass cap,
+/// then average the last two estimates rather than loop forever).
+fn neutral_to_xy(
+    neutral: [f32; 3],
+    t_lo: f64,
+    t_hi: f64,
+    cm_lo: [[f32; 3]; 3],
+    cm_hi: [[f32; 3]; 3],
+) -> Option<(f64, f64)> {
+    const D50_XY: (f64, f64) = (0.34567, 0.35850);
+    let mut last = D50_XY;
+    for pass in 0..30 {
+        let (color_matrix, _) = find_xyz_to_camera(last.0, last.1, t_lo, t_hi, cm_lo, cm_hi, None, None);
+        let camera_to_xyz = invert3x3(color_matrix)?;
+        let xyz = [
+            camera_to_xyz[0][0] * neutral[0]
+                + camera_to_xyz[0][1] * neutral[1]
+                + camera_to_xyz[0][2] * neutral[2],
+            camera_to_xyz[1][0] * neutral[0]
+                + camera_to_xyz[1][1] * neutral[1]
+                + camera_to_xyz[1][2] * neutral[2],
+            camera_to_xyz[2][0] * neutral[0]
+                + camera_to_xyz[2][1] * neutral[1]
+                + camera_to_xyz[2][2] * neutral[2],
+        ];
+        let mut next = xyz_to_xy(xyz)?;
+        if (next.0 - last.0).abs() + (next.1 - last.1).abs() < 1e-7 {
+            return Some(next);
+        }
+        if pass == 29 {
+            next = ((last.0 + next.0) * 0.5, (last.1 + next.1) * 0.5);
+        }
+        last = next;
+    }
+    Some(last)
 }
 
 fn read_ascii(data: &[u8], _dtype: u16, cnt: u32, val: u32, inline_pos: usize) -> String {
@@ -3057,6 +3156,38 @@ mod tests {
         let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         assert!(resolve_from_white_xy([0.3, 0.0], Some(17), Some(21), Some(cm1), None, None, None)
             .is_none());
+    }
+
+    #[test]
+    fn neutral_to_xy_inverts_resolve_from_white_xy() {
+        // Real-shaped matrices (row sums near 1, small off-diagonal terms) —
+        // an identity/diagonal pair makes FindXYZtoCamera's blend degenerate
+        // in a way that doesn't exercise the interesting cross terms.
+        let cm1 = [[1.2, -0.1, 0.0], [0.0, 1.1, 0.0], [0.0, 0.0, 1.3]];
+        let cm2 = [[0.9, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -0.1, 1.0]];
+        let (t1, t2) = (2850.0, 6500.0);
+        // A white point strictly between the two calibrations — the case
+        // that actually needs interpolation, not just clamping to one side.
+        let (want_x, want_y) = (0.36, 0.34);
+
+        let (color_matrix, _) = find_xyz_to_camera(want_x, want_y, t1, t2, cm1, cm2, None, None);
+        let xyz = xy_to_xyz(want_x, want_y);
+        let neutral = [
+            color_matrix[0][0] * xyz[0] + color_matrix[0][1] * xyz[1] + color_matrix[0][2] * xyz[2],
+            color_matrix[1][0] * xyz[0] + color_matrix[1][1] * xyz[1] + color_matrix[1][2] * xyz[2],
+            color_matrix[2][0] * xyz[0] + color_matrix[2][1] * xyz[1] + color_matrix[2][2] * xyz[2],
+        ];
+
+        let (got_x, got_y) = neutral_to_xy(neutral, t1, t2, cm1, cm2).expect("converges");
+        assert!((got_x - want_x).abs() < 1e-4, "x: got {got_x}, want {want_x}");
+        assert!((got_y - want_y).abs() < 1e-4, "y: got {got_y}, want {want_y}");
+    }
+
+    #[test]
+    fn neutral_to_xy_none_on_an_all_zero_neutral() {
+        let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cm2 = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        assert!(neutral_to_xy([0.0, 0.0, 0.0], 2850.0, 6500.0, cm1, cm2).is_none());
     }
 
     #[test]
