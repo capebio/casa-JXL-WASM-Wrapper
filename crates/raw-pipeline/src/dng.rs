@@ -200,6 +200,8 @@ const TAG_COLOR_MATRIX_1: u16 = 0xC621;
 const TAG_COLOR_MATRIX_2: u16 = 0xC622;
 const TAG_FORWARD_MATRIX_1: u16 = 0xC714;
 const TAG_FORWARD_MATRIX_2: u16 = 0xC715;
+const TAG_CALIBRATION_ILLUMINANT_1: u16 = 0xC65A;
+const TAG_CALIBRATION_ILLUMINANT_2: u16 = 0xC65B;
 
 pub(crate) const XYZ_D50_TO_SRGB: [[f32; 3]; 3] = [
     [3.133_856_1, -1.616_866_7, -0.490_614_6],
@@ -380,12 +382,14 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
 
     let black = raw.black_level.unwrap_or(0);
     let white = raw.white_level.unwrap_or(16383);
-    let color_matrix = choose_camera_to_srgb_matrix(
-        state.forward_matrix_1,
-        state.forward_matrix_2,
-        state.color_matrix_1,
-        state.color_matrix_2,
-    );
+    let color_matrix = state.resolved_color_matrix.or_else(|| {
+        choose_camera_to_srgb_matrix(
+            state.forward_matrix_1,
+            state.forward_matrix_2,
+            state.color_matrix_1,
+            state.color_matrix_2,
+        )
+    });
     // Color matrix (camera native -> sRGB via XYZ) is passed through to higher
     // LookRenderer for the advanced non-Riemannian / log geodesic / Molchanov
     // perceptual model (lens17). The demosaic stage (incl. optional mhc_matrix
@@ -488,12 +492,14 @@ fn dng_meta(
         wb_b: wb_g_neutral / wb_b_neutral.max(1e-6),
         // Finding 51: honest provenance — mirrors DngImage (AsShotNeutral presence).
         wb_from_camera: state.as_shot_neutral.is_some(),
-        color_matrix: choose_camera_to_srgb_matrix(
-            state.forward_matrix_1,
-            state.forward_matrix_2,
-            state.color_matrix_1,
-            state.color_matrix_2,
-        ),
+        color_matrix: state.resolved_color_matrix.or_else(|| {
+            choose_camera_to_srgb_matrix(
+                state.forward_matrix_1,
+                state.forward_matrix_2,
+                state.color_matrix_1,
+                state.color_matrix_2,
+            )
+        }),
         iso: state.iso,
         baseline_exposure: state.baseline_exposure.unwrap_or(0.0),
         orientation: state.orientation.unwrap_or(1),
@@ -1525,24 +1531,29 @@ fn load_dng(data: &[u8]) -> Result<(WalkState, RawIfd, bool)> {
     // The raw-image walk above does not read EXIF datetime / GPS tags; pull them
     // from IFD0's standard Exif/GPS sub-IFDs (same handling ORF already has).
     state.exif = crate::tiff::parse_exif_gps(data, le, ifd0_off);
-    // Derive AsShotNeutral from AsShotWhiteXY (tag 0xC629) when tag 0xC628 is absent.
-    // Pixel phone DNGs store only xy chromaticity coordinates.
-    // Formula: XYZ_white = [x/y, 1, (1-x-y)/y]; cam_neutral = ColorMatrix × XYZ_white.
+    // Derive AsShotNeutral from AsShotWhiteXY (tag 0xC629) when tag 0xC628 is
+    // absent — Pixel phone DNGs store only xy chromaticity coordinates. Also
+    // resolves the render matrix in the same call: both need the same
+    // CCT-weighted blend of ColorMatrix1/2 (see `resolve_from_white_xy`), so
+    // computing them separately would either duplicate the blend or (the
+    // previous version of this code) skip it and always take ColorMatrix2 —
+    // wrong whenever the shot's white point sits closer to calibration
+    // illuminant 1 (confirmed: LibRaw computes no AsShotWhiteXY-derived WB at
+    // all for these files, so it wasn't available as a reference to catch
+    // this against; verified instead against Adobe's own DNG SDK source).
     if state.as_shot_neutral.is_none() {
-        if let (Some(xy), Some(cm)) = (
-            state.as_shot_white_xy,
-            state.color_matrix_2.or(state.color_matrix_1),
-        ) {
-            let x = xy[0];
-            let y = xy[1];
-            if y > 1e-6 {
-                let xyz = [x / y, 1.0f32, (1.0 - x - y) / y];
-                let r = cm[0][0] * xyz[0] + cm[0][1] * xyz[1] + cm[0][2] * xyz[2];
-                let g = cm[1][0] * xyz[0] + cm[1][1] * xyz[1] + cm[1][2] * xyz[2];
-                let b = cm[2][0] * xyz[0] + cm[2][1] * xyz[1] + cm[2][2] * xyz[2];
-                if r > 0.0 && g > 0.0 && b > 0.0 {
-                    state.as_shot_neutral = Some([r, g, b]);
-                }
+        if let Some(xy) = state.as_shot_white_xy {
+            if let Some((neutral, render_matrix)) = resolve_from_white_xy(
+                xy,
+                state.calibration_illuminant_1,
+                state.calibration_illuminant_2,
+                state.color_matrix_1,
+                state.color_matrix_2,
+                state.forward_matrix_1,
+                state.forward_matrix_2,
+            ) {
+                state.as_shot_neutral = Some(neutral);
+                state.resolved_color_matrix = Some(render_matrix);
             }
         }
     }
@@ -1612,6 +1623,18 @@ struct WalkState {
     color_matrix_2: Option<[[f32; 3]; 3]>,
     forward_matrix_1: Option<[[f32; 3]; 3]>,
     forward_matrix_2: Option<[[f32; 3]; 3]>,
+    /// CalibrationIlluminant1/2 (0xC65A/0xC65B): EXIF LightSource codes (the
+    /// same enum as tag 0x9208) naming which light each color/forward matrix
+    /// pair was calibrated under. Needed to weight the two matrices by the
+    /// actual shot's correlated color temperature instead of always picking
+    /// one — see `find_xyz_to_camera`.
+    calibration_illuminant_1: Option<u16>,
+    calibration_illuminant_2: Option<u16>,
+    /// Camera→sRGB matrix already resolved by CCT-weighted interpolation, set
+    /// only when `as_shot_neutral` was derived from `as_shot_white_xy` (see
+    /// `load_dng`) — every other file keeps using `choose_camera_to_srgb_matrix`
+    /// unchanged. `None` here means "fall back to that", not "no matrix".
+    resolved_color_matrix: Option<[[f32; 3]; 3]>,
     /// ProfileToneCurve (0xC6FC): interleaved (x, y) pairs, empty when absent.
     profile_tone_curve: Vec<f32>,
     iso: Option<u32>,
@@ -1897,6 +1920,14 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 }
                 TAG_FORWARD_MATRIX_2 => {
                     state.forward_matrix_2 = read_matrix3x3(data, dtype, cnt, val, le);
+                }
+                TAG_CALIBRATION_ILLUMINANT_1 => {
+                    state.calibration_illuminant_1 =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
+                }
+                TAG_CALIBRATION_ILLUMINANT_2 => {
+                    state.calibration_illuminant_2 =
+                        first_u32(data, dtype, cnt, val, inline_pos, le).map(|v| v as u16);
                 }
                 0xC6FC => {
                     // ProfileToneCurve: FLOAT array of interleaved (x, y) pairs.
@@ -2336,6 +2367,225 @@ fn choose_camera_to_srgb_matrix(
     Some(mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz))
 }
 
+/// EXIF LightSource code (tag 0x9208's enum, reused by DNG's
+/// CalibrationIlluminant1/2) → correlated color temperature in Kelvin.
+/// Adobe's `dng_camera_profile::IlluminantToTemperature` table verbatim
+/// (`dng_camera_profile.cpp`, github.com/aizvorski/dng_sdk — a public mirror
+/// of the real DNG SDK). 0.0 for any code with no defined temperature
+/// (Unknown, Other, or a value this table doesn't cover) — callers treat
+/// that as "can't interpolate", same as Adobe.
+fn illuminant_to_temperature(light: u16) -> f64 {
+    match light {
+        3 | 17 => 2850.0,                  // Tungsten, StandardLightA
+        24 => 3200.0,                       // ISOStudioTungsten
+        23 => 5000.0,                       // D50
+        20 | 1 | 9 | 4 | 18 => 5500.0,       // D55, Daylight, FineWeather, Flash, StandardLightB
+        21 | 19 | 10 => 6500.0,             // D65, StandardLightC, CloudyWeather
+        22 | 11 => 7500.0,                  // D75, Shade
+        12 => (5700.0 + 7100.0) * 0.5,       // DaylightFluorescent
+        13 => (4600.0 + 5500.0) * 0.5,       // DayWhiteFluorescent
+        14 | 2 => (3800.0 + 4500.0) * 0.5,   // CoolWhiteFluorescent, Fluorescent
+        15 => (3250.0 + 3800.0) * 0.5,       // WhiteFluorescent
+        16 => (2600.0 + 3250.0) * 0.5,       // WarmWhiteFluorescent
+        _ => 0.0,
+    }
+}
+
+/// Wyszecki & Stiles, "Color Science" 2nd ed. p.228 — the isotherm table
+/// Adobe's `dng_temperature.cpp` uses for xy→CCT (Robertson's method).
+/// `(reciprocal megakelvin, u, v, isotherm slope)`.
+const ROBERTSON_TABLE: [(f64, f64, f64, f64); 31] = [
+    (0.0, 0.18006, 0.26352, -0.24341),
+    (10.0, 0.18066, 0.26589, -0.25479),
+    (20.0, 0.18133, 0.26846, -0.26876),
+    (30.0, 0.18208, 0.27119, -0.28539),
+    (40.0, 0.18293, 0.27407, -0.30470),
+    (50.0, 0.18388, 0.27709, -0.32675),
+    (60.0, 0.18494, 0.28021, -0.35156),
+    (70.0, 0.18611, 0.28342, -0.37915),
+    (80.0, 0.18740, 0.28668, -0.40955),
+    (90.0, 0.18880, 0.28997, -0.44278),
+    (100.0, 0.19032, 0.29326, -0.47888),
+    (125.0, 0.19462, 0.30141, -0.58204),
+    (150.0, 0.19962, 0.30921, -0.70471),
+    (175.0, 0.20525, 0.31647, -0.84901),
+    (200.0, 0.21142, 0.32312, -1.0182),
+    (225.0, 0.21807, 0.32909, -1.2168),
+    (250.0, 0.22511, 0.33439, -1.4512),
+    (275.0, 0.23247, 0.33904, -1.7298),
+    (300.0, 0.24010, 0.34308, -2.0637),
+    (325.0, 0.24702, 0.34655, -2.4681),
+    (350.0, 0.25591, 0.34951, -2.9641),
+    (375.0, 0.26400, 0.35200, -3.5814),
+    (400.0, 0.27218, 0.35407, -4.3633),
+    (425.0, 0.28039, 0.35577, -5.3762),
+    (450.0, 0.28863, 0.35714, -6.7262),
+    (475.0, 0.29685, 0.35823, -8.5955),
+    (500.0, 0.30505, 0.35907, -11.324),
+    (525.0, 0.31320, 0.35968, -15.628),
+    (550.0, 0.32129, 0.36011, -23.325),
+    (575.0, 0.32931, 0.36038, -40.770),
+    (600.0, 0.33724, 0.36051, -116.45),
+];
+
+/// CIE xy → correlated color temperature (Kelvin), Robertson's method. Port
+/// of `dng_temperature::Set_xy_coord` (`dng_temperature.cpp`,
+/// github.com/aizvorski/dng_sdk) — same table, same algorithm, minus the
+/// `tint` output DNG's white-balance slider needs and `FindXYZtoCamera`
+/// doesn't.
+fn xy_to_cct(x: f64, y: f64) -> f64 {
+    let u = 2.0 * x / (1.5 - x + 6.0 * y);
+    let v = 3.0 * y / (1.5 - x + 6.0 * y);
+
+    let mut last_dt = 0.0;
+    for index in 1..31usize {
+        let (_, tu, tv, slope) = ROBERTSON_TABLE[index];
+        let len = (1.0 + slope * slope).sqrt();
+        let (du, dv) = (1.0 / len, slope / len);
+        let (uu, vv) = (u - tu, v - tv);
+        let dt = -uu * dv + vv * du;
+        if dt <= 0.0 || index == 30 {
+            let dt = if dt > 0.0 { 0.0 } else { -dt };
+            let f = if index == 1 { 0.0 } else { dt / (last_dt + dt) };
+            let (r0, r1) = (ROBERTSON_TABLE[index - 1].0, ROBERTSON_TABLE[index].0);
+            return 1.0e6 / (r0 * f + r1 * (1.0 - f));
+        }
+        last_dt = dt;
+    }
+    // Unreachable: index == 30 always satisfies the loop's own exit test.
+    1.0e6 / ROBERTSON_TABLE[30].0
+}
+
+/// Blend ColorMatrix1/2 (and ForwardMatrix1/2, if both present) by the
+/// correlated color temperature of `white` — port of
+/// `dng_color_spec::FindXYZtoCamera` (`dng_color_spec.cpp`,
+/// github.com/aizvorski/dng_sdk), minus the reduction-matrix and
+/// camera-calibration outputs this pipeline doesn't use. `t1`/`t2` must
+/// already be ordered `t1 <= t2` with `cm1`/`fm1` the matrices calibrated at
+/// `t1` — the caller (`resolve_from_white_xy`) does that swap, matching
+/// Adobe's `dng_color_spec` constructor.
+fn find_xyz_to_camera(
+    white_x: f64,
+    white_y: f64,
+    t1: f64,
+    t2: f64,
+    cm1: [[f32; 3]; 3],
+    cm2: [[f32; 3]; 3],
+    fm1: Option<[[f32; 3]; 3]>,
+    fm2: Option<[[f32; 3]; 3]>,
+) -> ([[f32; 3]; 3], Option<[[f32; 3]; 3]>) {
+    let temp = xy_to_cct(white_x, white_y);
+
+    let g = if temp <= t1 {
+        1.0
+    } else if temp >= t2 {
+        0.0
+    } else {
+        let inv_t = 1.0 / temp;
+        (inv_t - 1.0 / t2) / (1.0 / t1 - 1.0 / t2)
+    };
+
+    let blend3x3 = |a: [[f32; 3]; 3], b: [[f32; 3]; 3]| -> [[f32; 3]; 3] {
+        let (gw, hw) = (g as f32, (1.0 - g) as f32);
+        let mut out = [[0f32; 3]; 3];
+        for i in 0..3 {
+            for j in 0..3 {
+                out[i][j] = gw * a[i][j] + hw * b[i][j];
+            }
+        }
+        out
+    };
+
+    let color_matrix = if g >= 1.0 {
+        cm1
+    } else if g <= 0.0 {
+        cm2
+    } else {
+        blend3x3(cm1, cm2)
+    };
+
+    let forward_matrix = if let (Some(a), Some(b)) = (fm1, fm2) {
+        if g >= 1.0 {
+            Some(a)
+        } else if g <= 0.0 {
+            Some(b)
+        } else {
+            Some(blend3x3(a, b))
+        }
+    } else {
+        fm1.or(fm2)
+    };
+
+    (color_matrix, forward_matrix)
+}
+
+/// Derive AsShotNeutral and the camera→sRGB render matrix together from
+/// AsShotWhiteXY (CIE xy) — the branch Pixel/Android DNGs need, since they
+/// carry AsShotWhiteXY instead of AsShotNeutral. Mirrors Adobe's
+/// `dng_color_spec::SetWhiteXY` for the neutral (`colorMatrix *
+/// XYZ_white`, `colorMatrix` now CCT-blended instead of always
+/// ColorMatrix2) and reuses this crate's existing forward/color-matrix →
+/// sRGB composition for the render matrix. Returns `None` when there isn't
+/// enough calibration data to produce a plausible (all-positive) neutral.
+///
+/// Not implemented: Adobe additionally runs `NormalizeForwardMatrix` (scales
+/// the forward matrix so all-ones camera RGB maps exactly to the D50 PCS
+/// white) before using it. Skipped — it corrects small rounding drift in a
+/// well-formed tag, not a wrong answer, and every fixture this was built
+/// against already has a forward matrix that round-trips cleanly without it.
+fn resolve_from_white_xy(
+    xy: [f32; 2],
+    illuminant_1: Option<u16>,
+    illuminant_2: Option<u16>,
+    cm1: Option<[[f32; 3]; 3]>,
+    cm2: Option<[[f32; 3]; 3]>,
+    fm1: Option<[[f32; 3]; 3]>,
+    fm2: Option<[[f32; 3]; 3]>,
+) -> Option<([f32; 3], [[f32; 3]; 3])> {
+    let (x, y) = (xy[0] as f64, xy[1] as f64);
+    if y <= 1e-6 {
+        return None;
+    }
+    let xyz = [(x / y) as f32, 1.0f32, ((1.0 - x - y) / y) as f32];
+
+    let (color_matrix, forward_matrix) = match (cm1, cm2) {
+        (Some(a), Some(b)) => {
+            let t1 = illuminant_1.map(illuminant_to_temperature).unwrap_or(0.0);
+            let t2 = illuminant_2.map(illuminant_to_temperature).unwrap_or(0.0);
+            // Adobe's own fallback (`dng_color_spec` constructor): if either
+            // temperature is missing or they collide, there's nothing to
+            // interpolate between — use ColorMatrix1 (its own "calibration 2
+            // becomes calibration 1" collapse ends at the same place).
+            if t1 <= 0.0 || t2 <= 0.0 || (t1 - t2).abs() < 1e-6 {
+                (a, fm1.or(fm2))
+            } else if t1 <= t2 {
+                find_xyz_to_camera(x, y, t1, t2, a, b, fm1, fm2)
+            } else {
+                find_xyz_to_camera(x, y, t2, t1, b, a, fm2, fm1)
+            }
+        }
+        (Some(a), None) | (None, Some(a)) => (a, fm1.or(fm2)),
+        (None, None) => return None,
+    };
+
+    let r = color_matrix[0][0] * xyz[0] + color_matrix[0][1] * xyz[1] + color_matrix[0][2] * xyz[2];
+    let g = color_matrix[1][0] * xyz[0] + color_matrix[1][1] * xyz[1] + color_matrix[1][2] * xyz[2];
+    let b = color_matrix[2][0] * xyz[0] + color_matrix[2][1] * xyz[1] + color_matrix[2][2] * xyz[2];
+    if !(r > 0.0 && g > 0.0 && b > 0.0) {
+        return None;
+    }
+
+    let render_matrix = match forward_matrix {
+        Some(fm) => mul3x3(XYZ_D50_TO_SRGB, fm),
+        None => {
+            let camera_to_xyz = invert3x3(color_matrix)?;
+            mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz)
+        }
+    };
+
+    Some(([r, g, b], render_matrix))
+}
+
 fn read_ascii(data: &[u8], _dtype: u16, cnt: u32, val: u32, inline_pos: usize) -> String {
     // Both branches use checked math + get(): a crafted IFD entry can place
     // inline_pos/val near EOF (or wrap p + cnt on 32-bit wasm) — return ""
@@ -2712,6 +2962,104 @@ mod tests {
     }
 
     #[test]
+    fn illuminant_to_temperature_matches_adobe_table() {
+        assert_eq!(illuminant_to_temperature(17), 2850.0); // StandardLightA
+        assert_eq!(illuminant_to_temperature(3), 2850.0); // Tungsten
+        assert_eq!(illuminant_to_temperature(21), 6500.0); // D65
+        assert_eq!(illuminant_to_temperature(23), 5000.0); // D50
+        assert_eq!(illuminant_to_temperature(0), 0.0); // Unknown
+        assert_eq!(illuminant_to_temperature(255), 0.0); // Other
+    }
+
+    #[test]
+    fn xy_to_cct_matches_standard_illuminant_definitions() {
+        // Nominal CIE xy for each illuminant; Robertson's method should land
+        // within a few Kelvin of the defining temperature.
+        let d65 = xy_to_cct(0.31271, 0.32902);
+        assert!((d65 - 6504.0).abs() < 5.0, "D65: {d65}");
+
+        let std_a = xy_to_cct(0.44757, 0.40745);
+        assert!((std_a - 2856.0).abs() < 5.0, "StandardLightA: {std_a}");
+
+        let d50 = xy_to_cct(0.34567, 0.35850);
+        assert!((d50 - 5003.0).abs() < 5.0, "D50: {d50}");
+    }
+
+    #[test]
+    fn find_xyz_to_camera_picks_cm1_at_or_below_t1() {
+        let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cm2 = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        // t1 set far above any CCT a real xy in this table can reach, so
+        // whatever xy_to_cct computes for Standard Light A's own xy (nominally
+        // 2850K, but the Robertson fit puts it at ~2856K — the two are close
+        // but not bit-identical) is guaranteed to clamp to g=1.0 here.
+        let (m, _) = find_xyz_to_camera(0.44757, 0.40745, 1_000_000.0, 1_000_001.0, cm1, cm2, None, None);
+        assert_matrix_close(m, cm1);
+    }
+
+    #[test]
+    fn find_xyz_to_camera_picks_cm2_at_or_above_t2() {
+        let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cm2 = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        // t1/t2 set far below any CCT a real xy in this table can reach (the
+        // table's own lowest is ~1667K), so D65's computed CCT clamps to g=0.0.
+        let (m, _) = find_xyz_to_camera(0.31271, 0.32902, 100.0, 101.0, cm1, cm2, None, None);
+        assert_matrix_close(m, cm2);
+    }
+
+    #[test]
+    fn find_xyz_to_camera_blends_strictly_between_the_two_illuminants() {
+        let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cm2 = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        // D50 sits between StandardLightA (2850K) and D65 (6500K).
+        let (m, _) = find_xyz_to_camera(0.34567, 0.35850, 2850.0, 6500.0, cm1, cm2, None, None);
+        assert!(
+            m[0][0] > 1.0 && m[0][0] < 2.0,
+            "expected a blend strictly between 1.0 and 2.0, got {}",
+            m[0][0]
+        );
+    }
+
+    #[test]
+    fn find_xyz_to_camera_forward_matrix_passthrough_when_only_one_present() {
+        let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let cm2 = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        let fwd = [[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.5]];
+        let (_, forward) =
+            find_xyz_to_camera(0.34567, 0.35850, 2850.0, 6500.0, cm1, cm2, Some(fwd), None);
+        assert_matrix_close(forward.expect("forward matrix"), fwd);
+    }
+
+    #[test]
+    fn resolve_from_white_xy_derives_a_plausible_neutral_and_matrix() {
+        let cm1 = [[1.2, -0.1, 0.0], [0.0, 1.1, 0.0], [0.0, 0.0, 1.3]];
+        let cm2 = [[0.9, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -0.1, 1.0]];
+        // D50-ish white point, between the two calibration illuminants.
+        let result = resolve_from_white_xy(
+            [0.34567, 0.35850],
+            Some(17), // StandardLightA
+            Some(21), // D65
+            Some(cm1),
+            Some(cm2),
+            None,
+            None,
+        );
+        let (neutral, matrix) = result.expect("plausible neutral");
+        assert!(neutral.iter().all(|&v| v > 0.0), "neutral: {neutral:?}");
+        // The render matrix is XYZ_D50_TO_SRGB composed with an inverted,
+        // CCT-blended color matrix — just check it produced *something*
+        // (not a degenerate all-zero matrix from a failed inversion).
+        assert!(matrix.iter().flatten().any(|&v| v.abs() > 1e-3), "{matrix:?}");
+    }
+
+    #[test]
+    fn resolve_from_white_xy_none_when_y_is_degenerate() {
+        let cm1 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(resolve_from_white_xy([0.3, 0.0], Some(17), Some(21), Some(cm1), None, None, None)
+            .is_none());
+    }
+
+    #[test]
     fn decode_uncompressed_tile_respects_big_endian() {
         let raw = RawIfd {
             bits_per_sample: 16,
@@ -2953,12 +3301,14 @@ pub(crate) fn decode_bytes_demosaiced_impl(
     let band_gains = demosaic::MhcGains::from_wb(wb_r, wb_g, wb_b);
     let black = raw.black_level.unwrap_or(0);
     let white = raw.white_level.unwrap_or(16383);
-    let color_matrix = choose_camera_to_srgb_matrix(
-        state.forward_matrix_1,
-        state.forward_matrix_2,
-        state.color_matrix_1,
-        state.color_matrix_2,
-    );
+    let color_matrix = state.resolved_color_matrix.or_else(|| {
+        choose_camera_to_srgb_matrix(
+            state.forward_matrix_1,
+            state.forward_matrix_2,
+            state.color_matrix_1,
+            state.color_matrix_2,
+        )
+    });
     // Color matrix (camera native -> sRGB via XYZ) is passed through to higher
     // LookRenderer for the advanced non-Riemannian / log geodesic / Molchanov
     // perceptual model (lens17). The demosaic stage (incl. optional mhc_matrix
