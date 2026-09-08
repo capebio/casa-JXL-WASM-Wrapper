@@ -582,6 +582,77 @@ impl<'a> NikonBits<'a> {
     }
 }
 
+/// A NEF that declares compression 34713 and carries **uncompressed packed
+/// samples**. `Some(plane)` when the strip is provably not a Huffman stream;
+/// `None` leaves the compressed path untouched.
+///
+/// **The Nikon D100 declares 34713 and then stores no compressed data at all.**
+/// Running the Huffman decoder over its packed samples produced a plane where
+/// 99.9896% of samples sat at 16383 and only 14 of 2024 rows carried any
+/// variation. Those live rows were *scattered* (946, 1639, 1660, ... 1998), not
+/// a prefix, which is what rules out "the decoder lost state after row N" and
+/// points at the payload not being a stream in the first place.
+///
+/// **The discriminator is structural, not a model string** — the same test
+/// dcraw makes in `nikon_is_compressed()`. The samples sit in 16-byte blocks of
+/// 15 data bytes plus one zero pad, so every 16th byte is zero; a Huffman
+/// stream fills that byte like any other. Keying on the bytes rather than on
+/// `model == "D100"` means a body nobody has a fixture for decodes for free,
+/// and a D100 that ever ships a real stream still takes the normal path.
+///
+/// Measured over the whole corpus, so the check is known to be capable of
+/// failing (00-COMMON invariant 3): on `12bit-compressed-other__D100.NEF` all
+/// 615,296 pad bytes are zero — every block, not a sampled prefix — while the
+/// three small-raw fixtures reach this test and are rejected by it loudly
+/// (D810 1,691,319 of 1,694,640 pad bytes nonzero; D4s DX 315,218 of 319,200;
+/// D4s FX 752,348 of 757,680). Every other 34713 fixture fails the shape tests
+/// above it and never reaches the pad scan.
+///
+/// The layout follows from the arithmetic once the padding is known: 4,864
+/// bytes per row is 304 blocks, 4,560 payload bytes, exactly 3,040 twelve-bit
+/// samples MSB-first with no slack, of which the declared 3,034 are kept.
+///
+/// **Verified per sample against LibRaw, not against a preview.** This
+/// unpacking reproduces `raw_image` over the full 2024 x 3037 visible frame
+/// with **0 of 6,146,888 samples differing**; LSB-first differs on 6,145,142 of
+/// them and correlates at -0.12. The last three columns the declared width
+/// drops are real image data (means 436.7 / 385.8 / 438.0, which is why LibRaw
+/// keeps them); columns 3037-3039 are the sensor's dark spares (means 0.8 /
+/// 190.6 / 191.7) and LibRaw crops those too.
+fn nikon_packed_in_disguise(
+    d: &[u8],
+    w: usize,
+    h: usize,
+    bits: u32,
+    off: usize,
+    len: usize,
+) -> Option<Vec<u16>> {
+    if h == 0 || len % h != 0 {
+        return None;
+    }
+    let row_bytes = len / h;
+    if row_bytes == 0 || row_bytes % 16 != 0 {
+        return None;
+    }
+    let strip = d.get(off..off + len)?;
+    // Every pad byte, not a prefix. dcraw samples because it is reading a file
+    // handle; we hold the slice, and a whole-strip test cannot be fooled by a
+    // stream that merely starts with zeros.
+    if strip.chunks_exact(16).any(|b| b[15] != 0) {
+        return None;
+    }
+    let per_row = row_bytes / 16 * 15 * 8 / bits as usize;
+    if per_row < w {
+        return None;
+    }
+    let mut raw = Vec::with_capacity(w * h);
+    for row in strip.chunks_exact(row_bytes) {
+        let payload: Vec<u8> = row.chunks_exact(16).flat_map(|b| b[..15].iter().copied()).collect();
+        raw.extend_from_slice(&unpack_msb(&payload, bits, per_row)[..w]);
+    }
+    (raw.len() == w * h).then_some(raw)
+}
+
 /// Nikon's compressed NEF (259 == 34713): a Huffman-coded DPCM over two
 /// vertical predictors, then a linearisation curve read from MakerNote 0x0096.
 ///
@@ -873,6 +944,25 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         // symbols out of nothing.
         if len == 0 || off.checked_add(len).map_or(true, |end| end > d.len()) {
             return Err("NEF: compressed strip length out of range".into());
+        }
+        // **The tag is the thing that is wrong, so it is caught before the
+        // decoder runs.** Decoding first and judging the output afterwards is
+        // exactly how this file archived a blank plane at exit 0.
+        if let Some(raw) = nikon_packed_in_disguise(d, w, h, bits, off, len) {
+            return Ok(BayerImage {
+                width: w,
+                height: h,
+                raw,
+                cfa_phase: (0, 0),
+                black: 0,
+                white: ((1u32 << bits) - 1).min(u16::MAX as u32) as u16,
+                wb_r: 2.0,
+                wb_g: 1.0,
+                wb_b: 1.5,
+                make: tag_str(&ifd0, 271),
+                model: tag_str(&ifd0, 272),
+                strip: off..off + len,
+            });
         }
         return nikon_compressed(d, &ifd0, w, h, bits, off, len, e);
     }
@@ -1356,5 +1446,121 @@ mod tests {
         d.extend_from_slice(&0u32.to_le_bytes());
         let e = decode_nef(&d).unwrap_err();
         assert!(e.contains("200 MP"), "want the cap error, got: {e}");
+    }
+
+    /// **A D100 declares compression 34713 and stores no compressed data.**
+    ///
+    /// Pinned against LibRaw per sample, not against "it stopped erroring". The
+    /// FNV-1a below is over the whole 2024 x 3034 plane as little-endian u16,
+    /// taken from `rawpy`'s `raw_image` (the full frame, because
+    /// `raw_image_visible` drops sensor margins that this reader keeps). Any
+    /// single sample moving changes it; the four spot values beside it exist so
+    /// that a failure says *where*.
+    ///
+    /// Before the fix this plane was 99.9896% pinned at 16383 with only 14 of
+    /// 2024 rows carrying any variation.
+    #[test]
+    fn a_d100_declares_compression_and_is_not_compressed() {
+        const F: &str = concat!(
+            r"C:\Foo\raw-converter\tests\NEF Raws\",
+            "12bit-compressed-other__D100.NEF"
+        );
+        let Ok(d) = std::fs::read(F) else {
+            eprintln!("skipped: {F} not present");
+            return;
+        };
+        let img = decode_nef(&d).expect("D100 decodes");
+        assert_eq!((img.width, img.height), (3034, 2024));
+        assert_eq!(img.white, 4095, "12-bit, and the reader once called it 14");
+
+        // Every row carries variation. The defect this replaces left 2010 of
+        // 2024 rows constant, so this assertion is the one that fails first if
+        // the packed path is ever bypassed again.
+        let flat = (0..img.height)
+            .filter(|&y| {
+                let r = &img.raw[y * img.width..(y + 1) * img.width];
+                r.iter().all(|&v| v == r[0])
+            })
+            .count();
+        assert_eq!(flat, 0, "{flat} of {} rows are constant", img.height);
+
+        // Spot values from LibRaw, so a hash mismatch is diagnosable.
+        assert_eq!(&img.raw[..8], &[386, 85, 182, 63, 221, 82, 208, 77]);
+        assert_eq!(&img.raw[1011 * 3034..1011 * 3034 + 4], &[531, 602, 329, 614]);
+        assert_eq!(*img.raw.iter().max().unwrap(), 3501);
+        assert_eq!(*img.raw.iter().min().unwrap(), 9);
+
+        // The whole plane, sample for sample.
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for v in &img.raw {
+            for b in v.to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(
+            h, 0xde21_bb64_c23a_9a3f,
+            "plane differs from the LibRaw reference"
+        );
+    }
+
+    /// **The discriminator must be able to say no**, or it is not a check.
+    ///
+    /// Two shapes it has to reject: a strip whose 16th bytes are not all zero
+    /// (a real Huffman stream), and one whose row length is not a multiple of
+    /// 16 (no block structure to read). The corpus supplies the first case for
+    /// real — the D810 and both D4s small-raw fixtures reach this test and are
+    /// rejected by it — but a unit test that carries its own counter-example
+    /// fails on a machine with no fixtures too.
+    #[test]
+    fn packed_in_disguise_rejects_a_stream_that_is_actually_compressed() {
+        // 2 rows x 32 bytes, pad bytes zero: accepted, and unpacks.
+        let mut good = vec![0u8; 64];
+        for (i, b) in good.iter_mut().enumerate() {
+            *b = if i % 16 == 15 { 0 } else { (i * 7 % 251) as u8 };
+        }
+        let per_row = 32 / 16 * 15 * 8 / 12; // 20 samples
+        assert!(nikon_packed_in_disguise(&good, per_row, 2, 12, 0, 64).is_some());
+
+        // One pad byte set, anywhere: refused.
+        for spoil in [15usize, 31, 47, 63] {
+            let mut bad = good.clone();
+            bad[spoil] = 1;
+            assert!(
+                nikon_packed_in_disguise(&bad, per_row, 2, 12, 0, 64).is_none(),
+                "a nonzero pad byte at {spoil} must send this to the Huffman path"
+            );
+        }
+
+        // Row length not a multiple of 16: refused rather than guessed at.
+        let odd = vec![0u8; 60];
+        assert!(nikon_packed_in_disguise(&odd, 4, 2, 12, 0, 60).is_none());
+
+        // A width the payload cannot fill: refused rather than padded.
+        assert!(nikon_packed_in_disguise(&good, per_row + 1, 2, 12, 0, 64).is_none());
+    }
+
+    /// A genuinely compressed sibling must keep taking the Huffman path.
+    ///
+    /// The new branch sits in front of `nikon_compressed`, so the failure mode
+    /// it could introduce is stealing files from it. The D70 is the closest
+    /// neighbour: same era, same declared compression, and it decodes
+    /// sample-exact against LibRaw today.
+    #[test]
+    fn the_packed_branch_does_not_steal_a_real_compressed_nef() {
+        const F: &str =
+            concat!(r"C:\Foo\raw-converter\tests\NEF Raws\", "12bit-lossy-type1__D70.NEF");
+        let Ok(d) = std::fs::read(F) else {
+            eprintln!("skipped: {F} not present");
+            return;
+        };
+        let img = decode_nef(&d).expect("D70 decodes");
+        assert_eq!((img.width, img.height), (3040, 2014));
+
+        let off = img.strip.start;
+        let len = img.strip.end - img.strip.start;
+        assert!(
+            nikon_packed_in_disguise(&d, img.width, img.height, 12, off, len).is_none(),
+            "the D70's strip is a Huffman stream and must not read as packed"
+        );
     }
 }
