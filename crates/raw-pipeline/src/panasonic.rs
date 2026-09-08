@@ -1022,6 +1022,29 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         declared_cfa_phase(&st).or_else(|| declared_cfa_phase(&ifd0)).unwrap_or((0, 0));
     let wb = nikon_wb(d).unwrap_or((2.0, 1.0, 1.5));
     if comp == 34713 {
+        // **Nikon reuses 34713 for High Efficiency, and an HE strip is not a
+        // Huffman-DPCM stream at all** — it is an intoPIX TicoRAW (JPEG XS)
+        // codestream, so it opens with the SOC marker `FF 10`.
+        //
+        // Measured before trusting the marker, because the lesson that started
+        // this thread is that 34713 itself turned out not to mean what it
+        // says. Over all 45 NEF/NRW files in the corpus, exactly 7 strips begin
+        // `FF 10` and all 7 are HE or HE* bodies (Z 50 II, Z 5 II, Z 6 III and
+        // four Z 9 HE/HE* files); the other 38 begin with 38 different byte
+        // pairs, none of them `FF 10`. In particular the D810 small-raw file
+        // that shares the linearisation-table refusal below begins `11 E1` and
+        // is NOT diverted here.
+        if len >= 2 && off + 2 <= d.len() && d[off] == 0xFF && d[off + 1] == 0x10 {
+            return crate::nikon_he::decode(
+                d,
+                off,
+                len,
+                w,
+                h,
+                tag_str(&ifd0, 271),
+                tag_str(&ifd0, 272),
+            );
+        }
         // dcraw's trees exist only for 12/14 bits; anything else would shift
         // out of range building `max` below.
         if bits != 12 && bits != 14 {
@@ -1376,17 +1399,25 @@ mod tests {
     /// real 0x0096. Version `0x49` skips 2110 bytes into it, i.e. past its end,
     /// and everything read after that is unrelated file content. Accepting it
     /// produced four files that decoded without error and were wrong.
+    ///
+    /// **The Z 6 III used to be the second case here and no longer is.** Its
+    /// strip really does begin with the JPEG XS SOC marker, so it is a High
+    /// Efficiency file that never reaches the curve check; the expectation, not
+    /// the routing, was the stale half. See
+    /// [`an_he_body_this_decoder_does_not_model_refuses_rather_than_overflowing`].
+    /// The D810's strip begins `11 E1`, not `FF 10`, so the HE route cannot take
+    /// it — and the "too small" the assertion below demands is the proof, since
+    /// only the curve check can produce that message.
     #[test]
     fn an_undersized_curve_blob_is_refused() {
-        for name in ["12bit-small-raw__D810", "8bit-compressed-other__Z6_3"] {
-            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
-            let Ok(d) = std::fs::read(&p) else {
-                eprintln!("skipped: {p} not present");
-                continue;
-            };
-            let e = decode_nef(&d).expect_err("must refuse rather than misread");
-            assert!(e.contains("too small"), "{name}: unhelpful refusal: {e}");
-        }
+        const NAME: &str = "12bit-small-raw__D810";
+        let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{NAME}.NEF");
+        let Ok(d) = std::fs::read(&p) else {
+            eprintln!("skipped: {p} not present");
+            return;
+        };
+        let e = decode_nef(&d).expect_err("must refuse rather than misread");
+        assert!(e.contains("too small"), "{NAME}: unhelpful refusal: {e}");
     }
 
     /// **The D1H splits its sensor across 407 strips.** Reading only the first

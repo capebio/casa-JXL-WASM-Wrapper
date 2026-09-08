@@ -1558,35 +1558,41 @@ fn load_dng(data: &[u8]) -> Result<(WalkState, RawIfd, bool)> {
         }
     }
     // Same gap, other direction: files with a real AsShotNeutral (so the WB
-    // gray-point is already right) but no ForwardMatrix at all — the render
-    // matrix still needs the CCT blend, just has to work backwards from the
-    // neutral to find which white xy it implies first (`neutral_to_xy`,
-    // Adobe's iterative `NeutralToXY`) before `find_xyz_to_camera` can weigh
-    // ColorMatrix1/2 by it. Confirmed this isn't theoretical: iPhone/ProRAW
-    // and GoPro GPR files in this shape have ColorMatrix1 vs ColorMatrix2
-    // entries differing by up to 0.34 — the same magnitude as the
-    // AsShotWhiteXY gap above, just masked because the WB itself is fine so
-    // nothing downstream of it (LibRaw's cam_mul, the gallery's tint metric)
-    // was in a position to catch a wrong RENDER matrix. Only fires when
-    // there's no forward matrix — a file with one already renders through
-    // choose_camera_to_srgb_matrix's ForwardMatrix2 path.
-    if state.resolved_color_matrix.is_none()
-        && state.forward_matrix_1.is_none()
-        && state.forward_matrix_2.is_none()
-    {
+    // gray-point is already right) — the render matrix still needs the CCT
+    // blend, just has to work backwards from the neutral to find which white
+    // xy it implies first (`neutral_to_xy`, Adobe's iterative `NeutralToXY`)
+    // before `find_xyz_to_camera` can weigh ColorMatrix1/2 (and, if both are
+    // present, ForwardMatrix1/2) by it. Originally gated to "no ForwardMatrix
+    // at all" (files where `choose_camera_to_srgb_matrix` had nothing better
+    // than a blind ColorMatrix2 pick to fall back on: iPhone/ProRAW, GoPro
+    // GPR). Generalized 2026-08-31 to the case that gate excluded — a real
+    // ForwardMatrix1 *and* ForwardMatrix2 both present — since
+    // `choose_camera_to_srgb_matrix`'s blind ForwardMatrix2 pick has the
+    // exact same defect: no CCT weighting, just always "2". Verified this is
+    // NOT theoretical for the one gallery file it touches (D80: CM1 vs CM2
+    // differ by up to 0.166, FM1 vs FM2 similarly) with a dedicated
+    // before/after comparison — see the gallery-colour handoff.
+    if state.resolved_color_matrix.is_none() {
         if let (Some(neutral), Some(cm1), Some(cm2)) =
             (state.as_shot_neutral, state.color_matrix_1, state.color_matrix_2)
         {
             let t1 = state.calibration_illuminant_1.map(illuminant_to_temperature).unwrap_or(0.0);
             let t2 = state.calibration_illuminant_2.map(illuminant_to_temperature).unwrap_or(0.0);
             if t1 > 0.0 && t2 > 0.0 && (t1 - t2).abs() > 1e-6 {
-                let (t_lo, t_hi, cm_lo, cm_hi) =
-                    if t1 <= t2 { (t1, t2, cm1, cm2) } else { (t2, t1, cm2, cm1) };
+                let (t_lo, t_hi, cm_lo, cm_hi, fm_lo, fm_hi) = if t1 <= t2 {
+                    (t1, t2, cm1, cm2, state.forward_matrix_1, state.forward_matrix_2)
+                } else {
+                    (t2, t1, cm2, cm1, state.forward_matrix_2, state.forward_matrix_1)
+                };
                 if let Some((x, y)) = neutral_to_xy(neutral, t_lo, t_hi, cm_lo, cm_hi) {
-                    let (color_matrix, _) =
-                        find_xyz_to_camera(x, y, t_lo, t_hi, cm_lo, cm_hi, None, None);
-                    if let Some(camera_to_xyz) = invert3x3(color_matrix) {
-                        state.resolved_color_matrix = Some(mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz));
+                    let (color_matrix, forward_matrix) =
+                        find_xyz_to_camera(x, y, t_lo, t_hi, cm_lo, cm_hi, fm_lo, fm_hi);
+                    let render_matrix = match forward_matrix {
+                        Some(fm) => Some(mul3x3(XYZ_D50_TO_SRGB, fm)),
+                        None => invert3x3(color_matrix).map(|c2x| mul3x3(XYZ_D50_TO_SRGB, c2x)),
+                    };
+                    if let Some(m) = render_matrix {
+                        state.resolved_color_matrix = Some(m);
                     }
                 }
             }
