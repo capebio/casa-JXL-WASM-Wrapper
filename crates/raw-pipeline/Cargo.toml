@@ -59,6 +59,16 @@ name = "casv_encode"
 path = "src/bin/casv_encode.rs"
 required-features = ["jxl-codec"]
 
+# These two import the optional `blizz` dep unconditionally, so they only
+# build with the feature that pulls it in.
+[[example]]
+name = "raw_archive"
+required-features = ["blink-bench"]
+
+[[example]]
+name = "orf_blink_bench"
+required-features = ["blink-bench"]
+
 [[example]]
 name = "orf_metric_bench"
 required-features = ["parallel"]
