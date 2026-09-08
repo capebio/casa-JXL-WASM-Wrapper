@@ -582,6 +582,104 @@ impl<'a> NikonBits<'a> {
     }
 }
 
+
+/// The camera's own white balance from Nikon MakerNote `0x000C`, if it is there.
+///
+/// **`wb_r: 2.0, wb_g: 1.0, wb_b: 1.5` was a placeholder at three sites and it
+/// is wrong by a lot.** Measured against the tag the files actually carry: a D3
+/// is 1.6875 / 1.4688, a D500 2.2988 / 1.8101, and a Z 6 **1.1914 / 2.1191** —
+/// where the hardcode claims 2.0 / 1.5, that last one is 68% out on red and 41%
+/// out on blue. Any renderer using these numbers produces a colour cast that
+/// looks like a decode fault and is a metadata fault, which is the same
+/// confusion `tools/gallery.py`'s grey-world first draft caused from the other
+/// direction.
+///
+/// `0x000C` is `WB_RBGGLevels`: four rationals in **R, B, G, G** order, already
+/// normalised so green is 1.0. Older bodies do not carry it — a D100 has 32
+/// MakerNote tags and none is `0x000C`, and a D1X has no signed MakerNote at all
+/// — so this returns `None` there and the caller keeps the documented default
+/// rather than inventing one.
+///
+/// The MakerNote is located exactly as the linearisation curve is, because it is
+/// the same IFD; see the two-shapes comment in [`nikon_compressed`].
+fn nikon_wb(d: &[u8]) -> Option<(f32, f32, f32)> {
+    let sig = d.windows(6).position(|x| x == b"Nikon\0")?;
+    let base = sig + 10;
+    if base + 8 > d.len() {
+        return None;
+    }
+    let me = End::of(&d[base..])?;
+    let mo = base + me.u32(&d[base + 4..]) as usize;
+    if mo + 2 > d.len() {
+        return None;
+    }
+    let n = me.u16(&d[mo..]) as usize;
+    if n > 512 || mo + 2 + n * 12 > d.len() {
+        return None;
+    }
+    for i in 0..n {
+        let e = mo + 2 + i * 12;
+        if me.u16(&d[e..]) != 0x000C {
+            continue;
+        }
+        // RATIONAL (5), four of them: 32 bytes, always out of line.
+        if me.u16(&d[e + 2..]) != 5 || me.u32(&d[e + 4..]) < 4 {
+            return None;
+        }
+        let p = base + me.u32(&d[e + 8..]) as usize;
+        if p + 32 > d.len() {
+            return None;
+        }
+        let q = |k: usize| -> Option<f32> {
+            let (num, den) = (me.u32(&d[p + k * 8..]), me.u32(&d[p + k * 8 + 4..]));
+            (den != 0).then(|| num as f32 / den as f32)
+        };
+        let (r, b) = (q(0)?, q(1)?);
+        // A zero or absurd multiplier is a misread, not a white balance. Refusing
+        // keeps the documented default rather than shipping a black frame.
+        return (r > 0.05 && r < 16.0 && b > 0.05 && b < 16.0).then_some((r, 1.0, b));
+    }
+    None
+}
+
+/// The red sample's `(x, y)` from a TIFF/EP `CFAPattern` (33422), if declared.
+///
+/// **Nikon is not all RGGB, and this reader assumed it was.** The comment on the
+/// NEF plane said "Nikon Bayer is RGGB on every model in this corpus" and the
+/// corpus disagrees: of 36 NEF/NRW fixtures, **27 declare RGGB, 4 declare BGGR,
+/// 4 GBRG and 1 GRBG**. BGGR against a hardcoded RGGB is a red/blue transposition
+/// in every consumer that demosaics; GBRG and GRBG are a one-sample shift, which
+/// is wrong in a subtler and equally unrecoverable way.
+///
+/// The tag is the camera's own statement about its sensor, so reading it beats
+/// any model table — and it was independently confirmed before being trusted:
+/// on the D100 the pattern measured from the embedded preview (GRBG) is the
+/// pattern the file declares (GRBG), and across the whole corpus measured and
+/// declared agree on 47 of 47 files that state one.
+///
+/// Values are 0=R, 1=G, 2=B, row-major over the 2x2 site. Some writers prefix
+/// the repeat dimensions as two shorts, which is why a 6+ byte value with a
+/// leading `2,0`/`0,2` has four bytes skipped. Mapping matches
+/// [`pana_cfa_phase`]: red at index `i` is `(i % 2, i / 2)`.
+fn declared_cfa_phase(m: &HashMap<u16, Entry>) -> Option<(u8, u8)> {
+    let e = m.get(&33422)?;
+    let mut v = e.val.as_slice();
+    if v.len() >= 6 && matches!(&v[..2], [2, 0] | [0, 2]) {
+        v = &v[4..];
+    }
+    if v.len() < 4 {
+        return None;
+    }
+    // A site with no red, or more than one, is not a Bayer pattern this
+    // understands — refuse rather than default, because defaulting is the bug.
+    let reds: Vec<usize> = (0..4).filter(|&i| v[i] == 0).collect();
+    match reds[..] {
+        [i] => Some(((i % 2) as u8, (i / 2) as u8)),
+        _ => None,
+    }
+}
+
+
 /// A NEF that declares compression 34713 and carries **uncompressed packed
 /// samples**. `Some(plane)` when the strip is provably not a Huffman stream;
 /// `None` leaves the compressed path untouched.
@@ -669,6 +767,9 @@ fn nikon_compressed(
     // The FILE's byte order. Needed only for the unsigned-MakerNote fallback,
     // whose offsets are file-relative; a signed MakerNote carries its own.
     e: End,
+    // Read from the sensor SubIFD's CFAPattern by the caller, which is the IFD
+    // that has it; this function only ever sees the MakerNote.
+    cfa_phase: (u8, u8),
 ) -> Result<BayerImage, String> {
     // **Nikon has written two MakerNote shapes and both appear in this corpus.**
     //
@@ -841,16 +942,19 @@ fn nikon_compressed(
         }
     }
 
+    // The camera's own multipliers where the body records them; the documented
+    // default only where it does not.
+    let wb = nikon_wb(d).unwrap_or((2.0, 1.0, 1.5));
     Ok(BayerImage {
         width: w,
         height: h,
         raw: out,
-        cfa_phase: (0, 0),
+        cfa_phase,
         black: 0,
         white: curve[max - 1],
-        wb_r: 2.0,
-        wb_g: 1.0,
-        wb_b: 1.5,
+        wb_r: wb.0,
+        wb_g: wb.1,
+        wb_b: wb.2,
         make: tag_str(_ifd0, 271),
         model: tag_str(_ifd0, 272),
         // Nikon declares the compressed strip length outright, so no cursor
@@ -911,6 +1015,12 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     let len = tag_u32(&st, 279).unwrap_or(0) as usize;
 
     check_dims(w, h, "NEF")?;
+    // **Declared, not assumed.** The sensor SubIFD carries CFAPattern on the
+    // bodies that are not RGGB; ifd0 is the fallback for writers that put it
+    // there. RGGB remains the default only for files that declare nothing.
+    let cfa_phase =
+        declared_cfa_phase(&st).or_else(|| declared_cfa_phase(&ifd0)).unwrap_or((0, 0));
+    let wb = nikon_wb(d).unwrap_or((2.0, 1.0, 1.5));
     if comp == 34713 {
         // dcraw's trees exist only for 12/14 bits; anything else would shift
         // out of range building `max` below.
@@ -933,18 +1043,18 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
                 width: w,
                 height: h,
                 raw,
-                cfa_phase: (0, 0),
+                cfa_phase,
                 black: 0,
                 white: ((1u32 << bits) - 1).min(u16::MAX as u32) as u16,
-                wb_r: 2.0,
-                wb_g: 1.0,
-                wb_b: 1.5,
+                wb_r: wb.0,
+                wb_g: wb.1,
+                wb_b: wb.2,
                 make: tag_str(&ifd0, 271),
                 model: tag_str(&ifd0, 272),
                 strip: off..off + len,
             });
         }
-        return nikon_compressed(d, &ifd0, w, h, bits, off, len, e);
+        return nikon_compressed(d, &ifd0, w, h, bits, off, len, e, cfa_phase);
     }
     if comp != 1 {
         return Err(format!("NEF: compression {} is not supported", comp));
@@ -1086,14 +1196,13 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         width: w,
         height: h,
         raw,
-        // Nikon Bayer is RGGB on every model in this corpus.
-        cfa_phase: (0, 0),
+        cfa_phase,
         black: 0,
         // `1u16 << 16` overflows; the widest legal white is u16::MAX.
         white: ((1u32 << bits) - 1).min(u16::MAX as u32) as u16,
-        wb_r: 2.0,
-        wb_g: 1.0,
-        wb_b: 1.5,
+        wb_r: wb.0,
+        wb_g: wb.1,
+        wb_b: wb.2,
         make: tag_str(&ifd0, 271),
         model: tag_str(&ifd0, 272),
         strip: strip_span,
@@ -1145,6 +1254,74 @@ mod tests {
         // whole plane is the pad -- not a truncated first pixel.
         assert_eq!(unpack_msb(&[0xff], 12, 3), vec![0, 0, 0]);
         assert_eq!(unpack_msb(&[0xff, 0xf0], 12, 3), vec![0xfff, 0, 0]);
+    }
+
+    /// **The white balance is the camera's, and the placeholder it replaced was
+    /// wrong by up to 68%.**
+    ///
+    /// `wb_r: 2.0, wb_g: 1.0, wb_b: 1.5` sat at three NEF construction sites and
+    /// was never read from a file. Against MakerNote `0x000C`: a D3 is
+    /// 1.6875/1.4688 and a Z 6 is **1.1914/2.1191**, so the placeholder overstated
+    /// the Z 6's red by 68% and understated its blue by 29%. Any renderer using
+    /// those numbers shows a cast that reads as a decode fault.
+    ///
+    /// The last case is the one that keeps the default honest: a D100 carries 32
+    /// MakerNote tags and none is `0x000C`, so it must fall back rather than
+    /// invent a value.
+    #[test]
+    fn the_white_balance_comes_from_the_file_where_the_file_has_one() {
+        for (name, want) in [
+            ("12bit-lossless__D3", Some((1.6875f32, 1.46875f32))),
+            ("12bit-compressed-other__Z_6", Some((1.1914063, 2.1191406))),
+            ("12bit-compressed-other__D100", None), // no 0x000C: documented default
+        ] {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            match want {
+                Some((r, bl)) => {
+                    assert!((b.wb_r - r).abs() < 1e-4, "{name}: wb_r {} want {r}", b.wb_r);
+                    assert!((b.wb_b - bl).abs() < 1e-4, "{name}: wb_b {} want {bl}", b.wb_b);
+                }
+                None => assert_eq!(
+                    (b.wb_r, b.wb_g, b.wb_b),
+                    (2.0, 1.0, 1.5),
+                    "{name} has no 0x000C and must keep the documented default"
+                ),
+            }
+            assert_eq!(b.wb_g, 1.0, "{name}: green is the reference and stays 1.0");
+        }
+    }
+
+    /// **Nikon is not all RGGB, and this reader used to say it was.**
+    ///
+    /// Of the NEF/NRW fixture set, 27 declare RGGB, 4 BGGR, 4 GBRG and 1 GRBG.
+    /// A BGGR plane handed over as RGGB is a red/blue transposition in every
+    /// consumer that demosaics it, and nothing downstream can detect it.
+    ///
+    /// Each expectation here is the value the FILE declares in CFAPattern, and
+    /// each was independently confirmed against the camera's own embedded
+    /// preview before being written down.
+    #[test]
+    fn the_cfa_phase_comes_from_the_file_not_from_an_assumption() {
+        // (fixture, declared pattern, red sample (x, y))
+        for (name, pat, want) in [
+            ("12bit-uncompressed__D1H", "BGGR", (1u8, 1u8)),
+            ("12bit-uncompressed__D2H", "GBRG", (0, 1)),
+            ("12bit-compressed-other__D100", "GRBG", (1, 0)),
+            ("12bit-lossless__D3", "RGGB", (0, 0)),
+        ] {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            assert_eq!(b.cfa_phase, want, "{name} declares {pat}");
+        }
     }
 
     /// **14-bit uncompressed is words, not packed bits.** Measured at exactly
