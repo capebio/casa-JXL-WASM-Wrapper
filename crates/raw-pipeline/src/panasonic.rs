@@ -1074,6 +1074,8 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
                 h,
                 tag_str(&ifd0, 271),
                 tag_str(&ifd0, 272),
+                cfa_phase,
+                wb,
             );
         }
         // dcraw's trees exist only for 12/14 bits; anything else would shift
@@ -1347,6 +1349,44 @@ mod tests {
                 ),
             }
             assert_eq!(b.wb_g, 1.0, "{name}: green is the reference and stays 1.0");
+        }
+    }
+
+    /// **The Nikon HE path used to carry its own hardcoded white balance.**
+    ///
+    /// `nikon_he::decode` built its `BayerImage` with `wb_r: 1.7051, wb_g: 1.0,
+    /// wb_b: 1.5449` — one file's as-shot values, `nikon_z9_he`'s, frozen into
+    /// the source. Every other HE body inherited them, which is the same defect
+    /// as the `2.0 / 1.0 / 1.5` placeholder this reader carried at three sites,
+    /// just narrower.
+    ///
+    /// The HE* files are the ones that expose it: they record **1.546875** where
+    /// the hardcode claims 1.544921875. The difference is small and that is
+    /// exactly why it survived — nothing downstream can see a 0.13% white
+    /// balance error, and nothing would see a large one either.
+    ///
+    /// This calls `nikon_wb` rather than `decode_nef` on purpose: an HE decode is
+    /// ~45 s a file, and what needs pinning is that the caller has a value to
+    /// pass, not the synthesis below it.
+    #[test]
+    fn the_he_bodies_have_their_own_white_balance_to_read() {
+        for (p, want_r, want_b) in [
+            (r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_hestar.NEF", 1.705078125f32, 1.546875f32),
+            (r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_he.NEF", 1.705078125, 1.544921875),
+        ] {
+            let Ok(d) = std::fs::read(p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let name = p.rsplit(std::path::MAIN_SEPARATOR).next().unwrap();
+            let wb = nikon_wb(&d).unwrap_or_else(|| panic!("{name} carries 0x000C"));
+            assert_eq!((wb.0, wb.1, wb.2), (want_r, 1.0, want_b), "{name}");
+        }
+        // The two must differ, or this test would pass against a hardcode.
+        let a = std::fs::read(r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_hestar.NEF");
+        let b = std::fs::read(r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_he.NEF");
+        if let (Ok(a), Ok(b)) = (a, b) {
+            assert_ne!(nikon_wb(&a), nikon_wb(&b), "HE and HE* must not share one value");
         }
     }
 

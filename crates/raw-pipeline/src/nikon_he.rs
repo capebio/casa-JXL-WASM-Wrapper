@@ -389,6 +389,11 @@ pub fn decode(
     h: usize,
     make: String,
     model: String,
+    // Both read from the file by `decode_nef`, which owns the sensor SubIFD and
+    // the MakerNote. This module used to hardcode them; see the construction at
+    // the end of this function for what that cost.
+    cfa_phase: (u8, u8),
+    wb: (f32, f32, f32),
 ) -> Result<BayerImage, String> {
     let end = off.checked_add(len).ok_or("NEF-HE: strip overflow")?;
     if end > d.len() {
@@ -595,15 +600,23 @@ pub fn decode(
         width: w,
         height: h,
         raw,
-        cfa_phase: (0, 0), // RGGB, red at origin
+        cfa_phase,
         black: 0,
         white,
-        // Accurate as-shot WB from NEF MakerNote tag 0x000C. NOTE: this experimental
-        // reconstruction is not in true sensor-raw balance (R≈g, B≈g), so a viewer applying
-        // this WB + a camera matrix casts magenta — correct pipeline, wrong-units input.
-        wb_r: 1.7051,
-        wb_g: 1.0,
-        wb_b: 1.5449,
+        // **These were hardcoded to 1.7051 / 1.0 / 1.5449 and they are one file's
+        // numbers.** That is the as-shot white balance of `nikon_z9_he`, read
+        // from its MakerNote 0x000C and then frozen into the source, so every
+        // other HE body silently inherited it: the Z 9 HE* files carry 1.546875
+        // where this claimed 1.544921875, and any future body could be as far out
+        // as the 68% the ordinary NEF path's placeholder was on a Z 6. The caller
+        // reads the tag; this takes what it read.
+        //
+        // NOTE, unchanged and still true: this experimental reconstruction is not
+        // in true sensor-raw balance (R≈g, B≈g), so a viewer applying this WB
+        // plus a camera matrix casts magenta — correct pipeline, wrong-units input.
+        wb_r: wb.0,
+        wb_g: wb.1,
+        wb_b: wb.2,
         make,
         model: format!("{model} [HE experimental]"),
         strip: off..end,
@@ -668,6 +681,11 @@ mod tests {
         assert_eq!(b.raw.len(), b.width * b.height);
         assert!(b.raw.iter().all(|&v| v != 0), "a blank plane is not a decode");
         assert_eq!(b.raw.iter().copied().max().unwrap(), 8008);
+        // From the file's MakerNote 0x000C, not from this module. The HE* sibling
+        // records 1.546875 for blue, which is what the old hardcode got wrong;
+        // `panasonic::tests::the_he_bodies_have_their_own_white_balance_to_read`
+        // pins that half without paying for a decode.
+        assert_eq!((b.wb_r, b.wb_g, b.wb_b), (1.705078125, 1.0, 1.544921875));
     }
 
     /// **`idwt` refuses instead of wrapping, and this is the check that can
