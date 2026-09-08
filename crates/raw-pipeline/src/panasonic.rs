@@ -883,9 +883,40 @@ fn nikon_compressed(
     let mut curve: Vec<u16> = (0..0x8000u32).map(|i| i as u16).collect();
     let csize = rd16(p) as usize;
     p += 2;
-    let step = if csize > 1 { max / (csize - 1) } else { 0 };
+    let mut step = if csize > 1 { max / (csize - 1) } else { 0 };
     let mut split = 0usize;
-    if ver0 == 0x44 && ver1 == 0x20 && step > 0 {
+    // **Version `0x44 0x40` is a quarter-scale interpolated curve, and reading
+    // it as a literal one silently loses the linearisation.**
+    //
+    // The `0x4440` shape stores the same 257 knots as `0x4420` but over a
+    // quarter of the range, so both `step` and `max` are divided by four before
+    // the interpolation. Without this arm it fell through to "read directly"
+    // below, which sets `max = csize` and copies 257 entries into a table left
+    // at its identity fill — so every sample above 256 came out as its own curve
+    // INDEX instead of the curve's value.
+    //
+    // Measured on `14bit-compressed-other__Z_6`, the one file in the corpus with
+    // this version: 15,146,739 of 24,498,560 samples differed from LibRaw, the
+    // plane maxed at 4092 where LibRaw reads 16371, and LibRaw's value was a
+    // pure monotone function of ours — 3,043 distinct values mapping one-to-one
+    // onto 3,043, identical below 1004 and diverging above. A perfect 1:1 map is
+    // what a missing lookup looks like; a broken decode does not produce one.
+    // Its siblings `Z_50` and `Z_f` are version `0x4630`, keep the identity
+    // curve, and were already exact, which is why this reads as body-specific.
+    if ver0 == 0x44 && (ver1 == 0x20 || ver1 == 0x40) && step > 0 {
+        if ver1 == 0x40 {
+            step /= 4;
+            max /= 4;
+        }
+        // `step` is the interpolation divisor below. dcraw tests it before the
+        // quarter-scaling and can therefore divide by zero on a crafted csize;
+        // refusing is cheaper than a panic and honest about what was unreadable.
+        if step == 0 {
+            return Err(format!(
+                "NEF: a {csize}-knot version {ver0:#04x}{ver1:02x} curve leaves no interpolation \
+                 step for {bits}-bit samples"
+            ));
+        }
         for i in 0..csize {
             curve[i * step] = rd16(p) as u16;
             p += 2;
@@ -1344,6 +1375,45 @@ mod tests {
             };
             let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
             assert_eq!(b.cfa_phase, want, "{name} declares {pat}");
+        }
+    }
+
+    /// **A version `0x4440` curve is quarter-scale, and reading it literally
+    /// threw the linearisation away.**
+    ///
+    /// `14bit-compressed-other__Z_6` is the only file in the corpus with this
+    /// version. Before the `ver1 == 0x40` arm it fell through to the
+    /// read-directly branch, which set `max = csize` and copied 257 entries into
+    /// a table still holding its identity fill, so every sample above 256 came
+    /// out as its own curve index: the plane maxed at **4092** where LibRaw
+    /// reads **16371**, and 15,146,739 of 24,498,560 samples differed. After the
+    /// fix, **0 of 24,498,560 differ**.
+    ///
+    /// The maximum is the cheap discriminator and the reason this test does not
+    /// need the oracle: a 14-bit body whose plane tops out just under 12 bits
+    /// has not been linearised. Its siblings `Z_50` and `Z_f` carry version
+    /// `0x4630`, keep the identity curve deliberately, and were exact all along
+    /// — so they are here to catch a fix that "corrects" them too.
+    #[test]
+    fn a_quarter_scale_curve_is_interpolated_not_read_literally() {
+        for (name, want_max, want_white) in [
+            ("14bit-compressed-other__Z_6", 16371u16, 16380u16),
+            ("14bit-compressed-other__Z_50", 16383, 16383),
+            ("14bit-compressed-other__Z_f", 8438, 16383),
+        ] {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            let mx = b.raw.iter().copied().max().unwrap();
+            assert_eq!(mx, want_max, "{name}: plane maximum");
+            assert_eq!(b.white, want_white, "{name}: white level");
+            assert!(
+                mx > 4096,
+                "{name} is a 14-bit body: a maximum inside 12 bits means no linearisation"
+            );
         }
     }
 
