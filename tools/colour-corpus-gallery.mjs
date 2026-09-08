@@ -50,7 +50,7 @@ const MIME = new Map([['.js', 'text/javascript'], ['.mjs', 'text/javascript'], [
 const OUT_FULL_RGB8 = 1;
 
 const PAGE = `<!doctype html><meta charset=utf8><body><script type=module>
-import initRaw, { process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, initThreadPool } from '/web/pkg/raw_converter_wasm.js';
+import initRaw, { process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags } from '/web/pkg/raw_converter_wasm.js';
 import { decodeWithLibRaw } from '/web/libraw-decode.js';
 const THUMB = ${THUMB};
 function rgbToThumb(rgb, w, h){
@@ -97,7 +97,7 @@ async function embeddedJpegB64(bytes){
     return cv.toDataURL('image/jpeg', 0.85);
   } finally { if (raw.dispose) raw.dispose(); }
 }
-window.__init = (async () => { await initRaw(); try { if (typeof initThreadPool==='function' && self.crossOriginIsolated) await Promise.race([initThreadPool(navigator.hardwareConcurrency), new Promise((_,rej)=>setTimeout(()=>rej(0),20000))]); } catch{} return 1; })();
+window.__init = (async () => { await initRaw(); return 1; })();
 window.__capture = async (path, kind, name) => {
   const out = { ours:null, lib:null, emb:null, ourRgbaB64:null, tw:0, th:0, err:null };
   const fetchBytes = async () => new Uint8Array((await (await fetch('/__img?p='+encodeURIComponent(path))).arrayBuffer()));

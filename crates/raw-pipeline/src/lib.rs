@@ -21,6 +21,7 @@ pub mod casv_container;
 pub mod cr2;
 /// Panasonic RW2, Leica RWL and uncompressed Nikon NEF/NRW.
 pub mod panasonic;
+pub mod nikon_he;
 pub mod decompress;
 pub mod demosaic;
 // FableBraid: braided-rANS + mod-256-predictor lossless codec (native + wasm).

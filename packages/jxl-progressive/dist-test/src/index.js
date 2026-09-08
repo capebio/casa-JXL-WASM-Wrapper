@@ -1,6 +1,8 @@
 // packages/jxl-progressive/src/index.ts
 // Manifest
-export { validateManifest, lookupTier, checkHash, migrateManifest, ManifestValidationError, ManifestStaleError, } from "./progressive-manifest.js";
+export { validateManifest, lookupTier, checkHash, migrateManifest, tierPixelDims, buildTiersFromOffsets, PROGRESSIVE_MANIFEST_VERSION, ManifestValidationError, ManifestStaleError, } from "./progressive-manifest.js";
+// S6: unified LOD/ROI resolver (one request language across progressive | pyramid | jxtc)
+export { resolveLod, toHttpRange, fromProgressiveManifest, fromPyramidLevels, fromJxtcContainer, LodResolveError, } from "./lod-resolver.js";
 // Saliency policy
 export { shouldUseSaliency, normaliseCenter, selectBestCenter, } from "./saliency-policy.js";
 // Profiler

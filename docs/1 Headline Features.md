@@ -692,3 +692,71 @@ several times faster at a fraction of the memory, with the WASM engine loaded on
 the main thread only if that path actually fires. The result is an identify flow
 fast enough to feel instant on ingested assets — and the groundwork for the
 point-camera-at-plant AR loop, whose budget is dominated by exactly this decode.
+
+---
+
+## 9. Blizz Lens Night (2026-08-13) — the overnight review that proved itself byte for byte
+
+*Provenance: branch `worktree-lens-review-2026-08-13` in the blizz repo; the full review is `HANDOFF-blizz-blink-lossy-video-pipeline-lens-review.md` beside this file; rejections in `1 rejected optimizations.md` (BLZ-R1..R3).*
+
+### Global motion finds 450-pixel pans for thousandths of the cost — because a frozen golden refused to move
+
+Blizz's global-motion estimator, ported from a codec whose motion vector was an
+`i8`, kept a search shape sized for ±127 px while the survey product routinely
+pans hundreds of pixels per frame: on exactly that footage its fallback swept an
+annulus of ~36 **billion** point operations per frame pair — roughly twenty
+times the cost of encoding the frame itself. The night's fix iterates a
+box-averaged pyramid instead: full search only at a level coarse enough to hold
+the whole range, ±3 refinement on the way down, and a new test recovers 200–450
+px pans *exactly* for a few thousand block comparisons, pan size no object.
+
+The story worth printing is the failure en route. The first pyramid replaced the
+old ±12 grid outright — and blizz's frozen BLNV P-frame golden, a synthetic pair
+nobody thought the estimator could touch, went red: the pin's gradient ramp is
+exactly self-similar under a mod-256 wrap, and the denoised pyramid *fairly*
+out-scored zero motion with an invented (−192, −224) vector on a static pair.
+The review's own verifier had argued the golden could not move. Nobody re-pinned
+it. The estimator was reshaped so the byte-preserved near grid decides everything
+it always decided and the pyramid runs only as escalation — better on real pans,
+identical on everything already pinned. A wire golden is an instrument; this one
+measured precisely the failure class it was built for, on the night it mattered.
+
+### The BLZL transform stage dropped its biggest intermediate — and two builds proved it, byte for byte
+
+BLZL, the lossy still arm that also paints blink's previews, carried three
+whole-image `f32` YCbCr planes on encode *and* decode — 12 bytes per pixel that
+the tree's own measurements put at 44% of a 453 MB peak on a 4K frame, plus a
+full extra DRAM round-trip in each direction, for what is ultimately a
+five-multiply per-pixel map. Both directions now fuse the colour transform into
+the block walks (the decoder additionally threading its reconstruction the way
+the encoder always did), with every floating-point expression kept term-for-term
+— down to preserving a `+128 − 128` round-trip whose "simplification" would
+move denormal-scale pixels.
+
+The proof is the house method, not the argument: a binary built from the
+pre-review merge head and one from the night's branch encode byte-identical
+`.blzl` and `.blnk` streams and decode byte-identical pixels in *both* cross
+directions — one A/B that simultaneously pins the fused transform, the
+still-encoder's extracted prelude, and the entropy-lane flush rewrite. Decoded
+BLZL pixels are the format's de facto conformance surface under its day-old
+freeze, which is exactly why the cheap decisive check ran before the commit did.
+
+### The archival promise got teeth: no panic, no clobber, no lying transcript
+
+A hostile-input sweep class that had caught real bugs on four decoders had never
+reached the two newest ones — and on its first structured pass the review found
+BLNV could be panicked four ways (a wraparound frame index, an extreme motion
+vector, an attacker-sized audio allocation, an overflowing subtitle timestamp).
+All four are refusals now, the never-panic property is pinned by new mutation
+sweeps over every section kind both containers can carry, and the deep forms
+enrolled themselves in the ship gate. The writers grew up to match: all four
+archival encoders publish through the export path's tested temp-and-rename
+transaction, so a failed verify or a mid-write crash leaves the previous good
+archive untouched instead of a corrupt file at its name.
+
+The gate itself stopped over-claiming: a red build no longer lets later stages
+print green byte-exact rows from stale binaries, the two feature-gated product
+surfaces (RAW ingest, export backends) are finally compiled by the gate that
+ships them, and `blv` joined the CLI contract with a `--version` that names its
+wire. Small pieces, one theme — the transcript an operator reads now means what
+it says.

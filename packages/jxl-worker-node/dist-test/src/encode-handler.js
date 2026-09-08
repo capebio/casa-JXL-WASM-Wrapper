@@ -103,6 +103,12 @@ export class EncodeHandler {
             ...(this.opts.progressiveAc != null ? { progressiveAc: this.opts.progressiveAc } : {}),
             ...(this.opts.qProgressiveAc != null ? { qProgressiveAc: this.opts.qProgressiveAc } : {}),
             ...(this.opts.groupOrder != null ? { groupOrder: this.opts.groupOrder } : {}),
+            // Advanced density knobs the facade honors directly (K6#2) — previously
+            // dropped here despite being on the wire.
+            ...(this.opts.modular != null ? { modular: this.opts.modular } : {}),
+            ...(this.opts.brotliEffort != null ? { brotliEffort: this.opts.brotliEffort } : {}),
+            ...(this.opts.decodingSpeed != null ? { decodingSpeed: this.opts.decodingSpeed } : {}),
+            ...(this.opts.photonNoiseIso != null ? { photonNoiseIso: this.opts.photonNoiseIso } : {}),
         };
         const encoder = codec.createEncoder(encOpts);
         this.encoder = encoder;
@@ -191,7 +197,11 @@ export class EncodeHandler {
     }
     async feedEncoder(encoder) {
         while (!this.cancelled && this.state !== "done" && !this.isErrored()) {
+            const wait0 = performance.now();
             await this.waitForPixels();
+            const waitMs = performance.now() - wait0;
+            // simple accum for profile (node already has ema for push)
+            // could postMetric("encode_wait_pixels_ms", waitMs) here if wanted per-wait
             while (this.pixelQueue.length > this.pixelReadIndex) {
                 const entry = this.takeNextPixels();
                 if (entry === null)
@@ -210,7 +220,10 @@ export class EncodeHandler {
                 if (this.cancelled || this.isErrored())
                     return;
                 this.state = "finalising";
+                const fin0 = performance.now();
                 await encoder.finish();
+                const finMs = performance.now() - fin0;
+                this.postMetric("encode_finish_ms", finMs);
                 return;
             }
         }

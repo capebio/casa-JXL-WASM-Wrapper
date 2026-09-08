@@ -341,18 +341,35 @@ struct Sos {
 }
 
 fn read_marker(src: &[u8], pos: &mut usize) -> Result<u8> {
-    while *pos + 1 < src.len() {
-        if src[*pos] == 0xFF {
-            let m = src[*pos + 1];
-            *pos += 2;
-            if m == 0x00 || m == 0xFF {
-                continue;
-            }
-            return Ok(m);
+    // FILL BYTES ARE SKIPPED ONE AT A TIME, NOT IN PAIRS.
+    //
+    // T.81 B.1.1.2 lets any number of 0xFF bytes precede a marker id. The
+    // previous loop consumed 0xFF 0xFF as a PAIR and continued, so a stream
+    // carrying a single fill byte before FFC4 --  -- had its marker
+    // id eaten: the second FF was read as a fill "marker", and C4 was then not
+    // 0xFF so the scan walked straight past the DHT. The decode failed later
+    // with "missing huffman table 0" while the table was present and valid.
+    //
+    // Found on Hasselblad 3FR, which writes fill bytes; Canon, Sony and Adobe
+    // streams do not, which is why this survived so long.
+    loop {
+        while *pos < src.len() && src[*pos] != 0xFF {
+            *pos += 1;
         }
+        while *pos < src.len() && src[*pos] == 0xFF {
+            *pos += 1;
+        }
+        if *pos >= src.len() {
+            bail!("ljpeg: unexpected EOF looking for marker");
+        }
+        let m = src[*pos];
         *pos += 1;
+        // 0x00 after 0xFF is a stuffed data byte, never a marker.
+        if m == 0x00 {
+            continue;
+        }
+        return Ok(m);
     }
-    bail!("ljpeg: unexpected EOF looking for marker");
 }
 
 fn read_u16_be(src: &[u8], pos: &mut usize) -> Result<u16> {

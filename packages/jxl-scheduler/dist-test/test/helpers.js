@@ -41,6 +41,7 @@ export function makeDecodeStart(sessionId, priority = "visible") {
         downsample: 1,
         progressionTarget: "final",
         emitEveryPass: true,
+        suppressDuplicateProgress: false,
         preserveIcc: true,
         preserveMetadata: true,
         priority,

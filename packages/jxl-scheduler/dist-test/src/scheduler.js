@@ -412,7 +412,20 @@ export class Scheduler {
                 this.workerPausedSession.set(record.pausedOnWorker.id, promotedTo);
             }
             else if (record.pending !== undefined && promotedRecord !== undefined) {
-                // Transfer queue position if still pending.
+                // Transfer queue position if still pending — but strip the CANCELLED
+                // caller's closures/signal first. (1) Reject the cancelled caller's
+                // acquireSlot promise now (mirror of the non-promotion queued branch
+                // below); otherwise drainQueue's pending.resolve() later looks up the
+                // DELETED old sessionId and resolves the cancelled caller with
+                // workerId -1 — a false success. (2) Drop the cancelled caller's
+                // AbortSignal: at drain time setupSignalAbort(promotedTo, signal) sees
+                // signal.aborted (the normal cancel-via-abort path) and would instantly
+                // cancel the still-wanted promoted session the moment it gets its
+                // worker. The subscriber's own signal was already wired at subscribe.
+                record.pending.reject(new Error("[jxl-scheduler] Session cancelled."));
+                record.pending.resolve = () => { };
+                record.pending.reject = () => { };
+                record.pending.signal = null;
                 promotedRecord.state = "queued";
                 promotedRecord.pending = record.pending;
                 promotedRecord.pending.sessionId = promotedTo;
@@ -546,7 +559,11 @@ export class Scheduler {
             return;
         bp.queueDepth = Math.max(0, bp.queueDepth - 1);
         // Dev-only invariant: queueDepth must never go negative (A3).
-        if (process.env.NODE_ENV !== "production" && bp.queueDepth < 0) {
+        // Guard `typeof process` — this runs in the browser too, where `process` is
+        // undefined and a bare `process.env` read throws ReferenceError on every drain
+        // (caught by the worker onmessage wrapper, losing the drain signal). Matches
+        // the guarded idiom already used in pool.ts / budget.ts / decode-session.ts.
+        if (typeof process !== "undefined" && process.env.NODE_ENV !== "production" && bp.queueDepth < 0) {
             throw new Error(`Scheduler invariant violated: queueDepth went negative (${bp.queueDepth}) for session ${sessionId}`);
         }
         const hwm = this.adaptiveHwm();
@@ -628,6 +645,21 @@ export class Scheduler {
             poolSpawning: this.pool.spawningCount,
         };
         return Object.freeze(snapshot);
+    }
+    /**
+     * Lightweight dashboard-facing stats snapshot.
+     * Read-only; no side effects; additive (no behavior change).
+     * Shape is stable across refactors — callers must not depend on internal field names.
+     */
+    getStats() {
+        return {
+            activeWorkers: this._runningCount,
+            idleWorkers: this.pool.idleCount,
+            queueDepth: this._queuedCount,
+            // _subscriberCount = fan-out dedupe subscriber sessions (non-worker-holding).
+            dedupeSize: this._subscriberCount,
+            draining: this.drainingQueue,
+        };
     }
     /**
      * Ensures a metric message's payload is decoupled before dispatch to any

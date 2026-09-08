@@ -22,8 +22,12 @@ describe("validateManifest", () => {
     it("throws on null", () => {
         assert.throws(() => validateManifest(null), ManifestValidationError);
     });
-    it("throws on wrong version", () => {
-        assert.throws(() => validateManifest({ ...validManifest, version: 2 }), (e) => e instanceof ManifestValidationError && e.field === "version");
+    it("accepts version 2 (S6 schema)", () => {
+        const m = validateManifest({ ...validManifest, version: 2 });
+        assert.equal(m.version, 2);
+    });
+    it("throws on a newer-than-reader version", () => {
+        assert.throws(() => validateManifest({ ...validManifest, version: 3 }), (e) => e instanceof ManifestValidationError && e.field === "version");
     });
     it("throws when tiers is empty", () => {
         assert.throws(() => validateManifest({ ...validManifest, tiers: [] }), (e) => e instanceof ManifestValidationError && e.field === "tiers");
@@ -84,8 +88,12 @@ describe("migrateManifest", () => {
         const m = migrateManifest(validManifest);
         assert.equal(m.version, 1);
     });
-    it("throws on version 2 (future, unsupported)", () => {
-        assert.throws(() => migrateManifest({ ...validManifest, version: 2 }), ManifestValidationError);
+    it("passes through version 2 (S6 schema)", () => {
+        const m = migrateManifest({ ...validManifest, version: 2 });
+        assert.equal(m.version, 2);
+    });
+    it("throws on a newer-than-reader version (future, unsupported)", () => {
+        assert.throws(() => migrateManifest({ ...validManifest, version: 3 }), ManifestValidationError);
     });
 });
 //# sourceMappingURL=manifest.test.js.map

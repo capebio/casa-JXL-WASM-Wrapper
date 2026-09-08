@@ -4,6 +4,25 @@ This document records optimizations proposed during pipeline reviews that were f
 
 ---
 
+## BLZ-R1 (C6): THUMB ladder — derive retry rungs from the 192-edge intermediate — PREMATURE, wire paperwork for an unobserved path (2026-08-13)
+
+**Target:** `blizz src/blink/encode.rs` thumb_record ladder (696-725) — each retry rung below 192 re-runs `box_filter` over the FULL-resolution planes (another O(3wh) pass, ~1.8 GB of reads at 604 MPx), when filtering the already-computed 192-edge planes would serve.
+**Observation verified line-for-line** (box_filter per rung at :714; preview adds an independent full pass at :589). The inefficiency is real.
+**Rejected because:** (1) the descent fires only when ICC/EXIF ≥ ~25 KB evicts the 192 rung on a >2 MPx image — no evidence this occurs in real workloads; the common path (one rung) and the preview double-pass are untouched by the fix. (2) Two-stage box filtering is not bit-identical to direct filtering (grid boundaries differ), so fallback thumb bytes move → WIRE-STABILITY entry + re-pin of the large-profile test (`a_large_profile_pushes_the_thumb_ladder_down`, mod.rs:1014-1069), and it weakens the documented "thumb is a real box filter of the source" invariant (WIRE-STABILITY.md:77, reference-pinned test mod.rs:189-204) — paperwork and invariant erosion for at most ~3 memory-bound passes on a path with no observed occurrence. **Disposition:** measure a real descent workload (SDE on a large-ICC 604 MPx encode) first; implement only if it fires in practice.
+
+## BLZ-R2 (C15): write_ppm16 per-sample interleave "hot-path twin" — FALSE (cold path; hot twin already fixed) (2026-08-13)
+
+**Target:** `blizz src/blink/io.rs:302-317` — triple-nested loop with per-sample `if bps == 2` branch; proposed specialised row kernels + avx2::interleave3, citing the loader-side precedent (~15 instr/sample measured and eliminated in load_ppm16, io.rs:221-224).
+**Rejected — the load-bearing claim is wrong.** write_ppm16 is NOT "the product output path for every 16-bit and PAM decode": the full-file deep decode (cli.rs:3680 → decode16_to_ppm, depth16.rs:1884) bypasses it entirely and already contains the proposed fix — specialised row kernels copy_out_rgb16/copy_out_gray16/copy_out_rgba (depth16.rs:1785-1829) with the branchy form only as an odd-channel fallback. write_ppm16's only product call site is the deep REGION-extract subcommand (cli.rs:3950) — a cold path dominated by entropy decode, where one predictable branch per sample is noise. Optimising it is unmeasured-hypothesis churn. Same instrument lesson as the panasonic.rs header: a call graph nobody has traced is a hypothesis.
+
+## BLZ-R3 (C42): nested poster-keyframe THUMB in BLNV — REVERSES A DAY-OLD DELIBERATE WIRE DECISION for a consumer that does not exist (2026-08-13)
+
+**Target:** `blizz src/blink/video.rs` / `encode.rs` — re-add ONE nested THUMB on the poster keyframe (~37 KB/clip) so a gallery of clips gets cheap first paint; taught to `blv extract --thumb`.
+**Observation verified:** no BLNV frame carries a THUMB (encode_frame strips it by design, encode.rs:884-900, pinned by `a_large_keyframe_carries_no_thumb`); poster paint costs keyframe + up-to-a-GOP decode.
+**Rejected because:** (1) the thumbless state is a deliberate, dated, documented decision — WIRE-STABILITY.md "Keyframes carry no per-frame THUMB — 2026-08-12", rationale recorded, one day old; (2) the gallery-of-clips consumer does not exist: PROGRESSIVE-DELIVERY.md never mentions BLNV, wasm/www serves stills only, and BLNV has no public prefix/stream_map surface at all (C38, deferred), so a nested poster THUMB would be unreachable by any remote client today; (3) the primary variant moves default-encode bytes for every ≥2 MPx clip (goldens re-pin + WIRE-STABILITY entry) for a speculative feature, and the opt-in variant is unused surface (YAGNI). **Disposition:** revisit as part of the BLNV read-surface design (C38) if the shelf UI becomes real, with explicit user sign-off since it amends a fresh documented decision.
+
+---
+
 ## CV-E6 / JE-6: default multi-threaded libjxl runner for JOLT streaming per-frame encode — MEASURED REGRESSION/WASH (2026-07-02)
 
 **Target:** `casa_video.rs` streaming encode (`encode_casv_video_streaming{,_to}`) — wire `StreamCtx` to a threaded `Encoder::with_threads` for P-frame crops/atlases + an `encode_chunked_threaded` for I-frames, default `available_parallelism()`.

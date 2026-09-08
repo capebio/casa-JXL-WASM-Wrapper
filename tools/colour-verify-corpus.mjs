@@ -9,8 +9,8 @@
 // plausibility, and a dark-decode (failure) signal. Writes JSON + Markdown.
 //
 // Loads the committed LibRaw web/pkg (so process_raw_mosaic_with_flags is present).
-// Threadpool init is raced against a 20s timeout (worker bootstrap can hang under
-// the static server); a timeout just falls back to single-thread — pixel-identical.
+// Verification also works with the scalar package. Threading is a performance
+// concern and is intentionally not required for these pixel comparisons.
 //
 // Usage: node tools/colour-verify-corpus.mjs
 
@@ -52,7 +52,7 @@ const MIME = new Map([['.js', 'text/javascript'], ['.mjs', 'text/javascript'], [
 
 const OUT_FULL_RGB8 = 1;
 const PAGE = `<!doctype html><meta charset=utf8><body><script type=module>
-import initRaw, { process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, rgb_to_rgba, initThreadPool } from '/web/pkg/raw_converter_wasm.js';
+import initRaw, { process_orf_with_flags, process_cr2_with_flags, process_dng_with_flags, process_raw_mosaic_with_flags, rgb_to_rgba } from '/web/pkg/raw_converter_wasm.js';
 import { decodeWithLibRaw } from '/web/libraw-decode.js';
 function meanRGB(rgb){ let r=0,g=0,b=0; const n=rgb.length/3; for(let i=0;i<rgb.length;i+=3){r+=rgb[i];g+=rgb[i+1];b+=rgb[i+2];} return {r:r/n,g:g/n,b:b/n}; }
 function fromRes(res){ const rgb=res.take_rgb(); const w=res.width,h=res.height; if(res.free) res.free(); return {mean:meanRGB(rgb), w, h}; }
@@ -65,9 +65,8 @@ async function decodeLibRaw(bytes, name){
 window.__init = (async () => {
   await initRaw();
   let tp='off';
-  if (typeof initThreadPool==='function' && self.crossOriginIsolated) {
-    try { await Promise.race([initThreadPool(navigator.hardwareConcurrency), new Promise((_,rej)=>setTimeout(()=>rej(new Error('t')),20000))]); tp='on'; } catch { tp='timeout'; }
-  }
+  // Scalar WASM builds do not export initThreadPool. Keep verification valid for
+  // both scalar packages and threaded packages; threading is a performance concern.
   return { crossOriginIsolated: self.crossOriginIsolated, tp };
 })();
 // LibRaw's own full sRGB render (camera WB + rgb_cam matrix + interpolation) = the

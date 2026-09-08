@@ -1,4 +1,61 @@
 // packages/jxl-progressive/src/progressive-manifest.ts
+/**
+ * S6 schema v2: the current manifest schema version. `validateManifest` accepts
+ * versions 1..=PROGRESSIVE_MANIFEST_VERSION and rejects anything newer (following the
+ * pyramid reader's "tolerate older, reject newer" pattern). v1 manifests parse unchanged
+ * — every v2 field is optional and default-filled on read.
+ */
+export const PROGRESSIVE_MANIFEST_VERSION = 2;
+/**
+ * K2: build progressive tiers directly from encoder-derived byte offsets — the
+ * exact progressive-pass boundaries of a SINGLE codestream (raw-pipeline's
+ * `progressive_tier_offsets` / `VariantSet.full_offsets`), instead of the old
+ * 4 KiB-granular re-decode profiler. `offsets` is strictly ascending with
+ * `offsets.at(-1) === jxlByteLength`. Always emits `dc` (offsets[0]) and `full`
+ * (the last offset); emits `preview` only when a distinct pass boundary at or below
+ * ~70% of the file exists strictly between them. Tiers are cumulative from byte 0
+ * (consumers `Range`-fetch `bytes=0-{byteEnd-1}`), so `byteStart` is always 0.
+ */
+export function buildTiersFromOffsets(offsets) {
+    if (offsets.length < 2) {
+        throw new Error(`progressive offsets need >=2 entries (dc + full), got ${offsets.length}`);
+    }
+    for (let i = 1; i < offsets.length; i++) {
+        if (offsets[i] <= offsets[i - 1]) {
+            throw new Error(`progressive offsets must be strictly ascending: ${JSON.stringify(offsets)}`);
+        }
+    }
+    const full = offsets[offsets.length - 1];
+    const dcEnd = offsets[0];
+    const tiers = [
+        { name: "dc", byteStart: 0, byteEnd: dcEnd, progressionIndex: 0, intendedUse: "thumbnail" },
+    ];
+    // preview = the last pass boundary at or below 70% of the file, strictly between
+    // dc and full (mirrors the re-decode profiler's preview selection).
+    const threshold = full * 0.7;
+    let previewIdx = -1;
+    for (let i = 1; i < offsets.length - 1; i++) {
+        if (offsets[i] <= threshold)
+            previewIdx = i;
+    }
+    if (previewIdx > 0 && offsets[previewIdx] > dcEnd && offsets[previewIdx] < full) {
+        tiers.push({
+            name: "preview",
+            byteStart: 0,
+            byteEnd: offsets[previewIdx],
+            progressionIndex: previewIdx,
+            intendedUse: "visible-card",
+        });
+    }
+    tiers.push({
+        name: "full",
+        byteStart: 0,
+        byteEnd: full,
+        progressionIndex: "final",
+        intendedUse: "zoom-export",
+    });
+    return tiers;
+}
 export class ManifestValidationError extends Error {
     field;
     constructor(message, field) {
@@ -22,7 +79,8 @@ const VALID_SCORE_METRICS = new Set(["ssim", "psnr", "butteraugli"]);
 export function validateManifest(json) {
     assertField(typeof json === "object" && json !== null, "root", "Manifest must be an object");
     const obj = json;
-    assertField(obj["version"] === 1, "version", "Manifest version must be 1");
+    // S6 v2: accept versions 1..=PROGRESSIVE_MANIFEST_VERSION; reject newer (unknown schema).
+    assertField(obj["version"] === 1 || obj["version"] === 2, "version", `Manifest version must be 1 or ${PROGRESSIVE_MANIFEST_VERSION}`);
     // source
     assertField(typeof obj["source"] === "object" && obj["source"] !== null, "source", "source must be an object");
     const src = obj["source"];
@@ -89,6 +147,15 @@ export function validateManifest(json) {
             assertField(typeof sc["value"] === "number" && Number.isFinite(sc["value"]), `${f}.score.value`, `${f}.score.value must be a finite number`);
             assertField(sc["reference"] === "final" || sc["reference"] === "source", `${f}.score.reference`, `${f}.score.reference must be "final" or "source"`);
         }
+        // S6 v2 (additive): per-tier intrinsic pixel dims. Validated only when present so v1
+        // tiers stay valid. Must be positive integers no larger than the source dims (a tier
+        // cannot reconstruct more detail than the source carries).
+        for (const dim of ["pixelWidth", "pixelHeight"]) {
+            if (t[dim] !== undefined) {
+                const cap = dim === "pixelWidth" ? src["width"] : src["height"];
+                assertField(typeof t[dim] === "number" && Number.isInteger(t[dim]) && t[dim] > 0 && t[dim] <= cap, `${f}.${dim}`, `${f}.${dim} must be a positive integer <= source.${dim === "pixelWidth" ? "width" : "height"} (${cap})`);
+            }
+        }
     }
     // Cross-tier: each tier name must appear at most once.
     const seenNames = new Set();
@@ -120,7 +187,28 @@ export function validateManifest(json) {
             }
         }
     }
+    // S6 v2 (additive): asset capabilities. Object of optional booleans; validated only when present.
+    if (obj["capabilities"] !== undefined) {
+        assertField(typeof obj["capabilities"] === "object" && obj["capabilities"] !== null && !Array.isArray(obj["capabilities"]), "capabilities", "capabilities must be an object if present");
+        const caps = obj["capabilities"];
+        for (const k of ["quality", "resolution", "region"]) {
+            if (caps[k] !== undefined) {
+                assertField(typeof caps[k] === "boolean", `capabilities.${k}`, `capabilities.${k} must be a boolean`);
+            }
+        }
+    }
     return json;
+}
+/**
+ * S6: the intrinsic pixel dims a tier reconstructs. Returns the tier's own v2
+ * `pixelWidth`/`pixelHeight` when present, else default-fills with the source dims (a v1
+ * manifest carries no per-tier resolution — the safe assumption is source resolution).
+ */
+export function tierPixelDims(manifest, tier) {
+    return {
+        width: tier.pixelWidth ?? manifest.source.width,
+        height: tier.pixelHeight ?? manifest.source.height,
+    };
 }
 export function lookupTier(manifest, name) {
     return manifest.tiers.find((t) => t.name === name);
@@ -149,8 +237,9 @@ export async function checkHash(manifest, jxlBytes) {
 export function migrateManifest(json) {
     if (typeof json === "object" && json !== null) {
         const v = json["version"];
-        if (typeof v === "number" && v > 1) {
-            throw new ManifestValidationError(`Cannot migrate manifest version ${v} (only version 1 supported)`, "version");
+        // S6 v2: accept 1..=PROGRESSIVE_MANIFEST_VERSION; a newer schema is unmigratable.
+        if (typeof v === "number" && v > PROGRESSIVE_MANIFEST_VERSION) {
+            throw new ManifestValidationError(`Cannot migrate manifest version ${v} (only versions 1..=${PROGRESSIVE_MANIFEST_VERSION} supported)`, "version");
         }
     }
     return validateManifest(json);

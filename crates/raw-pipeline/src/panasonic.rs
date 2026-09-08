@@ -841,6 +841,16 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
 
     check_dims(w, h, "NEF")?;
     if comp == 34713 {
+        // Nikon High Efficiency (HE / HE*) reuses compression tag 34713 but the
+        // strip is NOT Huffman-DPCM — it is a JPEG XS (intoPIX TicoRAW) codestream.
+        // Detect by the SOC marker `FF 10` and route to the HE decoder. Without
+        // this, HE files enter `nikon_compressed` and die at the 0x0096/0x008C
+        // linearisation-table sanity check with a misleading error.
+        if len >= 2 && off + 2 <= d.len() && d[off] == 0xFF && d[off + 1] == 0x10 {
+            return crate::nikon_he::decode(
+                d, off, len, w, h, tag_str(&ifd0, 271), tag_str(&ifd0, 272),
+            );
+        }
         // dcraw's trees exist only for 12/14 bits; anything else would shift
         // out of range building `max` below.
         if bits != 12 && bits != 14 {
