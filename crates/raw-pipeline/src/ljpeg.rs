@@ -612,8 +612,11 @@ impl LjpegPlan {
         let mut tables: [Option<Arc<HuffTable>>; MAX_COMPONENTS] = Default::default();
         for c in 0..cps {
             let id = sos.dht_id[c] as usize;
-            match &dhts[id] {
-                Some(t) if t.max_bits > 0 => {
+            // Bounds-check the DHT id from the (untrusted) scan header before indexing. A malformed
+            // SOS can carry an id past the table array; `dhts[id]` previously panicked with an
+            // out-of-bounds index (fuzz crash, ljpeg.rs:615). `.get()` bails gracefully instead.
+            match dhts.get(id) {
+                Some(Some(t)) if t.max_bits > 0 => {
                     if t.max_symbol > sof.precision {
                         bail!(
                             "ljpeg: category {} exceeds precision {}",

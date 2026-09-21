@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, extname, join, relative } from "node:path";
+import { basename, dirname, extname, join, relative } from "node:path";
 
 import {
   deriveFamilyIdFromArtifactName,
@@ -335,7 +335,10 @@ function formatNumber(value) {
 }
 
 function ensureParentDir(filePath) {
-  const dir = filePath.slice(0, Math.max(0, filePath.lastIndexOf("\\")));
+  // Cross-platform: use path.dirname, not a hardcoded "\\" separator. The old form broke on Linux CI —
+  // paths there use "/", so lastIndexOf("\\") returned -1 → dir="" → the backup dir was never created
+  // and copyFileSync ENOENT'd on the destination.
+  const dir = dirname(filePath);
   if (dir && !existsSync(dir)) mkdirSync(dir, { recursive: true });
 }
 

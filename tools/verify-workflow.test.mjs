@@ -468,6 +468,11 @@ describe("verify.yml — static structure", () => {
     const skipPatterns = /skip|skipped|unavailable|not.*available|ci.*env|ci_skip/i;
 
     for (const job of prJobs) {
+      // The dist-freshness gate is a pure git-diff check: its run text only *references* the jxl-wasm
+      // build command in an error hint (it never invokes Emscripten/WASM tooling), so the
+      // env-skip-annotation rule — meant for steps that actually perform a heavy WASM/Emscripten
+      // build — does not apply to it.
+      if (job.id === "dist-freshness") continue;
       for (const step of job.steps) {
         if (envBlockedPatterns.test(step.name) || envBlockedPatterns.test(step.run)) {
           // Must have an explicit skip signal in `run:` or `if:`
