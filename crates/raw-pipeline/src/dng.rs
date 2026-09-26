@@ -1438,10 +1438,20 @@ fn decode_jxl_segment(bytes: &[u8], cps: usize) -> Result<(Vec<u16>, u32, u32, b
             image.request_color_encoding(e);
         }
     }
-    let max = if xyb {
-        // libjxl scales an XYB stream's linear output by 255 / intensity_target
-        // (2040 -> 1/8). Checked against ImageMagick's libjxl 0.12, whose
-        // decode of that file has median 0.0353 = jxl-oxide's linear / 8.
+    let max = if hdr {
+        // After the PQ inverse below, 1.0 is the stream's intensity_target,
+        // which is libjxl's full scale: checked against ImageMagick's libjxl
+        // 0.12 on toucan.lossy-d2.00-3ev (target 2040): median 2315 both,
+        // and the clip pile [0.995, 1.0) / [1.0, 1.005) of the DNG white
+        // 188,987 / 154,591 here against 188,663 / 154,911. (Until 2026-09-26
+        // this also applied 255/target -- right for jxl-oxide's tone-mapped
+        // output, whose 1.0 is 255 nits, but 8x dark after the PQ route: the
+        // clipped sky sat at 0.125 of white, never clipped, and rendered
+        // lavender, GN86.)
+        65535.0
+    } else if xyb {
+        // No tone map at or below 255 nits; libjxl's linear output here is
+        // scaled by 255 / intensity_target (1.0 at the 255 default).
         65535.0 * 255.0 / target
     } else {
         ((1u32 << bits) - 1) as f32
