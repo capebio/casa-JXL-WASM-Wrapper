@@ -11,6 +11,10 @@ parallel = ["dep:rayon"]
 # jxl-codec: BSD-clean own-FFI JXL encode + decode (jxl-ffi crate). Native only.
 # Replaces the GPL jpegxl-rs / jpegxl-sys path entirely (encode + decode).
 jxl-codec = ["dep:jxl-ffi", "dep:half", "dep:rayon"]
+# jxl-pure: decode-only JPEG XL DNG (compression 52546) through pure-Rust
+# jxl-oxide. No cmake, no C toolchain, builds for wasm. Independent of
+# `jxl-codec`; when both are on, jxl-pure decodes DNG.
+jxl-pure = ["dep:jxl-oxide"]
 c-perceptual = []
 # mhc-simd128 (P3-T11, finding 21): opt-in wasm SIMD128 MHC interior demosaic kernel.
 # BIT-EXACT to scalar (proven by tests + wasm32 build), but OFF by default because the
@@ -37,6 +41,7 @@ anyhow = "1"
 # Deflate-compressed DNG (compression 8). Already in the tree via image/png —
 # same 0.8 line the lockfile pins, so an offline build resolves from cache.
 miniz_oxide = "0.8"
+jxl-oxide = { version = "0.12", default-features = false, optional = true }
 
 # BSD-clean own FFI (bindgen over external/libjxl headers). Native only — WASM
 # builds keep default-features = false and the JXL path stays on web/pkg + bridge.cpp.
@@ -168,6 +173,6 @@ name = "tile_admission_ab"
 required-features = ["jxl-codec"]
 
 [dev-dependencies]
-jxl-oxide = "0.11"
+jxl-oxide = "0.12"
 # golden-corpus hashing for the casa_video decode harnesses (examples only)
 sha2 = "0.10"

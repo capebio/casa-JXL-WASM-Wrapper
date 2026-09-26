@@ -351,11 +351,11 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool) -> Result<DngImage> {
         7 if use_blit => decode_tiles_blit(data, &raw, width, height, cps, &mut out)?,
         7 => decode_tiles(data, &raw, width, height, cps, &mut out)?,
         8 => decode_deflate(data, &raw, width, height, le, &mut out)?,
-        #[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+        #[cfg(any(all(feature = "jxl-codec", not(target_arch = "wasm32")), feature = "jxl-pure"))]
         52546 => jxl_lossy = Some(decode_jxl(data, &raw, width, height, cps, &mut out)?),
-        #[cfg(not(all(feature = "jxl-codec", not(target_arch = "wasm32"))))]
+        #[cfg(not(any(all(feature = "jxl-codec", not(target_arch = "wasm32")), feature = "jxl-pure")))]
         52546 => bail!(
-            "DNG compression 52546 (JPEG XL) needs the jxl-codec feature (native builds only)"
+            "DNG compression 52546 (JPEG XL) needs the jxl-codec or jxl-pure feature"
         ),
         c => bail!("DNG compression {c} not supported"),
     }
@@ -1281,7 +1281,7 @@ fn decode_deflate(
 /// Returns whether any segment's codestream is XYB-encoded (lossy) — the
 /// codestream's own word, carried up so an archiver can refuse lossy sources
 /// even when the container omits JXLDistance.
-#[cfg(all(feature = "jxl-codec", not(target_arch = "wasm32")))]
+#[cfg(any(all(feature = "jxl-codec", not(target_arch = "wasm32")), feature = "jxl-pure"))]
 fn decode_jxl(
     data: &[u8],
     raw: &RawIfd,
@@ -1290,12 +1290,9 @@ fn decode_jxl(
     cps: usize,
     out: &mut [u16],
 ) -> Result<bool> {
-    use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
-    let ch = match cps {
-        1 => Channels::Gray,
-        3 => Channels::Rgb,
-        c => bail!("JXL DNG: SamplesPerPixel {c} not supported"),
-    };
+    if !matches!(cps, 1 | 3) {
+        bail!("JXL DNG: SamplesPerPixel {cps} not supported");
+    }
     // Segment geometry: tiles when present, else strips (a strip = a full-width
     // band). Reuses the same offset arrays either way.
     struct Seg {
@@ -1375,15 +1372,7 @@ fn decode_jxl(
     // Decode each segment (parallel when available — one Decoder per task) into
     // a compact buffer, then blit its active rect. Correctness path; segment
     // decode dominates, the serial blit is a memcpy.
-    let decode_seg = |seg: &Seg| -> Result<(Vec<u16>, u32, u32, bool)> {
-        let mut dec = Decoder::new(DecodeOptions::default())
-            .ok_or_else(|| anyhow!("JXL DNG: decoder init failed"))?;
-        let mut buf: Vec<u16> = Vec::new();
-        let (dw, dh, meta) = dec
-            .decode_into_dims::<u16>(&data[seg.off..seg.end], ch, &mut buf)
-            .map_err(|e| anyhow!("JXL DNG: segment decode: {e}"))?;
-        Ok((buf, dw, dh, meta.xyb_encoded))
-    };
+    let decode_seg = |seg: &Seg| decode_jxl_segment(&data[seg.off..seg.end], cps);
     #[cfg(feature = "parallel")]
     let decoded: Vec<(Vec<u16>, u32, u32, bool)> = segs
         .par_iter()
@@ -1414,6 +1403,88 @@ fn decode_jxl(
         }
     }
     Ok(any_xyb)
+}
+
+/// One JXL codestream to `(samples, width, height, xyb_encoded)`.
+///
+/// **Backend: pure-Rust jxl-oxide when the `jxl-pure` feature is on, libjxl
+/// (own FFI, needs cmake) otherwise.** The pure path needs no C toolchain and
+/// builds for wasm. It returns each sample as `round(v * (2^bits - 1))` for an
+/// integer codestream, so the stored codes come back exactly; libjxl's UINT16
+/// output is full-range instead (see [`decode_jxl`]'s caveat). A lossy (XYB)
+/// stream has no integer codes and is scaled to the full 16-bit range.
+#[cfg(feature = "jxl-pure")]
+fn decode_jxl_segment(bytes: &[u8], cps: usize) -> Result<(Vec<u16>, u32, u32, bool)> {
+    let mut image = jxl_oxide::JxlImage::builder()
+        .read(std::io::Cursor::new(bytes))
+        .map_err(|e| anyhow!("JXL DNG: segment parse: {e}"))?;
+    let meta = &image.image_header().metadata;
+    let xyb = meta.xyb_encoded;
+    let target = meta.tone_mapping.intensity_target.max(1.0);
+    let bits = meta.bit_depth.bits_per_sample().clamp(1, 16);
+    // **jxl-oxide tone-maps (Rec. 2408) any stream whose intensity_target is
+    // above 255 nits into an SDR target**, which squashes the highlights and
+    // is not what libjxl's plain linear output does (toucan.lossy-d2.00-3ev
+    // declares 2040 = 8 x 255: its sky decoded at a fraction of white and
+    // rendered magenta). Asking for a PQ target skips the tone map (it only
+    // runs for a non-HDR target); PQ is inverted below to get the linear
+    // samples back.
+    let hdr = xyb && target > 255.0;
+    if hdr {
+        if let jxl_oxide::image::color::ColourEncoding::Enum(mut e) =
+            image.image_header().metadata.colour_encoding.clone()
+        {
+            e.tf = jxl_oxide::color::TransferFunction::Pq;
+            image.request_color_encoding(e);
+        }
+    }
+    let max = if xyb {
+        // libjxl scales an XYB stream's linear output by 255 / intensity_target
+        // (2040 -> 1/8). Checked against ImageMagick's libjxl 0.12, whose
+        // decode of that file has median 0.0353 = jxl-oxide's linear / 8.
+        65535.0 * 255.0 / target
+    } else {
+        ((1u32 << bits) - 1) as f32
+    };
+    let render = image
+        .render_frame(0)
+        .map_err(|e| anyhow!("JXL DNG: segment decode: {e}"))?;
+    let fb = render.image_all_channels();
+    let (w, h, c) = (fb.width(), fb.height(), fb.channels());
+    if c < cps {
+        bail!("JXL DNG: codestream has {c} channel(s), the IFD wants {cps}");
+    }
+    let lin = |v: f32| if hdr { pq_eotf(v) * 10000.0 / target } else { v };
+    let mut buf = Vec::with_capacity(w * h * cps);
+    for px in fb.buf().chunks_exact(c) {
+        buf.extend(px[..cps].iter().map(|&v| (lin(v) * max + 0.5).clamp(0.0, 65535.0) as u16));
+    }
+    Ok((buf, w as u32, h as u32, xyb))
+}
+
+/// SMPTE ST 2084 EOTF: PQ signal 0..1 -> luminance as a fraction of 10 000 nits.
+#[cfg(feature = "jxl-pure")]
+fn pq_eotf(e: f32) -> f32 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = 2523.0 / 4096.0 * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = 2413.0 / 4096.0 * 32.0;
+    const C3: f64 = 2392.0 / 4096.0 * 32.0;
+    let p = (e.max(0.0) as f64).powf(1.0 / M2);
+    (((p - C1).max(0.0) / (C2 - C3 * p)).powf(1.0 / M1)) as f32
+}
+
+#[cfg(all(feature = "jxl-codec", not(feature = "jxl-pure"), not(target_arch = "wasm32")))]
+fn decode_jxl_segment(bytes: &[u8], cps: usize) -> Result<(Vec<u16>, u32, u32, bool)> {
+    use crate::jxl_casadecoder::{Channels, DecodeOptions, Decoder};
+    let ch = if cps == 1 { Channels::Gray } else { Channels::Rgb };
+    let mut dec = Decoder::new(DecodeOptions::default())
+        .ok_or_else(|| anyhow!("JXL DNG: decoder init failed"))?;
+    let mut buf: Vec<u16> = Vec::new();
+    let (dw, dh, meta) = dec
+        .decode_into_dims::<u16>(bytes, ch, &mut buf)
+        .map_err(|e| anyhow!("JXL DNG: segment decode: {e}"))?;
+    Ok((buf, dw, dh, meta.xyb_encoded))
 }
 
 fn decode_uncompressed(
