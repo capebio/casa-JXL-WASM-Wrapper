@@ -713,7 +713,17 @@ fn nikon_compressed(
     p += 2;
     let step = if csize > 1 { max / (csize - 1) } else { 0 };
     let mut split = 0usize;
-    if ver0 == 0x44 && ver1 == 0x20 && step > 0 {
+    // Version 0x44 0x40 (14-bit, e.g. the Z 6's 14-bit compressed NEF) is
+    // LibRaw's addition, not dcraw's: the same interpolated curve at a quarter
+    // of the step and range (`nikon_read_curve`, `step /= 4; max /= 4`).
+    // Without it the curve stayed the identity and the plane was left in
+    // companded codes -- 62% of samples off LibRaw on that body (2026-09-27).
+    let (mut step, v40) = (step, ver0 == 0x44 && ver1 == 0x40);
+    if ver0 == 0x44 && (ver1 == 0x20 || (v40 && step > 3)) && step > 0 {
+        if v40 {
+            step /= 4;
+            max /= 4;
+        }
         for i in 0..csize {
             curve[i * step] = rd16(p) as u16;
             p += 2;
