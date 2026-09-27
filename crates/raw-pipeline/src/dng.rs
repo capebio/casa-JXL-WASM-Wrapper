@@ -985,6 +985,34 @@ fn decode_tiles_blit(
 /// source, or big-endian host) falls back to an explicit per-element decode so output stays
 /// byte-exact. `bytes.len()` must equal `dst.len() * 2` (callers guarantee this).
 #[inline]
+/// Bytes one row of `n` samples occupies. TIFF packs samples narrower than 16
+/// bits MSB-first, and every row starts on a byte boundary (dcraw
+/// `packed_dng_load_raw`: `getbits(-1)` resets the reader per row).
+fn row_bytes(n: usize, bps: u16) -> usize {
+    (n * bps as usize).div_ceil(8)
+}
+
+/// One row of an uncompressed DNG: 16-bit samples in the file's byte order, or
+/// 8-15-bit samples as an MSB-first bitstream (byte order does not apply to a
+/// bitstream). Casio EX-FH20 writes 12-bit packed DNG; before 2026-09-27 any
+/// bps but 16 was refused.
+fn fill_row(dst: &mut [u16], bytes: &[u8], le: bool, bps: u16) {
+    if bps == 16 {
+        return fill_u16_row(dst, bytes, le);
+    }
+    let (bps, mask) = (bps as u32, (1u32 << bps) - 1);
+    let (mut acc, mut nbits) = (0u32, 0u32);
+    let mut src = bytes.iter();
+    for o in dst.iter_mut() {
+        while nbits < bps {
+            acc = (acc << 8) | u32::from(*src.next().unwrap_or(&0));
+            nbits += 8;
+        }
+        nbits -= bps;
+        *o = ((acc >> nbits) & mask) as u16;
+    }
+}
+
 fn fill_u16_row(dst: &mut [u16], bytes: &[u8], le: bool) {
     #[cfg(target_endian = "little")]
     if le {
@@ -1036,7 +1064,7 @@ impl UncompressedLayout {
 /// Resolve the compression=1 layout (tiled vs strips) from the raw IFD, validating
 /// the same invariants the previous inline `decode_uncompressed` enforced.
 fn uncompressed_layout(raw: &RawIfd, width: usize, height: usize) -> Result<UncompressedLayout> {
-    if raw.bits_per_sample != 16 {
+    if !(8..=16).contains(&raw.bits_per_sample) {
         bail!("uncompressed DNG: bps {} unsupported", raw.bits_per_sample);
     }
     if !raw.tile_offsets.is_empty() {
@@ -1102,14 +1130,14 @@ fn decode_uncompressed_band(
                 let cw = col_end - col_start; // ≤ tw
                 let mut sp = 0usize;
                 for r in row_start..row_end {
-                    let need = cw * 2;
+                    let need = row_bytes(cw, raw.bits_per_sample);
                     if sp + need > src.len() {
                         bail!("uncompressed DNG: tile {idx} truncated");
                     }
                     let base = (r - band_first) * width + col_start;
-                    fill_u16_row(&mut band[base..base + cw], &src[sp..sp + need], le);
-                    // For valid tiles cw ≤ tw, so the row stride is tw*2.
-                    sp += tw * 2;
+                    fill_row(&mut band[base..base + cw], &src[sp..sp + need], le, raw.bits_per_sample);
+                    // For valid tiles cw ≤ tw, so the row stride is a full tile row.
+                    sp += row_bytes(tw, raw.bits_per_sample);
                 }
             }
             Ok(())
@@ -1131,7 +1159,7 @@ fn decode_uncompressed_band(
             let row_end = (band_first + rows_per_strip).min(height);
             // Per-row contiguous copy into the band. r*width+width can overflow on
             // hostile width; the band slice bound preserves the old get_mut guard.
-            let need = width * 2;
+            let need = row_bytes(width, raw.bits_per_sample);
             let mut sp = 0usize;
             for r in band_first..row_end {
                 if sp + need > src.len() {
@@ -1142,7 +1170,7 @@ fn decode_uncompressed_band(
                     .checked_add(width)
                     .and_then(|e| band.get_mut(base..e))
                     .ok_or_else(|| anyhow!("uncompressed DNG: strip {idx} dst OOB"))?;
-                fill_u16_row(dst, &src[sp..sp + need], le);
+                fill_row(dst, &src[sp..sp + need], le, raw.bits_per_sample);
                 sp += need;
             }
             Ok(())
@@ -1211,6 +1239,9 @@ fn decode_deflate(
         if p != 1 {
             bail!("deflate DNG: Predictor {p} not supported (only 1 = none)");
         }
+    }
+    if raw.bits_per_sample != 16 {
+        bail!("deflate DNG: bps {} unsupported (16 only)", raw.bits_per_sample);
     }
     let layout = uncompressed_layout(raw, width, height)?;
     let mut band_first = 0usize;
