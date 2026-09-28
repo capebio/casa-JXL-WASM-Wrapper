@@ -17,6 +17,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Global counter of container decodes (`decode_bytes` / `decode_bytes_inner`).
@@ -285,7 +286,7 @@ pub fn payload_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
 }
 
 pub fn decode_bytes(data: &[u8]) -> Result<DngImage> {
-    decode_bytes_inner(data, false, None)
+    decode_bytes_inner(data, false, None, None)
 }
 
 /// One JPEG XL tile/strip codestream -> `(samples, width, height, xyb)`, samples
@@ -299,7 +300,64 @@ pub type JxlSegmentFn<'a> =
 /// build's own backend: lets a caller pick libjxl natively, or hand in a
 /// separately loaded WASM libjxl in a browser. Non-JXL DNGs ignore `seg`.
 pub fn decode_bytes_with_jxl(data: &[u8], seg: JxlSegmentFn) -> Result<DngImage> {
-    decode_bytes_inner(data, false, Some(seg))
+    decode_bytes_inner(data, false, Some(seg), None)
+}
+
+/// A caller's parallel-for: run `task(i)` for every `i` in `0..n`, on any
+/// threads and in any order, and return once every call has finished.
+/// Handed to [`decode_bytes_with`] so an embedder runs the tile loops
+/// (LJPEG 7, deflate 8, JPEG XL 52546) on its own pool and thread count
+/// instead of rayon. Output does not depend on the order or thread count.
+pub type TileExecFn<'a> = &'a dyn Fn(usize, &(dyn Fn(usize) + Sync));
+
+/// [`decode_bytes`] with an optional JPEG XL tile decoder (see
+/// [`decode_bytes_with_jxl`]) and an optional tile executor. `exec: None`
+/// keeps the build's default: rayon under `parallel`, serial otherwise.
+pub fn decode_bytes_with(
+    data: &[u8],
+    seg: Option<JxlSegmentFn>,
+    exec: Option<TileExecFn>,
+) -> Result<DngImage> {
+    decode_bytes_inner(data, false, seg, exec)
+}
+
+/// Run `task` over `0..n` through `exec`, or the build's default.
+fn for_each_tile(exec: Option<TileExecFn>, n: usize, task: &(dyn Fn(usize) + Sync)) {
+    if let Some(exec) = exec {
+        return exec(n, task);
+    }
+    #[cfg(feature = "parallel")]
+    (0..n).into_par_iter().for_each(|i| task(i));
+    #[cfg(not(feature = "parallel"))]
+    (0..n).for_each(task);
+}
+
+/// `f(i, band_i)` over `out.chunks_mut(stride)` through [`for_each_tile`].
+/// Bands are disjoint, so each sits behind its own (uncontended) lock. The
+/// first error in band order wins, as in a serial loop; a band the executor
+/// never ran is an error, not silent zeros.
+fn for_each_band(
+    exec: Option<TileExecFn>,
+    out: &mut [u16],
+    stride: usize,
+    f: &(dyn Fn(usize, &mut [u16]) -> Result<()> + Sync),
+) -> Result<()> {
+    let bands: Vec<Mutex<(&mut [u16], Option<Result<()>>)>> =
+        out.chunks_mut(stride.max(1)).map(|b| Mutex::new((b, None))).collect();
+    for_each_tile(exec, bands.len(), &|i| {
+        let mut g = bands[i].lock().unwrap();
+        let (band, r) = &mut *g;
+        *r = Some(f(i, band));
+    });
+    bands
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap()
+                .1
+                .unwrap_or_else(|| Err(anyhow!("DNG: tile executor skipped a band")))
+        })
+        .collect()
 }
 
 /// Whether this DNG's raw image is JPEG XL-compressed (52546), i.e. whether a
@@ -314,10 +372,15 @@ pub fn uses_jxl(data: &[u8]) -> bool {
 /// real file for parity + timing; not part of the stable API.
 #[doc(hidden)]
 pub fn decode_bytes_blit(data: &[u8]) -> Result<DngImage> {
-    decode_bytes_inner(data, true, None)
+    decode_bytes_inner(data, true, None, None)
 }
 
-fn decode_bytes_inner(data: &[u8], use_blit: bool, seg: Option<JxlSegmentFn>) -> Result<DngImage> {
+fn decode_bytes_inner(
+    data: &[u8],
+    use_blit: bool,
+    seg: Option<JxlSegmentFn>,
+    exec: Option<TileExecFn>,
+) -> Result<DngImage> {
     // Count every container decode so the deferred-finish contract (decode the
     // container exactly once, then reuse the retained mosaic) is testable.
     DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -369,13 +432,13 @@ fn decode_bytes_inner(data: &[u8], use_blit: bool, seg: Option<JxlSegmentFn>) ->
     match raw.compression {
         1 => decode_uncompressed(data, &raw, width, height, le, &mut out)?,
         7 if use_blit => decode_tiles_blit(data, &raw, width, height, cps, &mut out)?,
-        7 => decode_tiles(data, &raw, width, height, cps, &mut out)?,
-        8 => decode_deflate(data, &raw, width, height, le, &mut out)?,
+        7 => decode_tiles(data, &raw, width, height, cps, &mut out, exec)?,
+        8 => decode_deflate(data, &raw, width, height, le, &mut out, exec)?,
         52546 => {
             let seg = seg.or(DEFAULT_JXL_SEGMENT).ok_or_else(|| {
                 anyhow!("DNG compression 52546 (JPEG XL) needs the jxl-codec or jxl-pure feature, or a decoder passed to decode_bytes_with_jxl")
             })?;
-            jxl_lossy = Some(decode_jxl(data, &raw, width, height, cps, &mut out, seg)?)
+            jxl_lossy = Some(decode_jxl(data, &raw, width, height, cps, &mut out, seg, exec)?)
         }
         c => bail!("DNG compression {c} not supported"),
     }
@@ -778,7 +841,7 @@ fn decode_band_into(
 /// Decode LJPEG tiles (compression=7) directly into the strided output mosaic,
 /// parallelised over **row-tile bands**.
 ///
-/// Each band is a disjoint, contiguous run of `out` rows (`par_chunks_mut`), so bands
+/// Each band is a disjoint, contiguous run of `out` rows ([`for_each_band`]), so bands
 /// can be decoded concurrently with no aliasing — and tiles *within* a band are decoded
 /// serially via the strided `ljpeg::decode_tile` (the same primitive the fused
 /// `decode_bytes_demosaiced` path uses), writing straight into their sub-rect of the band.
@@ -798,6 +861,7 @@ fn decode_tiles(
     height: usize,
     cps: usize,
     out: &mut [u16],
+    exec: Option<TileExecFn>,
 ) -> Result<()> {
     let tw = raw.tile_width.ok_or_else(|| anyhow!("missing TileWidth"))? as usize;
     let tl = raw
@@ -826,23 +890,10 @@ fn decode_tiles(
         decode_band_into(data, raw, width, height, cps, tw, tl, coltiles, tr, band)
     };
 
-    // par_chunks_mut(tl*width*cps) yields exactly `rowtiles` disjoint bands (the last
+    // chunks_mut(tl*width*cps) yields exactly `rowtiles` disjoint bands (the last
     // shorter when height isn't a multiple of tl); tl*width*cps ≤ 3*height*width ≤
     // 600 M samples (caller guard) so it cannot overflow usize on wasm32.
-    let band_stride = tl * width * cps;
-    #[cfg(feature = "parallel")]
-    {
-        out.par_chunks_mut(band_stride)
-            .enumerate()
-            .try_for_each(|(tr, band)| decode_band(tr, band))?;
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        for (tr, band) in out.chunks_mut(band_stride).enumerate() {
-            decode_band(tr, band)?;
-        }
-    }
-    Ok(())
+    for_each_band(exec, out, tl * width * cps, &decode_band)
 }
 
 /// Legacy LJPEG tile path: decode each tile into a private compact `Vec<u16>` (so tiles
@@ -1228,6 +1279,7 @@ fn decode_deflate(
     height: usize,
     le: bool,
     out: &mut [u16],
+    exec: Option<TileExecFn>,
 ) -> Result<()> {
     if raw.samples_per_pixel.max(1) != 1 {
         bail!(
@@ -1244,12 +1296,19 @@ fn decode_deflate(
         bail!("deflate DNG: bps {} unsupported (16 only)", raw.bits_per_sample);
     }
     let layout = uncompressed_layout(raw, width, height)?;
-    let mut band_first = 0usize;
-    while band_first < height {
-        let rows = layout.band_rows(band_first, height);
+    // One band = one strip or one tile row: a disjoint run of `out` rows.
+    // Clamped to `height` so a file-controlled strip/tile length cannot
+    // overflow the stride; one band then covers the image, as before.
+    let band_rows = match layout {
+        UncompressedLayout::Strips { rows_per_strip } => rows_per_strip,
+        UncompressedLayout::Tiled { tl, .. } => tl,
+    }
+    .min(height);
+    let decode_band = |i: usize, band: &mut [u16]| -> Result<()> {
+        let rows = band.len() / width;
         match layout {
-            UncompressedLayout::Strips { rows_per_strip } => {
-                let idx = band_first / rows_per_strip;
+            UncompressedLayout::Strips { .. } => {
+                let idx = i;
                 if idx >= raw.strip_offsets.len() || idx >= raw.strip_byte_counts.len() {
                     bail!("deflate DNG: strip {idx} index out of range");
                 }
@@ -1270,17 +1329,16 @@ fn decode_deflate(
                         rows
                     );
                 }
-                let base = band_first * width;
                 for r in 0..rows {
                     fill_u16_row(
-                        &mut out[base + r * width..base + (r + 1) * width],
+                        &mut band[r * width..(r + 1) * width],
                         &bytes[r * width * 2..(r + 1) * width * 2],
                         le,
                     );
                 }
             }
             UncompressedLayout::Tiled { tw, tl, coltiles } => {
-                let tr = band_first / tl;
+                let tr = i;
                 for tc in 0..coltiles {
                     let idx = tr * coltiles + tc;
                     if idx >= raw.tile_offsets.len() || idx >= raw.tile_byte_counts.len() {
@@ -1304,9 +1362,9 @@ fn decode_deflate(
                     let col_start = tc * tw;
                     let cw = ((tc + 1) * tw).min(width) - col_start;
                     for r in 0..rows {
-                        let dst = (band_first + r) * width + col_start;
+                        let dst = r * width + col_start;
                         fill_u16_row(
-                            &mut out[dst..dst + cw],
+                            &mut band[dst..dst + cw],
                             &bytes[r * tw * 2..r * tw * 2 + cw * 2],
                             le,
                         );
@@ -1314,9 +1372,9 @@ fn decode_deflate(
                 }
             }
         }
-        band_first += rows;
-    }
-    Ok(())
+        Ok(())
+    };
+    for_each_band(exec, out, band_rows * width, &decode_band)
 }
 
 /// JPEG XL-compressed DNG (compression 52546, DNG 1.7): each tile/strip is an
@@ -1340,6 +1398,7 @@ fn decode_jxl(
     cps: usize,
     out: &mut [u16],
     seg: JxlSegmentFn,
+    exec: Option<TileExecFn>,
 ) -> Result<bool> {
     if !matches!(cps, 1 | 3) {
         bail!("JXL DNG: SamplesPerPixel {cps} not supported");
@@ -1420,18 +1479,24 @@ fn decode_jxl(
         }
     }
 
-    // Decode each segment (parallel when available — one Decoder per task) into
-    // a compact buffer, then blit its active rect. Correctness path; segment
-    // decode dominates, the serial blit is a memcpy.
-    let decode_seg = |s: &Seg| seg(&data[s.off..s.end], cps).map_err(|e| anyhow!(e));
-    #[cfg(feature = "parallel")]
-    let decoded: Vec<(Vec<u16>, u32, u32, bool)> = segs
-        .par_iter()
-        .map(decode_seg)
+    // Decode each segment (through the tile executor — one Decoder per task)
+    // into a compact buffer, then blit its active rect. Correctness path;
+    // segment decode dominates, the serial blit is a memcpy.
+    type Decoded = (Vec<u16>, u32, u32, bool);
+    let slots: Vec<Mutex<Option<Result<Decoded>>>> = segs.iter().map(|_| Mutex::new(None)).collect();
+    for_each_tile(exec, segs.len(), &|i| {
+        let s = &segs[i];
+        let r = seg(&data[s.off..s.end], cps).map_err(|e| anyhow!(e));
+        *slots[i].lock().unwrap() = Some(r);
+    });
+    let decoded: Vec<Decoded> = slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap()
+                .unwrap_or_else(|| Err(anyhow!("JXL DNG: tile executor skipped a segment")))
+        })
         .collect::<Result<Vec<_>>>()?;
-    #[cfg(not(feature = "parallel"))]
-    let decoded: Vec<(Vec<u16>, u32, u32, bool)> =
-        segs.iter().map(decode_seg).collect::<Result<Vec<_>>>()?;
     let any_xyb = decoded.iter().any(|d| d.3);
 
     for (seg, (buf, dw, dh, _xyb)) in segs.iter().zip(decoded.iter()) {
@@ -3076,6 +3141,50 @@ mod tests {
         // payload_ranges: exactly the strip
         let r = payload_ranges(&dng).expect("ranges");
         assert_eq!(r, vec![(off as usize, off as usize + strip.len())]);
+    }
+
+    /// The tile executor owns the tile loop: tasks run in any order give the
+    /// serial plane, and a band it never runs is an error, not zeros.
+    #[test]
+    fn tile_executor_is_order_free_and_a_skip_is_an_error() {
+        let samples: Vec<u16> = (0u16..16).map(|v| v * 1000 + 7).collect();
+        // Four deflate strips of one row each: four bands.
+        let strips: Vec<Vec<u8>> = samples
+            .chunks(4)
+            .map(|row| {
+                let b: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+                miniz_oxide::deflate::compress_to_vec_zlib(&b, 6)
+            })
+            .collect();
+        let base = payload_off(8);
+        let (mut payload, mut counts, mut at) = (Vec::new(), Vec::new(), base + 32);
+        for s in &strips {
+            payload.extend_from_slice(&at.to_le_bytes());
+            counts.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            at += s.len() as u32;
+        }
+        payload.extend_from_slice(&counts);
+        for s in &strips {
+            payload.extend_from_slice(s);
+        }
+        let entries = [
+            (0x00FE_u16, 4_u16, 1_u32, 0_u32),
+            (0x0100, 4, 1, 4),
+            (0x0101, 4, 1, 4),
+            (0x0102, 3, 1, 16),
+            (0x0103, 3, 1, 8),         // deflate
+            (0x0111, 4, 4, base),      // strip offsets -> array
+            (0x0116, 4, 1, 1),         // rows per strip
+            (0x0117, 4, 4, base + 16), // strip byte counts -> array
+        ];
+        let dng = build_tiff_le(&entries, &payload);
+        assert_eq!(decode_bytes(&dng).expect("default").raw, samples);
+        let reverse = |n: usize, task: &(dyn Fn(usize) + Sync)| (0..n).rev().for_each(task);
+        let img = decode_bytes_with(&dng, None, Some(&reverse)).expect("reverse order");
+        assert_eq!(img.raw, samples);
+        let skip_last = |n: usize, task: &(dyn Fn(usize) + Sync)| (0..n - 1).for_each(task);
+        let e = decode_bytes_with(&dng, None, Some(&skip_last)).err().expect("skip").to_string();
+        assert!(e.contains("skipped"), "got: {e}");
     }
 
     #[test]
