@@ -792,8 +792,8 @@ impl crate::decompress::RawRowSource for DngRowSource<'_> {
 }
 
 /// Decode one row-tile band `tr` (comp=7 LJPEG tiles) into `band` (len == active_h*width,
-/// rows [tr*tl, min((tr+1)*tl, height))). Shared by `decode_tiles` (parallel full-frame
-/// blit) and the streaming `DngRowSource`. Byte-identical to the previous inline closure.
+/// rows [tr*tl, min((tr+1)*tl, height))), for the streaming `DngRowSource`.
+/// Byte-identical to `decode_tiles`.
 fn decode_band_into(
     data: &[u8],
     raw: &RawIfd,
@@ -838,22 +838,18 @@ fn decode_band_into(
     Ok(())
 }
 
-/// Decode LJPEG tiles (compression=7) directly into the strided output mosaic,
-/// parallelised over **row-tile bands**.
+/// Decode LJPEG tiles (compression=7) into the strided output mosaic, one
+/// [`for_each_tile`] task per **tile**.
 ///
-/// Each band is a disjoint, contiguous run of `out` rows ([`for_each_band`]), so bands
-/// can be decoded concurrently with no aliasing — and tiles *within* a band are decoded
-/// serially via the strided `ljpeg::decode_tile` (the same primitive the fused
-/// `decode_bytes_demosaiced` path uses), writing straight into their sub-rect of the band.
+/// Each row-tile band is a disjoint, contiguous run of `out` rows behind its own lock. A
+/// tile that finds its band free decodes straight into its sub-rect via the strided
+/// `ljpeg::decode_tile`; one that finds it busy decodes into a compact buffer and copies
+/// it in under the lock. Serially every tile takes the direct path.
 ///
-/// This replaces `decode_tiles_blit`'s per-tile scratch `Vec` + single-threaded serial
-/// blit (measured ~34% of `decode_bytes` wall time: 165 allocations + a full-image copy
-/// that ran *after* all parallel decode finished — pure Amdahl serialization). Output is
-/// byte-identical to the blit path (proven by `examples/dng_tiles_direct_flip.rs`).
-///
-/// Parallelism granularity drops from `coltiles*rowtiles` independent tasks to `rowtiles`
-/// bands; for real DNGs `rowtiles` comfortably exceeds the core count, and removing the
-/// serial blit + allocations more than compensates (see the flip example's numbers).
+/// Band-sized tasks (the previous shape) capped the parallelism at `rowtiles`, which is
+/// 6 on a 48-tile Apple ProRAW. `decode_tiles_blit`'s per-tile scratch + single-threaded
+/// serial blit (measured ~34% of `decode_bytes` wall time) stays avoided: only contended
+/// tiles copy, and they copy in parallel.
 fn decode_tiles(
     data: &[u8],
     raw: &RawIfd,
@@ -883,17 +879,54 @@ fn decode_tiles(
             raw.tile_byte_counts.len()
         );
     }
-    // One row-tile band (tr) decoded into its slice of `out`. `band` covers rows
-    // [tr*tl, row_end) at full `width*cps` sample stride, so a tile at column tc
-    // writes its active sub-rect at base = col_start*cps (row 0 of the band).
-    let decode_band = |tr: usize, band: &mut [u16]| -> Result<()> {
-        decode_band_into(data, raw, width, height, cps, tw, tl, coltiles, tr, band)
-    };
-
     // chunks_mut(tl*width*cps) yields exactly `rowtiles` disjoint bands (the last
     // shorter when height isn't a multiple of tl); tl*width*cps ≤ 3*height*width ≤
     // 600 M samples (caller guard) so it cannot overflow usize on wasm32.
-    for_each_band(exec, out, tl * width * cps, &decode_band)
+    let stride = width * cps;
+    let bands: Vec<Mutex<&mut [u16]>> = out.chunks_mut(tl * stride).map(Mutex::new).collect();
+    let results: Vec<Mutex<Option<Result<()>>>> = (0..expected).map(|_| Mutex::new(None)).collect();
+
+    // One task per TILE, not per band: a band is only `coltiles` wide, so
+    // band units cap the parallelism at `rowtiles` (6 on a 48-tile ProRAW).
+    // A tile whose band is free decodes straight into it at base
+    // col_start*cps (the serial arm always takes this path, so it does
+    // exactly the old work). A tile whose band is busy decodes into a compact
+    // buffer and holds the band lock only for the row copy.
+    let decode_one = |idx: usize| -> Result<()> {
+        let (tr, tc) = (idx / coltiles, idx % coltiles);
+        let off = raw.tile_offsets[idx] as usize;
+        let end = off
+            .checked_add(raw.tile_byte_counts[idx] as usize)
+            .ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let src = data.get(off..end).ok_or_else(|| anyhow!("tile {idx} OOB"))?;
+        let col_start = tc * tw;
+        let aw = ((tc + 1) * tw).min(width) - col_start;
+        let ah = ((tr + 1) * tl).min(height) - tr * tl;
+        let (base, row) = (col_start * cps, aw * cps);
+        match bands[tr].try_lock() {
+            Ok(mut band) => ljpeg::decode_tile(src, &mut band, base, stride, row, ah),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let mut buf = vec![0u16; row * ah];
+                ljpeg::decode_tile(src, &mut buf, 0, row, row, ah)?;
+                let mut band = bands[tr].lock().unwrap();
+                for (r, s) in buf.chunks_exact(row).enumerate() {
+                    band[r * stride + base..][..row].copy_from_slice(s);
+                }
+                Ok(())
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("DNG band lock poisoned: {e}"),
+        }
+        .with_context(|| format!("tile r={tr} c={tc}"))
+    };
+    for_each_tile(exec, expected, &|idx| *results[idx].lock().unwrap() = Some(decode_one(idx)));
+    results
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap()
+                .unwrap_or_else(|| Err(anyhow!("DNG: tile executor skipped a tile")))
+        })
+        .collect()
 }
 
 /// Legacy LJPEG tile path: decode each tile into a private compact `Vec<u16>` (so tiles
