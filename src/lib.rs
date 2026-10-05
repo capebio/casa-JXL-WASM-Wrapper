@@ -3828,6 +3828,57 @@ mod tests {
         }
         eprintln!("ProRAW fixtures rendered: {ran}");
     }
+
+    /// A Bayer DNG's live LookRenderer (neutral look, decode's WB) renders at the
+    /// same exposure as the decode itself: the DNG BaselineExposure must reach it
+    /// through `baseline_ev_used`. The Pixel NIGHT fixture carries ≈ +1.5 EV.
+    #[test]
+    fn bayer_dng_look_renderer_matches_decode_exposure() {
+        let Some(data) = ["C:/Foo/raw-converter/tests", "C:/Foo/raw-converter-wasm/.timing-source"]
+            .iter()
+            .find_map(|d| {
+                std::fs::read(
+                    std::path::Path::new(d).join("PXL_20260526_194503279.NIGHT.RAW-02.ORIGINAL.dng"),
+                )
+                .ok()
+            })
+        else {
+            eprintln!("SKIP: Pixel NIGHT fixture absent");
+            return;
+        };
+        let flags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_NO_ORIENT;
+        let mut r = process_dng_impl(decode_dng_raw(&data, flags).unwrap(), flags, &LookOverrides::neutral())
+            .unwrap();
+        let mean = |v: &[u8]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len() as f64;
+        let decode_mean = mean(&r.rgb);
+        let (wr, wb) = (r.wb_r_used, r.wb_b_used);
+        let live = r
+            .take_lightbox_renderer()
+            .render(wr, wb, 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., 0.)
+            .unwrap();
+        let ratio = mean(&live) / decode_mean;
+        eprintln!("NIGHT: decode mean {decode_mean:.2}, live mean {:.2}, ratio {ratio:.3}", mean(&live));
+        assert!((0.97..1.03).contains(&ratio), "live/decode mean ratio {ratio:.3}");
+    }
+
+    /// ActiveArea crop: the Adobe Bayer sample stores 10240x7168 with
+    /// ActiveArea [0,0,6376,9600]; LibRaw (rawpy `sizes`) reports 9600x6376 visible.
+    /// Native only: the sample is JXL-compressed (jxl-codec).
+    #[test]
+    fn dng_active_area_crops_to_libraw_dims() {
+        let Ok(data) =
+            std::fs::read("C:/Foo/raw-converter/tests/raw-pixls/adobe_03_jxl_bayer_raw_integer.dng")
+        else {
+            eprintln!("SKIP: Adobe Bayer fixture absent");
+            return;
+        };
+        let d = decode_dng_raw(&data, OUT_LIGHTBOX).unwrap();
+        assert_eq!((d.aw, d.ah), (9600, 6376));
+        assert_eq!(d.raw_mosaic.len(), 9600 * 6376);
+        let r = process_dng_impl(d, OUT_LIGHTBOX, &LookOverrides::neutral()).unwrap();
+        let (lw, lh) = target_dims(9600, 6376, 1800);
+        assert_eq!((r.lb_w, r.lb_h), (lw as u32, lh as u32));
+    }
 }
 
 /// WASM-resident rendering state for a single image (lightbox or thumbnail).
@@ -4511,6 +4562,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                 params.wb_r = wb_r;
                 params.wb_b = wb_b;
                 params.color_matrix = color_matrix.into();
+                // BaselineExposure folded into baseline_ev so the live LookRenderer
+                // (fed `baseline_ev_used`) matches the decode; see decode_linear_dng.
+                params.baseline_ev += baseline_exposure;
                 let color_matrix_flat: [f32; 9] = {
                     let mm = params.color_matrix.matrix();
                     [
@@ -4543,7 +4597,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
                     make,
                     model,
                     iso,
-                    baseline_exposure,
+                    baseline_exposure: 0.0, // folded into params.baseline_ev above
                     wb_from_camera,
                     datetime,
                     gps_lat,
@@ -4565,8 +4619,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     }
 
     let t = now_ms();
-    let img = raw_pipeline::dng::decode_bytes(data)
+    let mut img = raw_pipeline::dng::decode_bytes(data)
         .map_err(|e| JsError::new(&format!("DNG decode: {}", e)))?;
+    img.crop_to_active_area(); // Bayer and linear alike
     let decode_ms = now_ms() - t;
 
     let w = img.width;
@@ -4613,6 +4668,9 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     params.wb_r = img.wb_r;
     params.wb_b = img.wb_b;
     params.color_matrix = img.color_matrix.into();
+    // BaselineExposure folded into baseline_ev so the live LookRenderer (fed
+    // `baseline_ev_used`) matches the decode; see decode_linear_dng.
+    params.baseline_ev += img.baseline_exposure;
     let color_matrix_flat: [f32; 9] = {
         let m = params.color_matrix.matrix();
         [
@@ -4636,7 +4694,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         make: img.make,
         model: img.model,
         iso,
-        baseline_exposure: img.baseline_exposure,
+        baseline_exposure: 0.0, // folded into params.baseline_ev above
         wb_from_camera: img.wb_from_camera,
         datetime: img.datetime,
         gps_lat: img.gps_lat,
@@ -4985,9 +5043,9 @@ fn process_dng_impl(
     if look.wb_b.is_finite() && look.wb_b > 0.0 {
         params.wb_b = look.wb_b.min(8.0);
     }
-    // Fold the DNG's own BaselineExposure into the render exposure so low-light / night
-    // Pixel DNGs (which set +1.3..+1.6 EV) reach their intended brightness; the user's
-    // exposure slider still composes on top. 0.0 baseline (or absent tag) = unchanged.
+    // `baseline_exposure` is 0.0 from decode_dng_raw (the DNG BaselineExposure,
+    // +1.3..+1.6 EV on night Pixel DNGs, is already in params.baseline_ev); the
+    // user's exposure slider composes on top.
     raw_pipeline::pipeline::apply_look_params(
         &mut params,
         look.exposure_ev + baseline_exposure,

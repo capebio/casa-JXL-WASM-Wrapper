@@ -12,26 +12,7 @@ fn main() {
     let max_dim: usize = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(1100);
     let data = std::fs::read(&a[1]).expect("read");
     let mut img = raw_pipeline::dng::decode_bytes(&data).expect("decode");
-    // Crop to ActiveArea: pixels outside it are masked/padding (they showed as
-    // a dark border on the Adobe Bayer sample, whose stored plane is
-    // 10240x7168 with only 9600x6376 active).
-    if let Some([top, left, bottom, right]) = img.active_area {
-        let (t, l) = (top as usize, left as usize);
-        let (b, r) = ((bottom as usize).min(img.height), (right as usize).min(img.width));
-        if b > t && r > l && (b - t < img.height || r - l < img.width) {
-            let cps = img.samples_per_pixel;
-            let (nw, nh) = (r - l, b - t);
-            let mut v = vec![0u16; nw * nh * cps];
-            for y in 0..nh {
-                let src = ((t + y) * img.width + l) * cps;
-                v[y * nw * cps..(y + 1) * nw * cps]
-                    .copy_from_slice(&img.raw[src..src + nw * cps]);
-            }
-            img.raw = v;
-            img.width = nw;
-            img.height = nh;
-        }
-    }
+    img.crop_to_active_area();
     // Apply the LinearizationTable: `raw` holds STORED codes; every
     // white-level and PGTM computation below lives in the LINEAR domain.
     if !img.linearization_table.is_empty() {
@@ -257,8 +238,10 @@ fn main() {
     // file tag: the DNG stores Apple's pre-sharpening image, and the preview
     // carries their capture sharpening — measured 1.7-1.9x the local gradient
     // energy of the unsharpened render. Every mainstream raw renderer applies
-    // an equivalent default.
-    let out = if img.profile_gain_table_map.is_some() {
+    // an equivalent default. DNG_RENDER_NO_SHARPEN=1 skips it (to measure it).
+    let out = if img.profile_gain_table_map.is_some()
+        && std::env::var_os("DNG_RENDER_NO_SHARPEN").is_none()
+    {
         let (ow, oh) = (out.width() as usize, out.height() as usize);
         let px = out.as_raw();
         let mut luma = vec![0f32; ow * oh];

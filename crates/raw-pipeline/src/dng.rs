@@ -226,6 +226,30 @@ impl DngImage {
             model: self.model.clone(),
         }
     }
+
+    /// Crop `raw` (and `width`/`height`) to [`Self::active_area`]: pixels outside it
+    /// are masked/padding (a dark border on the Adobe Bayer sample, whose stored
+    /// plane is 10240x7168 with 9600x6376 active). The CFAPattern origin is the
+    /// ActiveArea's top-left (DNG spec), so `cfa` stays valid. No-op when absent,
+    /// degenerate, or the whole plane.
+    pub fn crop_to_active_area(&mut self) {
+        let Some([top, left, bottom, right]) = self.active_area else { return };
+        let (t, l) = (top as usize, left as usize);
+        let (b, r) = ((bottom as usize).min(self.height), (right as usize).min(self.width));
+        if b <= t || r <= l || (b - t == self.height && r - l == self.width) {
+            return;
+        }
+        let cps = self.samples_per_pixel;
+        let (nw, nh) = (r - l, b - t);
+        let mut v = vec![0u16; nw * nh * cps];
+        for y in 0..nh {
+            let src = ((t + y) * self.width + l) * cps;
+            v[y * nw * cps..(y + 1) * nw * cps].copy_from_slice(&self.raw[src..src + nw * cps]);
+        }
+        self.raw = v;
+        self.width = nw;
+        self.height = nh;
+    }
 }
 
 const TAG_COLOR_MATRIX_1: u16 = 0xC621;
@@ -670,6 +694,13 @@ impl<'a> DngRowSource<'a> {
             return Err(format!(
                 "DNG: streaming needs single-sample Bayer (cps={cps})"
             ));
+        }
+        // Streaming yields whole-plane rows; a real ActiveArea crop takes the full
+        // path (`DngImage::crop_to_active_area`) so previews match the final.
+        if let Some([t, l, b, r]) = raw.active_area {
+            if (t, l) != (0, 0) || (b as usize) < height || (r as usize) < width {
+                return Err("DNG: ActiveArea crop not streamable".into());
+            }
         }
         let cfa = match raw.cfa_pattern {
             Some([0, 1, 1, 2]) => Cfa::Rggb,
