@@ -19,6 +19,7 @@ import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { timingEnabled } from './timing-gate.js';
 import initRaw, * as rawWasm from './pkg/raw_converter_wasm.js';
 
 const DEFAULT_ORF_FOLDER = String.raw`C:\995\2026-02-20 Gobabeb To Windhoek`;
@@ -156,7 +157,10 @@ dngTest('DNG previews-only twin differs from monolithic previews (split stays OR
 // and mode 3 (retain phase-1 raw, finish without re-decompress — see the next test)
 // eliminate this; the full RGB8 bytes are byte-identical regardless. This test measures
 // the raw-WASM cost of the old two-call shape to justify collapsing it to one decompress.
-batchTest('two separate decode calls pay ~2x decompress vs monolithic', async () => {
+// Wall-clock ratio: opt-in only (web/timing-gate.js). The mode-3 test below pins
+// the shipped single-decompress path deterministically (decompress_ms unchanged by finish).
+const batchTimingTest = existsSync(ORF_FIXTURE) && timingEnabled() ? test : test.skip;
+batchTimingTest('timing (RCW_TIMING=1): two separate decode calls pay ~2x decompress vs monolithic', async () => {
     await ensureRaw();
     const bytes = new Uint8Array(readFileSync(ORF_FIXTURE));
     // Warmup: cold caches/predictors on the first decode inflate the single

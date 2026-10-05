@@ -12,6 +12,7 @@
  */
 
 import { expect, test } from 'bun:test';
+import { timingEnabled } from './timing-gate.js';
 import {
   encodeTileContainerRgba8,
   decodeTileContainerRegionRgba8,
@@ -95,7 +96,10 @@ test('Task 10: JXTC decode returns correct dimensions and non-zero pixels', { ti
 
 // ── Task 11: timing validation ───────────────────────────────────────────────
 
-test('Task 11: 128px JXTC region decode completes in < 2000 ms on this machine', { timeout: WASM_TIMEOUT }, async () => {
+// Wall-clock only: opt-in (web/timing-gate.js). The tile-proportional test below
+// covers what the region decode does.
+const timingTest = timingEnabled() ? test : test.skip;
+timingTest('timing (RCW_TIMING=1): 128px JXTC region decode completes in < 2000 ms', { timeout: WASM_TIMEOUT }, async () => {
   // NOTE: This test runs in Bun (Node/single-threaded SIMD). Browser decode
   // benefits from relaxed-simd-mt and is faster. The 2000 ms cap is a
   // conservative Bun-runnable proxy; browser target is < 15 ms for warm WASM.

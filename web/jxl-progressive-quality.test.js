@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { timingEnabled } from './timing-gate.js';
 import { computePsnrVsFinal, computeSsimVsFinal, computePsnrSsimFused, detectMonotone, MONOTONE_TOLERANCE_DB, computeChannelMoments, computeQualityBundle, isQualityPlateau } from './jxl-progressive-quality.js';
 import { pixelsToXyb, computeButteraugliVsFinal, createButteraugliComparer, computeButteraugliApproxVsFinal } from './jxl-butteraugli.js';
 
@@ -235,7 +236,8 @@ function flipFlop(name, aFn, bFn, dataArgs, runs = 10) {
   return { name, medA: med(times.a), medB: med(times.b) };
 }
 
-test('flipflop harness on moments (changed kernel)', () => {
+// Wall-clock median ratio on a sub-ms kernel: opt-in only (web/timing-gate.js).
+(timingEnabled() ? test : test.skip)('timing (RCW_TIMING=1): flipflop harness on moments (changed kernel)', () => {
   const p = new Uint8Array(1024 * 4).fill(77); // ~1k px
   const r = flipFlop('moments', computeChannelMoments, computeChannelMoments, [p, 32, 32, 3]);
   expect(r.medB).toBeLessThanOrEqual(r.medA * 1.2); // guard, same fn here; real use swaps old/new

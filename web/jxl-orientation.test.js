@@ -1,5 +1,7 @@
-// Phase 1/3 verification: encoding portrait + landscape ORFs should take
-// similar time. JXL records orientation as metadata — no CPU rotation tax.
+// Phase 1/3 verification: encoding portrait + landscape ORFs does the same work.
+// JXL records orientation as metadata — no CPU rotation tax. The default run
+// asserts bytes and dimensions; the wall-clock ratio runs only with RCW_TIMING=1
+// (web/timing-gate.js).
 //
 // Run with bun: `bun test web/jxl-orientation.test.js`
 //
@@ -11,6 +13,7 @@ import { expect, test } from 'bun:test';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import initRaw, * as rawWasm from './pkg/raw_converter_wasm.js';
+import { timingEnabled } from './timing-gate.js';
 
 const DEFAULT_ORF_FOLDER = String.raw`C:\995\2026-02-20 Gobabeb To Windhoek`;
 const ORF_FOLDER = process.env.TEST_ORF_FOLDER ?? DEFAULT_ORF_FOLDER;
@@ -36,33 +39,69 @@ function classify(orientation) {
     return `ori=${orientation}`;
 }
 
-maybeFixtureTest('Phase 1+3: portrait ORF encode time matches landscape (no CPU rotate)', async () => {
+// EXIF orientation → clockwise quarter turns for rotate_rgb8 (pure rotations only;
+// the mirrored orientations 2/4/5/7 have no rotate_rgb8 equivalent).
+const QUARTER_TURNS = { 1: 0, 3: 2, 6: 1, 8: 3 };
+
+function decode(fn, bytes, flags, keepRgb = true) {
+    const t0 = performance.now();
+    const r = fn(bytes, flags, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+    const ms = performance.now() - t0;
+    try {
+        return { w: r.width, h: r.height, ori: r.orientation, orientMs: r.orient_ms, ms,
+                 rgb: keepRgb ? r.take_rgb() : null };
+    } finally { r.free(); }
+}
+
+// Deterministic proof that the rotate path is exactly "no-rotate output, rotated"
+// and the OUT_NO_ORIENT path applies no rotation: dims swap for 6/8 and the
+// rotated bytes equal rotate_rgb8 of the unrotated bytes.
+function expectRotatedEquals(rot, noRot) {
+    const turns = QUARTER_TURNS[noRot.ori];
+    if (turns === undefined) return false;
+    if (turns % 2) { expect([rot.w, rot.h]).toEqual([noRot.h, noRot.w]); }
+    else { expect([rot.w, rot.h]).toEqual([noRot.w, noRot.h]); }
+    if (turns === 0) { expect(rot.rgb).toEqual(noRot.rgb); return true; }
+    const viaRotate = rawWasm.rotate_rgb8(noRot.rgb, noRot.w, noRot.h, turns);
+    try { expect(viaRotate.take_rgb()).toEqual(rot.rgb); } finally { viaRotate.free(); }
+    return true;
+}
+
+function decodeOrfRows(limit) {
+    const fullFlags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT;
+    return listOrfs(limit).map((name) => {
+        const bytes = readFileSync(join(ORF_FOLDER, name));
+        const { w, h, ori, orientMs, ms } = decode(rawWasm.process_orf_with_flags, bytes, fullFlags, false);
+        return { name, bytes, w, h, ori, pipelineMs: ms, orientMs };
+    });
+}
+
+maybeFixtureTest('Phase 1+3: OUT_NO_ORIENT does the same work for portrait and landscape ORFs', async () => {
     await initRaw();
-    const names = listOrfs(8);
-    if (names.length === 0) {
+    const rows = decodeOrfRows(8);
+    if (rows.length === 0) {
         console.warn(`No ORFs in ${ORF_FOLDER}; skipping`);
         return;
     }
-
-    const fullFlags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT;
-
-    const rows = [];
-    for (const name of names) {
-        const bytes = readFileSync(join(ORF_FOLDER, name));
-        const t0 = performance.now();
-        const result = rawWasm.process_orf_with_flags(
-            bytes, fullFlags,
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0,
-        );
-        const pipelineMs = performance.now() - t0;
-        const ori = result.orientation;
-        const w = result.width;
-        const h = result.height;
-        const orientMs = result.orient_ms;
-        result.free();
-
-        rows.push({ name, w, h, ori, pipelineMs, orientMs });
+    // No rotation on this path: every frame stays in sensor orientation, so a
+    // portrait frame is the same size (same pixel count) as a landscape one.
+    for (const r of rows) expect([r.w, r.h]).toEqual([rows[0].w, rows[0].h]);
+    const portrait = rows.find((r) => r.ori === 6 || r.ori === 8);
+    if (!portrait) {
+        console.log(`note: no portrait ORF among ${rows.length}; rotate parity not exercised`);
+        return;
     }
+    const noRot = decode(rawWasm.process_orf_with_flags, portrait.bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+    const rot = decode(rawWasm.process_orf_with_flags, portrait.bytes, OUT_FULL_RGB8);
+    expect(expectRotatedEquals(rot, noRot)).toBe(true);
+    console.log(`  ${portrait.name} (ori=${portrait.ori}): rotate path == rotate_rgb8(no-rotate) ${rot.w}x${rot.h}`);
+}, 300000);
+
+// Wall-clock half of the Phase 1 claim; opt-in only (web/timing-gate.js).
+const timingFixtureTest = existsSync(ORF_FOLDER) && timingEnabled() ? test : test.skip;
+timingFixtureTest('timing (RCW_TIMING=1): portrait ORF encode time matches landscape (no CPU rotate)', async () => {
+    await initRaw();
+    const rows = decodeOrfRows(8);
 
     console.log('\n=== Phase 1 verification — process_orf_with_flags(OUT_NO_ORIENT) ===');
     console.log('| File                | Dims        | Orientation         | Pipeline (ms) | orient_ms |');
@@ -140,27 +179,23 @@ maybeFixtureTest('Phase 1+3: portrait DNG → A/B rotate vs no-rotate', async ()
         return;
     }
     console.log(`Portrait fixture: ${found.dir}\\${found.name} (EXIF ori=${found.ori})`);
-    const flagsRot   = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB;
-    const flagsNoRot = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT;
-
-    const runs = [];
-    for (const [label, flags] of [['rotate', flagsRot], ['no-rotate', flagsNoRot]]) {
-        // warm-up
-        const w = rawWasm.process_dng_with_flags(found.bytes, flags, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
-        w.free();
-        const t0 = performance.now();
-        const r = rawWasm.process_dng_with_flags(found.bytes, flags, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
-        const ms = performance.now() - t0;
-        runs.push({ label, ms, orient_ms: r.orient_ms, w: r.width, h: r.height });
-        r.free();
-    }
-
-    console.log(`  rotate    : pipeline=${runs[0].ms.toFixed(0)}ms, orient_ms=${runs[0].orient_ms.toFixed(2)}, dims=${runs[0].w}x${runs[0].h}`);
-    console.log(`  no-rotate : pipeline=${runs[1].ms.toFixed(0)}ms, orient_ms=${runs[1].orient_ms.toFixed(2)}, dims=${runs[1].w}x${runs[1].h}`);
-    console.log(`  Δ orient_ms saved: ${(runs[0].orient_ms - runs[1].orient_ms).toFixed(1)} ms`);
-    expect(runs[1].orient_ms).toBeLessThan(2);
-    expect(runs[0].orient_ms).toBeGreaterThan(0);
+    expectRotateAB(rawWasm.process_dng_with_flags, found.bytes, found.name);
 }, 180000);
+
+// Same file through the rotate and OUT_NO_ORIENT paths: the rotate output must be
+// the no-rotate output turned by the EXIF orientation (bytes, not timings).
+function expectRotateAB(fn, bytes, name) {
+    const flags = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB;
+    const rot = decode(fn, bytes, flags);
+    const noRot = decode(fn, bytes, flags | OUT_NO_ORIENT);
+    expect(noRot.ori).toBe(rot.ori);
+    if (!expectRotatedEquals(rot, noRot)) {
+        // Mirrored orientations: rotate_rgb8 cannot model them; dims still must match the EXIF transform.
+        expect([rot.w, rot.h]).toEqual(noRot.ori >= 5 ? [noRot.h, noRot.w] : [noRot.w, noRot.h]);
+    }
+    console.log(`  ${name} (ori=${rot.ori}): rotate ${rot.w}x${rot.h} (orient_ms=${rot.orientMs.toFixed(2)}),` +
+        ` no-rotate ${noRot.w}x${noRot.h} (orient_ms=${noRot.orientMs.toFixed(2)})`);
+}
 
 maybeFixtureTest('Phase 3: A/B same-file with vs without OUT_NO_ORIENT', async () => {
     await initRaw();
@@ -169,33 +204,8 @@ maybeFixtureTest('Phase 3: A/B same-file with vs without OUT_NO_ORIENT', async (
     const name = names[0];
     const bytes = readFileSync(join(ORF_FOLDER, name));
 
-    // Force a portrait orientation tag so we exercise apply_orientation. We
-    // do that indirectly: synthetically simulate by measuring the same file
-    // with both flags so we can attribute the delta to rotation only when
-    // ori != 1 anyway. If file is landscape, both runs will have orient_ms=0
-    // and we just note the parity.
-    const flagsRot   = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB;
-    const flagsNoRot = OUT_FULL_RGB8 | OUT_LIGHTBOX | OUT_THUMB | OUT_NO_ORIENT;
-
-    const runs = [];
-    for (const [label, flags] of [['rotate', flagsRot], ['no-rotate', flagsNoRot]]) {
-        const t0 = performance.now();
-        const r = rawWasm.process_orf_with_flags(bytes, flags, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
-        const ms = performance.now() - t0;
-        runs.push({ label, ms, orient_ms: r.orient_ms, w: r.width, h: r.height, ori: r.orientation });
-        r.free();
-    }
-
-    console.log(`\n=== Phase 3 verification — same file, A/B rotate flag ===`);
-    console.log(`File: ${name}, EXIF orientation: ${runs[0].ori}`);
-    for (const r of runs) {
-        console.log(`  ${r.label.padEnd(10)}: pipeline=${r.ms.toFixed(0)}ms, orient_ms=${r.orient_ms.toFixed(2)}, dims=${r.w}x${r.h}`);
-    }
-    expect(runs[1].orient_ms).toBeLessThan(2); // no-rotate path: ~0 ms
-    if (runs[0].ori !== 1) {
-        // For non-identity orientation, the rotate path should report > 0 orient_ms.
-        expect(runs[0].orient_ms).toBeGreaterThan(0);
-    }
+    // ori=1: identical bytes on both paths; otherwise the rotate output is the turned no-rotate output.
+    expectRotateAB(rawWasm.process_orf_with_flags, bytes, name);
 }, 180000);
 
 test('Phase 3: rotate_rgb8 fast path round-trip', async () => {
