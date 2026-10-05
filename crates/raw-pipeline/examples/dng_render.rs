@@ -73,91 +73,13 @@ fn main() {
 
     // ── The DNG color pipeline, driven by what the file carries ──────────
 
-    // 3x3 helpers for the Bradford path below.
-    fn mul33(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
-        let mut o = [[0f32; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                o[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
-            }
-        }
-        o
-    }
-    fn inv33(m: [[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
-        let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-        if det.abs() < 1e-12 {
-            return None;
-        }
-        let d = 1.0 / det;
-        Some([
-            [
-                (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * d,
-                (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * d,
-                (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * d,
-            ],
-            [
-                (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * d,
-                (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * d,
-                (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * d,
-            ],
-            [
-                (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * d,
-                (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * d,
-                (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * d,
-            ],
-        ])
-    }
-    fn mulv(m: [[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
-        [
-            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
-            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
-            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
-        ]
-    }
-    // Constants: XYZ(D50)→sRGB (same values dng.rs carries) and Bradford.
-    const XYZ_D50_TO_SRGB: [[f32; 3]; 3] = [
-        [3.133_856_1, -1.616_866_7, -0.490_614_6],
-        [-0.978_768_4, 1.916_141_5, 0.033_454_0],
-        [0.071_945_3, -0.228_991_4, 1.405_242_7],
-    ];
-    const BRADFORD: [[f32; 3]; 3] = [
-        [0.8951, 0.2664, -0.1614],
-        [-0.7502, 1.7135, 0.0367],
-        [0.0389, -0.0685, 1.0296],
-    ];
-    const D50_WHITE: [f32; 3] = [0.9642, 1.0, 0.8249];
-
     // The Bradford-adapted ColorMatrix path, for files WITHOUT a ForwardMatrix
-    // (Apple). dng.rs fused color_matrix = XYZ2SRGB · CM⁻¹, so CM⁻¹ recovers as
-    // XYZ2SRGB⁻¹ · fused. The scene white in camera space is AsShotNeutral
-    // (reconstructed from the green-normalized wb multipliers); its XYZ under
-    // the scene illuminant is CM⁻¹·n, Bradford-adapted to D50, then to sRGB —
-    // by construction the camera neutral maps to sRGB (1,1,1), so this path
-    // needs (and must not have) separate WB multipliers. This replaces the
-    // earlier "CM path is never safe" bail-out, whose magenta was exactly the
-    // missing adaptation.
+    // (Apple): needs (and must not have) separate WB multipliers. This replaces
+    // the earlier "CM path is never safe" bail-out, whose magenta was exactly
+    // the missing adaptation.
     let cm_bradford: Option<[[f32; 3]; 3]> = if img.forward_matrix.is_none() {
-        img.color_matrix.and_then(|fused| {
-            let cam2xyz_scene = mul33(inv33(XYZ_D50_TO_SRGB)?, fused);
-            let n = [1.0 / img.wb_r.max(1e-6), 1.0, 1.0 / img.wb_b.max(1e-6)];
-            let white_scene = mulv(cam2xyz_scene, n);
-            if white_scene.iter().any(|&v| !(v > 0.0)) {
-                return None;
-            }
-            let cone_scene = mulv(BRADFORD, white_scene);
-            let cone_d50 = mulv(BRADFORD, D50_WHITE);
-            if cone_scene.iter().any(|&v| v.abs() < 1e-6) {
-                return None;
-            }
-            let mut diag = [[0f32; 3]; 3];
-            for i in 0..3 {
-                diag[i][i] = cone_d50[i] / cone_scene[i];
-            }
-            let adapt = mul33(inv33(BRADFORD)?, mul33(diag, BRADFORD));
-            Some(mul33(XYZ_D50_TO_SRGB, mul33(adapt, cam2xyz_scene)))
-        })
+        img.color_matrix
+            .and_then(|fused| raw_pipeline::dng::color_matrix_bradford(fused, img.wb_r, img.wb_b))
     } else {
         None
     };
@@ -171,23 +93,9 @@ fn main() {
             }
         }
     } else {
-        // WB sanity: some Linear DNGs (Adobe SDK re-encodes) store
-        // already-balanced channels while still carrying a non-unity
-        // AsShotNeutral; multiplying red by 2.8 on balanced data renders pink.
-        // Gray-world gate: WB only if it moves the channel means toward equal.
-        let mut mean = [0f64; 3];
-        for p in rgb.chunks_exact(3) {
-            mean[0] += p[0] as f64;
-            mean[1] += p[1] as f64;
-            mean[2] += p[2] as f64;
-        }
-        let spread = |m: &[f64; 3]| -> f64 {
-            let hi = m.iter().cloned().fold(f64::MIN, f64::max);
-            let lo = m.iter().cloned().fold(f64::MAX, f64::min).max(1e-9);
-            hi / lo
-        };
-        let wb_mean = [mean[0] * img.wb_r as f64, mean[1], mean[2] * img.wb_b as f64];
-        if spread(&wb_mean) < spread(&mean) {
+        // WB sanity (gray-world gate): WB only if it moves the channel means
+        // toward equal; some Linear DNGs store already-balanced channels.
+        if raw_pipeline::dng::wb_moves_toward_grey(&rgb, img.wb_r, img.wb_b) {
             for p in rgb.chunks_exact_mut(3) {
                 p[0] *= img.wb_r;
                 p[2] *= img.wb_b;
@@ -222,8 +130,6 @@ fn main() {
     if let Some(m) = &img.profile_gain_table_map {
         let (pv, ph) = (m.points_v as usize, m.points_h as usize);
         let nt = m.num_table_points as usize;
-        let entry = |r: usize, c: usize, t: usize| m.gains[(r * ph + c) * nt + t];
-        let [w0, w1, w2, w3, w4] = m.map_input_weights;
         // The reference feeds the weight dot-product camera-linear values in
         // [0,1] (v / WhiteLevel, in the LINEARIZED domain — applied above)
         // times 2^BaselineExposure; highlights can sit above 1.0 before the
@@ -231,30 +137,11 @@ fn main() {
         let wscale = (2f32).powf(img.baseline_exposure) / (img.white as f32).max(1.0);
         for y in 0..lh {
             let v_img = (y as f64 + 0.5) / lh as f64;
-            let y_map = ((v_img - m.origin_v) / m.spacing_v).clamp(0.0, (pv - 1) as f64);
-            let (y0, yf) = (y_map as usize, y_map.fract() as f32);
-            let y1 = (y0 + 1).min(pv - 1);
             for x in 0..lw {
                 let u_img = (x as f64 + 0.5) / lw as f64;
-                let x_map = ((u_img - m.origin_h) / m.spacing_h).clamp(0.0, (ph - 1) as f64);
-                let (x0, xf) = (x_map as usize, x_map.fract() as f32);
-                let x1 = (x0 + 1).min(ph - 1);
                 let i = (y * lw + x) * 3;
-                let (r, g, b) = (rgb[i] * wscale, rgb[i + 1] * wscale, rgb[i + 2] * wscale);
-                let (mn, mx) = (r.min(g).min(b), r.max(g).max(b));
-                let weight =
-                    (w0 * r + w1 * g + w2 * b + w3 * mn + w4 * mx).clamp(0.0, 1.0);
-                // Reference quirk kept: scaled by tableSize, index min'd to limit.
-                let ws = weight * nt as f32;
-                let t0 = (ws as usize).min(nt - 1);
-                let t1 = (t0 + 1).min(nt - 1);
-                let tf = ws - t0 as f32;
-                let lerp = |a: f32, b: f32, f: f32| a + (b - a) * f;
-                let g00 = lerp(entry(y0, x0, t0), entry(y0, x0, t1), tf);
-                let g01 = lerp(entry(y0, x1, t0), entry(y0, x1, t1), tf);
-                let g10 = lerp(entry(y1, x0, t0), entry(y1, x0, t1), tf);
-                let g11 = lerp(entry(y1, x1, t0), entry(y1, x1, t1), tf);
-                let gain = lerp(lerp(g00, g01, xf), lerp(g10, g11, xf), yf);
+                let p = [rgb[i] * wscale, rgb[i + 1] * wscale, rgb[i + 2] * wscale];
+                let gain = m.gain(u_img, v_img, p);
                 rgb[i] *= gain;
                 rgb[i + 1] *= gain;
                 rgb[i + 2] *= gain;

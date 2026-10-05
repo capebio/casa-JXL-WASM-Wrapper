@@ -65,6 +65,37 @@ pub struct GainTableMap {
     pub gains: Vec<f32>,
 }
 
+impl GainTableMap {
+    /// The gain at image-normalized position (`u` across, `v` down, pixel
+    /// centres in [0,1]) for a pixel whose linear RGB, already scaled to the
+    /// map's input domain (v / WhiteLevel × 2^BaselineExposure), is `rgb`.
+    /// Trilinear over (row, col, weight); one gain multiplies R, G and B.
+    pub fn gain(&self, u: f64, v: f64, rgb: [f32; 3]) -> f32 {
+        let (pv, ph) = (self.points_v as usize, self.points_h as usize);
+        let nt = self.num_table_points as usize;
+        let y_map = ((v - self.origin_v) / self.spacing_v).clamp(0.0, (pv - 1) as f64);
+        let x_map = ((u - self.origin_h) / self.spacing_h).clamp(0.0, (ph - 1) as f64);
+        let (y0, yf) = (y_map as usize, y_map.fract() as f32);
+        let (x0, xf) = (x_map as usize, x_map.fract() as f32);
+        let (y1, x1) = ((y0 + 1).min(pv - 1), (x0 + 1).min(ph - 1));
+        let [w0, w1, w2, w3, w4] = self.map_input_weights;
+        let [r, g, b] = rgb;
+        let (mn, mx) = (r.min(g).min(b), r.max(g).max(b));
+        let weight = (w0 * r + w1 * g + w2 * b + w3 * mn + w4 * mx).clamp(0.0, 1.0);
+        // Reference quirk kept: scaled by tableSize, index min'd to limit.
+        let ws = weight * nt as f32;
+        let t0 = (ws as usize).min(nt - 1);
+        let t1 = (t0 + 1).min(nt - 1);
+        let tf = ws - t0 as f32;
+        let lerp = |a: f32, b: f32, f: f32| a + (b - a) * f;
+        let e = |r: usize, c: usize| {
+            let o = (r * ph + c) * nt;
+            lerp(self.gains[o + t0], self.gains[o + t1], tf)
+        };
+        lerp(lerp(e(y0, x0), e(y0, x1), xf), lerp(e(y1, x0), e(y1, x1), xf), yf)
+    }
+}
+
 /// Parse a v1 ProfileGainTableMap blob (values in the FILE's byte order).
 fn parse_gain_table_map(d: &[u8], le: bool) -> Option<GainTableMap> {
     if d.len() < 64 {
@@ -2664,6 +2695,62 @@ fn choose_camera_to_srgb_matrix(
     let color = color_matrix_2.or(color_matrix_1)?;
     let camera_to_xyz = invert3x3(color)?;
     Some(mul3x3(XYZ_D50_TO_SRGB, camera_to_xyz))
+}
+
+/// Camera→sRGB(linear) for a DNG WITHOUT a ForwardMatrix (Apple ProRAW),
+/// applied to UNBALANCED camera RGB with NO separate white-balance multipliers.
+/// `fused` is [`DngImage::color_matrix`] (= XYZ2SRGB · CM⁻¹), so CM⁻¹ recovers
+/// as XYZ2SRGB⁻¹ · fused. The scene white in camera space is AsShotNeutral
+/// (rebuilt from the green-normalized `wb_r`/`wb_b`); its XYZ is Bradford-adapted
+/// to D50, so the camera neutral maps to sRGB (1,1,1) by construction. `None`
+/// when the matrix or the neutral is degenerate.
+pub fn color_matrix_bradford(fused: [[f32; 3]; 3], wb_r: f32, wb_b: f32) -> Option<[[f32; 3]; 3]> {
+    const BRADFORD: [[f32; 3]; 3] = [
+        [0.8951, 0.2664, -0.1614],
+        [-0.7502, 1.7135, 0.0367],
+        [0.0389, -0.0685, 1.0296],
+    ];
+    const D50_WHITE: [f32; 3] = [0.9642, 1.0, 0.8249];
+    let mulv = |m: [[f32; 3]; 3], v: [f32; 3]| -> [f32; 3] {
+        [0, 1, 2].map(|i| m[i][0] * v[0] + m[i][1] * v[1] + m[i][2] * v[2])
+    };
+    let cam2xyz_scene = mul3x3(invert3x3(XYZ_D50_TO_SRGB)?, fused);
+    let n = [1.0 / wb_r.max(1e-6), 1.0, 1.0 / wb_b.max(1e-6)];
+    let white_scene = mulv(cam2xyz_scene, n);
+    if white_scene.iter().any(|&v| !(v > 0.0)) {
+        return None;
+    }
+    let cone_scene = mulv(BRADFORD, white_scene);
+    let cone_d50 = mulv(BRADFORD, D50_WHITE);
+    if cone_scene.iter().any(|&v| v.abs() < 1e-6) {
+        return None;
+    }
+    let mut diag = [[0f32; 3]; 3];
+    for i in 0..3 {
+        diag[i][i] = cone_d50[i] / cone_scene[i];
+    }
+    let adapt = mul3x3(invert3x3(BRADFORD)?, mul3x3(diag, BRADFORD));
+    Some(mul3x3(XYZ_D50_TO_SRGB, mul3x3(adapt, cam2xyz_scene)))
+}
+
+/// Gray-world gate for a Linear DNG's white balance: some writers (Adobe SDK
+/// re-encodes) store already-balanced channels while still carrying a
+/// non-unity AsShotNeutral, and multiplying red by 2.8 on balanced data
+/// renders pink. `true` = applying `wb_r`/`wb_b` moves the channel means of
+/// the interleaved RGB `rgb` toward equal, so the WB should be applied.
+pub fn wb_moves_toward_grey<T: Copy + Into<f64>>(rgb: &[T], wb_r: f32, wb_b: f32) -> bool {
+    let mut mean = [0f64; 3];
+    for p in rgb.chunks_exact(3) {
+        for c in 0..3 {
+            mean[c] += p[c].into();
+        }
+    }
+    let spread = |m: [f64; 3]| -> f64 {
+        let hi = m.iter().cloned().fold(f64::MIN, f64::max);
+        let lo = m.iter().cloned().fold(f64::MAX, f64::min).max(1e-9);
+        hi / lo
+    };
+    spread([mean[0] * wb_r as f64, mean[1], mean[2] * wb_b as f64]) < spread(mean)
 }
 
 /// EXIF LightSource code (tag 0x9208's enum, reused by DNG's

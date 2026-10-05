@@ -22,7 +22,7 @@ mod bliss_wasm;
 use denoise_options::RawProcessOptions;
 use raw_pipeline::denoise::{
     classical_denoise, decide, estimate_noise, score_noise, resolve_noise_model,
-    iso_fallback_model, ActivationMode, DenoiseOptions,
+    iso_fallback_model, DenoiseOptions,
 };
 use raw_pipeline::denoise::dng_tags::RawNoiseMetadata;
 
@@ -608,6 +608,9 @@ pub struct ProcessResult {
     // retain (ORF retain or a normal decode).
     retained_dng_phase: Option<(u8, u8)>,
     retained_dng_baseline: f32,
+    // DNG ProfileToneCurve the render used (Apple ProRAW), handed to the live
+    // LookRenderers. `None` on every format/file without one.
+    profile_tone_curve: Option<std::sync::Arc<[(f32, f32)]>>,
     // ── Noise/denoise telemetry (process_*_with_options) ──────────────────────
     #[wasm_bindgen(readonly)]
     pub denoise_requested: bool,
@@ -920,6 +923,7 @@ impl ProcessResult {
             self.black_used,
             self.white_used,
             self.baseline_ev_used,
+            self.profile_tone_curve.clone(),
         )
     }
 
@@ -937,6 +941,7 @@ impl ProcessResult {
             self.black_used,
             self.white_used,
             self.baseline_ev_used,
+            self.profile_tone_curve.clone(),
         )
     }
 }
@@ -2006,17 +2011,23 @@ fn finish_dng_from_raw(
     let wb_b_used = params.wb_b;
 
     // MHC (quality) demosaic — full-res interleaved RGB16, honouring the CFA phase.
+    // A linear DNG retained its already-RGB samples (3 per pixel): no demosaic.
     let t = now_ms();
-    let mut rgb16 = demosaic::demosaic_bayer_mhc_gains(
-        &raw,
-        w,
-        h,
-        phase,
-        demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
-    )
-    .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
+    let mut rgb16 = if raw.len() == w * h * 3 {
+        raw
+    } else {
+        let rgb = demosaic::demosaic_bayer_mhc_gains(
+            &raw,
+            w,
+            h,
+            phase,
+            demosaic::MhcGains::from_wb(params.wb_r, params.wb_g, params.wb_b),
+        )
+        .map_err(|e| JsError::new(&format!("DNG demosaic: {}", e)))?;
+        drop(raw);
+        rgb
+    };
     let demosaic_ms = now_ms() - t;
-    drop(raw);
 
     let want_full16 = output_flags & OUT_FULL_16 != 0;
     let want_disp16 = output_flags & OUT_FULL_DISP16 != 0;
@@ -2337,6 +2348,7 @@ fn process_orf_impl(
         // baseline); the DNG-specific retain fields stay unset on this path.
         retained_dng_phase: None,
         retained_dng_baseline: 0.0,
+        profile_tone_curve: None,
         denoise_requested: false,
         denoise_applied: false,
         denoise_ms: 0.0,
@@ -3767,6 +3779,55 @@ mod tests {
             "deferred finish != monolithic (baseline + look)"
         );
     }
+
+    /// Apple ProRAW (linear DNG, 3 samples/pixel) renders through the app path, and
+    /// the retain + finish split is byte-identical to the monolithic render. Skips
+    /// when the fixtures are absent. `PRORAW_DUMP=<dir>` also writes each oriented
+    /// render as PPM, for comparison with `examples/dng_render.rs`.
+    #[test]
+    fn linear_dng_proraw_renders_and_retain_matches_monolithic() {
+        let dir = std::path::Path::new("../raw-converter/tests/dng-external");
+        let mut ran = 0;
+        for name in ["iphone12pro_IMG_1361.DNG", "UTWY1533.DNG"] {
+            let Ok(data) = std::fs::read(dir.join(name)) else {
+                eprintln!("SKIP {name}: fixture absent");
+                continue;
+            };
+            let neutral = LookOverrides::neutral();
+            let full = OUT_FULL_RGB8 | OUT_NO_ORIENT;
+            let mono = process_dng_impl(decode_dng_raw(&data, full).unwrap(), full, &neutral)
+                .unwrap();
+            assert_eq!(mono.rgb.len(), 4032 * 3024 * 3, "{name}");
+            let mean = mono.rgb.iter().map(|&v| v as u64).sum::<u64>() / mono.rgb.len() as u64;
+            assert!((20..235).contains(&mean), "{name}: mean {mean} is black or blown");
+
+            let split = OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW;
+            let mut r = process_dng_impl(decode_dng_raw(&data, split).unwrap(), split, &neutral)
+                .unwrap();
+            assert!(r.lb_w > 0 && r.thumb_w > 0, "{name}: previews missing");
+            let nan = f32::NAN;
+            r.finish_dng_full_rgb8(full, 0., 0., 0., 0., 0., 0., 0., 0., 0., 0., nan, nan, 0., 0.)
+                .unwrap();
+            assert!(r.rgb == mono.rgb, "{name}: retain+finish != monolithic");
+            ran += 1;
+
+            if let Ok(out) = std::env::var("PRORAW_DUMP") {
+                let o = process_dng_impl(
+                    decode_dng_raw(&data, OUT_FULL_RGB8).unwrap(),
+                    OUT_FULL_RGB8,
+                    &neutral,
+                )
+                .unwrap();
+                let mut ppm = format!("P6\n{} {}\n255\n", o.width, o.height).into_bytes();
+                ppm.extend_from_slice(&o.rgb);
+                std::fs::write(std::path::Path::new(&out).join(format!("{name}.app.ppm")), ppm)
+                    .unwrap();
+                eprintln!("{name}: mean {mean}, wb {}/{}, white {}, baseline_ev {}",
+                    o.wb_r_used, o.wb_b_used, o.white_used, o.baseline_ev_used);
+            }
+        }
+        eprintln!("ProRAW fixtures rendered: {ran}");
+    }
 }
 
 /// WASM-resident rendering state for a single image (lightbox or thumbnail).
@@ -3803,6 +3864,9 @@ pub struct LookRenderer {
     // render() must apply the same baseline the initial decode used or slider
     // edits jump ±1 EV.
     baseline_ev: f32,
+    // DNG ProfileToneCurve the decode rendered with (Apple ProRAW), so live edits
+    // keep the maker's curve instead of the generic baseline S-curve.
+    profile_tone_curve: Option<std::sync::Arc<[(f32, f32)]>>,
 }
 
 impl LookRenderer {
@@ -3828,6 +3892,7 @@ impl LookRenderer {
         black: u16,
         white: u16,
         baseline_ev: f32,
+        profile_tone_curve: Option<std::sync::Arc<[(f32, f32)]>>,
     ) -> LookRenderer {
         let w = width as usize;
         let h = height as usize;
@@ -3852,6 +3917,7 @@ impl LookRenderer {
             black,
             white,
             baseline_ev,
+            profile_tone_curve,
         }
     }
 }
@@ -3952,6 +4018,7 @@ impl LookRenderer {
             black,
             white,
             baseline_ev,
+            profile_tone_curve: None,
         })
     }
 
@@ -4006,6 +4073,7 @@ impl LookRenderer {
         // Same per-format exposure baseline as the initial decode (ORF 0.40 vs the
         // legacy 1.40) — else the first slider touch jumps the preview ±1 EV.
         params.baseline_ev = self.baseline_ev;
+        params.profile_tone_curve = self.profile_tone_curve.clone();
         if wb_r.is_finite() && wb_r > 0.0 {
             params.wb_r = wb_r;
         }
@@ -4254,6 +4322,12 @@ fn run_denoise_on_rgb16(
     if !opts.enabled {
         return (DenoiseTelemetry::disabled(), rgb_mhc);
     }
+    // Linear DNG: no mosaic to estimate noise from (the noise model is per CFA plane).
+    if raw.is_empty() {
+        let mut tel = DenoiseTelemetry::disabled();
+        tel.reason = "linear DNG (no mosaic)".to_string();
+        return (tel, rgb_mhc);
+    }
 
     // Blind noise estimation from the raw mosaic.
     let blind = estimate_noise(raw, width, height, cfa_index, metadata);
@@ -4353,7 +4427,8 @@ struct DngDecoded {
     thumb_w: usize,
     thumb_h: usize,
     fast_preview: bool,
-    // Raw mosaic retained for noise-aware processing (empty unless denoise path).
+    // Raw mosaic retained for noise-aware processing (empty unless denoise path;
+    // always empty for a linear DNG, which has no mosaic).
     // `cfa_index`: 0=RGGB,1=GRBG,2=GBRG,3=BGGR (matches estimate_noise / score_noise).
     raw_mosaic: Vec<u16>,
     cfa_index: usize,
@@ -4494,14 +4569,6 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         .map_err(|e| JsError::new(&format!("DNG decode: {}", e)))?;
     let decode_ms = now_ms() - t;
 
-    // This path demosaics; a Linear DNG (ProRAW, samples_per_pixel=3) is already
-    // demosaiced and its interleaved raw would be misread as a mosaic here.
-    if img.samples_per_pixel != 1 {
-        return Err(JsError::new(
-            "DNG: linear RGB DNG (e.g. Apple ProRAW) is not supported in this render path yet",
-        ));
-    }
-
     let w = img.width;
     let h = img.height;
     if w == 0 || h == 0 {
@@ -4518,6 +4585,11 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
             "DNG: {} pixels exceeds 120 MP browser processing limit",
             w * h
         )));
+    }
+    match img.samples_per_pixel {
+        1 => {}
+        3 => return decode_linear_dng(img, decode_ms),
+        n => return Err(JsError::new(&format!("DNG: {n} samples per pixel not supported"))),
     }
 
     let t = now_ms();
@@ -4580,6 +4652,134 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
         raw_mosaic,
         cfa_index,
         noise_metadata,
+    })
+}
+
+/// Linear DNG (3 samples/pixel: Apple ProRAW, Adobe Linear DNG). Already
+/// demosaiced, so no MHC: the interleaved RGB becomes `rgb16` and feeds the same
+/// tone path. Colour steps are those of `examples/dng_render.rs` (the reference
+/// render): LinearizationTable, then black; no ForwardMatrix (Apple) = the
+/// Bradford ColorMatrix path with WB inside the matrix, else the ForwardMatrix
+/// with the gray-world WB gate; ProfileGainTableMap (the Apple local tone map)
+/// baked into the samples. `raw_mosaic` is left EMPTY: there is no mosaic, so
+/// retain keeps `rgb16` instead and denoise is skipped.
+fn decode_linear_dng(
+    mut img: raw_pipeline::dng::DngImage,
+    decode_ms: f64,
+) -> Result<DngDecoded, JsError> {
+    use raw_pipeline::dng;
+    let (w, h) = (img.width, img.height);
+    if img.raw.len() != w * h * 3 {
+        return Err(JsError::new("DNG: linear RGB sample count mismatch"));
+    }
+    let t = now_ms();
+    // Stored codes → linear: BlackLevel and WhiteLevel live in the table's output domain.
+    let lin = &img.linearization_table;
+    let black = img.black;
+    for v in img.raw.iter_mut() {
+        let l = if lin.is_empty() { *v } else { lin[(*v as usize).min(lin.len() - 1)] };
+        *v = l.saturating_sub(black);
+    }
+    let range = img.white.saturating_sub(black).max(1);
+
+    let mut params = pipeline::PipelineParams::default_olympus();
+    params.black = 0;
+    params.white = range;
+    // The file's BaselineExposure is the exposure authority (Apple: -1.3..+3.9 EV);
+    // the Olympus-derived +1.40 EV Bayer baseline would blow it out. Folded into
+    // `baseline_ev` (not `baseline_exposure`) so the live LookRenderer, which only
+    // sees `baseline_ev_used`, renders at the same exposure as this decode.
+    params.baseline_ev = img.baseline_exposure;
+    if img.profile_tone_curve.len() >= 4 {
+        let pts: Vec<(f32, f32)> =
+            img.profile_tone_curve.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        params.profile_tone_curve = Some(pts.into());
+    }
+    let bradford = if img.forward_matrix.is_none() {
+        img.color_matrix
+            .and_then(|m| dng::color_matrix_bradford(m, img.wb_r, img.wb_b))
+    } else {
+        None
+    };
+    let (wb_r, wb_b, matrix) = match bradford {
+        Some(m) => (1.0, 1.0, Some(m)),
+        None if dng::wb_moves_toward_grey(&img.raw, img.wb_r, img.wb_b) => {
+            (img.wb_r, img.wb_b, img.color_matrix)
+        }
+        None => (1.0, 1.0, img.color_matrix),
+    };
+    // WB + matrix are BAKED into the samples (linear sRGB) and the pipeline gets the
+    // identity: its per-channel highlight shoulder then acts on display RGB, as the
+    // reference's does. Left in camera space it tinted bright clouds pink (camera G
+    // shouldered harder than R/B, and the matrix turned that into magenta).
+    let m = pipeline::ColorMatrix::from(matrix).matrix();
+    let m = [0, 1, 2].map(|r| [m[r][0] * wb_r, m[r][1], m[r][2] * wb_b]);
+    params.wb_r = 1.0;
+    params.wb_b = 1.0;
+    params.color_matrix = Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]).into();
+    // ProfileGainTableMap: its weight is computed on the render RGB scaled to
+    // v/White × 2^Baseline, and its one gain multiplies all three channels.
+    let map = img.profile_gain_table_map.as_ref();
+    let wscale = 2f32.powf(img.baseline_exposure) / range as f32;
+    let render = |i: usize, p: &[u16]| -> [f32; 3] {
+        let c = [p[0] as f32, p[1] as f32, p[2] as f32];
+        let rgb = [0, 1, 2].map(|r| (m[r][0] * c[0] + m[r][1] * c[1] + m[r][2] * c[2]).max(0.0));
+        let g = map.map_or(1.0, |map| {
+            let (x, y) = (i % w, i / w);
+            let (u, v) = ((x as f64 + 0.5) / w as f64, (y as f64 + 0.5) / h as f64);
+            map.gain(u, v, rgb.map(|s| s * wscale))
+        });
+        rgb.map(|s| s * g)
+    };
+    // Matrix and gains lift samples past white: find the peak, then scale samples
+    // AND white into u16 range together (exact, no clipping).
+    let mut peak = 0f32;
+    for (i, p) in img.raw.chunks_exact(3).enumerate() {
+        peak = render(i, p).into_iter().fold(peak, f32::max);
+    }
+    let k = if peak > 65535.0 { 65535.0 / peak } else { 1.0 };
+    for (i, p) in img.raw.chunks_exact_mut(3).enumerate() {
+        let rgb = render(i, p);
+        for (v, s) in p.iter_mut().zip(rgb) {
+            *v = (s * k + 0.5).min(65535.0) as u16;
+        }
+    }
+    params.white = ((range as f32 * k).round() as u16).max(1);
+    let demosaic_ms = now_ms() - t;
+    let color_matrix_flat: [f32; 9] = {
+        let m = params.color_matrix.matrix();
+        [
+            m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+        ]
+    };
+    Ok(DngDecoded {
+        rgb16: img.raw,
+        aw: w,
+        ah: h,
+        params,
+        color_matrix_flat,
+        decode_ms,
+        demosaic_ms,
+        orientation: img.orientation,
+        make: img.make,
+        model: img.model,
+        iso: img.iso.unwrap_or(0),
+        baseline_exposure: 0.0, // folded into params.baseline_ev above
+        wb_from_camera: img.wb_from_camera,
+        datetime: img.datetime,
+        gps_lat: img.gps_lat,
+        gps_lon: img.gps_lon,
+        gps_alt: img.gps_alt,
+        lb_packed: Vec::new(),
+        lb_w: 0,
+        lb_h: 0,
+        thumb_packed: Vec::new(),
+        thumb_w: 0,
+        thumb_h: 0,
+        fast_preview: false,
+        raw_mosaic: Vec::new(),
+        cfa_index: 0,
+        noise_metadata: img.noise_metadata,
     })
 }
 
@@ -4698,7 +4898,14 @@ fn process_dng_impl(
         let phase = dng_phase_from_cfa_index(cfa_index);
         let mut reported = params.clone();
         apply_look_to_params(&mut reported, &look_with_baseline(look, baseline_exposure));
-        drop(rgb16); // full-res buffer not needed on the retain path
+        // A linear DNG has no mosaic (`raw_mosaic` empty): retain its RGB instead, which
+        // `finish_dng_from_raw` recognises by length and does not demosaic.
+        let retained = if raw_mosaic.is_empty() {
+            rgb16
+        } else {
+            drop(rgb16); // full-res buffer not needed on the retain path
+            raw_mosaic
+        };
         return Ok(ProcessResult {
             rgb: Vec::new(),
             width: 0,
@@ -4749,12 +4956,13 @@ fn process_dng_impl(
             quality: 0,
             wb_mode: 0xFFFF,
             wb_from_camera,
-            retained_raw: Some(raw_mosaic),
+            retained_raw: Some(retained),
             retained_params: Some(params),
             retained_w: aw,
             retained_h: ah,
             retained_dng_phase: Some(phase),
             retained_dng_baseline: baseline_exposure,
+            profile_tone_curve: reported.profile_tone_curve.clone(),
             denoise_requested: false,
             denoise_applied: false,
             denoise_ms: 0.0,
@@ -4951,6 +5159,7 @@ fn process_dng_impl(
         retained_h: 0,
         retained_dng_phase: None,
         retained_dng_baseline: 0.0,
+        profile_tone_curve: params.profile_tone_curve.clone(),
         denoise_requested: false,
         denoise_applied: false,
         denoise_ms: 0.0,
@@ -5540,7 +5749,7 @@ fn decode_cr2_raw(data: &[u8]) -> Result<Cr2Decoded, JsError> {
     // geometric center).  demosaic_bayer_mhc accepts an explicit phase so
     // the demosaicer assigns R/G/B correctly regardless of crop origin.
     let t = now_ms();
-    let mut rgb16 = demosaic::demosaic_bayer_mhc_gains(
+    let rgb16 = demosaic::demosaic_bayer_mhc_gains(
         &cr2.raw,
         w,
         h,
@@ -5860,6 +6069,9 @@ pub fn create_dng_denoise_session(
     RawProcessOptions::from_js(&options)?; // fail-fast validation
     let output_flags = DENOISE_SESSION_FLAGS;
     let decoded = decode_dng_raw(data, output_flags | OUT_FULL_RGB8)?;
+    if decoded.raw_mosaic.is_empty() {
+        return Err(JsError::new("DNG denoise session: linear DNG has no mosaic"));
+    }
     Ok(DenoiseSession::from_decoded(decoded, output_flags))
 }
 
@@ -7054,6 +7266,7 @@ impl ResidentDeveloped {
             // Developed (non-RAW) pixels keep the legacy baseline — byte-identical to
             // the worker path, whose new_with_options call omits the arg.
             pipeline::BASELINE_EXP_EV,
+            None,
         )
     }
 
@@ -7083,6 +7296,7 @@ impl ResidentDeveloped {
             0,
             0,
             pipeline::BASELINE_EXP_EV,
+            None,
         )
     }
 

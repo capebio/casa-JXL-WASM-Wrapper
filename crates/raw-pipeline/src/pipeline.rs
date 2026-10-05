@@ -397,6 +397,10 @@ pub struct PipelineParams {
     /// (1.40). Any live re-tone path must carry the SAME value the initial decode
     /// used, or the first slider touch jumps the image ±1 EV.
     pub baseline_ev: f32,
+    /// A DNG ProfileToneCurve (Apple ProRAW): linear→linear `(x, y)` control
+    /// points, x ascending. When set it REPLACES the always-on baseline contrast
+    /// S-curve (it is the maker's own curve); the user sliders still apply on top.
+    pub profile_tone_curve: Option<std::sync::Arc<[(f32, f32)]>>,
 }
 
 impl PipelineParams {
@@ -423,6 +427,7 @@ impl PipelineParams {
             perceptual_constancy: false,
             compact_lut: false,
             baseline_ev: BASELINE_EXP_EV,
+            profile_tone_curve: None,
         }
     }
 }
@@ -479,13 +484,31 @@ struct TonePost {
     highlights: f32,
     whites: f32,
     blacks: f32,
+    profile: Option<std::sync::Arc<[(f32, f32)]>>,
 }
 
-/// LR-style per-channel tone curve: blacks/whites endpoint shifts,
-/// shadows/highlights region gammas, contrast S-curve, baseline curve,
-/// sRGB EOTF.  Input/output in [0,1] linear.
+/// Piecewise-linear lookup in sorted `(x, y)` control points, `x` clamped to [0,1].
+fn sample_profile_curve(c: &[(f32, f32)], x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let i = c.partition_point(|&(cx, _)| cx <= x);
+    if i == 0 {
+        c[0].1
+    } else if i >= c.len() {
+        c[c.len() - 1].1
+    } else {
+        let ((x0, y0), (x1, y1)) = (c[i - 1], c[i]);
+        if x1 > x0 { y0 + (y1 - y0) * (x - x0) / (x1 - x0) } else { y0 }
+    }
+}
+
+/// LR-style per-channel tone curve: profile curve (when the file has one),
+/// blacks/whites endpoint shifts, shadows/highlights region gammas, contrast
+/// S-curve, baseline curve, sRGB EOTF.  Input/output in [0,1] linear.
 fn tone_curve(x: f32, p: &TonePost) -> f32 {
-    let mut y = x;
+    let profile = p.profile.as_deref().filter(|c| !c.is_empty());
+    let mut y = profile.map_or(x, |c| sample_profile_curve(c, x));
+    // A profile curve replaces the always-on baseline contrast.
+    let baseline_contrast = if profile.is_some() { 0.0 } else { BASELINE_CONTRAST };
 
     // Endpoint shifts: independent operations so each slider works without the other.
     let blk_offset = p.blacks * BLK_OFFSET_SCALE;
@@ -512,9 +535,9 @@ fn tone_curve(x: f32, p: &TonePost) -> f32 {
     // Scale user delta to fill the remaining headroom each side so the full
     // slider range is usable: positive fills [BASELINE, 1], negative fills [BASELINE, -1].
     let c = if p.contrast >= 0.0 {
-        BASELINE_CONTRAST + p.contrast * (1.0 - BASELINE_CONTRAST)
+        baseline_contrast + p.contrast * (1.0 - baseline_contrast)
     } else {
-        BASELINE_CONTRAST + p.contrast * (1.0 + BASELINE_CONTRAST)
+        baseline_contrast + p.contrast * (1.0 + baseline_contrast)
     }
     .clamp(-1.0, 1.0);
     if c > 1e-4 {
@@ -894,6 +917,8 @@ struct LutCache {
     highlights_bits: u32,
     whites_bits: u32,
     blacks_bits: u32,
+    /// Held (not just compared) so its address cannot be reused while cached.
+    profile: Option<std::sync::Arc<[(f32, f32)]>>,
     pre_r: std::sync::Arc<Vec<u16>>,
     pre_g: std::sync::Arc<Vec<u16>>,
     pre_b: std::sync::Arc<Vec<u16>>,
@@ -942,6 +967,11 @@ impl LutCache {
             && self.highlights_bits == tone.highlights.to_bits()
             && self.whites_bits == tone.whites.to_bits()
             && self.blacks_bits == tone.blacks.to_bits()
+            && match (&self.profile, &tone.profile) {
+                (None, None) => true,
+                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                _ => false,
+            }
     }
 }
 
@@ -1895,6 +1925,7 @@ fn derive_tone_inputs(params: &PipelineParams) -> ToneInputs {
         highlights: params.highlights.clamp(-1.0, 1.0),
         whites: params.whites.clamp(-1.0, 1.0),
         blacks: params.blacks.clamp(-1.0, 1.0),
+        profile: params.profile_tone_curve.clone(),
     };
     let sat_param = params.saturation.clamp(-1.0, 1.0);
     // branchless for the sat blend (faster, no mispredict in per-image call)
@@ -1965,6 +1996,7 @@ fn ensure_lut(
                 highlights_bits: ti.tone.highlights.to_bits(),
                 whites_bits: ti.tone.whites.to_bits(),
                 blacks_bits: ti.tone.blacks.to_bits(),
+                profile: ti.tone.profile.clone(),
                 pre_r,
                 pre_g,
                 pre_b,
@@ -2007,6 +2039,7 @@ fn ensure_lut(
                 c.highlights_bits = ti.tone.highlights.to_bits();
                 c.whites_bits = ti.tone.whites.to_bits();
                 c.blacks_bits = ti.tone.blacks.to_bits();
+                c.profile = ti.tone.profile.clone();
             } else if need16 && c.post16.is_none() {
                 c.post16 = Some(std::sync::Arc::new(build_post16_lut(&ti.tone)));
             }
@@ -4325,6 +4358,7 @@ mod tonemap_flip_flops {
             perceptual_constancy: false,
             compact_lut: false,
             baseline_ev: BASELINE_EXP_EV,
+            profile_tone_curve: None,
         };
 
         // Support graphing stabilization: print CSV + running stats. 30 is often excessive; bench shows signal settles ~8-12.
@@ -5086,6 +5120,28 @@ mod region_tests {
             }
         }
         v
+    }
+
+    /// A profile tone curve changes the render, and the thread-local LUT cache never
+    /// serves a stale curve: A, B, then A again must reproduce A exactly.
+    #[test]
+    fn profile_tone_curve_applies_and_invalidates_lut_cache() {
+        let rgb16 = synth_rgb16(16, 12);
+        let mut params = PipelineParams::default_olympus();
+        let plain = process_auto(&rgb16, &params);
+        let lift: std::sync::Arc<[(f32, f32)]> = vec![(0.0, 0.0), (0.25, 0.5), (1.0, 1.0)].into();
+        let ident: std::sync::Arc<[(f32, f32)]> = vec![(0.0, 0.0), (1.0, 1.0)].into();
+        params.profile_tone_curve = Some(lift.clone());
+        let a = process_auto(&rgb16, &params);
+        params.profile_tone_curve = Some(ident);
+        let b = process_auto(&rgb16, &params);
+        params.profile_tone_curve = Some(lift);
+        assert_eq!(process_auto(&rgb16, &params), a, "stale LUT after curve change");
+        assert_ne!(a, b);
+        // Identity curve = no baseline S-curve (it replaces it), so it differs from plain.
+        assert_ne!(b, plain);
+        let mean = |v: &[u8]| v.iter().map(|&x| x as u64).sum::<u64>();
+        assert!(mean(&a) > mean(&b), "lifting curve must brighten");
     }
 
     #[test]
