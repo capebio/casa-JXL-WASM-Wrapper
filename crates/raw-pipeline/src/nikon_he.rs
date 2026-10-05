@@ -323,42 +323,62 @@ fn decode_packet(
 }
 
 /// exact JPEG XS 5/3 inverse (idwt_horizontal_line, shift 0)
-fn idwt(lf: &[i32], hf: &[i32]) -> Vec<i32> {
+///
+/// **Every add and subtract here is checked, and `None` means refuse.** The
+/// lifting steps are the one place in this decoder where a misread coefficient
+/// becomes an arithmetic fault rather than a wrong pixel: `size` in
+/// [`decode_packet`] is only clamped to 31 bitplanes and is then shifted left by
+/// the truncation level, so a stream this decoder does not model can hand these
+/// lines values within a factor of two of `i32::MAX` and the very next `+`
+/// leaves the type.
+///
+/// It is not hypothetical. Measured 2026-09-08 over the seven corpus files whose
+/// strip begins `FF 10`: the four Z 9 bodies synthesise fine, and all three of
+/// `8bit-compressed-other__Z6_3`, `__Z5_2` and `__Z50_2` overflowed here — the
+/// panic the SOC routing first exposed. Under `panic = "abort"` that is a crash;
+/// in a release build, where Rust does not check `+`, it was worse: the same
+/// three files wrapped silently and would have produced a plane out of numbers
+/// that mean nothing. Refusing is the only answer that is right in both
+/// profiles.
+fn idwt(lf: &[i32], hf: &[i32]) -> Option<Vec<i32>> {
     let len = lf.len() + hf.len();
     let mut out = vec![0i32; len];
     if len < 2 {
         if len == 1 {
-            out[0] = lf[0];
+            out[0] = *lf.first()?;
         }
-        return out;
+        return Some(out);
     }
-    out[0] = lf[0] - ((hf[0] + 1) >> 1);
+    out[0] = lf.first()?.checked_sub((hf.first()?.checked_add(1)?) >> 1)?;
     let (mut li, mut hi, mut oi) = (0usize, 0usize, 0usize);
     let mut i = 1usize;
     while i + 2 < len {
-        out[oi + 2] = lf[li + 1] - ((hf[hi] + hf[hi + 1] + 2) >> 2);
-        out[oi + 1] = hf[hi] + ((out[oi] + out[oi + 2]) >> 1);
+        let h2 = hf.get(hi)?.checked_add(*hf.get(hi + 1)?)?.checked_add(2)?;
+        out[oi + 2] = lf.get(li + 1)?.checked_sub(h2 >> 2)?;
+        out[oi + 1] = hf.get(hi)?.checked_add(out[oi].checked_add(out[oi + 2])? >> 1)?;
         li += 1;
         hi += 1;
         oi += 2;
         i += 2;
     }
     if len & 1 == 1 {
-        out[oi + 2] = lf[li + 1] - ((hf[hi] + 1) >> 1);
-        out[oi + 1] = hf[hi] + ((out[oi] + out[oi + 2]) >> 1);
+        out[oi + 2] = lf.get(li + 1)?.checked_sub(hf.get(hi)?.checked_add(1)? >> 1)?;
+        out[oi + 1] = hf.get(hi)?.checked_add(out[oi].checked_add(out[oi + 2])? >> 1)?;
     } else {
-        out[oi + 1] = hf[hi] + out[oi];
+        out[oi + 1] = hf.get(hi)?.checked_add(out[oi])?;
     }
-    out
+    Some(out)
 }
 
 /// horizontal synthesis of a coarse pyramid: LL + 4 horizontal-detail bands -> full-width row.
-fn synth_row(co: &[Vec<i32>]) -> Vec<i32> {
-    let mut low = co[0].clone();
+///
+/// `None` propagates [`idwt`]'s refusal.
+fn synth_row(co: &[Vec<i32>]) -> Option<Vec<i32>> {
+    let mut low = co.first()?.clone();
     for k in 1..co.len().min(5) {
-        low = idwt(&low, &co[k]);
+        low = idwt(&low, &co[k])?;
     }
-    low
+    Some(low)
 }
 
 pub fn decode(
@@ -369,6 +389,11 @@ pub fn decode(
     h: usize,
     make: String,
     model: String,
+    // Both read from the file by `decode_nef`, which owns the sensor SubIFD and
+    // the MakerNote. This module used to hardcode them; see the construction at
+    // the end of this function for what that cost.
+    cfa_phase: (u8, u8),
+    wb: (f32, f32, f32),
 ) -> Result<BayerImage, String> {
     let end = off.checked_add(len).ok_or("NEF-HE: strip overflow")?;
     if end > d.len() {
@@ -496,9 +521,13 @@ pub fn decode(
             let c3 = decode_packet(s, offs[3], &bandinfo(2), q, r, first, &mut pg3, &mut pt3);
             let c2 = decode_packet(s, offs[2], &dr_band, q, r, first, &mut pg2, &mut pt2);
             if row < rows {
-                let sg = synth_row(&c0);
-                let sdg = synth_row(&c1);
-                let sdb = synth_row(&c3);
+                // A refusal here means the coefficients are not what this
+                // decoder models — Z 9 class only, see `idwt`. Naming the row is
+                // what turns "it panicked somewhere" into a reportable finding.
+                let bad = || format!("NEF-HE: coefficients out of range at precinct row {row} — this decoder models the Z 9 codestream only");
+                let sg = synth_row(&c0).ok_or_else(bad)?;
+                let sdg = synth_row(&c1).ok_or_else(bad)?;
+                let sdb = synth_row(&c3).ok_or_else(bad)?;
                 for x in 0..cw {
                     pg[row * cw + x] = *sg.get(x).unwrap_or(&0) as i64;
                     pdg[row * cw + x] = *sdg.get(x).unwrap_or(&0) as i64;
@@ -571,17 +600,102 @@ pub fn decode(
         width: w,
         height: h,
         raw,
-        cfa_phase: (0, 0), // RGGB, red at origin
+        cfa_phase,
         black: 0,
         white,
-        // Accurate as-shot WB from NEF MakerNote tag 0x000C. NOTE: this experimental
-        // reconstruction is not in true sensor-raw balance (R≈g, B≈g), so a viewer applying
-        // this WB + a camera matrix casts magenta — correct pipeline, wrong-units input.
-        wb_r: 1.7051,
-        wb_g: 1.0,
-        wb_b: 1.5449,
+        // **These were hardcoded to 1.7051 / 1.0 / 1.5449 and they are one file's
+        // numbers.** That is the as-shot white balance of `nikon_z9_he`, read
+        // from its MakerNote 0x000C and then frozen into the source, so every
+        // other HE body silently inherited it: the Z 9 HE* files carry 1.546875
+        // where this claimed 1.544921875, and any future body could be as far out
+        // as the 68% the ordinary NEF path's placeholder was on a Z 6. The caller
+        // reads the tag; this takes what it read.
+        //
+        // NOTE, unchanged and still true: this experimental reconstruction is not
+        // in true sensor-raw balance (R≈g, B≈g), so a viewer applying this WB
+        // plus a camera matrix casts magenta — correct pipeline, wrong-units input.
+        wb_r: wb.0,
+        wb_g: wb.1,
+        wb_b: wb.2,
         make,
         model: format!("{model} [HE experimental]"),
         strip: off..end,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::panasonic::decode_nef;
+
+    /// **An HE body this decoder does not model must refuse, not overflow.**
+    ///
+    /// `decode_packet` clamps a group's bitplane count only to 31 and then
+    /// shifts it left by the truncation level, so a codestream shaped unlike the
+    /// Z 9's hands [`super::idwt`] values near `i32::MAX`. Before the checked
+    /// arithmetic went in, all three of these files panicked at the same lifting
+    /// step — and in a release build, where `+` is not checked, they wrapped
+    /// silently instead, which is worse.
+    ///
+    /// Measured 2026-09-08 across every corpus file whose strip begins `FF 10`:
+    /// the four Z 9 HE/HE* files synthesise (8280x5520, max 8008), and these
+    /// three refuse — Z 6 III at precinct row 157, Z 5 II at 213, Z 50 II at 95.
+    /// Only the small ones are here; a Z 9 decode is ~45 s, which is what
+    /// [`the_z9_codestream_this_decoder_does_model_still_decodes`] costs and why
+    /// it is ignored by default.
+    #[test]
+    fn an_he_body_this_decoder_does_not_model_refuses_rather_than_overflowing() {
+        for name in
+            ["8bit-compressed-other__Z6_3", "8bit-compressed-other__Z5_2", "8bit-compressed-other__Z50_2"]
+        {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let e = decode_nef(&d).expect_err("must refuse rather than overflow");
+            assert!(
+                e.starts_with("NEF-HE:"),
+                "{name} must reach the HE decoder and be refused by it, got: {e}"
+            );
+            assert!(e.contains("out of range"), "{name}: unhelpful refusal: {e}");
+        }
+    }
+
+    /// **The Z 9 arm still works.** The guard above must refuse the bodies this
+    /// decoder cannot read without also refusing the one it can, so this is the
+    /// other half of the same measurement: 8280x5520, every sample non-zero,
+    /// maximum 8008.
+    ///
+    /// Ignored by default because it decodes 17 MB of codestream at roughly 45 s
+    /// a file. Run it with `cargo test --lib -- --ignored`.
+    #[test]
+    #[ignore = "~45 s: decodes a full 8280x5520 Z 9 HE codestream"]
+    fn the_z9_codestream_this_decoder_does_model_still_decodes() {
+        const F: &str = r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_he.NEF";
+        let Ok(d) = std::fs::read(F) else {
+            eprintln!("skipped: {F} not present");
+            return;
+        };
+        let b = decode_nef(&d).expect("a Z 9 HE NEF must decode");
+        assert_eq!((b.width, b.height), (8280, 5520));
+        assert_eq!(b.raw.len(), b.width * b.height);
+        assert!(b.raw.iter().all(|&v| v != 0), "a blank plane is not a decode");
+        assert_eq!(b.raw.iter().copied().max().unwrap(), 8008);
+        // From the file's MakerNote 0x000C, not from this module. The HE* sibling
+        // records 1.546875 for blue, which is what the old hardcode got wrong;
+        // `panasonic::tests::the_he_bodies_have_their_own_white_balance_to_read`
+        // pins that half without paying for a decode.
+        assert_eq!((b.wb_r, b.wb_g, b.wb_b), (1.705078125, 1.0, 1.544921875));
+    }
+
+    /// **`idwt` refuses instead of wrapping, and this is the check that can
+    /// fail.** Two lines that overflow at the first lifting step, and one
+    /// ordinary pair that must still synthesise, so a `None`-always regression
+    /// is caught as loudly as a panic.
+    #[test]
+    fn the_lifting_step_refuses_coefficients_it_cannot_add() {
+        assert_eq!(super::idwt(&[10, 20], &[4]), Some(vec![8, 17, 18]));
+        assert_eq!(super::idwt(&[i32::MIN, 0], &[i32::MAX]), None);
+        assert_eq!(super::idwt(&[0, 0, 0], &[i32::MAX, i32::MAX]), None);
+    }
 }

@@ -127,13 +127,15 @@ fn main() {
             for k in 0..2 {
                 let which = (round + k) % 2;
                 let t = Instant::now();
+                // Both arms reduce to the one lane the sink consumes: the
+                // kernels' tuples are [u64; 3] and [u64; 4] and do not unify.
                 let r = if which == 0 {
-                    unsafe { ssim_moments_serial(&a, &b, np) }
+                    unsafe { ssim_moments_serial(&a, &b, np) }.1[1]
                 } else {
-                    unsafe { ssim_moments_avx2_cal(&a, &b, np) }
+                    unsafe { ssim_moments_avx2_cal(&a, &b, np) }.1[1]
                 };
                 let dt = t.elapsed().as_secs_f64() * 1e3;
-                sink = sink.wrapping_add(r.1[1]);
+                sink = sink.wrapping_add(r);
                 times[which].push(dt);
             }
         }

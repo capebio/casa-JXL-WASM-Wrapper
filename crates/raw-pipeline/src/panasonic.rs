@@ -582,6 +582,104 @@ impl<'a> NikonBits<'a> {
     }
 }
 
+
+/// The camera's own white balance from Nikon MakerNote `0x000C`, if it is there.
+///
+/// **`wb_r: 2.0, wb_g: 1.0, wb_b: 1.5` was a placeholder at three sites and it
+/// is wrong by a lot.** Measured against the tag the files actually carry: a D3
+/// is 1.6875 / 1.4688, a D500 2.2988 / 1.8101, and a Z 6 **1.1914 / 2.1191** —
+/// where the hardcode claims 2.0 / 1.5, that last one is 68% out on red and 41%
+/// out on blue. Any renderer using these numbers produces a colour cast that
+/// looks like a decode fault and is a metadata fault, which is the same
+/// confusion `tools/gallery.py`'s grey-world first draft caused from the other
+/// direction.
+///
+/// `0x000C` is `WB_RBGGLevels`: four rationals in **R, B, G, G** order, already
+/// normalised so green is 1.0. Older bodies do not carry it — a D100 has 32
+/// MakerNote tags and none is `0x000C`, and a D1X has no signed MakerNote at all
+/// — so this returns `None` there and the caller keeps the documented default
+/// rather than inventing one.
+///
+/// The MakerNote is located exactly as the linearisation curve is, because it is
+/// the same IFD; see the two-shapes comment in [`nikon_compressed`].
+fn nikon_wb(d: &[u8]) -> Option<(f32, f32, f32)> {
+    let sig = d.windows(6).position(|x| x == b"Nikon\0")?;
+    let base = sig + 10;
+    if base + 8 > d.len() {
+        return None;
+    }
+    let me = End::of(&d[base..])?;
+    let mo = base + me.u32(&d[base + 4..]) as usize;
+    if mo + 2 > d.len() {
+        return None;
+    }
+    let n = me.u16(&d[mo..]) as usize;
+    if n > 512 || mo + 2 + n * 12 > d.len() {
+        return None;
+    }
+    for i in 0..n {
+        let e = mo + 2 + i * 12;
+        if me.u16(&d[e..]) != 0x000C {
+            continue;
+        }
+        // RATIONAL (5), four of them: 32 bytes, always out of line.
+        if me.u16(&d[e + 2..]) != 5 || me.u32(&d[e + 4..]) < 4 {
+            return None;
+        }
+        let p = base + me.u32(&d[e + 8..]) as usize;
+        if p + 32 > d.len() {
+            return None;
+        }
+        let q = |k: usize| -> Option<f32> {
+            let (num, den) = (me.u32(&d[p + k * 8..]), me.u32(&d[p + k * 8 + 4..]));
+            (den != 0).then(|| num as f32 / den as f32)
+        };
+        let (r, b) = (q(0)?, q(1)?);
+        // A zero or absurd multiplier is a misread, not a white balance. Refusing
+        // keeps the documented default rather than shipping a black frame.
+        return (r > 0.05 && r < 16.0 && b > 0.05 && b < 16.0).then_some((r, 1.0, b));
+    }
+    None
+}
+
+/// The red sample's `(x, y)` from a TIFF/EP `CFAPattern` (33422), if declared.
+///
+/// **Nikon is not all RGGB, and this reader assumed it was.** The comment on the
+/// NEF plane said "Nikon Bayer is RGGB on every model in this corpus" and the
+/// corpus disagrees: of 36 NEF/NRW fixtures, **27 declare RGGB, 4 declare BGGR,
+/// 4 GBRG and 1 GRBG**. BGGR against a hardcoded RGGB is a red/blue transposition
+/// in every consumer that demosaics; GBRG and GRBG are a one-sample shift, which
+/// is wrong in a subtler and equally unrecoverable way.
+///
+/// The tag is the camera's own statement about its sensor, so reading it beats
+/// any model table — and it was independently confirmed before being trusted:
+/// on the D100 the pattern measured from the embedded preview (GRBG) is the
+/// pattern the file declares (GRBG), and across the whole corpus measured and
+/// declared agree on 47 of 47 files that state one.
+///
+/// Values are 0=R, 1=G, 2=B, row-major over the 2x2 site. Some writers prefix
+/// the repeat dimensions as two shorts, which is why a 6+ byte value with a
+/// leading `2,0`/`0,2` has four bytes skipped. Mapping matches
+/// [`pana_cfa_phase`]: red at index `i` is `(i % 2, i / 2)`.
+fn declared_cfa_phase(m: &HashMap<u16, Entry>) -> Option<(u8, u8)> {
+    let e = m.get(&33422)?;
+    let mut v = e.val.as_slice();
+    if v.len() >= 6 && matches!(&v[..2], [2, 0] | [0, 2]) {
+        v = &v[4..];
+    }
+    if v.len() < 4 {
+        return None;
+    }
+    // A site with no red, or more than one, is not a Bayer pattern this
+    // understands — refuse rather than default, because defaulting is the bug.
+    let reds: Vec<usize> = (0..4).filter(|&i| v[i] == 0).collect();
+    match reds[..] {
+        [i] => Some(((i % 2) as u8, (i / 2) as u8)),
+        _ => None,
+    }
+}
+
+
 /// A NEF that declares compression 34713 and carries **uncompressed packed
 /// samples**. `Some(plane)` when the strip is provably not a Huffman stream;
 /// `None` leaves the compressed path untouched.
@@ -669,6 +767,9 @@ fn nikon_compressed(
     // The FILE's byte order. Needed only for the unsigned-MakerNote fallback,
     // whose offsets are file-relative; a signed MakerNote carries its own.
     e: End,
+    // Read from the sensor SubIFD's CFAPattern by the caller, which is the IFD
+    // that has it; this function only ever sees the MakerNote.
+    cfa_phase: (u8, u8),
 ) -> Result<BayerImage, String> {
     // **Nikon has written two MakerNote shapes and both appear in this corpus.**
     //
@@ -782,18 +883,39 @@ fn nikon_compressed(
     let mut curve: Vec<u16> = (0..0x8000u32).map(|i| i as u16).collect();
     let csize = rd16(p) as usize;
     p += 2;
-    let step = if csize > 1 { max / (csize - 1) } else { 0 };
+    let mut step = if csize > 1 { max / (csize - 1) } else { 0 };
     let mut split = 0usize;
-    // Version 0x44 0x40 (14-bit, e.g. the Z 6's 14-bit compressed NEF) is
-    // LibRaw's addition, not dcraw's: the same interpolated curve at a quarter
-    // of the step and range (`nikon_read_curve`, `step /= 4; max /= 4`).
-    // Without it the curve stayed the identity and the plane was left in
-    // companded codes -- 62% of samples off LibRaw on that body (2026-09-27).
-    let (mut step, v40) = (step, ver0 == 0x44 && ver1 == 0x40);
-    if ver0 == 0x44 && (ver1 == 0x20 || (v40 && step > 3)) && step > 0 {
-        if v40 {
+    // **Version `0x44 0x40` is a quarter-scale interpolated curve, and reading
+    // it as a literal one silently loses the linearisation.**
+    //
+    // The `0x4440` shape stores the same 257 knots as `0x4420` but over a
+    // quarter of the range, so both `step` and `max` are divided by four before
+    // the interpolation. Without this arm it fell through to "read directly"
+    // below, which sets `max = csize` and copies 257 entries into a table left
+    // at its identity fill — so every sample above 256 came out as its own curve
+    // INDEX instead of the curve's value.
+    //
+    // Measured on `14bit-compressed-other__Z_6`, the one file in the corpus with
+    // this version: 15,146,739 of 24,498,560 samples differed from LibRaw, the
+    // plane maxed at 4092 where LibRaw reads 16371, and LibRaw's value was a
+    // pure monotone function of ours — 3,043 distinct values mapping one-to-one
+    // onto 3,043, identical below 1004 and diverging above. A perfect 1:1 map is
+    // what a missing lookup looks like; a broken decode does not produce one.
+    // Its siblings `Z_50` and `Z_f` are version `0x4630`, keep the identity
+    // curve, and were already exact, which is why this reads as body-specific.
+    if ver0 == 0x44 && (ver1 == 0x20 || ver1 == 0x40) && step > 0 {
+        if ver1 == 0x40 {
             step /= 4;
             max /= 4;
+        }
+        // `step` is the interpolation divisor below. dcraw tests it before the
+        // quarter-scaling and can therefore divide by zero on a crafted csize;
+        // refusing is cheaper than a panic and honest about what was unreadable.
+        if step == 0 {
+            return Err(format!(
+                "NEF: a {csize}-knot version {ver0:#04x}{ver1:02x} curve leaves no interpolation \
+                 step for {bits}-bit samples"
+            ));
         }
         for i in 0..csize {
             curve[i * step] = rd16(p) as u16;
@@ -851,16 +973,19 @@ fn nikon_compressed(
         }
     }
 
+    // The camera's own multipliers where the body records them; the documented
+    // default only where it does not.
+    let wb = nikon_wb(d).unwrap_or((2.0, 1.0, 1.5));
     Ok(BayerImage {
         width: w,
         height: h,
         raw: out,
-        cfa_phase: (0, 0),
+        cfa_phase,
         black: 0,
         white: curve[max - 1],
-        wb_r: 2.0,
-        wb_g: 1.0,
-        wb_b: 1.5,
+        wb_r: wb.0,
+        wb_g: wb.1,
+        wb_b: wb.2,
         make: tag_str(_ifd0, 271),
         model: tag_str(_ifd0, 272),
         // Nikon declares the compressed strip length outright, so no cursor
@@ -921,15 +1046,36 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
     let len = tag_u32(&st, 279).unwrap_or(0) as usize;
 
     check_dims(w, h, "NEF")?;
+    // **Declared, not assumed.** The sensor SubIFD carries CFAPattern on the
+    // bodies that are not RGGB; ifd0 is the fallback for writers that put it
+    // there. RGGB remains the default only for files that declare nothing.
+    let cfa_phase =
+        declared_cfa_phase(&st).or_else(|| declared_cfa_phase(&ifd0)).unwrap_or((0, 0));
+    let wb = nikon_wb(d).unwrap_or((2.0, 1.0, 1.5));
     if comp == 34713 {
-        // Nikon High Efficiency (HE / HE*) reuses compression tag 34713 but the
-        // strip is NOT Huffman-DPCM — it is a JPEG XS (intoPIX TicoRAW) codestream.
-        // Detect by the SOC marker `FF 10` and route to the HE decoder. Without
-        // this, HE files enter `nikon_compressed` and die at the 0x0096/0x008C
-        // linearisation-table sanity check with a misleading error.
+        // **Nikon reuses 34713 for High Efficiency, and an HE strip is not a
+        // Huffman-DPCM stream at all** — it is an intoPIX TicoRAW (JPEG XS)
+        // codestream, so it opens with the SOC marker `FF 10`.
+        //
+        // Measured before trusting the marker, because the lesson that started
+        // this thread is that 34713 itself turned out not to mean what it
+        // says. Over all 45 NEF/NRW files in the corpus, exactly 7 strips begin
+        // `FF 10` and all 7 are HE or HE* bodies (Z 50 II, Z 5 II, Z 6 III and
+        // four Z 9 HE/HE* files); the other 38 begin with 38 different byte
+        // pairs, none of them `FF 10`. In particular the D810 small-raw file
+        // that shares the linearisation-table refusal below begins `11 E1` and
+        // is NOT diverted here.
         if len >= 2 && off + 2 <= d.len() && d[off] == 0xFF && d[off + 1] == 0x10 {
             return crate::nikon_he::decode(
-                d, off, len, w, h, tag_str(&ifd0, 271), tag_str(&ifd0, 272),
+                d,
+                off,
+                len,
+                w,
+                h,
+                tag_str(&ifd0, 271),
+                tag_str(&ifd0, 272),
+                cfa_phase,
+                wb,
             );
         }
         // dcraw's trees exist only for 12/14 bits; anything else would shift
@@ -953,18 +1099,18 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
                 width: w,
                 height: h,
                 raw,
-                cfa_phase: (0, 0),
+                cfa_phase,
                 black: 0,
                 white: ((1u32 << bits) - 1).min(u16::MAX as u32) as u16,
-                wb_r: 2.0,
-                wb_g: 1.0,
-                wb_b: 1.5,
+                wb_r: wb.0,
+                wb_g: wb.1,
+                wb_b: wb.2,
                 make: tag_str(&ifd0, 271),
                 model: tag_str(&ifd0, 272),
                 strip: off..off + len,
             });
         }
-        return nikon_compressed(d, &ifd0, w, h, bits, off, len, e);
+        return nikon_compressed(d, &ifd0, w, h, bits, off, len, e, cfa_phase);
     }
     if comp != 1 {
         return Err(format!("NEF: compression {} is not supported", comp));
@@ -1106,14 +1252,13 @@ pub fn decode_nef(d: &[u8]) -> Result<BayerImage, String> {
         width: w,
         height: h,
         raw,
-        // Nikon Bayer is RGGB on every model in this corpus.
-        cfa_phase: (0, 0),
+        cfa_phase,
         black: 0,
         // `1u16 << 16` overflows; the widest legal white is u16::MAX.
         white: ((1u32 << bits) - 1).min(u16::MAX as u32) as u16,
-        wb_r: 2.0,
-        wb_g: 1.0,
-        wb_b: 1.5,
+        wb_r: wb.0,
+        wb_g: wb.1,
+        wb_b: wb.2,
         make: tag_str(&ifd0, 271),
         model: tag_str(&ifd0, 272),
         strip: strip_span,
@@ -1165,6 +1310,151 @@ mod tests {
         // whole plane is the pad -- not a truncated first pixel.
         assert_eq!(unpack_msb(&[0xff], 12, 3), vec![0, 0, 0]);
         assert_eq!(unpack_msb(&[0xff, 0xf0], 12, 3), vec![0xfff, 0, 0]);
+    }
+
+    /// **The white balance is the camera's, and the placeholder it replaced was
+    /// wrong by up to 68%.**
+    ///
+    /// `wb_r: 2.0, wb_g: 1.0, wb_b: 1.5` sat at three NEF construction sites and
+    /// was never read from a file. Against MakerNote `0x000C`: a D3 is
+    /// 1.6875/1.4688 and a Z 6 is **1.1914/2.1191**, so the placeholder overstated
+    /// the Z 6's red by 68% and understated its blue by 29%. Any renderer using
+    /// those numbers shows a cast that reads as a decode fault.
+    ///
+    /// The last case is the one that keeps the default honest: a D100 carries 32
+    /// MakerNote tags and none is `0x000C`, so it must fall back rather than
+    /// invent a value.
+    #[test]
+    fn the_white_balance_comes_from_the_file_where_the_file_has_one() {
+        for (name, want) in [
+            ("12bit-lossless__D3", Some((1.6875f32, 1.46875f32))),
+            ("12bit-compressed-other__Z_6", Some((1.1914063, 2.1191406))),
+            ("12bit-compressed-other__D100", None), // no 0x000C: documented default
+        ] {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            match want {
+                Some((r, bl)) => {
+                    assert!((b.wb_r - r).abs() < 1e-4, "{name}: wb_r {} want {r}", b.wb_r);
+                    assert!((b.wb_b - bl).abs() < 1e-4, "{name}: wb_b {} want {bl}", b.wb_b);
+                }
+                None => assert_eq!(
+                    (b.wb_r, b.wb_g, b.wb_b),
+                    (2.0, 1.0, 1.5),
+                    "{name} has no 0x000C and must keep the documented default"
+                ),
+            }
+            assert_eq!(b.wb_g, 1.0, "{name}: green is the reference and stays 1.0");
+        }
+    }
+
+    /// **The Nikon HE path used to carry its own hardcoded white balance.**
+    ///
+    /// `nikon_he::decode` built its `BayerImage` with `wb_r: 1.7051, wb_g: 1.0,
+    /// wb_b: 1.5449` — one file's as-shot values, `nikon_z9_he`'s, frozen into
+    /// the source. Every other HE body inherited them, which is the same defect
+    /// as the `2.0 / 1.0 / 1.5` placeholder this reader carried at three sites,
+    /// just narrower.
+    ///
+    /// The HE* files are the ones that expose it: they record **1.546875** where
+    /// the hardcode claims 1.544921875. The difference is small and that is
+    /// exactly why it survived — nothing downstream can see a 0.13% white
+    /// balance error, and nothing would see a large one either.
+    ///
+    /// This calls `nikon_wb` rather than `decode_nef` on purpose: an HE decode is
+    /// ~45 s a file, and what needs pinning is that the caller has a value to
+    /// pass, not the synthesis below it.
+    #[test]
+    fn the_he_bodies_have_their_own_white_balance_to_read() {
+        for (p, want_r, want_b) in [
+            (r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_hestar.NEF", 1.705078125f32, 1.546875f32),
+            (r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_he.NEF", 1.705078125, 1.544921875),
+        ] {
+            let Ok(d) = std::fs::read(p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let name = p.rsplit(std::path::MAIN_SEPARATOR).next().unwrap();
+            let wb = nikon_wb(&d).unwrap_or_else(|| panic!("{name} carries 0x000C"));
+            assert_eq!((wb.0, wb.1, wb.2), (want_r, 1.0, want_b), "{name}");
+        }
+        // The two must differ, or this test would pass against a hardcode.
+        let a = std::fs::read(r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_hestar.NEF");
+        let b = std::fs::read(r"C:\Foo\raw-converter\tests\raw-pixls\nikon_z9_he.NEF");
+        if let (Ok(a), Ok(b)) = (a, b) {
+            assert_ne!(nikon_wb(&a), nikon_wb(&b), "HE and HE* must not share one value");
+        }
+    }
+
+    /// **Nikon is not all RGGB, and this reader used to say it was.**
+    ///
+    /// Of the NEF/NRW fixture set, 27 declare RGGB, 4 BGGR, 4 GBRG and 1 GRBG.
+    /// A BGGR plane handed over as RGGB is a red/blue transposition in every
+    /// consumer that demosaics it, and nothing downstream can detect it.
+    ///
+    /// Each expectation here is the value the FILE declares in CFAPattern, and
+    /// each was independently confirmed against the camera's own embedded
+    /// preview before being written down.
+    #[test]
+    fn the_cfa_phase_comes_from_the_file_not_from_an_assumption() {
+        // (fixture, declared pattern, red sample (x, y))
+        for (name, pat, want) in [
+            ("12bit-uncompressed__D1H", "BGGR", (1u8, 1u8)),
+            ("12bit-uncompressed__D2H", "GBRG", (0, 1)),
+            ("12bit-compressed-other__D100", "GRBG", (1, 0)),
+            ("12bit-lossless__D3", "RGGB", (0, 0)),
+        ] {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            assert_eq!(b.cfa_phase, want, "{name} declares {pat}");
+        }
+    }
+
+    /// **A version `0x4440` curve is quarter-scale, and reading it literally
+    /// threw the linearisation away.**
+    ///
+    /// `14bit-compressed-other__Z_6` is the only file in the corpus with this
+    /// version. Before the `ver1 == 0x40` arm it fell through to the
+    /// read-directly branch, which set `max = csize` and copied 257 entries into
+    /// a table still holding its identity fill, so every sample above 256 came
+    /// out as its own curve index: the plane maxed at **4092** where LibRaw
+    /// reads **16371**, and 15,146,739 of 24,498,560 samples differed. After the
+    /// fix, **0 of 24,498,560 differ**.
+    ///
+    /// The maximum is the cheap discriminator and the reason this test does not
+    /// need the oracle: a 14-bit body whose plane tops out just under 12 bits
+    /// has not been linearised. Its siblings `Z_50` and `Z_f` carry version
+    /// `0x4630`, keep the identity curve deliberately, and were exact all along
+    /// — so they are here to catch a fix that "corrects" them too.
+    #[test]
+    fn a_quarter_scale_curve_is_interpolated_not_read_literally() {
+        for (name, want_max, want_white) in [
+            ("14bit-compressed-other__Z_6", 16371u16, 16380u16),
+            ("14bit-compressed-other__Z_50", 16383, 16383),
+            ("14bit-compressed-other__Z_f", 8438, 16383),
+        ] {
+            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
+            let Ok(d) = std::fs::read(&p) else {
+                eprintln!("skipped: {p} not present");
+                continue;
+            };
+            let b = decode_nef(&d).unwrap_or_else(|e| panic!("{name} must decode: {e}"));
+            let mx = b.raw.iter().copied().max().unwrap();
+            assert_eq!(mx, want_max, "{name}: plane maximum");
+            assert_eq!(b.white, want_white, "{name}: white level");
+            assert!(
+                mx > 4096,
+                "{name} is a 14-bit body: a maximum inside 12 bits means no linearisation"
+            );
+        }
     }
 
     /// **14-bit uncompressed is words, not packed bits.** Measured at exactly
@@ -1219,17 +1509,25 @@ mod tests {
     /// real 0x0096. Version `0x49` skips 2110 bytes into it, i.e. past its end,
     /// and everything read after that is unrelated file content. Accepting it
     /// produced four files that decoded without error and were wrong.
+    ///
+    /// **The Z 6 III used to be the second case here and no longer is.** Its
+    /// strip really does begin with the JPEG XS SOC marker, so it is a High
+    /// Efficiency file that never reaches the curve check; the expectation, not
+    /// the routing, was the stale half. See
+    /// [`an_he_body_this_decoder_does_not_model_refuses_rather_than_overflowing`].
+    /// The D810's strip begins `11 E1`, not `FF 10`, so the HE route cannot take
+    /// it — and the "too small" the assertion below demands is the proof, since
+    /// only the curve check can produce that message.
     #[test]
     fn an_undersized_curve_blob_is_refused() {
-        for name in ["12bit-small-raw__D810", "8bit-compressed-other__Z6_3"] {
-            let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{name}.NEF");
-            let Ok(d) = std::fs::read(&p) else {
-                eprintln!("skipped: {p} not present");
-                continue;
-            };
-            let e = decode_nef(&d).expect_err("must refuse rather than misread");
-            assert!(e.contains("too small"), "{name}: unhelpful refusal: {e}");
-        }
+        const NAME: &str = "12bit-small-raw__D810";
+        let p = format!(r"C:\Foo\raw-converter\tests\NEF Raws\{NAME}.NEF");
+        let Ok(d) = std::fs::read(&p) else {
+            eprintln!("skipped: {p} not present");
+            return;
+        };
+        let e = decode_nef(&d).expect_err("must refuse rather than misread");
+        assert!(e.contains("too small"), "{NAME}: unhelpful refusal: {e}");
     }
 
     /// **The D1H splits its sensor across 407 strips.** Reading only the first
