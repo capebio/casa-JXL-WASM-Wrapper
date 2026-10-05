@@ -35,11 +35,6 @@ impl Xorshift32 {
     fn next_f32(&mut self) -> f32 {
         (self.next_u32() as i32 as f32) / (i32::MAX as f32)
     }
-
-    /// Next f32 in [0.0, 1.0).
-    fn next_f32_01(&mut self) -> f32 {
-        self.next_u32() as f32 / u32::MAX as f32
-    }
 }
 
 // ─── FNV-1a hash (determinism gate) ──────────────────────────────────────────
@@ -58,17 +53,6 @@ fn fnv1a_u16_slice(data: &[u16]) -> u64 {
 }
 
 // ─── Synthetic data helpers ───────────────────────────────────────────────────
-
-/// Default noise model: typical ISO1600 DNG-like coefficients.
-fn default_model() -> NoiseModel {
-    let c = NoiseCoefficients { shot: 0.001, read: 0.0001 };
-    NoiseModel {
-        planes: [c; 4],
-        structured_sigma: [0.0; 4],
-        confidence: 1.0,
-        source: NoiseSource::DngNoiseProfile,
-    }
-}
 
 fn default_metadata() -> RawNoiseMetadata {
     RawNoiseMetadata {
@@ -395,7 +379,7 @@ fn gate3_mean_bias_below_quarter_sigma() {
     let mean_bias: f64 = denoised
         .iter()
         .zip(true_rgb.iter())
-        .map(|(&d, &t)| (d as f64 - t as f64))
+        .map(|(&d, &t)| d as f64 - t as f64)
         .sum::<f64>()
         / (n * 3) as f64;
 

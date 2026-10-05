@@ -32,6 +32,7 @@ pub(crate) fn ref_moments(b: &[u8], np: usize, ch: usize) -> ([u64; 3], [u64; 3]
 
 /// SSIM of `a` (test) vs precomputed reference moments. `sab`/`saa`/`sa` are
 /// accumulated here over the test buffer paired with the reference bytes `b`.
+#[cfg(test)] // the oracle for the SIMD moment kernels' tests
 pub(crate) fn ssim_with_ref(
     a: &[u8],
     b: &[u8],
@@ -144,6 +145,7 @@ pub(crate) fn finalize_ssim(
 }
 
 /// Per-channel mean/variance feature side-output (port of `computeChannelMoments`).
+#[cfg(test)] // the oracle for `Comparer::all`'s moments test
 pub(crate) fn channel_moments(
     px: &[u8],
     np: usize,

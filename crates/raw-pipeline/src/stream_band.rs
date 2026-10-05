@@ -500,7 +500,7 @@ fn pipe_process_strip(
 /// full-decode path). Sequential fallback when `parallel` is off.
 #[cfg(feature = "parallel")]
 pub fn decode_demosaic_tone_pipelined<S>(
-    mut src: S,
+    src: S,
     params: &PipelineParams,
     phase: (u8, u8),
     out_rgb8: &mut [u8],

@@ -496,10 +496,7 @@ mod tests {
 
         let result = denoise(&raw, &rgb_mhc, width, height, &metadata, &model, &metrics, 1.0);
         assert_eq!(result.len(), n * 3);
-        // All values should be in [0, 65535]
-        for &v in &result {
-            assert!(v <= 65535);
-        }
+        // Values in [0, 65535] are the u16 element type's guarantee: nothing to assert.
     }
 
     /// blend_to_u16 with t=1.0 should equal denoised converted to u16.

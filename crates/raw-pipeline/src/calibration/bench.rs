@@ -221,6 +221,7 @@ pub struct ThreadTiming {
 
 /// The worker counts to probe: 1, 2, 4, … up to the effective core budget (plus the
 /// budget itself). Deduped + sorted.
+#[cfg(any(feature = "parallel", test))]
 fn thread_ladder(budget: usize) -> Vec<usize> {
     let mut v = vec![1usize];
     let mut n = 2;

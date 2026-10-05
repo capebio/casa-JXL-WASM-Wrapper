@@ -855,6 +855,7 @@ mod kernels {
 // model tests (compiled on every target; zero runtime cost). All plans feed
 // two-input 32-lane shuffles: index < 16 selects from the first operand,
 // 16..32 from the second.
+#[cfg(any(target_arch = "wasm32", test))]
 mod simd_plans {
     /// Byte shift-left by `k` with zeros shifting in (operand b = zero vector):
     /// the log-step of the mod-256 prefix sum, same schedule as `_mm_slli_si128`.
@@ -1653,7 +1654,7 @@ mod tests {
             let esyms = enc_sym_table(&freqs);
             let e = &esyms[7];
             let hi = (f << 20) - 1;
-            let mut check = |x: u32| {
+            let check = |x: u32| {
                 let q = ((x as u128 * e.rcp as u128) >> 64) as u32;
                 let got = x + e.bias + q * e.cmpl;
                 let want = ((x / f) << PREC) + (x % f); // cum[7] == 0

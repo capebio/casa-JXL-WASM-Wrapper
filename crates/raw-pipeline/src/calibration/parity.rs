@@ -29,6 +29,7 @@ fn distort(px: &[u8]) -> Vec<u8> {
 /// The forced-backend ids to test, paired with their registry variant label. Only
 /// those the CPU can actually execute are run, so the report is honest about what ran.
 fn candidate_backends() -> Vec<(&'static str, BackendChoice)> {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))] // only x86 adds backends
     let mut v = vec![("scalar", BackendChoice::ForceScalar)];
     #[cfg(target_arch = "x86_64")]
     {

@@ -66,6 +66,7 @@ pub fn xyb_tail(
 /// 2× box downsample scalar edge: handles output columns `[x_start, dw)` for a
 /// single output row `dy`. Called after the vectorised inner loop exhausts full-width chunks.
 #[inline]
+#[cfg(target_arch = "x86_64")] // callers: the AVX2 and AVX-512 downsamplers
 pub fn downsample_row_tail(
     src: &[f32],
     w: usize,

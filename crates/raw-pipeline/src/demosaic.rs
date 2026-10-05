@@ -83,15 +83,17 @@ pub fn subtract_black_in_place(buf: &mut [u16], black: u16) {
                 p = p.add(1);
             }
         }
-        return;
     }
     // Native fallback (pointer form lets autovec do its thing; matches prior Lens 23 work)
-    let mut p = buf.as_mut_ptr();
-    let end = unsafe { p.add(buf.len()) };
-    while p < end {
-        unsafe {
-            *p = (*p).saturating_sub(black);
-            p = p.add(1);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut p = buf.as_mut_ptr();
+        let end = unsafe { p.add(buf.len()) };
+        while p < end {
+            unsafe {
+                *p = (*p).saturating_sub(black);
+                p = p.add(1);
+            }
         }
     }
 }
@@ -173,15 +175,17 @@ pub fn demosaic_rggb(raw: &[u16], width: usize, height: usize) -> Result<Vec<u16
     // instead of 3 stack arrays + 24 scalar stores. Bit-identical to demosaic_rggb_simd.
     // MHC (quality) is separate scalar path.
     #[cfg(target_arch = "wasm32")]
-    {
-        return demosaic_rggb_shuffle_simd(raw, width, height);
-    }
-    let n3 = width
-        .checked_mul(height)
-        .and_then(|n| n.checked_mul(3))
-        .ok_or_else(|| format!("demosaic: {}×{}×3 overflows usize", width, height))?;
-    let mut rgb = vec![0u16; n3];
-    demosaic_rggb_into(raw, width, height, &mut rgb)?;
+    let rgb = demosaic_rggb_shuffle_simd(raw, width, height)?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let rgb = {
+        let n3 = width
+            .checked_mul(height)
+            .and_then(|n| n.checked_mul(3))
+            .ok_or_else(|| format!("demosaic: {}×{}×3 overflows usize", width, height))?;
+        let mut rgb = vec![0u16; n3];
+        demosaic_rggb_into(raw, width, height, &mut rgb)?;
+        rgb
+    };
     Ok(rgb)
 }
 
@@ -903,7 +907,7 @@ pub fn demosaic_rggb_shuffle_simd(
             };
             // 3-way interleave via i8x16_shuffle (replaces scalar 24 stores).
             // Layout matches handoff: 3 groups of 8 u16.
-            let (o0, o1, o2) = unsafe {
+            let (o0, o1, o2) = {
                 let t0 =
                     i8x16_shuffle::<0, 1, 16, 17, 0, 0, 2, 3, 18, 19, 2, 2, 4, 5, 20, 21>(rv, gv);
                 let out0 =
@@ -1159,10 +1163,6 @@ impl MhcGains {
         }
     }
 
-    #[inline(always)]
-    fn is_unity(&self) -> bool {
-        *self == Self::UNITY
-    }
 }
 
 impl Default for MhcGains {
@@ -1373,6 +1373,7 @@ pub fn demosaic_bayer_mhc_gains(
             out_row[o + 1] = gg as u16;
             out_row[o + 2] = bb as u16;
         }
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))] // only the AVX2 arm advances it
         let mut scalar_start = int_start;
         #[cfg(target_arch = "x86_64")]
         if use_avx2 && row >= 2 && row + 2 <= h_max as usize && int_end > int_start {
@@ -1628,6 +1629,7 @@ unsafe fn mhc_row_interior_avx2(
 /// row-start indices into `raw` (row*width) for center/north/south/north2/south2.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+#[cfg(not(target_arch = "wasm32"))] // its one caller's gate
 fn mhc_simd128_lane(
     raw: &[u16],
     rc: usize,
@@ -2172,6 +2174,7 @@ pub fn demosaic_bayer_mhc_band_gains(
             out_row[o + 1] = gg as u16;
             out_row[o + 2] = bb as u16;
         }
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))] // only the AVX2 arm advances it
         let mut scalar_start = int_start;
         #[cfg(target_arch = "x86_64")]
         if use_avx2 && ctx_row >= 2 && ctx_row + 2 <= h_max as usize && int_end > int_start {
@@ -2657,6 +2660,7 @@ pub fn demosaic_rggb_mhc_band_gains(
         let row_here = &ctx[r_c * width..r_c * width + width];
         let row_south = &ctx[r_s * width..r_s * width + width];
         let row_s2 = &ctx[r_s2 * width..r_s2 * width + width];
+        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))] // only the AVX2 arm advances it
         let mut scalar_start = int_start;
         #[cfg(target_arch = "x86_64")]
         if use_avx2 && local >= 2 && local + 2 <= h_max as usize && int_end > int_start {

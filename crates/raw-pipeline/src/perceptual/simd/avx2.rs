@@ -59,7 +59,9 @@ pub unsafe fn scale_err_avx2(
     // Drain the f32 lane accumulator to f64 every FLUSH iterations to prevent
     // precision loss when summing > ~4096 values (f32 exact range ≈ 2^24).
     // Keeps SIMD throughput while achieving f64 accumulation precision end-to-end.
+    #[cfg(feature = "parallel")]
     const FLUSH: usize = 4096;
+    #[cfg(feature = "parallel")]
     const FLUSH_PX: usize = FLUSH * 8; // lanes per drained f64 block (32768 px)
     let lanes = n / 8 * 8;
     let mut sum = 0f64;
@@ -819,6 +821,7 @@ pub unsafe fn box_blur_avx2(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f3
 /// Column-band width for the parallel vertical pass — a multiple of 8 so every
 /// interior band is fully vectorised; only the final band can carry a scalar
 /// remainder (same columns the serial walk leaves for its remainder loop).
+#[cfg(feature = "parallel")]
 const V_BAND_COLS: usize = 256;
 /// Engage the parallel vertical pass only at ≥2 MP (bench-gated,
 /// examples/box_blur_vpar_flip.rs): below that the plane fits caches and rayon

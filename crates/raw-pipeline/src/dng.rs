@@ -3627,7 +3627,7 @@ mod tests {
         if !used_real {
             println!("No real asset found in cwd; falling back to synthetic black-sub kernel timing (isolates the new scalar loop cost).");
             let black = 64u16;
-            let mut base: Vec<u16> = (0..(1920 * 1440))
+            let base: Vec<u16> = (0..(1920 * 1440))
                 .map(|i| (i % 1000 + 100) as u16)
                 .collect();
             for i in 0..10 {

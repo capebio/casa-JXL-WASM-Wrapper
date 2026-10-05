@@ -1797,6 +1797,7 @@ pub fn apply_tone_fused(r: f32, g: f32, b: f32, m: &[[f32; 3]; 3]) -> (f32, f32,
 /// pc path delegates to scalar (bulk tile path covers pc+c-perceptual via AVX2).
 /// `sat_fused`: `m` is the pre-fused `S·M` ⇒ matrix-only, skip luma+blend.
 #[inline(always)]
+#[cfg(not(feature = "parallel"))] // its one caller is process_into's serial arm
 fn apply_tone_math4(
     rs: [f32; 4],
     gs: [f32; 4],
