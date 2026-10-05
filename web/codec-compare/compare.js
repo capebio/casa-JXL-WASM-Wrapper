@@ -5,6 +5,7 @@
 
 import initRaw, * as rawWasm from '../pkg/raw_converter_wasm.js';
 import { codecs } from './codecs.js';
+import { ensureJxlTileDecoder } from '../dng-jxl-libjxl.js';
 import { renderHeatmap, getButteraugliScore } from './heatmap.js';
 import { exportReport } from './report.js';
 
@@ -78,7 +79,10 @@ async function decodeRaw(file) {
     let result;
     if (ext === '.orf' || ext === '.raw') result = rawWasm.process_orf_with_flags(bytes, PROCESS_FLAGS, ...PROCESS_DEFAULTS);
     else if (ext === '.cr2')              result = rawWasm.process_cr2_with_flags(bytes, PROCESS_FLAGS, ...PROCESS_DEFAULTS);
-    else if (ext === '.dng')             result = rawWasm.process_dng_with_flags(bytes, PROCESS_FLAGS, ...PROCESS_DEFAULTS);
+    else if (ext === '.dng') {
+        await ensureJxlTileDecoder(rawWasm, bytes);
+        result = rawWasm.process_dng_with_flags(bytes, PROCESS_FLAGS, ...PROCESS_DEFAULTS);
+    }
     else throw new Error(`Unsupported RAW extension: ${ext}`);
     let rgba, w, h;
     try {

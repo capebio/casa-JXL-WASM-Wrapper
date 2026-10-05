@@ -1,6 +1,9 @@
 // Node WASM decode wrapper: RAW file → oriented RGB8 + dims + metadata getters.
 import { readFileSync } from "node:fs";
 import { extname } from "node:path";
+import { ensureJxlTileDecoder } from "../dng-jxl-libjxl.js";
+
+const LIBJXL_WASM = new URL("../../packages/jxl-wasm/dist/jxl-core.dec.simd.wasm", import.meta.url);
 
 const ARGS = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Number.NaN, Number.NaN, 0, 0];
 let raw;
@@ -26,7 +29,10 @@ export async function decodeRaw(path) {
   const bytes = new Uint8Array(readFileSync(path));
   let result;
   if (ext === ".cr2") result = raw.process_cr2_with_flags(bytes, 1, ...ARGS);
-  else if (ext === ".dng") result = raw.process_dng_with_flags(bytes, 1, ...ARGS);
+  else if (ext === ".dng") {
+    await ensureJxlTileDecoder(raw, bytes, () => ({ wasmBinary: readFileSync(LIBJXL_WASM) }));
+    result = raw.process_dng_with_flags(bytes, 1, ...ARGS);
+  }
   else if (ext === ".orf" || ext === ".raw") result = raw.process_orf_with_flags(bytes, 1, ...ARGS);
   else throw new Error(`decodeRaw: unsupported extension ${ext}`);
   const width = result.width, height = result.height;

@@ -2,6 +2,7 @@
 // Handles RAW decode and LookRenderer re-renders; keeps WASM state off the main thread.
 
 import { detectRawKind } from './format-detect.js';
+import { ensureJxlTileDecoder } from './dng-jxl-libjxl.js';
 
 // --- WASM init state ---
 let rawWasm = null;
@@ -64,8 +65,9 @@ function rgb8ToRgba8(rgb, n) {
  * Decode a RAW file and initialise the LookRenderer.
  * Returns rgba8 (Uint8ClampedArray) at lightbox size, plus metadata.
  */
-function handleDecode({ bytes, name }) {
+async function handleDecode({ bytes, name }) {
     const decoder = pickDecoder(bytes, name);
+    if (decoder === rawWasm.process_dng_with_flags) await ensureJxlTileDecoder(rawWasm, bytes);
     const o = RAW_NEUTRAL;
     const result = decoder(
         bytes, OUT_LIGHTBOX,
@@ -132,7 +134,7 @@ self.addEventListener('message', async (e) => {
         await ensureWasm();
 
         if (type === 'decode') {
-            const { rgba, meta } = handleDecode(e.data);
+            const { rgba, meta } = await handleDecode(e.data);
             self.postMessage(
                 { type: 'decoded', id, rgba, width: meta.width, height: meta.height, meta },
                 [rgba.buffer],

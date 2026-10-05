@@ -22,6 +22,7 @@ import {
   makeTimelapseCancelToken, buildTimelapseExportRequest,
 } from './timelapse-core.js';
 import { PRESETS } from './casv-lightbox/casv-lightbox-core.js';
+import { ensureJxlTileDecoder } from './dng-jxl-libjxl.js';
 
 const THUMB_LIMIT = 24;   // eager-decode at most this many thumbnails
 const THUMB_EDGE = 200;   // longest edge (px) of a decoded thumbnail
@@ -113,6 +114,7 @@ const OUT_THUMB = 4; // src/lib.rs output_flags bit: 360 px RGB16 thumb only
 async function decodeRawThumb(bytes, name) {
   const mod = await ensureWasm();
   const fn = pickThumbDecoder(mod, name);
+  if (fn === mod.process_dng_with_flags) await ensureJxlTileDecoder(mod, bytes);
   // Positional look args (see src/lib.rs / web/worker.js RAW_NEUTRAL). WB NaN =
   // use each file's metadata white balance (constant for a locked time-lapse).
   const r = fn(bytes, OUT_THUMB, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
@@ -446,6 +448,7 @@ export class TimelapseStudio {
               default: throw new Error('unsupported RAW: ' + frame.name);
             }
           })();
+          if (fn === mod.process_dng) await ensureJxlTileDecoder(mod, frame.bytes);
           const r = fn(frame.bytes, ...lookArgs);
           // Read width/height BEFORE freeing: the WASM getters dereference the
           // ProcessResult pointer, so touching r.width/r.height after r.free()

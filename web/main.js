@@ -47,6 +47,7 @@ import {
 // the H29 develop-channel fns (apply_look_stream / jxl_progressive_pass) are
 // absent until the Rust H29 work is built, so the channel path stays gated.
 import * as rawWasm from './pkg/raw_converter_wasm.js';
+import { ensureJxlTileDecoder } from './dng-jxl-libjxl.js';
 
 // ---------------------------------------------------------------------------
 // Finding 47 (P4 T8): lazy-loaded optional modules.
@@ -4584,6 +4585,7 @@ async function _idDecodeRawPreview(rawBytes, nm) {
     }[ext];
     if (typeof fn !== 'function') throw new Error('identify: unsupported RAW: ' + nm);
     await (_idWasmReady ||= rawWasm.default());
+    if (ext === 'dng') await ensureJxlTileDecoder(rawWasm, rawBytes);
     const OUT_LIGHTBOX = 2; // src/lib.rs output_flags bit: 1800 px RGB16 preview
     const r = fn(rawBytes, OUT_LIGHTBOX, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
     let w, h, wbR, wbB, renderer;
