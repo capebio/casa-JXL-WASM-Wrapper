@@ -25,7 +25,6 @@ import { commitJxlDecodeCache } from './jxl-decode-cache-policy.js';
 // RGBA buffers. Replaces per-card _jxlDecoded (unbounded WeakMap) with a single
 // governed cache; invalidated on generation change and explicit card delete.
 import { createDerivedCache } from './jxl-derived-cache.js';
-import { createTauriParityLightbox } from './tauri-parity-lightbox.js';
 import { readDenoiseOptions, denoiseNeedsReprocess } from './raw-denoise-options.js';
 // Finding 47 (P4 T8): lazy-load helper — optional heavy modules are imported
 // dynamically on first use, not at page parse time.

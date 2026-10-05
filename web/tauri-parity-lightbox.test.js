@@ -12,7 +12,9 @@ test('M2 slider ranges match pyramid checklist', () => {
 });
 
 test('main.js wires Tauri parity lightbox + H29 channel path', () => {
-  expect(mainJs).toContain("import { createTauriParityLightbox } from './tauri-parity-lightbox.js'");
+  // Lazy since finding 47 (7ab100bf): loaded on first lightbox open, never statically.
+  expect(mainJs).toContain("makeLazyModule(() => import('./tauri-parity-lightbox.js'))");
+  expect(mainJs).toContain('const { createTauriParityLightbox } = await lazyTauriParity();');
   expect(mainJs).toContain('apply_look_stream');
   expect(mainJs).toContain('jxl_progressive_pass');
   expect(mainJs).toContain('tauriParityLb');
