@@ -292,6 +292,19 @@ const thumbStateMap = new Map(); // taskId → same shape but thumb-sized LookRe
 // live tasks; entries are cleared as soon as they are consumed.
 const cancelledTasks = new Set();
 
+// libjxl for JPEG XL DNG tiles: loaded once, and only when a DNG needs it
+// (dng_uses_jxl). An older web/pkg without the binding skips it (the decode
+// then reports the missing JXL decoder as before).
+let jxlTileReady = null;
+async function ensureJxlTileDecoder(bytes) {
+    if (!rawWasm.dng_uses_jxl?.(bytes)) return;
+    jxlTileReady ??= (async () => {
+        const { loadLibjxlTileDecoder } = await import('./dng-jxl-libjxl.js');
+        rawWasm.set_jxl_tile_decoder(await loadLibjxlTileDecoder());
+    })().catch(e => { jxlTileReady = null; throw e; });
+    await jxlTileReady;
+}
+
 async function ensureWasm() {
     if (!wasmReady) wasmReady = (async () => {
         await loadWasm();
@@ -795,6 +808,7 @@ self.addEventListener('message', async (ev) => {
         }
         const nativeRaw = rawKind === 'orf' || rawKind === 'cr2' || rawKind === 'dng';
         const decoderFn = nativeRaw ? pickRawDecoderWithFlags(bytes, opts.name || '') : null;
+        if (rawKind === 'dng') await ensureJxlTileDecoder(bytes);
         let librawPayload = null;
         // Finding 44/45: derive format label and nominal bit-depth from the raw kind so
         // the info panel and export service show real values instead of a hardcoded string.

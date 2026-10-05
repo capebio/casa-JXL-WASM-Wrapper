@@ -247,3 +247,40 @@ dngTest('mode 3 (DNG): retain-raw + finish_dng_full_rgb8 == monolithic full, sin
     expect(() => noRetain.finish_dng_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0)).toThrow();
     noRetain.free();
 }, 300_000);
+
+// JPEG XL ProRAW (iOS 17+; lossless iPhone 17 Pro, lossy IMG_2025): the wasm has
+// no JXL decoder, so without one installed the decode fails; with the app's
+// libjxl installed (dng-jxl-libjxl.js, as worker.js does) it renders, and
+// retain + finish equals the monolithic render. Tile-level parity against
+// native libjxl: web/dng-jxl-tile-parity.mjs.
+const JXL_PRORAW = ['iphone17pro_IMG_0104.DNG', 'iphone_proraw_jxl_IMG_2025.DNG']
+    .map((n) => join(TESTS, 'raw-pixls', n));
+const jxlTest = JXL_PRORAW.every(existsSync) ? test : test.skip;
+jxlTest('JPEG XL ProRAW decodes through the app libjxl', async () => {
+    await ensureRaw();
+    if (typeof rawWasm.set_jxl_tile_decoder !== 'function') {
+        console.log('  SKIP (OWED): shipped web/pkg predates set_jxl_tile_decoder');
+        return;
+    }
+    const { loadLibjxlTileDecoder } = await import('./dng-jxl-libjxl.js');
+    const wasmBinary = readFileSync(new URL('../packages/jxl-wasm/dist/jxl-core.dec.simd.wasm', import.meta.url));
+    for (const f of JXL_PRORAW) {
+        const bytes = new Uint8Array(readFileSync(f));
+        expect(rawWasm.dng_uses_jxl(bytes)).toBe(true);
+        rawWasm.set_jxl_tile_decoder(undefined);
+        expect(() => processNeutral(rawWasm.process_dng_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT)).toThrow();
+        rawWasm.set_jxl_tile_decoder(await loadLibjxlTileDecoder({ wasmBinary }));
+        const ref = processNeutral(rawWasm.process_dng_with_flags, bytes, OUT_FULL_RGB8 | OUT_NO_ORIENT);
+        const rgb = ref.take_rgb();
+        const mean = rgb.reduce((s, v) => s + v, 0) / rgb.length;
+        ref.free();
+        expect(mean).toBeGreaterThan(20);
+        expect(mean).toBeLessThan(235);
+        const r = processNeutral(rawWasm.process_dng_with_flags, bytes, OUT_LIGHTBOX | OUT_THUMB | OUT_RETAIN_RAW);
+        r.finish_dng_full_rgb8(OUT_FULL_RGB8 | OUT_NO_ORIENT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, 0, 0);
+        expect(sha(r.take_rgb())).toBe(sha(rgb));
+        r.free();
+        console.log(`  ${f.split(/[\\/]/).pop()}: mean ${mean.toFixed(1)}, retain+finish identical`);
+    }
+    rawWasm.set_jxl_tile_decoder(undefined);
+}, 300_000);

@@ -3859,6 +3859,51 @@ mod tests {
         let (lw, lh) = target_dims(9600, 6376, 1800);
         assert_eq!((r.lb_w, r.lb_h), (lw as u32, lh as u32));
     }
+
+    /// JPEG XL DNG tiles go through the installed decoder (the browser's libjxl
+    /// in the app), one call per tile, serially on this thread; with native
+    /// libjxl installed the plane equals the default decode. `JXL_TILE_DUMP=<dir>`
+    /// also writes each tile (`<name>.<i>.jxl`) and its native samples (`.u16`,
+    /// LE) for `web/dng-jxl-tile-parity.mjs` to check the wasm libjxl against.
+    #[test]
+    fn jxl_dng_tiles_route_through_installed_decoder() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        let dir = "C:/Foo/raw-converter/tests/raw-pixls";
+        for name in ["iphone17pro_IMG_0104.DNG", "iphone_proraw_jxl_IMG_2025.DNG"] {
+            let Ok(data) = std::fs::read(format!("{dir}/{name}")) else {
+                eprintln!("SKIP {name}: fixture absent");
+                continue;
+            };
+            assert!(dng_uses_jxl(&data), "{name}");
+            let plain = decode_dng_bytes(&data).unwrap();
+            CALLS.store(0, Ordering::Relaxed);
+            let dump = std::env::var("JXL_TILE_DUMP").ok();
+            let tag = name.to_string();
+            JXL_TILE.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move |tile: &[u8], cps: usize| {
+                    let i = CALLS.fetch_add(1, Ordering::Relaxed);
+                    let r = raw_pipeline::dng::jxl_segment_libjxl(tile, cps)?;
+                    if let Some(d) = &dump {
+                        let p = std::path::Path::new(d);
+                        std::fs::write(p.join(format!("{tag}.{i}.jxl")), tile).unwrap();
+                        let le: Vec<u8> = r.0.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        std::fs::write(p.join(format!("{tag}.{i}.{cps}.{}x{}.u16", r.1, r.2)), le).unwrap();
+                    }
+                    Ok(r)
+                }) as JxlTileFn)
+            });
+            let hooked = decode_dng_bytes(&data);
+            JXL_TILE.with(|h| *h.borrow_mut() = None);
+            let hooked = hooked.unwrap();
+            assert_eq!(
+                CALLS.load(Ordering::Relaxed),
+                raw_pipeline::dng::payload_ranges(&data).unwrap().len(),
+                "{name}: one call per tile"
+            );
+            assert!(hooked.raw == plain.raw, "{name}: hooked plane differs from the default");
+        }
+    }
 }
 
 /// WASM-resident rendering state for a single image (lightbox or thumbnail).
@@ -4464,6 +4509,63 @@ struct DngDecoded {
     noise_metadata: RawNoiseMetadata,
 }
 
+/// One JPEG XL DNG tile → `(samples, w, h, xyb)`, as `raw_pipeline::dng::JxlSegmentFn`.
+type JxlTileFn = Box<dyn Fn(&[u8], usize) -> Result<(Vec<u16>, u32, u32, bool), String>>;
+
+thread_local! {
+    /// The JPEG XL tile decoder the host installed (the browser's libjxl). The
+    /// wasm build carries no JXL decoder of its own, so JXL DNGs need this.
+    static JXL_TILE: RefCell<Option<JxlTileFn>> = const { RefCell::new(None) };
+}
+
+/// Whether this DNG's sensor data is JPEG XL (compression 52546): the host
+/// then loads libjxl (only for these files) and calls [`set_jxl_tile_decoder`].
+#[wasm_bindgen]
+pub fn dng_uses_jxl(bytes: &[u8]) -> bool {
+    raw_pipeline::dng::uses_jxl(bytes)
+}
+
+/// Install (or with `undefined`, remove) this thread's JPEG XL DNG tile decoder:
+/// `decode_tile(tile: Uint8Array, cps: number) -> { w, h, samples: Uint16Array }`,
+/// `samples` holding `cps` interleaved channels per pixel as libjxl's UINT16
+/// output gives them. Every later DNG decode on this thread routes its JXL
+/// tiles through it.
+#[wasm_bindgen]
+pub fn set_jxl_tile_decoder(decode_tile: Option<js_sys::Function>) {
+    use wasm_bindgen::JsCast;
+    let f = decode_tile.map(|decode_tile| -> JxlTileFn {
+        Box::new(move |tile: &[u8], cps: usize| {
+            let r = decode_tile
+                .call2(&JsValue::NULL, &js_sys::Uint8Array::from(tile), &JsValue::from(cps as u32))
+                .map_err(|e| format!("libjxl tile decode: {}", e.as_string().unwrap_or_else(|| format!("{e:?}"))))?;
+            let num = |k: &str| js_sys::Reflect::get(&r, &k.into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+            let samples = js_sys::Reflect::get(&r, &"samples".into())
+                .ok()
+                .and_then(|v| v.dyn_into::<js_sys::Uint16Array>().ok())
+                .ok_or("libjxl tile decode returned no samples")?;
+            // xyb only feeds DngImage.jxl_lossy, which nothing here reads.
+            Ok((samples.to_vec(), num("w"), num("h"), false))
+        })
+    });
+    JXL_TILE.with(|h| *h.borrow_mut() = f);
+}
+
+/// `dng::decode_bytes`, with a JPEG XL DNG's tiles routed through the installed
+/// [`JXL_TILE`] decoder when there is one.
+fn decode_dng_bytes(data: &[u8]) -> Result<raw_pipeline::dng::DngImage, String> {
+    use raw_pipeline::dng;
+    if JXL_TILE.with(|h| h.borrow().is_none()) || !dng::uses_jxl(data) {
+        return dng::decode_bytes(data).map_err(|e| e.to_string());
+    }
+    // Captures nothing, so it is Sync; it reads the hook on this thread, and the
+    // serial executor keeps every tile here (a JS function cannot cross threads).
+    let via = |b: &[u8], cps: usize| {
+        JXL_TILE.with(|h| h.borrow().as_ref().ok_or("JXL tile decoder removed")?(b, cps))
+    };
+    let serial = |n: usize, task: &(dyn Fn(usize) + Sync)| (0..n).for_each(task);
+    dng::decode_bytes_with(data, Some(&via), Some(&serial)).map_err(|e| e.to_string())
+}
+
 /// Shared DNG decode path: decode bytes → validate → align CFA → demosaic → NR → WB/params setup.
 /// Returns pre-tonemapped RGB16 and all metadata.  Called by process_dng_impl.
 fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError> {
@@ -4596,7 +4698,7 @@ fn decode_dng_raw(data: &[u8], output_flags: u32) -> Result<DngDecoded, JsError>
     }
 
     let t = now_ms();
-    let mut img = raw_pipeline::dng::decode_bytes(data)
+    let mut img = decode_dng_bytes(data)
         .map_err(|e| JsError::new(&format!("DNG decode: {}", e)))?;
     img.crop_to_active_area(); // Bayer and linear alike
     let decode_ms = now_ms() - t;
