@@ -13,12 +13,9 @@
 use raw_pipeline::cr2;
 use raw_pipeline::ljpeg::LjpegStats;
 use std::fs;
-use std::path::Path;
 use std::time::Instant;
 
 struct Run {
-    file: String,
-    size_kb: usize,
     total_ms: f64,
     parse_ms: f64,
     ljpeg_ms: f64,
@@ -81,8 +78,6 @@ fn main() {
             img.height
         );
         runs.push(Run {
-            file: fname.clone(),
-            size_kb: data.len() / 1024,
             total_ms: timings.total_ms,
             parse_ms: timings.parse_ms,
             ljpeg_ms: timings.ljpeg_ms,
@@ -159,7 +154,6 @@ fn print_ljpeg_stats(label: &str, img: &raw_pipeline::cr2::Cr2Image, s: &LjpegSt
         100.0 * s.slow_fill_hits as f64 / (s.bulk_fill_hits + s.slow_fill_hits).max(1) as f64
     );
     let compressed_bits = (s.bulk_fill_hits * 32 + s.slow_fill_hits * 8) as f64;
-    let huff_bits = s.fast8_hits as f64 * 6.0; // rough: avg code len 6 bits for common tables
     println!(
         "  approx bits:    compressed={:.1}M  symbols≈{}  L3_bits={}M",
         compressed_bits / 1e6,

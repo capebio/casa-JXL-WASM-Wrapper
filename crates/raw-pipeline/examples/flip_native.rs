@@ -68,10 +68,7 @@ struct Variant<'a> {
 struct Stat {
     name: String,
     median_ms: f64,
-    mean_ms: f64,
     stdev_ms: f64,
-    min_ms: f64,
-    max_ms: f64,
     peak_mb: f64,
     pct_saved: f64,
     trust: &'static str,
@@ -123,10 +120,7 @@ fn flip(variants: &mut [Variant], rounds: usize, inner: usize) -> Vec<Stat> {
         out.push(Stat {
             name: variants[i].name.to_string(),
             median_ms: median,
-            mean_ms: mean,
             stdev_ms: stdev,
-            min_ms: *t.first().unwrap(),
-            max_ms: *t.last().unwrap(),
             peak_mb: peaks[i],
             pct_saved: (base_median - median) / base_median * 100.0,
             trust: if cv < 0.10 { "high" } else { "low" },

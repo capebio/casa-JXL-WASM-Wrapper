@@ -3,8 +3,6 @@
 //
 // Run: cargo --release run --example wasm_memory_audit --no-default-features --features parallel-wasm
 
-use std::time::Instant;
-
 // Note: This is a native audit harness. For actual WASM memory tracking,
 // use the browser-based benchmark at .flipflop/memory-audit.mjs which can
 // inspect Module.memory.buffer.byteLength directly in the JS runtime.

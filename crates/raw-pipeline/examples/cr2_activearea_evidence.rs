@@ -16,14 +16,10 @@ fn main() {
     let (off, len, stride, rows) = cr2::ljpeg_strip_geometry(&data).expect("geometry");
     let si = cr2::parse_sensor_info(&data).expect("SensorInfo");
     let img = cr2::decode_bytes(&data).expect("decode");
-    let (cw, ch) = (img.width, img.height);
+    let cw = img.width;
     let mut lc = (stride - cw) / 2;
     if lc & 1 != 0 {
         lc -= 1;
-    }
-    let mut tc = (rows - ch) / 2;
-    if tc & 1 != 0 {
-        tc -= 1;
     }
 
     let mut grid = vec![0u16; stride * rows];

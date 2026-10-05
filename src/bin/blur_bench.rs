@@ -217,6 +217,8 @@ fn v_pass_tiled<const TILE: usize>(src: &[u16], w: usize, h: usize, k: &[f32], d
 // 8-wide unrolled vertical pass with a separate scalar tail.
 // Inner `for i in 0..LANE` is always exactly 8 iterations — LLVM can fully
 // unroll it. v_pass_tiled's `tile` variable at the right edge may block that.
+// Kept, unwired, as the code of the REJECTED lever recorded above.
+#[allow(dead_code)]
 fn v_pass_clarity(src: &[u16], w: usize, h: usize, k: &[f32], dst: &mut [u16]) {
     let half = k.len() / 2;
     const LANE: usize = 8;

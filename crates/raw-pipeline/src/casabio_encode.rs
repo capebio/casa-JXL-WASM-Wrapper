@@ -916,6 +916,7 @@ fn encode_into(
 }
 
 /// Encode one variant with a fresh one-shot [`Encoder`] (rayon branch).
+#[cfg(feature = "parallel")]
 #[allow(clippy::too_many_arguments)]
 fn encode_variant(
     pixels: &[u8],

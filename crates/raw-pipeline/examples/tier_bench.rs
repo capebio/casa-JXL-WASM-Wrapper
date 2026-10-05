@@ -86,7 +86,7 @@ fn main() {
         Fable,
     }
 
-    let mut run = |label: &str, tier: Tier| {
+    let run = |label: &str, tier: Tier| {
         let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
         let t0 = Instant::now();
         let bytes = match &tier {

@@ -6890,6 +6890,7 @@ fn fs_core_simd_exact(d: &[u8], px: usize) -> FsRaw {
 /// Tail-safe 4-lane word-hash scalar kernel (full buffer). Same hash definition as the
 /// hand-v128 path (lanes by pixel index % 4), so the native fallback and the wasm SIMD
 /// path agree. Used as the non-wasm `fs_core_simd` fallback.
+#[cfg(not(target_arch = "wasm32"))]
 fn fs_core_word_scalar(d: &[u8], px: usize) -> FsRaw {
     let (mut a_min, mut a_max, mut a_zero, mut rgb_nz) = (255u32, 0u32, 0u32, 0u32);
     let (mut l_sum, mut l_sq) = (0f64, 0f64);

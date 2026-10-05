@@ -77,7 +77,7 @@ fn main() {
     let n = w * h;
     let mut buf = Vec::with_capacity(n * 4);
     for i in 0..n {
-        let t = (i as f32 / n as f32);
+        let t = i as f32 / n as f32;
         let r = (0.5 + 0.5 * (t * 17.0).sin()) * (1.0 + 2.0 * t); // up to ~3.0
         let g = (0.5 + 0.5 * (t * 17.0 + 2.0).sin()) * (1.0 + 2.0 * t);
         let b = (0.5 + 0.5 * (t * 17.0 + 4.0).sin()) * 0.02; // some in the 12.92 linear segment

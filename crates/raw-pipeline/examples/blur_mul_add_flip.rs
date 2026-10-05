@@ -206,7 +206,7 @@ fn run_case(label: &str, width: usize, height: usize, rounds: usize) {
     let mut sink = 0u64;
     let mut tmp: Vec<u16> = Vec::new();
     let mut out: Vec<u16> = Vec::new();
-    let mut timed = |which: u8, sink: &mut u64, tmp: &mut Vec<u16>, out: &mut Vec<u16>| -> f64 {
+    let timed = |which: u8, sink: &mut u64, tmp: &mut Vec<u16>, out: &mut Vec<u16>| -> f64 {
         let t0 = Instant::now();
         match which {
             0 => blur::<0>(&src, width, height, &kernel, tmp, out),

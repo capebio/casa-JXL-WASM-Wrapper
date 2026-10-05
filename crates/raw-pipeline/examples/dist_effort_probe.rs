@@ -73,7 +73,7 @@ fn main() {
         (0.5, 4),
         (2.0, 3),
     ];
-    let mut run = |d: f32, e: u8| {
+    let run = |d: f32, e: u8| {
         let mut opts = CasaVideoOptions::streaming(d);
         opts.effort = e;
         opts.rate = VideoRate::Lossy(d);
