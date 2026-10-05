@@ -233,68 +233,13 @@ fn main() {
             out.put_pixel(ox as u32, oy as u32, image::Rgb([q(acc[0]), q(acc[1]), q(acc[2])]));
         }
     }
-    // Default capture sharpening on the Apple path (unsharp mask, ACR-ish
-    // defaults: amount 0.5, ~1 px radius). The ONE step here not driven by a
-    // file tag: the DNG stores Apple's pre-sharpening image, and the preview
-    // carries their capture sharpening — measured 1.7-1.9x the local gradient
-    // energy of the unsharpened render. Every mainstream raw renderer applies
-    // an equivalent default. DNG_RENDER_NO_SHARPEN=1 skips it (to measure it).
-    let out = if img.profile_gain_table_map.is_some()
-        && std::env::var_os("DNG_RENDER_NO_SHARPEN").is_none()
-    {
+    // Capture sharpening on the Apple path: the DNG stores Apple's pre-sharpening
+    // image. Shared with the app's ProRAW decode. DNG_RENDER_NO_SHARPEN=1 skips
+    // it (to measure it).
+    if img.profile_gain_table_map.is_some() && std::env::var_os("DNG_RENDER_NO_SHARPEN").is_none() {
         let (ow, oh) = (out.width() as usize, out.height() as usize);
-        let px = out.as_raw();
-        let mut luma = vec![0f32; ow * oh];
-        for i in 0..ow * oh {
-            luma[i] = 0.299 * px[3 * i] as f32
-                + 0.587 * px[3 * i + 1] as f32
-                + 0.114 * px[3 * i + 2] as f32;
-        }
-        // Separable 5-tap Gaussian ([1,4,6,4,1]/16), ~1 px sigma.
-        let k = [1f32, 4.0, 6.0, 4.0, 1.0];
-        let mut tmp = vec![0f32; ow * oh];
-        for y in 0..oh {
-            for x in 0..ow {
-                let (mut s, mut wsum) = (0f32, 0f32);
-                for (di, kv) in k.iter().enumerate() {
-                    let xx = x as isize + di as isize - 2;
-                    if (0..ow as isize).contains(&xx) {
-                        s += kv * luma[y * ow + xx as usize];
-                        wsum += kv;
-                    }
-                }
-                tmp[y * ow + x] = s / wsum;
-            }
-        }
-        let mut blur = vec![0f32; ow * oh];
-        for y in 0..oh {
-            for x in 0..ow {
-                let (mut s, mut wsum) = (0f32, 0f32);
-                for (di, kv) in k.iter().enumerate() {
-                    let yy = y as isize + di as isize - 2;
-                    if (0..oh as isize).contains(&yy) {
-                        s += kv * tmp[yy as usize * ow + x];
-                        wsum += kv;
-                    }
-                }
-                blur[y * ow + x] = s / wsum;
-            }
-        }
-        let mut sharp = image::RgbImage::new(ow as u32, oh as u32);
-        let amount = 0.9f32;
-        for i in 0..ow * oh {
-            let gain = amount * (luma[i] - blur[i]);
-            let p = [
-                (px[3 * i] as f32 + gain).clamp(0.0, 255.0) as u8,
-                (px[3 * i + 1] as f32 + gain).clamp(0.0, 255.0) as u8,
-                (px[3 * i + 2] as f32 + gain).clamp(0.0, 255.0) as u8,
-            ];
-            sharp.put_pixel((i % ow) as u32, (i / ow) as u32, image::Rgb(p));
-        }
-        sharp
-    } else {
-        out
-    };
+        raw_pipeline::pipeline::capture_sharpen_rgb8(&mut out, ow, oh, 0.9);
+    }
 
     // Honor the EXIF orientation the way the embedded preview's viewer will.
     let out = match img.orientation {

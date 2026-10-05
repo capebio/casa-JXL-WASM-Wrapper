@@ -401,6 +401,10 @@ pub struct PipelineParams {
     /// points, x ascending. When set it REPLACES the always-on baseline contrast
     /// S-curve (it is the maker's own curve); the user sliders still apply on top.
     pub profile_tone_curve: Option<std::sync::Arc<[(f32, f32)]>>,
+    /// Capture-sharpening amount for the final RGB8 ([`capture_sharpen_rgb8`]);
+    /// 0.0 = off. Set by the Apple ProRAW decode (the file stores the image before
+    /// Apple's sharpening); live previews keep 0.
+    pub capture_sharpen: f32,
 }
 
 impl PipelineParams {
@@ -428,6 +432,51 @@ impl PipelineParams {
             compact_lut: false,
             baseline_ev: BASELINE_EXP_EV,
             profile_tone_curve: None,
+            capture_sharpen: 0.0,
+        }
+    }
+}
+
+/// Apple-path capture sharpening on display RGB8, in place: an unsharp mask on
+/// luma (0.299/0.587/0.114) with a separable 5-tap [1,4,6,4,1]/16 Gaussian
+/// (~1 px sigma, weights renormalised at the borders), the luma detail times
+/// `amount` added to all three channels. Apple ProRAW stores the image before
+/// Apple's own sharpening; its preview measured 1.7-1.9x the local gradient
+/// energy of the unsharpened render. Amount 0.9 is the reference render's
+/// (`examples/dng_render.rs`), which shares this function.
+pub fn capture_sharpen_rgb8(px: &mut [u8], w: usize, h: usize, amount: f32) {
+    let luma: Vec<f32> = px
+        .chunks_exact(3)
+        .map(|p| 0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+        .collect();
+    let k = [1f32, 4.0, 6.0, 4.0, 1.0];
+    // Separable blur; `at(i)` reads the source at tap offset i-2 along one axis.
+    let blur = |src: &[f32], along_x: bool| -> Vec<f32> {
+        let mut out = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let (mut s, mut wsum) = (0f32, 0f32);
+                for (di, kv) in k.iter().enumerate() {
+                    let (xx, yy) = if along_x {
+                        (x as isize + di as isize - 2, y as isize)
+                    } else {
+                        (x as isize, y as isize + di as isize - 2)
+                    };
+                    if (0..w as isize).contains(&xx) && (0..h as isize).contains(&yy) {
+                        s += kv * src[yy as usize * w + xx as usize];
+                        wsum += kv;
+                    }
+                }
+                out[y * w + x] = s / wsum;
+            }
+        }
+        out
+    };
+    let blurred = blur(&blur(&luma, true), false);
+    for (i, p) in px.chunks_exact_mut(3).enumerate() {
+        let gain = amount * (luma[i] - blurred[i]);
+        for c in p {
+            *c = (*c as f32 + gain).clamp(0.0, 255.0) as u8;
         }
     }
 }
@@ -4333,6 +4382,19 @@ mod tonemap_flip_flops {
     }
 
     #[test]
+    fn capture_sharpen_keeps_flat_and_steepens_edges() {
+        // 8x4 grey step 100 | 150: flat areas unchanged, both sides of the edge pushed apart.
+        let (w, h) = (8usize, 4usize);
+        let mut px: Vec<u8> = (0..w * h).flat_map(|i| [if i % w < 4 { 100 } else { 150 }; 3]).collect();
+        let before = px.clone();
+        capture_sharpen_rgb8(&mut px, w, h, 0.9);
+        assert_eq!(px[0..3], before[0..3], "flat left border");
+        assert_eq!(px[(w - 1) * 3], 150, "flat right border");
+        assert!(px[3 * 3] < 100 && px[4 * 3] > 150, "edge steepened: {} {}", px[9], px[12]);
+        assert_eq!(px[3 * 3], px[3 * 3 + 2], "same gain on every channel");
+    }
+
+    #[test]
     fn flip_flop_tonemap_apply_10x() {
         let buf = make_test_rgb16(1920 * 1080 / 4); // ~0.5M pixels, manageable
                                                     // Explicit struct (no Default derive in all feature sets).
@@ -4359,6 +4421,7 @@ mod tonemap_flip_flops {
             compact_lut: false,
             baseline_ev: BASELINE_EXP_EV,
             profile_tone_curve: None,
+            capture_sharpen: 0.0,
         };
 
         // Support graphing stabilization: print CSV + running stats. 30 is often excessive; bench shows signal settles ~8-12.

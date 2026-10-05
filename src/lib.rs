@@ -2033,6 +2033,9 @@ fn finish_dng_from_raw(
             }
             let mut rgb8 = vec![0u8; w * h * 3];
             pipeline::process_into_auto(&rgb16, &params, &mut rgb8);
+            if params.capture_sharpen > 0.0 {
+                pipeline::capture_sharpen_rgb8(&mut rgb8, w, h, params.capture_sharpen);
+            }
             let tonemap_ms = now_ms() - t;
             let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
             let (rgb16_disp, disp16_w, disp16_h) = if want_disp16 {
@@ -4751,6 +4754,11 @@ fn decode_linear_dng(
     // ProfileGainTableMap: its weight is computed on the render RGB scaled to
     // v/White × 2^Baseline, and its one gain multiplies all three channels.
     let map = img.profile_gain_table_map.as_ref();
+    // Apple path (PGTM present): the file holds the image before Apple's capture
+    // sharpening; apply the reference render's (dng_render) on the full RGB8.
+    if map.is_some() {
+        params.capture_sharpen = 0.9;
+    }
     let wscale = 2f32.powf(img.baseline_exposure) / range as f32;
     let render = |i: usize, p: &[u16]| -> [f32; 3] {
         let c = [p[0] as f32, p[1] as f32, p[2] as f32];
@@ -5055,7 +5063,10 @@ fn process_dng_impl(
             pipeline::apply_unsharp_masks(&mut rgb16, aw, ah, &params);
         }
         // Chapter 1: SIMD bulk tone (DNG + CR2 share this impl). See process_into_auto.
-        let rgb8 = pipeline::process_auto(&rgb16, &params);
+        let mut rgb8 = pipeline::process_auto(&rgb16, &params);
+        if params.capture_sharpen > 0.0 {
+            pipeline::capture_sharpen_rgb8(&mut rgb8, aw, ah, params.capture_sharpen);
+        }
         let tonemap_ms = now_ms() - t;
         // Compute display-referred 16-bit BEFORE moving rgb16 (borrow must end before move).
         let skip_orient = (output_flags & OUT_NO_ORIENT) != 0;
