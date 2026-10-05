@@ -1,6 +1,7 @@
 import initRaw, * as rawWasm from './pkg/raw_converter_wasm.js';
 import { createEncoder, createDecoder } from '@casabio/jxl-wasm';
 import { initDebugConsole, dbgLog } from './jxl-debug-console.js';
+import { ensureJxlTileDecoder } from './dng-jxl-libjxl.js';
 import {
     buildRawMeasurementKey,
     createBenchmarkRow,
@@ -530,6 +531,8 @@ async function runRawIsolation() {
         const fn = ext === 'orf' ? rawWasm.process_orf_with_flags
                  : ext === 'dng' ? rawWasm.process_dng_with_flags
                  : ext === 'cr2' ? rawWasm.process_cr2_with_flags : null;
+        // Before any timing, so the one-off libjxl load stays out of the numbers.
+        if (fn === rawWasm.process_dng_with_flags) await ensureJxlTileDecoder(rawWasm, bytes);
 
         let bench = null;
         if (typeof rawWasm?.bench_decode_orf === 'function') {
