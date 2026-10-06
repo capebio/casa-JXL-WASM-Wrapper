@@ -50,36 +50,40 @@ fn decode_row_into<const WIDE: bool>(
         let bitlen = 32 - carry_lo.leading_zeros() as i32;
         let nbits = (2 + i as i32).max(bitlen - i as i32).min(16) as usize;
 
-        // NB: per-read truncation checks are kept deliberately (NOT folded to
-        // one). They break the BitReader state-dependency chain between reads,
-        // letting truncation bookkeeping resolve off the inter-pixel critical
-        // path; folding them measured +13% on x86 (rejected D9 — see bisect).
-        let sb = br.read_bits(3);
-        if br.truncated {
-            return Err(bitstream_exhausted(width, nrows));
-        }
+        // ONE window and ONE consume a pixel: the 3-bit sign/low field, the
+        // unary "high", the escape's (16 - nbits) bits and the nbits literal
+        // are at most 3 + 12 + 16 = 31 bits, so all four come out of one
+        // left-aligned peek at fixed or locally known offsets. Four separate
+        // reads (each its own fill test, shift and truncation check) were
+        // ~143 instructions a pixel. The truncation outcome is the same: the
+        // reads consume in order, so some read crosses into pad bits exactly
+        // when their total does.
+        let x = br.peek31();
+        let sb = (x >> 61) as u32;
         let low = (sb & 3) as i32;
         // arithmetic shift spreads top bit of the 3-bit field into a -1/0 mask
         let sign = (((sb as i32) << 29) >> 31) as i32;
 
-        let high0 = br.read_huff();
-        if br.truncated {
-            return Err(bitstream_exhausted(width, nrows));
-        }
+        // `read_huff`'s closed form: the number of leading zeros of the
+        // 12-bit peek (12 = escape), consumed length value + 1 capped at 12.
+        let high0 = (((x >> 49) & 0xFFF) as u32).leading_zeros() - 20;
+        let mut used = 3 + (high0 + 1).min(12);
         // Escape path reads (16 - nbits) bits — NOT a flat 16.  Then drop LSB.
         let high = if high0 == 12 {
-            let extra = (16u32).saturating_sub(nbits as u32);
-            (br.read_bits(extra) >> 1) as i32
+            let extra = 16 - nbits as u32;
+            let v = if extra == 0 { 0 } else { (x << used) >> (64 - extra) };
+            used += extra;
+            (v >> 1) as i32
         } else {
             high0 as i32
         };
-        if br.truncated {
-            return Err(bitstream_exhausted(width, nrows));
-        }
 
         // carry[0] = (high << nbits) | nbits-bit literal.  `low` is NOT
         // OR'ed in here — it is applied to the diff when storing the pixel.
-        acarry[parity][0] = (high << (nbits as u32)) | (br.read_bits(nbits as u32) as i32);
+        // nbits is 2..=16, so the shift is never 64.
+        let lit = ((x << used) >> (64 - nbits as u32)) as i32;
+        acarry[parity][0] = (high << (nbits as u32)) | lit;
+        br.consume(used + nbits as u32);
         if br.truncated {
             return Err(bitstream_exhausted(width, nrows));
         }
@@ -491,6 +495,8 @@ impl<'a, const WIDE: bool> BitReader<'a, WIDE> {
         }
     }
 
+    /// The per-read form, kept as the oracle the tests decode with.
+    #[cfg(test)]
     #[inline(always)]
     fn read_bits(&mut self, n: u32) -> u32 {
         if n == 0 {
@@ -509,12 +515,35 @@ impl<'a, const WIDE: bool> BitReader<'a, WIDE> {
         v as u32
     }
 
+    /// The next 31 bits (at least), left-aligned in a u64; pad bits past the
+    /// end read as zero. Pair with [`Self::consume`].
+    #[inline(always)]
+    fn peek31(&mut self) -> u64 {
+        self.fill(31);
+        // fill(31) leaves 31..=56 bits in `buf`, so the shift is 8..=33.
+        self.buf << (64 - self.nbits)
+    }
+
+    /// Drop `n` (<= 31) bits after a [`Self::peek31`], with `read_bits`'s
+    /// truncation rule.
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        if n > self.real_in_buf {
+            self.truncated = true;
+            self.real_in_buf = 0;
+        } else {
+            self.real_in_buf -= n;
+        }
+        self.nbits -= n;
+    }
+
     /// Decode one Olympus "high" symbol. It is a **unary prefix code**, so no table
     /// is needed: from the original dcraw 4096-entry lookup, value = number of leading
     /// zero bits in the 12-bit peek (capped at 12 = escape) and the consumed length =
     /// value + 1 (capped at 12). One `leading_zeros` replaces a per-pixel 8 KB
     /// data-cache load on the inter-pixel critical path. `huff_lz_equiv_sweep` proves
     /// this closed form equals the canonical table for all 4096 indices.
+    #[cfg(test)]
     #[inline(always)]
     fn read_huff(&mut self) -> u32 {
         self.fill(12);
@@ -1115,6 +1144,19 @@ mod tests {
         let rb = decompress_rows_into(&short, 64, 64, 64, &mut b);
         assert!(ra.is_err());
         assert_eq!(ra, rb, "truncation Err differs");
+        // Every cut point of a small stream: the one-consume-a-pixel reader
+        // must truncate exactly where the four per-read checks did.
+        let full = synth_payload(9, 7, 0x77);
+        for cut in HEADER_SKIP + 1..full.len() {
+            let mut a = vec![0u16; 9 * 7];
+            let mut b = vec![0u16; 9 * 7];
+            let ra = decompress_rows_into_old(&full[..cut], 9, 7, 7, &mut a);
+            let rb = decompress_rows_into(&full[..cut], 9, 7, 7, &mut b);
+            assert_eq!(ra, rb, "cut {cut}");
+            if ra.is_ok() {
+                assert_eq!(a, b, "cut {cut}");
+            }
+        }
     }
 
     // Rule-9 A/B timing. Interleaved with per-iteration start rotation to cancel
