@@ -55,14 +55,16 @@ struct HuffTable {
     fast8: [u16; 256],
     // Code and magnitude in one lookup, indexed by peek(FUSED_BITS) (see
     // `next_diff`). Full: `bits used | diff << 4`, the diff already extended
-    // (|diff| < 2^11 since bits used ≤ 12). Partial (magnitude past the peek):
-    // `code len << 4 | t << 8`, its low nibble 0. 0: the code is longer than
-    // FUSED_BITS, invalid, or t == 16 — take the two-step path. u16, not u32
-    // (DNG-70): 8 KiB per table, so the per-symbol load stays in L1.
+    // (|diff| < 2^11 since bits used ≤ FUSED_BITS ≤ 12). Partial (magnitude
+    // past the peek): `code len << 4 | t << 8`, its low nibble 0. 0: the code is
+    // longer than FUSED_BITS, invalid, or t == 16 — take the two-step path. u16,
+    // not u32 (DNG-70), and 11 bits, not 12 (DNG-72): 4 KiB per table, so the
+    // per-symbol load stays in L1.
     fused: Box<[u16]>,
 }
 
-const FUSED_BITS: u32 = 12;
+// ≤ 12: a full entry's diff must fit 12 signed bits.
+const FUSED_BITS: u32 = 11;
 
 impl HuffTable {
     fn build(bits: &[u8; 16], values: &[u8]) -> Result<Self> {
