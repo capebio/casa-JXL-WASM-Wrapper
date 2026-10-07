@@ -28,74 +28,34 @@ fn bitstream_exhausted(width: usize, nrows: usize) -> String {
 /// for the first two rows. `acarry`/`west`/`north_west` are row-local and reset
 /// here every call (dcraw resets carry per row). Byte-exact with the pre-refactor
 /// inline loop; `#[inline(always)]` so `decompress_rows_into` codegen is unchanged.
+///
+/// `interior` (OPF-16): rows >= 2 decode columns >= 2 in a loop of their own,
+/// with no per-pixel row/column tests and no north bounds check. `false` = every
+/// column through the general loop (the screening reference). `pair` (OPF-17):
+/// the interior loop takes (even, odd) column pairs with per-parity locals.
 #[inline(always)]
-fn decode_row_into<const WIDE: bool>(
-    br: &mut BitReader<'_, WIDE>,
+fn decode_row_into<B: OrfBits>(
+    br: &mut B,
     row: usize,
     width: usize,
     nrows: usize,
     north_row: &[u16],
     cur_row: &mut [u16],
+    interior: bool,
+    pair: bool,
 ) -> Result<(), String> {
     // acarry[parity] = [last_value, running_avg_signed, stable_counter]
     let mut acarry = [[0i32; 3]; 2];
     let mut west = [0i32; 2];
     let mut north_west = [0i32; 2];
     let cur_row_ptr = cur_row.as_mut_ptr();
-    for col in 0..width {
+    let head = if row >= 2 && interior { width.min(2) } else { width };
+    for col in 0..head {
         let parity = col & 1;
-        let i = if acarry[parity][2] < 3 { 2 } else { 0 };
-        // D2: leading_zeros equiv to the search loop (tested in D8(b)).
-        let carry_lo = (acarry[parity][0] as u16) as u32;
-        let bitlen = 32 - carry_lo.leading_zeros() as i32;
-        let nbits = (2 + i as i32).max(bitlen - i as i32).min(16) as usize;
-
-        // ONE window and ONE consume a pixel: the 3-bit sign/low field, the
-        // unary "high", the escape's (16 - nbits) bits and the nbits literal
-        // are at most 3 + 12 + 16 = 31 bits, so all four come out of one
-        // left-aligned peek at fixed or locally known offsets. Four separate
-        // reads (each its own fill test, shift and truncation check) were
-        // ~143 instructions a pixel. The truncation outcome is the same: the
-        // reads consume in order, so some read crosses into pad bits exactly
-        // when their total does.
-        let x = br.peek31();
-        let sb = (x >> 61) as u32;
-        let low = (sb & 3) as i32;
-        // arithmetic shift spreads top bit of the 3-bit field into a -1/0 mask
-        let sign = (((sb as i32) << 29) >> 31) as i32;
-
-        // `read_huff`'s closed form: the number of leading zeros of the
-        // 12-bit peek (12 = escape), consumed length value + 1 capped at 12.
-        let high0 = (((x >> 49) & 0xFFF) as u32).leading_zeros() - 20;
-        let mut used = 3 + (high0 + 1).min(12);
-        // Escape path reads (16 - nbits) bits — NOT a flat 16.  Then drop LSB.
-        let high = if high0 == 12 {
-            let extra = 16 - nbits as u32;
-            let v = if extra == 0 { 0 } else { (x << used) >> (64 - extra) };
-            used += extra;
-            (v >> 1) as i32
-        } else {
-            high0 as i32
-        };
-
-        // carry[0] = (high << nbits) | nbits-bit literal.  `low` is NOT
-        // OR'ed in here — it is applied to the diff when storing the pixel.
-        // nbits is 2..=16, so the shift is never 64.
-        let lit = ((x << used) >> (64 - nbits as u32)) as i32;
-        acarry[parity][0] = (high << (nbits as u32)) | lit;
-        br.consume(used + nbits as u32);
-        if br.truncated {
+        let (diff, low) = decode_diff(br, &mut acarry[parity]);
+        if B::PER_PIXEL_TRUNC && br.truncated() {
             return Err(bitstream_exhausted(width, nrows));
         }
-        let diff = (acarry[parity][0] ^ sign) + acarry[parity][1];
-        // Running average uses the carry's OWN previous value (carry[1]),
-        // not carry[0].  This is the dcraw / LibRaw / rawloader form.
-        acarry[parity][1] = (diff * 3 + acarry[parity][1]) >> 5;
-        acarry[parity][2] = if acarry[parity][0] > 16 {
-            0
-        } else {
-            acarry[parity][2] + 1
-        };
 
         // D1 predictor using delay lines (bit-exact with u16-masked re-reads).
         // D10: load this column's north sample ONCE (row>=2). The raw-pointer
@@ -109,23 +69,7 @@ fn decode_row_into<const WIDE: bool>(
         } else if col < 2 {
             north
         } else {
-            // Branchless: flatten the nested data-dependent branches (every
-            // pixel mispredicted) into precomputed candidates + cmov selects.
-            // Bit-exact with the original gradient predictor.
-            let w_ = west[parity];
-            let n_ = north;
-            let nw = north_west[parity];
-            let awn = (w_ - nw).abs();
-            let ann = (n_ - nw).abs();
-            let between = ((w_ < nw) & (nw < n_)) | ((n_ < nw) & (nw < w_));
-            let far = (awn > 32) | (ann > 32);
-            let p_between = if far { w_ + n_ - nw } else { (w_ + n_) >> 1 };
-            let p_else = if awn > ann { w_ } else { n_ };
-            if between {
-                p_between
-            } else {
-                p_else
-            }
+            gradient_pred(west[parity], north, north_west[parity])
         };
 
         let v = (pred + ((diff << 2) | low)) & 0xFFFF;
@@ -140,7 +84,127 @@ fn decode_row_into<const WIDE: bool>(
             north_west[parity] = north;
         }
     }
+    if head < width && pair {
+        // OPF-17: columns >= 2 in (even, odd) pairs, each parity's state in its
+        // own locals, so nothing is indexed by `col & 1` (no stack array, no
+        // address arithmetic). head == 2, so `col` starts even.
+        let north_row = &north_row[..width];
+        let [mut ce, mut co] = acarry;
+        let [mut we, mut wo] = west;
+        let [mut nwe, mut nwo] = north_west;
+        let mut px = |col: usize, c: &mut [i32; 3], w: &mut i32, nw: &mut i32| -> bool {
+            let (diff, low) = decode_diff(br, c);
+            if B::PER_PIXEL_TRUNC && br.truncated() {
+                return false;
+            }
+            let north = north_row[col] as i32;
+            let v = (gradient_pred(*w, north, *nw) + ((diff << 2) | low)) & 0xFFFF;
+            // SAFETY: col < width == cur_row.len(); see the general loop.
+            unsafe {
+                *cur_row_ptr.add(col) = v as u16;
+            }
+            *w = v;
+            *nw = north;
+            true
+        };
+        let mut col = head;
+        while col + 1 < width {
+            if !px(col, &mut ce, &mut we, &mut nwe) || !px(col + 1, &mut co, &mut wo, &mut nwo) {
+                return Err(bitstream_exhausted(width, nrows));
+            }
+            col += 2;
+        }
+        if col < width && !px(col, &mut ce, &mut we, &mut nwe) {
+            return Err(bitstream_exhausted(width, nrows));
+        }
+    } else if head < width {
+        // Rows >= 2, columns >= 2: always the gradient predictor.
+        let north_row = &north_row[..width];
+        for col in head..width {
+            let parity = col & 1;
+            let (diff, low) = decode_diff(br, &mut acarry[parity]);
+            if B::PER_PIXEL_TRUNC && br.truncated() {
+                return Err(bitstream_exhausted(width, nrows));
+            }
+            let north = north_row[col] as i32;
+            let v = (gradient_pred(west[parity], north, north_west[parity]) + ((diff << 2) | low)) & 0xFFFF;
+            // SAFETY: as above; col < width == cur_row.len().
+            unsafe {
+                *cur_row_ptr.add(col) = v as u16;
+            }
+            west[parity] = v;
+            north_west[parity] = north;
+        }
+    }
     Ok(())
+}
+
+/// The gradient predictor from west, north and north-west (rows >= 2,
+/// columns >= 2). Branchless: the nested data-dependent branches (every pixel
+/// mispredicted) flattened into precomputed candidates + cmov selects.
+/// Bit-exact with the original.
+#[inline(always)]
+fn gradient_pred(w_: i32, n_: i32, nw: i32) -> i32 {
+    let awn = (w_ - nw).abs();
+    let ann = (n_ - nw).abs();
+    let between = ((w_ < nw) & (nw < n_)) | ((n_ < nw) & (nw < w_));
+    let far = (awn > 32) | (ann > 32);
+    let p_between = if far { w_ + n_ - nw } else { (w_ + n_) >> 1 };
+    let p_else = if awn > ann { w_ } else { n_ };
+    if between { p_between } else { p_else }
+}
+
+/// One pixel's bits: updates `carry` ([last_value, running_avg_signed,
+/// stable_counter]) and returns the signed diff and the 2-bit low field.
+/// Truncation is the caller's test.
+#[inline(always)]
+fn decode_diff<B: OrfBits>(br: &mut B, carry: &mut [i32; 3]) -> (i32, i32) {
+    let i = if carry[2] < 3 { 2 } else { 0 };
+    // D2: leading_zeros equiv to the search loop (tested in D8(b)).
+    let carry_lo = (carry[0] as u16) as u32;
+    let bitlen = 32 - carry_lo.leading_zeros() as i32;
+    let nbits = (2 + i as i32).max(bitlen - i as i32).min(16) as usize;
+
+    // ONE window and ONE consume a pixel: the 3-bit sign/low field, the
+    // unary "high", the escape's (16 - nbits) bits and the nbits literal
+    // are at most 3 + 12 + 16 = 31 bits, so all four come out of one
+    // left-aligned peek at fixed or locally known offsets. Four separate
+    // reads (each its own fill test, shift and truncation check) were
+    // ~143 instructions a pixel. The truncation outcome is the same: the
+    // reads consume in order, so some read crosses into pad bits exactly
+    // when their total does.
+    let x = br.peek31();
+    let sb = (x >> 61) as u32;
+    let low = (sb & 3) as i32;
+    // arithmetic shift spreads top bit of the 3-bit field into a -1/0 mask
+    let sign = (((sb as i32) << 29) >> 31) as i32;
+
+    // `read_huff`'s closed form: the number of leading zeros of the
+    // 12-bit peek (12 = escape), consumed length value + 1 capped at 12.
+    let high0 = (((x >> 49) & 0xFFF) as u32).leading_zeros() - 20;
+    let mut used = 3 + (high0 + 1).min(12);
+    // Escape path reads (16 - nbits) bits — NOT a flat 16.  Then drop LSB.
+    let high = if high0 == 12 {
+        let extra = 16 - nbits as u32;
+        let v = if extra == 0 { 0 } else { (x << used) >> (64 - extra) };
+        used += extra;
+        (v >> 1) as i32
+    } else {
+        high0 as i32
+    };
+
+    // carry[0] = (high << nbits) | nbits-bit literal.  `low` is NOT
+    // OR'ed in here — it is applied to the diff when storing the pixel.
+    // nbits is 2..=16, so the shift is never 64.
+    let lit = ((x << used) >> (64 - nbits as u32)) as i32;
+    carry[0] = (high << (nbits as u32)) | lit;
+    br.consume(used + nbits as u32);
+    let diff = (carry[0] ^ sign) + carry[1];
+    // Running average uses the carry's OWN previous value (carry[1]),
+    // not carry[0].  This is the dcraw / LibRaw / rawloader form.
+    carry[1] = (diff * 3 + carry[1]) >> 5;
+    carry[2] = if carry[0] > 16 { 0 } else { carry[2] + 1 };
+    (diff, low)
 }
 
 pub fn decompress(compressed: &[u8], width: usize, height: usize) -> Result<Vec<u16>, String> {
@@ -263,6 +327,12 @@ fn decompress_rows_into_generic<const WIDE: bool>(
     if width == 0 {
         return Ok(nrows);
     }
+    // OPF-15: read by absolute bit position (switch `BLIZZ_ORF_REF=1` = the
+    // BitReader path). `WIDE=false` stays on the BitReader: it is the bench's
+    // byte-loop arm and the tests' oracle.
+    if WIDE && std::env::var_os("BLIZZ_ORF_REF").is_none() {
+        return decompress_rows_pos(&compressed[HEADER_SKIP..], width, nrows, &mut out[..n]);
+    }
     let mut br = BitReader::<WIDE>::new(&compressed[HEADER_SKIP..]);
 
     for row in 0..nrows {
@@ -276,12 +346,248 @@ fn decompress_rows_into_generic<const WIDE: bool>(
         } else {
             &[]
         };
-        decode_row_into::<WIDE>(&mut br, row, width, nrows, north_row, &mut cur[..width])?;
+        // every column through the general loop: with `BLIZZ_ORF_REF=1` (and
+        // blizz's `BLIZZ_ORF_PIPE_REF=1`) this is the pre-OPF-15 decode, the
+        // one-binary "all levers off" arm
+        decode_row_into(&mut br, row, width, nrows, north_row, &mut cur[..width], false, false)?;
     }
     if br.truncated {
         return Err(bitstream_exhausted(width, nrows));
     }
     Ok(nrows)
+}
+
+/// OPF-15: the frame decode with no bit-buffer state, only a bit position: each
+/// pixel's window is one big-endian 8-byte load at `pos >> 3`, shifted by
+/// `pos & 7`. A pixel uses at most 31 bits, so a row whose worst case
+/// (`31 * width` bits) ends 8 bytes before the end loads unchecked; the last
+/// rows go through the zero-padding load. Consumed bits only grow, so "some
+/// read crossed into pad bits" is `pos > 8 * len` at the end of the row: the
+/// same Ok/Err outcome as the BitReader's per-pixel test.
+fn decompress_rows_pos(data: &[u8], width: usize, nrows: usize, out: &mut [u16]) -> Result<usize, String> {
+    let real = data.len() as u64 * 8;
+    let safe = data.len().saturating_sub(8) as u64 * 8;
+    let worst = (width as u64).saturating_mul(31);
+    // Screening switch for OPF-16: `BLIZZ_ORF_INT_REF=1` = no interior loop.
+    let interior = std::env::var_os("BLIZZ_ORF_INT_REF").is_none();
+    // OPF-17: `BLIZZ_ORF_PAIR_REF=1` = interior loop one column at a time.
+    let pair = std::env::var_os("BLIZZ_ORF_PAIR_REF").is_none();
+    let mut pos = 0u64;
+    for row in 0..nrows {
+        let (above, cur) = out.split_at_mut(row * width);
+        let north_row: &[u16] = if row >= 2 { &above[(row - 2) * width..(row - 1) * width] } else { &[] };
+        let cur = &mut cur[..width];
+        if pos.saturating_add(worst) <= safe {
+            let mut br = PosBits::<false> { data, pos };
+            decode_row_into(&mut br, row, width, nrows, north_row, cur, interior, pair)?;
+            pos = br.pos;
+        } else {
+            let mut br = PosBits::<true> { data, pos };
+            decode_row_into(&mut br, row, width, nrows, north_row, cur, interior, pair)?;
+            pos = br.pos;
+        }
+        if pos > real {
+            return Err(bitstream_exhausted(width, nrows));
+        }
+    }
+    Ok(nrows)
+}
+
+/// OPF-18: [`decompress`] on two threads, same output. The bit parse does not
+/// depend on pixel values (a pixel's bit count comes from the carry, which
+/// comes from earlier bits), so a spawned thread parses each pixel's residual
+/// `(diff << 2) | low` into `out` and hands over bands of rows; the calling
+/// thread follows, turning residuals into pixels with the predictor in place.
+/// 16 bits of residual are enough: the pixel is `(pred + residual) & 0xFFFF`.
+/// Native only (wasm32 has no threads); tiny or malformed inputs take the
+/// serial path, which owns their errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decompress_pipelined(compressed: &[u8], width: usize, height: usize) -> Result<Vec<u16>, String> {
+    const BAND: usize = 32;
+    let n = width
+        .checked_mul(height)
+        .ok_or_else(|| format!("decompress: {}x{} overflows", width, height))?;
+    if width < 2
+        || height < 2
+        || compressed.len() <= HEADER_SKIP
+        || (compressed.len() - HEADER_SKIP).saturating_mul(8) < n.saturating_mul(6)
+    {
+        return decompress(compressed, width, height);
+    }
+    let data = &compressed[HEADER_SKIP..];
+    let mut out = vec![0u16; n];
+    let (tx, rx) = std::sync::mpsc::channel::<&mut [u16]>();
+    std::thread::scope(|s| {
+        let out = &mut out[..];
+        let parse = s.spawn(move || parse_rows_pos(data, width, height, BAND, out, tx));
+        let mut prev: &[u16] = &[];
+        let mut row0 = 0;
+        for band in rx {
+            let rows = band.len() / width;
+            for r in 0..rows {
+                let (above, cur) = band.split_at_mut(r * width);
+                let north: &[u16] = match (row0 + r, r) {
+                    (0 | 1, _) => &[],
+                    (_, 0 | 1) => &prev[prev.len() - (2 - r) * width..][..width],
+                    _ => &above[(r - 2) * width..(r - 1) * width],
+                };
+                predict_row(row0 + r, north, &mut cur[..width]);
+            }
+            prev = band;
+            row0 += rows;
+        }
+        parse.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })?;
+    Ok(out)
+}
+
+/// OPF-18 stage 1: residuals for every row, sent on in bands of `band` rows.
+/// Same reader, row checks and truncation rule as [`decompress_rows_pos`].
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_rows_pos<'a>(
+    data: &[u8],
+    width: usize,
+    nrows: usize,
+    band: usize,
+    out: &'a mut [u16],
+    tx: std::sync::mpsc::Sender<&'a mut [u16]>,
+) -> Result<(), String> {
+    let real = data.len() as u64 * 8;
+    let safe = data.len().saturating_sub(8) as u64 * 8;
+    let worst = (width as u64).saturating_mul(31);
+    let mut pos = 0u64;
+    for rows in out.chunks_mut(band * width) {
+        for cur in rows.chunks_mut(width) {
+            pos = if pos.saturating_add(worst) <= safe {
+                parse_row(&mut PosBits::<false> { data, pos }, cur)
+            } else {
+                parse_row(&mut PosBits::<true> { data, pos }, cur)
+            };
+            if pos > real {
+                return Err(bitstream_exhausted(width, nrows));
+            }
+        }
+        if tx.send(rows).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// One row of residuals; returns the bit position after it.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn parse_row<const CHECKED: bool>(br: &mut PosBits<'_, CHECKED>, cur: &mut [u16]) -> u64 {
+    let res = |(diff, low): (i32, i32)| ((diff << 2) | low) as u16;
+    let (mut ce, mut co) = ([0i32; 3], [0i32; 3]);
+    let mut col = 0;
+    while col + 1 < cur.len() {
+        cur[col] = res(decode_diff(br, &mut ce));
+        cur[col + 1] = res(decode_diff(br, &mut co));
+        col += 2;
+    }
+    if col < cur.len() {
+        cur[col] = res(decode_diff(br, &mut ce));
+    }
+    br.pos
+}
+
+/// OPF-18 stage 2: residuals of `row` to pixels in place, with the same
+/// predictor cases as [`decode_row_into`]. `north` = final row `row - 2`.
+#[cfg(not(target_arch = "wasm32"))]
+fn predict_row(row: usize, north: &[u16], cur: &mut [u16]) {
+    let w = cur.len();
+    let px = |pred: i32, r: u16| ((pred + r as i32) & 0xFFFF) as u16;
+    if row < 2 {
+        // Columns 0-1 predict 0; the rest predict west (same parity).
+        for col in 2..w {
+            cur[col] = px(cur[col - 2] as i32, cur[col]);
+        }
+        return;
+    }
+    let north = &north[..w];
+    for col in 0..w.min(2) {
+        cur[col] = px(north[col] as i32, cur[col]);
+    }
+    let (mut we, mut wo) = (cur[0] as i32, cur[1] as i32);
+    let (mut nwe, mut nwo) = (north[0] as i32, north[1] as i32);
+    let mut col = 2;
+    while col + 1 < w {
+        let n = north[col] as i32;
+        cur[col] = px(gradient_pred(we, n, nwe), cur[col]);
+        we = cur[col] as i32;
+        nwe = n;
+        let n = north[col + 1] as i32;
+        cur[col + 1] = px(gradient_pred(wo, n, nwo), cur[col + 1]);
+        wo = cur[col + 1] as i32;
+        nwo = n;
+        col += 2;
+    }
+    if col < w {
+        cur[col] = px(gradient_pred(we, north[col] as i32, nwe), cur[col]);
+    }
+}
+
+/// The bit source `decode_row_into` reads: one left-aligned window of at least
+/// 31 bits a pixel, then the bits it used.
+trait OrfBits {
+    /// Test truncation after every pixel (the BitReader); `PosBits` tests once a row.
+    const PER_PIXEL_TRUNC: bool;
+    fn peek31(&mut self) -> u64;
+    fn consume(&mut self, n: u32);
+    fn truncated(&self) -> bool;
+}
+
+impl<const WIDE: bool> OrfBits for BitReader<'_, WIDE> {
+    const PER_PIXEL_TRUNC: bool = true;
+    #[inline(always)]
+    fn peek31(&mut self) -> u64 {
+        BitReader::peek31(self)
+    }
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        BitReader::consume(self, n)
+    }
+    #[inline(always)]
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// OPF-15 reader: a bit position only. `CHECKED` = the load may run past the
+/// end (bytes there read as zero); unchecked rows are guaranteed in bounds by
+/// [`decompress_rows_pos`].
+struct PosBits<'a, const CHECKED: bool> {
+    data: &'a [u8],
+    pos: u64,
+}
+
+impl<const CHECKED: bool> OrfBits for PosBits<'_, CHECKED> {
+    const PER_PIXEL_TRUNC: bool = false;
+    #[inline(always)]
+    fn peek31(&mut self) -> u64 {
+        let b = (self.pos >> 3) as usize;
+        let w = if !CHECKED || b + 8 <= self.data.len() {
+            load_be_u64(self.data, b)
+        } else {
+            let mut t = [0u8; 8];
+            if b < self.data.len() {
+                let r = &self.data[b..];
+                t[..r.len()].copy_from_slice(r);
+            }
+            u64::from_be_bytes(t)
+        };
+        // 64 - 7 = 57 valid bits after the shift.
+        w << (self.pos & 7)
+    }
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        self.pos += n as u64;
+    }
+    #[inline(always)]
+    fn truncated(&self) -> bool {
+        false
+    }
 }
 
 /// A source of decoded raw rows, produced strictly top-to-bottom. The extension
@@ -348,7 +654,7 @@ impl RawRowSource for OrfRowDecoder<'_> {
         } else {
             &[]
         };
-        decode_row_into::<WIDE_FILL>(&mut self.br, r, w, self.height, north, &mut dst[..w])?;
+        decode_row_into(&mut self.br, r, w, self.height, north, &mut dst[..w], true, true)?;
         // Stash into the ring so rows r+2 can read it as north.
         let cs = (r % 3) * w;
         self.ring[cs..cs + w].copy_from_slice(&dst[..w]);
@@ -731,6 +1037,43 @@ mod tests {
 
     // #3: zero-width frame decodes to zero pixels for any height without spinning
     // the row loop (out tail untouched; returns the row count).
+    /// OPF-15: the bit-position decode equals the BitReader (`WIDE=false`), on
+    /// whole streams and on streams cut short anywhere, errors included.
+    #[test]
+    fn pos_reader_matches_bitreader() {
+        for &(w, h, seed) in &[(4usize, 3usize, 1u64), (3, 257, 2), (255, 64, 3), (64, 255, 4), (1, 9, 5)] {
+            let full = synth_payload(w, h, seed);
+            let mut cuts: Vec<usize> = (0..40).map(|k| HEADER_SKIP + 1 + k * (full.len() - HEADER_SKIP) / 40).collect();
+            cuts.extend([full.len(), full.len() - 1, full.len() - 8, HEADER_SKIP + 1, HEADER_SKIP + 9]);
+            for len in cuts {
+                let src = &full[..len.min(full.len()).max(HEADER_SKIP + 1)];
+                let (mut a, mut b) = (vec![0u16; w * h], vec![0u16; w * h]);
+                let ra = decompress_rows_into(src, w, h, h, &mut a);
+                let rb = bench_decode_rows_into::<false>(src, w, h, h, &mut b);
+                assert_eq!(ra, rb, "{w}x{h} len {len}");
+                if ra.is_ok() {
+                    assert_eq!(a, b, "{w}x{h} len {len}");
+                }
+            }
+        }
+    }
+
+    /// OPF-18: the two-thread decode equals the serial one, across band edges
+    /// (32 rows), odd widths and streams cut short, errors included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pipelined_matches_serial() {
+        for &(w, h, seed) in &[(4usize, 3usize, 1u64), (3, 257, 2), (255, 64, 3), (64, 255, 4), (2, 40, 5), (1, 9, 6), (7, 33, 7)] {
+            let full = synth_payload(w, h, seed);
+            let mut cuts: Vec<usize> = (0..30).map(|k| HEADER_SKIP + 1 + k * (full.len() - HEADER_SKIP) / 30).collect();
+            cuts.extend([full.len(), full.len() - 1, HEADER_SKIP]);
+            for len in cuts {
+                let src = &full[..len];
+                assert_eq!(decompress_pipelined(src, w, h), decompress(src, w, h), "{w}x{h} len {len}");
+            }
+        }
+    }
+
     #[test]
     fn decompress_zero_width_is_noop() {
         let payload = synth_payload(1, 1, 1); // any >HEADER_SKIP payload
