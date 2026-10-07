@@ -29,8 +29,8 @@ fn bitstream_exhausted(width: usize, nrows: usize) -> String {
 /// here every call (dcraw resets carry per row). Byte-exact with the pre-refactor
 /// inline loop; `#[inline(always)]` so `decompress_rows_into` codegen is unchanged.
 #[inline(always)]
-fn decode_row_into<const WIDE: bool>(
-    br: &mut BitReader<'_, WIDE>,
+fn decode_row_into<B: OrfBits>(
+    br: &mut B,
     row: usize,
     width: usize,
     nrows: usize,
@@ -84,7 +84,7 @@ fn decode_row_into<const WIDE: bool>(
         let lit = ((x << used) >> (64 - nbits as u32)) as i32;
         acarry[parity][0] = (high << (nbits as u32)) | lit;
         br.consume(used + nbits as u32);
-        if br.truncated {
+        if B::PER_PIXEL_TRUNC && br.truncated() {
             return Err(bitstream_exhausted(width, nrows));
         }
         let diff = (acarry[parity][0] ^ sign) + acarry[parity][1];
@@ -263,6 +263,12 @@ fn decompress_rows_into_generic<const WIDE: bool>(
     if width == 0 {
         return Ok(nrows);
     }
+    // OPF-15: read by absolute bit position (switch `BLIZZ_ORF_REF=1` = the
+    // BitReader path). `WIDE=false` stays on the BitReader: it is the bench's
+    // byte-loop arm and the tests' oracle.
+    if WIDE && std::env::var_os("BLIZZ_ORF_REF").is_none() {
+        return decompress_rows_pos(&compressed[HEADER_SKIP..], width, nrows, &mut out[..n]);
+    }
     let mut br = BitReader::<WIDE>::new(&compressed[HEADER_SKIP..]);
 
     for row in 0..nrows {
@@ -276,12 +282,106 @@ fn decompress_rows_into_generic<const WIDE: bool>(
         } else {
             &[]
         };
-        decode_row_into::<WIDE>(&mut br, row, width, nrows, north_row, &mut cur[..width])?;
+        decode_row_into(&mut br, row, width, nrows, north_row, &mut cur[..width])?;
     }
     if br.truncated {
         return Err(bitstream_exhausted(width, nrows));
     }
     Ok(nrows)
+}
+
+/// OPF-15: the frame decode with no bit-buffer state, only a bit position: each
+/// pixel's window is one big-endian 8-byte load at `pos >> 3`, shifted by
+/// `pos & 7`. A pixel uses at most 31 bits, so a row whose worst case
+/// (`31 * width` bits) ends 8 bytes before the end loads unchecked; the last
+/// rows go through the zero-padding load. Consumed bits only grow, so "some
+/// read crossed into pad bits" is `pos > 8 * len` at the end of the row: the
+/// same Ok/Err outcome as the BitReader's per-pixel test.
+fn decompress_rows_pos(data: &[u8], width: usize, nrows: usize, out: &mut [u16]) -> Result<usize, String> {
+    let real = data.len() as u64 * 8;
+    let safe = data.len().saturating_sub(8) as u64 * 8;
+    let worst = (width as u64).saturating_mul(31);
+    let mut pos = 0u64;
+    for row in 0..nrows {
+        let (above, cur) = out.split_at_mut(row * width);
+        let north_row: &[u16] = if row >= 2 { &above[(row - 2) * width..(row - 1) * width] } else { &[] };
+        let cur = &mut cur[..width];
+        if pos.saturating_add(worst) <= safe {
+            let mut br = PosBits::<false> { data, pos };
+            decode_row_into(&mut br, row, width, nrows, north_row, cur)?;
+            pos = br.pos;
+        } else {
+            let mut br = PosBits::<true> { data, pos };
+            decode_row_into(&mut br, row, width, nrows, north_row, cur)?;
+            pos = br.pos;
+        }
+        if pos > real {
+            return Err(bitstream_exhausted(width, nrows));
+        }
+    }
+    Ok(nrows)
+}
+
+/// The bit source `decode_row_into` reads: one left-aligned window of at least
+/// 31 bits a pixel, then the bits it used.
+trait OrfBits {
+    /// Test truncation after every pixel (the BitReader); `PosBits` tests once a row.
+    const PER_PIXEL_TRUNC: bool;
+    fn peek31(&mut self) -> u64;
+    fn consume(&mut self, n: u32);
+    fn truncated(&self) -> bool;
+}
+
+impl<const WIDE: bool> OrfBits for BitReader<'_, WIDE> {
+    const PER_PIXEL_TRUNC: bool = true;
+    #[inline(always)]
+    fn peek31(&mut self) -> u64 {
+        BitReader::peek31(self)
+    }
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        BitReader::consume(self, n)
+    }
+    #[inline(always)]
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+}
+
+/// OPF-15 reader: a bit position only. `CHECKED` = the load may run past the
+/// end (bytes there read as zero); unchecked rows are guaranteed in bounds by
+/// [`decompress_rows_pos`].
+struct PosBits<'a, const CHECKED: bool> {
+    data: &'a [u8],
+    pos: u64,
+}
+
+impl<const CHECKED: bool> OrfBits for PosBits<'_, CHECKED> {
+    const PER_PIXEL_TRUNC: bool = false;
+    #[inline(always)]
+    fn peek31(&mut self) -> u64 {
+        let b = (self.pos >> 3) as usize;
+        let w = if !CHECKED || b + 8 <= self.data.len() {
+            load_be_u64(self.data, b)
+        } else {
+            let mut t = [0u8; 8];
+            if b < self.data.len() {
+                let r = &self.data[b..];
+                t[..r.len()].copy_from_slice(r);
+            }
+            u64::from_be_bytes(t)
+        };
+        // 64 - 7 = 57 valid bits after the shift.
+        w << (self.pos & 7)
+    }
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        self.pos += n as u64;
+    }
+    #[inline(always)]
+    fn truncated(&self) -> bool {
+        false
+    }
 }
 
 /// A source of decoded raw rows, produced strictly top-to-bottom. The extension
@@ -348,7 +448,7 @@ impl RawRowSource for OrfRowDecoder<'_> {
         } else {
             &[]
         };
-        decode_row_into::<WIDE_FILL>(&mut self.br, r, w, self.height, north, &mut dst[..w])?;
+        decode_row_into(&mut self.br, r, w, self.height, north, &mut dst[..w])?;
         // Stash into the ring so rows r+2 can read it as north.
         let cs = (r % 3) * w;
         self.ring[cs..cs + w].copy_from_slice(&dst[..w]);
@@ -731,6 +831,27 @@ mod tests {
 
     // #3: zero-width frame decodes to zero pixels for any height without spinning
     // the row loop (out tail untouched; returns the row count).
+    /// OPF-15: the bit-position decode equals the BitReader (`WIDE=false`), on
+    /// whole streams and on streams cut short anywhere, errors included.
+    #[test]
+    fn pos_reader_matches_bitreader() {
+        for &(w, h, seed) in &[(4usize, 3usize, 1u64), (3, 257, 2), (255, 64, 3), (64, 255, 4), (1, 9, 5)] {
+            let full = synth_payload(w, h, seed);
+            let mut cuts: Vec<usize> = (0..40).map(|k| HEADER_SKIP + 1 + k * (full.len() - HEADER_SKIP) / 40).collect();
+            cuts.extend([full.len(), full.len() - 1, full.len() - 8, HEADER_SKIP + 1, HEADER_SKIP + 9]);
+            for len in cuts {
+                let src = &full[..len.min(full.len()).max(HEADER_SKIP + 1)];
+                let (mut a, mut b) = (vec![0u16; w * h], vec![0u16; w * h]);
+                let ra = decompress_rows_into(src, w, h, h, &mut a);
+                let rb = bench_decode_rows_into::<false>(src, w, h, h, &mut b);
+                assert_eq!(ra, rb, "{w}x{h} len {len}");
+                if ra.is_ok() {
+                    assert_eq!(a, b, "{w}x{h} len {len}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn decompress_zero_width_is_noop() {
         let payload = synth_payload(1, 1, 1); // any >HEADER_SKIP payload
