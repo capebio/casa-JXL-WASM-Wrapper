@@ -340,6 +340,7 @@ impl<'a> PanaBits<'a> {
     #[inline(never)]
     fn fill(&mut self) {
         let lf = self.load_flags;
+        // (Zeroing only the uncopied tail, OPF-31: ab NOISE, reverted.)
         self.buf[..0x4000].fill(0);
         let n1 = self.src.len().saturating_sub(self.pos).min(0x4000 - lf);
         self.buf[lf..lf + n1].copy_from_slice(&self.src[self.pos..self.pos + n1]);
@@ -444,6 +445,109 @@ fn pana_block(block: &mut [u16], mut get: impl FnMut(u32) -> u32) {
     }
 }
 
+/// [`pana_block_fixed`] for 16 consecutive blocks at once (OPF-30): `src` is
+/// their 16 chunks (256 bytes, block `b` at `16 * b`, which is how the page
+/// lays out consecutive chunks), `dst` gets `16 * 14` pixels plus 2 scratch
+/// samples past the end. One block per 16-bit lane: the predictors stay in
+/// `0..=16287` (start <= 4095, six steps of at most `127 << 4`), so i16 lanes
+/// hold them and the clamp is a no-op. `false` (dst untouched) when any block
+/// has a zero first code.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pana_group16(src: &[u8; 256], dst: &mut [u16; 16 * 14 + 2]) -> bool {
+    use std::arch::x86_64::*;
+    // Rows of 8 lanes in each 128-bit half -> lane j of row q, per half.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn t8x8(a: [__m256i; 8]) -> [__m256i; 8] {
+        let t = [
+            _mm256_unpacklo_epi16(a[0], a[1]), _mm256_unpackhi_epi16(a[0], a[1]),
+            _mm256_unpacklo_epi16(a[2], a[3]), _mm256_unpackhi_epi16(a[2], a[3]),
+            _mm256_unpacklo_epi16(a[4], a[5]), _mm256_unpackhi_epi16(a[4], a[5]),
+            _mm256_unpacklo_epi16(a[6], a[7]), _mm256_unpackhi_epi16(a[6], a[7]),
+        ];
+        let u = [
+            _mm256_unpacklo_epi32(t[0], t[2]), _mm256_unpackhi_epi32(t[0], t[2]),
+            _mm256_unpacklo_epi32(t[1], t[3]), _mm256_unpackhi_epi32(t[1], t[3]),
+            _mm256_unpacklo_epi32(t[4], t[6]), _mm256_unpackhi_epi32(t[4], t[6]),
+            _mm256_unpacklo_epi32(t[5], t[7]), _mm256_unpackhi_epi32(t[5], t[7]),
+        ];
+        [
+            _mm256_unpacklo_epi64(u[0], u[4]), _mm256_unpackhi_epi64(u[0], u[4]),
+            _mm256_unpacklo_epi64(u[1], u[5]), _mm256_unpackhi_epi64(u[1], u[5]),
+            _mm256_unpacklo_epi64(u[2], u[6]), _mm256_unpackhi_epi64(u[2], u[6]),
+            _mm256_unpacklo_epi64(u[3], u[7]), _mm256_unpackhi_epi64(u[3], u[7]),
+        ]
+    }
+    let p = src.as_ptr() as *const __m128i;
+    // Row b: chunk b in the low half, chunk b + 8 in the high half; after the
+    // transpose, w[q] lane b (b + 8 high) = 16-bit word q of that chunk.
+    let w = t8x8(std::array::from_fn(|b| {
+        _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(p.add(b))), _mm_loadu_si128(p.add(b + 8)))
+    }));
+    // Field of `n` bits starting at chunk bit `lo` (bit 0 = LSB of the u128).
+    let f = |lo: i32, n: i32| {
+        let (q, off) = ((lo >> 4) as usize, lo & 15);
+        let mut v = _mm256_srl_epi16(w[q], _mm_cvtsi32_si128(off));
+        if off + n > 16 {
+            v = _mm256_or_si256(v, _mm256_sll_epi16(w[q + 1], _mm_cvtsi32_si128(16 - off)));
+        }
+        _mm256_and_si256(v, _mm256_set1_epi16(((1u32 << n) - 1) as i16))
+    };
+    let zero = _mm256_setzero_si256();
+    let (n0, n1) = (f(120, 8), f(108, 8));
+    let z = _mm256_or_si256(_mm256_cmpeq_epi16(n0, zero), _mm256_cmpeq_epi16(n1, zero));
+    if _mm256_testz_si256(z, z) == 0 {
+        return false;
+    }
+    let mut pred = [
+        _mm256_or_si256(_mm256_slli_epi16::<4>(n0), f(116, 4)),
+        _mm256_or_si256(_mm256_slli_epi16::<4>(n1), f(104, 4)),
+    ];
+    let mut o = [zero; 16];
+    o[0] = pred[0];
+    o[1] = pred[1];
+    // 1 << sh for the 2-bit field x: sh = 4 >> (3 - x) = 0, 1, 2, 4. The high
+    // byte of each index is 0x80 so pshufb zeroes it.
+    let m_lut = _mm256_setr_epi8(1, 2, 4, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    let hi80 = _mm256_set1_epi16(0x8000u16 as i16);
+    let three = _mm256_set1_epi16(3);
+    let one = _mm256_set1_epi16(1);
+    let (mut m, mut keep, mut m128) = (zero, zero, zero);
+    let mut top = 104;
+    for i in 2..14 {
+        if i % 3 == 2 {
+            let x = f(top - 2, 2);
+            top -= 2;
+            m = _mm256_shuffle_epi8(m_lut, _mm256_or_si256(x, hi80));
+            m128 = _mm256_slli_epi16::<7>(m);
+            // Bits cleared when pred < 0 or sh == 4: everything above sh.
+            keep = _mm256_andnot_si256(_mm256_sub_epi16(m, one), _mm256_cmpeq_epi16(x, three));
+        }
+        let j = f(top - 8, 8);
+        top -= 8;
+        let k = i & 1;
+        let t = _mm256_sub_epi16(pred[k], m128);
+        let clear = _mm256_or_si256(keep, _mm256_andnot_si256(_mm256_sub_epi16(m, one), _mm256_cmpgt_epi16(zero, t)));
+        let t = _mm256_add_epi16(_mm256_andnot_si256(clear, t), _mm256_mullo_epi16(j, m));
+        pred[k] = _mm256_blendv_epi8(t, pred[k], _mm256_cmpeq_epi16(j, zero));
+        o[i] = pred[k];
+    }
+    // Back to block order: r[b] = pixels 0..8 of block b (b + 8 high), s[b] =
+    // pixels 8..16 (14 and 15 are zero and land in the 2 scratch samples or
+    // under the next block, which is stored after).
+    let r = t8x8(std::array::from_fn(|i| o[i]));
+    let s = t8x8(std::array::from_fn(|i| o[i + 8]));
+    let d = dst.as_mut_ptr();
+    for b in 0..8 {
+        _mm256_storeu_si256(d.add(b * 14) as *mut __m256i, _mm256_permute2x128_si256::<0x20>(r[b], s[b]));
+    }
+    for b in 0..8 {
+        _mm256_storeu_si256(d.add((b + 8) * 14) as *mut __m256i, _mm256_permute2x128_si256::<0x31>(r[b], s[b]));
+    }
+    true
+}
+
 /// Decode a Panasonic RW2 or Leica RWL.
 pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     if d.len() < 8 || &d[0..2] != b"II" {
@@ -508,16 +612,43 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     let phase = ((px as usize + left) as u8 & 1, (py as usize + top) as u8 & 1);
     let mut raw = vec![0u16; img_w * img_h];
     let span = img_w.min(sensor_w - left);
-    let mut line = vec![0u16; sensor_w];
+    // + 2: scratch for the last block of a `pana_group16` store.
+    let mut line = vec![0u16; sensor_w + 2];
     // load_flags is a function of RawFormat; 0x2008 is the value for format 4,
     // which is the only one accepted above.
     let mut bits_rd = PanaBits::new(&d[raw_off..], 0x2008);
     // Screening switch for OPF-13: every block through `PanaBits::get`.
     let chunked = std::env::var_os("BLIZZ_RW2_BLOCK_REF").is_none();
+    // OPF-30: 16 blocks per AVX2 group (`BLIZZ_OPF30=0` turns it off).
+    #[cfg(target_arch = "x86_64")]
+    let group16 = chunked
+        && std::env::var_os("BLIZZ_OPF30").map_or(true, |v| v != "0")
+        && std::is_x86_feature_detected!("avx2");
+    let full = sensor_w / 14;
     for row in 0..sensor_h {
         // A 14-pixel block resets the predictors; walking blocks removes the
         // per-pixel `col % 14`.
-        for block in line.chunks_mut(14) {
+        let mut b = 0;
+        // Blocks left to take one at a time after a group declined.
+        let mut single = 0u32;
+        while b * 14 < sensor_w {
+            #[cfg(target_arch = "x86_64")]
+            if group16 && single == 0 && b + 16 <= full && bits_rd.vbits >= 16 * 128 && bits_rd.vbits & 127 == 0 {
+                // 16 chunks below the cursor, consecutive and ascending in the page.
+                let at = ((bits_rd.vbits - 1) >> 3 ^ 0x3ff0) as usize & !15;
+                let src: &[u8; 256] = bits_rd.buf[at..at + 256].try_into().unwrap();
+                let dst: &mut [u16; 16 * 14 + 2] = (&mut line[b * 14..b * 14 + 16 * 14 + 2]).try_into().unwrap();
+                // SAFETY: avx2 checked above.
+                if unsafe { pana_group16(src, dst) } {
+                    bits_rd.vbits -= 16 * 128;
+                    b += 16;
+                    continue;
+                }
+                single = 16;
+            }
+            single = single.saturating_sub(1);
+            let block = &mut line[b * 14..(b * 14 + 14).min(sensor_w)];
+            b += 1;
             // OPF-13: a full block with nonzero first codes is exactly one
             // 128-bit chunk with every field at a fixed place (on the bodies
             // here every block starts on a chunk boundary). Anything else goes
@@ -1423,6 +1554,50 @@ mod tests {
             if !zero_first {
                 assert_eq!(q, 0, "u={u:#x}");
                 assert_eq!(a, b, "u={u:#x}");
+            }
+        }
+    }
+
+    /// OPF-30: 16 chunks through `pana_group16` give exactly what
+    /// `pana_block_fixed` gives per chunk, and the group declines (dst
+    /// untouched) when any block has a zero first code.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pana_group16_matches_pana_block_fixed() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for t in 0..20_000 {
+            let mut src = [0u8; 256];
+            for c in src.chunks_mut(8) {
+                c.copy_from_slice(&next().to_le_bytes());
+            }
+            if t % 5 == 0 {
+                // One block with a zero first code: the group must decline.
+                src[16 * (t % 16) + if t % 2 == 0 { 15 } else { 13 }] = 0;
+                src[16 * (t % 16) + 14] &= if t % 2 == 0 { 0xff } else { 0xf0 };
+            }
+            let mut want = [7u16; 16 * 14 + 2];
+            let mut ok = true;
+            for b in 0..16 {
+                let u = u128::from_le_bytes(src[16 * b..16 * b + 16].try_into().unwrap());
+                let mut blk = [0u16; 14];
+                ok &= pana_block_fixed(&mut blk, u);
+                want[14 * b..14 * b + 14].copy_from_slice(&blk);
+            }
+            let mut got = [7u16; 16 * 14 + 2];
+            assert_eq!(unsafe { pana_group16(&src, &mut got) }, ok, "t={t}");
+            if ok {
+                assert_eq!(got[..16 * 14], want[..16 * 14], "t={t}");
+            } else {
+                assert!(got.iter().all(|&v| v == 7), "t={t}");
             }
         }
     }
