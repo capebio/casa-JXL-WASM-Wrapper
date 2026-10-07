@@ -53,7 +53,14 @@ struct HuffTable {
     // the per-symbol hot path. 0 means the code is longer than 8 bits — fall back
     // to `lookup`.
     fast8: [u16; 256],
+    // Code and magnitude in one lookup, indexed by peek(FUSED_BITS) (see
+    // `next_diff`). Full: `bits used | diff << 16`, the diff already extended.
+    // Partial (magnitude past the peek): `code len | t << 8 | 0x8000`. 0: the
+    // code is longer than FUSED_BITS or invalid — take the two-step path.
+    fused: Box<[u32]>,
 }
+
+const FUSED_BITS: u32 = 12;
 
 impl HuffTable {
     fn build(bits: &[u8; 16], values: &[u8]) -> Result<Self> {
@@ -117,11 +124,31 @@ impl HuffTable {
                 }
             }
         }
+        let mut fused = vec![0u32; 1 << FUSED_BITS].into_boxed_slice();
+        for &(code_len, value, code) in &codes {
+            let (l, t) = (code_len as u32, value as u32);
+            if l > FUSED_BITS || t > 16 {
+                continue;
+            }
+            let free = FUSED_BITS - l;
+            for s in 0..1u32 << free {
+                fused[((code << free) | s) as usize] = match t {
+                    0 => l,
+                    16 => l | ((-32768i32 as u32) << 16),
+                    _ if l + t <= FUSED_BITS => {
+                        let v = (s >> (free - t)) as i32;
+                        (l + t) | ((extend(v, t) as u32) << 16)
+                    }
+                    _ => l | (t << 8) | 0x8000,
+                };
+            }
+        }
         Ok(HuffTable {
             lookup,
             max_bits,
             max_symbol,
             fast8,
+            fused,
         })
     }
 }
@@ -194,8 +221,9 @@ impl<'a, const COLLECT_STATS: bool> BitReader<'a, COLLECT_STATS> {
         // shift+mask the live window), so leaving stale high bits between refills
         // is harmless; we only clear them here so the `<< 32` below cannot fold
         // stale bits back into the live window. fill() is reached only when
-        // nbits < n ≤ 16, so `1 << nbits` never overflows.
-        debug_assert!(self.nbits < 16);
+        // nbits < n ≤ 16, or nbits < 32 from `next_diff`, so `1 << nbits` never
+        // overflows.
+        debug_assert!(self.nbits < 32);
         self.bits &= (1u64 << self.nbits).wrapping_sub(1);
         while self.nbits <= 48 && !self.finished {
             let remaining = self.src.len().saturating_sub(self.pos);
@@ -924,6 +952,52 @@ fn decode_diff<const COLLECT_STATS: bool>(
     }
 }
 
+/// [`next_category`] then [`decode_diff`], with one `fused` lookup doing both
+/// when the window holds every bit the symbol needs. Anything else (a long or
+/// invalid code, the stream's last bits, stats collection) takes those two
+/// verbatim, so values and errors are theirs.
+#[inline(always)]
+fn next_diff<const COLLECT_STATS: bool>(
+    br: &mut BitReader<'_, COLLECT_STATS>,
+    table: &HuffTable,
+    fast8_hits: &mut u64,
+    slow_huffman_hits: &mut u64,
+    total_symbols: &mut u64,
+    category_hist: &mut [u64; 17],
+    get_bits_calls: &mut u64,
+    get_bits_total_bits: &mut u64,
+) -> Result<i32> {
+    if !COLLECT_STATS {
+        if br.nbits < 32 {
+            br.fill();
+        }
+        let e = table.fused[br.peek(FUSED_BITS) as usize];
+        let len = e & 0xFF;
+        if e & 0x8000 == 0 {
+            if e != 0 && len <= br.nbits {
+                br.nbits -= len;
+                return Ok((e as i32) >> 16);
+            }
+        } else {
+            let t = (e >> 8) & 0x1F;
+            if len + t <= br.nbits {
+                br.nbits -= len + t;
+                let v = ((br.bits >> br.nbits) & ((1u64 << t) - 1)) as i32;
+                return Ok(extend(v, t));
+            }
+        }
+    }
+    let t = next_category::<COLLECT_STATS>(
+        br,
+        table,
+        fast8_hits,
+        slow_huffman_hits,
+        total_symbols,
+        category_hist,
+    )?;
+    decode_diff::<COLLECT_STATS>(br, t, get_bits_calls, get_bits_total_bits)
+}
+
 /// Monomorphized single-component (CFA RAW) kernel. `PRECISION` is a const so
 /// the category/precision guards and `base_pred` fold at compile time; with
 /// `components = 1` the output column index is just `col`, the predictor state
@@ -967,17 +1041,13 @@ fn decode_c1<const PRECISION: u8, const COLLECT_STATS: bool>(
         for col in 0..width {
             let predictor = if col == 0 { prev_row_first } else { left };
 
-            let t = next_category::<COLLECT_STATS>(
+            let diff = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
@@ -1068,17 +1138,13 @@ fn decode_c2<const PRECISION: u8, const COLLECT_STATS: bool>(
             let at_col0 = col == 0;
             // --- component 0 ---
             let pred0 = if at_col0 { prev0 } else { left0 };
-            let t0 = next_category::<COLLECT_STATS>(
+            let diff0 = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table0,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff0 = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t0,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
@@ -1090,17 +1156,13 @@ fn decode_c2<const PRECISION: u8, const COLLECT_STATS: bool>(
 
             // --- component 1 ---
             let pred1 = if at_col0 { prev1 } else { left1 };
-            let t1 = next_category::<COLLECT_STATS>(
+            let diff1 = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table1,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff1 = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t1,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
@@ -1212,17 +1274,13 @@ fn decode_c4<const PRECISION: u8, const COLLECT_STATS: bool>(
             let at_col0 = col == 0;
             // --- component 0 ---
             let pred0 = if at_col0 { prev0 } else { left0 };
-            let t0 = next_category::<COLLECT_STATS>(
+            let diff0 = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table0,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff0 = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t0,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
@@ -1234,17 +1292,13 @@ fn decode_c4<const PRECISION: u8, const COLLECT_STATS: bool>(
 
             // --- component 1 ---
             let pred1 = if at_col0 { prev1 } else { left1 };
-            let t1 = next_category::<COLLECT_STATS>(
+            let diff1 = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table1,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff1 = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t1,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
@@ -1256,17 +1310,13 @@ fn decode_c4<const PRECISION: u8, const COLLECT_STATS: bool>(
 
             // --- component 2 ---
             let pred2 = if at_col0 { prev2 } else { left2 };
-            let t2 = next_category::<COLLECT_STATS>(
+            let diff2 = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table2,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff2 = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t2,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
@@ -1278,17 +1328,13 @@ fn decode_c4<const PRECISION: u8, const COLLECT_STATS: bool>(
 
             // --- component 3 ---
             let pred3 = if at_col0 { prev3 } else { left3 };
-            let t3 = next_category::<COLLECT_STATS>(
+            let diff3 = next_diff::<COLLECT_STATS>(
                 &mut br,
                 table3,
                 &mut fast8_hits,
                 &mut slow_huffman_hits,
                 &mut total_symbols,
                 &mut category_hist,
-            )?;
-            let diff3 = decode_diff::<COLLECT_STATS>(
-                &mut br,
-                t3,
                 &mut get_bits_calls,
                 &mut get_bits_total_bits,
             )?;
