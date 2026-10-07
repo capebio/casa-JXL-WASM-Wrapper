@@ -400,6 +400,8 @@ fn pana_block_fixed(block: &mut [u16; 14], u: u128) -> bool {
         let j = f(top, 8) as i32;
         top -= 8;
         let k = i & 1;
+        // (Branch-free `j != 0`, OPF-14: LOSS +5.1% cyc; RW2 mispredicts are
+        // ~1-2.5 per 1000 branches, nothing to remove.)
         if j != 0 {
             pred[k] -= 0x80 << sh;
             if pred[k] < 0 || sh == 4 {
