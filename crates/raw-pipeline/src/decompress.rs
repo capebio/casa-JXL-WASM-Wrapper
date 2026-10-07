@@ -181,8 +181,10 @@ fn decode_diff<B: OrfBits>(br: &mut B, carry: &mut [i32; 3]) -> (i32, i32) {
 
     // `read_huff`'s closed form: the number of leading zeros of the
     // 12-bit peek (12 = escape), consumed length value + 1 capped at 12.
-    let high0 = (((x >> 49) & 0xFFF) as u32).leading_zeros() - 20;
-    let mut used = 3 + (high0 + 1).min(12);
+    // OPF-23: one 64-bit count with a stop bit at 51, so an all-zero field
+    // reads 12 with no mask, bias or cap on the bit-position chain.
+    let high0 = ((x << 3) | (1 << 51)).leading_zeros();
+    let mut used = 3 + high0 + (high0 < 12) as u32;
     // Escape path reads (16 - nbits) bits — NOT a flat 16.  Then drop LSB.
     let high = if high0 == 12 {
         let extra = 16 - nbits as u32;
