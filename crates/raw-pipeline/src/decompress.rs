@@ -346,7 +346,10 @@ fn decompress_rows_into_generic<const WIDE: bool>(
         } else {
             &[]
         };
-        decode_row_into(&mut br, row, width, nrows, north_row, &mut cur[..width], true, true)?;
+        // every column through the general loop: with `BLIZZ_ORF_REF=1` (and
+        // blizz's `BLIZZ_ORF_PIPE_REF=1`) this is the pre-OPF-15 decode, the
+        // one-binary "all levers off" arm
+        decode_row_into(&mut br, row, width, nrows, north_row, &mut cur[..width], false, false)?;
     }
     if br.truncated {
         return Err(bitstream_exhausted(width, nrows));

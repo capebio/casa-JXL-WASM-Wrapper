@@ -737,6 +737,7 @@ dependencies = [
  "image",
  "jxl-ffi",
  "jxl-oxide",
+ "memchr",
  "miniz_oxide",
  "rayon",
  "serde",
