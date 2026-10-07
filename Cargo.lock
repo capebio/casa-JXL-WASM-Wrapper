@@ -508,6 +508,7 @@ dependencies = [
  "half",
  "image",
  "jxl-ffi",
+ "memchr",
  "miniz_oxide",
  "rayon",
  "serde",
