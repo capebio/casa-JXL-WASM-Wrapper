@@ -1571,7 +1571,37 @@ fn decode_generic_pred<const PRED: u8, const COLLECT_STATS: bool>(
         // as each column completes: the value being overwritten is exactly the
         // next column's Rc, so it is saved into `rc_hold` at overwrite time.
         let mut rc_hold = [0i32; MAX_COMPONENTS];
-        for col in 0..sof_w {
+        // One sample: decode the diff against `$pred`, update the row state, emit.
+        macro_rules! sample {
+            ($raw_col:expr, $comp:expr, $rb:expr, $pred:expr) => {{
+                let diff = next_diff::<COLLECT_STATS>(
+                    &mut br,
+                    comp_tables[$comp],
+                    &mut fast8_hits,
+                    &mut slow_huffman_hits,
+                    &mut total_symbols,
+                    &mut category_hist,
+                    &mut get_bits_calls,
+                    &mut get_bits_total_bits,
+                )?;
+                let val = ($pred).wrapping_add(diff);
+                left[$comp] = val;
+                rc_hold[$comp] = $rb; // this column's above becomes next column's above-left
+                prev[$raw_col] = val;
+                if emit_row && $raw_col < out_pixel_cols {
+                    // SAFETY: geometry_check validated the max index (same model
+                    // as decode_generic).
+                    unsafe {
+                        *out.get_unchecked_mut(row_base + $raw_col) =
+                            ((val << point_transform) & 0xFFFF) as u16;
+                    }
+                }
+            }};
+        }
+        // Row 0 and column 0 have their own predictors (G-20): they run first,
+        // so the interior loop below carries no edge test.
+        let edge = if first_row { sof_w } else { sof_w.min(1) };
+        for col in 0..edge {
             let first_col = col == 0;
             let mut raw_col = col * cps;
             for comp in 0..cps {
@@ -1582,47 +1612,29 @@ fn decode_generic_pred<const PRED: u8, const COLLECT_STATS: bool>(
                     } else {
                         left[comp] // Ra: row 0 always predicts left
                     }
-                } else if first_col {
-                    rb // Rb: column 0 predicts from above
                 } else {
-                    let ra = left[comp];
-                    let rc = rc_hold[comp];
-                    match PRED {
-                        1 => ra,
-                        2 => rb,
-                        3 => rc,
-                        4 => ra.wrapping_add(rb).wrapping_sub(rc),
-                        5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
-                        6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
-                        _ => ra.wrapping_add(rb) >> 1, // 7; prepare bounds selector to 1..=7
-                    }
+                    rb // Rb: column 0 predicts from above
                 };
-
-                let table = comp_tables[comp];
-                let diff = next_diff::<COLLECT_STATS>(
-                    &mut br,
-                    table,
-                    &mut fast8_hits,
-                    &mut slow_huffman_hits,
-                    &mut total_symbols,
-                    &mut category_hist,
-                    &mut get_bits_calls,
-                    &mut get_bits_total_bits,
-                )?;
-
-                let val = predictor.wrapping_add(diff);
-                left[comp] = val;
-                rc_hold[comp] = rb; // this column's above becomes next column's above-left
-                prev[raw_col] = val;
-
-                if emit_row && raw_col < out_pixel_cols {
-                    // SAFETY: geometry_check validated the max index (same model
-                    // as decode_generic).
-                    unsafe {
-                        *out.get_unchecked_mut(row_base + raw_col) =
-                            ((val << point_transform) & 0xFFFF) as u16;
-                    }
-                }
+                sample!(raw_col, comp, rb, predictor);
+                raw_col += 1;
+            }
+        }
+        for col in edge..sof_w {
+            let mut raw_col = col * cps;
+            for comp in 0..cps {
+                let rb = prev[raw_col];
+                let ra = left[comp];
+                let rc = rc_hold[comp];
+                let predictor = match PRED {
+                    1 => ra,
+                    2 => rb,
+                    3 => rc,
+                    4 => ra.wrapping_add(rb).wrapping_sub(rc),
+                    5 => ra.wrapping_add(rb.wrapping_sub(rc) >> 1),
+                    6 => rb.wrapping_add(ra.wrapping_sub(rc) >> 1),
+                    _ => ra.wrapping_add(rb) >> 1, // 7; prepare bounds selector to 1..=7
+                };
+                sample!(raw_col, comp, rb, predictor);
                 raw_col += 1;
             }
         }
