@@ -624,6 +624,7 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     let group16 = chunked
         && std::env::var_os("BLIZZ_OPF30").map_or(true, |v| v != "0")
         && std::is_x86_feature_detected!("avx2");
+    #[cfg(target_arch = "x86_64")]
     let full = sensor_w / 14;
     for row in 0..sensor_h {
         // A 14-pixel block resets the predictors; walking blocks removes the
