@@ -773,15 +773,16 @@ fn execute<const COLLECT_STATS: bool>(
     // The specialized kernels below hard-code predictor 1 (left) state; any other
     // predictor takes the prev-row generic kernel, which handles all of 1..=7.
     if plan.predictor != 1 {
-        return decode_generic_pred::<COLLECT_STATS>(
-            plan,
-            src,
-            out,
-            base,
-            stride_pixels,
-            out_pixel_cols,
-            out_rows,
-        );
+        // One loop per selector (G-6): the per-sample `match` folds away.
+        let a = (plan, src, out, base, stride_pixels, out_pixel_cols, out_rows);
+        return match plan.predictor {
+            2 => decode_generic_pred::<2, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            3 => decode_generic_pred::<3, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            4 => decode_generic_pred::<4, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            5 => decode_generic_pred::<5, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            6 => decode_generic_pred::<6, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            _ => decode_generic_pred::<7, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+        };
     }
     match (plan.components, plan.precision) {
         (1, 12) => decode_c1::<12, COLLECT_STATS>(
@@ -1521,7 +1522,7 @@ fn decode_generic<const COLLECT_STATS: bool>(
 /// `2^(P - Pt - 1)`; the rest of row 0 predicts from Ra (left) regardless of the
 /// selector; column 0 of later rows predicts from Rb (above); everywhere else
 /// the selected predictor applies. Apple ProRAW tiles are cps=3, predictor 7.
-fn decode_generic_pred<const COLLECT_STATS: bool>(
+fn decode_generic_pred<const PRED: u8, const COLLECT_STATS: bool>(
     plan: &LjpegPlan,
     src: &[u8],
     out: &mut [u16],
@@ -1535,7 +1536,6 @@ fn decode_generic_pred<const COLLECT_STATS: bool>(
     let sof_h = plan.height;
     let precision = plan.precision;
     let point_transform = plan.point_transform;
-    let predictor_sel = plan.predictor;
     let base_pred = 1i32 << (precision - point_transform - 1);
     let mut br = BitReader::<COLLECT_STATS>::new(plan.entropy(src));
 
@@ -1587,7 +1587,7 @@ fn decode_generic_pred<const COLLECT_STATS: bool>(
                 } else {
                     let ra = left[comp];
                     let rc = rc_hold[comp];
-                    match predictor_sel {
+                    match PRED {
                         1 => ra,
                         2 => rb,
                         3 => rc,
