@@ -777,12 +777,16 @@ fn execute<const COLLECT_STATS: bool>(
         // One loop per selector (G-6): the per-sample `match` folds away.
         let a = (plan, src, out, base, stride_pixels, out_pixel_cols, out_rows);
         return match plan.predictor {
-            2 => decode_generic_pred::<2, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
-            3 => decode_generic_pred::<3, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
-            4 => decode_generic_pred::<4, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
-            5 => decode_generic_pred::<5, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
-            6 => decode_generic_pred::<6, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
-            _ => decode_generic_pred::<7, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            2 => decode_generic_pred::<2, false, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            3 => decode_generic_pred::<3, false, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            4 => decode_generic_pred::<4, false, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            5 => decode_generic_pred::<5, false, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            6 => decode_generic_pred::<6, false, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            // Apple ProRAW (predictor 7, 3 components) under DNG-74's switch.
+            _ if !COLLECT_STATS && plan.components >= 2 && pairs_on() => {
+                decode_generic_pred::<7, true, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6)
+            }
+            _ => decode_generic_pred::<7, false, COLLECT_STATS>(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
         };
     }
     match (plan.components, plan.precision) {
@@ -998,6 +1002,40 @@ fn next_diff<const COLLECT_STATS: bool>(
         category_hist,
     )?;
     decode_diff::<COLLECT_STATS>(br, t, get_bits_calls, get_bits_total_bits)
+}
+
+/// Two symbols in one lookup (DNG-74): `a`'s symbol, then `b`'s when both fit
+/// the peek, indexed by peek(FUSED_BITS). Entry: bits used (low nibble) | 0x10
+/// when it holds both | first diff (i12) << 8 | second diff (i12) << 20. A
+/// single full symbol leaves 0x10 clear; 0 = `a`'s entry was not full — take
+/// [`next_diff`].
+fn pair_table(a: &HuffTable, b: &HuffTable) -> Box<[u32]> {
+    let mask = (1usize << FUSED_BITS) - 1;
+    (0..=mask)
+        .map(|i| {
+            let ea = a.fused[i];
+            let la = (ea & 0xF) as u32;
+            if la == 0 {
+                return 0;
+            }
+            let d1 = ((ea as i16 >> 4) as u32 & 0xFFF) << 8;
+            // `b`'s entry from the bits after `a`'s, zero padded: valid when it
+            // uses no more than the bits that are really there.
+            let eb = b.fused[(i << la) & mask];
+            let lb = (eb & 0xF) as u32;
+            if lb != 0 && la + lb <= FUSED_BITS {
+                (la + lb) | 0x10 | d1 | (((eb as i16 >> 4) as u32) << 20)
+            } else {
+                la | d1
+            }
+        })
+        .collect()
+}
+
+/// DNG-74's switch, read once per process.
+fn pairs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLIZZ_LJPEG_PAIRS").is_some())
 }
 
 /// Monomorphized single-component (CFA RAW) kernel. `PRECISION` is a const so
@@ -1523,7 +1561,7 @@ fn decode_generic<const COLLECT_STATS: bool>(
 /// `2^(P - Pt - 1)`; the rest of row 0 predicts from Ra (left) regardless of the
 /// selector; column 0 of later rows predicts from Rb (above); everywhere else
 /// the selected predictor applies. Apple ProRAW tiles are cps=3, predictor 7.
-fn decode_generic_pred<const PRED: u8, const COLLECT_STATS: bool>(
+fn decode_generic_pred<const PRED: u8, const PAIRS: bool, const COLLECT_STATS: bool>(
     plan: &LjpegPlan,
     src: &[u8],
     out: &mut [u16],
@@ -1562,10 +1600,55 @@ fn decode_generic_pred<const PRED: u8, const COLLECT_STATS: bool>(
     let mut get_bits_total_bits = 0u64;
     let mut category_hist = [0u64; 17];
 
+    // PAIRS (DNG-74, cps ≥ 2): each row's diffs are decoded first, up to two
+    // symbols per lookup, then the loops below read them from `diffs`.
+    let n = sof_w * cps;
+    let mut diffs: Vec<i32> = Vec::new();
+    let mut pairs: Vec<Box<[u32]>> = Vec::new();
+    if PAIRS {
+        diffs = vec![0; n];
+        pairs = (0..cps)
+            .map(|c| pair_table(comp_tables[c], comp_tables[(c + 1) % cps]))
+            .collect();
+    }
+
     for row in 0..sof_h {
         let row_base = base + row * stride_pixels;
         let emit_row = row < out_rows;
         let first_row = row == 0;
+        if PAIRS {
+            let (mut i, mut ph) = (0usize, 0usize);
+            while i < n {
+                if br.nbits < 32 {
+                    br.fill();
+                }
+                let e = pairs[ph][br.peek(FUSED_BITS) as usize];
+                let len = e & 0xF;
+                let c = if e != 0 && len <= br.nbits && i + 1 < n {
+                    br.nbits -= len;
+                    diffs[i] = ((e << 12) as i32) >> 20;
+                    diffs[i + 1] = (e as i32) >> 20;
+                    1 + (e as usize >> 4 & 1)
+                } else {
+                    diffs[i] = next_diff::<COLLECT_STATS>(
+                        &mut br,
+                        comp_tables[ph],
+                        &mut fast8_hits,
+                        &mut slow_huffman_hits,
+                        &mut total_symbols,
+                        &mut category_hist,
+                        &mut get_bits_calls,
+                        &mut get_bits_total_bits,
+                    )?;
+                    1
+                };
+                i += c;
+                ph += c;
+                if ph >= cps {
+                    ph -= cps; // c ≤ 2 ≤ cps
+                }
+            }
+        }
         let mut left = [0i32; MAX_COMPONENTS];
         // Rc per component = previous row's value at the PREVIOUS column. Held
         // separately because `prev[raw_col]` is overwritten with this row's value
@@ -1575,16 +1658,20 @@ fn decode_generic_pred<const PRED: u8, const COLLECT_STATS: bool>(
         // One sample: decode the diff against `$pred`, update the row state, emit.
         macro_rules! sample {
             ($raw_col:expr, $comp:expr, $rb:expr, $pred:expr) => {{
-                let diff = next_diff::<COLLECT_STATS>(
-                    &mut br,
-                    comp_tables[$comp],
-                    &mut fast8_hits,
-                    &mut slow_huffman_hits,
-                    &mut total_symbols,
-                    &mut category_hist,
-                    &mut get_bits_calls,
-                    &mut get_bits_total_bits,
-                )?;
+                let diff = if PAIRS {
+                    diffs[$raw_col]
+                } else {
+                    next_diff::<COLLECT_STATS>(
+                        &mut br,
+                        comp_tables[$comp],
+                        &mut fast8_hits,
+                        &mut slow_huffman_hits,
+                        &mut total_symbols,
+                        &mut category_hist,
+                        &mut get_bits_calls,
+                        &mut get_bits_total_bits,
+                    )?
+                };
                 let val = ($pred).wrapping_add(diff);
                 left[$comp] = val;
                 rc_hold[$comp] = $rb; // this column's above becomes next column's above-left
