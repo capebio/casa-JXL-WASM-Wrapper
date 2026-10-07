@@ -31,7 +31,8 @@ fn bitstream_exhausted(width: usize, nrows: usize) -> String {
 ///
 /// `interior` (OPF-16): rows >= 2 decode columns >= 2 in a loop of their own,
 /// with no per-pixel row/column tests and no north bounds check. `false` = every
-/// column through the general loop (the screening reference).
+/// column through the general loop (the screening reference). `pair` (OPF-17):
+/// the interior loop takes (even, odd) column pairs with per-parity locals.
 #[inline(always)]
 fn decode_row_into<B: OrfBits>(
     br: &mut B,
@@ -41,6 +42,7 @@ fn decode_row_into<B: OrfBits>(
     north_row: &[u16],
     cur_row: &mut [u16],
     interior: bool,
+    pair: bool,
 ) -> Result<(), String> {
     // acarry[parity] = [last_value, running_avg_signed, stable_counter]
     let mut acarry = [[0i32; 3]; 2];
@@ -82,7 +84,40 @@ fn decode_row_into<B: OrfBits>(
             north_west[parity] = north;
         }
     }
-    if head < width {
+    if head < width && pair {
+        // OPF-17: columns >= 2 in (even, odd) pairs, each parity's state in its
+        // own locals, so nothing is indexed by `col & 1` (no stack array, no
+        // address arithmetic). head == 2, so `col` starts even.
+        let north_row = &north_row[..width];
+        let [mut ce, mut co] = acarry;
+        let [mut we, mut wo] = west;
+        let [mut nwe, mut nwo] = north_west;
+        let mut px = |col: usize, c: &mut [i32; 3], w: &mut i32, nw: &mut i32| -> bool {
+            let (diff, low) = decode_diff(br, c);
+            if B::PER_PIXEL_TRUNC && br.truncated() {
+                return false;
+            }
+            let north = north_row[col] as i32;
+            let v = (gradient_pred(*w, north, *nw) + ((diff << 2) | low)) & 0xFFFF;
+            // SAFETY: col < width == cur_row.len(); see the general loop.
+            unsafe {
+                *cur_row_ptr.add(col) = v as u16;
+            }
+            *w = v;
+            *nw = north;
+            true
+        };
+        let mut col = head;
+        while col + 1 < width {
+            if !px(col, &mut ce, &mut we, &mut nwe) || !px(col + 1, &mut co, &mut wo, &mut nwo) {
+                return Err(bitstream_exhausted(width, nrows));
+            }
+            col += 2;
+        }
+        if col < width && !px(col, &mut ce, &mut we, &mut nwe) {
+            return Err(bitstream_exhausted(width, nrows));
+        }
+    } else if head < width {
         // Rows >= 2, columns >= 2: always the gradient predictor.
         let north_row = &north_row[..width];
         for col in head..width {
@@ -311,7 +346,7 @@ fn decompress_rows_into_generic<const WIDE: bool>(
         } else {
             &[]
         };
-        decode_row_into(&mut br, row, width, nrows, north_row, &mut cur[..width], true)?;
+        decode_row_into(&mut br, row, width, nrows, north_row, &mut cur[..width], true, true)?;
     }
     if br.truncated {
         return Err(bitstream_exhausted(width, nrows));
@@ -332,6 +367,8 @@ fn decompress_rows_pos(data: &[u8], width: usize, nrows: usize, out: &mut [u16])
     let worst = (width as u64).saturating_mul(31);
     // Screening switch for OPF-16: `BLIZZ_ORF_INT_REF=1` = no interior loop.
     let interior = std::env::var_os("BLIZZ_ORF_INT_REF").is_none();
+    // OPF-17: `BLIZZ_ORF_PAIR_REF=1` = interior loop one column at a time.
+    let pair = std::env::var_os("BLIZZ_ORF_PAIR_REF").is_none();
     let mut pos = 0u64;
     for row in 0..nrows {
         let (above, cur) = out.split_at_mut(row * width);
@@ -339,11 +376,11 @@ fn decompress_rows_pos(data: &[u8], width: usize, nrows: usize, out: &mut [u16])
         let cur = &mut cur[..width];
         if pos.saturating_add(worst) <= safe {
             let mut br = PosBits::<false> { data, pos };
-            decode_row_into(&mut br, row, width, nrows, north_row, cur, interior)?;
+            decode_row_into(&mut br, row, width, nrows, north_row, cur, interior, pair)?;
             pos = br.pos;
         } else {
             let mut br = PosBits::<true> { data, pos };
-            decode_row_into(&mut br, row, width, nrows, north_row, cur, interior)?;
+            decode_row_into(&mut br, row, width, nrows, north_row, cur, interior, pair)?;
             pos = br.pos;
         }
         if pos > real {
@@ -479,7 +516,7 @@ impl RawRowSource for OrfRowDecoder<'_> {
         } else {
             &[]
         };
-        decode_row_into(&mut self.br, r, w, self.height, north, &mut dst[..w], true)?;
+        decode_row_into(&mut self.br, r, w, self.height, north, &mut dst[..w], true, true)?;
         // Stash into the ring so rows r+2 can read it as north.
         let cs = (r % 3) * w;
         self.ring[cs..cs + w].copy_from_slice(&dst[..w]);
