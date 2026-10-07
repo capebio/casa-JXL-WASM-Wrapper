@@ -523,8 +523,14 @@ use nikon_compressed::{make_decoder, NIKON_TREE};
 ///
 /// The MakerNote is located exactly as the linearisation curve is, because it is
 /// the same IFD; see the two-shapes comment in [`nikon_compressed`].
+/// First `Nikon\0` MakerNote signature. memmem, not a `windows(6)` walk: a
+/// signature-less body (D1X) scans the whole file, twice per decode.
+fn nikon_sig(d: &[u8]) -> Option<usize> {
+    memchr::memmem::find(d, b"Nikon\0")
+}
+
 fn nikon_wb(d: &[u8]) -> Option<(f32, f32, f32)> {
-    let sig = d.windows(6).position(|x| x == b"Nikon\0")?;
+    let sig = nikon_sig(d)?;
     let base = sig + 10;
     if base + 8 > d.len() {
         return None;

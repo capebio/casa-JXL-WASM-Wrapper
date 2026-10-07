@@ -152,7 +152,7 @@ pub(super) fn nikon_compressed(
     // The signed form is still found by scan rather than by tag, because that is
     // what worked for every file before today and a scan cannot regress on them.
     // Only the fallback needs the tag walk.
-    let (mo, base, me) = if let Some(sig) = d.windows(6).position(|x| x == b"Nikon\0") {
+    let (mo, base, me) = if let Some(sig) = nikon_sig(d) {
         let base = sig + 10;
         if base + 8 > d.len() {
             return Err("NEF: MakerNote runs past end of file".into());
