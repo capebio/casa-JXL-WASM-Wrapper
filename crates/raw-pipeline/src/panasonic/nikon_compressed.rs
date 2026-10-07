@@ -93,6 +93,19 @@ impl<'a> NikonBits<'a> {
         NikonBits { d, p: 0, buf: 0, vbits: 0 }
     }
     fn fill(&mut self, n: u32) {
+        if self.vbits >= n {
+            return;
+        }
+        // One 8-byte load tops the buffer up to 57..63 bits; only the last
+        // seven bytes of the strip take the byte loop (and its zero padding).
+        if let Some(b) = self.d.get(self.p..self.p + 8) {
+            let k = (63 - self.vbits) / 8;
+            let w = u64::from_be_bytes(b.try_into().unwrap());
+            self.buf = (self.buf << (8 * k)) | (w >> (64 - 8 * k));
+            self.p += k as usize;
+            self.vbits += 8 * k;
+            return;
+        }
         while self.vbits < n {
             let c = *self.d.get(self.p).unwrap_or(&0) as u64;
             self.p += 1;
