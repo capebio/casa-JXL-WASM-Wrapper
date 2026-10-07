@@ -54,10 +54,12 @@ struct HuffTable {
     // to `lookup`.
     fast8: [u16; 256],
     // Code and magnitude in one lookup, indexed by peek(FUSED_BITS) (see
-    // `next_diff`). Full: `bits used | diff << 16`, the diff already extended.
-    // Partial (magnitude past the peek): `code len | t << 8 | 0x8000`. 0: the
-    // code is longer than FUSED_BITS or invalid — take the two-step path.
-    fused: Box<[u32]>,
+    // `next_diff`). Full: `bits used | diff << 4`, the diff already extended
+    // (|diff| < 2^11 since bits used ≤ 12). Partial (magnitude past the peek):
+    // `code len << 4 | t << 8`, its low nibble 0. 0: the code is longer than
+    // FUSED_BITS, invalid, or t == 16 — take the two-step path. u16, not u32
+    // (DNG-70): 8 KiB per table, so the per-symbol load stays in L1.
+    fused: Box<[u16]>,
 }
 
 const FUSED_BITS: u32 = 12;
@@ -124,22 +126,19 @@ impl HuffTable {
                 }
             }
         }
-        let mut fused = vec![0u32; 1 << FUSED_BITS].into_boxed_slice();
+        let mut fused = vec![0u16; 1 << FUSED_BITS].into_boxed_slice();
         for &(code_len, value, code) in &codes {
             let (l, t) = (code_len as u32, value as u32);
-            if l > FUSED_BITS || t > 16 {
+            if l > FUSED_BITS || t > 15 {
                 continue;
             }
             let free = FUSED_BITS - l;
             for s in 0..1u32 << free {
-                fused[((code << free) | s) as usize] = match t {
-                    0 => l,
-                    16 => l | ((-32768i32 as u32) << 16),
-                    _ if l + t <= FUSED_BITS => {
-                        let v = (s >> (free - t)) as i32;
-                        (l + t) | ((extend(v, t) as u32) << 16)
-                    }
-                    _ => l | (t << 8) | 0x8000,
+                fused[((code << free) | s) as usize] = if l + t <= FUSED_BITS {
+                    let v = if t == 0 { 0 } else { (s >> (free - t)) as i32 };
+                    ((l + t) | ((extend(v, t) as u32) << 4)) as u16
+                } else {
+                    ((l << 4) | (t << 8)) as u16
                 };
             }
         }
@@ -973,14 +972,14 @@ fn next_diff<const COLLECT_STATS: bool>(
             br.fill();
         }
         let e = table.fused[br.peek(FUSED_BITS) as usize];
-        let len = e & 0xFF;
-        if e & 0x8000 == 0 {
-            if e != 0 && len <= br.nbits {
+        let len = (e & 0xF) as u32;
+        if len != 0 {
+            if len <= br.nbits {
                 br.nbits -= len;
-                return Ok((e as i32) >> 16);
+                return Ok((e as i16 >> 4) as i32);
             }
-        } else {
-            let t = (e >> 8) & 0x1F;
+        } else if e != 0 {
+            let (len, t) = ((e >> 4 & 0xF) as u32, (e >> 8) as u32);
             if len + t <= br.nbits {
                 br.nbits -= len + t;
                 let v = ((br.bits >> br.nbits) & ((1u64 << t) - 1)) as i32;
