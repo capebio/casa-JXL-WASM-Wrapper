@@ -360,6 +360,86 @@ impl<'a> PanaBits<'a> {
         let hi = self.buf[byte + 1] as u32;
         ((lo | (hi << 8)) >> (self.vbits & 7)) & !(!0u32 << nbits)
     }
+
+    /// The 128 bits below the cursor as one little-endian `u128`, when the cursor
+    /// sits on a 16-byte chunk boundary inside a filled page (OPF-13). Bit `r` of
+    /// the page lives at byte `(r >> 3) ^ 0x3ff0`, bit `r & 7`, so the positions
+    /// `[p - 128, p)` are exactly the 16 bytes of one chunk, LE, bit `r & 127`.
+    #[inline(always)]
+    fn chunk(&self) -> Option<u128> {
+        let p = self.vbits;
+        if p == 0 || p & 127 != 0 {
+            return None;
+        }
+        let at = (((p - 1) >> 3) ^ 0x3ff0) as usize & !15;
+        Some(u128::from_le_bytes(self.buf[at..at + 16].try_into().unwrap()))
+    }
+}
+
+/// [`pana_block`] for a full block whose two first codes (`nonz`) are nonzero,
+/// from its 128-bit chunk (OPF-13). Then every field has a fixed place, top
+/// down: 8+4, 8+4, then 2 before pixels 2, 5, 8, 11 and 8 per pixel = 128 bits,
+/// so each is a constant shift of `u` and nothing waits on a moving cursor.
+/// `false` (block untouched) when a first code is zero: its layout differs.
+#[inline(always)]
+fn pana_block_fixed(block: &mut [u16; 14], u: u128) -> bool {
+    let f = |top: u32, n: u32| ((u >> (top - n)) as u32) & !(!0u32 << n);
+    let (n0, n1) = (f(128, 8) as i32, f(116, 8) as i32);
+    if n0 == 0 || n1 == 0 {
+        return false;
+    }
+    let mut pred = [(n0 << 4) | f(120, 4) as i32, (n1 << 4) | f(108, 4) as i32];
+    block[0] = pred[0].clamp(0, 65535) as u16;
+    block[1] = pred[1].clamp(0, 65535) as u16;
+    let (mut top, mut sh) = (104u32, 0u32);
+    for i in 2..14 {
+        if i % 3 == 2 {
+            sh = 4 >> (3 - f(top, 2));
+            top -= 2;
+        }
+        let j = f(top, 8) as i32;
+        top -= 8;
+        let k = i & 1;
+        if j != 0 {
+            pred[k] -= 0x80 << sh;
+            if pred[k] < 0 || sh == 4 {
+                pred[k] &= !((-1i32) << sh);
+            }
+            pred[k] += j << sh;
+        }
+        block[i] = pred[k].clamp(0, 65535) as u16;
+    }
+    true
+}
+
+/// One 14-pixel block (or a row's shorter tail block), fields from `get`. The
+/// predictors reset per block, so a block decodes from its bit position alone.
+#[inline(always)]
+fn pana_block(block: &mut [u16], mut get: impl FnMut(u32) -> u32) {
+    let (mut pred, mut nonz) = ([0i32; 2], [0i32; 2]);
+    let mut sh = 0u32;
+    for (i, o) in block.iter_mut().enumerate() {
+        if i % 3 == 2 {
+            sh = 4 >> (3 - get(2));
+        }
+        let k = i & 1;
+        if nonz[k] != 0 {
+            let j = get(8) as i32;
+            if j != 0 {
+                pred[k] -= 0x80 << sh;
+                if pred[k] < 0 || sh == 4 {
+                    pred[k] &= !((-1i32) << sh);
+                }
+                pred[k] += j << sh;
+            }
+        } else {
+            nonz[k] = get(8) as i32;
+            if nonz[k] != 0 || i > 11 {
+                pred[k] = (nonz[k] << 4) | get(4) as i32;
+            }
+        }
+        *o = pred[k].clamp(0, 65535) as u16;
+    }
 }
 
 /// Decode a Panasonic RW2 or Leica RWL.
@@ -430,34 +510,25 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     // load_flags is a function of RawFormat; 0x2008 is the value for format 4,
     // which is the only one accepted above.
     let mut bits_rd = PanaBits::new(&d[raw_off..], 0x2008);
+    // Screening switch for OPF-13: every block through `PanaBits::get`.
+    let chunked = std::env::var_os("BLIZZ_RW2_BLOCK_REF").is_none();
     for row in 0..sensor_h {
         // A 14-pixel block resets the predictors; walking blocks removes the
         // per-pixel `col % 14`.
         for block in line.chunks_mut(14) {
-            let (mut pred, mut nonz) = ([0i32; 2], [0i32; 2]);
-            let mut sh = 0u32;
-            for (i, o) in block.iter_mut().enumerate() {
-                if i % 3 == 2 {
-                    sh = 4 >> (3 - bits_rd.get(2));
-                }
-                let k = i & 1;
-                if nonz[k] != 0 {
-                    let j = bits_rd.get(8) as i32;
-                    if j != 0 {
-                        pred[k] -= 0x80 << sh;
-                        if pred[k] < 0 || sh == 4 {
-                            pred[k] &= !((-1i32) << sh);
-                        }
-                        pred[k] += j << sh;
-                    }
-                } else {
-                    nonz[k] = bits_rd.get(8) as i32;
-                    if nonz[k] != 0 || i > 11 {
-                        pred[k] = (nonz[k] << 4) | bits_rd.get(4) as i32;
+            // OPF-13: a full block with nonzero first codes is exactly one
+            // 128-bit chunk with every field at a fixed place (on the bodies
+            // here every block starts on a chunk boundary). Anything else goes
+            // through `get`.
+            if chunked {
+                if let (Ok(b14), Some(u)) = (<&mut [u16; 14]>::try_from(&mut *block), bits_rd.chunk()) {
+                    if pana_block_fixed(b14, u) {
+                        bits_rd.vbits -= 128;
+                        continue;
                     }
                 }
-                *o = pred[k].clamp(0, 65535) as u16;
             }
+            pana_block(block, |n| bits_rd.get(n));
         }
         if (top..top + img_h).contains(&row) {
             let y = row - top;
@@ -1310,6 +1381,42 @@ mod tests {
         // 0xFFFF entries at offset 0 -- the shape a corrupt or misread offset takes.
         let d = vec![0xffu8; 64];
         assert!(read_ifd(&d, 0, End::Le).is_err());
+    }
+
+    /// OPF-13: the fixed-layout block equals `pana_block` reading the same chunk
+    /// top-down, and declines exactly when a first code is zero.
+    #[test]
+    fn pana_block_fixed_matches_pana_block() {
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for t in 0..200_000 {
+            let mut u = ((next() as u128) << 64) | next() as u128;
+            if t % 7 == 0 {
+                u &= !(0xffu128 << 120); // first code zero
+            }
+            if t % 11 == 0 {
+                u &= !(0xffu128 << 108); // second first code zero
+            }
+            let (mut a, mut b) = ([0u16; 14], [0u16; 14]);
+            let mut q = 128u32;
+            pana_block(&mut a, |n| {
+                // A zero first code can need more than 128 bits; only the
+                // nonzero case is compared, so wrap rather than panic.
+                q = q.wrapping_sub(n);
+                ((u >> (q & 127)) as u32) & !(!0u32 << n)
+            });
+            let zero_first = (u >> 120) as u8 == 0 || (u >> 108) as u8 == 0;
+            assert_eq!(pana_block_fixed(&mut b, u), !zero_first, "u={u:#x}");
+            if !zero_first {
+                assert_eq!(q, 0, "u={u:#x}");
+                assert_eq!(a, b, "u={u:#x}");
+            }
+        }
     }
 
     #[test]
