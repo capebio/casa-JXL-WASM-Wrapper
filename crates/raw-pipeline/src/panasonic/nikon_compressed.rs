@@ -48,6 +48,37 @@ pub(super) fn make_decoder(tree: &[u8; 32]) -> Vec<u16> {
     huff
 }
 
+/// Bits looked at by the fused table (`make_fused`).
+const FUSE_BITS: u32 = 12;
+
+/// Code and difference in one lookup (the CAN-9 shape): slot `w` holds
+/// `consumed << 16 | diff as u16` for a code plus its magnitude bits that fit in
+/// the next `FUSE_BITS` bits, 0 when they do not (the per-sample path decides).
+/// Empty when the code itself is longer than the window.
+fn make_fused(huff: &[u16]) -> Vec<u32> {
+    let max = huff[0] as u32;
+    if max > FUSE_BITS {
+        return Vec::new();
+    }
+    (0..1u32 << FUSE_BITS)
+        .map(|w| {
+            let v = huff[1 + (w >> (FUSE_BITS - max)) as usize];
+            let (clen, sym) = ((v >> 8) as u32, (v & 0xff) as u32);
+            let (len, shl) = (sym & 15, sym >> 4);
+            let nb = len - shl.min(len);
+            if clen == 0 || clen + nb > FUSE_BITS {
+                return 0;
+            }
+            let bits = (w >> (FUSE_BITS - clen - nb)) & ((1 << nb) - 1);
+            let mut diff = ((((bits << 1) + 1) << shl) >> 1) as i32;
+            if len > 0 && (diff & (1 << (len - 1))) == 0 {
+                diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
+            }
+            (clen + nb) << 16 | diff as u16 as u32
+        })
+        .collect()
+}
+
 /// MSB-first bit reader over the strip. Unlike `PanaBits` this is a plain
 /// forward reader; Nikon does not page or reverse anything.
 struct NikonBits<'a> {
@@ -285,21 +316,35 @@ pub(super) fn nikon_compressed(
         return Err("NEF: strip offset past end of file".into());
     }
     let mut huff = make_decoder(&NIKON_TREE[tree]);
+    let mut fused = make_fused(&huff);
     let mut bs = NikonBits::new(&d[off..]);
     let mut out = vec![0u16; w * h];
     let mut hpred = [0i32; 2];
     for row in 0..h {
         if split != 0 && row == split {
             huff = make_decoder(&NIKON_TREE[tree + 1]);
+            fused = make_fused(&huff);
         }
         for col in 0..w {
-            let i = bs.huff(&huff);
-            let len = (i & 15) as u32;
-            let shl = (i >> 4) as u32;
-            let mut diff = ((((bs.get(len - shl.min(len)) << 1) + 1) << shl) >> 1) as i32;
-            if len > 0 && (diff & (1 << (len - 1))) == 0 {
-                diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
-            }
+            let f = if fused.is_empty() {
+                0
+            } else {
+                bs.fill(FUSE_BITS);
+                fused[((bs.buf >> (bs.vbits - FUSE_BITS)) & ((1 << FUSE_BITS) - 1)) as usize]
+            };
+            let diff = if f != 0 {
+                bs.vbits -= f >> 16;
+                f as u16 as i16 as i32
+            } else {
+                let i = bs.huff(&huff);
+                let len = (i & 15) as u32;
+                let shl = (i >> 4) as u32;
+                let mut diff = ((((bs.get(len - shl.min(len)) << 1) + 1) << shl) >> 1) as i32;
+                if len > 0 && (diff & (1 << (len - 1))) == 0 {
+                    diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
+                }
+                diff
+            };
             if col < 2 {
                 vpred[row & 1][col] += diff;
                 hpred[col] = vpred[row & 1][col];
@@ -329,4 +374,35 @@ pub(super) fn nikon_compressed(
         // arithmetic is needed here.
         strip: off..off + _len,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every non-zero fused slot is what the per-sample path reads from the
+    /// same bits, for all six trees (the split trees included).
+    #[test]
+    fn fused_slot_matches_the_per_sample_path() {
+        for tree in &NIKON_TREE {
+            let huff = make_decoder(tree);
+            let fused = make_fused(&huff);
+            assert!(!fused.is_empty());
+            for w in 0..1u32 << FUSE_BITS {
+                let f = fused[w as usize];
+                if f == 0 {
+                    continue;
+                }
+                let bytes = ((w << 20) | 0xA_5A5A).to_be_bytes();
+                let mut bs = NikonBits::new(&bytes);
+                let i = bs.huff(&huff);
+                let (len, shl) = ((i & 15) as u32, (i >> 4) as u32);
+                let mut diff = ((((bs.get(len - shl.min(len)) << 1) + 1) << shl) >> 1) as i32;
+                if len > 0 && (diff & (1 << (len - 1))) == 0 {
+                    diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
+                }
+                assert_eq!((f >> 16, f as u16 as i16 as i32), (bs.p as u32 * 8 - bs.vbits, diff), "w={w:#x}");
+            }
+        }
+    }
 }
