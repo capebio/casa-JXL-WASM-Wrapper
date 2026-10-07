@@ -1462,21 +1462,16 @@ fn decode_generic<const COLLECT_STATS: bool>(
 
                 let table = comp_tables[comp];
 
-                let t = next_category::<COLLECT_STATS>(
+                // Category bounds were validated per table in prepare; next_diff
+                // (shared with the monomorphized kernels) handles t==0 / t==16 /
+                // magnitude-receive without a per-symbol precision guard.
+                let diff = next_diff::<COLLECT_STATS>(
                     &mut br,
                     table,
                     &mut fast8_hits,
                     &mut slow_huffman_hits,
                     &mut total_symbols,
                     &mut category_hist,
-                )?;
-
-                // Category bounds were validated per table in prepare; decode_diff
-                // (shared with the monomorphized kernels) handles t==0 / t==16 /
-                // magnitude-receive without a per-symbol precision guard.
-                let diff = decode_diff::<COLLECT_STATS>(
-                    &mut br,
-                    t,
                     &mut get_bits_calls,
                     &mut get_bits_total_bits,
                 )?;
@@ -1604,17 +1599,13 @@ fn decode_generic_pred<const COLLECT_STATS: bool>(
                 };
 
                 let table = comp_tables[comp];
-                let t = next_category::<COLLECT_STATS>(
+                let diff = next_diff::<COLLECT_STATS>(
                     &mut br,
                     table,
                     &mut fast8_hits,
                     &mut slow_huffman_hits,
                     &mut total_symbols,
                     &mut category_hist,
-                )?;
-                let diff = decode_diff::<COLLECT_STATS>(
-                    &mut br,
-                    t,
                     &mut get_bits_calls,
                     &mut get_bits_total_bits,
                 )?;
