@@ -390,6 +390,141 @@ fn decompress_rows_pos(data: &[u8], width: usize, nrows: usize, out: &mut [u16])
     Ok(nrows)
 }
 
+/// OPF-18: [`decompress`] on two threads, same output. The bit parse does not
+/// depend on pixel values (a pixel's bit count comes from the carry, which
+/// comes from earlier bits), so a spawned thread parses each pixel's residual
+/// `(diff << 2) | low` into `out` and hands over bands of rows; the calling
+/// thread follows, turning residuals into pixels with the predictor in place.
+/// 16 bits of residual are enough: the pixel is `(pred + residual) & 0xFFFF`.
+/// Native only (wasm32 has no threads); tiny or malformed inputs take the
+/// serial path, which owns their errors.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn decompress_pipelined(compressed: &[u8], width: usize, height: usize) -> Result<Vec<u16>, String> {
+    const BAND: usize = 32;
+    let n = width
+        .checked_mul(height)
+        .ok_or_else(|| format!("decompress: {}x{} overflows", width, height))?;
+    if width < 2
+        || height < 2
+        || compressed.len() <= HEADER_SKIP
+        || (compressed.len() - HEADER_SKIP).saturating_mul(8) < n.saturating_mul(6)
+    {
+        return decompress(compressed, width, height);
+    }
+    let data = &compressed[HEADER_SKIP..];
+    let mut out = vec![0u16; n];
+    let (tx, rx) = std::sync::mpsc::channel::<&mut [u16]>();
+    std::thread::scope(|s| {
+        let out = &mut out[..];
+        let parse = s.spawn(move || parse_rows_pos(data, width, height, BAND, out, tx));
+        let mut prev: &[u16] = &[];
+        let mut row0 = 0;
+        for band in rx {
+            let rows = band.len() / width;
+            for r in 0..rows {
+                let (above, cur) = band.split_at_mut(r * width);
+                let north: &[u16] = match (row0 + r, r) {
+                    (0 | 1, _) => &[],
+                    (_, 0 | 1) => &prev[prev.len() - (2 - r) * width..][..width],
+                    _ => &above[(r - 2) * width..(r - 1) * width],
+                };
+                predict_row(row0 + r, north, &mut cur[..width]);
+            }
+            prev = band;
+            row0 += rows;
+        }
+        parse.join().unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })?;
+    Ok(out)
+}
+
+/// OPF-18 stage 1: residuals for every row, sent on in bands of `band` rows.
+/// Same reader, row checks and truncation rule as [`decompress_rows_pos`].
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_rows_pos<'a>(
+    data: &[u8],
+    width: usize,
+    nrows: usize,
+    band: usize,
+    out: &'a mut [u16],
+    tx: std::sync::mpsc::Sender<&'a mut [u16]>,
+) -> Result<(), String> {
+    let real = data.len() as u64 * 8;
+    let safe = data.len().saturating_sub(8) as u64 * 8;
+    let worst = (width as u64).saturating_mul(31);
+    let mut pos = 0u64;
+    for rows in out.chunks_mut(band * width) {
+        for cur in rows.chunks_mut(width) {
+            pos = if pos.saturating_add(worst) <= safe {
+                parse_row(&mut PosBits::<false> { data, pos }, cur)
+            } else {
+                parse_row(&mut PosBits::<true> { data, pos }, cur)
+            };
+            if pos > real {
+                return Err(bitstream_exhausted(width, nrows));
+            }
+        }
+        if tx.send(rows).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// One row of residuals; returns the bit position after it.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+fn parse_row<const CHECKED: bool>(br: &mut PosBits<'_, CHECKED>, cur: &mut [u16]) -> u64 {
+    let res = |(diff, low): (i32, i32)| ((diff << 2) | low) as u16;
+    let (mut ce, mut co) = ([0i32; 3], [0i32; 3]);
+    let mut col = 0;
+    while col + 1 < cur.len() {
+        cur[col] = res(decode_diff(br, &mut ce));
+        cur[col + 1] = res(decode_diff(br, &mut co));
+        col += 2;
+    }
+    if col < cur.len() {
+        cur[col] = res(decode_diff(br, &mut ce));
+    }
+    br.pos
+}
+
+/// OPF-18 stage 2: residuals of `row` to pixels in place, with the same
+/// predictor cases as [`decode_row_into`]. `north` = final row `row - 2`.
+#[cfg(not(target_arch = "wasm32"))]
+fn predict_row(row: usize, north: &[u16], cur: &mut [u16]) {
+    let w = cur.len();
+    let px = |pred: i32, r: u16| ((pred + r as i32) & 0xFFFF) as u16;
+    if row < 2 {
+        // Columns 0-1 predict 0; the rest predict west (same parity).
+        for col in 2..w {
+            cur[col] = px(cur[col - 2] as i32, cur[col]);
+        }
+        return;
+    }
+    let north = &north[..w];
+    for col in 0..w.min(2) {
+        cur[col] = px(north[col] as i32, cur[col]);
+    }
+    let (mut we, mut wo) = (cur[0] as i32, cur[1] as i32);
+    let (mut nwe, mut nwo) = (north[0] as i32, north[1] as i32);
+    let mut col = 2;
+    while col + 1 < w {
+        let n = north[col] as i32;
+        cur[col] = px(gradient_pred(we, n, nwe), cur[col]);
+        we = cur[col] as i32;
+        nwe = n;
+        let n = north[col + 1] as i32;
+        cur[col + 1] = px(gradient_pred(wo, n, nwo), cur[col + 1]);
+        wo = cur[col + 1] as i32;
+        nwo = n;
+        col += 2;
+    }
+    if col < w {
+        cur[col] = px(gradient_pred(we, north[col] as i32, nwe), cur[col]);
+    }
+}
+
 /// The bit source `decode_row_into` reads: one left-aligned window of at least
 /// 31 bits a pixel, then the bits it used.
 trait OrfBits {
@@ -916,6 +1051,22 @@ mod tests {
                 if ra.is_ok() {
                     assert_eq!(a, b, "{w}x{h} len {len}");
                 }
+            }
+        }
+    }
+
+    /// OPF-18: the two-thread decode equals the serial one, across band edges
+    /// (32 rows), odd widths and streams cut short, errors included.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pipelined_matches_serial() {
+        for &(w, h, seed) in &[(4usize, 3usize, 1u64), (3, 257, 2), (255, 64, 3), (64, 255, 4), (2, 40, 5), (1, 9, 6), (7, 33, 7)] {
+            let full = synth_payload(w, h, seed);
+            let mut cuts: Vec<usize> = (0..30).map(|k| HEADER_SKIP + 1 + k * (full.len() - HEADER_SKIP) / 30).collect();
+            cuts.extend([full.len(), full.len() - 1, HEADER_SKIP]);
+            for len in cuts {
+                let src = &full[..len];
+                assert_eq!(decompress_pipelined(src, w, h), decompress(src, w, h), "{w}x{h} len {len}");
             }
         }
     }
