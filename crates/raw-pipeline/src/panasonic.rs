@@ -336,6 +336,8 @@ impl<'a> PanaBits<'a> {
     /// is fed — so every self-consistency check passes while the picture is wrong.
     /// It took a reference image to catch: correlation against ImageMagick was
     /// 0.56 without the split and 0.90 with it.
+    #[cold]
+    #[inline(never)]
     fn fill(&mut self) {
         let lf = self.load_flags;
         self.buf[..0x4000].fill(0);
@@ -347,6 +349,7 @@ impl<'a> PanaBits<'a> {
         self.pos += n2;
     }
 
+    #[inline(always)]
     fn get(&mut self, nbits: u32) -> u32 {
         if self.vbits == 0 {
             self.fill();
@@ -410,43 +413,11 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     }
 
     // Decode the FULL sensor width, then crop — the bit stream is defined over
-    // the sensor grid and the borders are part of it.
-    let mut full = vec![0u16; sensor_w * sensor_h];
-    // load_flags is a function of RawFormat; 0x2008 is the value for format 4,
-    // which is the only one accepted above.
-    let mut bits_rd = PanaBits::new(&d[raw_off..], 0x2008);
-    for row in 0..sensor_h {
-        let (mut pred, mut nonz) = ([0i32; 2], [0i32; 2]);
-        let mut sh = 0u32;
-        for col in 0..sensor_w {
-            let i = col % 14;
-            if i == 0 {
-                pred = [0, 0];
-                nonz = [0, 0];
-            }
-            if i % 3 == 2 {
-                sh = 4 >> (3 - bits_rd.get(2));
-            }
-            let k = i & 1;
-            if nonz[k] != 0 {
-                let j = bits_rd.get(8) as i32;
-                if j != 0 {
-                    pred[k] -= 0x80 << sh;
-                    if pred[k] < 0 || sh == 4 {
-                        pred[k] &= !((-1i32) << sh);
-                    }
-                    pred[k] += j << sh;
-                }
-            } else {
-                nonz[k] = bits_rd.get(8) as i32;
-                if nonz[k] != 0 || i > 11 {
-                    pred[k] = (nonz[k] << 4) | bits_rd.get(4) as i32;
-                }
-            }
-            full[row * sensor_w + col] = pred[k].clamp(0, 65535) as u16;
-        }
-    }
-
+    // the sensor grid and the borders are part of it. One sensor row at a time
+    // into a scratch row, and only its active-area span is kept (OPF-6,
+    // 2026-10-07: the whole-sensor plane plus a crop copy was a second plane
+    // of memory and page faults for nothing).
+    //
     // Crop to the active area. The CFA phase is defined on the sensor grid, so
     // an odd border flips it — get this wrong and the image is colour-swapped
     // with no other symptom, which is exactly the silent failure this pipeline's
@@ -454,14 +425,44 @@ pub fn decode_rw2(d: &[u8]) -> Result<BayerImage, String> {
     let (px, py) = pana_cfa_phase(cfa);
     let phase = ((px as usize + left) as u8 & 1, (py as usize + top) as u8 & 1);
     let mut raw = vec![0u16; img_w * img_h];
-    for y in 0..img_h {
-        let sy = y + top;
-        if sy >= sensor_h {
-            break;
+    let span = img_w.min(sensor_w - left);
+    let mut line = vec![0u16; sensor_w];
+    // load_flags is a function of RawFormat; 0x2008 is the value for format 4,
+    // which is the only one accepted above.
+    let mut bits_rd = PanaBits::new(&d[raw_off..], 0x2008);
+    for row in 0..sensor_h {
+        // A 14-pixel block resets the predictors; walking blocks removes the
+        // per-pixel `col % 14`.
+        for block in line.chunks_mut(14) {
+            let (mut pred, mut nonz) = ([0i32; 2], [0i32; 2]);
+            let mut sh = 0u32;
+            for (i, o) in block.iter_mut().enumerate() {
+                if i % 3 == 2 {
+                    sh = 4 >> (3 - bits_rd.get(2));
+                }
+                let k = i & 1;
+                if nonz[k] != 0 {
+                    let j = bits_rd.get(8) as i32;
+                    if j != 0 {
+                        pred[k] -= 0x80 << sh;
+                        if pred[k] < 0 || sh == 4 {
+                            pred[k] &= !((-1i32) << sh);
+                        }
+                        pred[k] += j << sh;
+                    }
+                } else {
+                    nonz[k] = bits_rd.get(8) as i32;
+                    if nonz[k] != 0 || i > 11 {
+                        pred[k] = (nonz[k] << 4) | bits_rd.get(4) as i32;
+                    }
+                }
+                *o = pred[k].clamp(0, 65535) as u16;
+            }
         }
-        let s = sy * sensor_w + left;
-        let n = img_w.min(sensor_w - left);
-        raw[y * img_w..y * img_w + n].copy_from_slice(&full[s..s + n]);
+        if (top..top + img_h).contains(&row) {
+            let y = row - top;
+            raw[y * img_w..y * img_w + span].copy_from_slice(&line[left..left + span]);
+        }
     }
 
     // The bit reader's cursor is the honest end of the sensor payload. "Offset to
