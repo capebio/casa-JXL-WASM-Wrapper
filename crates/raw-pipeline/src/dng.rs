@@ -1676,6 +1676,15 @@ fn oxide_segment(bytes: &[u8], cps: usize) -> Result<(Vec<u16>, u32, u32, bool)>
             image.request_color_encoding(e);
         }
     }
+    // **jxl-oxide gamut-maps a wide-gamut XYB stream toward grey**: it decodes
+    // XYB to linear sRGB and, for other primaries with perceptual intent,
+    // runs GamutMap (saturation 0.3) on the out-of-[0,1] sRGB colours BEFORE
+    // the matrix to the declared primaries, moving colours the declared space
+    // holds. libjxl has no such step. adobe_01 (BT.2100): 2085 samples off by
+    // > 256, up to 2877, near white and black, all channels (2026-10-08,
+    // blizz tools/rs/jxltile; djxl == ImageMagick on every sample). So ask
+    // for sRGB primaries and apply the matrix here, unclamped.
+    let to_declared = if !hdr && xyb && cps == 3 { srgb_to_declared(&mut image) } else { None };
     let max = if hdr {
         // After the PQ inverse below, 1.0 is the stream's intensity_target,
         // which is libjxl's full scale: checked against ImageMagick's libjxl
@@ -1704,10 +1713,75 @@ fn oxide_segment(bytes: &[u8], cps: usize) -> Result<(Vec<u16>, u32, u32, bool)>
     }
     let lin = |v: f32| if hdr { pq_eotf(v) * 10000.0 / target } else { v };
     let mut buf = Vec::with_capacity(w * h * cps);
+    let px_out = |v: f32| (lin(v) * max + 0.5).clamp(0.0, 65535.0) as u16;
     for px in fb.buf().chunks_exact(c) {
-        buf.extend(px[..cps].iter().map(|&v| (lin(v) * max + 0.5).clamp(0.0, 65535.0) as u16));
+        match &to_declared {
+            Some(m) => buf.extend(m.map(|r| px_out(r[0] * px[0] + r[1] * px[1] + r[2] * px[2]))),
+            None => buf.extend(px[..cps].iter().map(|&v| px_out(v))),
+        }
     }
     Ok((buf, w as u32, h as u32, xyb))
+}
+
+/// For a linear, D65, non-sRGB-primaries enum colour encoding: requests
+/// linear sRGB output (what jxl-oxide decodes XYB to, so no GamutMap runs)
+/// and returns the linear sRGB -> declared primaries matrix (rows), derived
+/// in f64 from the chromaticities. `None` leaves the request untouched.
+// ponytail: D65 + linear only (every JXL DNG seen); another white point or
+// transfer would still be gamut-mapped by jxl-oxide.
+#[cfg(feature = "jxl-pure")]
+fn srgb_to_declared(image: &mut jxl_oxide::JxlImage) -> Option<[[f32; 3]; 3]> {
+    use jxl_oxide::color::{Primaries, TransferFunction, WhitePoint};
+    let jxl_oxide::image::color::ColourEncoding::Enum(mut e) = image.image_header().metadata.colour_encoding.clone() else {
+        return None;
+    };
+    if e.tf != TransferFunction::Linear || e.white_point != WhitePoint::D65 {
+        return None;
+    }
+    let xy = |c: &jxl_oxide::color::Customxy| [c.x as f64 / 1e6, c.y as f64 / 1e6];
+    let declared = match &e.primaries {
+        Primaries::Srgb => return None,
+        Primaries::Bt2100 => [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]],
+        Primaries::P3 => [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]],
+        Primaries::Custom { red, green, blue } => [xy(red), xy(green), xy(blue)],
+    };
+    let to_xyz = rgb_to_xyz([[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]]);
+    let from_xyz = inv3(rgb_to_xyz(declared))?;
+    e.primaries = Primaries::Srgb;
+    image.request_color_encoding(e);
+    let m = mul3(from_xyz, to_xyz);
+    Some(m.map(|r| r.map(|v| v as f32)))
+}
+
+/// Linear RGB -> XYZ for primaries `p` (x, y) and white D65 (0.3127, 0.3290).
+#[cfg(feature = "jxl-pure")]
+fn rgb_to_xyz(p: [[f64; 2]; 3]) -> [[f64; 3]; 3] {
+    let col = |[x, y]: [f64; 2]| [x / y, 1.0, (1.0 - x - y) / y];
+    let (r, g, b) = (col(p[0]), col(p[1]), col(p[2]));
+    let m = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+    let w = col([0.3127, 0.3290]);
+    let s = mul3v(inv3(m).expect("primaries are independent"), w);
+    m.map(|row| [row[0] * s[0], row[1] * s[1], row[2] * s[2]])
+}
+
+#[cfg(feature = "jxl-pure")]
+fn inv3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
+    let c = |i: usize, j: usize| {
+        let (r0, r1, c0, c1) = ((i + 1) % 3, (i + 2) % 3, (j + 1) % 3, (j + 2) % 3);
+        m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0]
+    };
+    let det = m[0][0] * c(0, 0) + m[0][1] * c(0, 1) + m[0][2] * c(0, 2);
+    (det.abs() > 1e-12).then(|| std::array::from_fn(|i| std::array::from_fn(|j| c(j, i) / det)))
+}
+
+#[cfg(feature = "jxl-pure")]
+fn mul3(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
+}
+
+#[cfg(feature = "jxl-pure")]
+fn mul3v(a: [[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|i| (0..3).map(|k| a[i][k] * v[k]).sum())
 }
 
 /// SMPTE ST 2084 EOTF: PQ signal 0..1 -> luminance as a fraction of 10 000 nits.
@@ -3138,6 +3212,22 @@ fn read_u32(data: &[u8], off: usize, le: bool) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The linear sRGB -> BT.2100 matrix derived from chromaticities matches
+    /// ITU-R BT.2087's published one.
+    #[cfg(feature = "jxl-pure")]
+    #[test]
+    fn srgb_to_bt2100_matrix_matches_bt2087() {
+        let s = rgb_to_xyz([[0.64, 0.33], [0.30, 0.60], [0.15, 0.06]]);
+        let t = rgb_to_xyz([[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]]);
+        let m = mul3(inv3(t).unwrap(), s);
+        let want = [[0.6274, 0.3293, 0.0433], [0.0691, 0.9195, 0.0114], [0.0164, 0.0880, 0.8956]];
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((m[i][j] - want[i][j]).abs() < 1e-4, "m[{i}][{j}] = {} want {}", m[i][j], want[i][j]);
+            }
+        }
+    }
 
     /// Minimal little-endian TIFF builder for synthesized DNG tests: one IFD0
     /// with the given entries (tag, type, count, value-or-offset), then payload
