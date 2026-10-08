@@ -80,7 +80,9 @@ fn make_fused(huff: &[u16]) -> Vec<u32> {
 }
 
 /// MSB-first bit reader over the strip. Unlike `PanaBits` this is a plain
-/// forward reader; Nikon does not page or reverse anything.
+/// forward reader; Nikon does not page or reverse anything. The decode uses
+/// [`NikonLeft`]; this is the test's reference.
+#[cfg(test)]
 struct NikonBits<'a> {
     d: &'a [u8],
     p: usize,
@@ -88,6 +90,7 @@ struct NikonBits<'a> {
     vbits: u32,
 }
 
+#[cfg(test)]
 impl<'a> NikonBits<'a> {
     fn new(d: &'a [u8]) -> Self {
         NikonBits { d, p: 0, buf: 0, vbits: 0 }
@@ -122,6 +125,7 @@ trait Bits {
     fn skip(&mut self, n: u32);
 }
 
+#[cfg(test)]
 impl Bits for NikonBits<'_> {
     #[inline(always)]
     fn peek(&mut self, n: u32) -> u32 {
@@ -171,17 +175,9 @@ impl Bits for NikonLeft<'_> {
     }
 }
 
-/// Screening switch: on by env var `name`, or by an exe path containing it in
-/// lower case (broker `ab` has no per-arm env). Read once per decode.
-fn switch(name: &str) -> bool {
-    std::env::var_os(name).is_some()
-        || std::env::current_exe()
-            .map_or(false, |p| p.to_string_lossy().contains(&name.to_lowercase()))
-}
-
-/// The Huffman-DPCM sample loop. `NB` (NSP-29) indexes a row slice and
+/// The Huffman-DPCM sample loop. NSP-29: it indexes a row slice and
 /// fixed-size tables so the bounds checks fold away.
-fn nikon_rows<R: Bits, const NB: bool>(
+fn nikon_rows<R: Bits>(
     mut bs: R,
     w: usize,
     h: usize,
@@ -201,17 +197,11 @@ fn nikon_rows<R: Bits, const NB: bool>(
             fused = make_fused(&huff);
         }
         let fa: Option<&[u32; 1 << FUSE_BITS]> = fused.as_slice().try_into().ok();
-        let (o, base) = if NB { (&mut out[row * w..(row + 1) * w], 0) } else { (&mut out[..], row * w) };
+        let o = &mut out[row * w..(row + 1) * w];
         for col in 0..w {
-            let f = if NB {
-                match fa {
-                    Some(t) => t[bs.peek(FUSE_BITS) as usize],
-                    None => 0,
-                }
-            } else if fused.is_empty() {
-                0
-            } else {
-                fused[bs.peek(FUSE_BITS) as usize]
+            let f = match fa {
+                Some(t) => t[bs.peek(FUSE_BITS) as usize],
+                None => 0,
             };
             let diff = if f != 0 {
                 bs.skip(f >> 16);
@@ -241,7 +231,7 @@ fn nikon_rows<R: Bits, const NB: bool>(
                 hpred[col & 1] += diff;
             }
             let i = hpred[col & 1].clamp(0, 0x3fff) as usize;
-            o[base + col] = if NB { ca[i] } else { curve[i] };
+            o[col] = ca[i];
         }
     }
     out
@@ -445,12 +435,7 @@ pub(super) fn nikon_compressed(
     }
     let s = &d[off..];
     let left = NikonLeft { d: s, p: 0, buf: 0, bits: 0 };
-    let out = match (!switch("NSP30OFF"), !switch("NSP29OFF")) {
-        (false, false) => nikon_rows::<_, false>(NikonBits::new(s), w, h, tree, split, vpred, &curve),
-        (false, true) => nikon_rows::<_, true>(NikonBits::new(s), w, h, tree, split, vpred, &curve),
-        (true, false) => nikon_rows::<_, false>(left, w, h, tree, split, vpred, &curve),
-        (true, true) => nikon_rows::<_, true>(left, w, h, tree, split, vpred, &curve),
-    };
+    let out = nikon_rows(left, w, h, tree, split, vpred, &curve);
 
     // The camera's own multipliers where the body records them; the documented
     // default only where it does not.
