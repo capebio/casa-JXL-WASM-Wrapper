@@ -84,7 +84,36 @@ fn decode_row_into<B: OrfBits>(
             north_west[parity] = north;
         }
     }
-    if head < width && pair {
+    if head < width && pair && !B::PER_PIXEL_TRUNC && win2() {
+        // OPF-24: OPF-17's pair loop with both pixels' bits from one pair of
+        // words (`decode_pair`). PosBits only: truncation is tested once a
+        // row by the caller.
+        let north_row = &north_row[..width];
+        let [mut ce, mut co] = acarry;
+        let [mut we, mut wo] = west;
+        let [mut nwe, mut nwo] = north_west;
+        let st = |col: usize, (diff, low): (i32, i32), w: &mut i32, nw: &mut i32| {
+            let north = north_row[col] as i32;
+            let v = (gradient_pred(*w, north, *nw) + ((diff << 2) | low)) & 0xFFFF;
+            // SAFETY: col < width == cur_row.len(); see the general loop.
+            unsafe {
+                *cur_row_ptr.add(col) = v as u16;
+            }
+            *w = v;
+            *nw = north;
+        };
+        let mut col = head;
+        while col + 1 < width {
+            let [e, o] = decode_pair(br, &mut ce, &mut co, true);
+            st(col, e, &mut we, &mut nwe);
+            st(col + 1, o, &mut wo, &mut nwo);
+            col += 2;
+        }
+        if col < width {
+            let e = decode_diff(br, &mut ce);
+            st(col, e, &mut we, &mut nwe);
+        }
+    } else if head < width && pair {
         // OPF-17: columns >= 2 in (even, odd) pairs, each parity's state in its
         // own locals, so nothing is indexed by `col & 1` (no stack array, no
         // address arithmetic). head == 2, so `col` starts even.
@@ -159,6 +188,38 @@ fn gradient_pred(w_: i32, n_: i32, nw: i32) -> i32 {
 /// Truncation is the caller's test.
 #[inline(always)]
 fn decode_diff<B: OrfBits>(br: &mut B, carry: &mut [i32; 3]) -> (i32, i32) {
+    let (diff, low, n) = diff_from(br.peek31(), carry);
+    br.consume(n);
+    (diff, low)
+}
+
+/// OPF-24: an (even, odd) pair of pixels from two words loaded at `pos >> 3`
+/// (addresses from `pos` alone), no data-dependent branch: the odd pixel's
+/// window is a shift/shift/or of the words, not a fresh load. `win2 ==
+/// false`, or fewer than 16 bytes left, = one load per pixel.
+#[inline(always)]
+fn decode_pair<B: OrfBits>(br: &mut B, ce: &mut [i32; 3], co: &mut [i32; 3], win2: bool) -> [(i32, i32); 2] {
+    if let Some((hi, lo, s)) = br.peek_pair().filter(|_| win2) {
+        let (d0, l0, n0) = diff_from(hi << s, ce);
+        // k = s + n0 is 3..=38: the odd pixel's window has 64 real bits.
+        let k = s + n0;
+        let (d1, l1, n1) = diff_from((hi << k) | (lo >> (64 - k)), co);
+        br.consume(n0 + n1);
+        return [(d0, l0), (d1, l1)];
+    }
+    [decode_diff(br, ce), decode_diff(br, co)]
+}
+
+/// OPF-24 screening switch, read once: `BLIZZ_ORF_WIN2_REF=1` = one load per pixel.
+fn win2() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("BLIZZ_ORF_WIN2_REF").is_none())
+}
+
+/// [`decode_diff`] on a left-aligned window with >= 31 real bits: the
+/// signed diff, the 2-bit low field and the bits the pixel takes.
+#[inline(always)]
+fn diff_from(x: u64, carry: &mut [i32; 3]) -> (i32, i32, u32) {
     let i = if carry[2] < 3 { 2 } else { 0 };
     // D2: leading_zeros equiv to the search loop (tested in D8(b)).
     let carry_lo = (carry[0] as u16) as u32;
@@ -173,7 +234,6 @@ fn decode_diff<B: OrfBits>(br: &mut B, carry: &mut [i32; 3]) -> (i32, i32) {
     // ~143 instructions a pixel. The truncation outcome is the same: the
     // reads consume in order, so some read crosses into pad bits exactly
     // when their total does.
-    let x = br.peek31();
     let sb = (x >> 61) as u32;
     let low = (sb & 3) as i32;
     // arithmetic shift spreads top bit of the 3-bit field into a -1/0 mask
@@ -200,13 +260,12 @@ fn decode_diff<B: OrfBits>(br: &mut B, carry: &mut [i32; 3]) -> (i32, i32) {
     // nbits is 2..=16, so the shift is never 64.
     let lit = ((x << used) >> (64 - nbits as u32)) as i32;
     carry[0] = (high << (nbits as u32)) | lit;
-    br.consume(used + nbits as u32);
     let diff = (carry[0] ^ sign) + carry[1];
     // Running average uses the carry's OWN previous value (carry[1]),
     // not carry[0].  This is the dcraw / LibRaw / rawloader form.
     carry[1] = (diff * 3 + carry[1]) >> 5;
     carry[2] = if carry[0] > 16 { 0 } else { carry[2] + 1 };
-    (diff, low)
+    (diff, low, used + nbits as u32)
 }
 
 pub fn decompress(compressed: &[u8], width: usize, height: usize) -> Result<Vec<u16>, String> {
@@ -482,10 +541,12 @@ fn parse_rows_pos<'a>(
 fn parse_row<const CHECKED: bool>(br: &mut PosBits<'_, CHECKED>, cur: &mut [u16]) -> u64 {
     let res = |(diff, low): (i32, i32)| ((diff << 2) | low) as u16;
     let (mut ce, mut co) = ([0i32; 3], [0i32; 3]);
+    let w2 = win2();
     let mut col = 0;
     while col + 1 < cur.len() {
-        cur[col] = res(decode_diff(br, &mut ce));
-        cur[col + 1] = res(decode_diff(br, &mut co));
+        let [e, o] = decode_pair(br, &mut ce, &mut co, w2);
+        cur[col] = res(e);
+        cur[col + 1] = res(o);
         col += 2;
     }
     if col < cur.len() {
@@ -538,6 +599,11 @@ trait OrfBits {
     fn peek31(&mut self) -> u64;
     fn consume(&mut self, n: u32);
     fn truncated(&self) -> bool;
+    /// OPF-24: the 16 bytes at `pos >> 3` as two big-endian words, and
+    /// `pos & 7`; `None` when 16 bytes are not left (or no such window).
+    fn peek_pair(&self) -> Option<(u64, u64, u32)> {
+        None
+    }
 }
 
 impl<const WIDE: bool> OrfBits for BitReader<'_, WIDE> {
@@ -589,6 +655,14 @@ impl<const CHECKED: bool> OrfBits for PosBits<'_, CHECKED> {
     #[inline(always)]
     fn truncated(&self) -> bool {
         false
+    }
+    #[inline(always)]
+    fn peek_pair(&self) -> Option<(u64, u64, u32)> {
+        let b = (self.pos >> 3) as usize;
+        if b + 16 > self.data.len() {
+            return None;
+        }
+        Some((load_be_u64(self.data, b), load_be_u64(self.data, b + 8), (self.pos & 7) as u32))
     }
 }
 
