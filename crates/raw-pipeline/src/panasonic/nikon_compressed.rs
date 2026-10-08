@@ -93,6 +93,19 @@ impl<'a> NikonBits<'a> {
         NikonBits { d, p: 0, buf: 0, vbits: 0 }
     }
     fn fill(&mut self, n: u32) {
+        if self.vbits >= n {
+            return;
+        }
+        // One 8-byte load tops the buffer up to 57..63 bits; only the last
+        // seven bytes of the strip take the byte loop (and its zero padding).
+        if let Some(b) = self.d.get(self.p..self.p + 8) {
+            let k = (63 - self.vbits) / 8;
+            let w = u64::from_be_bytes(b.try_into().unwrap());
+            self.buf = (self.buf << (8 * k)) | (w >> (64 - 8 * k));
+            self.p += k as usize;
+            self.vbits += 8 * k;
+            return;
+        }
         while self.vbits < n {
             let c = *self.d.get(self.p).unwrap_or(&0) as u64;
             self.p += 1;
@@ -100,23 +113,138 @@ impl<'a> NikonBits<'a> {
             self.vbits += 8;
         }
     }
-    fn get(&mut self, nbits: u32) -> u32 {
-        if nbits == 0 {
-            return 0;
-        }
-        self.fill(nbits);
-        let v = ((self.buf >> (self.vbits - nbits)) & ((1u64 << nbits) - 1)) as u32;
-        self.vbits -= nbits;
-        v
-    }
-    fn huff(&mut self, huff: &[u16]) -> u16 {
-        let n = huff[0] as u32;
+}
+
+/// The two operations the sample loop needs, so it can run on either reader.
+trait Bits {
+    /// The next `n` bits (1..=25), not consumed.
+    fn peek(&mut self, n: u32) -> u32;
+    fn skip(&mut self, n: u32);
+}
+
+impl Bits for NikonBits<'_> {
+    #[inline(always)]
+    fn peek(&mut self, n: u32) -> u32 {
         self.fill(n);
-        let c = ((self.buf >> (self.vbits - n)) & ((1u64 << n) - 1)) as usize;
-        let v = huff[1 + c];
-        self.vbits -= (v >> 8) as u32;
-        v & 0xff
+        ((self.buf >> (self.vbits - n)) & ((1u64 << n) - 1)) as u32
     }
+    #[inline(always)]
+    fn skip(&mut self, n: u32) {
+        self.vbits -= n;
+    }
+}
+
+/// NSP-30: the unread bits sit at the TOP of `buf`, so a peek is a constant
+/// shift and a skip is one left shift; the serial chain per sample loses the
+/// `vbits - n` step. Bits below `bits` are the stream's next bytes or zero.
+struct NikonLeft<'a> {
+    d: &'a [u8],
+    p: usize,
+    buf: u64,
+    bits: u32,
+}
+
+impl Bits for NikonLeft<'_> {
+    #[inline(always)]
+    fn peek(&mut self, n: u32) -> u32 {
+        if self.bits < n {
+            if let Some(b) = self.d.get(self.p..self.p + 8) {
+                self.buf |= u64::from_be_bytes(b.try_into().unwrap()) >> self.bits;
+                let k = (63 - self.bits) / 8;
+                self.p += k as usize;
+                self.bits += 8 * k;
+            } else {
+                while self.bits < n {
+                    let c = *self.d.get(self.p).unwrap_or(&0) as u64;
+                    self.p += 1;
+                    self.buf |= c << (56 - self.bits);
+                    self.bits += 8;
+                }
+            }
+        }
+        (self.buf >> (64 - n)) as u32
+    }
+    #[inline(always)]
+    fn skip(&mut self, n: u32) {
+        self.buf <<= n;
+        self.bits -= n;
+    }
+}
+
+/// Screening switch: on by env var `name`, or by an exe path containing it in
+/// lower case (broker `ab` has no per-arm env). Read once per decode.
+fn switch(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+        || std::env::current_exe()
+            .map_or(false, |p| p.to_string_lossy().contains(&name.to_lowercase()))
+}
+
+/// The Huffman-DPCM sample loop. `NB` (NSP-29) indexes a row slice and
+/// fixed-size tables so the bounds checks fold away.
+fn nikon_rows<R: Bits, const NB: bool>(
+    mut bs: R,
+    w: usize,
+    h: usize,
+    tree: usize,
+    split: usize,
+    mut vpred: [[i32; 2]; 2],
+    curve: &[u16],
+) -> Vec<u16> {
+    let ca: &[u16; 0x8000] = curve[..0x8000].try_into().unwrap();
+    let mut huff = make_decoder(&NIKON_TREE[tree]);
+    let mut fused = make_fused(&huff);
+    let mut out = vec![0u16; w * h];
+    let mut hpred = [0i32; 2];
+    for row in 0..h {
+        if split != 0 && row == split {
+            huff = make_decoder(&NIKON_TREE[tree + 1]);
+            fused = make_fused(&huff);
+        }
+        let fa: Option<&[u32; 1 << FUSE_BITS]> = fused.as_slice().try_into().ok();
+        let (o, base) = if NB { (&mut out[row * w..(row + 1) * w], 0) } else { (&mut out[..], row * w) };
+        for col in 0..w {
+            let f = if NB {
+                match fa {
+                    Some(t) => t[bs.peek(FUSE_BITS) as usize],
+                    None => 0,
+                }
+            } else if fused.is_empty() {
+                0
+            } else {
+                fused[bs.peek(FUSE_BITS) as usize]
+            };
+            let diff = if f != 0 {
+                bs.skip(f >> 16);
+                f as u16 as i16 as i32
+            } else {
+                let v = huff[1 + bs.peek(huff[0] as u32) as usize];
+                bs.skip((v >> 8) as u32);
+                let (len, shl) = ((v & 15) as u32, ((v & 0xff) >> 4) as u32);
+                let nb = len - shl.min(len);
+                let b = if nb == 0 {
+                    0
+                } else {
+                    let b = bs.peek(nb);
+                    bs.skip(nb);
+                    b
+                };
+                let mut diff = ((((b << 1) + 1) << shl) >> 1) as i32;
+                if len > 0 && (diff & (1 << (len - 1))) == 0 {
+                    diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
+                }
+                diff
+            };
+            if col < 2 {
+                vpred[row & 1][col] += diff;
+                hpred[col] = vpred[row & 1][col];
+            } else {
+                hpred[col & 1] += diff;
+            }
+            let i = hpred[col & 1].clamp(0, 0x3fff) as usize;
+            o[base + col] = if NB { ca[i] } else { curve[i] };
+        }
+    }
+    out
 }
 
 /// Nikon's compressed NEF (259 == 34713): a Huffman-coded DPCM over two
@@ -315,45 +443,14 @@ pub(super) fn nikon_compressed(
     if off >= d.len() {
         return Err("NEF: strip offset past end of file".into());
     }
-    let mut huff = make_decoder(&NIKON_TREE[tree]);
-    let mut fused = make_fused(&huff);
-    let mut bs = NikonBits::new(&d[off..]);
-    let mut out = vec![0u16; w * h];
-    let mut hpred = [0i32; 2];
-    for row in 0..h {
-        if split != 0 && row == split {
-            huff = make_decoder(&NIKON_TREE[tree + 1]);
-            fused = make_fused(&huff);
-        }
-        for col in 0..w {
-            let f = if fused.is_empty() {
-                0
-            } else {
-                bs.fill(FUSE_BITS);
-                fused[((bs.buf >> (bs.vbits - FUSE_BITS)) & ((1 << FUSE_BITS) - 1)) as usize]
-            };
-            let diff = if f != 0 {
-                bs.vbits -= f >> 16;
-                f as u16 as i16 as i32
-            } else {
-                let i = bs.huff(&huff);
-                let len = (i & 15) as u32;
-                let shl = (i >> 4) as u32;
-                let mut diff = ((((bs.get(len - shl.min(len)) << 1) + 1) << shl) >> 1) as i32;
-                if len > 0 && (diff & (1 << (len - 1))) == 0 {
-                    diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
-                }
-                diff
-            };
-            if col < 2 {
-                vpred[row & 1][col] += diff;
-                hpred[col] = vpred[row & 1][col];
-            } else {
-                hpred[col & 1] += diff;
-            }
-            out[row * w + col] = curve[hpred[col & 1].clamp(0, 0x3fff) as usize];
-        }
-    }
+    let s = &d[off..];
+    let left = NikonLeft { d: s, p: 0, buf: 0, bits: 0 };
+    let out = match (!switch("NSP30OFF"), !switch("NSP29OFF")) {
+        (false, false) => nikon_rows::<_, false>(NikonBits::new(s), w, h, tree, split, vpred, &curve),
+        (false, true) => nikon_rows::<_, true>(NikonBits::new(s), w, h, tree, split, vpred, &curve),
+        (true, false) => nikon_rows::<_, false>(left, w, h, tree, split, vpred, &curve),
+        (true, true) => nikon_rows::<_, true>(left, w, h, tree, split, vpred, &curve),
+    };
 
     // The camera's own multipliers where the body records them; the documented
     // default only where it does not.
@@ -395,9 +492,13 @@ mod tests {
                 }
                 let bytes = ((w << 20) | 0xA_5A5A).to_be_bytes();
                 let mut bs = NikonBits::new(&bytes);
-                let i = bs.huff(&huff);
-                let (len, shl) = ((i & 15) as u32, (i >> 4) as u32);
-                let mut diff = ((((bs.get(len - shl.min(len)) << 1) + 1) << shl) >> 1) as i32;
+                let v = huff[1 + bs.peek(huff[0] as u32) as usize];
+                bs.skip((v >> 8) as u32);
+                let (len, shl) = ((v & 15) as u32, ((v & 0xff) >> 4) as u32);
+                let nb = len - shl.min(len);
+                let b = if nb == 0 { 0 } else { bs.peek(nb) };
+                bs.skip(nb);
+                let mut diff = ((((b << 1) + 1) << shl) >> 1) as i32;
                 if len > 0 && (diff & (1 << (len - 1))) == 0 {
                     diff -= (1 << len) - if shl != 0 { 0 } else { 1 };
                 }
