@@ -1032,6 +1032,14 @@ fn pair_table(a: &HuffTable, b: &HuffTable) -> Box<[u32]> {
         .collect()
 }
 
+/// Screening switches for lane LJP (B-c7, 10-08), read once per process:
+/// `BLIZZ_LJP<n>=0` turns lever LJP-<n> off; default on. Stay until the
+/// closing pass.
+fn ljp_on(n: usize) -> bool {
+    static S: std::sync::OnceLock<[bool; 1]> = std::sync::OnceLock::new();
+    S.get_or_init(|| [1].map(|n| std::env::var(format!("BLIZZ_LJP{n}")).map_or(true, |v| v != "0")))[n - 1]
+}
+
 /// DNG-74's switch, read once per process.
 fn pairs_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1168,10 +1176,44 @@ fn decode_c2<const PRECISION: u8, const COLLECT_STATS: bool>(
     // overwritten with the decoded value as the row's column 0 completes).
     let mut prev0 = base_pred;
     let mut prev1 = base_pred;
+    let ljp1 = !COLLECT_STATS && ljp_on(1);
 
     for row in 0..height {
         let row_base = base + row * stride_pixels;
         let emit_row = row < out_rows;
+        // LJP-1: a row written whole (every interior DNG tile row, every CR2
+        // row) takes one checked slice, column 0 peeled, no per-sample
+        // col-0 selects or column tests: fewer live values, so the predictor
+        // state stays in registers instead of spilling to the stack.
+        if ljp1 && emit_row && width > 0 && 2 * width <= out_pixel_cols {
+            let o = &mut out[row_base..row_base + 2 * width];
+            let (f8, sh, ts) = (&mut fast8_hits, &mut slow_huffman_hits, &mut total_symbols);
+            let mut l0 = prev0.wrapping_add(next_diff::<COLLECT_STATS>(
+                &mut br, table0, f8, sh, ts, &mut category_hist, &mut get_bits_calls,
+                &mut get_bits_total_bits,
+            )?);
+            let mut l1 = prev1.wrapping_add(next_diff::<COLLECT_STATS>(
+                &mut br, table1, f8, sh, ts, &mut category_hist, &mut get_bits_calls,
+                &mut get_bits_total_bits,
+            )?);
+            prev0 = l0;
+            prev1 = l1;
+            o[0] = ((l0 << point_transform) & 0xFFFF) as u16;
+            o[1] = ((l1 << point_transform) & 0xFFFF) as u16;
+            for px in o[2..].chunks_exact_mut(2) {
+                l0 = l0.wrapping_add(next_diff::<COLLECT_STATS>(
+                    &mut br, table0, f8, sh, ts, &mut category_hist, &mut get_bits_calls,
+                    &mut get_bits_total_bits,
+                )?);
+                l1 = l1.wrapping_add(next_diff::<COLLECT_STATS>(
+                    &mut br, table1, f8, sh, ts, &mut category_hist, &mut get_bits_calls,
+                    &mut get_bits_total_bits,
+                )?);
+                px[0] = ((l0 << point_transform) & 0xFFFF) as u16;
+                px[1] = ((l1 << point_transform) & 0xFFFF) as u16;
+            }
+            continue;
+        }
         let mut left0 = 0i32;
         let mut left1 = 0i32;
         for col in 0..width {
