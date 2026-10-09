@@ -1,7 +1,8 @@
 //! Olympus 12-bit raw decompression.
 //!
 //! Port of dcraw v9.28's `olympus_load_raw()` (David Coffin, public domain),
-//! cross-checked against LibRaw 0.21.4 and the rawloader crate.
+//! with LibRaw 0.21.4 and the rawloader crate used only as black-box output
+//! oracles (no code taken from either).
 //! Algorithm: predictive variable-length encoding with a 12-bit Huffman prefix
 //! table for the run-length "high" value, per-row state ("carry"), and a
 //! context-dependent predictor using west / north / north-west neighbours.
