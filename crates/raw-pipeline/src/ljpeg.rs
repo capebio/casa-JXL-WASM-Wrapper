@@ -1796,6 +1796,7 @@ pub fn decode_tile(
     out_rows: usize,
 ) -> Result<()> {
     let plan = LjpegPlan::prepare(src)?;
+    let (stride_pixels, out_pixel_cols, out_rows) = unfold(&plan, stride_pixels, out_pixel_cols, out_rows);
     execute::<false>(
         &plan,
         src,
@@ -1806,6 +1807,22 @@ pub fn decode_tile(
         out_rows,
     )?;
     Ok(())
+}
+
+/// A folded frame: DJI FC4382 / FC9287 DNGs (2025) code a W x H tile as ONE SOF3 frame of k*W x H/k,
+/// each JPEG line carrying k sensor rows back to back (predictor 6; LibRaw's plane, observed as a
+/// black box, is the frame unfolded). When the tile spans the whole output row (stride == cols) those
+/// k rows are contiguous in `out`, so the frame decodes unchanged with a k-times longer line. Any
+/// other shape is left alone and `geometry_check` still refuses it.
+fn unfold(plan: &LjpegPlan, stride: usize, cols: usize, rows: usize) -> (usize, usize, usize) {
+    let raw = plan.width * plan.components;
+    if plan.height < rows && stride == cols && cols > 0 && raw % cols == 0 {
+        let k = raw / cols;
+        if k > 1 && plan.height.checked_mul(k) == Some(rows) {
+            return (stride * k, cols * k, rows / k);
+        }
+    }
+    (stride, cols, rows)
 }
 
 /// Decode one LJPEG tile and return per-stage statistics for profiling.
@@ -1819,6 +1836,7 @@ pub fn decode_tile_stats(
     out_rows: usize,
 ) -> Result<LjpegStats> {
     let plan = LjpegPlan::prepare(src)?;
+    let (stride_pixels, out_pixel_cols, out_rows) = unfold(&plan, stride_pixels, out_pixel_cols, out_rows);
     execute::<true>(
         &plan,
         src,
@@ -2130,6 +2148,25 @@ mod tests {
                 assert_eq!(out, samples, "pred={pred} cps={cps}");
             }
         }
+    }
+
+    /// DJI FC4382 / FC9287: a W x H tile coded as one 2W x H/2 frame (two sensor
+    /// rows per JPEG line, predictor 6) decodes into the W x H tile unchanged; the
+    /// same frame into a tile narrower than the output row is still refused.
+    #[test]
+    fn ljpeg_folded_frame_unfolds_into_full_width_tile() {
+        let (w, h, precision) = (6usize, 8usize, 16u8);
+        let a = 1u16 << (precision - 2);
+        let samples: Vec<u16> = prand_samples(w * h, precision, 0xD31)
+            .into_iter()
+            .map(|v| a + (v & (a - 1)))
+            .collect();
+        let jpg = encode_sof3(&samples, 2 * w, h / 2, 1, precision, 6);
+        let mut out = vec![0u16; w * h];
+        decode_tile(&jpg, &mut out, 0, w, w, h).unwrap_or_else(|e| panic!("{e:#}"));
+        assert_eq!(out, samples);
+        let mut wide = vec![0u16; 2 * w * h];
+        assert!(decode_tile(&jpg, &mut wide, 0, 2 * w, w, h).is_err());
     }
 
     /// Predictor 7 — the production case (Apple ProRAW) — additionally at full

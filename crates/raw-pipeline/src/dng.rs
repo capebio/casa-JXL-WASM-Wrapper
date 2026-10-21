@@ -1072,6 +1072,12 @@ fn decode_tiles_blit(
         let mut buf = vec![0u16; bw * bh];
         ljpeg::decode_tile_compact(src, &mut buf, bw, bh)
             .with_context(|| format!("compact tile r={tr} c={tc}"))?;
+        // A folded frame (k sensor rows per JPEG line, `ljpeg::unfold`): the
+        // same buffer read as bw/k x bh*k is the tile.
+        let (bw, bh) = match tl.checked_rem(bh) {
+            Some(0) if bh < tl && bw % (tl / bh) == 0 => (bw / (tl / bh), tl),
+            _ => (bw, bh),
+        };
         Ok(DecodedTile {
             row_start,
             col_start,
@@ -1294,7 +1300,15 @@ fn decode_uncompressed_band(
                 bail!("uncompressed DNG: strip {idx} index out of range");
             }
             let off = raw.strip_offsets[idx] as usize;
-            let bc = raw.strip_byte_counts[idx] as usize;
+            let mut bc = raw.strip_byte_counts[idx] as usize;
+            // Hasselblad L2D-20c (DJI): StripByteCounts understates the strip
+            // (41,775,360 for 42,534,912 = W*H*2), whose rows end EXACTLY at EOF;
+            // LibRaw (black box) reads them all. Only that exact fit is trusted.
+            let full = row_bytes(width, raw.bits_per_sample)
+                .checked_mul((band_first + rows_per_strip).min(height) - band_first);
+            if let Some(full) = full.filter(|&f| bc < f && off.checked_add(f) == Some(data.len())) {
+                bc = full;
+            }
             // checked_add (000-security-11): off+bc can wrap usize on wasm32.
             let end = off
                 .checked_add(bc)
@@ -3306,6 +3320,24 @@ mod tests {
             let r = payload_ranges(&dng).expect("ranges");
             assert_eq!(r, vec![(off as usize, off as usize + jxl.len())]);
         }
+    }
+
+    /// Hasselblad L2D-20c: StripByteCounts understates a strip whose W*H*2 bytes
+    /// end exactly at EOF -> the whole plane is read; one byte past EOF more and
+    /// the understated count is not trusted (refused, as before).
+    #[test]
+    fn understated_strip_ending_at_eof_reads_whole_plane() {
+        let samples: Vec<u16> = (0..16u16).map(|v| v.wrapping_mul(2731)).collect();
+        let strip: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let (mut dng, _) = synth_dng_1strip(1, &strip);
+        let n = 8;
+        let bc_at = 8 + 2 + 7 * 12 + 8; // entry 7 (0x0117) value field
+        assert_eq!(dng[bc_at - 8..bc_at - 6], 0x0117u16.to_le_bytes());
+        dng[bc_at..bc_at + 4].copy_from_slice(&24u32.to_le_bytes());
+        assert_eq!(dng.len(), payload_off(n) as usize + 32);
+        assert_eq!(decode_bytes(&dng).expect("understated strip at EOF").raw, samples);
+        dng.push(0);
+        assert!(decode_bytes(&dng).is_err());
     }
 
     /// The dng_sdk remainder rule, worked by hand: field f holds
