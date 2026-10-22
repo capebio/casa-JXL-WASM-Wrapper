@@ -14,9 +14,13 @@ fn main() {
                 let n = img.raw.len();
                 let mean = img.raw.iter().map(|&v| v as u64).sum::<u64>() as f64 / n as f64;
                 let mx = img.raw.iter().copied().max().unwrap_or(0);
+                // FNV-1a 64 over the samples as u16 LE (interleaved), the zoo's plane hash.
+                let fnv = img.raw.iter().flat_map(|v| v.to_le_bytes()).fold(0xcbf29ce484222325u64, |h, b| {
+                    (h ^ b as u64).wrapping_mul(0x100000001b3)
+                });
                 println!(
-                    "{a}: OK {}x{} cfa={:?} black={} white={} samples={} mean={mean:.1} max={mx} make={} model={}",
-                    img.width, img.height, img.cfa, img.black, img.white, n, img.make, img.model
+                    "{a}: OK {}x{} cps={} cfa={:?} black={} white={} samples={} mean={mean:.1} max={mx} fnv={fnv:016x} make={} model={}",
+                    img.width, img.height, img.samples_per_pixel, img.cfa, img.black, img.white, n, img.make, img.model
                 );
             }
             Err(e) => println!("{a}: DECODE FAIL {e:#}"),

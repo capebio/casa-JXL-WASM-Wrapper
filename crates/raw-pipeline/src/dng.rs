@@ -473,27 +473,16 @@ fn decode_bytes_inner(
     if cps != 1 && cps != 3 {
         bail!("DNG: SamplesPerPixel {cps} not supported (1 = Bayer, 3 = linear RGB)");
     }
+    refuse_misdecodes(&raw)?;
     let mut out = vec![0u16; width * height * cps];
 
-    // Guard: decode_uncompressed assumes 1 sample/pixel (one u16 per mosaic cell).
-    // A multi-sample uncompressed DNG (e.g. linear/demosaiced RGB, cps>1) would be
-    // silently mis-decoded as Bayer data — wrong stride, garbage output. Bail early
-    // with a clear error rather than produce corrupt pixel data. Multi-sample
-    // uncompressed decode is not implemented (out of scope).
-    if raw.compression == 1 && cps != 1 {
-        bail!(
-            "DNG: uncompressed multi-sample DNG not supported (SamplesPerPixel={}); \
-             only single-sample (Bayer mosaic) is implemented",
-            cps
-        );
-    }
     // `mut` is only exercised by the jxl-codec arm below.
     #[allow(unused_mut)]
     let mut jxl_lossy: Option<bool> = None;
     let mut white_mapped = None;
     match raw.compression {
         34892 => white_mapped = decode_lossy_jpeg(data, &raw, width, height, cps, &mut out)?,
-        1 => decode_uncompressed(data, &raw, width, height, le, &mut out)?,
+        1 => decode_uncompressed(data, &raw, width, height, cps, le, &mut out)?,
         7 if use_blit => decode_tiles_blit(data, &raw, width, height, cps, &mut out)?,
         7 => decode_tiles(data, &raw, width, height, cps, &mut out, exec)?,
         8 => decode_deflate(data, &raw, width, height, le, &mut out, exec)?,
@@ -700,6 +689,7 @@ impl<'a> DngRowSource<'a> {
         if (width as u64).saturating_mul(height as u64) > 200_000_000 {
             return Err(format!("DNG: implausible dimensions {width}×{height}"));
         }
+        refuse_misdecodes(&raw).map_err(|e| e.to_string())?;
         let cps = raw.samples_per_pixel.max(1) as usize;
         if cps != 1 {
             return Err(format!(
@@ -1985,10 +1975,18 @@ fn decode_uncompressed(
     raw: &RawIfd,
     width: usize,
     height: usize,
+    cps: usize,
     le: bool,
     out: &mut [u16],
 ) -> Result<()> {
-    let layout = uncompressed_layout(raw, width, height)?;
+    let layout = match uncompressed_layout(raw, width, height)? {
+        // Chunky `cps`-sample pixels (Linear DNG, Adobe DNG Converter -l -u): a
+        // row of `width` pixels is a row of `width*cps` samples, so the band
+        // primitive runs unchanged on sample units. Tile count stays the same.
+        UncompressedLayout::Tiled { tw, tl, coltiles } => UncompressedLayout::Tiled { tw: tw * cps, tl, coltiles },
+        l => l,
+    };
+    let width = width * cps;
     // Whole-frame decode = decode every row-band directly into its slice of `out`.
     // Byte-identical to the previous inline loops (same per-band primitive).
     let band_stride = match layout {
@@ -2212,6 +2210,42 @@ struct RawIfd {
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
+    /// CFAPattern (0x828E) entry count, 0 = absent; CFARepeatPatternDim (0x828D).
+    cfa_len: usize,
+    cfa_repeat: Option<[u32; 2]>,
+    /// PhotometricInterpretation (0x0106): 32803 = CFA, 34892 = LinearRaw; 0 = absent.
+    photometric: u32,
+    /// SampleFormat (0x0153): 1 = unsigned int, 3 = IEEE float; 0 = absent.
+    sample_format: u32,
+    /// PlanarConfiguration (0x011C): 1 = chunky, 2 = planar; 0 = absent.
+    planar_config: u32,
+}
+
+/// Raw IFDs the decoders would otherwise MIS-decode (wrong values, no error):
+/// refused by name instead. Shared by [`decode_bytes`] and [`DngRowSource`].
+fn refuse_misdecodes(raw: &RawIfd) -> Result<()> {
+    let cps = raw.samples_per_pixel.max(1);
+    if raw.sample_format == 3 {
+        bail!(
+            "DNG: floating-point samples (SampleFormat 3, {} bit; e.g. an HDR merge) not supported: the plane is u16",
+            raw.bits_per_sample
+        );
+    }
+    if raw.photometric == 34892 && cps == 1 {
+        bail!("DNG: monochrome Linear DNG (Photometric 34892, 1 sample/pixel) not supported: it is not a Bayer mosaic");
+    }
+    if raw.photometric != 34892 {
+        if let Some(d) = raw.cfa_repeat.filter(|&d| d != [2, 2]) {
+            bail!("DNG: CFA repeat pattern {}x{} not supported (2x2 only)", d[0], d[1]);
+        }
+        if raw.cfa_len != 0 && raw.cfa_len != 4 {
+            bail!("DNG: CFAPattern of {} entries not supported (2x2 only)", raw.cfa_len);
+        }
+    }
+    if cps > 1 && raw.planar_config == 2 {
+        bail!("DNG: planar (PlanarConfiguration 2) {cps}-sample data not supported");
+    }
+    Ok(())
 }
 
 #[derive(Default, Debug)]
@@ -2418,15 +2452,28 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                 0x014A => {
                     subs = read_array_u32(data, dtype, cnt, val, inline_pos, le);
                 }
+                0x0106 => {
+                    ifd.photometric = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                }
+                0x0153 => {
+                    ifd.sample_format = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                }
+                0x011C => {
+                    ifd.planar_config = first_u32(data, dtype, cnt, val, inline_pos, le).unwrap_or(0);
+                }
                 0x828D => {
-                    // CFARepeatPatternDim — ignore (we assume 2x2)
+                    // CFARepeatPatternDim: anything but 2x2 is refused (refuse_misdecodes).
+                    let a = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                    if a.len() == 2 {
+                        ifd.cfa_repeat = Some([a[0], a[1]]);
+                    }
                 }
                 0x828E => {
-                    // CFAPattern: we only handle the standard 2x2 mosaic (exactly 4
-                    // entries). Any other length (non-2x2 repeat, malformed, or absent
-                    // tag) is an INTENTIONAL fallback to the RGGB default applied
-                    // downstream — not a silent error.
+                    // CFAPattern: only the standard 2x2 mosaic (exactly 4 entries)
+                    // decodes; another length is refused (refuse_misdecodes); an
+                    // absent tag falls back to the RGGB default downstream.
                     let arr = read_array_u32(data, dtype, cnt, val, inline_pos, le);
+                    ifd.cfa_len = arr.len();
                     if arr.len() == 4 {
                         ifd.cfa_pattern =
                             Some([arr[0] as u8, arr[1] as u8, arr[2] as u8, arr[3] as u8]);
@@ -3924,7 +3971,7 @@ mod tests {
         };
         let data = [0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04];
         let mut out = vec![0u16; 4];
-        decode_uncompressed(&data, &raw, 2, 2, false, &mut out).unwrap();
+        decode_uncompressed(&data, &raw, 2, 2, 1, false, &mut out).unwrap();
         assert_eq!(out, vec![1, 2, 3, 4]);
     }
 
@@ -3939,8 +3986,53 @@ mod tests {
         };
         let data = [1, 0, 2, 0, 3, 0, 4, 0];
         let mut out = vec![0u16; 4];
-        decode_uncompressed(&data, &raw, 2, 2, true, &mut out).unwrap();
+        decode_uncompressed(&data, &raw, 2, 2, 1, true, &mut out).unwrap();
         assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    /// Linear DNG uncompressed, chunky RGB in 2x2 tiles over a 3-wide image: the
+    /// right tile is partial (one real column + one pad column per row).
+    #[test]
+    fn decode_uncompressed_tiled_three_samples() {
+        let v = |x: u16, y: u16, c: u16| y * 100 + x * 10 + c;
+        let mut data = Vec::new();
+        for (x0, real) in [(0u16, 2u16), (2, 1)] {
+            for y in 0..2 {
+                for dx in 0..2 {
+                    for c in 0..3 {
+                        let s = if dx < real { v(x0 + dx, y, c) } else { 9999 };
+                        data.extend_from_slice(&s.to_le_bytes());
+                    }
+                }
+            }
+        }
+        let raw = RawIfd {
+            bits_per_sample: 16,
+            samples_per_pixel: 3,
+            tile_offsets: vec![0, 24],
+            tile_byte_counts: vec![24, 24],
+            tile_width: Some(2),
+            tile_length: Some(2),
+            ..Default::default()
+        };
+        let mut out = vec![0u16; 3 * 2 * 3];
+        decode_uncompressed(&data, &raw, 3, 2, 3, true, &mut out).unwrap();
+        let want: Vec<u16> = (0..2).flat_map(|y| (0..3).flat_map(move |x| (0..3).map(move |c| v(x, y, c)))).collect();
+        assert_eq!(out, want);
+    }
+
+    /// Layouts that used to decode to wrong values without an error.
+    #[test]
+    fn refuse_misdecodes_names_float_mono_and_non_2x2_cfa() {
+        let e = |raw: RawIfd| refuse_misdecodes(&raw).unwrap_err().to_string();
+        assert!(e(RawIfd { sample_format: 3, bits_per_sample: 16, ..Default::default() }).contains("floating-point"));
+        assert!(e(RawIfd { photometric: 34892, samples_per_pixel: 1, ..Default::default() }).contains("monochrome"));
+        assert!(e(RawIfd { photometric: 32803, cfa_repeat: Some([6, 6]), ..Default::default() }).contains("6x6"));
+        assert!(e(RawIfd { cfa_len: 36, ..Default::default() }).contains("36 entries"));
+        assert!(e(RawIfd { samples_per_pixel: 3, planar_config: 2, ..Default::default() }).contains("planar"));
+        let ok = RawIfd { photometric: 32803, cfa_repeat: Some([2, 2]), cfa_len: 4, ..Default::default() };
+        refuse_misdecodes(&ok).unwrap();
+        refuse_misdecodes(&RawIfd { photometric: 34892, samples_per_pixel: 3, ..Default::default() }).unwrap();
     }
 
     #[test]
