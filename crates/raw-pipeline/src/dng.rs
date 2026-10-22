@@ -3656,7 +3656,7 @@ mod tests {
         let img = decode_bytes(&dng).expect("lossy DNG decodes");
         assert!(img.lossy_jpeg);
         assert_eq!(img.raw, (0..16u16).map(|v| v * 16).collect::<Vec<_>>());
-        assert_eq!(payload_ranges(&dng).unwrap(), vec![(off as usize, 16)]);
+        assert_eq!(payload_ranges(&dng).unwrap(), vec![(off as usize, off as usize + strip.len())]);
     }
 
     #[test]
