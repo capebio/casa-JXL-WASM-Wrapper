@@ -44,7 +44,7 @@ All 6 tests in `crates/raw-pipeline/tests/parity_corpus.rs` pass:
 
 Pixel hashes (release, `target-cpu=native`) — current pins in `tests/parity_corpus.rs`:
 - ORF rgba8 `0x1cc346e73c26d8cb`
-- DNG rgb8  `0x40c9457b04b0b032`
+- DNG rgb8  `0xf86fb2615b297d1d`
 
 Lineage (each re-pin author-validated, never adopted silently):
 
@@ -54,6 +54,7 @@ Lineage (each re-pin author-validated, never adopted silently):
 | 2026-07-08 | `0xfb91a7f35549eaeb` | `0x7a2717d8cdbbe4c2` | tone fix b1ce12ed (`HIGHLIGHT_KNEE` 0.80→0.68) + per-format white-level fix d0a22cc9 |
 | 2026-07-28 | `0xda808882dc6b1e96` | `0x40c9457b04b0b032` | MHC demosaic fix: B-at-R gradient correction restored (the kernel was asymmetric under R/B exchange) + cross-channel gradients scaled by the WB ratios (`MhcGains`). Demosaic-only; no tone or colour math changed. |
 | 2026-07-29 | `0x1cc346e73c26d8cb` | unchanged | ORF only, three changes (HANDOFF-orf-baseline items 4+2+1): (a) `decode_orf_rgba8` made app-representative — black=256 pedestal, camera WB (gray-world fallback), MakerNote 0x1011 matrix, WB-scaled MHC gains, matching the app's `decode_orf_raw` (it previously rendered with `default_olympus()` placeholders, so harnesses on it — highlight_tune ORF row — misled); (b) native-ISO ORF baseline 1.40 → `ORF_BASELINE_EXP_EV` 1.6 via `pipeline::orf_baseline_ev` (measured vs embedded JPEG; LOW-ISO keeps 0.40, unknown ISO keeps 1.40); (c) base-ISO chroma-only NR `apply_chroma_nr` @ 0.3 for iso<1600 (luma untouched by construction). CR2/DNG untouched throughout. |
+| 2026-10-22 | unchanged | `0xf86fb2615b297d1d` | DNG only: 8186c250 (CCT-weighted ColorMatrix1/2 blend for AsShotWhiteXY-derived WB), an intended colour change; found by `git bisect` a09f6008 (good) .. bfcbf354 (bad), 843957b9 good, db7df1ec + 8186c250 bad, same hash at head. ORF pin still holds in release + `target-cpu=native`; a debug build without it gives `0x61e9a44f69ee9cf5` (not a drift). |
 
 ---
 

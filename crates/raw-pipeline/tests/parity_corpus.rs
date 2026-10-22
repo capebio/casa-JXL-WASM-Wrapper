@@ -59,7 +59,7 @@ use std::hash::{Hash, Hasher};
 //      matching the app's finish_from_raw.
 // Intentional; DNG pin untouched (CR2/DNG keep BASELINE_EXP_EV, no chroma NR).
 const ORF_RGBA8_HASH: u64 = 0x1cc3_46e7_3c26_d8cb; // P1110226.ORF → decode_orf_rgba8 (was 0xda80_8882_dc6b_1e96; placeholder params + legacy 1.40 + no chroma NR)
-const DNG_RGB8_HASH: u64 = 0x40c9_457b_04b0_b032; //  PXL…dng → process() rgb8 (was 0x7a27_17d8_cdbb_e4c2; same MHC fix)
+const DNG_RGB8_HASH: u64 = 0xf86f_b261_5b29_7d1d; //  PXL…dng → process() rgb8 (was 0x40c9_457b_04b0_b032; 8186c250 CCT ColorMatrix blend)
 // Fixture tier — captured on rustc 1.95.0 from the checked-in mandelbrot assets.
 // tiff8 == exr-display: the EXR is the HDR-linear twin of the same pattern the
 // 8-bit TIFF stores as sRGB, so linear→sRGB8 display reproduces the TIFF exactly
