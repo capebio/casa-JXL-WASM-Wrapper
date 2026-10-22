@@ -160,6 +160,11 @@ pub struct DngImage {
     /// sources should trust this over [`Self::jxl_distance`], which most
     /// writers omit.
     pub jxl_lossy: Option<bool>,
+    /// The raw IFD is lossy JPEG (compression 34892): 8-bit baseline JPEG tiles,
+    /// decoded through [`set_lossy_jpeg_decoder`]'s hook and mapped to linear
+    /// 16-bit through OpcodeList2's MapPolynomial. An archiver refuses this like
+    /// lossy JPEG XL; a viewer shows it.
+    pub lossy_jpeg: bool,
     /// Meaningless (left at the Rggb default) when `samples_per_pixel == 3`.
     pub cfa: Cfa,
     pub black: u16,
@@ -309,12 +314,13 @@ pub fn ljpeg_tile_ranges(data: &[u8]) -> Result<Vec<(usize, usize)>> {
 }
 
 /// Byte ranges of the sensor payload within `data`, for EVERY compression the
-/// walker accepts (1 uncompressed, 7 LJPEG, 8 deflate, 52546 JPEG XL) — tiles
-/// or strips. This is pure tag arithmetic (offsets + byte counts); no decoding.
+/// walker accepts (1 uncompressed, 7 LJPEG, 8 deflate, 34892 lossy JPEG, 52546
+/// JPEG XL) — tiles or strips. This is pure tag arithmetic (offsets + byte
+/// counts); no decoding.
 ///
 /// The archive use case (`blizz` ingest): everything outside these ranges rides
-/// along verbatim in the archive's sidecar. A lossy DNG (34892) is refused with
-/// the reason via the walker's named error rather than located and archived.
+/// along verbatim in the archive's sidecar. (`blizz` refuses a lossy DNG before
+/// it gets here: [`DngImage::lossy_jpeg`].)
 ///
 /// Sibling of [`ljpeg_tile_ranges`], which stays pinned to compression 7 for
 /// its existing callers.
@@ -484,7 +490,9 @@ fn decode_bytes_inner(
     // `mut` is only exercised by the jxl-codec arm below.
     #[allow(unused_mut)]
     let mut jxl_lossy: Option<bool> = None;
+    let mut white_mapped = None;
     match raw.compression {
+        34892 => white_mapped = decode_lossy_jpeg(data, &raw, width, height, cps, &mut out)?,
         1 => decode_uncompressed(data, &raw, width, height, le, &mut out)?,
         7 if use_blit => decode_tiles_blit(data, &raw, width, height, cps, &mut out)?,
         7 => decode_tiles(data, &raw, width, height, cps, &mut out, exec)?,
@@ -518,8 +526,10 @@ fn decode_bytes_inner(
     let wb_g = 1.0;
     let wb_b = wb_g_neutral / wb_b_neutral.max(1e-6);
 
-    let black = raw.black_level.unwrap_or(0);
-    let white = raw.white_level.unwrap_or(16383);
+    // A MapPolynomial-mapped lossy plane is already black-subtracted and
+    // normalised to 0..=65535.
+    let black = if white_mapped.is_some() { 0 } else { raw.black_level.unwrap_or(0) };
+    let white = white_mapped.unwrap_or_else(|| raw.white_level.unwrap_or(16383));
     let color_matrix = state.resolved_color_matrix.or_else(|| {
         choose_camera_to_srgb_matrix(
             state.forward_matrix_1,
@@ -542,6 +552,7 @@ fn decode_bytes_inner(
         samples_per_pixel: cps,
         jxl_distance: raw.jxl_distance,
         jxl_lossy,
+        lossy_jpeg: raw.compression == 34892,
         cfa,
         black,
         white,
@@ -912,6 +923,151 @@ fn decode_band_into(
 /// 6 on a 48-tile Apple ProRAW. `decode_tiles_blit`'s per-tile scratch + single-threaded
 /// serial blit (measured ~34% of `decode_bytes` wall time) stays avoided: only contended
 /// tiles copy, and they copy in parallel.
+/// One baseline JPEG (a lossy DNG tile or strip) -> `(width, height, components,
+/// samples)`, 8-bit, interleaved, colour-converted as the JPEG's own markers say.
+pub type LossyJpegFn = fn(&[u8]) -> std::result::Result<(usize, usize, usize, Vec<u8>), String>;
+
+static LOSSY_JPEG: std::sync::OnceLock<LossyJpegFn> = std::sync::OnceLock::new();
+
+/// Hand in the JPEG decoder for lossy DNG (compression 34892). This crate has
+/// none of its own; the first call wins, later calls are ignored.
+pub fn set_lossy_jpeg_decoder(f: LossyJpegFn) {
+    let _ = LOSSY_JPEG.set(f);
+}
+
+/// Compression 34892: every tile (or strip) is an 8-bit baseline JPEG with
+/// `cps` components. OpcodeList2's MapPolynomial opcodes (id 8) are the
+/// encoding curve back to linear (Adobe DNG Converter writes one cubic per
+/// plane): when present they are applied here, on (code - black) / (white -
+/// black) per DNG §6 stage 2, and the plane comes back normalised to 0..=65535
+/// (`Some(65535)` = the new white, black 0). Without them the 8-bit codes are
+/// returned as stored (`None`).
+fn decode_lossy_jpeg(
+    data: &[u8],
+    raw: &RawIfd,
+    width: usize,
+    height: usize,
+    cps: usize,
+    out: &mut [u16],
+) -> Result<Option<u16>> {
+    let dec = LOSSY_JPEG.get().ok_or_else(|| {
+        anyhow!("DNG compression 34892 (lossy JPEG) needs a JPEG decoder: none was set (set_lossy_jpeg_decoder)")
+    })?;
+    let (tw, tl, offs, cnts) = if !raw.tile_offsets.is_empty() {
+        let tw = raw.tile_width.ok_or_else(|| anyhow!("missing TileWidth"))? as usize;
+        let tl = raw.tile_length.ok_or_else(|| anyhow!("missing TileLength"))? as usize;
+        (tw, tl, &raw.tile_offsets, &raw.tile_byte_counts)
+    } else {
+        let rps = raw.rows_per_strip.map_or(height, |r| (r as usize).min(height));
+        (width, rps, &raw.strip_offsets, &raw.strip_byte_counts)
+    };
+    if tw == 0 || tl == 0 {
+        bail!("DNG: zero tile/strip size");
+    }
+    let across = width.div_ceil(tw);
+    if offs.len() != across * height.div_ceil(tl) || cnts.len() != offs.len() {
+        bail!("DNG 34892: {} segments for a {width}x{height} image of {tw}x{tl}", offs.len());
+    }
+    // The stored 8-bit codes; `out` gets them, or their mapped values.
+    let mut codes = vec![0u8; out.len()];
+    // ponytail: serial tile loop; hand it the TileExecFn if lossy DNG view time matters.
+    for (i, (&o, &n)) in offs.iter().zip(cnts.iter()).enumerate() {
+        let seg = data
+            .get(o as usize..(o as usize).saturating_add(n as usize))
+            .ok_or_else(|| anyhow!("DNG 34892: segment {i} past end of file"))?;
+        let (jw, jh, jc, px) = dec(seg).map_err(|e| anyhow!("DNG 34892 segment {i}: {e}"))?;
+        if jc != cps || px.len() < jw * jh * jc {
+            bail!("DNG 34892 segment {i}: {jc} components, {cps} expected");
+        }
+        let (x0, y0) = ((i % across) * tw, (i / across) * tl);
+        for y in 0..jh.min(tl).min(height - y0) {
+            let n = jw.min(tw).min(width - x0) * cps;
+            let at = ((y0 + y) * width + x0) * cps;
+            codes[at..at + n].copy_from_slice(&px[y * jw * cps..][..n]);
+        }
+    }
+    let maps = raw.opcode_list2.map_or_else(Vec::new, |(o, n)| map_polynomials(data.get(o..o.saturating_add(n)).unwrap_or(&[])));
+    if maps.is_empty() {
+        for (d, &c) in out.iter_mut().zip(&codes) {
+            *d = c as u16;
+        }
+        return Ok(None);
+    }
+    let black = raw.black_level.unwrap_or(0) as f64;
+    let range = (raw.white_level.unwrap_or(255) as f64 - black).max(1.0);
+    // Samples no opcode covers still get the same normalisation.
+    for (d, &c) in out.iter_mut().zip(&codes) {
+        *d = (((c as f64 - black) / range).clamp(0.0, 1.0) * 65535.0).round() as u16;
+    }
+    for m in &maps {
+        let lut: Vec<u16> = (0..256)
+            .map(|c| {
+                let x = (c as f64 - black) / range;
+                let y = m.coef.iter().rev().fold(0.0, |acc, &k| acc * x + k);
+                (y.clamp(0.0, 1.0) * 65535.0).round() as u16
+            })
+            .collect();
+        let (bottom, right) = (m.bottom.min(height), m.right.min(width));
+        for y in (m.top..bottom).step_by(m.row_pitch.max(1)) {
+            for x in (m.left..right).step_by(m.col_pitch.max(1)) {
+                for pl in m.plane..(m.plane + m.planes).min(cps) {
+                    let at = (y * width + x) * cps + pl;
+                    out[at] = lut[codes[at] as usize];
+                }
+            }
+        }
+    }
+    Ok(Some(65535))
+}
+
+/// DNG MapPolynomial opcode (id 8): `y = sum coef[k] x^k` over an area/plane range.
+struct MapPoly {
+    top: usize,
+    left: usize,
+    bottom: usize,
+    right: usize,
+    plane: usize,
+    planes: usize,
+    row_pitch: usize,
+    col_pitch: usize,
+    coef: Vec<f64>,
+}
+
+/// The MapPolynomial opcodes of an opcode list (big-endian per the DNG spec);
+/// other opcodes are skipped by their byte count.
+fn map_polynomials(b: &[u8]) -> Vec<MapPoly> {
+    let u = |p: usize| b.get(p..p + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize);
+    let mut v = Vec::new();
+    let Some(n) = u(0) else { return v };
+    let mut p = 4;
+    for _ in 0..n {
+        let (Some(id), Some(len)) = (u(p), u(p + 12)) else { break };
+        let q = p + 16;
+        if id == 8 {
+            let f = |k: usize| u(q + 4 * k).unwrap_or(0);
+            let deg = f(8);
+            let coef: Vec<f64> = (0..=deg.min(8))
+                .filter_map(|k| b.get(q + 36 + 8 * k..q + 44 + 8 * k).map(|s| f64::from_be_bytes(s.try_into().unwrap())))
+                .collect();
+            if coef.len() == deg.min(8) + 1 {
+                v.push(MapPoly {
+                    top: f(0),
+                    left: f(1),
+                    bottom: f(2),
+                    right: f(3),
+                    plane: f(4),
+                    planes: f(5),
+                    row_pitch: f(6),
+                    col_pitch: f(7),
+                    coef,
+                });
+            }
+        }
+        p = q + len;
+    }
+    v
+}
+
 fn decode_tiles(
     data: &[u8],
     raw: &RawIfd,
@@ -2010,14 +2166,7 @@ fn load_dng(data: &[u8]) -> Result<(WalkState, RawIfd, bool)> {
         if state.refused_compressions.is_empty() {
             anyhow!("no raw SubIFD found")
         } else {
-            let named: Vec<String> = state
-                .refused_compressions
-                .iter()
-                .map(|&c| match c {
-                    34892 => "34892 (lossy JPEG — refused by design)".to_string(),
-                    c => c.to_string(),
-                })
-                .collect();
+            let named: Vec<String> = state.refused_compressions.iter().map(|c| c.to_string()).collect();
             anyhow!(
                 "no supported raw SubIFD found (refused compression: {})",
                 named.join(", ")
@@ -2058,6 +2207,8 @@ struct RawIfd {
     pgtm_range: Option<(usize, usize)>,
     /// LinearizationTable (0xC618): stored code → linear value.
     linearization: Vec<u16>,
+    /// OpcodeList2 (0xC741) blob extent in the file: (offset, len).
+    opcode_list2: Option<(usize, usize)>,
     black_level: Option<u16>,
     white_level: Option<u16>,
     cfa_pattern: Option<[u8; 4]>,
@@ -2095,7 +2246,7 @@ struct WalkState {
     /// Accumulated noise-related DNG tags; converted to `RawNoiseMetadata` after the walk.
     noise_tags: NoiseTagAccumulator,
     /// Compression numbers of full-res image IFDs refused ONLY for their
-    /// compression, so the no-raw-IFD error can say why (34892 = lossy JPEG).
+    /// compression, so the no-raw-IFD error can say why.
     refused_compressions: Vec<u32>,
 }
 
@@ -2134,15 +2285,15 @@ fn first_srational_f32(
 /// 7 = lossless JPEG, 8 = deflate, 52546 = JPEG XL (DNG 1.7; decode needs the
 /// `jxl-codec` feature but the payload is still locatable without it).
 fn compression_supported(c: u32) -> bool {
-    matches!(c, 1 | 7 | 8 | 52546)
+    matches!(c, 1 | 7 | 8 | 34892 | 52546)
 }
 
 fn raw_ifd_supported_candidate(ifd: &RawIfd, new_subfile_type: u32) -> bool {
     let has_storage = (!ifd.tile_offsets.is_empty() && !ifd.tile_byte_counts.is_empty())
         || (!ifd.strip_offsets.is_empty() && !ifd.strip_byte_counts.is_empty());
     let is_subsampled = (new_subfile_type & 1) != 0;
-    // PARSERS-005 / ERR-011: 0x884C (lossy DNG) is not decoded; exclude it from
-    // the candidate check so walk() does not select an IFD that will fail later.
+    // PARSERS-005 / ERR-011: an undecodable compression is excluded from the
+    // candidate check so walk() does not select an IFD that will fail later.
     ifd.width > 0
         && ifd.height > 0
         && has_storage
@@ -2232,6 +2383,13 @@ fn walk(data: &[u8], off: usize, le: bool, state: &mut WalkState) {
                     // ProfileGainTableMap: UNDEFINED blob, parsed after the walk.
                     if dtype == 7 && cnt > 4 {
                         ifd.pgtm_range = Some((val as usize, cnt as usize));
+                    }
+                }
+                0xC741 => {
+                    // OpcodeList2: UNDEFINED blob (always big-endian), read by the
+                    // lossy-JPEG arm for its MapPolynomial.
+                    if dtype == 7 && cnt > 4 {
+                        ifd.opcode_list2 = Some((val as usize, cnt as usize));
                     }
                 }
                 0xCD49 => {
@@ -3490,17 +3648,33 @@ mod tests {
     }
 
     #[test]
-    fn lossy_dng_refused_with_reason() {
-        let (dng, _) = synth_dng_1strip(34892, &[0u8; 64]);
-        for e in [
-            decode_bytes(&dng).err().expect("expected error").to_string(),
-            payload_ranges(&dng).unwrap_err().to_string(),
-        ] {
-            assert!(
-                e.contains("34892") && e.contains("lossy"),
-                "refusal must name lossy JPEG by number, got: {e}"
-            );
+    fn lossy_dng_decodes_through_the_hook() {
+        // The hook is process-wide (first set wins): every test that sets one sets this one.
+        set_lossy_jpeg_decoder(|b| Ok((4, 4, 1, b.iter().map(|v| v.wrapping_mul(16)).collect())));
+        let strip: Vec<u8> = (0..16).collect();
+        let (dng, off) = synth_dng_1strip(34892, &strip);
+        let img = decode_bytes(&dng).expect("lossy DNG decodes");
+        assert!(img.lossy_jpeg);
+        assert_eq!(img.raw, (0..16u16).map(|v| v * 16).collect::<Vec<_>>());
+        assert_eq!(payload_ranges(&dng).unwrap(), vec![(off as usize, 16)]);
+    }
+
+    #[test]
+    fn map_polynomial_parsed_from_opcode_list() {
+        // One MapPolynomial (id 8) on plane 1 of a 10x20 area, y = 0.25 + 0.5x, then an unknown opcode.
+        let mut b = Vec::new();
+        for v in [2u32, 8, 0x0103_0000, 0, 36 + 16, 0, 0, 10, 20, 1, 1, 1, 1, 1] {
+            b.extend(v.to_be_bytes());
         }
+        b.extend(0.25f64.to_be_bytes());
+        b.extend(0.5f64.to_be_bytes());
+        for v in [99u32, 1, 0, 4, 7] {
+            b.extend(v.to_be_bytes());
+        }
+        let m = map_polynomials(&b);
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].bottom, m[0].right, m[0].plane, m[0].planes), (10, 20, 1, 1));
+        assert_eq!(m[0].coef, vec![0.25, 0.5]);
     }
 
     #[test]
